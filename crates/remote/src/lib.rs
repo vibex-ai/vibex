@@ -2980,6 +2980,210 @@ async fn dispatch_provider_request(
             })
             .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::RefreshDetectedAgentVersions(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.refresh_detected_agent_versions();
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_catalog_refresh".to_string(),
+                "Detected Agent versions refreshed from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(
+                vibex_core::RemoteProviderRefreshDetectedAgentVersionsResponse { count: value },
+            )
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListAgentCatalog(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_agent_catalog()?;
+            serde_json::to_value(vibex_core::RemoteProviderListAgentCatalogResponse {
+                catalog: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListAcpCatalogPresets(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_acp_catalog_presets()?;
+            serde_json::to_value(vibex_core::RemoteProviderListAcpCatalogPresetsResponse {
+                catalog: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::GetAcpProfileConfig(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.get_acp_profile_config(request.provider_profile_id)?;
+            serde_json::to_value(vibex_core::RemoteProviderGetAcpProfileConfigResponse {
+                config: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateAcpProfileConfig(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.update_acp_profile_config(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "acp_profile_config".to_string(),
+                "ACP profile configuration updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderUpdateAcpProfileConfigResponse {
+                profile: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PreviewNativeImport(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.preview_native_import(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderPreviewNativeImportResponse {
+                preview: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::CreateProfileFromImport(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.create_profile_from_import(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "native_import".to_string(),
+                "Provider profile created from a native import by a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderCreateProfileFromImportResponse {
+                result: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::PreviewNativeExport(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.preview_native_export(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderPreviewNativeExportResponse {
+                preview: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ApplyNativeExport(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.apply_native_export(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "native_export_apply".to_string(),
+                "Native export applied from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderApplyNativeExportResponse {
+                result: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::RollbackNativeExport(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.rollback_native_export(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "native_export_rollback".to_string(),
+                "Native export rolled back from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteProviderRollbackNativeExportResponse {
+                result: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::ListNativeExports(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = service.list_native_exports(request.request)?;
+            serde_json::to_value(vibex_core::RemoteProviderListNativeExportsResponse {
+                exports: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::MutateProviderCredentialSecret(request) => {
             let (proof, request) = request.into_request();
             let auth = authorize_provider_action(

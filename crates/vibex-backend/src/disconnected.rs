@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use vibex_core::{
-    AgentListRequest, AgentListResponse, AgentModelProviderDisplayOrderListRequest,
-    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
-    AgentSessionRuntimeSelectionState, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
+    AgentCatalogListResponse, AgentListRequest, AgentListResponse,
+    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+    AgentModelProviderProfileTestResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
@@ -30,9 +32,16 @@ use vibex_core::{
     McpServerValidateRequest, McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt,
     PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
-    ProviderProfileSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
-    RemoteAuditRecord, RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+    ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
+    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
@@ -925,6 +934,74 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<AutomationRunCancelRequest>,
     ) -> BackendFuture<'_, AutomationRun> {
+        disconnected_future!()
+    }
+
+    fn refresh_detected_agent_versions(&self) -> BackendFuture<'_, usize> {
+        disconnected_future!()
+    }
+
+    fn agent_catalog(&self) -> BackendFuture<'_, AgentCatalogListResponse> {
+        disconnected_future!()
+    }
+
+    fn acp_catalog_presets(&self) -> BackendFuture<'_, AcpProviderCatalogListResponse> {
+        disconnected_future!()
+    }
+
+    fn acp_profile_config(
+        &self,
+        _provider_profile_id: ProviderProfileId,
+    ) -> BackendFuture<'_, AcpProviderConfig> {
+        disconnected_future!()
+    }
+
+    fn update_acp_profile_config(
+        &self,
+        _request: MutationRequest<AcpProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        disconnected_future!()
+    }
+
+    fn preview_native_import(
+        &self,
+        _request: ProviderNativeImportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeImportPreview> {
+        disconnected_future!()
+    }
+
+    fn create_profile_from_import(
+        &self,
+        _request: MutationRequest<ProviderNativeImportCreateRequest>,
+    ) -> BackendFuture<'_, ProviderNativeImportCreateResult> {
+        disconnected_future!()
+    }
+
+    fn preview_native_export(
+        &self,
+        _request: ProviderNativeExportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeExportPreview> {
+        disconnected_future!()
+    }
+
+    fn apply_native_export(
+        &self,
+        _request: MutationRequest<ProviderNativeExportApplyRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportApplyResult> {
+        disconnected_future!()
+    }
+
+    fn rollback_native_export(
+        &self,
+        _request: MutationRequest<ProviderNativeExportRollbackRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportRollbackResult> {
+        disconnected_future!()
+    }
+
+    fn native_exports(
+        &self,
+        _request: ProviderNativeExportListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
         disconnected_future!()
     }
 

@@ -17,7 +17,9 @@ use crate::agent_auth::{
     AgentAuthContextRefreshModelsRequest, AgentAuthContextVerifyRequest,
     AgentAuthenticationOperation,
 };
-use crate::agent_config::{AgentConfigStatus, AgentId, AgentRuntimeStatus, AgentSnapshotEntry};
+use crate::agent_config::{
+    AgentCatalogListResponse, AgentConfigStatus, AgentId, AgentRuntimeStatus, AgentSnapshotEntry,
+};
 use crate::agent_provider_runtime::{
     AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
     AgentRuntimeProbeStartRequest,
@@ -45,7 +47,8 @@ use crate::ids::{
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
 use crate::provider::{
-    Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest, Hook,
+    HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
     HookUpdateRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
@@ -53,7 +56,12 @@ use crate::provider::{
     McpServerValidationResult, Prompt, PromptCreateRequest, PromptDeleteRequest,
     PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
     ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderProfileSummary,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfileSummary,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
     ProviderUsageSummary, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest,
     SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest,
@@ -1621,6 +1629,17 @@ pub enum RemoteProviderOperationKind {
     DiscoverMcpSources,
     ImportMcpServers,
     ValidateMcpServer,
+    RefreshDetectedAgentVersions,
+    ListAgentCatalog,
+    ListAcpCatalogPresets,
+    GetAcpProfileConfig,
+    UpdateAcpProfileConfig,
+    PreviewNativeImport,
+    CreateProfileFromImport,
+    PreviewNativeExport,
+    ApplyNativeExport,
+    RollbackNativeExport,
+    ListNativeExports,
     SkillList,
     SkillCreate,
     SkillUpdate,
@@ -2316,6 +2335,146 @@ pub struct RemoteProviderHookPreviewInstallResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRefreshDetectedAgentVersionsRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRefreshDetectedAgentVersionsResponse {
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListAgentCatalogRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListAgentCatalogResponse {
+    pub catalog: AgentCatalogListResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListAcpCatalogPresetsRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListAcpCatalogPresetsResponse {
+    pub catalog: AcpProviderCatalogListResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderGetAcpProfileConfigRequest {
+    pub auth: RemoteAuthProof,
+    pub provider_profile_id: crate::ids::ProviderProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderGetAcpProfileConfigResponse {
+    pub config: AcpProviderConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderUpdateAcpProfileConfigRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AcpProviderProfileUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderUpdateAcpProfileConfigResponse {
+    pub profile: crate::provider::ProviderProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPreviewNativeImportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeImportPreviewRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPreviewNativeImportResponse {
+    pub preview: ProviderNativeImportPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCreateProfileFromImportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeImportCreateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderCreateProfileFromImportResponse {
+    pub result: ProviderNativeImportCreateResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPreviewNativeExportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeExportPreviewRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPreviewNativeExportResponse {
+    pub preview: ProviderNativeExportPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderApplyNativeExportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeExportApplyRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderApplyNativeExportResponse {
+    pub result: ProviderNativeExportApplyResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRollbackNativeExportRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeExportRollbackRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderRollbackNativeExportResponse {
+    pub result: ProviderNativeExportRollbackResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListNativeExportsRequest {
+    pub auth: RemoteAuthProof,
+    pub request: ProviderNativeExportListRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderListNativeExportsResponse {
+    pub exports: Vec<ProviderNativeExportRecordSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteProviderMcpListRequest {
     pub auth: RemoteAuthProof,
 }
@@ -2560,6 +2719,17 @@ pub enum RemoteProviderRequest {
     DiscoverMcpSources(RemoteProviderMcpDiscoverRequest),
     ImportMcpServers(RemoteProviderMcpImportRequest),
     ValidateMcpServer(RemoteProviderMcpValidateRequest),
+    RefreshDetectedAgentVersions(RemoteProviderRefreshDetectedAgentVersionsRequest),
+    ListAgentCatalog(RemoteProviderListAgentCatalogRequest),
+    ListAcpCatalogPresets(RemoteProviderListAcpCatalogPresetsRequest),
+    GetAcpProfileConfig(RemoteProviderGetAcpProfileConfigRequest),
+    UpdateAcpProfileConfig(RemoteProviderUpdateAcpProfileConfigRequest),
+    PreviewNativeImport(RemoteProviderPreviewNativeImportRequest),
+    CreateProfileFromImport(RemoteProviderCreateProfileFromImportRequest),
+    PreviewNativeExport(RemoteProviderPreviewNativeExportRequest),
+    ApplyNativeExport(RemoteProviderApplyNativeExportRequest),
+    RollbackNativeExport(RemoteProviderRollbackNativeExportRequest),
+    ListNativeExports(RemoteProviderListNativeExportsRequest),
     SkillList(RemoteProviderSkillListRequest),
     SkillCreate(RemoteProviderSkillCreateRequest),
     SkillUpdate(RemoteProviderSkillUpdateRequest),
@@ -2600,6 +2770,11 @@ impl RemoteProviderRequest {
                 | Self::UpdateAgentModelProviderBinding(_)
                 | Self::MutateProviderCredentialSecret(_)
                 | Self::SetAgentModelProviderDefault(_)
+                | Self::RefreshDetectedAgentVersions(_)
+                | Self::UpdateAcpProfileConfig(_)
+                | Self::CreateProfileFromImport(_)
+                | Self::ApplyNativeExport(_)
+                | Self::RollbackNativeExport(_)
         )
     }
 
@@ -2688,6 +2863,21 @@ impl RemoteProviderRequest {
             Self::DiscoverMcpSources(_) => RemoteProviderOperationKind::DiscoverMcpSources,
             Self::ImportMcpServers(_) => RemoteProviderOperationKind::ImportMcpServers,
             Self::ValidateMcpServer(_) => RemoteProviderOperationKind::ValidateMcpServer,
+            Self::RefreshDetectedAgentVersions(_) => {
+                RemoteProviderOperationKind::RefreshDetectedAgentVersions
+            }
+            Self::ListAgentCatalog(_) => RemoteProviderOperationKind::ListAgentCatalog,
+            Self::ListAcpCatalogPresets(_) => RemoteProviderOperationKind::ListAcpCatalogPresets,
+            Self::GetAcpProfileConfig(_) => RemoteProviderOperationKind::GetAcpProfileConfig,
+            Self::UpdateAcpProfileConfig(_) => RemoteProviderOperationKind::UpdateAcpProfileConfig,
+            Self::PreviewNativeImport(_) => RemoteProviderOperationKind::PreviewNativeImport,
+            Self::CreateProfileFromImport(_) => {
+                RemoteProviderOperationKind::CreateProfileFromImport
+            }
+            Self::PreviewNativeExport(_) => RemoteProviderOperationKind::PreviewNativeExport,
+            Self::ApplyNativeExport(_) => RemoteProviderOperationKind::ApplyNativeExport,
+            Self::RollbackNativeExport(_) => RemoteProviderOperationKind::RollbackNativeExport,
+            Self::ListNativeExports(_) => RemoteProviderOperationKind::ListNativeExports,
             Self::SkillList(_) => RemoteProviderOperationKind::SkillList,
             Self::SkillCreate(_) => RemoteProviderOperationKind::SkillCreate,
             Self::SkillUpdate(_) => RemoteProviderOperationKind::SkillUpdate,

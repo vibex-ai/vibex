@@ -2,42 +2,50 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vibex_core::{
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentListRequest, AgentListResponse, AgentModelProviderDisplayOrderListRequest,
-    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentUsageStatistics, AgentUsageStatisticsRequest,
-    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
-    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
-    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
-    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
-    HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderHealthSummary, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
+    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+    AgentModelProviderProfileTestResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentUsageStatistics, AgentUsageStatisticsRequest, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    ForkAgentSessionRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+    ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
@@ -2630,6 +2638,177 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .automation()
                 .cancel_run(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn refresh_detected_agent_versions(&self) -> BackendFuture<'_, usize> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .refresh_detected_agent_versions()
+                .map_err(Into::into)
+        })
+    }
+
+    fn agent_catalog(&self) -> BackendFuture<'_, AgentCatalogListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_agent_catalog()
+                .map_err(Into::into)
+        })
+    }
+
+    fn acp_catalog_presets(&self) -> BackendFuture<'_, AcpProviderCatalogListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_acp_catalog_presets()
+                .map_err(Into::into)
+        })
+    }
+
+    fn acp_profile_config(
+        &self,
+        provider_profile_id: ProviderProfileId,
+    ) -> BackendFuture<'_, AcpProviderConfig> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_acp_profile_config(provider_profile_id)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_acp_profile_config(
+        &self,
+        request: MutationRequest<AcpProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_acp_profile_config(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn preview_native_import(
+        &self,
+        request: ProviderNativeImportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeImportPreview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .preview_native_import(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_profile_from_import(
+        &self,
+        request: MutationRequest<ProviderNativeImportCreateRequest>,
+    ) -> BackendFuture<'_, ProviderNativeImportCreateResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_profile_from_import(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn preview_native_export(
+        &self,
+        request: ProviderNativeExportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeExportPreview> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .preview_native_export(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn apply_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportApplyRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportApplyResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .apply_native_export(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn rollback_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportRollbackRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportRollbackResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .rollback_native_export(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn native_exports(
+        &self,
+        request: ProviderNativeExportListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_native_exports(request)
                 .map_err(Into::into)
         })
     }

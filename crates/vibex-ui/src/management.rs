@@ -1162,24 +1162,32 @@ mod tests {
     };
 
     use vibex_core::{
-        AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
-        AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-        AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-        AgentModelProviderProfileTestResult, AutomationGraph, AutomationGraphCreateRequest,
-        AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-        AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-        AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-        AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest, McpServer,
-        McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-        McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-        McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-        McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-        ProviderCapabilitySummary, ProviderRunCapabilityProbesRequest,
-        ProviderRunCapabilityProbesResult, ScheduledTaskAttentionListRequest,
-        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
+        AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
+        AgentCatalogListResponse, AgentModelProviderDisplayOrderListRequest,
+        AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
+        AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
+        AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+        AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AutomationGraph,
+        AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+        AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest,
+        AutomationRun, AutomationRunCancelRequest, AutomationRunListRequest,
+        AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStep,
+        AutomationRunStepListRequest, McpServer, McpServerAgentMatrix,
+        McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+        McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+        McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+        McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
+        ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+        ProviderNativeExportListRequest, ProviderNativeExportPreview,
+        ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+        ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+        ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+        ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+        ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+        ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1607,6 +1615,74 @@ mod tests {
             &self,
             _request: MutationRequest<AutomationRunCancelRequest>,
         ) -> BackendFuture<'_, AutomationRun> {
+            error_future()
+        }
+
+        fn refresh_detected_agent_versions(&self) -> BackendFuture<'_, usize> {
+            error_future()
+        }
+
+        fn agent_catalog(&self) -> BackendFuture<'_, AgentCatalogListResponse> {
+            error_future()
+        }
+
+        fn acp_catalog_presets(&self) -> BackendFuture<'_, AcpProviderCatalogListResponse> {
+            error_future()
+        }
+
+        fn acp_profile_config(
+            &self,
+            _provider_profile_id: ProviderProfileId,
+        ) -> BackendFuture<'_, AcpProviderConfig> {
+            error_future()
+        }
+
+        fn update_acp_profile_config(
+            &self,
+            _request: MutationRequest<AcpProviderProfileUpdateRequest>,
+        ) -> BackendFuture<'_, ProviderProfile> {
+            error_future()
+        }
+
+        fn preview_native_import(
+            &self,
+            _request: ProviderNativeImportPreviewRequest,
+        ) -> BackendFuture<'_, ProviderNativeImportPreview> {
+            error_future()
+        }
+
+        fn create_profile_from_import(
+            &self,
+            _request: MutationRequest<ProviderNativeImportCreateRequest>,
+        ) -> BackendFuture<'_, ProviderNativeImportCreateResult> {
+            error_future()
+        }
+
+        fn preview_native_export(
+            &self,
+            _request: ProviderNativeExportPreviewRequest,
+        ) -> BackendFuture<'_, ProviderNativeExportPreview> {
+            error_future()
+        }
+
+        fn apply_native_export(
+            &self,
+            _request: MutationRequest<ProviderNativeExportApplyRequest>,
+        ) -> BackendFuture<'_, ProviderNativeExportApplyResult> {
+            error_future()
+        }
+
+        fn rollback_native_export(
+            &self,
+            _request: MutationRequest<ProviderNativeExportRollbackRequest>,
+        ) -> BackendFuture<'_, ProviderNativeExportRollbackResult> {
+            error_future()
+        }
+
+        fn native_exports(
+            &self,
+            _request: ProviderNativeExportListRequest,
+        ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
             error_future()
         }
 

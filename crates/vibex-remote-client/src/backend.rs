@@ -12,52 +12,60 @@ use vibex_backend::{
     WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentListRequest, AgentListResponse, AgentNotificationIntent, AgentSession,
-    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AutomationGraph,
-    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
-    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
-    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, MessageSubmissionState, OpenWorkspaceRequest, ProjectId,
-    ProjectWorkspaceSummary, ProviderHealthSummary, ProviderProfileSummary,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteActionClass,
-    RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
-    RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
-    RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
-    RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
-    RemoteAgentAuthenticateContextResponse, RemoteAgentAuthenticationOperationRequest,
-    RemoteAgentAuthenticationOperationResponse, RemoteAgentCancelContextAuthenticationRequest,
-    RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
-    RemoteAgentCreateSessionRequest, RemoteAgentCreateSessionResponse,
-    RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
-    RemoteAgentForkSessionRequest, RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest,
-    RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
-    RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
-    RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
-    RemoteAgentRenameSessionResponse, RemoteAgentReplaceUserMessageRequest,
-    RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
-    RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
-    RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
-    RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
-    RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
-    RemoteAgentSendMessageRequest, RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
+    AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
+    AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentTimelineDisplaySettings, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
+    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+    ProviderProfileId, ProviderProfileSummary, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RemoteActionClass, RemoteAgentAuthContextListRequest,
+    RemoteAgentAuthContextListResponse, RemoteAgentAuthContextMutationResponse,
+    RemoteAgentAuthLogoutPreviewRequest, RemoteAgentAuthLogoutPreviewResponse,
+    RemoteAgentAuthMethodListRequest, RemoteAgentAuthMethodListResponse,
+    RemoteAgentAuthenticateContextRequest, RemoteAgentAuthenticateContextResponse,
+    RemoteAgentAuthenticationOperationRequest, RemoteAgentAuthenticationOperationResponse,
+    RemoteAgentCancelContextAuthenticationRequest, RemoteAgentCancelRuntimeSwitchRequest,
+    RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentCreateSessionRequest,
+    RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveRequest,
+    RemoteAgentDeepLinkResolveResponse, RemoteAgentForkSessionRequest,
+    RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
+    RemoteAgentLogoutAuthContextRequest, RemoteAgentMessageSubmissionRequest,
+    RemoteAgentMessageSubmissionResponse, RemoteAgentRefreshAuthModelsRequest,
+    RemoteAgentRenameSessionRequest, RemoteAgentRenameSessionResponse,
+    RemoteAgentReplaceUserMessageRequest, RemoteAgentReplaceUserMessageResponse,
+    RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
+    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
+    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeOptionsRequest,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
+    RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
@@ -4561,6 +4569,274 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<vibex_core::RemoteAutomationRunResponse>(value)?.run)
+        })
+    }
+
+    fn refresh_detected_agent_versions(&self) -> BackendFuture<'_, usize> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::RefreshDetectedAgentVersions(
+                vibex_core::RemoteProviderRefreshDetectedAgentVersionsRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(
+                decode::<vibex_core::RemoteProviderRefreshDetectedAgentVersionsResponse>(value)?
+                    .count,
+            )
+        })
+    }
+
+    fn agent_catalog(&self) -> BackendFuture<'_, AgentCatalogListResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListAgentCatalog(
+                vibex_core::RemoteProviderListAgentCatalogRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderListAgentCatalogResponse>(value)?.catalog)
+        })
+    }
+
+    fn acp_catalog_presets(&self) -> BackendFuture<'_, AcpProviderCatalogListResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListAcpCatalogPresets(
+                vibex_core::RemoteProviderListAcpCatalogPresetsRequest { auth: this.auth() },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderListAcpCatalogPresetsResponse>(value)?.catalog)
+        })
+    }
+
+    fn acp_profile_config(
+        &self,
+        provider_profile_id: ProviderProfileId,
+    ) -> BackendFuture<'_, AcpProviderConfig> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetAcpProfileConfig(
+                vibex_core::RemoteProviderGetAcpProfileConfigRequest {
+                    auth: this.auth(),
+                    provider_profile_id,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderGetAcpProfileConfigResponse>(value)?.config)
+        })
+    }
+
+    fn update_acp_profile_config(
+        &self,
+        request: MutationRequest<AcpProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateAcpProfileConfig(
+                vibex_core::RemoteProviderUpdateAcpProfileConfigRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderUpdateAcpProfileConfigResponse>(value)?.profile)
+        })
+    }
+
+    fn preview_native_import(
+        &self,
+        request: ProviderNativeImportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeImportPreview> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::PreviewNativeImport(
+                vibex_core::RemoteProviderPreviewNativeImportRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPreviewNativeImportResponse>(value)?.preview)
+        })
+    }
+
+    fn create_profile_from_import(
+        &self,
+        request: MutationRequest<ProviderNativeImportCreateRequest>,
+    ) -> BackendFuture<'_, ProviderNativeImportCreateResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateProfileFromImport(
+                vibex_core::RemoteProviderCreateProfileFromImportRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderCreateProfileFromImportResponse>(value)?.result)
+        })
+    }
+
+    fn preview_native_export(
+        &self,
+        request: ProviderNativeExportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeExportPreview> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::PreviewNativeExport(
+                vibex_core::RemoteProviderPreviewNativeExportRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPreviewNativeExportResponse>(value)?.preview)
+        })
+    }
+
+    fn apply_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportApplyRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportApplyResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::ApplyNativeExport(
+                vibex_core::RemoteProviderApplyNativeExportRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderApplyNativeExportResponse>(value)?.result)
+        })
+    }
+
+    fn rollback_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportRollbackRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportRollbackResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::RollbackNativeExport(
+                vibex_core::RemoteProviderRollbackNativeExportRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderRollbackNativeExportResponse>(value)?.result)
+        })
+    }
+
+    fn native_exports(
+        &self,
+        request: ProviderNativeExportListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListNativeExports(
+                vibex_core::RemoteProviderListNativeExportsRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderListNativeExportsResponse>(value)?.exports)
         })
     }
 

@@ -1,40 +1,47 @@
 use serde::{Deserialize, Serialize};
 use vibex_core::{
-    AgentId, AgentListRequest, AgentListResponse, AgentModelProviderBinding,
-    AgentModelProviderBindingCreateRequest, AgentModelProviderBindingListRequest,
-    AgentModelProviderBindingUpdateRequest, AgentModelProviderDisplayOrderListRequest,
-    AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-    AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
-    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
-    AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
-    AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
-    AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
-    AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
-    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AutomationGraph,
-    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
-    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-    CustomAgentCreateRequest, CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest,
-    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
-    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
+    AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
+    AgentModelProviderBinding, AgentModelProviderBindingCreateRequest,
+    AgentModelProviderBindingListRequest, AgentModelProviderBindingUpdateRequest,
+    AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
+    AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
+    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+    AgentModelProviderProfileTestResult, AgentProviderProjectionCapability,
+    AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
+    AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
+    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
+    AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
+    AgentSnapshotEntry, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+    AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
+    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
+    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
+    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
+    McpServerValidateRequest, McpServerValidationResult, ModelProviderProfile,
+    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
-    ProviderHealthSummary, ProviderProfileId, ProviderProfileSummary,
-    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
-    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
-    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
+    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
+    ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
+    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
+    ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
+    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -424,4 +431,50 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: HookInstallPreviewRequest,
     ) -> BackendFuture<'_, HookInstallPreview>;
+
+    fn refresh_detected_agent_versions(&self) -> BackendFuture<'_, usize>;
+
+    fn agent_catalog(&self) -> BackendFuture<'_, AgentCatalogListResponse>;
+
+    fn acp_catalog_presets(&self) -> BackendFuture<'_, AcpProviderCatalogListResponse>;
+
+    fn acp_profile_config(
+        &self,
+        provider_profile_id: ProviderProfileId,
+    ) -> BackendFuture<'_, AcpProviderConfig>;
+
+    fn update_acp_profile_config(
+        &self,
+        request: MutationRequest<AcpProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile>;
+
+    fn preview_native_import(
+        &self,
+        request: ProviderNativeImportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeImportPreview>;
+
+    fn create_profile_from_import(
+        &self,
+        request: MutationRequest<ProviderNativeImportCreateRequest>,
+    ) -> BackendFuture<'_, ProviderNativeImportCreateResult>;
+
+    fn preview_native_export(
+        &self,
+        request: ProviderNativeExportPreviewRequest,
+    ) -> BackendFuture<'_, ProviderNativeExportPreview>;
+
+    fn apply_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportApplyRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportApplyResult>;
+
+    fn rollback_native_export(
+        &self,
+        request: MutationRequest<ProviderNativeExportRollbackRequest>,
+    ) -> BackendFuture<'_, ProviderNativeExportRollbackResult>;
+
+    fn native_exports(
+        &self,
+        request: ProviderNativeExportListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>>;
 }
