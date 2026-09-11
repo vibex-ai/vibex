@@ -40,21 +40,22 @@ use vibex_core::{
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteAuditListRequest, RemoteAuditRecord,
-    RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
-    RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
-    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
-    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
-    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
-    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
-    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
-    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
+    RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
+    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
+    RemotePairingOfferSummary, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
+    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
+    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillValidateRequest, SkillValidationResult, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem,
+    TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::{
@@ -1002,6 +1003,13 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: ProviderNativeExportListRequest,
     ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
+        disconnected_future!()
+    }
+
+    fn usage_summaries(
+        &self,
+        _request: ProviderUsageListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
         disconnected_future!()
     }
 

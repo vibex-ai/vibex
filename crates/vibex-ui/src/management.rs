@@ -1184,10 +1184,10 @@ mod tests {
         ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
         ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
         ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-        ScheduledTaskUpdateRequest,
+        ProviderUsageListRequest, ProviderUsageSummary, ScheduledTaskAttentionListRequest,
+        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1683,6 +1683,13 @@ mod tests {
             &self,
             _request: ProviderNativeExportListRequest,
         ) -> BackendFuture<'_, Vec<ProviderNativeExportRecordSummary>> {
+            error_future()
+        }
+
+        fn usage_summaries(
+            &self,
+            _request: ProviderUsageListRequest,
+        ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
             error_future()
         }
 

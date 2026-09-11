@@ -35,13 +35,14 @@ use vibex_core::{
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RelayPeerId, RelayRoomId, ScheduledTaskAttentionListRequest,
-    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix,
-    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
-    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
-    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RelayPeerId,
+    RelayRoomId, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
+    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
+    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -212,6 +213,11 @@ pub trait ManagementBackend: BackendBound {
     ) -> BackendFuture<'_, AgentModelProviderProfileFetchModelsResponse>;
 
     fn capability_summaries(&self) -> BackendFuture<'_, Vec<ProviderCapabilitySummary>>;
+
+    fn usage_summaries(
+        &self,
+        request: ProviderUsageListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderUsageSummary>>;
 
     fn run_capability_probes(
         &self,

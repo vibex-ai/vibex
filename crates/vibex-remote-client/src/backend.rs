@@ -45,27 +45,27 @@ use vibex_core::{
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderProfileSummary, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, RemoteActionClass, RemoteAgentAuthContextListRequest,
-    RemoteAgentAuthContextListResponse, RemoteAgentAuthContextMutationResponse,
-    RemoteAgentAuthLogoutPreviewRequest, RemoteAgentAuthLogoutPreviewResponse,
-    RemoteAgentAuthMethodListRequest, RemoteAgentAuthMethodListResponse,
-    RemoteAgentAuthenticateContextRequest, RemoteAgentAuthenticateContextResponse,
-    RemoteAgentAuthenticationOperationRequest, RemoteAgentAuthenticationOperationResponse,
-    RemoteAgentCancelContextAuthenticationRequest, RemoteAgentCancelRuntimeSwitchRequest,
-    RemoteAgentCancelRuntimeSwitchResponse, RemoteAgentCreateSessionRequest,
-    RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveRequest,
-    RemoteAgentDeepLinkResolveResponse, RemoteAgentForkSessionRequest,
-    RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest, RemoteAgentInterruptResponse,
-    RemoteAgentLogoutAuthContextRequest, RemoteAgentMessageSubmissionRequest,
-    RemoteAgentMessageSubmissionResponse, RemoteAgentRefreshAuthModelsRequest,
-    RemoteAgentRenameSessionRequest, RemoteAgentRenameSessionResponse,
-    RemoteAgentReplaceUserMessageRequest, RemoteAgentReplaceUserMessageResponse,
-    RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
-    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
-    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeOptionsRequest,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
-    RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
-    RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
+    RemoteActionClass, RemoteAgentAuthContextListRequest, RemoteAgentAuthContextListResponse,
+    RemoteAgentAuthContextMutationResponse, RemoteAgentAuthLogoutPreviewRequest,
+    RemoteAgentAuthLogoutPreviewResponse, RemoteAgentAuthMethodListRequest,
+    RemoteAgentAuthMethodListResponse, RemoteAgentAuthenticateContextRequest,
+    RemoteAgentAuthenticateContextResponse, RemoteAgentAuthenticationOperationRequest,
+    RemoteAgentAuthenticationOperationResponse, RemoteAgentCancelContextAuthenticationRequest,
+    RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
+    RemoteAgentCreateSessionRequest, RemoteAgentCreateSessionResponse,
+    RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
+    RemoteAgentForkSessionRequest, RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest,
+    RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
+    RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
+    RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
+    RemoteAgentRenameSessionResponse, RemoteAgentReplaceUserMessageRequest,
+    RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
+    RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
+    RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
+    RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
+    RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
+    RemoteAgentSendMessageRequest, RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
@@ -4837,6 +4837,31 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<vibex_core::RemoteProviderListNativeExportsResponse>(value)?.exports)
+        })
+    }
+
+    fn usage_summaries(
+        &self,
+        request: ProviderUsageListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::ListUsageSummaries(
+                vibex_core::RemoteProviderUsageSummaryListRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderUsageSummaryListResponse>(value)?.summaries)
         })
     }
 

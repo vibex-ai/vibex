@@ -46,8 +46,9 @@ use vibex_core::{
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, RemoteAuditListRequest,
-    RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
+    ProviderUsageSummary, RemoteAuditListRequest, RemoteAuditRecord,
+    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
@@ -2809,6 +2810,22 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .list_native_exports(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn usage_summaries(
+        &self,
+        request: ProviderUsageListRequest,
+    ) -> BackendFuture<'_, Vec<ProviderUsageSummary>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .list_usage_summaries(request)
                 .map_err(Into::into)
         })
     }
