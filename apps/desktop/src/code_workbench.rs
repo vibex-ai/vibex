@@ -5,6 +5,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::terminal_transport::{
+    LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
+};
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
     DragMoveEvent, Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _,
@@ -928,7 +931,26 @@ fn worktree_lifecycle_primary_action(
 /// installed without touching the file/Git surfaces.
 #[derive(Clone)]
 pub(crate) struct TerminalSurfaceTransport {
-    pub manager: TerminalManager,
+    pub transport: Arc<dyn TerminalTransport>,
+}
+
+/// Terminal transport over the local in-process manager.
+pub(crate) fn local_terminal_surface_transport(
+    manager: TerminalManager,
+) -> TerminalSurfaceTransport {
+    TerminalSurfaceTransport {
+        transport: Arc::new(LocalTerminalTransport::new(manager)),
+    }
+}
+
+/// Terminal transport over a paired authority's terminal backend.
+pub(crate) fn remote_terminal_surface_transport(
+    backend: Arc<dyn vibex_backend::TerminalBackend>,
+    executor: gpui::BackgroundExecutor,
+) -> TerminalSurfaceTransport {
+    TerminalSurfaceTransport {
+        transport: Arc::new(RemoteTerminalTransport::new(backend, executor)),
+    }
 }
 
 /// A Git mutation the workbench can run through the backend facade.
@@ -1747,6 +1769,11 @@ impl CodeWorkbench {
     /// installs the Remote v2 terminal transport instead. `None` means the
     /// desktop has no terminal transport for the current authority, and the
     /// terminal UI says so instead of silently doing nothing.
+    /// The transport serving terminals for the current authority.
+    pub(crate) fn terminal_surface_transport(&self) -> Option<TerminalSurfaceTransport> {
+        self.terminal_transport.clone()
+    }
+
     pub(crate) fn set_terminal_transport(
         &mut self,
         transport: Option<TerminalSurfaceTransport>,
@@ -3672,8 +3699,8 @@ impl CodeWorkbench {
         self.terminal_surfaces.insert(
             terminal_id.as_str().to_string(),
             cx.new(|cx| {
-                TerminalSurface::from_preview_shared_session(
-                    transport.manager,
+                TerminalSurface::from_preview_shared_session_with_transport(
+                    transport.transport,
                     workspace.root,
                     session,
                     window,

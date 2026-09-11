@@ -5964,12 +5964,12 @@ impl VibexWorkbench {
                             this.code_workbench.update(cx, |workbench, cx| {
                                 workbench.set_backend(facade.clone(), cx);
                                 // A local authority renders terminals from its
-                                // in-process manager; a remote authority installs
-                                // the Remote v2 transport instead.
+                                // in-process manager; a remote authority serves
+                                // the same surface from the Remote v2 transport.
                                 workbench.set_terminal_transport(
-                                    Some(crate::code_workbench::TerminalSurfaceTransport {
-                                        manager: terminal_manager,
-                                    }),
+                                    Some(crate::code_workbench::local_terminal_surface_transport(
+                                        terminal_manager,
+                                    )),
                                     cx,
                                 );
                             });
@@ -6661,9 +6661,13 @@ impl VibexWorkbench {
         ));
         self.usage_view
             .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
+        let remote_terminal_transport = crate::code_workbench::remote_terminal_surface_transport(
+            facade.terminal().clone(),
+            cx.background_executor().clone(),
+        );
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_backend(facade.clone(), cx);
-            workbench.set_terminal_transport(None, cx);
+            workbench.set_terminal_transport(Some(remote_terminal_transport), cx);
         });
         self.management_view.update(cx, |management, cx| {
             management.set_backend(facade.clone(), cx)
@@ -11248,13 +11252,15 @@ impl VibexWorkbench {
                 generation,
                 cx,
             );
-            self.load_agent_session_terminals(
-                runtime.clone(),
-                session_id.clone(),
-                workspace_id,
-                generation,
-                cx,
-            );
+            if let Some(backend) = self.backend.clone() {
+                self.load_agent_session_terminals(
+                    backend,
+                    session_id.clone(),
+                    workspace_id,
+                    generation,
+                    cx,
+                );
+            }
             if runtime_initializing {
                 self.agent_projection_task = None;
                 self.runtime_heartbeat_task = None;
@@ -11737,7 +11743,7 @@ impl VibexWorkbench {
 
     fn load_agent_session_terminals(
         &mut self,
-        runtime: Arc<DesktopRuntime>,
+        backend: BackendFacade,
         session_id: VibexSessionId,
         workspace_id: Option<vibex_core::WorkspaceId>,
         generation: u64,
@@ -11745,8 +11751,10 @@ impl VibexWorkbench {
     ) {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if let Some(workspace_id) = workspace_id.as_ref() {
-                runtime
-                    .list_terminals(workspace_id)
+                backend
+                    .terminal()
+                    .list_terminals(workspace_id.clone())
+                    .await
                     .map(running_terminal_sessions)
                     .unwrap_or_default()
             } else {
@@ -16280,13 +16288,22 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Terminal transport for the current authority, owned by the workbench so
+    /// every terminal view shares one set of remote pump tasks.
+    fn terminal_transport(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<crate::code_workbench::TerminalSurfaceTransport> {
+        self.code_workbench.read(cx).terminal_surface_transport()
+    }
+
     fn ensure_composer_terminal_surface(
         &mut self,
         terminal: TerminalSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<TerminalSurface>> {
-        let runtime = self.runtime.clone()?;
+        let transport = self.terminal_transport(cx)?;
         let terminal_id = terminal.id.as_str().to_string();
         let workspace_root = self
             .selected_session()
@@ -16298,8 +16315,8 @@ impl VibexWorkbench {
             .entry(terminal_id)
             .or_insert_with(|| {
                 cx.new(|cx| {
-                    TerminalSurface::from_embedded_shared_session(
-                        runtime.terminals().manager(),
+                    TerminalSurface::from_embedded_shared_session_with_transport(
+                        transport.transport,
                         workspace_root,
                         terminal,
                         window,
@@ -16526,9 +16543,10 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let (Some(runtime), Some(session)) =
-            (self.runtime.clone(), self.selected_session().cloned())
-        else {
+        let (Some(transport), Some(session)) = (
+            self.terminal_transport(cx),
+            self.selected_session().cloned(),
+        ) else {
             self.agent_error = Some("Select a session before creating a terminal".into());
             cx.notify();
             return;
@@ -16564,7 +16582,17 @@ impl VibexWorkbench {
             cols: 100,
         };
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.create_terminal(terminal_root, request)
+            transport
+                .transport
+                .create_terminal(std::path::Path::new(&terminal_root), request)
+                .await
+                .map_err(|error| {
+                    vibex_core::VibexError::new(
+                        vibex_core::ErrorCategory::Storage,
+                        error.code,
+                        error.message,
+                    )
+                })
         });
         let entity = cx.weak_entity();
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
@@ -16629,9 +16657,10 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let (Some(runtime), Some(session)) =
-            (self.runtime.clone(), self.selected_session().cloned())
-        else {
+        let (Some(transport), Some(session)) = (
+            self.terminal_transport(cx),
+            self.selected_session().cloned(),
+        ) else {
             self.agent_error = Some("Select a session before creating a terminal".into());
             cx.notify();
             return;
@@ -16667,7 +16696,17 @@ impl VibexWorkbench {
             cols: 100,
         };
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.create_terminal(terminal_root, request)
+            transport
+                .transport
+                .create_terminal(std::path::Path::new(&terminal_root), request)
+                .await
+                .map_err(|error| {
+                    vibex_core::VibexError::new(
+                        vibex_core::ErrorCategory::Storage,
+                        error.code,
+                        error.message,
+                    )
+                })
         });
         let entity = cx.weak_entity();
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
@@ -16717,7 +16756,7 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(transport) = self.terminal_transport(cx) else {
             return;
         };
         let composer_ids = self
@@ -16743,7 +16782,7 @@ impl VibexWorkbench {
             let mut closed = Vec::new();
             let mut errors = Vec::new();
             for terminal_id in terminal_ids {
-                match runtime.kill_terminal(&terminal_id) {
+                match transport.transport.close_terminal(&terminal_id).await {
                     Ok(_) => closed.push(terminal_id),
                     Err(error) if error.code == "terminal_not_found" => closed.push(terminal_id),
                     Err(error) => errors.push(format!("{}: {}", error.code, error.message)),
@@ -16826,7 +16865,7 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(transport) = self.terminal_transport(cx) else {
             return;
         };
         self.agent_action_pending = true;
@@ -16836,8 +16875,19 @@ impl VibexWorkbench {
             terminal_id: terminal_id.clone(),
             shell,
         };
-        let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { runtime.switch_terminal_shell(&request) });
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            transport
+                .transport
+                .switch_shell(request)
+                .await
+                .map_err(|error| {
+                    vibex_core::VibexError::new(
+                        vibex_core::ErrorCategory::Storage,
+                        error.code,
+                        error.message,
+                    )
+                })
+        });
         let entity = cx.weak_entity();
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -47202,8 +47252,8 @@ impl FoundationSettings {
                                 workbench.load_agent_overview(cx);
                             }
                             StorageCleanupKind::Terminals => {
-                                if let (Some(runtime), Some(session_id)) = (
-                                    workbench.runtime.clone(),
+                                if let (Some(backend), Some(session_id)) = (
+                                    workbench.backend.clone(),
                                     workbench.selected_session_id.clone(),
                                 ) {
                                     let workspace_id = workbench
@@ -47213,7 +47263,7 @@ impl FoundationSettings {
                                         .map(|session| session.workspace_id.clone());
                                     let generation = workbench.session_generation;
                                     workbench.load_agent_session_terminals(
-                                        runtime,
+                                        backend,
                                         session_id,
                                         workspace_id,
                                         generation,

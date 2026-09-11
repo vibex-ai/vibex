@@ -67,6 +67,9 @@ use crate::motion::hover_listener;
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::resize_seam;
 use crate::terminal_surface::TerminalSurface;
+use crate::terminal_transport::{
+    LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
+};
 use crate::theme;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
@@ -598,6 +601,9 @@ pub struct ManagementCenter {
     /// implemented. A paired runtime leaves `runtime` empty, so these sections
     /// are the only ones that can drive a headless authority.
     backend: Option<BackendFacade>,
+    /// Terminal transport for the current authority; the Agent sign-in
+    /// terminal is served by whichever runtime owns the PTY.
+    terminal_transport: Option<Arc<dyn TerminalTransport>>,
     navigation: ManagementNavigation,
     snapshot: ProviderCenterSnapshot,
     agent_ordering: AgentOrdering,
@@ -671,6 +677,9 @@ pub struct ManagementCenter {
     agent_auth_operations: BTreeMap<String, AgentAuthPendingOperation>,
     agent_auth_terminal: Option<TerminalAuthActionDescriptor>,
     agent_auth_terminal_surface: Option<(String, Entity<TerminalSurface>)>,
+    /// Terminal id whose authoritative session is being fetched for attach.
+    agent_auth_terminal_surface_pending: Option<String>,
+    agent_auth_terminal_surface_task: Option<Task<()>>,
     agent_auth_terminal_state: Option<AgentAuthTerminalState>,
     provider_display_order_drag_state: Option<ProviderDisplayOrderDragState>,
     provider_display_order_drop_target: Option<ProviderDisplayOrderDropTarget>,
@@ -1110,6 +1119,7 @@ impl ManagementCenter {
         Self {
             runtime: None,
             backend: None,
+            terminal_transport: None,
             navigation: ManagementNavigation::default(),
             snapshot: ProviderCenterSnapshot::default(),
             agent_ordering: AgentOrdering::default(),
@@ -1184,6 +1194,8 @@ impl ManagementCenter {
             agent_auth_operations: BTreeMap::new(),
             agent_auth_terminal: None,
             agent_auth_terminal_surface: None,
+            agent_auth_terminal_surface_pending: None,
+            agent_auth_terminal_surface_task: None,
             agent_auth_terminal_state: None,
             provider_display_order_drag_state: None,
             selected_mcp_id: None,
@@ -1242,6 +1254,10 @@ impl ManagementCenter {
     /// installs only this, and every section reads the capabilities it needs
     /// from the facade instead of assuming a local runtime exists.
     pub fn set_backend(&mut self, backend: BackendFacade, cx: &mut Context<Self>) {
+        self.terminal_transport = Some(Arc::new(RemoteTerminalTransport::new(
+            backend.terminal().clone(),
+            cx.background_executor().clone(),
+        )));
         self.backend = Some(backend);
         self.error = None;
         if self.runtime.is_none() {
@@ -1260,6 +1276,12 @@ impl ManagementCenter {
     }
 
     pub fn set_runtime(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
+        // A local authority serves the sign-in terminal from the in-process
+        // manager; installing the runtime therefore replaces the transport a
+        // preceding `set_backend` installed for a paired authority.
+        self.terminal_transport = Some(Arc::new(LocalTerminalTransport::new(
+            runtime.terminals().manager(),
+        )));
         let runtime_changed = self
             .runtime
             .as_ref()
@@ -1271,7 +1293,7 @@ impl ManagementCenter {
             self.details_ready = false;
             self.refresh_task = None;
             self.agent_auth_generation = self.agent_auth_generation.saturating_add(1);
-            self.clear_agent_auth_terminal();
+            self.clear_agent_auth_terminal(cx);
             self.agent_auth_scope = None;
             self.agent_auth_catalog = None;
             self.agent_auth_context = None;
@@ -1388,7 +1410,7 @@ impl ManagementCenter {
     }
 
     pub fn clear_runtime(&mut self, cx: &mut Context<Self>) {
-        self.clear_agent_auth_terminal();
+        self.clear_agent_auth_terminal(cx);
         self.runtime = None;
         self.backend = None;
         self.generation = self.generation.saturating_add(1);
@@ -1545,7 +1567,7 @@ impl ManagementCenter {
             self.agent_auth_error = None;
             self.agent_auth_inputs.clear();
             self.agent_auth_clear_values.clear();
-            self.clear_agent_auth_terminal();
+            self.clear_agent_auth_terminal(cx);
             cx.notify();
             return;
         };
@@ -1580,7 +1602,7 @@ impl ManagementCenter {
             self.agent_auth_reauthentication = false;
             self.agent_auth_inputs.clear();
             self.agent_auth_clear_values.clear();
-            self.clear_agent_auth_terminal();
+            self.clear_agent_auth_terminal(cx);
         }
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -1738,7 +1760,7 @@ impl ManagementCenter {
         self.agent_auth_logout_preview = None;
         self.agent_auth_reauthentication = true;
         self.agent_auth_error = None;
-        self.clear_agent_auth_terminal();
+        self.clear_agent_auth_terminal(cx);
         cx.notify();
     }
 
@@ -1753,8 +1775,8 @@ impl ManagementCenter {
         scope: (String, Option<String>),
         cx: &mut Context<Self>,
     ) {
-        let (Some(runtime), Some(context), Some(method)) = (
-            self.runtime.clone(),
+        let (Some(backend), Some(context), Some(method)) = (
+            self.backend.clone(),
             self.agent_auth_context.clone(),
             self.agent_auth_catalog.as_ref().and_then(|catalog| {
                 catalog
@@ -1804,20 +1826,26 @@ impl ManagementCenter {
         self.agent_auth_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
-        let runtime_for_callback = runtime.clone();
+        let backend_for_callback = backend.clone();
+        let Some(transport_for_callback) = self.terminal_transport.clone() else {
+            return;
+        };
         let scope_for_callback = scope.clone();
         let operation_id_for_request = operation_id.clone();
         let operation_id_for_callback = operation_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .agent()
-                .authenticate_context(AgentAuthContextAuthenticateRequest {
-                    operation_id: operation_id_for_request,
-                    auth_context_id: context.id,
-                    expected_context_revision: context.revision,
-                    method_id: method.id,
-                })
+                .authenticate_agent_context(MutationRequest::new(
+                    AgentAuthContextAuthenticateRequest {
+                        operation_id: operation_id_for_request,
+                        auth_context_id: context.id,
+                        expected_context_revision: context.revision,
+                        method_id: method.id,
+                    },
+                ))
                 .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         let completed_mutation = mutation;
         let agent_id_for_callback = agent_id_key.clone();
@@ -1849,12 +1877,12 @@ impl ManagementCenter {
                         && let Some(terminal_id) = result
                             .terminal
                             .as_ref()
-                            .and_then(|terminal| terminal.terminal_id.as_ref())
+                            .and_then(|terminal| terminal.terminal_id.clone())
                     {
-                        let _ = runtime_for_callback
-                            .terminals()
-                            .manager()
-                            .kill(terminal_id);
+                        let transport = transport_for_callback.clone();
+                        std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+                            let _ = transport.close_terminal(&terminal_id).await;
+                        }));
                     }
                     cx.notify();
                     return;
@@ -1869,11 +1897,12 @@ impl ManagementCenter {
                             .as_ref()
                             .and_then(|terminal| terminal.terminal_id.clone());
                         if let Some(terminal) = result.terminal {
-                            this.clear_agent_auth_terminal();
+                            this.clear_agent_auth_terminal(cx);
                             this.agent_auth_terminal = Some(terminal);
                             if let Some(terminal_id) = terminal_id {
                                 this.start_agent_auth_context_terminal_monitor(
-                                    runtime_for_callback.clone(),
+                                    backend_for_callback.clone(),
+                                    transport_for_callback.clone(),
                                     scope_for_callback.clone(),
                                     generation,
                                     operation_id_for_callback.clone(),
@@ -1950,7 +1979,7 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let Some(scope) = self.current_agent_auth_scope() else {
@@ -2038,46 +2067,54 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let method_id_for_request = method.id.clone();
         let scope_for_callback = scope.clone();
-        let runtime_for_callback = runtime.clone();
+        let backend_for_callback = backend.clone();
+        let Some(transport_for_callback) = self.terminal_transport.clone() else {
+            return;
+        };
         let agent_id_for_monitor = agent_id.clone();
         let provider_profile_id_for_monitor = provider_profile_id.clone();
         let operation_id_for_request = operation_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if method.kind == AgentAuthMethodKind::Environment && !values.is_empty() {
-                runtime
-                    .management()
-                    .providers()
-                    .management()
-                    .update_agent_auth_environment(AgentAuthEnvironmentUpdateRequest {
-                        agent_id: agent_id.clone(),
-                        provider_profile_id: provider_profile_id
-                            .clone()
-                            .expect("environment authentication profile was validated"),
-                        method_id: method_id_for_request.clone(),
-                        values,
-                    })?;
+                backend
+                    .agent()
+                    .update_agent_auth_environment(MutationRequest::new(
+                        AgentAuthEnvironmentUpdateRequest {
+                            agent_id: agent_id.clone(),
+                            provider_profile_id: provider_profile_id
+                                .clone()
+                                .expect("environment authentication profile was validated"),
+                            method_id: method_id_for_request.clone(),
+                            values,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
             }
             if required_credential_cleared {
-                let mut catalog = runtime
+                let mut catalog = backend
                     .agent()
-                    .refresh_auth_methods(agent_id, provider_profile_id)
-                    .await?;
+                    .refresh_agent_auth_methods(MutationRequest::new(agent_id.clone()))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 catalog.status = AgentAuthStatus::AuthenticationRequired;
                 return Ok::<_, VibexError>((catalog, None, true));
             }
-            let result = runtime
+            let result = backend
                 .agent()
-                .authenticate(AgentAuthenticateRequest {
+                .authenticate_agent(MutationRequest::new(AgentAuthenticateRequest {
                     operation_id: operation_id_for_request,
                     agent_id: agent_id.clone(),
                     provider_profile_id: provider_profile_id.clone(),
                     method_id: method_id_for_request,
-                })
-                .await?;
-            let mut catalog = runtime
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let mut catalog = backend
                 .agent()
-                .refresh_auth_methods(agent_id, provider_profile_id)
-                .await?;
+                .refresh_agent_auth_methods(MutationRequest::new(agent_id.clone()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
             catalog.status = if result.terminal.is_some() {
                 AgentAuthStatus::Unknown
             } else {
@@ -2113,12 +2150,12 @@ impl ManagementCenter {
                 }
                 if !operation_is_registered || !scope_is_current {
                     if let Ok(Ok((_, Some(terminal), _))) = &outcome
-                        && let Some(terminal_id) = terminal.terminal_id.as_ref()
+                        && let Some(terminal_id) = terminal.terminal_id.clone()
                     {
-                        let _ = runtime_for_callback
-                            .terminals()
-                            .manager()
-                            .kill(terminal_id);
+                        let transport = transport_for_callback.clone();
+                        std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+                            let _ = transport.close_terminal(&terminal_id).await;
+                        }));
                     }
                     cx.notify();
                     return;
@@ -2134,11 +2171,12 @@ impl ManagementCenter {
                         this.agent_auth_clear_values.clear();
                         if let Some(terminal) = terminal {
                             let terminal_id = terminal.terminal_id.clone();
-                            this.clear_agent_auth_terminal();
+                            this.clear_agent_auth_terminal(cx);
                             this.agent_auth_terminal = Some(terminal);
                             if let Some(terminal_id) = terminal_id {
                                 this.start_agent_auth_terminal_monitor(
-                                    runtime_for_callback.clone(),
+                                    backend_for_callback.clone(),
+                                    transport_for_callback.clone(),
                                     scope_for_callback.clone(),
                                     generation,
                                     agent_id_for_monitor.clone(),
@@ -2302,7 +2340,7 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(true)) => {
                         this.agent_auth_operations.remove(&agent_id_for_callback);
-                        this.clear_agent_auth_terminal();
+                        this.clear_agent_auth_terminal(cx);
                         this.agent_auth_error = None;
                         this.notice = Some(
                             management_locale_text(
@@ -2615,7 +2653,7 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(catalog)) => {
                         this.agent_auth_catalog = Some(catalog);
-                        this.clear_agent_auth_terminal();
+                        this.clear_agent_auth_terminal(cx);
                         this.notice = Some(
                             management_locale_text_for(
                                 active_locale,
@@ -2785,7 +2823,7 @@ impl ManagementCenter {
                         this.agent_auth_context = Some(result.context);
                         this.agent_auth_model_catalog = None;
                         this.agent_auth_logout_preview = None;
-                        this.clear_agent_auth_terminal();
+                        this.clear_agent_auth_terminal(cx);
                         this.agent_auth_error = None;
                         this.notice = Some(format!(
                             "{} ({affected_count})",
@@ -2816,15 +2854,19 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    fn clear_agent_auth_terminal(&mut self) {
+    fn clear_agent_auth_terminal(&mut self, cx: &mut Context<Self>) {
         self.agent_auth_terminal_monitor_task = None;
-        if let (Some(runtime), Some(terminal_id)) = (
-            self.runtime.as_ref(),
+        self.agent_auth_terminal_surface_task = None;
+        self.agent_auth_terminal_surface_pending = None;
+        if let (Some(transport), Some(terminal_id)) = (
+            self.terminal_transport.clone(),
             self.agent_auth_terminal
                 .as_ref()
-                .and_then(|terminal| terminal.terminal_id.as_ref()),
+                .and_then(|terminal| terminal.terminal_id.clone()),
         ) {
-            let _ = runtime.terminals().manager().kill(terminal_id);
+            std::mem::drop(gpui_tokio::Tokio::spawn(cx, async move {
+                let _ = transport.close_terminal(&terminal_id).await;
+            }));
         }
         self.agent_auth_terminal = None;
         self.agent_auth_terminal_surface = None;
@@ -2842,7 +2884,7 @@ impl ManagementCenter {
             self.cancel_agent_authentication(agent_id, operation_id, cx);
             return;
         }
-        self.clear_agent_auth_terminal();
+        self.clear_agent_auth_terminal(cx);
         cx.notify();
     }
 
@@ -2859,34 +2901,64 @@ impl ManagementCenter {
             .agent_auth_terminal_surface
             .as_ref()
             .is_some_and(|(id, _)| id == terminal_id.as_str())
+            || self.agent_auth_terminal_surface_pending.as_deref() == Some(terminal_id.as_str())
         {
             return;
         }
-        let Some(runtime) = self.runtime.as_ref() else {
+        let Some(transport) = self.terminal_transport.clone() else {
             return;
         };
-        let manager = runtime.terminals().manager();
-        let Ok(snapshot) = manager.snapshot(&terminal_id) else {
-            return;
-        };
-        let workspace_root = PathBuf::from(&snapshot.session.cwd);
-        let surface = cx.new(|cx| {
-            TerminalSurface::from_shared_session(
-                manager,
-                workspace_root,
-                snapshot.session,
-                window,
-                cx,
-            )
-        });
-        surface.update(cx, |surface, cx| surface.set_active(true, cx));
-        self.agent_auth_terminal_surface = Some((terminal_id.as_str().to_string(), surface));
+        self.agent_auth_terminal_surface_pending = Some(terminal_id.as_str().to_string());
+        let entity = cx.weak_entity();
+        let window_handle = window.window_handle();
+        self.agent_auth_terminal_surface_task = Some(cx.spawn(async move |_, cx| {
+            // The session belongs to whichever runtime owns the PTY, so the
+            // attach reads it through the transport before building the view.
+            let session = match transport.poll_terminal(&terminal_id, i64::MAX).await {
+                Ok(snapshot) => snapshot.session,
+                Err(_) => {
+                    let _ = entity.update(cx, |this, _| {
+                        this.agent_auth_terminal_surface_pending = None;
+                    });
+                    return;
+                }
+            };
+            let attached_terminal_id = terminal_id.clone();
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    let is_current = this
+                        .agent_auth_terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.terminal_id.as_ref())
+                        == Some(&attached_terminal_id);
+                    this.agent_auth_terminal_surface_pending = None;
+                    if !is_current {
+                        return;
+                    }
+                    let workspace_root = PathBuf::from(&session.cwd);
+                    let surface = cx.new(|cx| {
+                        TerminalSurface::from_shared_session_with_transport(
+                            transport,
+                            workspace_root,
+                            session,
+                            window,
+                            cx,
+                        )
+                    });
+                    surface.update(cx, |surface, cx| surface.set_active(true, cx));
+                    this.agent_auth_terminal_surface =
+                        Some((attached_terminal_id.as_str().to_string(), surface));
+                    cx.notify();
+                });
+            });
+        }));
     }
 
     #[allow(clippy::too_many_arguments)]
     fn start_agent_auth_context_terminal_monitor(
         &mut self,
-        runtime: Arc<DesktopRuntime>,
+        backend: BackendFacade,
+        transport: Arc<dyn TerminalTransport>,
         scope: (String, Option<String>),
         generation: u64,
         operation_id: AgentAuthenticationOperationId,
@@ -2895,28 +2967,20 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) {
         self.agent_auth_terminal_state = Some(AgentAuthTerminalState::Running);
-        let manager = runtime.terminals().manager();
         let terminal_id_for_runner = terminal_id.clone();
         let operation_id_for_runner = operation_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let exit_status = loop {
-                if let Some(status) = manager.process_exit_status(&terminal_id_for_runner)? {
-                    break status;
+            let terminal_error =
+                await_agent_auth_terminal_exit(&transport, &terminal_id_for_runner).await;
+            let completion = wait_for_agent_auth_completion(&backend, &operation_id_for_runner)
+                .await
+                .map(AgentAuthTerminalCompletion::AgentAccount);
+            match terminal_error {
+                Some(error) => {
+                    Ok::<_, VibexError>(AgentAuthTerminalCompletion::AuthenticationRequired(error))
                 }
-                tokio::time::sleep(AGENT_AUTH_TERMINAL_POLL_INTERVAL).await;
-            };
-            let exit_error = terminal_auth_exit_error(&exit_status);
-            let completion = runtime
-                .agent()
-                .auth_contexts()
-                .wait_for_authentication_operation(&operation_id_for_runner)
-                .await;
-            if let Some(error) = exit_error {
-                return Ok::<_, VibexError>(AgentAuthTerminalCompletion::AuthenticationRequired(
-                    error,
-                ));
+                None => completion,
             }
-            completion.map(AgentAuthTerminalCompletion::AgentAccount)
         });
         let entity = cx.weak_entity();
         self.agent_auth_terminal_monitor_task = Some(cx.spawn(async move |_, cx| {
@@ -2987,41 +3051,37 @@ impl ManagementCenter {
     #[allow(clippy::too_many_arguments)]
     fn start_agent_auth_terminal_monitor(
         &mut self,
-        runtime: Arc<DesktopRuntime>,
+        backend: BackendFacade,
+        transport: Arc<dyn TerminalTransport>,
         scope: (String, Option<String>),
         generation: u64,
         agent_id: AgentId,
-        provider_profile_id: Option<vibex_core::ProviderProfileId>,
+        _provider_profile_id: Option<vibex_core::ProviderProfileId>,
         operation_id: AgentAuthenticationOperationId,
         terminal_id: vibex_core::TerminalId,
         active_locale: ResolvedLocale,
         cx: &mut Context<Self>,
     ) {
         self.agent_auth_terminal_state = Some(AgentAuthTerminalState::Running);
-        let manager = runtime.terminals().manager();
         let terminal_id_for_runner = terminal_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let exit_status = loop {
-                if let Some(status) = manager.process_exit_status(&terminal_id_for_runner)? {
-                    break status;
-                }
-                tokio::time::sleep(AGENT_AUTH_TERMINAL_POLL_INTERVAL).await;
-            };
-            if let Some(error) = terminal_auth_exit_error(&exit_status) {
+            if let Some(error) =
+                await_agent_auth_terminal_exit(&transport, &terminal_id_for_runner).await
+            {
                 return Ok::<_, VibexError>(AgentAuthTerminalCompletion::AuthenticationRequired(
                     error,
                 ));
             }
-            let (catalog, refresh_error) = match runtime
+            let (catalog, refresh_error) = match backend
                 .agent()
-                .refresh_auth_methods(agent_id, provider_profile_id)
+                .refresh_agent_auth_methods(MutationRequest::new(agent_id))
                 .await
             {
                 Ok(mut catalog) => {
                     catalog.status = AgentAuthStatus::Authenticated;
                     (Some(catalog), None)
                 }
-                Err(error) => (None, Some(error)),
+                Err(error) => (None, Some(crate::app::remote_error_into_vibex(error))),
             };
             Ok(AgentAuthTerminalCompletion::Authenticated {
                 catalog,
@@ -15440,23 +15500,103 @@ fn agent_auth_scope_matches(
     current_generation == expected_generation && current_scope == Some(expected_scope)
 }
 
-fn terminal_auth_exit_error(
-    status: &vibex_terminal::TerminalProcessExitStatus,
+/// Waits until the sign-in terminal leaves the running state.
+///
+/// The authority reports the terminal's status in its session, so the same
+/// wait works for an in-process PTY and for one owned by a paired runtime. The
+/// exit code stays with the authority; a failed sign-in still surfaces through
+/// the authentication operation's own error code.
+async fn await_agent_auth_terminal_exit(
+    transport: &Arc<dyn TerminalTransport>,
+    terminal_id: &vibex_core::TerminalId,
 ) -> Option<VibexError> {
-    if status.exit_code == Some(0) && status.signal.is_none() {
-        return None;
+    // A cursor beyond any frame keeps the wait read-only: the snapshot still
+    // carries the authoritative session and no output is consumed.
+    loop {
+        match transport.poll_terminal(terminal_id, i64::MAX).await {
+            Ok(snapshot) => match terminal_auth_status_error(snapshot.session.status) {
+                // Still running: keep waiting for the interactive sign-in.
+                None if snapshot.session.status == vibex_core::TerminalStatus::Running => {}
+                outcome => return outcome,
+            },
+            // A terminal the authority no longer knows must not hang the
+            // sign-in; the operation poll below decides the outcome.
+            Err(_) => return None,
+        }
+        tokio::time::sleep(AGENT_AUTH_TERMINAL_POLL_INTERVAL).await;
     }
-    let mut error = VibexError::process(
-        "agent_terminal_auth_failed",
-        "Interactive Agent authentication did not complete successfully",
-    );
-    if let Some(exit_code) = status.exit_code {
-        error = error.with_diagnostic("exitCode", exit_code.to_string());
+}
+
+/// A sign-in terminal that was killed or lost can never complete the sign-in.
+fn terminal_auth_status_error(status: vibex_core::TerminalStatus) -> Option<VibexError> {
+    match status {
+        vibex_core::TerminalStatus::Exited => None,
+        vibex_core::TerminalStatus::Killed => Some(
+            VibexError::process(
+                "agent_terminal_auth_failed",
+                "Interactive Agent authentication did not complete successfully",
+            )
+            .with_diagnostic("terminalStatus", "killed"),
+        ),
+        vibex_core::TerminalStatus::Stale => Some(
+            VibexError::process(
+                "agent_terminal_auth_failed",
+                "Interactive Agent authentication did not complete successfully",
+            )
+            .with_diagnostic("terminalStatus", "stale"),
+        ),
+        vibex_core::TerminalStatus::Running => None,
     }
-    if let Some(signal) = status.signal.as_deref() {
-        error = error.with_diagnostic("signal", signal);
+}
+
+/// Polls the authority's authentication operation until it reaches a final
+/// state and returns the refreshed context with its model catalogue.
+async fn wait_for_agent_auth_completion(
+    backend: &BackendFacade,
+    operation_id: &AgentAuthenticationOperationId,
+) -> VibexResult<AgentAuthContextMutationResult> {
+    const MAX_POLLS: usize = 2_400;
+    for _ in 0..MAX_POLLS {
+        let operation = backend
+            .agent()
+            .get_agent_authentication_operation(operation_id.clone())
+            .await
+            .map_err(crate::app::remote_error_into_vibex)?;
+        match operation.state {
+            vibex_core::AgentAuthenticationOperationState::Succeeded => {
+                return backend
+                    .agent()
+                    .refresh_agent_auth_models(MutationRequest::new(
+                        AgentAuthContextRefreshModelsRequest {
+                            auth_context_id: operation.auth_context_id,
+                            expected_context_revision: operation.expected_context_revision,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex);
+            }
+            vibex_core::AgentAuthenticationOperationState::Failed => {
+                return Err(VibexError::conflict(
+                    operation
+                        .error_code
+                        .as_deref()
+                        .unwrap_or("agent_authentication_verification_failed"),
+                    "Interactive Agent authentication failed",
+                ));
+            }
+            vibex_core::AgentAuthenticationOperationState::Cancelled => {
+                return Err(VibexError::conflict(
+                    "agent_authentication_cancelled",
+                    "Interactive Agent authentication was cancelled",
+                ));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
     }
-    Some(error)
+    Err(VibexError::process(
+        "agent_authentication_completion_timeout",
+        "Interactive Agent authentication did not reach a final state",
+    ))
 }
 
 fn management_locale_text(
@@ -18528,25 +18668,16 @@ mod tests {
 
     #[test]
     fn terminal_auth_exit_status_distinguishes_success_failure_and_signal() {
-        assert!(
-            terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
-                exit_code: Some(0),
-                signal: None,
-            })
-            .is_none()
-        );
-        let nonzero = terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
-            exit_code: Some(7),
-            signal: None,
-        })
-        .expect("nonzero exit must fail authentication");
-        assert_eq!(nonzero.code, "agent_terminal_auth_failed");
-        let signaled = terminal_auth_exit_error(&vibex_terminal::TerminalProcessExitStatus {
-            exit_code: None,
-            signal: Some("SIGTERM".to_string()),
-        })
-        .expect("signal exit must fail authentication");
-        assert_eq!(signaled.code, "agent_terminal_auth_failed");
+        // A clean exit is ambiguous: the authority's authentication operation
+        // decides whether it succeeded. A killed or lost terminal never can.
+        assert!(terminal_auth_status_error(vibex_core::TerminalStatus::Exited).is_none());
+        assert!(terminal_auth_status_error(vibex_core::TerminalStatus::Running).is_none());
+        let killed = terminal_auth_status_error(vibex_core::TerminalStatus::Killed)
+            .expect("a killed sign-in terminal must fail authentication");
+        assert_eq!(killed.code, "agent_terminal_auth_failed");
+        let stale = terminal_auth_status_error(vibex_core::TerminalStatus::Stale)
+            .expect("a lost sign-in terminal must fail authentication");
+        assert_eq!(stale.code, "agent_terminal_auth_failed");
     }
 
     #[test]
