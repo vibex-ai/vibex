@@ -4119,7 +4119,7 @@ impl ManagementCenter {
         else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -4130,11 +4130,9 @@ impl ManagementCenter {
         };
         self.begin_simple_task(ManagementMutation::ProfileCreate, cx, async move {
             let agent_id = profile.agent_id.clone();
-            let created = runtime
+            let created = backend
                 .management()
-                .providers()
-                .management()
-                .create_agent_model_provider_profile(
+                .create_agent_model_provider_profile(MutationRequest::new(
                     vibex_core::AgentModelProviderProfileCreateRequest {
                         agent_id: agent_id.clone(),
                         display_name: copy_name,
@@ -4151,7 +4149,9 @@ impl ManagementCenter {
                         provider_options: Some(profile.provider_options),
                         secret_references: Vec::new(),
                     },
-                )?;
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
             let message = match active_locale {
                 ResolvedLocale::En => {
                     format!("Duplicated provider configuration {}", created.display_name)
