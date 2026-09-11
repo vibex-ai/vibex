@@ -81,6 +81,10 @@ pub struct RelayStatusSummary {
 pub struct ManagementProfileSelectionRequest {
     pub agent_id: AgentId,
     pub provider_profile_id: ProviderProfileId,
+    /// Scope the default applies to. `None` means the authority's global
+    /// scope; a paired client passes the workspace it is managing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<vibex_core::ProviderProfileDefaultScope>,
 }
 
 pub trait ManagementBackend: BackendBound {

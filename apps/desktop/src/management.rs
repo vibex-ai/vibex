@@ -33,7 +33,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-use vibex_backend::{BackendFacade, MutationRequest};
+use vibex_backend::{BackendFacade, ManagementProfileSelectionRequest, MutationRequest};
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextCancelAuthenticationRequest, AgentAuthContextLogoutPreview,
@@ -4498,10 +4498,10 @@ impl ManagementCenter {
         agent_id: String,
         cx: &mut Context<Self>,
     ) {
-        let (Ok(provider_profile_id), Ok(agent_id), Some(runtime)) = (
+        let (Ok(provider_profile_id), Ok(agent_id), Some(backend)) = (
             vibex_core::ProviderProfileId::parse(profile_id.clone()),
             AgentId::parse(agent_id),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             self.error = Some(
                 management_error_text(
@@ -4519,9 +4519,7 @@ impl ManagementCenter {
             ManagementMutation::ProviderProbe(profile_id),
             cx,
             async move {
-                runtime
-                    .management()
-                    .providers()
+                backend
                     .management()
                     .test_agent_model_provider_profile(
                         vibex_core::AgentModelProviderProfileTestRequest {
@@ -4529,6 +4527,8 @@ impl ManagementCenter {
                             provider_profile_id,
                         },
                     )
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|result| {
                         format!(
                             "{}: {}",
@@ -4708,37 +4708,63 @@ impl ManagementCenter {
                 )
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
-                        let Some(runtime) = this.runtime.clone() else {
+                        let Some(backend) = this.backend.clone() else {
                             return;
                         };
-                        let providers = runtime.management().providers().management();
                         match target.clone() {
                             ManagedDeleteTarget::Agent { id, .. } => {
                                 this.uninstall_managed_agent(id, cx);
                             }
                             ManagedDeleteTarget::Provider { id, .. } => {
-                                if let Ok(provider_profile_id) =
+                                // The profile's Agent owns it, so the delete
+                                // request has to travel with that identity.
+                                let agent_id = this
+                                    .provider_profiles
+                                    .iter()
+                                    .find(|profile| profile.id.as_str() == id)
+                                    .map(|profile| profile.agent_id.clone());
+                                let Ok(provider_profile_id) =
                                     vibex_core::ProviderProfileId::parse(id.clone())
-                                {
-                                    this.begin_simple_task(
-                                        ManagementMutation::ProfileDelete(id),
-                                        cx,
-                                        async move {
-                                            providers.delete_profile(
-                                                vibex_core::ProviderProfileDeleteRequest {
-                                                    provider_profile_id,
-                                                },
-                                            )?;
-                                            Ok(management_locale_text_for(
-                                                active_locale,
-                                                "Provider configuration deleted",
-                                                "供应商配置已删除",
-                                                "供應商配置已刪除",
-                                            )
-                                            .into())
-                                        },
+                                else {
+                                    return;
+                                };
+                                let Some(agent_id) = agent_id else {
+                                    this.error = Some(
+                                        management_error_text(
+                                            "Provider configuration is no longer listed",
+                                            "供应商配置已不在列表中",
+                                            "供應商配置已不在清單中",
+                                        )
+                                        .into(),
                                     );
-                                }
+                                    cx.notify();
+                                    return;
+                                };
+                                this.begin_simple_task(
+                                    ManagementMutation::ProfileDelete(id),
+                                    cx,
+                                    async move {
+                                        backend
+                                            .management()
+                                            .delete_agent_model_provider_profile(
+                                                MutationRequest::new(
+                                                    vibex_core::AgentModelProviderProfileDeleteRequest {
+                                                        agent_id,
+                                                        provider_profile_id,
+                                                    },
+                                                ),
+                                            )
+                                            .await
+                                            .map_err(crate::app::remote_error_into_vibex)?;
+                                        Ok(management_locale_text_for(
+                                            active_locale,
+                                            "Provider configuration deleted",
+                                            "供应商配置已删除",
+                                            "供應商配置已刪除",
+                                        )
+                                        .into())
+                                    },
+                                );
                             }
                             ManagedDeleteTarget::Mcp { id, .. } => {
                                 if let Ok(mcp_server_id) =
@@ -4748,11 +4774,15 @@ impl ManagementCenter {
                                         ManagementMutation::McpAction(format!("delete:{id}")),
                                         cx,
                                         async move {
-                                            providers.delete_mcp_server(
-                                                vibex_core::McpServerDeleteRequest {
-                                                    mcp_server_id,
-                                                },
-                                            )?;
+                                            backend
+                                                .management()
+                                                .delete_mcp_server(MutationRequest::new(
+                                                    vibex_core::McpServerDeleteRequest {
+                                                        mcp_server_id,
+                                                    },
+                                                ))
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(management_locale_text_for(
                                                 active_locale,
                                                 "MCP server deleted",
@@ -4770,9 +4800,13 @@ impl ManagementCenter {
                                         ManagementMutation::SkillAction(format!("delete:{id}")),
                                         cx,
                                         async move {
-                                            providers.delete_skill(
-                                                vibex_core::SkillDeleteRequest { skill_id },
-                                            )?;
+                                            backend
+                                                .management()
+                                                .delete_skill(MutationRequest::new(
+                                                    vibex_core::SkillDeleteRequest { skill_id },
+                                                ))
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(management_locale_text_for(
                                                 active_locale,
                                                 "Skill deleted",
@@ -4790,9 +4824,13 @@ impl ManagementCenter {
                                         ManagementMutation::PromptAction(format!("delete:{id}")),
                                         cx,
                                         async move {
-                                            providers.delete_prompt(
-                                                vibex_core::PromptDeleteRequest { prompt_id },
-                                            )?;
+                                            backend
+                                                .management()
+                                                .delete_prompt(MutationRequest::new(
+                                                    vibex_core::PromptDeleteRequest { prompt_id },
+                                                ))
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(management_locale_text_for(
                                                 active_locale,
                                                 "Prompt deleted",
@@ -4810,9 +4848,13 @@ impl ManagementCenter {
                                         ManagementMutation::HookAction(format!("delete:{id}")),
                                         cx,
                                         async move {
-                                            providers.delete_hook(
-                                                vibex_core::HookDeleteRequest { hook_id },
-                                            )?;
+                                            backend
+                                                .management()
+                                                .delete_hook(MutationRequest::new(
+                                                    vibex_core::HookDeleteRequest { hook_id },
+                                                ))
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(management_locale_text_for(
                                                 active_locale,
                                                 "Hook deleted",
@@ -5561,10 +5603,10 @@ impl ManagementCenter {
         agent_id: String,
         cx: &mut Context<Self>,
     ) {
-        let (Ok(provider_profile_id), Ok(agent_id), Some(runtime)) = (
+        let (Ok(provider_profile_id), Ok(agent_id), Some(backend)) = (
             vibex_core::ProviderProfileId::parse(profile_id.clone()),
             AgentId::parse(agent_id),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -5575,18 +5617,16 @@ impl ManagementCenter {
             ManagementMutation::ProviderPreview(format!("default:{profile_id}")),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .set_agent_model_provider_default(
-                        vibex_core::AgentModelProviderSetDefaultRequest {
-                            scope,
-                            agent_id,
-                            provider_profile_id,
-                        },
-                    )
-                    .map(|_| management_default_updated_message(active_locale, scope_kind).into())
+                    .select_profile(MutationRequest::new(ManagementProfileSelectionRequest {
+                        agent_id,
+                        provider_profile_id,
+                        scope: Some(scope),
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(management_default_updated_message(active_locale, scope_kind).into())
             },
         );
     }
@@ -6183,9 +6223,9 @@ impl ManagementCenter {
     }
 
     fn validate_mcp_server(&mut self, id: String, cx: &mut Context<Self>) {
-        let (Ok(mcp_server_id), Some(runtime)) = (
+        let (Ok(mcp_server_id), Some(backend)) = (
             vibex_core::McpServerId::parse(id.clone()),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -6198,14 +6238,14 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let validated_id = id;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .validate_mcp_server(vibex_core::McpServerValidateRequest {
                     mcp_server_id: Some(mcp_server_id),
                     candidate: None,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6261,9 +6301,9 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
-        let (Ok(mcp_server_id), Some(runtime)) = (
+        let (Ok(mcp_server_id), Some(backend)) = (
             vibex_core::McpServerId::parse(id.clone()),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -6272,31 +6312,31 @@ impl ManagementCenter {
             ManagementMutation::McpAction(format!("agent-matrix:{id}")),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .set_mcp_server_agent_matrix(vibex_core::McpServerSetAgentMatrixRequest {
-                        mcp_server_id,
-                        agent_matrix: matrix,
-                    })
-                    .map(|_| {
-                        format!(
-                            "{}: {}",
-                            management_locale_text_for(
-                                active_locale,
-                                "Agent enablement",
-                                "Agent 启用范围",
-                                "Agent 啟用範圍",
-                            ),
-                            management_locale_text_for(
-                                active_locale,
-                                if enabled { "Enabled" } else { "Disabled" },
-                                if enabled { "已启用" } else { "已停用" },
-                                if enabled { "已啟用" } else { "已停用" },
-                            )
-                        )
-                    })
+                    .set_mcp_server_agent_matrix(MutationRequest::new(
+                        vibex_core::McpServerSetAgentMatrixRequest {
+                            mcp_server_id,
+                            agent_matrix: matrix,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(format!(
+                    "{}: {}",
+                    management_locale_text_for(
+                        active_locale,
+                        "Agent enablement",
+                        "Agent 启用范围",
+                        "Agent 啟用範圍",
+                    ),
+                    management_locale_text_for(
+                        active_locale,
+                        if enabled { "Enabled" } else { "Disabled" },
+                        if enabled { "已启用" } else { "已停用" },
+                        if enabled { "已啟用" } else { "已停用" },
+                    )
+                ))
             },
         );
     }
@@ -6456,8 +6496,8 @@ impl ManagementCenter {
     }
 
     fn validate_skill(&mut self, id: String, cx: &mut Context<Self>) {
-        let (Ok(skill_id), Some(runtime)) =
-            (vibex_core::SkillId::parse(id.clone()), self.runtime.clone())
+        let (Ok(skill_id), Some(backend)) =
+            (vibex_core::SkillId::parse(id.clone()), self.backend.clone())
         else {
             return;
         };
@@ -6470,14 +6510,14 @@ impl ManagementCenter {
         let entity = cx.weak_entity();
         let validated_id = id;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .validate_skill(vibex_core::SkillValidateRequest {
                     skill_id: Some(skill_id),
                     candidate: None,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -6528,8 +6568,8 @@ impl ManagementCenter {
             cx.notify();
             return;
         };
-        let (Ok(skill_id), Some(runtime)) =
-            (vibex_core::SkillId::parse(id.clone()), self.runtime.clone())
+        let (Ok(skill_id), Some(backend)) =
+            (vibex_core::SkillId::parse(id.clone()), self.backend.clone())
         else {
             return;
         };
@@ -6538,31 +6578,31 @@ impl ManagementCenter {
             ManagementMutation::SkillAction(format!("agent-matrix:{id}")),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .set_skill_agent_matrix(vibex_core::SkillSetAgentMatrixRequest {
-                        skill_id,
-                        agent_matrix: matrix,
-                    })
-                    .map(|_| {
-                        format!(
-                            "{}: {}",
-                            management_locale_text_for(
-                                active_locale,
-                                "Agent enablement",
-                                "Agent 启用范围",
-                                "Agent 啟用範圍",
-                            ),
-                            management_locale_text_for(
-                                active_locale,
-                                if enabled { "Enabled" } else { "Disabled" },
-                                if enabled { "已启用" } else { "已停用" },
-                                if enabled { "已啟用" } else { "已停用" },
-                            )
-                        )
-                    })
+                    .set_skill_agent_matrix(MutationRequest::new(
+                        vibex_core::SkillSetAgentMatrixRequest {
+                            skill_id,
+                            agent_matrix: matrix,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(format!(
+                    "{}: {}",
+                    management_locale_text_for(
+                        active_locale,
+                        "Agent enablement",
+                        "Agent 启用范围",
+                        "Agent 啟用範圍",
+                    ),
+                    management_locale_text_for(
+                        active_locale,
+                        if enabled { "Enabled" } else { "Disabled" },
+                        if enabled { "已启用" } else { "已停用" },
+                        if enabled { "已啟用" } else { "已停用" },
+                    )
+                ))
             },
         );
     }
@@ -7090,8 +7130,8 @@ impl ManagementCenter {
     }
 
     fn resume_automation_run(&mut self, run_id: String, cx: &mut Context<Self>) {
-        let (Ok(run_id), Some(runtime)) =
-            (AutomationRunId::parse(run_id.clone()), self.runtime.clone())
+        let (Ok(run_id), Some(backend)) =
+            (AutomationRunId::parse(run_id.clone()), self.backend.clone())
         else {
             return;
         };
@@ -7100,14 +7140,14 @@ impl ManagementCenter {
             ManagementMutation::AutomationResumeRun(run_id.as_str().to_string()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .automation()
-                    .resume_run(AutomationRunResumeRequest {
+                    .resume_automation_run(MutationRequest::new(AutomationRunResumeRequest {
                         run_id,
                         now_ms: Some(unix_timestamp_ms()),
-                    })
+                    }))
                     .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|run| match active_locale {
                         ResolvedLocale::En => format!("Automation run is {:?}", run.status),
                         ResolvedLocale::ZhCn => format!("自动化运行状态：{:?}", run.status),
@@ -7118,8 +7158,8 @@ impl ManagementCenter {
     }
 
     fn cancel_automation_run(&mut self, run_id: String, cx: &mut Context<Self>) {
-        let (Ok(run_id), Some(runtime)) =
-            (AutomationRunId::parse(run_id.clone()), self.runtime.clone())
+        let (Ok(run_id), Some(backend)) =
+            (AutomationRunId::parse(run_id.clone()), self.backend.clone())
         else {
             return;
         };
@@ -7128,14 +7168,15 @@ impl ManagementCenter {
             ManagementMutation::AutomationCancel(run_id.as_str().to_string()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .automation()
-                    .cancel_run(AutomationRunCancelRequest {
+                    .cancel_automation_run(MutationRequest::new(AutomationRunCancelRequest {
                         run_id,
                         now_ms: Some(unix_timestamp_ms()),
                         reason: Some("canceled from GPUI management".into()),
-                    })
+                    }))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|run| match active_locale {
                         ResolvedLocale::En => format!("Automation run is {:?}", run.status),
                         ResolvedLocale::ZhCn => format!("自动化运行状态：{:?}", run.status),
@@ -7190,15 +7231,20 @@ impl ManagementCenter {
                 )
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
-                        if let (Some(runtime), Ok(id)) = (
-                            this.runtime.clone(),
+                        if let (Some(backend), Ok(id)) = (
+                            this.backend.clone(),
                             AutomationGraphId::parse(graph_id.clone()),
                         ) {
                             this.begin_simple_task(
                                 ManagementMutation::AutomationArchive(graph_id.clone()),
                                 cx,
                                 async move {
-                                    runtime.management().automation().archive(&id).map(|_| {
+                                    backend
+                                        .management()
+                                        .archive_automation_graph(id)
+                                        .await
+                                        .map_err(crate::app::remote_error_into_vibex)?;
+                                    Ok({
                                         management_locale_text_for(
                                             active_locale,
                                             "Automation graph archived",
@@ -7380,9 +7426,9 @@ impl ManagementCenter {
     }
 
     fn preview_native_export(&mut self, profile_id: String, cx: &mut Context<Self>) {
-        let (Ok(provider_profile_id), Some(runtime)) = (
+        let (Ok(provider_profile_id), Some(backend)) = (
             vibex_core::ProviderProfileId::parse(profile_id.clone()),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -7399,9 +7445,7 @@ impl ManagementCenter {
         self.error = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .preview_native_export(vibex_core::ProviderNativeExportPreviewRequest {
                     provider_profile_id,
@@ -7409,6 +7453,8 @@ impl ManagementCenter {
                     mode,
                     persist: true,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -7470,9 +7516,9 @@ impl ManagementCenter {
     }
 
     fn apply_native_export(&mut self, export_id: String, cx: &mut Context<Self>) {
-        let (Ok(export_id), Some(runtime)) = (
+        let (Ok(export_id), Some(backend)) = (
             vibex_core::RequestId::parse(export_id),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -7481,11 +7527,13 @@ impl ManagementCenter {
             ManagementMutation::ProviderPreview("native-export-apply".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .apply_native_export(vibex_core::ProviderNativeExportApplyRequest { export_id })
+                    .apply_native_export(MutationRequest::new(
+                        vibex_core::ProviderNativeExportApplyRequest { export_id },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|result| match active_locale {
                         ResolvedLocale::En => format!("Native export {:?}", result.status),
                         ResolvedLocale::ZhCn => format!("原生配置导出：{:?}", result.status),
@@ -7496,9 +7544,9 @@ impl ManagementCenter {
     }
 
     fn rollback_native_export(&mut self, export_id: String, cx: &mut Context<Self>) {
-        let (Ok(export_id), Some(runtime)) = (
+        let (Ok(export_id), Some(backend)) = (
             vibex_core::RequestId::parse(export_id),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -7507,13 +7555,13 @@ impl ManagementCenter {
             ManagementMutation::ProviderPreview("native-export-rollback".into()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .rollback_native_export(vibex_core::ProviderNativeExportRollbackRequest {
-                        export_id,
-                    })
+                    .rollback_native_export(MutationRequest::new(
+                        vibex_core::ProviderNativeExportRollbackRequest { export_id },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)
                     .map(|result| match active_locale {
                         ResolvedLocale::En => format!("Native rollback {:?}", result.status),
                         ResolvedLocale::ZhCn => format!("原生配置回滚：{:?}", result.status),
@@ -11943,10 +11991,10 @@ impl ManagementCenter {
     }
 
     fn save_acp_config(&mut self, cx: &mut Context<Self>) {
-        let (Some(profile_id), Some(mut config), Some(runtime)) = (
+        let (Some(profile_id), Some(mut config), Some(backend)) = (
             self.selected_acp_profile_id.clone(),
             self.acp_config_draft.clone(),
-            self.runtime.clone(),
+            self.backend.clone(),
         ) else {
             return;
         };
@@ -11972,14 +12020,16 @@ impl ManagementCenter {
         config = acp_config_with_editor_fields(config, command, &args, &cwd_template);
         let active_locale = locale::current_locale();
         self.begin_simple_task(ManagementMutation::AcpConfig(profile_id), cx, async move {
-            let profile = runtime
+            let profile = backend
                 .management()
-                .providers()
-                .management()
-                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
-                    provider_profile_id,
-                    config,
-                })?;
+                .update_acp_profile_config(MutationRequest::new(
+                    vibex_core::AcpProviderProfileUpdateRequest {
+                        provider_profile_id,
+                        config,
+                    },
+                ))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
             let message = match active_locale {
                 ResolvedLocale::En => {
                     format!("Updated ACP configuration {}", profile.display_name)
@@ -13419,8 +13469,8 @@ impl ManagementCenter {
                             .label(management_locale_text("Run", "运行", "執行"))
                             .disabled(any_pending)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let (Some(runtime), Ok(task_id)) =
-                                    (this.runtime.clone(), ScheduledTaskId::parse(run_id.clone()))
+                                if let (Some(backend), Ok(task_id)) =
+                                    (this.backend.clone(), ScheduledTaskId::parse(run_id.clone()))
                                 {
                                     this.begin_simple_task(
                                         ManagementMutation::ScheduledRun(run_id.clone()),
@@ -13433,10 +13483,14 @@ impl ManagementCenter {
                                                 "排程任務執行已領取",
                                             )
                                             .to_string();
-                                            runtime
+                                            backend
                                                 .management()
-                                                .scheduled()
-                                                .claim_due(&task_id, unix_timestamp_ms())?
+                                                .claim_due_scheduled_task(
+                                                    task_id,
+                                                    unix_timestamp_ms(),
+                                                )
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?
                                                 .map(|_| claimed)
                                                 .ok_or_else(|| {
                                                     VibexError::conflict(
@@ -13463,8 +13517,8 @@ impl ManagementCenter {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let parsed = ScheduledTaskId::parse(toggle_id.clone()).ok();
                                 if let Some(parsed) = parsed {
-                                    let runtime = this.runtime.clone();
-                                    if let Some(runtime) = runtime {
+                                    let backend = this.backend.clone();
+                                    if let Some(backend) = backend {
                                         let mutation = if active {
                                             ManagementMutation::ScheduledPause(
                                                 parsed.as_str().into(),
@@ -13475,12 +13529,11 @@ impl ManagementCenter {
                                             )
                                         };
                                         this.begin_simple_task(mutation, cx, async move {
-                                            let handle = runtime.management().scheduled();
-                                            let task = if active {
-                                                handle.pause(&parsed)?
-                                            } else {
-                                                handle.resume(&parsed)?
-                                            };
+                                            let task = backend
+                                                .management()
+                                                .set_scheduled_task_status(parsed, !active)
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(task.title.to_string())
                                         });
                                     }
@@ -13545,14 +13598,19 @@ impl ManagementCenter {
                 )
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
-                        if let (Some(runtime), Ok(task_id)) =
-                            (this.runtime.clone(), ScheduledTaskId::parse(id.clone()))
+                        if let (Some(backend), Ok(task_id)) =
+                            (this.backend.clone(), ScheduledTaskId::parse(id.clone()))
                         {
                             this.begin_simple_task(
                                 ManagementMutation::ScheduledDelete(id.clone()),
                                 cx,
                                 async move {
-                                    runtime.management().scheduled().delete(&task_id).map(|_| {
+                                    backend
+                                        .management()
+                                        .delete_scheduled_task(task_id)
+                                        .await
+                                        .map_err(crate::app::remote_error_into_vibex)?;
+                                    Ok({
                                         management_locale_text_for(
                                             active_locale,
                                             "Scheduled task deleted",
@@ -14059,8 +14117,8 @@ impl ManagementCenter {
                                 })
                                 .disabled(pending)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let (Some(runtime), Ok(graph_id)) =
-                                        (this.runtime.clone(), AutomationGraphId::parse(id.clone()))
+                                    if let (Some(backend), Ok(graph_id)) =
+                                        (this.backend.clone(), AutomationGraphId::parse(id.clone()))
                                     {
                                         let mutation = if paused {
                                             ManagementMutation::AutomationResume(id.clone())
@@ -14068,17 +14126,16 @@ impl ManagementCenter {
                                             ManagementMutation::AutomationPause(id.clone())
                                         };
                                         this.begin_simple_task(mutation, cx, async move {
-                                            let graph = if paused {
-                                                runtime
-                                                    .management()
-                                                    .automation()
-                                                    .resume(&graph_id)?
+                                            let status = if paused {
+                                                vibex_core::AutomationGraphStatus::Active
                                             } else {
-                                                runtime
-                                                    .management()
-                                                    .automation()
-                                                    .pause(&graph_id)?
+                                                vibex_core::AutomationGraphStatus::Paused
                                             };
+                                            let graph = backend
+                                                .management()
+                                                .set_automation_graph_status(graph_id, status)
+                                                .await
+                                                .map_err(crate::app::remote_error_into_vibex)?;
                                             Ok(graph.title)
                                         });
                                     }
@@ -14092,8 +14149,8 @@ impl ManagementCenter {
                                 .disabled(pending || !runnable)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if runnable
-                                        && let (Some(runtime), Ok(graph_id)) = (
-                                            this.runtime.clone(),
+                                        && let (Some(backend), Ok(graph_id)) = (
+                                            this.backend.clone(),
                                             AutomationGraphId::parse(run_id.clone()),
                                         )
                                     {
@@ -14102,16 +14159,18 @@ impl ManagementCenter {
                                             ManagementMutation::AutomationRun(run_id.clone()),
                                             cx,
                                             async move {
-                                                runtime
+                                                backend
                                                     .management()
-                                                    .automation()
-                                                    .start_run(AutomationRunStartRequest {
-                                                        graph_id,
-                                                        trigger: AutomationRunTrigger::Manual,
-                                                        scheduled_task_id: None,
-                                                        now_ms: None,
-                                                    })
+                                                    .start_automation_run(MutationRequest::new(
+                                                        AutomationRunStartRequest {
+                                                            graph_id,
+                                                            trigger: AutomationRunTrigger::Manual,
+                                                            scheduled_task_id: None,
+                                                            now_ms: None,
+                                                        },
+                                                    ))
                                                     .await
+                                                    .map_err(crate::app::remote_error_into_vibex)
                                                     .map(|run| match active_locale {
                                                         ResolvedLocale::En => {
                                                             format!("Run {} started", run.id)
@@ -14403,21 +14462,24 @@ impl ManagementCenter {
                 )
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
-                        if let (Some(runtime), Ok(id)) = (
-                            this.runtime.clone(),
+                        if let (Some(backend), Ok(id)) = (
+                            this.backend.clone(),
                             vibex_core::DeviceId::parse(device_id.clone()),
                         ) {
                             this.begin_simple_task(
                                 ManagementMutation::RemoteRevoke(device_id.clone()),
                                 cx,
                                 async move {
-                                    runtime
-                                        .management()
-                                        .remote()
-                                        .revoke_device(vibex_core::RemoteRevokeDeviceRequest {
-                                            device_id: id,
-                                            reason: Some("revoked from GPUI management".into()),
-                                        })
+                                    backend
+                                        .device()
+                                        .revoke_device(MutationRequest::new(
+                                            vibex_core::RemoteRevokeDeviceRequest {
+                                                device_id: id,
+                                                reason: Some("revoked from GPUI management".into()),
+                                            },
+                                        ))
+                                        .await
+                                        .map_err(crate::app::remote_error_into_vibex)
                                         .map(|_| {
                                             management_locale_text_for(
                                                 active_locale,

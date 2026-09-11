@@ -2487,6 +2487,7 @@ mod tests {
             .select_profile(MutationRequest::new(ManagementProfileSelectionRequest {
                 agent_id: selected_profile.agent_id.clone(),
                 provider_profile_id: selected_profile.id.clone(),
+                scope: None,
             }))
             .await
             .unwrap();

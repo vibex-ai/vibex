@@ -1607,11 +1607,13 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .set_agent_model_provider_default(vibex_core::AgentModelProviderSetDefaultRequest {
-                    scope: vibex_core::ProviderProfileDefaultScope {
-                        kind: vibex_core::ProviderDefaultScopeKind::Global,
-                        project_id: None,
-                        workspace_id: None,
-                    },
+                    scope: request.payload.scope.unwrap_or(
+                        vibex_core::ProviderProfileDefaultScope {
+                            kind: vibex_core::ProviderDefaultScopeKind::Global,
+                            project_id: None,
+                            workspace_id: None,
+                        },
+                    ),
                     agent_id: request.payload.agent_id,
                     provider_profile_id: request.payload.provider_profile_id,
                 })
