@@ -188,11 +188,15 @@ has an in-process implementation over `TerminalManager` and a remote one over
 the gateway's terminal operations, and the workbench, composer and Agent
 sign-in surfaces render whichever authority owns the PTY.
 
-Three composer/Agent conveniences are still local-only and therefore disabled
-against a paired runtime rather than silently wrong: slash-command discovery
-and its `@`-mention file candidates, provider model discovery for Agents whose
-CLI owns the catalogue, and the legacy profile-scoped Agent sign-out. Each
-needs its own operation on the wire.
+Three composer/Agent conveniences resolve on the authority too, because each
+depends on state that only the authority owns: composer command discovery
+(the Agent catalogue, `@` file references and `$` Skills) is one
+`discover_composer_commands` read, Agent-owned model catalogues are discovered
+by the bridge that lives with the Agent, and the legacy profile-scoped Agent
+sign-out releases credentials where they are stored.
+
+The live per-session token-usage snapshot is the remaining local-only read, so
+the usage indicator does not update against a paired runtime.
 
 Provider credentials belong to the runtime database. In cloud mode the
 operator's own host stores them, which is the accepted single-user threat
