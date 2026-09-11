@@ -482,6 +482,9 @@ pub enum RemoteAgentOperationKind {
     ListAuthContexts,
     EnsureDefaultAuthContext,
     RefreshAuthMethods,
+    UpdateAuthEnvironment,
+    AuthenticateAgent,
+    CancelAuthentication,
     ListAuthMethods,
     AuthenticateContext,
     GetAuthenticationOperation,
@@ -710,6 +713,188 @@ pub struct RemoteAgentRefreshAuthMethodsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentRefreshAuthMethodsResponse {
     pub catalog: AgentAuthCatalog,
+}
+
+/// Carries the credentials an Agent sign-in method collected to the
+/// authoritative runtime, which owns the Provider profile they belong to.
+///
+/// Same posture as [`RemoteProviderCredentialSecretMutationRequest`]: this is a
+/// wire type that may contain Secret values, the transport is always E2EE or
+/// TLS, `Debug` never prints a value, and the runtime stores them in its own
+/// secret store before answering with the redacted profile.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUpdateAuthEnvironmentRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+    pub provider_profile_id: crate::ProviderProfileId,
+    pub method_id: String,
+    pub values: Vec<RemoteAgentAuthEnvironmentValue>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthEnvironmentValue {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub clear: bool,
+}
+
+impl fmt::Debug for RemoteAgentAuthEnvironmentValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteAgentAuthEnvironmentValue")
+            .field("name", &self.name)
+            .field("has_value", &self.value.is_some())
+            .field("secret", &self.secret)
+            .field("optional", &self.optional)
+            .field("clear", &self.clear)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteAgentUpdateAuthEnvironmentRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteAgentUpdateAuthEnvironmentRequest")
+            .field("auth", &self.auth)
+            .field("agent_id", &self.agent_id)
+            .field("provider_profile_id", &self.provider_profile_id)
+            .field("method_id", &self.method_id)
+            .field("value_count", &self.values.len())
+            .finish()
+    }
+}
+
+impl RemoteAgentUpdateAuthEnvironmentRequest {
+    pub fn from_request(
+        auth: RemoteAuthProof,
+        request: crate::AgentAuthEnvironmentUpdateRequest,
+    ) -> Self {
+        Self {
+            auth,
+            agent_id: request.agent_id,
+            provider_profile_id: request.provider_profile_id,
+            method_id: request.method_id,
+            values: request
+                .values
+                .into_iter()
+                .map(|value| RemoteAgentAuthEnvironmentValue {
+                    name: value.name,
+                    value: value.value,
+                    secret: value.secret,
+                    optional: value.optional,
+                    clear: value.clear,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn into_request(self) -> crate::AgentAuthEnvironmentUpdateRequest {
+        crate::AgentAuthEnvironmentUpdateRequest {
+            agent_id: self.agent_id,
+            provider_profile_id: self.provider_profile_id,
+            method_id: self.method_id,
+            values: self
+                .values
+                .into_iter()
+                .map(|value| crate::AgentAuthEnvironmentValue {
+                    name: value.name,
+                    value: value.value,
+                    secret: value.secret,
+                    optional: value.optional,
+                    clear: value.clear,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentUpdateAuthEnvironmentResponse {
+    pub profile: crate::ProviderProfile,
+}
+
+/// Runs the legacy per-Agent interactive sign-in for a Provider profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticateRequest {
+    pub auth: RemoteAuthProof,
+    pub operation_id: crate::AgentAuthenticationOperationId,
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile_id: Option<crate::ProviderProfileId>,
+    pub method_id: String,
+}
+
+impl RemoteAgentAuthenticateRequest {
+    pub fn from_request(auth: RemoteAuthProof, request: crate::AgentAuthenticateRequest) -> Self {
+        Self {
+            auth,
+            operation_id: request.operation_id,
+            agent_id: request.agent_id,
+            provider_profile_id: request.provider_profile_id,
+            method_id: request.method_id,
+        }
+    }
+
+    pub fn into_request(self) -> crate::AgentAuthenticateRequest {
+        crate::AgentAuthenticateRequest {
+            operation_id: self.operation_id,
+            agent_id: self.agent_id,
+            provider_profile_id: self.provider_profile_id,
+            method_id: self.method_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentAuthenticateResponse {
+    pub method_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<crate::TerminalAuthActionDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCancelAuthenticationRequest {
+    pub auth: RemoteAuthProof,
+    pub operation_id: crate::AgentAuthenticationOperationId,
+    pub agent_id: AgentId,
+}
+
+impl RemoteAgentCancelAuthenticationRequest {
+    pub fn from_request(
+        auth: RemoteAuthProof,
+        request: crate::AgentAuthenticationCancelRequest,
+    ) -> Self {
+        Self {
+            auth,
+            operation_id: request.operation_id,
+            agent_id: request.agent_id,
+        }
+    }
+
+    pub fn into_request(self) -> crate::AgentAuthenticationCancelRequest {
+        crate::AgentAuthenticationCancelRequest {
+            operation_id: self.operation_id,
+            agent_id: self.agent_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentCancelAuthenticationResponse {
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1037,6 +1222,9 @@ pub enum RemoteAgentRequest {
     ListAuthContexts(RemoteAgentAuthContextListRequest),
     EnsureDefaultAuthContext(RemoteAgentEnsureDefaultAuthContextRequest),
     RefreshAuthMethods(RemoteAgentRefreshAuthMethodsRequest),
+    UpdateAuthEnvironment(RemoteAgentUpdateAuthEnvironmentRequest),
+    AuthenticateAgent(RemoteAgentAuthenticateRequest),
+    CancelAuthentication(RemoteAgentCancelAuthenticationRequest),
     ListAuthMethods(RemoteAgentAuthMethodListRequest),
     AuthenticateContext(RemoteAgentAuthenticateContextRequest),
     GetAuthenticationOperation(RemoteAgentAuthenticationOperationRequest),
@@ -1084,6 +1272,9 @@ impl RemoteAgentRequest {
             Self::ListAuthContexts(_) => RemoteAgentOperationKind::ListAuthContexts,
             Self::EnsureDefaultAuthContext(_) => RemoteAgentOperationKind::EnsureDefaultAuthContext,
             Self::RefreshAuthMethods(_) => RemoteAgentOperationKind::RefreshAuthMethods,
+            Self::UpdateAuthEnvironment(_) => RemoteAgentOperationKind::UpdateAuthEnvironment,
+            Self::AuthenticateAgent(_) => RemoteAgentOperationKind::AuthenticateAgent,
+            Self::CancelAuthentication(_) => RemoteAgentOperationKind::CancelAuthentication,
             Self::ListAuthMethods(_) => RemoteAgentOperationKind::ListAuthMethods,
             Self::AuthenticateContext(_) => RemoteAgentOperationKind::AuthenticateContext,
             Self::GetAuthenticationOperation(_) => {

@@ -3,16 +3,19 @@ use vibex_core::{
     AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
-    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentId, AgentNotificationIntent, AgentRuntimeOptionProbeRequest,
-    AgentRuntimeOptionProbeResult, AgentSession, AgentSessionRuntimeSelectionEvent,
-    AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
-    AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
-    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
-    RemoteDeepLinkResolution, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
-    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
+    AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
+    AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
+    AgentAuthenticationOperationId, AgentId, AgentNotificationIntent,
+    AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
+    AgentSessionRuntimeSelectionEvent, AgentSessionRuntimeSelectionState,
+    AgentTimelineDisplaySettings, AgentUsageStatistics, AgentUsageStatisticsRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    FetchTimelineRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    MessageSubmissionState, ProviderProfile, RemoteDeepLinkResolution, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelineLiveEvent, TimelinePage,
+    VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -205,6 +208,63 @@ pub trait AgentBackend: BackendBound {
         &self,
         request: MutationRequest<AgentId>,
     ) -> BackendFuture<'_, AgentAuthCatalog>;
+
+    /// Reads the durable state of one submitted message.
+    ///
+    /// The submission record lives with the authority that accepted it, so a
+    /// paired client polls it through the same operation instead of giving up
+    /// on delivery confirmation.
+    fn agent_message_submission(
+        &self,
+        _request: GetMessageSubmissionRequest,
+    ) -> BackendFuture<'_, MessageSubmissionState> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_message_submission_unavailable",
+                "durable message submission is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Runs the legacy per-Agent interactive sign-in for a Provider profile.
+    fn authenticate_agent(
+        &self,
+        _request: MutationRequest<AgentAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthenticateResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Cancels a legacy per-Agent interactive sign-in.
+    fn cancel_agent_authentication(
+        &self,
+        _request: MutationRequest<AgentAuthenticationCancelRequest>,
+    ) -> BackendFuture<'_, bool> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Stores the credentials an Agent sign-in method collected for the
+    /// Agent's Provider profile.
+    fn update_agent_auth_environment(
+        &self,
+        _request: MutationRequest<AgentAuthEnvironmentUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_account_auth_unavailable",
+                "Agent account authentication is unavailable on this backend",
+            ))
+        })
+    }
 
     fn authenticate_agent_context(
         &self,

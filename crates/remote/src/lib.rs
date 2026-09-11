@@ -175,6 +175,12 @@ pub trait RemoteSidebarOrganizationSource: Send + Sync {
 
 #[async_trait]
 pub trait RemoteAgentAuthContextSource: Send + Sync {
+    /// Persists the credentials collected by an Agent sign-in method.
+    async fn update_agent_auth_environment(
+        &self,
+        request: vibex_core::AgentAuthEnvironmentUpdateRequest,
+    ) -> VibexResult<vibex_core::ProviderProfile>;
+
     async fn list_auth_contexts(&self) -> VibexResult<Vec<vibex_core::AgentAuthContext>>;
 
     async fn list_auth_methods(
@@ -3958,6 +3964,93 @@ async fn dispatch_agent_request(
             })
             .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::AuthenticateAgent(request) => {
+            let agent_id = request.agent_id.clone();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth.clone(),
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.authenticate_agent(request.into_request()).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                agent_id.as_str(),
+                "Agent sign-in started",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteAgentAuthenticateResponse {
+                method_id: result.method_id,
+                terminal: result.terminal,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::CancelAuthentication(request) => {
+            let agent_id = request.agent_id.clone();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth.clone(),
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager
+                .cancel_agent_authentication(request.into_request())
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                agent_id.as_str(),
+                "Agent sign-in cancelled",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(vibex_core::RemoteAgentCancelAuthenticationResponse {
+                cancelled: result?,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::UpdateAuthEnvironment(request) => {
+            let agent_id = request.agent_id.clone();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth.clone(),
+                RemoteActionClass::MutateAgentAuthentication,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let source = state.agent_auth_contexts.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_agent_account_auth_unavailable",
+                    "Agent account authentication is not available on this service",
+                )
+            })?;
+            let result = source
+                .update_agent_auth_environment(request.into_request())
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                agent_id.as_str(),
+                "Agent authentication credentials stored",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            serde_json::to_value(vibex_core::RemoteAgentUpdateAuthEnvironmentResponse {
+                profile: result?,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::ListAuthMethods(request) => {
             authorize_agent_action(
                 &manager,
@@ -5983,6 +6076,7 @@ mod tests {
         operation_calls: AtomicUsize,
         verify_calls: AtomicUsize,
         refresh_calls: AtomicUsize,
+        auth_environment_updates: Mutex<Vec<String>>,
         sensitive_execution_state: Vec<String>,
     }
 
@@ -6106,6 +6200,7 @@ mod tests {
                 operation_calls: AtomicUsize::new(0),
                 verify_calls: AtomicUsize::new(0),
                 refresh_calls: AtomicUsize::new(0),
+                auth_environment_updates: Mutex::new(Vec::new()),
                 sensitive_execution_state: vec![
                     "auth-operation-command-sentinel".to_string(),
                     "auth-operation-env-value-sentinel".to_string(),
@@ -6144,6 +6239,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RemoteAgentAuthContextSource for TestAgentAuthContextSource {
+        async fn update_agent_auth_environment(
+            &self,
+            request: vibex_core::AgentAuthEnvironmentUpdateRequest,
+        ) -> VibexResult<vibex_core::ProviderProfile> {
+            self.auth_environment_updates
+                .lock()
+                .map_err(|_| VibexError::process("test_lock_poisoned", "test lock is poisoned"))?
+                .push(request.method_id.clone());
+            Err(VibexError::capability(
+                "test_provider_profile_unavailable",
+                "the test source does not model provider profiles",
+            ))
+        }
+
         async fn list_auth_contexts(&self) -> VibexResult<Vec<vibex_core::AgentAuthContext>> {
             Ok(vec![self.context.clone()])
         }

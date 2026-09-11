@@ -1980,6 +1980,7 @@ impl DesktopRuntime {
             acp_runtime.clone(),
             terminal_host,
             auth_catalog.clone(),
+            provider_config_service.clone(),
         )?);
         let runtime_catalog = Arc::new(
             RuntimeOptionCatalogService::with_live_runtime(

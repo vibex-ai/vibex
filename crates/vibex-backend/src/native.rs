@@ -7,9 +7,10 @@ use vibex_core::{
     AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
-    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
+    AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
+    AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
+    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
+    AgentListResponse, AgentManagedInstallState, AgentModelProviderDisplayOrderListRequest,
     AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
     AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
@@ -28,11 +29,11 @@ use vibex_core::{
     CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
-    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -43,10 +44,11 @@ use vibex_core::{
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest,
-    PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest, PromptValidationResult,
-    ProviderCapabilitySummary, ProviderHealthSummary, ProviderNativeExportApplyRequest,
-    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
+    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -521,6 +523,70 @@ impl AgentBackend for NativeBackend {
                 .agent()
                 .list_auth_methods(agent_id, None)
                 .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn agent_message_submission(
+        &self,
+        request: GetMessageSubmissionRequest,
+    ) -> BackendFuture<'_, MessageSubmissionState> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .message_submission()
+                .get_submission(&request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn authenticate_agent(
+        &self,
+        request: MutationRequest<AgentAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthenticateResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .authenticate(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn cancel_agent_authentication(
+        &self,
+        request: MutationRequest<AgentAuthenticationCancelRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .cancel_authentication(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_agent_auth_environment(
+        &self,
+        request: MutationRequest<AgentAuthEnvironmentUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_agent_auth_environment(request.payload)
                 .map_err(Into::into)
         })
     }

@@ -1328,6 +1328,7 @@ mod tests {
                 acp_runtime.clone(),
                 Arc::new(vibex_agent_acp::DisabledAcpTerminalHost),
                 auth_catalog,
+                provider_config.clone(),
             )
             .unwrap(),
         );

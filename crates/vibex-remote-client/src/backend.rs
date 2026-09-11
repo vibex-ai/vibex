@@ -17,9 +17,10 @@ use vibex_core::{
     AgentAuthContextAuthenticateResult, AgentAuthContextCancelAuthenticationRequest,
     AgentAuthContextId, AgentAuthContextLogoutPreview, AgentAuthContextLogoutRequest,
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
-    AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
-    AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
+    AgentAuthContextVerifyRequest, AgentAuthEnvironmentUpdateRequest, AgentAuthenticateRequest,
+    AgentAuthenticateResult, AgentAuthenticationCancelRequest, AgentAuthenticationOperation,
+    AgentAuthenticationOperationId, AgentCatalogListResponse, AgentId, AgentListRequest,
+    AgentListResponse, AgentManagedInstallState, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
@@ -1321,6 +1322,115 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentAuthMethodListResponse>(value)?.catalog)
+        })
+    }
+
+    fn update_agent_auth_environment(
+        &self,
+        request: MutationRequest<AgentAuthEnvironmentUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::UpdateAuthEnvironment(
+                vibex_core::RemoteAgentUpdateAuthEnvironmentRequest::from_request(
+                    this.auth(),
+                    request.payload,
+                ),
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentUpdateAuthEnvironmentResponse>(value)?.profile)
+        })
+    }
+
+    fn agent_message_submission(
+        &self,
+        request: GetMessageSubmissionRequest,
+    ) -> BackendFuture<'_, MessageSubmissionState> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteAgentRequest::GetMessageSubmission(RemoteAgentMessageSubmissionRequest {
+                    auth: this.auth(),
+                    request,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentMessageSubmissionResponse>(value)?.submission)
+        })
+    }
+
+    fn authenticate_agent(
+        &self,
+        request: MutationRequest<AgentAuthenticateRequest>,
+    ) -> BackendFuture<'_, AgentAuthenticateResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::AuthenticateAgent(
+                vibex_core::RemoteAgentAuthenticateRequest::from_request(
+                    this.auth(),
+                    request.payload,
+                ),
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            let response = decode::<vibex_core::RemoteAgentAuthenticateResponse>(value)?;
+            Ok(AgentAuthenticateResult {
+                method_id: response.method_id,
+                terminal: response.terminal,
+            })
+        })
+    }
+
+    fn cancel_agent_authentication(
+        &self,
+        request: MutationRequest<AgentAuthenticationCancelRequest>,
+    ) -> BackendFuture<'_, bool> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::CancelAuthentication(
+                vibex_core::RemoteAgentCancelAuthenticationRequest::from_request(
+                    this.auth(),
+                    request.payload,
+                ),
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentCancelAuthenticationResponse>(value)?.cancelled)
         })
     }
 

@@ -24,6 +24,7 @@ use vibex_db::{
 use vibex_remote::RemoteAgentAuthContextSource;
 
 use crate::AgentAuthCatalogService;
+use vibex_config_switch::ProviderConfigService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentAuthContextChanged {
@@ -38,6 +39,7 @@ pub struct AgentAuthContextService {
     acp_runtime: Arc<AcpRuntimeClient>,
     terminal_host: Arc<dyn AcpTerminalHost>,
     auth_catalog: Arc<AgentAuthCatalogService>,
+    provider_config: ProviderConfigService,
     operation_locks: Arc<Mutex<BTreeMap<AgentAuthContextId, Arc<tokio::sync::Mutex<()>>>>>,
     changes: broadcast::Sender<AgentAuthContextChanged>,
 }
@@ -49,6 +51,7 @@ impl AgentAuthContextService {
         acp_runtime: Arc<AcpRuntimeClient>,
         terminal_host: Arc<dyn AcpTerminalHost>,
         auth_catalog: Arc<AgentAuthCatalogService>,
+        provider_config: ProviderConfigService,
     ) -> VibexResult<Self> {
         let mut conn = open_database(&db_path)?;
         apply_migrations(&mut conn)?;
@@ -60,6 +63,7 @@ impl AgentAuthContextService {
             acp_runtime,
             terminal_host,
             auth_catalog,
+            provider_config,
             operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             changes,
         })
@@ -985,6 +989,13 @@ impl AgentAuthContextService {
 
 #[async_trait::async_trait]
 impl RemoteAgentAuthContextSource for AgentAuthContextService {
+    async fn update_agent_auth_environment(
+        &self,
+        request: vibex_core::AgentAuthEnvironmentUpdateRequest,
+    ) -> VibexResult<vibex_core::ProviderProfile> {
+        self.provider_config.update_agent_auth_environment(request)
+    }
+
     async fn list_auth_contexts(&self) -> VibexResult<Vec<AgentAuthContext>> {
         self.list()
     }
