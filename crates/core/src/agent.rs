@@ -359,6 +359,18 @@ pub struct SendAgentMessageRequest {
     pub correlation_id: Option<CorrelationId>,
 }
 
+/// Rewrites the latest user message of a session and re-runs its turn.
+///
+/// The authority owns the session timeline, so the desktop timeline editor
+/// sends this over the backend facade instead of mutating local state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceUserMessagePayload {
+    pub user_sequence: i64,
+    pub expected_end_sequence: i64,
+    pub message: SendAgentMessageRequest,
+}
+
 impl fmt::Debug for SendAgentMessageRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

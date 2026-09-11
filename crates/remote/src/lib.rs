@@ -22,7 +22,8 @@ use vibex_core::{
     RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveResponse,
     RemoteAgentDetachRuntimeResponse, RemoteAgentForkSessionResponse, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionResponse, RemoteAgentProjectionCapabilityResponse,
-    RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse, RemoteAgentRequest,
+    RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse,
+    RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
     RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsResponse,
     RemoteAgentRuntimeProbeCancelResponse, RemoteAgentRuntimeProbeGetResponse,
@@ -2593,6 +2594,42 @@ async fn dispatch_agent_request(
             })?;
             let submission = coordinator.get_submission(&request.request)?;
             serde_json::to_value(RemoteAgentMessageSubmissionResponse { submission })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ReplaceUserMessage(request) => {
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let coordinator = state.message_submission.as_ref().ok_or_else(|| {
+                VibexError::capability(
+                    "remote_agent_message_submission_unavailable",
+                    "remote Agent message submission state is not available on this service",
+                )
+            })?;
+            let session_id = request.payload.message.session_id.clone();
+            let result = coordinator
+                .replace_user_message(vibex_agent::ReplaceUserMessageRequest {
+                    user_sequence: request.payload.user_sequence,
+                    expected_end_sequence: request.payload.expected_end_sequence,
+                    message: request.payload.message,
+                })
+                .await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                session_id.as_str(),
+                "Agent user message replace",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let items = result?;
+            serde_json::to_value(RemoteAgentReplaceUserMessageResponse { items })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::SendMessage(request) => {

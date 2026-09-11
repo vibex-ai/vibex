@@ -7,7 +7,8 @@ use crate::agent::{
     AgentSession, AgentSessionSummary, AgentTimelineDisplaySettings, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
     GetMessageSubmissionRequest, MessageSubmissionState, RenameAgentSessionRequest,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest,
 };
 use crate::agent_auth::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -441,6 +442,7 @@ pub enum RemoteAgentOperationKind {
     SetDesiredRuntime,
     CancelRuntimeSwitch,
     GetMessageSubmission,
+    ReplaceUserMessage,
     SendMessage,
     ContinueTurn,
     Interrupt,
@@ -829,6 +831,24 @@ pub struct RemoteAgentMessageSubmissionResponse {
     pub submission: MessageSubmissionState,
 }
 
+/// Replaces the latest user message of a session and re-runs the turn.
+///
+/// The desktop timeline editor rewrites the last user message, so the mutation
+/// has to reach the authority that owns the session timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentReplaceUserMessageRequest {
+    pub auth: RemoteAuthProof,
+    #[serde(flatten)]
+    pub payload: ReplaceUserMessagePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentReplaceUserMessageResponse {
+    pub items: Vec<TimelineItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentSendMessageRequest {
@@ -944,6 +964,7 @@ pub enum RemoteAgentRequest {
     SetDesiredRuntime(RemoteAgentSetDesiredRuntimeRequest),
     CancelRuntimeSwitch(RemoteAgentCancelRuntimeSwitchRequest),
     GetMessageSubmission(RemoteAgentMessageSubmissionRequest),
+    ReplaceUserMessage(RemoteAgentReplaceUserMessageRequest),
     SendMessage(RemoteAgentSendMessageRequest),
     ContinueTurn(RemoteAgentContinueTurnRequest),
     Interrupt(RemoteAgentInterruptRequest),
@@ -992,6 +1013,7 @@ impl RemoteAgentRequest {
             Self::SetDesiredRuntime(_) => RemoteAgentOperationKind::SetDesiredRuntime,
             Self::CancelRuntimeSwitch(_) => RemoteAgentOperationKind::CancelRuntimeSwitch,
             Self::GetMessageSubmission(_) => RemoteAgentOperationKind::GetMessageSubmission,
+            Self::ReplaceUserMessage(_) => RemoteAgentOperationKind::ReplaceUserMessage,
             Self::SendMessage(_) => RemoteAgentOperationKind::SendMessage,
             Self::ContinueTurn(_) => RemoteAgentOperationKind::ContinueTurn,
             Self::Interrupt(_) => RemoteAgentOperationKind::Interrupt,

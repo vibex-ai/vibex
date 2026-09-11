@@ -1490,6 +1490,8 @@ mod tests {
         }
     }
 
+    use vibex_core::ReplaceUserMessagePayload;
+
     impl AgentBackend for MockAgentBackend {
         fn subscribe(&self) -> BackendResult<Box<dyn BackendEventSubscription>> {
             Err(BackendError::unsupported("mock", "mock"))
@@ -1592,6 +1594,13 @@ mod tests {
                     .clone()
                     .ok_or_else(|| BackendError::failed("mock", "missing resolution"))
             })
+        }
+
+        fn replace_user_message(
+            &self,
+            _request: MutationRequest<ReplaceUserMessagePayload>,
+        ) -> BackendFuture<'_, Vec<TimelineItem>> {
+            Box::pin(async { Err(BackendError::unsupported("mock", "mock")) })
         }
 
         fn rename_session(

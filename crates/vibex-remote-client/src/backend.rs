@@ -47,12 +47,13 @@ use vibex_core::{
     RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
     RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
-    RemoteAgentRenameSessionResponse, RemoteAgentRequest, RemoteAgentResolveElicitationRequest,
-    RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionRequest,
-    RemoteAgentResolvePermissionResponse, RemoteAgentRuntimeOptionsRequest,
-    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
-    RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
-    RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
+    RemoteAgentRenameSessionResponse, RemoteAgentReplaceUserMessageRequest,
+    RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
+    RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
+    RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
+    RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
+    RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
+    RemoteAgentSendMessageRequest, RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
@@ -87,11 +88,11 @@ use vibex_core::{
     RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
     RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RenameAgentSessionRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelineLiveEvent,
-    TimelinePage, VibexSessionId, WorkspaceId,
+    RemoteWorkbenchRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::binary::{
@@ -1046,6 +1047,32 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentResolveElicitationResponse>(value)?.item)
+        })
+    }
+
+    fn replace_user_message(
+        &self,
+        request: MutationRequest<ReplaceUserMessagePayload>,
+    ) -> BackendFuture<'_, Vec<TimelineItem>> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteAgentRequest::ReplaceUserMessage(RemoteAgentReplaceUserMessageRequest {
+                    auth: this.auth(),
+                    payload: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentReplaceUserMessageResponse>(value)?.items)
         })
     }
 

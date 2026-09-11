@@ -633,6 +633,23 @@ impl AgentHandle {
         self.message_submission.clone()
     }
 
+    /// Rewrites the latest user message of a session using the core contract.
+    ///
+    /// The coordinator speaks the agent crate's request type, but backend
+    /// adapters only see `vibex-core`, so the translation stays here.
+    pub async fn replace_user_message(
+        &self,
+        payload: vibex_core::ReplaceUserMessagePayload,
+    ) -> VibexResult<Vec<vibex_core::TimelineItem>> {
+        self.message_submission
+            .replace_user_message(vibex_agent::ReplaceUserMessageRequest {
+                user_sequence: payload.user_sequence,
+                expected_end_sequence: payload.expected_end_sequence,
+                message: payload.message,
+            })
+            .await
+    }
+
     pub fn runtime_catalog(&self) -> Arc<RuntimeOptionCatalogService> {
         self.runtime_catalog.clone()
     }

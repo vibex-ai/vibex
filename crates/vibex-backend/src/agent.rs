@@ -8,10 +8,10 @@ use vibex_core::{
     AgentSessionRuntimeSelectionState, AgentTimelineDisplaySettings, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
-    RemoteDeepLinkResolution, RenameAgentSessionRequest, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TimelineItem,
-    TimelineLiveEvent, TimelinePage, VibexSessionId,
+    RemoteDeepLinkResolution, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
+    SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -150,6 +150,12 @@ pub trait AgentBackend: BackendBound {
         &self,
         request: MutationRequest<ResolveElicitationRequest>,
     ) -> BackendFuture<'_, TimelineItem>;
+
+    /// Rewrites the latest user message of a session and re-runs its turn.
+    fn replace_user_message(
+        &self,
+        request: MutationRequest<ReplaceUserMessagePayload>,
+    ) -> BackendFuture<'_, Vec<TimelineItem>>;
 
     fn rename_session(
         &self,

@@ -65,7 +65,6 @@ use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, watch};
-use vibex_agent::ReplaceUserMessageRequest;
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_app_update::{CheckReason, UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -92,16 +91,16 @@ use vibex_core::{
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
     PromptId, ProviderBindingMetadata, ProviderKind, ProviderProfileSummary,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
-    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
-    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem,
-    TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
-    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
+    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
+    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
+    TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
+    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
     managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
@@ -17970,7 +17969,11 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        // Rewriting the last user message is an authoritative timeline
+        // mutation, so it rides the backend facade. The local runtime used to
+        // own this path, which made the inline editor silently inert whenever
+        // the workbench was paired with a remote runtime.
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let submitted_at_ms = unix_timestamp_ms();
@@ -17996,19 +17999,17 @@ impl VibexWorkbench {
         let generation = self.session_generation;
         let selected_source_session_id = source_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let manager = runtime.agent().manager();
-            let selection = runtime
+            let selection = backend
                 .agent()
-                .runtime_selection()
-                .get_selection_state(&source_session_id);
+                .runtime_selection(source_session_id.clone())
+                .await;
             let outcome = match selection {
                 Ok(selection) => {
                     let selection = selection.effective;
                     let reasoning_effort = selection.reasoning_effort.clone();
-                    runtime
+                    backend
                         .agent()
-                        .message_submission()
-                        .replace_user_message(ReplaceUserMessageRequest {
+                        .replace_user_message(MutationRequest::new(ReplaceUserMessagePayload {
                             user_sequence,
                             expected_end_sequence: expected_source_end_sequence,
                             message: SendAgentMessageRequest {
@@ -18023,12 +18024,17 @@ impl VibexWorkbench {
                                 reasoning_effort,
                                 correlation_id: None,
                             },
-                        })
+                        }))
                         .await
+                        .map_err(remote_error_into_vibex)
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(remote_error_into_vibex(error)),
             };
-            let session = manager.get_session(&source_session_id).await.ok();
+            let session = backend
+                .agent()
+                .open_session(source_session_id.clone())
+                .await
+                .ok();
             (outcome, session)
         });
         cx.spawn(
