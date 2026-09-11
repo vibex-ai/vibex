@@ -1110,12 +1110,47 @@ async fn fetch_authoritative_timeline(
     }
 }
 
-async fn fetch_child_agent_session_snapshot(
-    runtime: Arc<DesktopRuntime>,
+/// Authority-agnostic twin of [`fetch_authoritative_timeline`].
+///
+/// Child-Agent timelines are read by the parent session view, which must work
+/// the same way whether the workbench owns the runtime or is paired with a
+/// remote one.
+async fn fetch_authoritative_timeline_via_backend(
+    backend: BackendFacade,
+    session_id: VibexSessionId,
+) -> vibex_core::VibexResult<Vec<vibex_core::TimelineItem>> {
+    let mut items = Vec::new();
+    let mut after_sequence = 0_i64;
+    loop {
+        let page = backend
+            .agent()
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session_id.clone(),
+                after_sequence: Some(after_sequence),
+                limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
+            })
+            .await
+            .map_err(remote_error_into_vibex)?;
+        let next_cursor = next_authoritative_timeline_cursor(&session_id, after_sequence, &page)
+            .map_err(TimelineRestoreError::into_vibex_error)?;
+        items.extend(page.items);
+        let Some(next_cursor) = next_cursor else {
+            return Ok(items);
+        };
+        after_sequence = next_cursor;
+    }
+}
+
+async fn fetch_child_agent_session_snapshot_via_backend(
+    backend: BackendFacade,
     session_id: VibexSessionId,
 ) -> vibex_core::VibexResult<(AgentSession, Vec<vibex_core::TimelineItem>)> {
-    let session = runtime.agent().manager().get_session(&session_id).await?;
-    let items = fetch_authoritative_timeline(runtime, session_id).await?;
+    let session = backend
+        .agent()
+        .open_session(session_id.clone())
+        .await
+        .map_err(remote_error_into_vibex)?;
+    let items = fetch_authoritative_timeline_via_backend(backend, session_id).await?;
     Ok((session, items))
 }
 
@@ -11484,7 +11519,7 @@ impl VibexWorkbench {
             state.load_generation = state.load_generation.wrapping_add(1);
             state.load_generation
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             if let Some(state) = self.child_agent_timelines.get_mut(&key) {
                 state.loading = false;
                 state.error = Some("Agent runtime is not available".to_string());
@@ -11494,7 +11529,7 @@ impl VibexWorkbench {
         };
         let request_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            fetch_child_agent_session_snapshot(runtime, request_session_id).await
+            fetch_child_agent_session_snapshot_via_backend(backend, request_session_id).await
         });
         cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -21470,7 +21505,9 @@ impl VibexWorkbench {
     }
 
     fn refresh_session_search_index(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        // Session search indexes authoritative timelines, so it reads them
+        // through the backend facade and works against a paired runtime too.
+        let Some(runtime) = self.backend.clone() else {
             return;
         };
         let live_session_ids = self
@@ -21503,7 +21540,8 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             for session in stale_sessions {
                 let Ok(items) =
-                    fetch_authoritative_timeline(runtime.clone(), session.id.clone()).await
+                    fetch_authoritative_timeline_via_backend(runtime.clone(), session.id.clone())
+                        .await
                 else {
                     continue;
                 };
@@ -54768,7 +54806,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn apply_child_agent_timeline_events("))
             .map(|(body, _)| body)
             .expect("child Agent loader should remain inspectable");
-        assert!(child_loader.contains("fetch_child_agent_session_snapshot("));
+        assert!(child_loader.contains("fetch_child_agent_session_snapshot_via_backend("));
         assert!(child_loader.contains("state.session = Some(session);"));
 
         let child_label = source
