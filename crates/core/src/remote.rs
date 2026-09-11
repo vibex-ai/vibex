@@ -3154,6 +3154,17 @@ pub struct RemoteAutomationRunResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteProviderManagementSnapshotRequest {
     pub auth: RemoteAuthProof,
+    #[serde(flatten)]
+    pub payload: ManagementSnapshotPayload,
+}
+
+/// The Config Center snapshot request without an auth proof.
+///
+/// Backend adapters inject their own device proof, so the shared payload keeps
+/// the two fields the loader actually chooses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagementSnapshotPayload {
     pub default_scope: ProviderProfileDefaultScope,
     #[serde(default)]
     pub refresh_agent_versions: bool,

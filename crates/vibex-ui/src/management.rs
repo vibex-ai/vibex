@@ -1172,7 +1172,7 @@ mod tests {
         AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest,
         AutomationRun, AutomationRunCancelRequest, AutomationRunListRequest,
         AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStep,
-        AutomationRunStepListRequest, McpServer, McpServerAgentMatrix,
+        AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
         McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
         McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
         McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
@@ -1185,10 +1185,10 @@ mod tests {
         ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
         ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
         ProviderUsageListRequest, ProviderUsageSummary, RemoteProviderManagementSnapshot,
-        RemoteProviderManagementSnapshotRequest, ScheduledTaskAttentionListRequest,
-        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
+        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+        ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1696,7 +1696,7 @@ mod tests {
 
         fn management_snapshot(
             &self,
-            _request: RemoteProviderManagementSnapshotRequest,
+            _request: ManagementSnapshotPayload,
         ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
             error_future()
         }

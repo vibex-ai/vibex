@@ -3230,7 +3230,10 @@ async fn dispatch_provider_request(
                 )
             })?;
             let snapshot = source
-                .management_snapshot(request.default_scope, request.refresh_agent_versions)
+                .management_snapshot(
+                    request.payload.default_scope,
+                    request.payload.refresh_agent_versions,
+                )
                 .await?;
             serde_json::to_value(vibex_core::RemoteProviderManagementSnapshotResponse { snapshot })
                 .map_err(remote_payload_encode_error)

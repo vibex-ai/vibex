@@ -1159,6 +1159,32 @@ pub async fn assemble_management_snapshot(
     })
 }
 
+#[cfg(test)]
+mod management_snapshot_tests {
+    /// The Config Center depends on detected Agent versions being refreshed
+    /// before capability state is read, and that ordering now lives here rather
+    /// than in the desktop loader.
+    #[test]
+    fn snapshot_refreshes_versioned_agents_before_loading_capabilities() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("pub async fn assemble_management_snapshot(")
+            .and_then(|(_, tail)| tail.split_once("\nfn projection_workspace_key("))
+            .map(|(body, _)| body)
+            .expect("management snapshot assembly should remain inspectable");
+        let refresh = body
+            .find("provider.refresh_detected_agent_versions()?")
+            .expect("assembly must refresh detected Agent versions");
+        let agent_list = body
+            .find("let agents = provider")
+            .expect("assembly must load Agent snapshots");
+        assert!(
+            refresh < agent_list,
+            "versioned Agent identity must be refreshed before capability state is loaded"
+        );
+    }
+}
+
 fn projection_workspace_key(scope: &vibex_core::ProviderProfileDefaultScope) -> String {
     scope
         .workspace_id

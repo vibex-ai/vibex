@@ -36,9 +36,9 @@ use vibex_core::{
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
+    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -91,13 +91,12 @@ use vibex_core::{
     RemoteGitWorktreeSnapshotRequest, RemoteGitWorktreeSnapshotResponse, RemoteOperationKind,
     RemotePairingOfferSummary, RemoteProviderHealthSummaryListRequest,
     RemoteProviderHealthSummaryListResponse, RemoteProviderManagementSnapshot,
-    RemoteProviderManagementSnapshotRequest, RemoteProviderRequest,
-    RemoteProviderRunHealthProbesRequest, RemoteProviderRunHealthProbesResponse,
-    RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest, RemoteTerminalCreateResponse,
-    RemoteTerminalKillRequest, RemoteTerminalKillResponse, RemoteTerminalListRequest,
-    RemoteTerminalListResponse, RemoteTerminalResizeRequest, RemoteTerminalResizeResponse,
-    RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse, RemoteTerminalWriteRequest,
-    RemoteTerminalWriteResponse, RemoteWorkbenchDeleteProjectRequest,
+    RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
+    RemoteProviderRunHealthProbesResponse, RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest,
+    RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
+    RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
+    RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
+    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchDeleteProjectRequest,
     RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
     RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
@@ -4868,15 +4867,14 @@ impl ManagementBackend for WebRemoteBackend {
 
     fn management_snapshot(
         &self,
-        request: RemoteProviderManagementSnapshotRequest,
+        request: ManagementSnapshotPayload,
     ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
         let this = self.clone();
         Box::pin(async move {
             let payload = RemoteProviderRequest::ManagementSnapshot(
                 vibex_core::RemoteProviderManagementSnapshotRequest {
                     auth: this.auth(),
-                    default_scope: request.default_scope,
-                    refresh_agent_versions: request.refresh_agent_versions,
+                    payload: request,
                 },
             );
             let value = this

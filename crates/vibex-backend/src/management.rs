@@ -19,13 +19,13 @@ use vibex_core::{
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
     CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, McpServer, McpServerAgentMatrix,
-    McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-    McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-    McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-    McpServerValidateRequest, McpServerValidationResult, ModelProviderProfile,
-    ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
+    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
+    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
     ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
@@ -36,14 +36,13 @@ use vibex_core::{
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
     ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RelayPeerId,
-    RelayRoomId, RemoteProviderManagementSnapshot, RemoteProviderManagementSnapshotRequest,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
-    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
-    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult,
+    RelayRoomId, RemoteProviderManagementSnapshot, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
+    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
@@ -222,7 +221,7 @@ pub trait ManagementBackend: BackendBound {
 
     fn management_snapshot(
         &self,
-        request: RemoteProviderManagementSnapshotRequest,
+        request: ManagementSnapshotPayload,
     ) -> BackendFuture<'_, RemoteProviderManagementSnapshot>;
 
     fn run_capability_probes(

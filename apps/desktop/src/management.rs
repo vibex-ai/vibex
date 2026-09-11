@@ -43,23 +43,18 @@ use vibex_core::{
     AgentAuthMethodKind, AgentAuthModelCatalogSnapshot, AgentAuthStatus, AgentAuthenticateRequest,
     AgentAuthenticationCancelRequest, AgentAuthenticationOperationId, AgentId, AgentListRequest,
     AgentSnapshotEntry, AgentUpdateConfigRequest, AutomationGraphCreateRequest, AutomationGraphId,
-    AutomationGraphListRequest, AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest,
-    AutomationRunId, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep,
-    AutomationRunStepListRequest, AutomationRunTrigger, ProviderKind, ScheduledTask,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAuditListRequest, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskIntervalSchedule, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskSchedule, TerminalAuthActionDescriptor, VibexError,
-    VibexResult, WorkspaceMode, unix_timestamp_ms,
+    AutomationGraphStatus, AutomationRun, AutomationRunCancelRequest, AutomationRunId,
+    AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep,
+    AutomationRunTrigger, ProviderKind, ScheduledTask, ScheduledTaskCreateRequest, ScheduledTaskId,
+    ScheduledTaskIntervalSchedule, ScheduledTaskRun, ScheduledTaskSchedule,
+    TerminalAuthActionDescriptor, VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AutomationGraphDraft, ManagementNavigation, ManagementSection,
     PairingContextProjection, ProviderCenterSnapshot, RecoveryOperationState,
     RedactedDiagnosticProjection, ordered_agent_ids,
 };
-use vibex_desktop_runtime::{
-    DesktopRuntime, ManagementHandle, RuntimeOptionProbeResult, validate_external_open_url,
-};
+use vibex_desktop_runtime::{DesktopRuntime, RuntimeOptionProbeResult, validate_external_open_url};
 use vibex_markdown::code_font_weight;
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
@@ -3281,8 +3276,8 @@ impl ManagementCenter {
     }
 
     fn start_fast_snapshot(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
-            self.loading = false;
+        let Some(backend) = self.backend.clone() else {
+            self.note_management_reads_unavailable(cx);
             return;
         };
         self.generation = self.generation.saturating_add(1);
@@ -3292,7 +3287,7 @@ impl ManagementCenter {
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            load_snapshot(runtime, default_scope, false).await
+            load_snapshot(backend, default_scope, false).await
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -3334,8 +3329,8 @@ impl ManagementCenter {
     }
 
     fn start_full_refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
-            self.loading = false;
+        let Some(backend) = self.backend.clone() else {
+            self.note_management_reads_unavailable(cx);
             return;
         };
         self.generation = self.generation.saturating_add(1);
@@ -3345,7 +3340,7 @@ impl ManagementCenter {
         let default_scope = management_provider_default_scope(self.pairing_workspace_id.clone());
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            load_snapshot(runtime, default_scope, true).await
+            load_snapshot(backend, default_scope, true).await
         });
         self.refresh_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
@@ -3565,7 +3560,6 @@ impl ManagementCenter {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
-            self.note_management_reads_unavailable(cx);
             return;
         };
         let background = cx.background_executor().clone();
@@ -4126,7 +4120,6 @@ impl ManagementCenter {
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
-            self.note_management_reads_unavailable(cx);
             return;
         };
         let active_locale = locale::current_locale();
@@ -16568,29 +16561,23 @@ fn load_agent_snapshot(runtime: Arc<DesktopRuntime>) -> VibexResult<Vec<AgentSna
 }
 
 async fn load_snapshot(
-    runtime: Arc<DesktopRuntime>,
+    backend: BackendFacade,
     default_scope: vibex_core::ProviderProfileDefaultScope,
     refresh_agent_versions: bool,
 ) -> VibexResult<ManagementSnapshot> {
-    let management: ManagementHandle = runtime.management();
-    let provider = management.providers().management();
-    // Config Center refresh is the explicit, bounded slow path for installed
-    // versioned Agent CLIs. Ordinary Agent catalog reads remain process-free.
-    if refresh_agent_versions {
-        provider.refresh_detected_agent_versions()?;
-    }
-    let agents = provider
-        .list_agents(AgentListRequest {
-            include_disabled: true,
-        })?
-        .agents
-        .into_iter()
-        .filter(|agent| {
-            agent.source_kind == vibex_core::AgentSourceKind::Custom
-                || vibex_core::is_user_visible_agent(&agent.id)
+    // One aggregated read instead of two dozen sequential ones: the authority
+    // assembles the bundle, and the projections below are pure derivations.
+    let bundle = backend
+        .management()
+        .management_snapshot(vibex_core::ManagementSnapshotPayload {
+            default_scope: default_scope.clone(),
+            refresh_agent_versions,
         })
-        .collect::<Vec<_>>();
-    let mut catalog = provider.list_agent_catalog()?;
+        .await
+        .map_err(crate::app::remote_error_into_vibex)?;
+
+    let agents = bundle.agents;
+    let mut catalog = bundle.catalog;
     catalog
         .agents
         .retain(|agent| vibex_core::is_user_visible_agent(&agent.id));
@@ -16598,194 +16585,67 @@ async fn load_snapshot(
         .into_iter()
         .map(|agent_id| agent_id.as_str().to_string())
         .collect();
-    let profiles = provider.list_profiles()?;
-    let native_import_preview = provider
-        .preview_native_import(vibex_core::ProviderNativeImportPreviewRequest {
-            sources: vec![
-                vibex_core::ProviderNativeImportSource::Codex,
-                vibex_core::ProviderNativeImportSource::Claude,
-                vibex_core::ProviderNativeImportSource::CcSwitch,
-            ],
-        })
-        .ok();
-    let acp_configs = profiles
-        .iter()
-        .filter(|profile| profile.kind == ProviderKind::Acp)
-        .filter_map(|profile| {
-            provider
-                .get_acp_profile_config(profile.id.clone())
-                .ok()
-                .map(|config| (profile.id.as_str().to_string(), config))
-        })
+    let profiles = bundle.profiles;
+    let native_import_preview = bundle.native_import_preview;
+    let acp_configs = bundle
+        .acp_configs
+        .into_iter()
+        .map(|entry| (entry.provider_profile_id.as_str().to_string(), entry.config))
         .collect::<Vec<_>>();
+
     let mut agent_profile_states = Vec::new();
     let mut provider_display_order = BTreeMap::new();
     let mut projection_states = Vec::new();
-    let projection_workspace_key = default_scope
-        .workspace_id
-        .as_ref()
-        .map(|workspace_id| workspace_id.as_str().to_string())
-        .or_else(|| {
-            default_scope
-                .project_id
-                .as_ref()
-                .map(|project_id| project_id.as_str().to_string())
-        })
-        .unwrap_or_else(|| "management-global".to_string());
-    for agent in agents.iter().filter(|agent| agent.added) {
-        let response = provider.list_agent_model_provider_profiles(
-            vibex_core::AgentModelProviderProfileListRequest {
-                agent_id: agent.id.clone(),
-                include_disabled: true,
-            },
-        )?;
-        let scoped_default = provider.get_agent_model_provider_default(
-            vibex_core::AgentModelProviderDefaultRequest {
-                scope: default_scope.clone(),
-                agent_id: agent.id.clone(),
-            },
-        )?;
-        provider_display_order.extend(response.profiles.iter().filter_map(|item| {
+    for detail in bundle.agent_details {
+        let agent_id = detail.agent_id.as_str().to_string();
+        provider_display_order.extend(detail.profiles.iter().filter_map(|item| {
             item.display_order_index
                 .map(|order_index| (item.profile.id.as_str().to_string(), order_index))
         }));
         agent_profile_states.extend(agent_provider_profile_states(
-            agent.id.as_str(),
-            response.profiles.into_iter().map(|item| item.profile),
-            scoped_default.provider_profile_id.as_ref(),
+            &agent_id,
+            detail.profiles.into_iter().map(|item| item.profile),
+            detail.default_profile_id.as_ref(),
         ));
-
-        let runtimes = provider.list_agent_runtime_profiles(&agent.id)?;
-        let bindings = provider.list_agent_model_provider_bindings(
-            vibex_core::AgentModelProviderBindingListRequest {
-                agent_id: Some(agent.id.clone()),
-                model_provider_profile_id: None,
-            },
-        )?;
-        for runtime_profile in runtimes {
-            let runtime_bindings = bindings
-                .iter()
-                .filter(|binding| binding.runtime_profile_id == runtime_profile.id)
-                .collect::<Vec<_>>();
-            if runtime_bindings.is_empty() {
-                let capability = provider.agent_provider_projection_capability(
-                    vibex_core::AgentProviderProjectionCapabilityRequest {
-                        runtime_profile_id: runtime_profile.id.clone(),
-                        binding_id: None,
-                    },
-                )?;
-                projection_states.push(AgentProviderProjectionState {
-                    agent_id: agent.id.as_str().to_string(),
-                    legacy_profile_id: None,
-                    capability,
-                    preview: None,
-                });
-                continue;
-            }
-            for binding in runtime_bindings {
-                let capability = provider.agent_provider_projection_capability(
-                    vibex_core::AgentProviderProjectionCapabilityRequest {
-                        runtime_profile_id: runtime_profile.id.clone(),
-                        binding_id: Some(binding.id.clone()),
-                    },
-                )?;
-                let preview = provider
-                    .preview_agent_provider_projection(
-                        vibex_core::AgentProviderProjectionPreviewRequest {
-                            binding_id: binding.id.clone(),
-                            workspace_key: projection_workspace_key.clone(),
-                        },
-                    )
-                    .ok();
-                projection_states.push(AgentProviderProjectionState {
-                    agent_id: agent.id.as_str().to_string(),
-                    legacy_profile_id: binding
-                        .legacy_provider_profile_id
-                        .as_ref()
-                        .map(|profile_id| profile_id.as_str().to_string()),
-                    capability,
-                    preview,
-                });
-            }
+        for entry in detail.projections {
+            let legacy_profile_id = entry.binding_id.as_ref().and_then(|binding_id| {
+                detail
+                    .bindings
+                    .iter()
+                    .find(|binding| &binding.id == binding_id)
+                    .and_then(|binding| binding.legacy_provider_profile_id.as_ref())
+                    .map(|profile_id| profile_id.as_str().to_string())
+            });
+            projection_states.push(AgentProviderProjectionState {
+                agent_id: agent_id.clone(),
+                legacy_profile_id,
+                capability: entry.capability,
+                preview: entry.preview,
+            });
         }
     }
-    let mcp_servers = provider.list_mcp_servers()?;
-    let skills = provider.list_skills()?;
-    let prompts = provider.list_prompts()?;
-    let hooks = provider.list_hooks()?;
-    let health_summaries = provider.list_health_summaries()?;
-    let capability_summaries = provider.list_capability_summaries()?;
-    let usage_summaries = provider.list_usage_summaries(vibex_core::ProviderUsageListRequest {
-        provider_profile_ids: None,
-        include_empty: true,
-    })?;
-    let native_exports =
-        provider.list_native_exports(vibex_core::ProviderNativeExportListRequest {
-            provider_profile_id: None,
-            limit: Some(50),
-        })?;
-    let scheduled = management.scheduled().list(ScheduledTaskListRequest {
-        workspace_id: None,
-        status: None,
-        include_deleted: false,
-        limit: Some(100),
-    })?;
-    let scheduled_runs = management
-        .scheduled()
-        .list_runs(ScheduledTaskRunListRequest {
-            task_id: None,
-            session_id: None,
-            status: None,
-            limit: Some(100),
-        })?;
-    let scheduled_attention =
-        management
-            .scheduled()
-            .list_attention(ScheduledTaskAttentionListRequest {
-                workspace_id: None,
-                limit: Some(100),
-            })?;
-    let scheduled_audit = management
-        .scheduled()
-        .list_audit(ScheduledTaskAuditListRequest {
-            workspace_id: None,
-            status: None,
-            limit: Some(100),
-        })?;
-    let graphs = management.automation().list(AutomationGraphListRequest {
-        workspace_id: None,
-        status: None,
-        include_deleted: false,
-        limit: Some(100),
-    })?;
-    let selected_graph_id = graphs.first().map(|graph| graph.id.clone());
-    let automation_runs = management
-        .automation()
-        .list_runs(AutomationRunListRequest {
-            graph_id: selected_graph_id,
-            status: None,
-            limit: Some(100),
-        })?;
-    let automation_steps = management
-        .automation()
-        .list_steps(AutomationRunStepListRequest {
-            run_id: None,
-            node_id: None,
-            status: None,
-            limit: Some(500),
-        })?;
-    let devices = management.remote().list_devices()?;
+
+    let mcp_servers = bundle.mcp_servers;
+    let skills = bundle.skills;
+    let prompts = bundle.prompts;
+    let hooks = bundle.hooks;
+    let health_summaries = bundle.health_summaries;
+    let capability_summaries = bundle.capability_summaries;
+    let usage_summaries = bundle.usage_summaries;
+    let native_exports = bundle.native_exports;
+    let scheduled = bundle.scheduled;
+    let scheduled_runs = bundle.scheduled_runs;
+    let scheduled_attention = bundle.scheduled_attention;
+    let scheduled_audit = bundle.scheduled_audit;
+    let graphs = bundle.automation_graphs;
+    let automation_runs = bundle.automation_runs;
+    let automation_steps = bundle.automation_steps;
+    let devices = bundle.devices;
     let revoked_device_count = devices
         .iter()
         .filter(|device| device.status == vibex_core::RemoteDeviceStatus::Revoked)
         .count();
-    let audit_count = management
-        .remote()
-        .list_audit(vibex_core::RemoteAuditListRequest {
-            device_id: None,
-            limit: Some(100),
-        })?
-        .len();
+    let audit_count = bundle.audit_count;
     Ok(ManagementSnapshot {
         center: ProviderCenterSnapshot {
             agents,
@@ -18508,15 +18368,15 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\nfn "))
             .map(|(body, _)| body)
             .expect("management snapshot loader should remain inspectable");
-        let version_refresh = load_snapshot
-            .find("provider.refresh_detected_agent_versions()?")
-            .expect("Config Center snapshot must refresh detected Agent versions");
-        let agent_list = load_snapshot
-            .find("let agents = provider")
-            .expect("Config Center snapshot must load Agent snapshots");
+        // The refresh ordering now lives in the authority's assembly function;
+        // the loader's job is to forward the flag with the aggregated read.
         assert!(
-            version_refresh < agent_list,
-            "versioned Agent identity must be refreshed before capability state is loaded"
+            load_snapshot.contains("refresh_agent_versions,"),
+            "Config Center snapshot must forward the Agent version refresh flag"
+        );
+        assert!(
+            load_snapshot.contains(".management_snapshot("),
+            "Config Center snapshot must read the aggregated authority bundle"
         );
     }
 
