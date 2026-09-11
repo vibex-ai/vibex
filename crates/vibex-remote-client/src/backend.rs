@@ -19,6 +19,7 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
     AgentTimelineDisplaySettings, AutomationGraph, AutomationGraphCreateRequest,
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
@@ -3164,6 +3165,60 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteProviderRunHealthProbesResponse>(value)?.result)
+        })
+    }
+
+    fn create_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::CreateAgentModelProviderProfile(
+                vibex_core::RemoteAgentModelProviderProfileCreateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderProfileCreateResponse>(value)?.profile)
+        })
+    }
+
+    fn update_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::UpdateAgentModelProviderProfile(
+                vibex_core::RemoteAgentModelProviderProfileUpdateRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteAgentModelProviderProfileUpdateResponse>(value)?.profile)
         })
     }
 

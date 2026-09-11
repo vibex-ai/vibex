@@ -1165,30 +1165,31 @@ mod tests {
         AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
         AgentCatalogListResponse, AgentModelProviderDisplayOrderListRequest,
         AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
-        AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileDeleteRequest,
-        AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-        AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult, AutomationGraph,
-        AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
-        AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest,
-        AutomationRun, AutomationRunCancelRequest, AutomationRunListRequest,
-        AutomationRunResumeRequest, AutomationRunStartRequest, AutomationRunStep,
-        AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
-        McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
-        McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
-        McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
-        McpServerValidateRequest, McpServerValidationResult, ProviderCapabilitySummary,
-        ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-        ProviderNativeExportListRequest, ProviderNativeExportPreview,
-        ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
-        ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
-        ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
-        ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
-        ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
-        ProviderUsageListRequest, ProviderUsageSummary, RemoteProviderManagementSnapshot,
-        ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-        ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-        ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-        ScheduledTaskUpdateRequest,
+        AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
+        AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
+        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+        AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
+        AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
+        AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
+        AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+        AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
+        AutomationRunStep, AutomationRunStepListRequest, ManagementSnapshotPayload, McpServer,
+        McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+        McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
+        McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
+        McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+        ProviderCapabilitySummary, ProviderNativeExportApplyRequest,
+        ProviderNativeExportApplyResult, ProviderNativeExportListRequest,
+        ProviderNativeExportPreview, ProviderNativeExportPreviewRequest,
+        ProviderNativeExportRecordSummary, ProviderNativeExportRollbackRequest,
+        ProviderNativeExportRollbackResult, ProviderNativeImportCreateRequest,
+        ProviderNativeImportCreateResult, ProviderNativeImportPreview,
+        ProviderNativeImportPreviewRequest, ProviderProfile, ProviderRunCapabilityProbesRequest,
+        ProviderRunCapabilityProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
+        RemoteProviderManagementSnapshot, ScheduledTaskAttentionListRequest,
+        ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+        ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+        ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest,
     };
 
     fn error_future<T: 'static>() -> BackendFuture<'static, T> {
@@ -1385,6 +1386,20 @@ mod tests {
         }
 
         fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+            error_future()
+        }
+
+        fn create_agent_model_provider_profile(
+            &self,
+            _request: MutationRequest<AgentModelProviderProfileCreateRequest>,
+        ) -> BackendFuture<'_, ProviderProfile> {
+            error_future()
+        }
+
+        fn update_agent_model_provider_profile(
+            &self,
+            _request: MutationRequest<AgentModelProviderProfileUpdateRequest>,
+        ) -> BackendFuture<'_, ProviderProfile> {
             error_future()
         }
 

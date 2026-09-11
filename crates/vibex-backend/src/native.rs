@@ -11,9 +11,10 @@ use vibex_core::{
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-    AgentModelProviderProfileTestResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
+    AgentModelProviderProfileUpdateRequest, AgentSession, AgentSessionRuntimeSelectionState,
     AgentUsageStatistics, AgentUsageStatisticsRequest, AutomationGraph,
     AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
     AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
@@ -1774,6 +1775,40 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .run_health_probes(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .create_agent_model_provider_profile(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn update_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .update_agent_model_provider_profile(request.payload)
                 .map_err(Into::into)
         })
     }

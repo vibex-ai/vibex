@@ -3559,7 +3559,7 @@ impl ManagementCenter {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let background = cx.background_executor().clone();
@@ -3567,13 +3567,13 @@ impl ManagementCenter {
             background
                 .timer(MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL)
                 .await;
-            runtime
-                .management()
-                .providers()
+            backend
                 .management()
                 .list_agents(AgentListRequest {
                     include_disabled: true,
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
         });
         self.agent_install_refresh_task = Some(cx.spawn(async move |entity, cx| {
             let outcome = runner.await;
@@ -5599,7 +5599,7 @@ impl ManagementCenter {
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.to_string()) else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let active_locale = locale::current_locale();
@@ -5626,16 +5626,16 @@ impl ManagementCenter {
             ManagementMutation::ProviderDisplayOrder(agent_id.to_string()),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .set_agent_model_provider_display_order(
+                    .set_agent_model_provider_display_order(MutationRequest::new(
                         vibex_core::AgentModelProviderDisplayOrderSetRequest {
                             agent_id: parsed_agent_id,
                             entries,
                         },
-                    )?;
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 Ok(management_locale_text_for(
                     active_locale,
                     "Provider order updated",

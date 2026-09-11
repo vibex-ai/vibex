@@ -3215,6 +3215,56 @@ async fn dispatch_provider_request(
             })
             .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::CreateAgentModelProviderProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.request.agent_id.as_str().to_string();
+            let result = service.create_agent_model_provider_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_profile:{profile_id}"),
+                "Agent model provider profile created from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderProfileCreateResponse {
+                profile,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::UpdateAgentModelProviderProfile(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let profile_id = request.request.provider_profile_id.as_str().to_string();
+            let result = service.update_agent_model_provider_profile(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                format!("agent_model_provider_profile:{profile_id}"),
+                "Agent model provider profile updated from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let profile = result?;
+            serde_json::to_value(vibex_core::RemoteAgentModelProviderProfileUpdateResponse {
+                profile,
+            })
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::ManagementSnapshot(request) => {
             authorize_provider_action(
                 runtime,

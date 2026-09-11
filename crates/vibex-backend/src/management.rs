@@ -6,9 +6,10 @@ use vibex_core::{
     AgentModelProviderBindingListRequest, AgentModelProviderBindingUpdateRequest,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-    AgentModelProviderProfileTestResult, AgentProviderProjectionCapability,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
+    AgentModelProviderProfileUpdateRequest, AgentProviderProjectionCapability,
     AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
     AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
     AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
@@ -185,6 +186,16 @@ pub trait ManagementBackend: BackendBound {
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary>;
 
     /// Deletes a per-Agent model provider profile.
+    fn create_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile>;
+
+    fn update_agent_model_provider_profile(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile>;
+
     fn delete_agent_model_provider_profile(
         &self,
         request: MutationRequest<AgentModelProviderProfileDeleteRequest>,

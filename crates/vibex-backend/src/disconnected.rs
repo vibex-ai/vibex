@@ -5,9 +5,10 @@ use vibex_core::{
     AgentCatalogListResponse, AgentListRequest, AgentListResponse,
     AgentModelProviderDisplayOrderListRequest, AgentModelProviderDisplayOrderListResponse,
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
-    AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
-    AgentModelProviderProfileTestResult, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
+    AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
+    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
+    AgentModelProviderProfileUpdateRequest, AgentSession, AgentSessionRuntimeSelectionState,
     AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
     AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
     AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
@@ -1021,6 +1022,20 @@ impl ManagementBackend for DisconnectedBackend {
     }
 
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+        disconnected_future!()
+    }
+
+    fn create_agent_model_provider_profile(
+        &self,
+        _request: MutationRequest<AgentModelProviderProfileCreateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
+        disconnected_future!()
+    }
+
+    fn update_agent_model_provider_profile(
+        &self,
+        _request: MutationRequest<AgentModelProviderProfileUpdateRequest>,
+    ) -> BackendFuture<'_, ProviderProfile> {
         disconnected_future!()
     }
 
