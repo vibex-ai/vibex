@@ -23,8 +23,8 @@ use crate::{
     ProjectionEvidenceReference, ProjectionEvidenceState, ProviderSecretKind,
     ProviderSwitchBehavior, VibexError, VibexResult, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
     WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
-    WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
-    acp_agent_catalog_entries,
+    WIRE_PROTOCOL_GOOGLE_VERTEX, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+    WIRE_PROTOCOL_OPENAI_RESPONSES, acp_agent_catalog_entries,
 };
 use crate::{AgentModelProviderBindingId, AgentRuntimeProbeId, AgentRuntimeProfileId};
 
@@ -334,16 +334,25 @@ fn catalog_projection_shape(
                 "GOOGLE_GEMINI_BASE_URL",
                 "GEMINI_API_KEY",
                 "GEMINI_MODEL",
-                vec![catalog_interface(
-                    WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
-                    false,
-                    true,
-                )],
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, false, true),
+                    catalog_interface(WIRE_PROTOCOL_GOOGLE_VERTEX, false, true),
+                ],
             )),
-            "copilot" => Ok(environment_projection_shape(
+            // `copilot` switches its wire protocol through
+            // `COPILOT_PROVIDER_TYPE` / `COPILOT_PROVIDER_WIRE_API` rather than
+            // the endpoint, so all three API-key-expressible shapes it really
+            // speaks are selectable. Azure is deliberately absent: it needs an
+            // `api-version` query parameter this projection cannot express.
+            "copilot" => Ok(environment_projection_shape_with_interfaces(
                 "COPILOT_PROVIDER_BASE_URL",
                 "COPILOT_PROVIDER_API_KEY",
                 "COPILOT_MODEL",
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
             )),
             "codewhale" => Ok(environment_projection_shape(
                 "CODEWHALE_BASE_URL",
@@ -363,12 +372,16 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
                 ],
             )),
+            // Kimi Code CLI ships four chat providers: `openai_legacy`,
+            // `openai_responses`, `anthropic`, and `google_genai`.
             "kimi" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::KimiToml,
                 "VIBEX_KIMI_API_KEY",
                 vec![
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, true, true),
                 ],
             )),
             "poolside" => Ok(environment_projection_shape(
@@ -412,14 +425,16 @@ fn catalog_projection_shape(
                     true,
                 )],
             )),
+            // grok's `api_backend` accepts `chat_completions` (its own
+            // default), `responses`, and `messages`.
             "grok" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::GrokToml,
                 "VIBEX_GROK_API_KEY",
-                vec![catalog_interface(
-                    WIRE_PROTOCOL_OPENAI_RESPONSES,
-                    false,
-                    true,
-                )],
+                vec![
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
+                    catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                ],
             )),
             "hermes" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::HermesYaml,
@@ -449,6 +464,11 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
                 ],
             )),
+            // pi's `models.json` `api` field selects one of ten built-in
+            // protocol implementations; these four are the API-key
+            // expressible ones Vibex projects. Bedrock authenticates through
+            // AWS credentials and is listed so the wire protocol is declared,
+            // but its endpoint is the AWS SDK's, not a Provider endpoint.
             "pi" => Ok(overlay_projection_shape(
                 ConfigOverlayStrategy::PiModelsJson,
                 "VIBEX_PI_API_KEY",
@@ -456,6 +476,9 @@ fn catalog_projection_shape(
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
                     catalog_interface(WIRE_PROTOCOL_OPENAI_RESPONSES, true, true),
                     catalog_interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, true, true),
+                    catalog_interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, true, true),
+                    catalog_interface(WIRE_PROTOCOL_GOOGLE_VERTEX, true, true),
+                    catalog_interface(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, true, true),
                 ],
             )),
             "qwen-code" => Ok(overlay_projection_shape(
@@ -572,11 +595,10 @@ fn antigravity_projection_shape() -> CatalogProjectionShape {
             aliases: vec!["model".to_string()],
         },
         credential_kinds: vec![AgentCredentialKind::ApiKey],
-        model_interfaces: vec![catalog_interface(
-            WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
-            false,
-            true,
-        )],
+        model_interfaces: vec![
+            catalog_interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, false, true),
+            catalog_interface(WIRE_PROTOCOL_GOOGLE_VERTEX, false, true),
+        ],
         runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
         switch_behavior: ProviderSwitchBehavior::RestartAndResume,
         evidence_state: ProjectionEvidenceState::Documented,
@@ -1791,15 +1813,70 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        // Gemini CLI and Antigravity both speak the first-party Generative
+        // Language API and Vertex AI.
         assert_eq!(
             protocols("antigravity"),
-            vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
+            vec![
+                WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                WIRE_PROTOCOL_GOOGLE_VERTEX,
+            ]
         );
         assert_eq!(
             protocols("gemini"),
-            vec![WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI]
+            vec![
+                WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                WIRE_PROTOCOL_GOOGLE_VERTEX,
+            ]
         );
-        assert_eq!(protocols("grok"), vec![WIRE_PROTOCOL_OPENAI_RESPONSES]);
+        // grok's `api_backend` accepts all three OpenAI/Anthropic shapes.
+        assert_eq!(
+            protocols("grok"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            ]
+        );
+        // Copilot CLI's BYOK surface covers both OpenAI wire APIs plus
+        // Anthropic Messages.
+        assert_eq!(
+            protocols("copilot"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            ]
+        );
+        // Kimi Code CLI ships four chat providers.
+        assert_eq!(
+            protocols("kimi"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+            ]
+        );
+        // pi's `models.json` selects among ten protocol implementations; these
+        // are the ones a Provider Profile can drive.
+        assert_eq!(
+            protocols("pi"),
+            vec![
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                WIRE_PROTOCOL_OPENAI_RESPONSES,
+                WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
+                WIRE_PROTOCOL_GOOGLE_VERTEX,
+                WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+            ]
+        );
+        // codebuddy-code's endpoint override only ever carries an
+        // OpenAI-shaped body; it exposes no protocol selector.
+        assert_eq!(
+            protocols("codebuddy-code"),
+            vec![WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS]
+        );
         assert_eq!(
             protocols("deepseek-harness"),
             vec![

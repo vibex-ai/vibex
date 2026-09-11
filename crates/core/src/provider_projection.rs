@@ -25,6 +25,13 @@ pub const WIRE_PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
 pub const WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS: &str = "openai_chat_completions";
 pub const WIRE_PROTOCOL_ANTHROPIC_MESSAGES: &str = "anthropic_messages";
 pub const WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI: &str = "google_generative_ai";
+/// Vertex AI's Gemini surface. It carries the same
+/// `generateContent`/`streamGenerateContent` body as
+/// [`WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI`] but a distinct
+/// `/v1beta1/publishers/google/models/<model>` route and GCP credentials, so an
+/// Agent that can speak both needs to distinguish them at the endpoint and
+/// environment-variable level.
+pub const WIRE_PROTOCOL_GOOGLE_VERTEX: &str = "google_vertex";
 pub const WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE: &str = "aws_bedrock_converse";
 
 pub const CLAUDE_PROJECTION_DESCRIPTOR_ID: &str = "projection_claude_environment_v1";
@@ -363,6 +370,7 @@ pub fn is_model_provider_wire_protocol(value: &str) -> bool {
             | WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS
             | WIRE_PROTOCOL_ANTHROPIC_MESSAGES
             | WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
+            | WIRE_PROTOCOL_GOOGLE_VERTEX
             | WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE
     )
 }
@@ -1505,6 +1513,10 @@ fn claude_projection_descriptor() -> VibexResult<AgentProviderProjectionDescript
             AgentCredentialKind::ApiKey,
             AgentCredentialKind::ManagedSubscription,
         ],
+        // The bundled Claude Code CLI also speaks Bedrock and Vertex, but both
+        // authenticate through AWS SigV4 / Google ADC rather than an API key,
+        // and `ModelProviderProfile` secrets cannot carry either. They are
+        // therefore deliberately absent instead of selectable-but-unusable.
         model_interfaces: vec![AgentModelInterfaceDescriptor {
             wire_protocol_id: WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string(),
             sdk_adapter_id: None,
@@ -1595,6 +1607,7 @@ fn opencode_projection_descriptor() -> VibexResult<AgentProviderProjectionDescri
             ),
             interface(WIRE_PROTOCOL_ANTHROPIC_MESSAGES, "@ai-sdk/anthropic"),
             interface(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, "@ai-sdk/google"),
+            interface(WIRE_PROTOCOL_GOOGLE_VERTEX, "@ai-sdk/google-vertex"),
             interface(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE, "@ai-sdk/amazon-bedrock"),
         ],
         runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
@@ -1970,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_opencode_descriptor_exposes_all_five_direct_protocols() {
+    fn builtin_opencode_descriptor_exposes_every_direct_protocol() {
         let descriptor = AgentProviderProjectionRegistry::builtin()
             .unwrap()
             .resolve(&builtin_identity("opencode"))
@@ -2008,6 +2021,11 @@ mod tests {
                 (
                     WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI,
                     Some("@ai-sdk/google"),
+                    AgentModelInterfaceIntegrationKind::Direct,
+                ),
+                (
+                    WIRE_PROTOCOL_GOOGLE_VERTEX,
+                    Some("@ai-sdk/google-vertex"),
                     AgentModelInterfaceIntegrationKind::Direct,
                 ),
                 (

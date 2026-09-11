@@ -1249,8 +1249,12 @@ fn project_provider_control(
     match &descriptor.provider_control {
         AgentProviderControl::Environment { base_url_key } => {
             if let (Some(key), Some(endpoint)) = (base_url_key, endpoint) {
-                let endpoint_url = environment_base_url(descriptor, &endpoint.url);
-                env.insert(key.clone(), endpoint_url.clone());
+                // Agents that can speak more than one Google-flavoured protocol
+                // read a different environment variable per protocol, so the
+                // descriptor's declared key is only the first-party default.
+                let key = environment_base_url_key(descriptor, model, key);
+                let endpoint_url = environment_base_url(descriptor, model, &endpoint.url);
+                env.insert(key.to_string(), endpoint_url.clone());
                 targets.push(endpoint_target(key, &endpoint_url));
             }
         }
@@ -1466,19 +1470,44 @@ fn project_model_control(
     }
 }
 
+/// Agents whose Google support spans both the first-party Generative Language
+/// API and Vertex AI read a protocol-specific origin variable. Selecting the
+/// Vertex wire protocol while writing `GOOGLE_GEMINI_BASE_URL` would silently
+/// keep the Agent on the first-party route, so the key follows the selected
+/// Model's protocol and falls back to the descriptor's declared default.
+fn environment_base_url_key<'a>(
+    descriptor: &AgentProviderProjectionDescriptor,
+    model: Option<&AgentConfiguredModelBinding>,
+    declared_key: &'a str,
+) -> &'a str {
+    if projection_wire_protocol(model) != vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX {
+        return declared_key;
+    }
+    match descriptor.route.agent_id.as_str() {
+        "antigravity" | "gemini" => "GOOGLE_VERTEX_BASE_URL",
+        _ => declared_key,
+    }
+}
+
 /// Gemini CLI and Antigravity treat `GOOGLE_GEMINI_BASE_URL` as an origin and
 /// append the Google Generative Language API path themselves. Provider forms
 /// commonly store an OpenAI-style `/v1` suffix; forwarding it verbatim produces
 /// `/v1/v1beta/models/...` and makes every prompt fail after a successful ACP
-/// handshake. Keep other Agents byte-for-byte unchanged.
+/// handshake. Vertex resolves the same way because the SDK appends
+/// `/v1beta1/publishers/google/models/...` to whatever origin it is given. Keep
+/// other Agents byte-for-byte unchanged.
 fn environment_base_url(
     descriptor: &AgentProviderProjectionDescriptor,
+    _model: Option<&AgentConfiguredModelBinding>,
     endpoint_url: &str,
 ) -> String {
     if !matches!(descriptor.route.agent_id.as_str(), "antigravity" | "gemini") {
         return endpoint_url.to_string();
     }
+    strip_google_api_path_suffix(endpoint_url)
+}
 
+fn strip_google_api_path_suffix(endpoint_url: &str) -> String {
     let trimmed = endpoint_url.trim_end_matches('/');
     for api_suffix in ["/v1beta", "/v1"] {
         if let Some(origin) = trimmed.strip_suffix(api_suffix)
@@ -1506,15 +1535,15 @@ mod google_generative_ai_base_url_tests {
                 .unwrap();
 
             assert_eq!(
-                environment_base_url(&descriptor, "https://gateway.example/v1"),
+                environment_base_url(&descriptor, None, "https://gateway.example/v1"),
                 "https://gateway.example"
             );
             assert_eq!(
-                environment_base_url(&descriptor, "https://gateway.example/v1beta/"),
+                environment_base_url(&descriptor, None, "https://gateway.example/v1beta/"),
                 "https://gateway.example"
             );
             assert_eq!(
-                environment_base_url(&descriptor, "https://gateway.example/custom/"),
+                environment_base_url(&descriptor, None, "https://gateway.example/custom/"),
                 "https://gateway.example/custom"
             );
         }
@@ -1649,7 +1678,38 @@ fn apply_agent_projection_defaults(
                 );
             }
         }
+        // `COPILOT_PROVIDER_BASE_URL` alone only switches Copilot CLI into
+        // BYOK mode; the wire protocol stays on its `openai` / `completions`
+        // default until these are set. Without them an Anthropic or Responses
+        // profile is silently spoken to the wrong route.
+        "copilot" => {
+            env.insert(
+                "COPILOT_PROVIDER_TYPE".to_string(),
+                copilot_provider_type(model).to_string(),
+            );
+            env.insert(
+                "COPILOT_PROVIDER_WIRE_API".to_string(),
+                copilot_wire_api(model).to_string(),
+            );
+        }
         _ => {}
+    }
+}
+
+/// Copilot CLI's BYOK provider type. Anthropic Messages is its own type; both
+/// OpenAI protocols are served by the `openai` type and differ only by
+/// `COPILOT_PROVIDER_WIRE_API`.
+fn copilot_provider_type(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        _ => "openai",
+    }
+}
+
+fn copilot_wire_api(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
+        _ => "completions",
     }
 }
 
@@ -2149,6 +2209,7 @@ fn opencode_provider_identity<'a>(
         vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS => "chat",
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
         vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX => "google-vertex",
         vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => "bedrock",
         _ => "custom",
     };
@@ -2390,6 +2451,9 @@ fn pi_api_kind(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
     match projection_wire_protocol(model) {
         vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai-responses",
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic-messages",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google-generative-ai",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX => "google-vertex",
+        vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE => "bedrock-converse-stream",
         _ => "openai-completions",
     }
 }
@@ -2479,6 +2543,8 @@ fn zcode_provider_kind(model: &AgentConfiguredModelBinding) -> &'static str {
 fn kimi_provider_type(model: &AgentConfiguredModelBinding) -> &'static str {
     match model.wire_protocol_id.as_str() {
         vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "anthropic",
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "openai_responses",
+        vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI => "google_genai",
         _ => "openai_legacy",
     }
 }
@@ -2798,6 +2864,7 @@ fn goose_model_entry(model_id: &str) -> serde_json::Value {
 fn grok_model_config(
     provider: &ModelProviderProfile,
     model_id: &str,
+    model: Option<&AgentConfiguredModelBinding>,
     endpoint: Option<&ModelProviderEndpoint>,
     secret_env_key: &str,
 ) -> serde_json::Value {
@@ -2810,8 +2877,25 @@ fn grok_model_config(
     );
     config.insert("name".to_string(), serde_json::json!(provider.display_name));
     config.insert("env_key".to_string(), serde_json::json!(secret_env_key));
-    config.insert("api_backend".to_string(), serde_json::json!("responses"));
+    // `api_backend` is grok's per-model protocol selector and defaults to
+    // `chat_completions`. Pinning it to `responses` made every
+    // chat-completions-only gateway answer on a route it never serves.
+    config.insert(
+        "api_backend".to_string(),
+        serde_json::json!(grok_api_backend(model)),
+    );
     serde_json::Value::Object(config)
+}
+
+/// Maps Vibex wire protocols onto grok's `api_backend` values. grok's own
+/// default is `chat_completions`, so an undeclared protocol resolves there
+/// instead of the previous hardcoded `responses`.
+fn grok_api_backend(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
+    match projection_wire_protocol(model) {
+        vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES => "responses",
+        vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES => "messages",
+        _ => "chat_completions",
+    }
 }
 
 fn grok_overlay(
@@ -2822,19 +2906,28 @@ fn grok_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let group = overlay_model_group(binding, model, |_| "openai-responses");
+    // Group by the protocol each Model actually declares: `api_backend` is
+    // per-model, so a group keyed on a fixed protocol would emit the wrong
+    // backend for every sibling Model.
+    let group = overlay_model_group(binding, model, |_| "");
     let mut model_table = serde_json::Map::new();
     if group.is_empty() {
         model_table.insert(
             model_id.to_string(),
-            grok_model_config(provider, model_id, endpoint, secret_env_key),
+            grok_model_config(provider, model_id, model, endpoint, secret_env_key),
         );
     } else {
         for model_binding in group {
             let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
             model_table.insert(
                 model_id.to_string(),
-                grok_model_config(provider, model_id, endpoint, secret_env_key),
+                grok_model_config(
+                    provider,
+                    model_id,
+                    Some(model_binding),
+                    endpoint,
+                    secret_env_key,
+                ),
             );
         }
     }
@@ -4834,7 +4927,9 @@ mod tests {
                 assert_eq!(model["model"].as_str(), Some("agent-model"));
                 assert_eq!(model["base_url"].as_str(), Some(ENDPOINT));
                 assert_eq!(model["env_key"].as_str(), Some("VIBEX_GROK_API_KEY"));
-                assert_eq!(model["api_backend"].as_str(), Some("responses"));
+                // grok defaults to `chat_completions`; the overlay must follow
+                // the Model's declared protocol instead of pinning `responses`.
+                assert_eq!(model["api_backend"].as_str(), Some("chat_completions"));
                 assert!(model.get("auth_scheme").is_none());
             }
             "hermes" => {
@@ -6218,5 +6313,176 @@ mod tests {
 
         assert_eq!(updated.display_name, "Revision test updated");
         assert_eq!(updated.revision, created.revision + 1);
+    }
+
+    /// Each Agent exposes its own protocol vocabulary, and every selector must
+    /// project the Model's declared wire protocol rather than a fixed default.
+    #[test]
+    fn agent_protocol_selectors_follow_the_declared_wire_protocol() {
+        use vibex_core::{
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE,
+            WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI, WIRE_PROTOCOL_GOOGLE_VERTEX,
+            WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        };
+
+        let (_, _, binding, _) = fixture(ConfigOverlayStrategy::GrokToml);
+        let base = binding.configured_models[0].clone();
+        let with = |protocol: &str| {
+            let mut model = base.clone();
+            model.wire_protocol_id = protocol.to_string();
+            model
+        };
+
+        // grok: `api_backend` defaults to chat_completions upstream, so an
+        // undeclared protocol must not be pinned to `responses`.
+        assert_eq!(grok_api_backend(None), "chat_completions");
+        assert_eq!(
+            grok_api_backend(Some(&with(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS))),
+            "chat_completions"
+        );
+        assert_eq!(
+            grok_api_backend(Some(&with(WIRE_PROTOCOL_OPENAI_RESPONSES))),
+            "responses"
+        );
+        assert_eq!(
+            grok_api_backend(Some(&with(WIRE_PROTOCOL_ANTHROPIC_MESSAGES))),
+            "messages"
+        );
+
+        // Copilot CLI splits its BYOK switch across a provider type and a wire
+        // API; both must follow the Model.
+        assert_eq!(copilot_provider_type(None), "openai");
+        assert_eq!(copilot_wire_api(None), "completions");
+        assert_eq!(
+            copilot_provider_type(Some(&with(WIRE_PROTOCOL_ANTHROPIC_MESSAGES))),
+            "anthropic"
+        );
+        assert_eq!(
+            copilot_wire_api(Some(&with(WIRE_PROTOCOL_ANTHROPIC_MESSAGES))),
+            "completions"
+        );
+        assert_eq!(
+            copilot_wire_api(Some(&with(WIRE_PROTOCOL_OPENAI_RESPONSES))),
+            "responses"
+        );
+
+        // Kimi Code CLI names each chat provider in its `type` key.
+        assert_eq!(
+            kimi_provider_type(&with(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS)),
+            "openai_legacy"
+        );
+        assert_eq!(
+            kimi_provider_type(&with(WIRE_PROTOCOL_OPENAI_RESPONSES)),
+            "openai_responses"
+        );
+        assert_eq!(
+            kimi_provider_type(&with(WIRE_PROTOCOL_ANTHROPIC_MESSAGES)),
+            "anthropic"
+        );
+        assert_eq!(
+            kimi_provider_type(&with(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI)),
+            "google_genai"
+        );
+
+        // pi names the protocol implementation directly in `models.json`.
+        assert_eq!(
+            pi_api_kind(Some(&with(WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI))),
+            "google-generative-ai"
+        );
+        assert_eq!(
+            pi_api_kind(Some(&with(WIRE_PROTOCOL_GOOGLE_VERTEX))),
+            "google-vertex"
+        );
+        assert_eq!(
+            pi_api_kind(Some(&with(WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE))),
+            "bedrock-converse-stream"
+        );
+
+        // OpenCode namespaces its generated provider id by protocol and loads
+        // a different AI SDK adapter per protocol.
+        assert_eq!(
+            opencode_provider_identity("vibex", &with(WIRE_PROTOCOL_GOOGLE_VERTEX)).0,
+            "vibex-google-vertex"
+        );
+
+        // The Provider endpoint key for the Gemini-shaped Agents changes with
+        // the protocol, otherwise a Vertex Model keeps writing the
+        // first-party origin variable.
+        let registry = vibex_core::AgentProviderProjectionRegistry::builtin().unwrap();
+        for agent_id in ["gemini", "antigravity"] {
+            let descriptor = registry
+                .descriptors()
+                .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                environment_base_url_key(&descriptor, None, "GOOGLE_GEMINI_BASE_URL"),
+                "GOOGLE_GEMINI_BASE_URL"
+            );
+            assert_eq!(
+                environment_base_url_key(
+                    &descriptor,
+                    Some(&with(WIRE_PROTOCOL_GOOGLE_VERTEX)),
+                    "GOOGLE_GEMINI_BASE_URL"
+                ),
+                "GOOGLE_VERTEX_BASE_URL"
+            );
+        }
+        assert_eq!(
+            environment_base_url_key(
+                &provider_descriptor("copilot"),
+                Some(&with(WIRE_PROTOCOL_GOOGLE_VERTEX)),
+                "COPILOT_PROVIDER_BASE_URL"
+            ),
+            "COPILOT_PROVIDER_BASE_URL"
+        );
+    }
+
+    /// `COPILOT_PROVIDER_BASE_URL` only enables BYOK mode; the CLI keeps its
+    /// OpenAI/Completions default until the type and wire API are supplied.
+    #[test]
+    fn copilot_projection_carries_the_byok_type_and_wire_api() {
+        use vibex_core::{
+            WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            WIRE_PROTOCOL_OPENAI_RESPONSES,
+        };
+
+        let descriptor = provider_descriptor("copilot");
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::StructuredJsonOverlay);
+        let base = binding.configured_models[0].clone();
+
+        for (protocol, expected_type, expected_wire) in [
+            (
+                WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "openai",
+                "completions",
+            ),
+            (WIRE_PROTOCOL_OPENAI_RESPONSES, "openai", "responses"),
+            (WIRE_PROTOCOL_ANTHROPIC_MESSAGES, "anthropic", "completions"),
+        ] {
+            let mut model = base.clone();
+            model.wire_protocol_id = protocol.to_string();
+            let mut env = BTreeMap::new();
+            apply_agent_projection_defaults(&descriptor, &provider, Some(&model), None, &mut env);
+            assert_eq!(
+                env.get("COPILOT_PROVIDER_TYPE").map(String::as_str),
+                Some(expected_type),
+                "protocol {protocol}"
+            );
+            assert_eq!(
+                env.get("COPILOT_PROVIDER_WIRE_API").map(String::as_str),
+                Some(expected_wire),
+                "protocol {protocol}"
+            );
+        }
+    }
+
+    fn provider_descriptor(agent_id: &str) -> AgentProviderProjectionDescriptor {
+        vibex_core::AgentProviderProjectionRegistry::builtin()
+            .unwrap()
+            .descriptors()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == agent_id)
+            .cloned()
+            .unwrap()
     }
 }

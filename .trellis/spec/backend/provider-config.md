@@ -3525,6 +3525,35 @@ ProviderConfigService::{
   only the adapter/protocol pairs registered for the matching semantic-version
   descriptor. The OpenCode inline-provider contract currently supports
   `>=1.17.9, <2.0.0`; it was exercised against local OpenCode `1.18.11`.
+- A descriptor's `model_interfaces` must list exactly the wire protocols the
+  installed Agent was observed to speak, because that list is the only thing
+  that makes a protocol selectable and it also gates binding validation. The
+  observed API-key-expressible surface is:
+  `claude` = Anthropic Messages only (its Bedrock and Vertex routes authenticate
+  through AWS SigV4 / Google ADC, which `ModelProviderProfile` secrets cannot
+  carry, so they must stay unlisted rather than selectable-but-unusable);
+  `codex` = Responses only; `opencode` = Responses, Chat Completions, Anthropic
+  Messages, Google Generative AI, Google Vertex, Bedrock Converse;
+  `gemini` and `antigravity` = Google Generative AI plus Google Vertex;
+  `kimi` = Chat Completions, Responses, Anthropic Messages, Google Generative AI;
+  `pi` = those four plus Google Vertex and Bedrock Converse; `copilot` = Chat
+  Completions, Responses, Anthropic Messages; `grok` = Chat Completions,
+  Responses, Anthropic Messages; `hermes` = Chat Completions, Responses,
+  Anthropic Messages, Bedrock Converse; `deepseek-harness` = Chat Completions,
+  Responses, Anthropic Messages; `zcode` = Chat Completions, Anthropic Messages;
+  `codebuddy-code` = Chat Completions.
+- Google Vertex is a distinct wire protocol rather than a `google_generative_ai`
+  endpoint, because the Agents that speak both read a different origin variable
+  per protocol (`GOOGLE_GEMINI_BASE_URL` vs `GOOGLE_VERTEX_BASE_URL`) and the
+  SDK appends a different route (`/v1beta/models/...` vs
+  `/v1beta1/publishers/google/models/...`). Writing the first-party variable for
+  a Vertex Model leaves the Agent silently on the wrong route.
+- An Agent that selects its protocol through an environment switch rather than
+  the endpoint must have that switch projected from the selected Model:
+  Copilot CLI's `COPILOT_PROVIDER_TYPE` / `COPILOT_PROVIDER_WIRE_API`, grok's
+  per-model `api_backend`, Kimi Code CLI's `providers.<id>.type`, and pi's
+  `models.json` `providers.<id>.api`. Projecting only the base URL and key
+  leaves each of them on its own default protocol.
 - `AgentCredential` is a discriminated union covering API key, OAuth, AWS, GCP,
   Azure, Snowflake, local, and managed-subscription credentials. Ordinary
   records contain references and status only; plaintext values are resolved

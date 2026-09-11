@@ -1759,6 +1759,7 @@ fn legacy_wire_protocol(
         Some(ProviderModelWireApi::GoogleGenerativeAi) => {
             vibex_core::WIRE_PROTOCOL_GOOGLE_GENERATIVE_AI
         }
+        Some(ProviderModelWireApi::GoogleVertex) => vibex_core::WIRE_PROTOCOL_GOOGLE_VERTEX,
         Some(ProviderModelWireApi::AwsBedrockConverse) => {
             vibex_core::WIRE_PROTOCOL_AWS_BEDROCK_CONVERSE
         }

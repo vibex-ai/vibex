@@ -260,14 +260,16 @@ enum OpenCodeWireApi {
     OpenaiChatCompletions,
     AnthropicMessages,
     GoogleGenerativeAi,
+    GoogleVertex,
     AwsBedrockConverse,
 }
 
-const OPENCODE_WIRE_APIS: [OpenCodeWireApi; 5] = [
+const OPENCODE_WIRE_APIS: [OpenCodeWireApi; 6] = [
     OpenCodeWireApi::OpenaiResponses,
     OpenCodeWireApi::OpenaiChatCompletions,
     OpenCodeWireApi::AnthropicMessages,
     OpenCodeWireApi::GoogleGenerativeAi,
+    OpenCodeWireApi::GoogleVertex,
     OpenCodeWireApi::AwsBedrockConverse,
 ];
 
@@ -15441,6 +15443,7 @@ impl OpenCodeWireApi {
             Self::OpenaiChatCompletions => "@ai-sdk/openai-compatible",
             Self::AnthropicMessages => "@ai-sdk/anthropic",
             Self::GoogleGenerativeAi => "@ai-sdk/google",
+            Self::GoogleVertex => "@ai-sdk/google-vertex",
             Self::AwsBedrockConverse => "@ai-sdk/amazon-bedrock",
         }
     }
@@ -15451,6 +15454,7 @@ impl OpenCodeWireApi {
             Self::OpenaiChatCompletions => "chat",
             Self::AnthropicMessages => "anthropic",
             Self::GoogleGenerativeAi => "google",
+            Self::GoogleVertex => "google-vertex",
             Self::AwsBedrockConverse => "bedrock",
         }
     }
@@ -15462,6 +15466,7 @@ impl OpenCodeWireApi {
             Self::OpenaiChatCompletions => "OpenAI Chat Completions",
             Self::AnthropicMessages => "Anthropic Messages",
             Self::GoogleGenerativeAi => "Google Generative AI",
+            Self::GoogleVertex => "Google Vertex AI",
             Self::AwsBedrockConverse => "AWS Bedrock Converse",
         }
     }
@@ -15474,6 +15479,7 @@ impl From<ProviderModelWireApi> for OpenCodeWireApi {
             ProviderModelWireApi::OpenaiChatCompletions => Self::OpenaiChatCompletions,
             ProviderModelWireApi::AnthropicMessages => Self::AnthropicMessages,
             ProviderModelWireApi::GoogleGenerativeAi => Self::GoogleGenerativeAi,
+            ProviderModelWireApi::GoogleVertex => Self::GoogleVertex,
             ProviderModelWireApi::AwsBedrockConverse => Self::AwsBedrockConverse,
         }
     }
@@ -15901,6 +15907,7 @@ fn provider_model_wire_api_name(wire_api: OpenCodeWireApi) -> &'static str {
         OpenCodeWireApi::OpenaiChatCompletions => "openai_chat_completions",
         OpenCodeWireApi::AnthropicMessages => "anthropic_messages",
         OpenCodeWireApi::GoogleGenerativeAi => "google_generative_ai",
+        OpenCodeWireApi::GoogleVertex => "google_vertex",
         OpenCodeWireApi::AwsBedrockConverse => "aws_bedrock_converse",
     }
 }

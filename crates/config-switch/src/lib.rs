@@ -5639,8 +5639,9 @@ fn run_provider_api_probe(
         vibex_core::ProviderModelWireApi::AnthropicMessages => {
             run_anthropic_api_probe(profile, probe_kind)
         }
-        vibex_core::ProviderModelWireApi::GoogleGenerativeAi => {
-            run_google_generative_ai_probe(profile, probe_kind)
+        vibex_core::ProviderModelWireApi::GoogleGenerativeAi
+        | vibex_core::ProviderModelWireApi::GoogleVertex => {
+            run_google_generative_ai_probe(profile, probe_kind, wire_api)
         }
         vibex_core::ProviderModelWireApi::AwsBedrockConverse => {
             run_bedrock_converse_probe(profile, probe_kind)
@@ -5821,6 +5822,7 @@ fn run_anthropic_api_probe(
 fn run_google_generative_ai_probe(
     profile: &ProviderProfile,
     probe_kind: ProviderApiProbeKind,
+    wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<ProviderApiProbeOutcome> {
     let Some(api_key) = resolved_profile_secret_value(profile)? else {
         return Ok(provider_api_probe_fail(
@@ -5829,10 +5831,7 @@ fn run_google_generative_ai_probe(
             vec![diagnostic("secret", "missing")],
         ));
     };
-    let Some(base_url) = profile_protocol_base_url(
-        profile,
-        vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
-    ) else {
+    let Some(base_url) = profile_protocol_base_url(profile, wire_api) else {
         return Ok(provider_api_probe_fail(
             "agent_model_provider_endpoint_missing",
             "Provider profile is missing an API request URL",
@@ -5843,7 +5842,12 @@ fn run_google_generative_ai_probe(
     match probe_kind {
         ProviderApiProbeKind::ModelList => probe_get_json(
             &client,
-            &google_api_endpoint_candidates(base_url, "models", profile_uses_full_api_url(profile)),
+            &google_endpoint_candidates(
+                base_url,
+                "models",
+                profile_uses_full_api_url(profile),
+                wire_api,
+            ),
             |request| request.header("x-goog-api-key", &api_key),
             "agent_model_provider_model_list_probe_passed",
             "Google model list API request succeeded",
@@ -5864,10 +5868,11 @@ fn run_google_generative_ai_probe(
             let model = encoded_url_path_segment(model)?;
             probe_post_json(
                 &client,
-                &google_api_endpoint_candidates(
+                &google_endpoint_candidates(
                     base_url,
                     &format!("models/{model}:generateContent"),
                     profile_uses_full_api_url(profile),
+                    wire_api,
                 ),
                 serde_json::json!({
                     "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
@@ -6046,8 +6051,12 @@ fn fetch_provider_profile_models(
         Some(vibex_core::ProviderModelWireApi::AnthropicMessages) => {
             fetch_anthropic_profile_models(profile)
         }
-        Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi) => {
-            fetch_google_profile_models(profile)
+        Some(vibex_core::ProviderModelWireApi::GoogleGenerativeAi) => fetch_google_profile_models(
+            profile,
+            vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
+        ),
+        Some(vibex_core::ProviderModelWireApi::GoogleVertex) => {
+            fetch_google_profile_models(profile, vibex_core::ProviderModelWireApi::GoogleVertex)
         }
         Some(vibex_core::ProviderModelWireApi::AwsBedrockConverse) => {
             fetch_bedrock_profile_models(profile)
@@ -6086,6 +6095,7 @@ fn fetch_openai_compatible_profile_models(
 
 fn fetch_google_profile_models(
     profile: &ProviderProfile,
+    wire_api: vibex_core::ProviderModelWireApi,
 ) -> VibexResult<(Vec<String>, Vec<ProviderBindingMetadata>)> {
     let Some(api_key) = resolved_profile_secret_value(profile)? else {
         return Err(VibexError::validation(
@@ -6093,10 +6103,7 @@ fn fetch_google_profile_models(
             "Provider profile is missing an available API key",
         ));
     };
-    let Some(base_url) = profile_protocol_base_url(
-        profile,
-        vibex_core::ProviderModelWireApi::GoogleGenerativeAi,
-    ) else {
+    let Some(base_url) = profile_protocol_base_url(profile, wire_api) else {
         return Err(VibexError::validation(
             "agent_model_provider_endpoint_missing",
             "Provider profile is missing an API request URL",
@@ -6105,9 +6112,27 @@ fn fetch_google_profile_models(
     let client = provider_probe_http_client()?;
     fetch_models_from_endpoints(
         &client,
-        &google_api_endpoint_candidates(base_url, "models", profile_uses_full_api_url(profile)),
+        &google_endpoint_candidates(
+            base_url,
+            "models",
+            profile_uses_full_api_url(profile),
+            wire_api,
+        ),
         |request| request.header("x-goog-api-key", &api_key),
     )
+}
+
+fn google_endpoint_candidates(
+    base_url: &str,
+    path: &str,
+    full_url: bool,
+    wire_api: vibex_core::ProviderModelWireApi,
+) -> Vec<String> {
+    if wire_api == vibex_core::ProviderModelWireApi::GoogleVertex {
+        google_vertex_endpoint_candidates(base_url, path, full_url)
+    } else {
+        google_api_endpoint_candidates(base_url, path, full_url)
+    }
 }
 
 fn fetch_bedrock_profile_models(
@@ -6354,6 +6379,28 @@ fn google_api_endpoint_candidates(base_url: &str, path: &str, full_url: bool) ->
     vec![
         format!("{base}/v1beta/{path}"),
         format!("{base}/v1/{path}"),
+        format!("{base}/{path}"),
+    ]
+}
+
+/// Vertex AI serves the same Gemini models under a `publishers/google` route.
+/// A Provider endpoint may already carry that segment or a version suffix, so
+/// the candidates cover the spellings a user can reasonably paste.
+fn google_vertex_endpoint_candidates(base_url: &str, path: &str, full_url: bool) -> Vec<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if full_url {
+        return vec![base.to_string()];
+    }
+    let path = path.trim_start_matches('/');
+    if base.ends_with("/v1beta1") || base.ends_with("/v1") {
+        return vec![format!("{base}/{path}")];
+    }
+    if base.ends_with("/publishers/google/models") || base.ends_with("/publishers/google") {
+        return vec![format!("{base}/{path}")];
+    }
+    vec![
+        format!("{base}/v1beta1/publishers/google/{path}"),
+        format!("{base}/v1/publishers/google/{path}"),
         format!("{base}/{path}"),
     ]
 }
