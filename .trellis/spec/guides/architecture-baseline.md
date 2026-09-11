@@ -166,11 +166,22 @@ in `docs/remote/protocol-v2.md`.
 The desktop workbench participates in both seats. Natively it fills the
 authority role through `NativeBackend`; paired with a headless runtime it
 drives the identical facade through `WebRemoteBackend` (the "Remote Runtime"
-settings page, credential store under the desktop home). Authority-local
-concerns — the code-workbench file/git panels, composer terminals, message
-editing, durable submission locators — degrade with explicit messages in
-remote-client mode instead of silently failing. Live updates arrive through
-the same `BackendEvent` pump mapped onto the desktop event pipeline.
+settings page, credential store under the desktop home). Every Config Center
+section — Agents, provider settings, MCP/Skills/Prompts/Hooks, scheduled tasks,
+automation, device management and recovery (diagnostic export plus database
+backup) — runs through that facade, so the remote runtime serves it; the
+recovery artifacts themselves are written where the runtime data lives and the
+client displays the reported path. Agent account authentication,
+including the legacy per-Agent sign-in and its stored environment credentials,
+travels the same way.
+
+Operations that genuinely belong to the machine in front of the user stay
+local and degrade with explicit messages instead of silently failing: the
+desktop's own self-update, remote-access connectivity/pairing setup, durable
+submission locators, and reading a stored provider credential back into a form
+(a paired runtime never returns stored secrets, so the field opens empty and a
+typed value replaces it). Live updates arrive through the same `BackendEvent`
+pump mapped onto the desktop event pipeline.
 
 Provider credentials belong to the runtime database. In cloud mode the
 operator's own host stores them, which is the accepted single-user threat

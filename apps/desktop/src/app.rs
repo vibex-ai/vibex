@@ -14846,7 +14846,9 @@ impl VibexWorkbench {
                         if this.composer_submission_locators.is_empty() {
                             return None;
                         }
-                        let runtime = this.runtime.clone()?;
+                        // The submission record lives with whichever runtime
+                        // accepted the message, so the poll asks the backend.
+                        let backend = this.backend.clone()?;
                         let session_id = this.selected_session_id.clone()?;
                         let locators = this
                             .composer_submission_locators
@@ -14854,11 +14856,11 @@ impl VibexWorkbench {
                             .filter(|locator| locator.session_id == session_id)
                             .cloned()
                             .collect::<Vec<_>>();
-                        Some((runtime, locators))
+                        Some((backend, locators))
                     }) else {
                         break;
                     };
-                    let Some((runtime, locators)) = gathered else {
+                    let Some((backend, locators)) = gathered else {
                         let stop = entity
                             .update_in(cx, |this, _, _| {
                                 this.composer_submission_locators.is_empty()
@@ -14876,15 +14878,15 @@ impl VibexWorkbench {
                         gpui_tokio::Tokio::spawn(cx, async move {
                             let mut states = Vec::new();
                             for locator in locators {
-                                if let Ok(state) = runtime
+                                if let Ok(state) = backend
                                     .agent()
-                                    .message_submission()
-                                    .get_submission(&GetMessageSubmissionRequest {
+                                    .agent_message_submission(GetMessageSubmissionRequest {
                                         session_id: locator.session_id.clone(),
                                         message_idempotency_key: locator
                                             .message_idempotency_key
                                             .clone(),
                                     })
+                                    .await
                                 {
                                     states.push(state);
                                 }
@@ -17475,8 +17477,8 @@ impl VibexWorkbench {
         if self.agent_action_pending {
             return;
         }
-        let (Some(runtime), Some(session_id)) =
-            (self.runtime.clone(), self.selected_session_id.clone())
+        let (Some(backend), Some(session_id)) =
+            (self.backend.clone(), self.selected_session_id.clone())
         else {
             return;
         };
@@ -17528,9 +17530,12 @@ impl VibexWorkbench {
         let generation = self.session_generation;
         let interrupted_session_id = session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let manager = runtime.agent().manager();
-            manager.interrupt(&session_id).await?;
-            Ok::<_, vibex_core::VibexError>(manager.get_session(&session_id).await.ok())
+            backend
+                .agent()
+                .interrupt(MutationRequest::new(session_id.clone()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            Ok::<_, vibex_core::VibexError>(backend.agent().open_session(session_id).await.ok())
         });
         self.agent_action_task = Some(cx.spawn_in(
             window,

@@ -3847,6 +3847,20 @@ impl ManagementCenter {
     ) {
         let Some(runtime) = self.runtime.clone() else {
             self.profile_secret_loading = false;
+            // A paired runtime never hands stored secrets back over the wire,
+            // so the editor opens empty and a typed value replaces the stored
+            // one. Say that instead of leaving the field silently blank.
+            self.profile_secret_touched = false;
+            self.projection_editor.set_secret_intent(false, false);
+            self.notice = Some(
+                management_locale_text(
+                    "Stored credentials stay on the connected runtime; enter a new value to replace them",
+                    "已保存的凭据保留在连接的运行时上，输入新值即可替换",
+                    "已儲存的憑證保留在連線的執行階段上，輸入新值即可取代",
+                )
+                .to_string(),
+            );
+            cx.notify();
             return;
         };
         let expected_agent_id = agent_id.as_str().to_string();
@@ -9299,7 +9313,9 @@ impl ManagementCenter {
         let pending = self.mutation.is_some()
             || selected_agent_pending
             || self.agent_auth_terminal_state == Some(AgentAuthTerminalState::Running);
-        let auth_available = self.runtime.is_some() && self.current_agent_auth_scope().is_some();
+        // Agent account authentication rides the backend contract, so a paired
+        // runtime serves it too; only the scope is a local selection.
+        let auth_available = self.backend.is_some() && self.current_agent_auth_scope().is_some();
         let catalog = self.agent_auth_catalog.clone();
         let context = self.agent_auth_context.clone();
         let status = if !auth_available {
