@@ -3205,8 +3205,30 @@ impl ManagementCenter {
         self.start_agent_refresh(cx);
     }
 
+    /// Reports that this authority does not serve the management reads yet.
+    ///
+    /// A paired remote runtime holds no local handle, so the sections whose
+    /// aggregated snapshot still loads through one are explicitly unavailable
+    /// rather than silently inert.
+    fn note_management_reads_unavailable(&mut self, cx: &mut Context<Self>) {
+        if self.backend.is_some() {
+            self.loading = false;
+            self.details_ready = false;
+            self.notice = Some(
+                management_locale_text(
+                    "This runtime does not serve Config Center reads yet. Agent authentication, model providers, MCP, Skills, Prompts, Hooks, Scheduled tasks, and Automation are unavailable until it does.",
+                    "当前运行时尚未提供配置中心读取接口。在补齐之前，Agent 认证、模型提供商、MCP、Skills、提示词、Hook、定时任务与自动化均不可用。",
+                    "目前執行階段尚未提供配置中心讀取介面。在補齊之前，Agent 驗證、模型提供商、MCP、Skills、提示詞、Hook、排程任務與自動化均無法使用。",
+                )
+                .to_string(),
+            );
+        }
+        cx.notify();
+    }
+
     fn start_agent_refresh(&mut self, cx: &mut Context<Self>) {
         let Some(runtime) = self.runtime.clone() else {
+            self.note_management_reads_unavailable(cx);
             return;
         };
         self.generation = self.generation.saturating_add(1);
@@ -3543,6 +3565,7 @@ impl ManagementCenter {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
+            self.note_management_reads_unavailable(cx);
             return;
         };
         let background = cx.background_executor().clone();
@@ -4103,6 +4126,7 @@ impl ManagementCenter {
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
+            self.note_management_reads_unavailable(cx);
             return;
         };
         let active_locale = locale::current_locale();
