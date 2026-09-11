@@ -1236,6 +1236,66 @@ impl vibex_remote::RemoteManagementSnapshotSource for ManagementSnapshotSource {
     }
 }
 
+/// Serves diagnostic export and database backup to the gateway.
+///
+/// Like the Config Center read bundle, these handles only exist once the
+/// runtime is built, so the slot is filled after construction.
+pub struct RecoverySource {
+    management: Arc<std::sync::OnceLock<ManagementHandle>>,
+}
+
+impl RecoverySource {
+    pub fn new() -> (Self, Arc<std::sync::OnceLock<ManagementHandle>>) {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        (
+            Self {
+                management: cell.clone(),
+            },
+            cell,
+        )
+    }
+
+    fn management(&self) -> VibexResult<&ManagementHandle> {
+        self.management.get().ok_or_else(|| {
+            VibexError::process(
+                "desktop_management_handle_unavailable",
+                "the runtime management handle is not installed yet",
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl vibex_remote::RemoteRecoverySource for RecoverySource {
+    async fn export_diagnostics(
+        &self,
+        payload: vibex_core::DiagnosticExportPayload,
+    ) -> VibexResult<vibex_core::DiagnosticExportOutcome> {
+        self.management()?.export_diagnostics(payload)
+    }
+
+    async fn backup_create(
+        &self,
+        payload: vibex_core::BackupCreatePayload,
+    ) -> VibexResult<vibex_core::BackupCreateOutcome> {
+        self.management()?.backup_create(payload)
+    }
+
+    async fn backup_inspect(
+        &self,
+        payload: vibex_core::BackupInspectPayload,
+    ) -> VibexResult<vibex_core::BackupInspectOutcome> {
+        self.management()?.backup_inspect(payload)
+    }
+
+    async fn backup_restore(
+        &self,
+        payload: vibex_core::BackupRestorePayload,
+    ) -> VibexResult<vibex_core::BackupRestoreOutcome> {
+        self.management()?.backup_restore(payload)
+    }
+}
+
 /// Serves managed-Agent installation to the gateway.
 pub struct AgentInstallSource {
     agent: AgentHandle,
@@ -1588,6 +1648,103 @@ impl ManagementHandle {
         self.home_dir.join("diagnostics.json")
     }
 
+    /// Writes a redacted diagnostic bundle and reports where it landed.
+    ///
+    /// The export aborts rather than write a bundle that fails the redaction
+    /// sentinel gate, so a successful call is always redaction-verified.
+    pub fn export_diagnostics(
+        &self,
+        payload: vibex_core::DiagnosticExportPayload,
+    ) -> VibexResult<vibex_core::DiagnosticExportOutcome> {
+        let destination = self.diagnostics_destination();
+        self.diagnostics
+            .export_to_path(payload.request.unwrap_or_default(), destination.as_path())?;
+        Ok(vibex_core::DiagnosticExportOutcome {
+            destination: destination.display().to_string(),
+            redaction_verified: true,
+        })
+    }
+
+    pub fn backup_create(
+        &self,
+        payload: vibex_core::BackupCreatePayload,
+    ) -> VibexResult<vibex_core::BackupCreateOutcome> {
+        let destination = self.resolve_backup_path(
+            payload.destination,
+            vibex_core::unix_timestamp_ms().to_string(),
+        );
+        let result = self.backup.create(destination)?;
+        Ok(vibex_core::BackupCreateOutcome {
+            backup_dir: result.backup_dir.display().to_string(),
+        })
+    }
+
+    pub fn backup_inspect(
+        &self,
+        payload: vibex_core::BackupInspectPayload,
+    ) -> VibexResult<vibex_core::BackupInspectOutcome> {
+        let backup_dir = self.resolve_backup_path(payload.backup_dir, "manual");
+        let inspection = self.backup.inspect(backup_dir.as_path())?;
+        Ok(vibex_core::BackupInspectOutcome {
+            backup_dir: inspection.backup_dir.display().to_string(),
+            database_schema_version: inspection.database_schema_version,
+            migration_compatibility: match inspection.migration_compatibility {
+                vibex_backup::MigrationCompatibility::Ready => {
+                    vibex_core::BackupMigrationCompatibility::Ready
+                }
+                vibex_backup::MigrationCompatibility::MigrationRequired => {
+                    vibex_core::BackupMigrationCompatibility::MigrationRequired
+                }
+                vibex_backup::MigrationCompatibility::UnsupportedNewerSchema => {
+                    vibex_core::BackupMigrationCompatibility::UnsupportedNewerSchema
+                }
+                vibex_backup::MigrationCompatibility::Invalid => {
+                    vibex_core::BackupMigrationCompatibility::Invalid
+                }
+            },
+        })
+    }
+
+    pub fn backup_restore(
+        &self,
+        payload: vibex_core::BackupRestorePayload,
+    ) -> VibexResult<vibex_core::BackupRestoreOutcome> {
+        let backup_dir = self.resolve_backup_path(payload.backup_dir, "manual");
+        let target_db_path = payload
+            .target_db_path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                self.backup
+                    .database_path()
+                    .with_file_name("management-restored.db")
+            });
+        let result = self.backup.restore(backup_dir, target_db_path)?;
+        Ok(vibex_core::BackupRestoreOutcome {
+            target_db_path: result.target_db_path.display().to_string(),
+            status: match result.status {
+                vibex_backup::BackupRestoreStatus::Restored => {
+                    vibex_core::BackupRestoreOutcomeStatus::Restored
+                }
+                vibex_backup::BackupRestoreStatus::RestoredMigrated => {
+                    vibex_core::BackupRestoreOutcomeStatus::RestoredMigrated
+                }
+            },
+        })
+    }
+
+    /// Resolves a caller-supplied recovery path, falling back to the
+    /// authority's own home-directory layout.
+    fn resolve_backup_path(
+        &self,
+        explicit: Option<String>,
+        default_suffix: impl AsRef<str>,
+    ) -> PathBuf {
+        match explicit {
+            Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => self.backup_destination(default_suffix),
+        }
+    }
+
     pub fn backup_destination(&self, suffix: impl AsRef<str>) -> PathBuf {
         let safe_suffix: String = suffix
             .as_ref()
@@ -1860,6 +2017,7 @@ impl DesktopRuntime {
                 .with_worktree_snapshot_source(Arc::new(git.clone())),
         );
         let management_snapshot_cell;
+        let recovery_cell;
         let sidebar_organization = SidebarOrganizationBridge::new();
         let timeline_display_settings = TimelineDisplaySettingsBridge::new();
         let remote_dispatcher = remote_dispatcher
@@ -1882,6 +2040,11 @@ impl DesktopRuntime {
             .with_management_snapshot_source({
                 let (source, cell) = ManagementSnapshotSource::new();
                 management_snapshot_cell = cell;
+                Arc::new(source)
+            })
+            .with_recovery_source({
+                let (source, cell) = RecoverySource::new();
+                recovery_cell = cell;
                 Arc::new(source)
             })
             .with_automation_source(Arc::new(AutomationSource::new(AutomationHandle {
@@ -2001,6 +2164,7 @@ impl DesktopRuntime {
                 .push(task);
         }
         let _ = management_snapshot_cell.set(runtime.management());
+        let _ = recovery_cell.set(runtime.management());
         startup_stage("usage_consumer_start", || {
             runtime.spawn_usage_consumer(usage_receiver)
         })?;

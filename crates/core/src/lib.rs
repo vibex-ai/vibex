@@ -22,6 +22,7 @@ pub mod local_history;
 pub mod permission;
 pub mod provider;
 pub mod provider_projection;
+pub mod recovery;
 pub mod relay;
 pub mod remote;
 pub mod remote_v2;
@@ -237,6 +238,7 @@ pub use provider::{
     SkillValidateRequest, SkillValidationResult, SkillValidationStatus,
 };
 pub use provider_projection::*;
+pub use recovery::*;
 pub use relay::{
     RelayBridgeMessage, RelayControlMessage, RelayDeepLink, RelayEncryptedFrame, RelayError,
     RelayErrorCode, RelayFrameKind, RelayHandshakeHello, RelayHandshakeReady, RelayHeartbeat,

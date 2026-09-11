@@ -133,6 +133,7 @@ struct RemoteRouterState {
     automation: Option<Arc<dyn RemoteAutomationSource>>,
     management_snapshot: Option<Arc<dyn RemoteManagementSnapshotSource>>,
     agent_install: Option<Arc<dyn RemoteAgentInstallSource>>,
+    recovery: Option<Arc<dyn RemoteRecoverySource>>,
     sidebar_organization: Option<Arc<dyn RemoteSidebarOrganizationSource>>,
     workbench: Option<RemoteWorkbenchRuntime>,
     provider: Option<RemoteProviderRuntime>,
@@ -394,6 +395,33 @@ pub trait RemoteAgentInstallSource: Send + Sync {
     async fn delete_agent_auth_catalog(&self, agent_id: vibex_core::AgentId) -> VibexResult<()>;
 }
 
+/// Authority-side diagnostic export and database backup.
+///
+/// Both operations write to the authority's home directory, which the gateway
+/// cannot reach, so the runtime installs this source.
+#[async_trait]
+pub trait RemoteRecoverySource: Send + Sync {
+    async fn export_diagnostics(
+        &self,
+        payload: vibex_core::DiagnosticExportPayload,
+    ) -> VibexResult<vibex_core::DiagnosticExportOutcome>;
+
+    async fn backup_create(
+        &self,
+        payload: vibex_core::BackupCreatePayload,
+    ) -> VibexResult<vibex_core::BackupCreateOutcome>;
+
+    async fn backup_inspect(
+        &self,
+        payload: vibex_core::BackupInspectPayload,
+    ) -> VibexResult<vibex_core::BackupInspectOutcome>;
+
+    async fn backup_restore(
+        &self,
+        payload: vibex_core::BackupRestorePayload,
+    ) -> VibexResult<vibex_core::BackupRestoreOutcome>;
+}
+
 #[async_trait]
 pub trait RemoteManagementSnapshotSource: Send + Sync {
     async fn management_snapshot(
@@ -497,6 +525,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
@@ -519,6 +548,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: None,
@@ -546,6 +576,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
@@ -575,6 +606,7 @@ impl RemoteRouterState {
             scheduled_tasks: None,
             automation: None,
             agent_install: None,
+            recovery: None,
             management_snapshot: None,
             sidebar_organization: None,
             workbench: Some(workbench),
@@ -734,6 +766,19 @@ impl RemoteDispatcher {
 
     pub fn has_management_snapshot_source(&self) -> bool {
         self.state.management_snapshot.is_some()
+    }
+
+    pub fn has_recovery_source(&self) -> bool {
+        self.state.recovery.is_some()
+    }
+
+    pub fn recovery_source(&self) -> Option<&Arc<dyn RemoteRecoverySource>> {
+        self.state.recovery.as_ref()
+    }
+
+    pub fn with_recovery_source(mut self, source: Arc<dyn RemoteRecoverySource>) -> Self {
+        self.state.recovery = Some(source);
+        self
     }
 
     pub fn with_sidebar_organization_source(
@@ -7319,6 +7364,7 @@ mod tests {
                 automation: None,
                 management_snapshot: None,
                 agent_install: None,
+                recovery: None,
                 sidebar_organization: None,
                 workbench: None,
                 provider: None,

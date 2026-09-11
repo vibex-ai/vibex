@@ -87,6 +87,11 @@ pub enum BackendOperation {
     DeviceList,
     DeviceRevoke,
     DeviceAudit,
+    /// Authority-local recovery: diagnostic export and database backup.
+    RecoveryDiagnosticsExport,
+    RecoveryBackupCreate,
+    RecoveryBackupInspect,
+    RecoveryBackupRestore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +253,10 @@ impl BackendCapabilitySnapshot {
                 DeviceList,
                 DeviceRevoke,
                 DeviceAudit,
+                RecoveryDiagnosticsExport,
+                RecoveryBackupCreate,
+                RecoveryBackupInspect,
+                RecoveryBackupRestore,
             ]),
         }
     }

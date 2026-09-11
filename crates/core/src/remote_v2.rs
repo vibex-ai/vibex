@@ -1140,6 +1140,10 @@ pub enum RemoteDeviceOperationKind {
     ListDevices,
     RevokeDevice,
     ListAudit,
+    ExportDiagnostics,
+    BackupCreate,
+    BackupInspect,
+    BackupRestore,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1241,6 +1245,10 @@ pub enum RemoteDeviceRequest {
     ListDevices(RemoteDeviceListRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
     ListAudit(RemoteDeviceAuditListRequest),
+    ExportDiagnostics(RemoteDeviceDiagnosticsExportRequest),
+    BackupCreate(RemoteDeviceBackupCreateRequest),
+    BackupInspect(RemoteDeviceBackupInspectRequest),
+    BackupRestore(RemoteDeviceBackupRestoreRequest),
 }
 
 /// Reads the trust-service audit trail for paired devices.
@@ -1260,6 +1268,61 @@ pub struct RemoteDeviceAuditListResponse {
     pub records: Vec<crate::remote::RemoteAuditRecord>,
 }
 
+/// Recovery operations run on the authority: the diagnostic bundle and the
+/// database backup both live next to the runtime data, so the client sends
+/// intent and reads back the path the authority used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceDiagnosticsExportRequest {
+    pub auth: RemoteAuthProof,
+    pub payload: crate::DiagnosticExportPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceDiagnosticsExportResponse {
+    pub outcome: crate::DiagnosticExportOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupCreateRequest {
+    pub auth: RemoteAuthProof,
+    pub payload: crate::BackupCreatePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupCreateResponse {
+    pub outcome: crate::BackupCreateOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupInspectRequest {
+    pub auth: RemoteAuthProof,
+    pub payload: crate::BackupInspectPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupInspectResponse {
+    pub outcome: crate::BackupInspectOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupRestoreRequest {
+    pub auth: RemoteAuthProof,
+    pub payload: crate::BackupRestorePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceBackupRestoreResponse {
+    pub outcome: crate::BackupRestoreOutcome,
+}
+
 impl RemoteDeviceRequest {
     pub const fn operation_kind(&self) -> RemoteDeviceOperationKind {
         match self {
@@ -1268,6 +1331,10 @@ impl RemoteDeviceRequest {
             Self::ListDevices(_) => RemoteDeviceOperationKind::ListDevices,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
             Self::ListAudit(_) => RemoteDeviceOperationKind::ListAudit,
+            Self::ExportDiagnostics(_) => RemoteDeviceOperationKind::ExportDiagnostics,
+            Self::BackupCreate(_) => RemoteDeviceOperationKind::BackupCreate,
+            Self::BackupInspect(_) => RemoteDeviceOperationKind::BackupInspect,
+            Self::BackupRestore(_) => RemoteDeviceOperationKind::BackupRestore,
         }
     }
 }

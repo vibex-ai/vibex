@@ -29,8 +29,10 @@ use vibex_core::{
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
     AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
+    BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
     GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
@@ -5221,6 +5223,109 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn export_diagnostics(
+        &self,
+        request: MutationRequest<DiagnosticExportPayload>,
+    ) -> BackendFuture<'_, DiagnosticExportOutcome> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteDeviceRequest::ExportDiagnostics(
+                vibex_core::RemoteDeviceDiagnosticsExportRequest {
+                    auth: this.auth(),
+                    payload: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceDiagnosticsExportResponse>(value)?.outcome)
+        })
+    }
+
+    fn backup_create(
+        &self,
+        request: MutationRequest<BackupCreatePayload>,
+    ) -> BackendFuture<'_, BackupCreateOutcome> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::BackupCreate(vibex_core::RemoteDeviceBackupCreateRequest {
+                    auth: this.auth(),
+                    payload: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceBackupCreateResponse>(value)?.outcome)
+        })
+    }
+
+    fn backup_inspect(
+        &self,
+        request: BackupInspectPayload,
+    ) -> BackendFuture<'_, BackupInspectOutcome> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteDeviceRequest::BackupInspect(vibex_core::RemoteDeviceBackupInspectRequest {
+                    auth: this.auth(),
+                    payload: request,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceBackupInspectResponse>(value)?.outcome)
+        })
+    }
+
+    fn backup_restore(
+        &self,
+        request: MutationRequest<BackupRestorePayload>,
+    ) -> BackendFuture<'_, BackupRestoreOutcome> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::BackupRestore(vibex_core::RemoteDeviceBackupRestoreRequest {
+                    auth: this.auth(),
+                    payload: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteDeviceBackupRestoreResponse>(value)?.outcome)
+        })
+    }
+
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
         self.unsupported(
             "remote_relay_status_unavailable",
@@ -5407,6 +5512,7 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
     let has_scheduled_tasks = features.contains("scheduled_tasks");
     let has_automation = features.contains("automation");
     let has_device = features.contains("device_management");
+    let has_recovery = features.contains("recovery");
     let has_device_pairing = features.contains("device_pairing");
     let permits = |action: RemoteActionClass| {
         info.and_then(|info| {
@@ -5762,6 +5868,22 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 (
                     BackendOperation::DeviceAudit,
                     permits(RemoteActionClass::ReadDeviceManagement),
+                ),
+                (
+                    BackendOperation::RecoveryDiagnosticsExport,
+                    has_recovery && permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::RecoveryBackupCreate,
+                    has_recovery && permits(RemoteActionClass::MutateDeviceManagement),
+                ),
+                (
+                    BackendOperation::RecoveryBackupInspect,
+                    has_recovery && permits(RemoteActionClass::ReadDeviceManagement),
+                ),
+                (
+                    BackendOperation::RecoveryBackupRestore,
+                    has_recovery && permits(RemoteActionClass::MutateDeviceManagement),
                 ),
             ])
         } else {

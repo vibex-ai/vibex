@@ -20,8 +20,10 @@ use vibex_core::{
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
     AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
+    AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
+    BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
+    CustomAgentCreateRequest, CustomAgentDeleteRequest, DiagnosticExportOutcome,
+    DiagnosticExportPayload, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
     HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
     McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
@@ -271,6 +273,30 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: ManagementSnapshotPayload,
     ) -> BackendFuture<'_, RemoteProviderManagementSnapshot>;
+
+    /// Writes a redacted diagnostic bundle on the authority.
+    fn export_diagnostics(
+        &self,
+        request: MutationRequest<DiagnosticExportPayload>,
+    ) -> BackendFuture<'_, DiagnosticExportOutcome>;
+
+    /// Creates a database backup on the authority.
+    fn backup_create(
+        &self,
+        request: MutationRequest<BackupCreatePayload>,
+    ) -> BackendFuture<'_, BackupCreateOutcome>;
+
+    /// Inspects a backup directory on the authority.
+    fn backup_inspect(
+        &self,
+        request: BackupInspectPayload,
+    ) -> BackendFuture<'_, BackupInspectOutcome>;
+
+    /// Restores a backup into a new database on the authority.
+    fn backup_restore(
+        &self,
+        request: MutationRequest<BackupRestorePayload>,
+    ) -> BackendFuture<'_, BackupRestoreOutcome>;
 
     fn run_capability_probes(
         &self,

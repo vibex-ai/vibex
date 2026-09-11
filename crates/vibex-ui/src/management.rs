@@ -1177,7 +1177,9 @@ mod tests {
         AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
         AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
         AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
-        ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
+        BackupCreateOutcome, BackupCreatePayload, BackupInspectOutcome, BackupInspectPayload,
+        BackupRestoreOutcome, BackupRestorePayload, DiagnosticExportOutcome,
+        DiagnosticExportPayload, ManagementSnapshotPayload, McpServer, McpServerAgentMatrix,
         McpServerAgentMatrixListRequest, McpServerCreateRequest, McpServerDeleteRequest,
         McpServerDiscoverRequest, McpServerDiscoveryResponse, McpServerImportRequest,
         McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
@@ -1766,6 +1768,34 @@ mod tests {
             &self,
             _request: ManagementSnapshotPayload,
         ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
+            error_future()
+        }
+
+        fn export_diagnostics(
+            &self,
+            _request: MutationRequest<DiagnosticExportPayload>,
+        ) -> BackendFuture<'_, DiagnosticExportOutcome> {
+            error_future()
+        }
+
+        fn backup_create(
+            &self,
+            _request: MutationRequest<BackupCreatePayload>,
+        ) -> BackendFuture<'_, BackupCreateOutcome> {
+            error_future()
+        }
+
+        fn backup_inspect(
+            &self,
+            _request: BackupInspectPayload,
+        ) -> BackendFuture<'_, BackupInspectOutcome> {
+            error_future()
+        }
+
+        fn backup_restore(
+            &self,
+            _request: MutationRequest<BackupRestorePayload>,
+        ) -> BackendFuture<'_, BackupRestoreOutcome> {
             error_future()
         }
 

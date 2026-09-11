@@ -46,6 +46,7 @@ use vibex_core::{
     AutomationGraphCreateRequest, AutomationGraphId, AutomationGraphStatus, AutomationRun,
     AutomationRunCancelRequest, AutomationRunId, AutomationRunResumeRequest,
     AutomationRunStartRequest, AutomationRunStatus, AutomationRunStep, AutomationRunTrigger,
+    BackupCreatePayload, BackupInspectPayload, BackupRestorePayload, DiagnosticExportPayload,
     ProviderKind, ScheduledTask, ScheduledTaskCreateRequest, ScheduledTaskId,
     ScheduledTaskIntervalSchedule, ScheduledTaskRun, ScheduledTaskSchedule,
     TerminalAuthActionDescriptor, VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
@@ -426,6 +427,9 @@ struct ManagementTaskSuccess {
     message: String,
     agent_install_state: Option<(AgentId, vibex_core::AgentManagedInstallState)>,
     provider_profiles: Vec<vibex_core::ProviderProfile>,
+    /// Path the authority resolved for a recovery operation, echoed back so
+    /// the Recovery panel can show where the artifact actually landed.
+    recovery_destination: Option<String>,
 }
 
 impl ManagementTaskSuccess {
@@ -438,6 +442,7 @@ impl ManagementTaskSuccess {
             message,
             agent_install_state: Some((agent_id, state)),
             provider_profiles: Vec::new(),
+            recovery_destination: None,
         }
     }
 
@@ -449,6 +454,16 @@ impl ManagementTaskSuccess {
             message,
             agent_install_state: None,
             provider_profiles,
+            recovery_destination: None,
+        }
+    }
+
+    fn with_recovery_destination(message: String, destination: String) -> Self {
+        Self {
+            message,
+            agent_install_state: None,
+            provider_profiles: Vec::new(),
+            recovery_destination: Some(destination),
         }
     }
 }
@@ -459,6 +474,7 @@ impl From<String> for ManagementTaskSuccess {
             message,
             agent_install_state: None,
             provider_profiles: Vec::new(),
+            recovery_destination: None,
         }
     }
 }
@@ -3631,7 +3647,7 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
@@ -3650,25 +3666,27 @@ impl ManagementCenter {
         self.diagnostics.status = "exporting".into();
         self.diagnostics.error_code = None;
         let entity = cx.weak_entity();
-        let management = runtime.management();
-        let management_for_runner = management.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let destination = management_for_runner.diagnostics_destination();
-            management_for_runner
-                .diagnostics()
-                .export_to_path(vibex_core::DiagnosticBundleRequest::default(), &destination)?;
-            Ok::<_, VibexError>("diagnostics exported with redaction verification".to_string())
+            let outcome = backend
+                .management()
+                .export_diagnostics(MutationRequest::new(DiagnosticExportPayload::default()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            Ok::<_, VibexError>((
+                outcome.destination,
+                outcome.redaction_verified,
+                "diagnostics exported with redaction verification".to_string(),
+            ))
         });
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.mutation = None;
                 match outcome {
-                    Ok(Ok(message)) => {
+                    Ok(Ok((destination, redaction_verified, message))) => {
                         this.diagnostics.status = "succeeded".into();
-                        this.diagnostics.redaction_verified = true;
-                        this.diagnostics.destination =
-                            Some(management.diagnostics_destination().display().to_string());
+                        this.diagnostics.redaction_verified = redaction_verified;
+                        this.diagnostics.destination = Some(destination);
                         this.notice = Some(format!("{key}: {message}"));
                         this.refresh(cx);
                     }
@@ -5858,6 +5876,9 @@ impl ManagementCenter {
                                 this.recovery.phase = "succeeded".into();
                                 this.recovery.progress_percent = 100;
                                 this.recovery.error_code = None;
+                                if let Some(destination) = &success.recovery_destination {
+                                    this.recovery.destination = Some(destination.clone());
+                                }
                             }
                             _ => {}
                         }
@@ -14416,125 +14437,115 @@ impl ManagementCenter {
     }
 
     fn begin_backup_create(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let raw_path = self.backup_path.read(cx).value().trim().to_string();
-        let backup_dir = if raw_path.is_empty() {
-            runtime
-                .management()
-                .backup_destination(unix_timestamp_ms().to_string())
-        } else {
-            PathBuf::from(raw_path)
-        };
         self.recovery = RecoveryOperationState {
             operation: "backup_create".into(),
             phase: "copying".into(),
             progress_percent: 20,
-            destination: Some(backup_dir.display().to_string()),
+            destination: Some(raw_path.clone()),
             rollback_available: false,
             error_code: None,
         };
         let active_locale = locale::current_locale();
-        self.begin_simple_task(ManagementMutation::BackupCreate, cx, async move {
-            runtime
+        self.begin_task_with_success(ManagementMutation::BackupCreate, cx, async move {
+            let outcome = backend
                 .management()
-                .backup()
-                .create(backup_dir)
-                .map(|result| match active_locale {
-                    ResolvedLocale::En => {
-                        format!("Backup created at {}", result.backup_dir.display())
-                    }
-                    ResolvedLocale::ZhCn => {
-                        format!("备份已创建：{}", result.backup_dir.display())
-                    }
-                    ResolvedLocale::ZhTw => {
-                        format!("備份已建立：{}", result.backup_dir.display())
-                    }
-                })
+                .backup_create(MutationRequest::new(BackupCreatePayload {
+                    destination: (!raw_path.is_empty()).then_some(raw_path),
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let message = match active_locale {
+                ResolvedLocale::En => format!("Backup created at {}", outcome.backup_dir),
+                ResolvedLocale::ZhCn => format!("备份已创建：{}", outcome.backup_dir),
+                ResolvedLocale::ZhTw => format!("備份已建立：{}", outcome.backup_dir),
+            };
+            Ok(ManagementTaskSuccess::with_recovery_destination(
+                message,
+                outcome.backup_dir,
+            ))
         });
     }
 
     fn begin_backup_inspect(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let raw_path = self.backup_path.read(cx).value().trim().to_string();
-        let backup_dir = if raw_path.is_empty() {
-            runtime.management().backup_destination("manual")
-        } else {
-            PathBuf::from(raw_path)
-        };
         self.recovery = RecoveryOperationState {
             operation: "backup_inspect".into(),
             phase: "validating".into(),
             progress_percent: 10,
-            destination: Some(backup_dir.display().to_string()),
+            destination: Some(raw_path.clone()),
             rollback_available: false,
             error_code: None,
         };
         let active_locale = locale::current_locale();
-        self.begin_simple_task(ManagementMutation::BackupInspect, cx, async move {
-            runtime
+        self.begin_task_with_success(ManagementMutation::BackupInspect, cx, async move {
+            let outcome = backend
                 .management()
-                .backup()
-                .inspect(&backup_dir)
-                .map(|inspection| match active_locale {
-                    ResolvedLocale::En => format!(
-                        "Backup verified: schema {}, {:?}",
-                        inspection.database_schema_version, inspection.migration_compatibility
-                    ),
-                    ResolvedLocale::ZhCn => format!(
-                        "备份验证通过：数据库结构版本 {}，{:?}",
-                        inspection.database_schema_version, inspection.migration_compatibility
-                    ),
-                    ResolvedLocale::ZhTw => format!(
-                        "備份驗證通過：資料庫結構版本 {}，{:?}",
-                        inspection.database_schema_version, inspection.migration_compatibility
-                    ),
+                .backup_inspect(BackupInspectPayload {
+                    backup_dir: (!raw_path.is_empty()).then_some(raw_path),
                 })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let message = match active_locale {
+                ResolvedLocale::En => format!(
+                    "Backup verified: schema {}, {:?}",
+                    outcome.database_schema_version, outcome.migration_compatibility
+                ),
+                ResolvedLocale::ZhCn => format!(
+                    "备份验证通过：数据库结构版本 {}，{:?}",
+                    outcome.database_schema_version, outcome.migration_compatibility
+                ),
+                ResolvedLocale::ZhTw => format!(
+                    "備份驗證通過：資料庫結構版本 {}，{:?}",
+                    outcome.database_schema_version, outcome.migration_compatibility
+                ),
+            };
+            Ok(ManagementTaskSuccess::with_recovery_destination(
+                message,
+                outcome.backup_dir,
+            ))
         });
     }
 
     fn begin_backup_restore(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let raw_backup = self.backup_path.read(cx).value().trim().to_string();
         let raw_target = self.restore_target.read(cx).value().trim().to_string();
-        let backup_dir = if raw_backup.is_empty() {
-            runtime.management().backup_destination("manual")
-        } else {
-            PathBuf::from(raw_backup)
-        };
-        let target_db_path = if raw_target.is_empty() {
-            runtime
-                .management()
-                .backup()
-                .database_path()
-                .with_file_name("management-restored.db")
-        } else {
-            PathBuf::from(raw_target)
-        };
         self.recovery = RecoveryOperationState {
             operation: "backup_restore".into(),
             phase: "restoring".into(),
             progress_percent: 20,
-            destination: Some(target_db_path.display().to_string()),
+            destination: Some(raw_target.clone()),
             rollback_available: true,
             error_code: None,
         };
         let active_locale = locale::current_locale();
-        self.begin_simple_task(ManagementMutation::BackupRestore, cx, async move {
-            runtime
+        self.begin_task_with_success(ManagementMutation::BackupRestore, cx, async move {
+            let outcome = backend
                 .management()
-                .backup()
-                .restore(backup_dir, target_db_path)
-                .map(|result| match active_locale {
-                    ResolvedLocale::En => format!("Backup restored: {:?}", result.status),
-                    ResolvedLocale::ZhCn => format!("备份已恢复：{:?}", result.status),
-                    ResolvedLocale::ZhTw => format!("備份已復原：{:?}", result.status),
-                })
+                .backup_restore(MutationRequest::new(BackupRestorePayload {
+                    backup_dir: (!raw_backup.is_empty()).then_some(raw_backup),
+                    target_db_path: (!raw_target.is_empty()).then_some(raw_target),
+                }))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            let message = match active_locale {
+                ResolvedLocale::En => format!("Backup restored: {:?}", outcome.status),
+                ResolvedLocale::ZhCn => format!("备份已恢复：{:?}", outcome.status),
+                ResolvedLocale::ZhTw => format!("備份已復原：{:?}", outcome.status),
+            };
+            Ok(ManagementTaskSuccess::with_recovery_destination(
+                message,
+                outcome.target_db_path,
+            ))
         });
     }
 

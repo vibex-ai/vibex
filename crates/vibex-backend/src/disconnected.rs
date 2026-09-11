@@ -16,8 +16,10 @@ use vibex_core::{
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
     AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
+    BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, GitBranchListResponse, GitCommitDetail,
     GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
@@ -1084,6 +1086,34 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: ManagementSnapshotPayload,
     ) -> BackendFuture<'_, RemoteProviderManagementSnapshot> {
+        disconnected_future!()
+    }
+
+    fn export_diagnostics(
+        &self,
+        _request: MutationRequest<DiagnosticExportPayload>,
+    ) -> BackendFuture<'_, DiagnosticExportOutcome> {
+        disconnected_future!()
+    }
+
+    fn backup_create(
+        &self,
+        _request: MutationRequest<BackupCreatePayload>,
+    ) -> BackendFuture<'_, BackupCreateOutcome> {
+        disconnected_future!()
+    }
+
+    fn backup_inspect(
+        &self,
+        _request: BackupInspectPayload,
+    ) -> BackendFuture<'_, BackupInspectOutcome> {
+        disconnected_future!()
+    }
+
+    fn backup_restore(
+        &self,
+        _request: MutationRequest<BackupRestorePayload>,
+    ) -> BackendFuture<'_, BackupRestoreOutcome> {
         disconnected_future!()
     }
 

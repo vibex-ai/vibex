@@ -23,8 +23,10 @@ use vibex_core::{
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
     AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
+    AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
+    BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
     FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
     FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GitBranchListResponse,
     GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
@@ -3048,6 +3050,53 @@ impl ManagementBackend for NativeBackend {
             )
             .await
             .map_err(Into::into)
+        })
+    }
+
+    fn export_diagnostics(
+        &self,
+        request: MutationRequest<DiagnosticExportPayload>,
+    ) -> BackendFuture<'_, DiagnosticExportOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.management().export_diagnostics(request.payload)?)
+        })
+    }
+
+    fn backup_create(
+        &self,
+        request: MutationRequest<BackupCreatePayload>,
+    ) -> BackendFuture<'_, BackupCreateOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.management().backup_create(request.payload)?)
+        })
+    }
+
+    fn backup_inspect(
+        &self,
+        request: BackupInspectPayload,
+    ) -> BackendFuture<'_, BackupInspectOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.management().backup_inspect(request)?)
+        })
+    }
+
+    fn backup_restore(
+        &self,
+        request: MutationRequest<BackupRestorePayload>,
+    ) -> BackendFuture<'_, BackupRestoreOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.management().backup_restore(request.payload)?)
         })
     }
 

@@ -64,9 +64,10 @@ use super::zero_config_pairing::{
     seal_json as seal_zero_config_json,
 };
 use super::{
-    RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteRequestEnvelope,
-    RemoteResponseEnvelope, RemoteServiceConfig, RemoteTrustService, build_router_with_dispatcher,
-    file_service_for_workspace, open_migrated_database, remote_timeline_event,
+    RemoteDispatcher, RemoteIdentity, RemoteIdentityStore, RemoteRecoverySource,
+    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteServiceConfig, RemoteTrustService,
+    build_router_with_dispatcher, file_service_for_workspace, open_migrated_database,
+    remote_timeline_event,
 };
 
 const DEFAULT_WS_TICKET_TTL_MS: u32 = 30_000;
@@ -4346,7 +4347,8 @@ async fn process_rpc_inner(
             request.correlation_id,
             request.payload,
             cache_key.as_ref(),
-        )?;
+        )
+        .await?;
         if fresh && let Some(cache_key) = cache_key {
             store_cached_rpc_response(state, cache_key, response.clone())?;
         }
@@ -4402,7 +4404,7 @@ async fn process_rpc_inner(
     Ok(response)
 }
 
-fn process_device_management_rpc(
+async fn process_device_management_rpc(
     state: &GatewayState,
     request_id: RequestId,
     correlation_id: Option<vibex_core::CorrelationId>,
@@ -4445,6 +4447,22 @@ fn process_device_management_rpc(
         RemoteDeviceRequest::ListAudit(request) => (
             request.auth.clone(),
             RemoteActionClass::ReadDeviceManagement,
+        ),
+        RemoteDeviceRequest::ExportDiagnostics(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::BackupCreate(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::BackupInspect(request) => (
+            request.auth.clone(),
+            RemoteActionClass::ReadDeviceManagement,
+        ),
+        RemoteDeviceRequest::BackupRestore(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
         ),
     };
     let auth = authorize_device_management(
@@ -4489,6 +4507,30 @@ fn process_device_management_rpc(
                 .collect();
             serde_json::to_value(RemoteDeviceListResponse { devices })
         }
+        RemoteDeviceRequest::ExportDiagnostics(request) => {
+            let outcome = recovery_source(state)?
+                .export_diagnostics(request.payload)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteDeviceDiagnosticsExportResponse { outcome })
+        }
+        RemoteDeviceRequest::BackupCreate(request) => {
+            let outcome = recovery_source(state)?
+                .backup_create(request.payload)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteDeviceBackupCreateResponse { outcome })
+        }
+        RemoteDeviceRequest::BackupInspect(request) => {
+            let outcome = recovery_source(state)?
+                .backup_inspect(request.payload)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteDeviceBackupInspectResponse { outcome })
+        }
+        RemoteDeviceRequest::BackupRestore(request) => {
+            let outcome = recovery_source(state)?
+                .backup_restore(request.payload)
+                .await?;
+            serde_json::to_value(vibex_core::RemoteDeviceBackupRestoreResponse { outcome })
+        }
         RemoteDeviceRequest::RevokeDevice(request) => {
             if auth.device_id == request.request.device_id {
                 return Err(VibexError::new(
@@ -4528,6 +4570,17 @@ fn process_device_management_rpc(
         },
         true,
     ))
+}
+
+/// Recovery runs on the authority, whose handles the gateway cannot reach, so
+/// the runtime installs the source on the dispatcher.
+fn recovery_source(state: &GatewayState) -> VibexResult<Arc<dyn RemoteRecoverySource>> {
+    state.dispatcher.recovery_source().cloned().ok_or_else(|| {
+        VibexError::capability(
+            "remote_recovery_unavailable",
+            "diagnostic export and database backup are not available on this service",
+        )
+    })
 }
 
 fn authorize_device_management(
@@ -5484,6 +5537,9 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     }
     if state.dispatcher.has_management_snapshot_source() {
         features.push("management_snapshot".to_string());
+    }
+    if state.dispatcher.has_recovery_source() {
+        features.push("recovery".to_string());
     }
     features
 }
@@ -7194,6 +7250,172 @@ mod tests {
         assert!(
             rebind.is_ok(),
             "stopping the TLS listener releases its socket"
+        );
+    }
+    /// Recovery operations must run where the runtime data lives: the client
+    /// sends intent, the authority resolves the path, and read-only devices
+    /// cannot trigger a restore.
+    #[tokio::test]
+    async fn recovery_rpc_runs_on_the_authority_and_reports_paths() {
+        struct TestRecoverySource {
+            calls: Mutex<Vec<&'static str>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteRecoverySource for TestRecoverySource {
+            async fn export_diagnostics(
+                &self,
+                payload: vibex_core::DiagnosticExportPayload,
+            ) -> VibexResult<vibex_core::DiagnosticExportOutcome> {
+                self.calls.lock().unwrap().push("diagnostics");
+                assert!(payload.request.is_none());
+                Ok(vibex_core::DiagnosticExportOutcome {
+                    destination: "/authority/home/diagnostics.json".to_string(),
+                    redaction_verified: true,
+                })
+            }
+
+            async fn backup_create(
+                &self,
+                payload: vibex_core::BackupCreatePayload,
+            ) -> VibexResult<vibex_core::BackupCreateOutcome> {
+                self.calls.lock().unwrap().push("backup_create");
+                assert!(payload.destination.is_none());
+                Ok(vibex_core::BackupCreateOutcome {
+                    backup_dir: "/authority/home/backup-1700000000000".to_string(),
+                })
+            }
+
+            async fn backup_inspect(
+                &self,
+                payload: vibex_core::BackupInspectPayload,
+            ) -> VibexResult<vibex_core::BackupInspectOutcome> {
+                self.calls.lock().unwrap().push("backup_inspect");
+                assert!(payload.backup_dir.is_none());
+                Ok(vibex_core::BackupInspectOutcome {
+                    backup_dir: "/authority/home/backup-manual".to_string(),
+                    database_schema_version: 42,
+                    migration_compatibility: vibex_core::BackupMigrationCompatibility::Ready,
+                })
+            }
+
+            async fn backup_restore(
+                &self,
+                payload: vibex_core::BackupRestorePayload,
+            ) -> VibexResult<vibex_core::BackupRestoreOutcome> {
+                self.calls.lock().unwrap().push("backup_restore");
+                assert!(payload.backup_dir.is_none());
+                assert!(payload.target_db_path.is_none());
+                Ok(vibex_core::BackupRestoreOutcome {
+                    target_db_path: "/authority/home/management-restored.db".to_string(),
+                    status: vibex_core::BackupRestoreOutcomeStatus::Restored,
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
+        config.service.enabled = true;
+        let database_path = directory.path().join("gateway.db");
+        let mut connection = open_migrated_database(&database_path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let source = Arc::new(TestRecoverySource {
+            calls: Mutex::new(Vec::new()),
+        });
+        let dispatcher = RemoteDispatcher::new(config.service.clone())
+            .with_recovery_source(source.clone() as Arc<dyn RemoteRecoverySource>);
+        let gateway = RemoteGateway::new(
+            config,
+            dispatcher,
+            &database_path,
+            directory.path().join("identity.json"),
+        );
+        let admin = pair_test_device(
+            &database_path,
+            RemoteDevicePermissionLevel::FullControl,
+            None,
+        );
+        let reader = pair_test_device(&database_path, RemoteDevicePermissionLevel::ReadOnly, None);
+        let state = gateway_state_for_test(&gateway);
+
+        assert!(
+            gateway_features(&state).contains(&"recovery".to_string()),
+            "a service with a recovery source advertises the feature"
+        );
+
+        // The read-shaped inspect needs no mutation contract.
+        let inspect = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::BackupInspect(
+                    vibex_core::RemoteDeviceBackupInspectRequest {
+                        auth: admin.clone(),
+                        payload: vibex_core::BackupInspectPayload::default(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        let inspected = process_rpc_inner(&state, &admin, inspect).await.unwrap();
+        let inspected: vibex_core::RemoteDeviceBackupInspectResponse =
+            serde_json::from_value(inspected.payload.unwrap()).unwrap();
+        assert_eq!(inspected.outcome.database_schema_version, 42);
+        assert_eq!(
+            inspected.outcome.backup_dir,
+            "/authority/home/backup-manual"
+        );
+
+        let mut export = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::ExportDiagnostics(
+                    vibex_core::RemoteDeviceDiagnosticsExportRequest {
+                        auth: admin.clone(),
+                        payload: vibex_core::DiagnosticExportPayload::default(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        export.mutation = Some(RemoteMutationContract {
+            idempotency_key: "recovery-diagnostics-export".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        let exported = process_rpc_inner(&state, &admin, export).await.unwrap();
+        let exported: vibex_core::RemoteDeviceDiagnosticsExportResponse =
+            serde_json::from_value(exported.payload.unwrap()).unwrap();
+        assert!(exported.outcome.redaction_verified);
+        assert_eq!(
+            exported.outcome.destination,
+            "/authority/home/diagnostics.json"
+        );
+
+        let mut restore = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::BackupRestore(
+                    vibex_core::RemoteDeviceBackupRestoreRequest {
+                        auth: reader.clone(),
+                        payload: vibex_core::BackupRestorePayload::default(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        restore.mutation = Some(RemoteMutationContract {
+            idempotency_key: "recovery-reader-restore".to_string(),
+            expected_revision: None,
+            expected_generation: None,
+        });
+        assert!(
+            process_rpc_inner(&state, &reader, restore).await.is_err(),
+            "a read-only device cannot restore a backup"
+        );
+
+        assert_eq!(
+            *source.calls.lock().unwrap(),
+            vec!["backup_inspect", "diagnostics"]
         );
     }
 }
