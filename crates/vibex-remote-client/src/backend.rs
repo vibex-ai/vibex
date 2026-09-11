@@ -19,7 +19,8 @@ use vibex_core::{
     AgentAuthContextMutationResult, AgentAuthContextRefreshModelsRequest,
     AgentAuthContextVerifyRequest, AgentAuthenticationOperation, AgentAuthenticationOperationId,
     AgentCatalogListResponse, AgentId, AgentListRequest, AgentListResponse,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileUpdateRequest,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentSession, AgentSessionRuntimeSelectionState,
     AgentTimelineDisplaySettings, AutomationGraph, AutomationGraphCreateRequest,
     AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
@@ -3165,6 +3166,36 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteProviderRunHealthProbesResponse>(value)?.result)
+        })
+    }
+
+    fn mutate_agent_model_provider_profile_secret(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::MutateAgentModelProviderProfileSecret(
+                vibex_core::RemoteAgentModelProviderProfileSecretMutationRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(
+                decode::<vibex_core::RemoteAgentModelProviderProfileSecretMutationResponse>(value)?
+                    .response,
+            )
         })
     }
 

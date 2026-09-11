@@ -4240,7 +4240,7 @@ impl ManagementCenter {
         let agent_id = agent.id.clone();
         let secret_touched = self.profile_secret_touched
             && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             self.error = Some(
                 management_error_text(
                     "Management runtime is not connected",
@@ -4264,59 +4264,70 @@ impl ManagementCenter {
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let providers = runtime.management().providers().management();
             let updating = editing_profile_id.is_some();
             let profile = if let Some(provider_profile_id) = editing_profile_id {
-                providers.update_agent_model_provider_profile(
-                    vibex_core::AgentModelProviderProfileUpdateRequest {
-                        agent_id: agent_id.clone(),
-                        provider_profile_id,
-                        display_name: Some(name),
-                        status: None,
-                        account_alias: (!note.is_empty()).then_some(note),
-                        base_url: (!base_url.is_empty()).then_some(base_url),
-                        default_model: default_model.clone(),
-                        small_model: None,
-                        large_model: None,
-                        configured_models: Some(configured_models.clone()),
-                        reasoning_effort: None,
-                        sandbox_defaults: None,
-                        network_defaults: None,
-                        permission_defaults: None,
-                        provider_options: Some(provider_options.clone()),
-                    },
-                )?
+                backend
+                    .management()
+                    .update_agent_model_provider_profile(MutationRequest::new(
+                        vibex_core::AgentModelProviderProfileUpdateRequest {
+                            agent_id: agent_id.clone(),
+                            provider_profile_id,
+                            display_name: Some(name),
+                            status: None,
+                            account_alias: (!note.is_empty()).then_some(note),
+                            base_url: (!base_url.is_empty()).then_some(base_url),
+                            default_model: default_model.clone(),
+                            small_model: None,
+                            large_model: None,
+                            configured_models: Some(configured_models.clone()),
+                            reasoning_effort: None,
+                            sandbox_defaults: None,
+                            network_defaults: None,
+                            permission_defaults: None,
+                            provider_options: Some(provider_options.clone()),
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?
             } else {
-                providers.create_agent_model_provider_profile(
-                    vibex_core::AgentModelProviderProfileCreateRequest {
-                        agent_id: agent_id.clone(),
-                        display_name: name,
-                        account_alias: (!note.is_empty()).then_some(note),
-                        base_url: (!base_url.is_empty()).then_some(base_url),
-                        default_model,
-                        small_model: None,
-                        large_model: None,
-                        configured_models,
-                        reasoning_effort: None,
-                        sandbox_defaults: None,
-                        network_defaults: None,
-                        permission_defaults: None,
-                        provider_options: Some(provider_options),
-                        secret_references: Vec::new(),
-                    },
-                )?
+                backend
+                    .management()
+                    .create_agent_model_provider_profile(MutationRequest::new(
+                        vibex_core::AgentModelProviderProfileCreateRequest {
+                            agent_id: agent_id.clone(),
+                            display_name: name,
+                            account_alias: (!note.is_empty()).then_some(note),
+                            base_url: (!base_url.is_empty()).then_some(base_url),
+                            default_model,
+                            small_model: None,
+                            large_model: None,
+                            configured_models,
+                            reasoning_effort: None,
+                            sandbox_defaults: None,
+                            network_defaults: None,
+                            permission_defaults: None,
+                            provider_options: Some(provider_options),
+                            secret_references: Vec::new(),
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?
             };
             let saved_profile_id = profile.id.as_str().to_string();
             if (!updating && !api_key.is_empty()) || (updating && secret_touched) {
                 let clear = api_key.is_empty();
-                providers.update_agent_model_provider_profile_secret_value(
-                    vibex_core::AgentModelProviderProfileSecretValueUpdateRequest {
-                        agent_id: agent_id.clone(),
-                        provider_profile_id: profile.id.clone(),
-                        value: (!clear).then_some(api_key),
-                        clear,
-                    },
-                )?;
+                backend
+                    .management()
+                    .mutate_agent_model_provider_profile_secret(MutationRequest::new(
+                        vibex_core::AgentModelProviderProfileSecretValueUpdateRequest {
+                            agent_id: agent_id.clone(),
+                            provider_profile_id: profile.id.clone(),
+                            value: (!clear).then_some(api_key),
+                            clear,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
             }
             let message = if updating {
                 management_locale_text_for(
@@ -4907,7 +4918,7 @@ impl ManagementCenter {
             cx.notify();
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let selected_id = agent_id.as_str().to_string();
@@ -4917,17 +4928,19 @@ impl ManagementCenter {
             ManagementMutation::AgentToggle(format!("custom:{selected_id}")),
             cx,
             async move {
-                runtime
+                backend
                     .management()
-                    .providers()
-                    .management()
-                    .create_custom_agent(vibex_core::CustomAgentCreateRequest {
-                        agent_id,
-                        label,
-                        description: (!description.is_empty()).then_some(description),
-                        command: vibex_core::AgentCommandConfig { command, args },
-                        env,
-                    })?;
+                    .create_custom_agent(MutationRequest::new(
+                        vibex_core::CustomAgentCreateRequest {
+                            agent_id,
+                            label,
+                            description: (!description.is_empty()).then_some(description),
+                            command: vibex_core::AgentCommandConfig { command, args },
+                            env,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 Ok(management_locale_text(
                     "Custom ACP Agent added",
                     "自定义 ACP Agent 已添加",
@@ -7113,7 +7126,7 @@ impl ManagementCenter {
                 return;
             }
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(backend) = self.backend.clone() else {
             return;
         };
         let existing_profiles = self.provider_profiles.clone();
@@ -7129,7 +7142,6 @@ impl ManagementCenter {
             ),
             cx,
             async move {
-                let providers = runtime.management().providers().management();
                 let request = vibex_core::ProviderNativeImportPreviewRequest {
                     sources: vec![
                         vibex_core::ProviderNativeImportSource::Codex,
@@ -7137,7 +7149,11 @@ impl ManagementCenter {
                         vibex_core::ProviderNativeImportSource::CcSwitch,
                     ],
                 };
-                let preview = providers.preview_native_import(request.clone())?;
+                let preview = backend
+                    .management()
+                    .preview_native_import(request.clone())
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 if !import {
                     return Ok(ManagementTaskSuccess::from(match active_locale {
                         ResolvedLocale::En => format!(
@@ -7173,12 +7189,16 @@ impl ManagementCenter {
                     let mut missing_secret_count = 0usize;
                     let mut imported_profiles = Vec::new();
                     for import_item_id in import_item_ids {
-                        let result = providers.create_profile_from_import(
-                            vibex_core::ProviderNativeImportCreateRequest {
-                                preview_request: request.clone(),
-                                import_item_id,
-                            },
-                        )?;
+                        let result = backend
+                            .management()
+                            .create_profile_from_import(MutationRequest::new(
+                                vibex_core::ProviderNativeImportCreateRequest {
+                                    preview_request: request.clone(),
+                                    import_item_id,
+                                },
+                            ))
+                            .await
+                            .map_err(crate::app::remote_error_into_vibex)?;
                         imported_count += 1;
                         imported_profiles.push(result.profile);
                         if result.diagnostics.iter().any(|diagnostic| {
@@ -7223,11 +7243,16 @@ impl ManagementCenter {
                             "no importable native Provider record was found",
                         )
                     })?;
-                let result = providers
-                    .create_profile_from_import(vibex_core::ProviderNativeImportCreateRequest {
-                        preview_request: request,
-                        import_item_id: item.import_item_id.clone(),
-                    })?;
+                let result = backend
+                    .management()
+                    .create_profile_from_import(MutationRequest::new(
+                        vibex_core::ProviderNativeImportCreateRequest {
+                            preview_request: request,
+                            import_item_id: item.import_item_id.clone(),
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
                 let message = match active_locale {
                         ResolvedLocale::En => {
                             format!("Imported native profile {}", result.profile.display_name)

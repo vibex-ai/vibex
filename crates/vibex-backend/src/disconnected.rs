@@ -7,11 +7,12 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
-    AgentModelProviderProfileUpdateRequest, AgentSession, AgentSessionRuntimeSelectionState,
-    AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
-    AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
-    AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
+    AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
+    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest, AgentSession,
+    AgentSessionRuntimeSelectionState, AutomationGraph, AutomationGraphCreateRequest,
+    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
+    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, CancelAgentSessionRuntimeSwitchRequest,
     ContinueAgentTurnRequest, CreateAgentSessionRequest, FetchTimelineRequest, FileMutationRequest,
@@ -1022,6 +1023,13 @@ impl ManagementBackend for DisconnectedBackend {
     }
 
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+        disconnected_future!()
+    }
+
+    fn mutate_agent_model_provider_profile_secret(
+        &self,
+        _request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
         disconnected_future!()
     }
 

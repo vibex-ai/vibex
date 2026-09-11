@@ -8,20 +8,21 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileTestRequest, AgentModelProviderProfileTestResult,
-    AgentModelProviderProfileUpdateRequest, AgentProviderProjectionCapability,
-    AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
-    AgentProviderProjectionPreviewRequest, AgentRuntimeProbeCancelRequest,
-    AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord, AgentRuntimeProbeStartRequest,
-    AgentRuntimeProfile, AgentRuntimeProfileCreateRequest, AgentRuntimeProfileUpdateRequest,
-    AgentSnapshotEntry, AutomationGraph, AutomationGraphCreateRequest,
-    AutomationGraphDefinitionUpdateRequest, AutomationGraphId, AutomationGraphListRequest,
-    AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun, AutomationRunCancelRequest,
-    AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
-    AutomationRunStep, AutomationRunStepListRequest, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
+    AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
+    AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
+    AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
+    AgentProviderProjectionPreview, AgentProviderProjectionPreviewRequest,
+    AgentRuntimeProbeCancelRequest, AgentRuntimeProbeListRequest, AgentRuntimeProbeRecord,
+    AgentRuntimeProbeStartRequest, AgentRuntimeProfile, AgentRuntimeProfileCreateRequest,
+    AgentRuntimeProfileUpdateRequest, AgentSnapshotEntry, AutomationGraph,
+    AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest, AutomationGraphId,
+    AutomationGraphListRequest, AutomationGraphStatus, AutomationGraphUpdateRequest, AutomationRun,
+    AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
+    CustomAgentCreateRequest, CustomAgentDeleteRequest, Hook, HookCreateRequest, HookDeleteRequest,
+    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
+    McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
     McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
     McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
@@ -186,6 +187,11 @@ pub trait ManagementBackend: BackendBound {
     fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary>;
 
     /// Deletes a per-Agent model provider profile.
+    fn mutate_agent_model_provider_profile_secret(
+        &self,
+        request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse>;
+
     fn create_agent_model_provider_profile(
         &self,
         request: MutationRequest<AgentModelProviderProfileCreateRequest>,

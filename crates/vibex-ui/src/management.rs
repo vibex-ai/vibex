@@ -1167,7 +1167,8 @@ mod tests {
         AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
         AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
         AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileTestRequest,
+        AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
+        AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
         AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
         AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
         AutomationGraphId, AutomationGraphListRequest, AutomationGraphStatus,
@@ -1386,6 +1387,13 @@ mod tests {
         }
 
         fn relay_status(&self) -> BackendFuture<'_, RelayStatusSummary> {
+            error_future()
+        }
+
+        fn mutate_agent_model_provider_profile_secret(
+            &self,
+            _request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+        ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
             error_future()
         }
 

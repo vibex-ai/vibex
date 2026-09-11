@@ -49,16 +49,17 @@ use crate::ids::{
 use crate::provider::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentModelProviderProfile, AgentModelProviderProfileCreateRequest,
-    AgentModelProviderProfileUpdateRequest, Hook, HookCreateRequest, HookDeleteRequest,
-    HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult, Prompt,
-    PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderFailoverRecommendation,
-    ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
-    ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
+    AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
+    Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest,
+    HookUpdateRequest, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
+    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
     ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -1623,6 +1624,7 @@ pub enum RemoteProviderOperationKind {
     DeleteAgentModelProviderProfile,
     CreateAgentModelProviderProfile,
     UpdateAgentModelProviderProfile,
+    MutateAgentModelProviderProfileSecret,
     GetAgentModelProviderDisplayOrder,
     SetAgentModelProviderDisplayOrder,
     TestAgentModelProviderProfile,
@@ -2589,6 +2591,19 @@ pub struct RemoteProviderMcpDeleteResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileSecretMutationRequest {
+    pub auth: RemoteAuthProof,
+    pub request: AgentModelProviderProfileSecretValueUpdateRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileSecretMutationResponse {
+    pub response: AgentModelProviderProfileSecretValueResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderProfileCreateRequest {
     pub auth: RemoteAuthProof,
     pub request: AgentModelProviderProfileCreateRequest,
@@ -2742,6 +2757,7 @@ pub enum RemoteProviderRequest {
     DeleteAgentModelProviderProfile(RemoteAgentModelProviderProfileDeleteRequest),
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
     UpdateAgentModelProviderProfile(RemoteAgentModelProviderProfileUpdateRequest),
+    MutateAgentModelProviderProfileSecret(RemoteAgentModelProviderProfileSecretMutationRequest),
     GetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderGetRequest),
     SetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderSetRequest),
     TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
@@ -2816,6 +2832,7 @@ impl RemoteProviderRequest {
                 | Self::RollbackNativeExport(_)
                 | Self::CreateAgentModelProviderProfile(_)
                 | Self::UpdateAgentModelProviderProfile(_)
+                | Self::MutateAgentModelProviderProfileSecret(_)
         )
     }
 
@@ -2880,6 +2897,9 @@ impl RemoteProviderRequest {
             }
             Self::UpdateAgentModelProviderProfile(_) => {
                 RemoteProviderOperationKind::UpdateAgentModelProviderProfile
+            }
+            Self::MutateAgentModelProviderProfileSecret(_) => {
+                RemoteProviderOperationKind::MutateAgentModelProviderProfileSecret
             }
             Self::GetAgentModelProviderDisplayOrder(_) => {
                 RemoteProviderOperationKind::GetAgentModelProviderDisplayOrder
