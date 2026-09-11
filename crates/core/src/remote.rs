@@ -1019,6 +1019,7 @@ pub enum RemoteWorkbenchOperationKind {
     ListWorkspaces,
     OpenWorkspace,
     DeleteWorkspace,
+    DeleteProject,
     FileListTree,
     FileRead,
     FileSearch,
@@ -1042,6 +1043,7 @@ pub enum RemoteWorkbenchOperationKind {
     GitRemoteAction,
     GitWorktreeEligibility,
     GitWorktreeSnapshot,
+    GitWorktreeRenameBranch,
     TerminalList,
     TerminalCreate,
     TerminalSnapshot,
@@ -1085,6 +1087,19 @@ pub struct RemoteWorkbenchDeleteWorkspaceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteWorkbenchDeleteWorkspaceResponse {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchDeleteProjectRequest {
+    pub auth: RemoteAuthProof,
+    pub project_id: crate::ids::ProjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchDeleteProjectResponse {
     pub deleted: bool,
 }
 
@@ -1195,6 +1210,24 @@ pub struct RemoteGitWorktreeEligibilityRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteGitWorktreeEligibilityResponse {
     pub eligibility: GitProjectEligibility,
+}
+
+/// Renames the branch backing a managed worktree.
+///
+/// The desktop sidebar renames the worktree and its Git branch together, and
+/// the authority owns both, so the rename travels over Remote v2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeRenameBranchRequest {
+    pub auth: RemoteAuthProof,
+    pub workspace_id: crate::ids::WorkspaceId,
+    pub new_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitWorktreeRenameBranchResponse {
+    pub renamed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1413,6 +1446,7 @@ pub enum RemoteWorkbenchRequest {
     ListWorkspaces(RemoteWorkbenchListWorkspacesRequest),
     OpenWorkspace(RemoteWorkbenchOpenWorkspaceRequest),
     DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest),
+    DeleteProject(RemoteWorkbenchDeleteProjectRequest),
     FileListTree(RemoteFileTreeRequest),
     FileRead(RemoteFileReadRequest),
     FileSearch(RemoteFileSearchRequest),
@@ -1436,6 +1470,7 @@ pub enum RemoteWorkbenchRequest {
     GitRemoteAction(RemoteGitRemoteActionRequest),
     GitWorktreeEligibility(RemoteGitWorktreeEligibilityRequest),
     GitWorktreeSnapshot(RemoteGitWorktreeSnapshotRequest),
+    GitWorktreeRenameBranch(RemoteGitWorktreeRenameBranchRequest),
     TerminalList(RemoteTerminalListRequest),
     TerminalCreate(RemoteTerminalCreateRequest),
     TerminalSnapshot(RemoteTerminalSnapshotRequest),
@@ -1450,6 +1485,7 @@ impl RemoteWorkbenchRequest {
             Self::ListWorkspaces(_) => RemoteWorkbenchOperationKind::ListWorkspaces,
             Self::OpenWorkspace(_) => RemoteWorkbenchOperationKind::OpenWorkspace,
             Self::DeleteWorkspace(_) => RemoteWorkbenchOperationKind::DeleteWorkspace,
+            Self::DeleteProject(_) => RemoteWorkbenchOperationKind::DeleteProject,
             Self::FileListTree(_) => RemoteWorkbenchOperationKind::FileListTree,
             Self::FileRead(_) => RemoteWorkbenchOperationKind::FileRead,
             Self::FileSearch(_) => RemoteWorkbenchOperationKind::FileSearch,
@@ -1473,6 +1509,9 @@ impl RemoteWorkbenchRequest {
             Self::GitRemoteAction(_) => RemoteWorkbenchOperationKind::GitRemoteAction,
             Self::GitWorktreeEligibility(_) => RemoteWorkbenchOperationKind::GitWorktreeEligibility,
             Self::GitWorktreeSnapshot(_) => RemoteWorkbenchOperationKind::GitWorktreeSnapshot,
+            Self::GitWorktreeRenameBranch(_) => {
+                RemoteWorkbenchOperationKind::GitWorktreeRenameBranch
+            }
             Self::TerminalList(_) => RemoteWorkbenchOperationKind::TerminalList,
             Self::TerminalCreate(_) => RemoteWorkbenchOperationKind::TerminalCreate,
             Self::TerminalSnapshot(_) => RemoteWorkbenchOperationKind::TerminalSnapshot,

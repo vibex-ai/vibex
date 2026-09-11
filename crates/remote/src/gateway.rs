@@ -4757,6 +4757,8 @@ fn mutation_requires_idempotency(kind: &str) -> bool {
             | "file_write"
             | "file_delete"
             | "file_rename"
+            | "delete_project"
+            | "git_worktree_rename_branch"
             | "file_create_directory"
             | "file_copy"
             | "git_stage"

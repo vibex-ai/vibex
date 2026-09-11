@@ -1119,6 +1119,21 @@ impl GitBackend for NativeBackend {
         })
     }
 
+    fn git_worktree_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        new_branch: String,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .git()
+                .worktree_rename_branch(&workspace_id, &new_branch)
+                .map_err(Into::into)
+        })
+    }
+
     fn git_revert(
         &self,
         request: MutationRequest<GitStageRequest>,

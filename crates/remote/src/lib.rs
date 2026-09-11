@@ -43,17 +43,18 @@ use vibex_core::{
     RemoteGitCommitDetailResponse, RemoteGitCommitResponse, RemoteGitDiffResponse,
     RemoteGitHistoryResponse, RemoteGitRemoteActionResponse, RemoteGitStatusMutationResponse,
     RemoteGitStatusResponse, RemoteGitWorktreeEligibilityResponse,
-    RemoteGitWorktreeSnapshotResponse, RemoteHandshakeResponse, RemoteHealthState,
-    RemoteHealthStatus, RemoteLiveEventChannel, RemoteLiveEventEnvelope, RemoteOperationKind,
-    RemotePairingCode, RemoteProtocolVersion, RemoteProviderFailoverRecommendationListResponse,
-    RemoteProviderHealthSummaryListResponse, RemoteProviderInjectionPreviewResponse,
-    RemoteProviderProfileListResponse, RemoteProviderRequest,
-    RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
-    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRevokeDeviceRequest, RemoteServiceInfo,
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
-    RemoteSidebarOrganizationSnapshot, RemoteTerminalCreateResponse, RemoteTerminalKillResponse,
-    RemoteTerminalListResponse, RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteResponse, RemoteWorkbenchDeleteWorkspaceResponse,
+    RemoteGitWorktreeRenameBranchResponse, RemoteGitWorktreeSnapshotResponse,
+    RemoteHandshakeResponse, RemoteHealthState, RemoteHealthStatus, RemoteLiveEventChannel,
+    RemoteLiveEventEnvelope, RemoteOperationKind, RemotePairingCode, RemoteProtocolVersion,
+    RemoteProviderFailoverRecommendationListResponse, RemoteProviderHealthSummaryListResponse,
+    RemoteProviderInjectionPreviewResponse, RemoteProviderProfileListResponse,
+    RemoteProviderRequest, RemoteProviderRunHealthProbesResponse,
+    RemoteProviderUsageSummaryListResponse, RemoteRequestEnvelope, RemoteResponseEnvelope,
+    RemoteRevokeDeviceRequest, RemoteServiceInfo, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationResponse, RemoteSidebarOrganizationSnapshot,
+    RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
+    RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
+    RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
     RemoteWorkbenchRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
     RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus,
@@ -237,6 +238,12 @@ pub trait RemoteWorktreeSnapshotSource: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
     ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot>;
+
+    async fn worktree_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        new_branch: &str,
+    ) -> VibexResult<()>;
 }
 
 #[derive(Clone)]
@@ -2894,6 +2901,30 @@ async fn dispatch_workbench_request(
             serde_json::to_value(RemoteWorkbenchDeleteWorkspaceResponse { deleted: true })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteWorkbenchRequest::DeleteProject(request) => {
+            let auth = authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateFile,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let mut conn = open_migrated_database(&runtime.db_path)?;
+            let result = WorkspaceRepository::delete_project(&mut conn, &request.project_id);
+            audit_workbench_mutation(
+                runtime,
+                &auth,
+                RemoteAuditTargetKind::WorkspaceFile,
+                request.project_id.as_str(),
+                format!("Project delete: {}", request.project_id.as_str()),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(RemoteWorkbenchDeleteProjectResponse { deleted: true })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteWorkbenchRequest::FileListTree(request) => {
             authorize_workbench_action(
                 runtime,
@@ -3292,6 +3323,45 @@ async fn dispatch_workbench_request(
                 source.worktree_eligibility(request.workspace_id).await?,
             );
             serde_json::to_value(RemoteGitWorktreeEligibilityResponse { eligibility })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::GitWorktreeRenameBranch(request) => {
+            let auth = authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateGit,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let new_branch = request.new_branch.trim().to_string();
+            if new_branch.is_empty() || new_branch.len() > 160 {
+                return Err(VibexError::validation(
+                    "remote_worktree_branch_invalid",
+                    "worktree branch name must be non-empty and bounded",
+                ));
+            }
+            let source = runtime.worktrees.as_ref().ok_or_else(|| {
+                VibexError::validation(
+                    "remote_worktree_read_unavailable",
+                    "remote worktree snapshots are unavailable",
+                )
+            })?;
+            let workspace_id = request.workspace_id.clone();
+            let result = source
+                .worktree_rename_branch(workspace_id.clone(), &new_branch)
+                .await;
+            audit_workbench_mutation(
+                runtime,
+                &auth,
+                RemoteAuditTargetKind::WorkspaceFile,
+                workspace_id.as_str(),
+                format!("Worktree branch rename: {}", workspace_id.as_str()),
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            result?;
+            serde_json::to_value(RemoteGitWorktreeRenameBranchResponse { renamed: true })
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::GitWorktreeSnapshot(request) => {
@@ -4407,6 +4477,14 @@ mod tests {
             _workspace_id: WorkspaceId,
         ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot> {
             Ok(self.snapshot.clone())
+        }
+
+        async fn worktree_rename_branch(
+            &self,
+            _workspace_id: WorkspaceId,
+            _new_branch: &str,
+        ) -> VibexResult<()> {
+            Ok(())
         }
     }
 

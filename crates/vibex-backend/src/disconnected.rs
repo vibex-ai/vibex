@@ -423,6 +423,14 @@ impl GitBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn git_worktree_rename_branch(
+        &self,
+        _workspace_id: WorkspaceId,
+        _new_branch: String,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
     fn git_revert(
         &self,
         _request: MutationRequest<GitStageRequest>,

@@ -988,6 +988,17 @@ mod tests {
             })
         }
 
+        fn git_worktree_rename_branch(
+            &self,
+            _workspace_id: WorkspaceId,
+            _new_branch: String,
+        ) -> BackendFuture<'_, ()> {
+            error_future(BackendError::unsupported(
+                "fixture_worktree_unsupported",
+                "fixture Git backend does not expose managed worktrees",
+            ))
+        }
+
         fn git_revert(
             &self,
             request: MutationRequest<GitStageRequest>,

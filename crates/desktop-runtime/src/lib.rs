@@ -903,6 +903,14 @@ impl RemoteWorktreeSnapshotSource for GitHandle {
     ) -> VibexResult<vibex_core::GitWorktreeLifecycleSnapshot> {
         self.worktree_snapshot(&workspace_id)
     }
+
+    async fn worktree_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        new_branch: &str,
+    ) -> VibexResult<()> {
+        self.worktree_rename_branch(&workspace_id, new_branch)
+    }
 }
 
 #[derive(Clone)]

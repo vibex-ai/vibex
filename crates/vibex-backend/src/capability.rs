@@ -48,6 +48,7 @@ pub enum BackendOperation {
     GitWorktreeRead,
     GitWorktreeCreate,
     GitWorktreeLifecycleMutate,
+    GitWorktreeRenameBranch,
     TerminalList,
     TerminalCreate,
     TerminalAttach,
@@ -184,6 +185,7 @@ impl BackendCapabilitySnapshot {
                 GitWorktreeRead,
                 GitWorktreeCreate,
                 GitWorktreeLifecycleMutate,
+                GitWorktreeRenameBranch,
             ]),
             terminal: DomainCapabilities::available([
                 TerminalList,

@@ -20870,12 +20870,14 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        // The authority owns the branch rename, so it rides the backend facade
+        // and works against a local runtime or a paired remote one.
+        let Some(backend) = self.backend.clone() else {
             self.agent_error = Some(
                 locale::text(
-                    "Git Worktree rename is unavailable",
-                    "当前无法重命名 Git Worktree",
-                    "目前無法重新命名 Git Worktree",
+                    "Git Worktree rename is unavailable because no runtime is connected",
+                    "未连接运行时，无法重命名 Git Worktree",
+                    "未連線執行階段，無法重新命名 Git Worktree",
                 )
                 .to_string(),
             );
@@ -20886,9 +20888,11 @@ impl VibexWorkbench {
             .insert(workspace_id.as_str().to_string());
         let workspace_id_for_runner = workspace_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
+            backend
                 .git()
-                .worktree_rename_branch(&workspace_id_for_runner, &new_branch)
+                .git_worktree_rename_branch(workspace_id_for_runner, new_branch)
+                .await
+                .map_err(remote_error_into_vibex)
         });
         cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -21155,13 +21159,15 @@ impl VibexWorkbench {
         {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        // The authority owns project deletion, so it rides the backend facade
+        // and works identically against a local runtime or a paired remote one.
+        let Some(backend) = self.backend.clone() else {
             self.pending_project_deletion_ids.remove(&project_key);
             self.agent_error = Some(
                 locale::text(
-                    "Project deletion is unavailable while connected to a remote runtime.",
-                    "连接远程运行时期间无法删除项目。",
-                    "連線遠端執行階段期間無法刪除專案。",
+                    "Project deletion is unavailable because no runtime is connected.",
+                    "未连接运行时，无法删除项目。",
+                    "未連線執行階段，無法刪除專案。",
                 )
                 .to_string(),
             );
@@ -21175,7 +21181,11 @@ impl VibexWorkbench {
         self.optimistically_remove_project(project_id.as_str());
         let generation = self.session_generation;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime.workspace().delete_project(&project_id)
+            backend
+                .workspace()
+                .delete_project(MutationRequest::new(project_id))
+                .await
+                .map_err(remote_error_into_vibex)
         });
         self.finish_project_deletion(generation, project_key, runner, cx);
     }

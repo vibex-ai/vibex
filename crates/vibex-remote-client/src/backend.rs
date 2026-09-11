@@ -74,22 +74,24 @@ use vibex_core::{
     RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
     RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
     RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
-    RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeSnapshotRequest,
-    RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
-    RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
-    RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
-    RemoteProviderRunHealthProbesResponse, RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest,
-    RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
-    RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
-    RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchDeleteWorkspaceRequest,
-    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesRequest,
-    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
-    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest, RenameAgentSessionRequest,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
+    RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeRenameBranchRequest,
+    RemoteGitWorktreeSnapshotRequest, RemoteGitWorktreeSnapshotResponse, RemoteOperationKind,
+    RemotePairingOfferSummary, RemoteProviderHealthSummaryListRequest,
+    RemoteProviderHealthSummaryListResponse, RemoteProviderRequest,
+    RemoteProviderRunHealthProbesRequest, RemoteProviderRunHealthProbesResponse,
+    RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest, RemoteTerminalCreateResponse,
+    RemoteTerminalKillRequest, RemoteTerminalKillResponse, RemoteTerminalListRequest,
+    RemoteTerminalListResponse, RemoteTerminalResizeRequest, RemoteTerminalResizeResponse,
+    RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse, RemoteTerminalWriteRequest,
+    RemoteTerminalWriteResponse, RemoteWorkbenchDeleteProjectRequest,
+    RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
+    RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
+    RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
+    RemoteWorkbenchRequest, RenameAgentSessionRequest, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelineLiveEvent,
+    TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::binary::{
@@ -1546,11 +1548,26 @@ impl WorkspaceBackend for WebRemoteBackend {
         })
     }
 
-    fn delete_project(&self, _request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
-        self.unsupported(
-            "remote_workspace_delete_unavailable",
-            "remote project deletion is not exposed by this Gateway",
-        )
+    fn delete_project(&self, request: MutationRequest<ProjectId>) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteWorkbenchRequest::DeleteProject(RemoteWorkbenchDeleteProjectRequest {
+                    auth: this.auth(),
+                    project_id: request.payload,
+                });
+            this.rpc(
+                RemoteOperationKind::WorkspaceFile,
+                payload,
+                Some(request.request_id),
+                Some((&key, request.expected_revision.as_deref(), None)),
+                vibex_core::RemoteTimeoutClass::LongRunning,
+            )
+            .await?;
+            Ok(())
+        })
     }
 }
 
@@ -2098,6 +2115,34 @@ impl GitBackend for WebRemoteBackend {
                 ));
             }
             Ok(branches)
+        })
+    }
+
+    fn git_worktree_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        new_branch: String,
+    ) -> BackendFuture<'_, ()> {
+        let this = self.clone();
+        Box::pin(async move {
+            let request_id = vibex_core::RequestId::new();
+            let idempotency_key = format!("worktree-rename:{}", request_id.as_str());
+            let payload = RemoteWorkbenchRequest::GitWorktreeRenameBranch(
+                RemoteGitWorktreeRenameBranchRequest {
+                    auth: this.auth(),
+                    workspace_id,
+                    new_branch,
+                },
+            );
+            this.rpc(
+                RemoteOperationKind::Git,
+                payload,
+                Some(request_id),
+                Some((&idempotency_key, None, None)),
+                vibex_core::RemoteTimeoutClass::LongRunning,
+            )
+            .await?;
+            Ok(())
         })
     }
 
@@ -3425,6 +3470,10 @@ fn remote_capabilities(info: Option<&vibex_core::RemoteServerInfoV2>) -> Backend
                 ),
                 (
                     BackendOperation::GitRemoteAction,
+                    permits(RemoteActionClass::MutateGit),
+                ),
+                (
+                    BackendOperation::GitWorktreeRenameBranch,
                     permits(RemoteActionClass::MutateGit),
                 ),
                 (

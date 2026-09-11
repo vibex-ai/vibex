@@ -140,6 +140,13 @@ pub trait GitBackend: BackendBound {
         workspace_id: WorkspaceId,
     ) -> BackendFuture<'_, GitBranchListResponse>;
 
+    /// Renames the branch backing a managed worktree.
+    fn git_worktree_rename_branch(
+        &self,
+        workspace_id: WorkspaceId,
+        new_branch: String,
+    ) -> BackendFuture<'_, ()>;
+
     fn git_revert(
         &self,
         request: MutationRequest<GitStageRequest>,
