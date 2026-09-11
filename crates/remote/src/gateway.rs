@@ -800,6 +800,16 @@ impl RemoteGateway {
             .unwrap_or(false)
     }
 
+    /// Pairing routes the gateway was constructed with.
+    ///
+    /// Connectivity reconciliation restores these when no operator-configured
+    /// publication method is enabled, so deployment-provided candidates (for
+    /// example the `VIBEX_PUBLIC_HOST` direct candidate) survive startup
+    /// instead of being replaced by an empty default.
+    pub fn configured_pairing_routes(&self) -> RemoteGatewayPairingRoutes {
+        self.inner.config.pairing_routes.clone()
+    }
+
     pub fn create_pairing_offer(
         &self,
         request: RemoteCreatePairingOfferRequest,

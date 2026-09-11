@@ -2176,9 +2176,12 @@ impl RemoteConnectivityController {
             for runtime in state.methods.values_mut() {
                 *runtime = MethodRuntime::disabled();
             }
-            self.inner
-                .gateway
-                .set_pairing_routes(RemoteGatewayPairingRoutes::default())?;
+            // Restore the routes the gateway was configured with rather than an
+            // empty default: a headless deployment derives its public direct
+            // candidate from `VIBEX_PUBLIC_HOST`, and no connectivity method is
+            // enabled there, so an empty default would discard it on every boot.
+            let configured = self.inner.gateway.configured_pairing_routes();
+            self.inner.gateway.set_pairing_routes(configured)?;
             drop(state);
             return Ok(self.snapshot().await);
         }
@@ -4113,6 +4116,57 @@ mod tests {
         assert_eq!(tailscale.inspect_calls.load(Ordering::SeqCst), 0);
         assert_eq!(direct.calls.load(Ordering::SeqCst), 0);
         assert_eq!(relay.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_preserves_deployment_pairing_routes() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:0");
+        config
+            .pairing_routes
+            .direct_candidates
+            .push(vibex_core::RemotePairingCandidate {
+                transport: vibex_core::RemotePairingTransport::Direct,
+                url: "https://vibex.example.com".to_string(),
+                relay_room_id: None,
+                relay_pc_peer_id: None,
+                relay_pc_public_key: None,
+            });
+        let dispatcher = vibex_remote::RemoteDispatcher::new(
+            vibex_remote::RemoteServiceConfig::loopback_disabled(),
+        );
+        let gateway = RemoteGateway::new(
+            config,
+            dispatcher.clone(),
+            directory.path().join("vibex.db"),
+            directory.path().join("relay/desktop-identity.json"),
+        );
+        let relay = RelayClientRuntime::with_remote_gateway(dispatcher, gateway.clone()).unwrap();
+        let controller = RemoteConnectivityController::with_publication_adapters(
+            directory.path(),
+            gateway.clone(),
+            relay,
+            Arc::new(FakeTailscale::default()),
+            Arc::new(FakeDirectProbe::default()),
+            Arc::new(FakeRelayProbe::default()),
+        )
+        .unwrap();
+
+        let snapshot = controller.reconcile_on_startup().await.unwrap();
+
+        assert!(!snapshot.desired_enabled);
+        let routes = gateway.current_config().pairing_routes;
+        assert_eq!(
+            routes.direct_candidates.len(),
+            1,
+            "the configured public candidate must survive startup reconciliation"
+        );
+        assert_eq!(
+            routes.direct_candidates[0].url,
+            "https://vibex.example.com/"
+        );
+        assert!(gateway.pairing_routes_available());
     }
 
     #[tokio::test]
