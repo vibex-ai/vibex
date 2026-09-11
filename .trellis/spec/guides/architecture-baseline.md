@@ -177,11 +177,22 @@ travels the same way.
 
 Operations that genuinely belong to the machine in front of the user stay
 local and degrade with explicit messages instead of silently failing: the
-desktop's own self-update, remote-access connectivity/pairing setup, durable
-submission locators, and reading a stored provider credential back into a form
-(a paired runtime never returns stored secrets, so the field opens empty and a
-typed value replaces it). Live updates arrive through the same `BackendEvent`
-pump mapped onto the desktop event pipeline.
+desktop's own self-update, remote-access connectivity/pairing setup, and
+reading a stored provider credential back into a form (a paired runtime never
+returns stored secrets, so the field opens empty and a typed value replaces
+it). Live updates arrive through the same `BackendEvent` pump mapped onto the
+desktop event pipeline.
+
+Terminals follow the same rule through a transport seam: `TerminalTransport`
+has an in-process implementation over `TerminalManager` and a remote one over
+the gateway's terminal operations, and the workbench, composer and Agent
+sign-in surfaces render whichever authority owns the PTY.
+
+Three composer/Agent conveniences are still local-only and therefore disabled
+against a paired runtime rather than silently wrong: slash-command discovery
+and its `@`-mention file candidates, provider model discovery for Agents whose
+CLI owns the catalogue, and the legacy profile-scoped Agent sign-out. Each
+needs its own operation on the wire.
 
 Provider credentials belong to the runtime database. In cloud mode the
 operator's own host stores them, which is the accepted single-user threat
