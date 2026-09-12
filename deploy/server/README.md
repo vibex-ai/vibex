@@ -250,13 +250,23 @@ own self-update, remote-access publication setup, and the stored provider
 credential read-back stay on the client machine; a temporary session asks the
 authority for its workspace root, and managed worktree creation/lifecycle,
 usage statistics, and the live per-session token snapshot are served over
-Remote v2. Local CLI-history import and the client's storage usage/cleanup
+Remote v2. That temporary root is authoritative state, not scratch space: the
+server keeps it in `<VIBEX_HOME>/tmp/vibex/sessions`, inside the persisted
+`/data` volume, because the sessions that reference it outlive any single
+container. Local CLI-history import and the client's storage usage/cleanup
 remain client-side.
 
 ## Production Notes
 
 - One runtime per `VIBEX_HOME`. The home lock (`VIBEX_ACQUIRE_HOME_LOCK`)
   prevents two servers from sharing a database.
+- Workspaces are directories **inside the container**: `/data` is the only
+  persisted path by default, so mount a repository into the container and open
+  that path rather than a host path that does not exist in the container's
+  mount namespace. A workspace whose recorded directory later disappears (an
+  unmounted volume, a removed checkout) cannot start sessions: clients report
+  it as `remote_agent_workspace_root_missing`, and the operator either restores
+  the directory or deletes the stale workspace from a client.
 - Back up `/data` (database + `relay/desktop-identity.json`): losing the
   identity key forces every device to re-pair.
 - Keep the database and TLS keys owned by the runtime user; the container

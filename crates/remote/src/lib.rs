@@ -597,6 +597,10 @@ pub struct RemoteDispatcher {
 #[derive(Clone)]
 pub struct RemoteWorkbenchRuntime {
     db_path: PathBuf,
+    /// Root the authority hands to a session that has no project of its own.
+    /// Derived from the database location, so it follows the runtime home
+    /// rather than the operating system's temporary directory.
+    temp_session_root: PathBuf,
     terminals: TerminalManager,
     worktrees: Option<Arc<dyn RemoteWorktreeSnapshotSource>>,
     worktree_lifecycle: Option<Arc<dyn RemoteWorktreeLifecycleSource>>,
@@ -604,12 +608,26 @@ pub struct RemoteWorkbenchRuntime {
 
 impl RemoteWorkbenchRuntime {
     pub fn new(db_path: impl Into<PathBuf>, terminals: TerminalManager) -> Self {
+        let db_path = db_path.into();
+        let temp_session_root = temporary_session_root_for_database(&db_path);
         Self {
-            db_path: db_path.into(),
+            db_path,
+            temp_session_root,
             terminals,
             worktrees: None,
             worktree_lifecycle: None,
         }
+    }
+
+    /// Overrides where temporary session workspaces are created. Deployments
+    /// use the location derived from the database; tests pin their own.
+    pub fn with_temp_session_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.temp_session_root = root.into();
+        self
+    }
+
+    pub fn temp_session_root(&self) -> &Path {
+        &self.temp_session_root
     }
 
     pub fn with_worktree_snapshot_source(
@@ -4906,13 +4924,31 @@ async fn dispatch_agent_request(
     }
 }
 
+/// Where the authority keeps the workspace it hands to a session that has no
+/// project of its own.
+///
+/// The root is authoritative state, not scratch space: a session keeps
+/// referencing it by workspace id long after creation, and the runtime
+/// materializes the Agent inside it. It therefore lives beside the
+/// authoritative database — the runtime home, which is also the only volume
+/// the documented container deployment persists — instead of in the operating
+/// system's temporary directory, which a container recreation or a host reboot
+/// empties while the workspace row survives in that database.
+fn temporary_session_root_for_database(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("tmp")
+        .join("vibex")
+        .join("sessions")
+}
+
 /// Creates and resolves the authority's temporary session root.
 ///
 /// A remote client without a published workspace asks for this instead of
 /// proposing a path that only exists on the machine in front of the user.
-fn ensure_temporary_session_root() -> VibexResult<String> {
-    let root = std::env::temp_dir().join("vibex").join("sessions");
-    std::fs::create_dir_all(&root).map_err(|error| {
+fn ensure_temporary_session_root(root: &Path) -> VibexResult<String> {
+    std::fs::create_dir_all(root).map_err(|error| {
         VibexError::storage(
             "temporary_workspace_create_failed",
             "failed to create temporary session workspace",
@@ -4932,33 +4968,108 @@ fn ensure_temporary_session_root() -> VibexResult<String> {
         })
 }
 
+/// How the workspace a remote client asked for relates to the workspaces the
+/// authority published.
+enum RequestedWorkspace {
+    /// The authority published exactly this root and mode.
+    Published(vibex_core::WorkspaceRecord),
+    /// The authority published this root, but not with the requested mode, so
+    /// the session would run against a workspace identity nobody asked for.
+    ModeMismatch(vibex_core::WorkspaceRecord),
+    /// The authority published exactly this root and mode, but the directory it
+    /// points at is gone from the authority host.
+    RootMissing(vibex_core::WorkspaceRecord),
+}
+
 fn published_agent_session_request(
     manager: &AgentManager,
     mut request: vibex_core::CreateAgentSessionRequest,
 ) -> VibexResult<vibex_core::CreateAgentSessionRequest> {
-    let not_published = || {
-        VibexError::validation(
-            "remote_agent_workspace_not_published",
-            "the requested workspace is not published by the desktop",
-        )
+    let workspace = match classify_requested_workspace(manager, &request)? {
+        RequestedWorkspace::Published(workspace) => workspace,
+        RequestedWorkspace::ModeMismatch(workspace) => {
+            return Err(VibexError::validation(
+                "remote_agent_workspace_mode_mismatch",
+                "the workspace is published with a different mode than this session requested; select the workspace again",
+            )
+            .with_recovery_hint(
+                "A session uses the mode of the workspace it targets; a new worktree has to be created first",
+            )
+            .with_diagnostic("workspaceId", workspace.id.as_str()));
+        }
+        RequestedWorkspace::RootMissing(workspace) => {
+            return Err(VibexError::validation(
+                "remote_agent_workspace_root_missing",
+                "the workspace is published by the authority host, but its directory no longer exists there; open the workspace again or choose another project",
+            )
+            .with_recovery_hint(
+                "A workspace root on an ephemeral path does not survive a restart of the authority host",
+            )
+            .with_diagnostic("workspaceId", workspace.id.as_str()));
+        }
     };
-    let requested_root = Path::new(&request.workspace_root)
-        .canonicalize()
-        .map_err(|_| not_published())?;
+    request.workspace_root = workspace.root_path;
+    Ok(request)
+}
+
+/// Resolves the `(root, mode)` pair a remote client asked for against the
+/// workspaces the authority published.
+///
+/// A session may only target a workspace the authority itself published: the
+/// requested root has to resolve on the authority host, and an active row has
+/// to carry both that canonical root and the requested mode. The
+/// client-supplied root is never used as a path, so a paired device cannot
+/// point a session at a directory of its choosing.
+///
+/// Naming the two recoverable cases adds no filesystem oracle: each root they
+/// mention is already published, and therefore already listed for every device
+/// that may reach this point by `ListWorkspaces`.
+fn classify_requested_workspace(
+    manager: &AgentManager,
+    request: &vibex_core::CreateAgentSessionRequest,
+) -> VibexResult<RequestedWorkspace> {
     let conn = open_migrated_database(manager.database_path())?;
-    let workspace = WorkspaceRepository::list(&conn)?
-        .into_iter()
-        .map(|(_, workspace)| workspace)
-        .find(|workspace| {
+    let workspaces = WorkspaceRepository::list(&conn)?;
+    let requested_root = Path::new(&request.workspace_root);
+    let requested_canonical = requested_root.canonicalize().ok();
+    if let Some(requested_canonical) = requested_canonical.as_deref()
+        && let Some((_, workspace)) = workspaces.iter().find(|(_, workspace)| {
             workspace.mode == request.workspace_mode
                 && Path::new(&workspace.root_path)
                     .canonicalize()
-                    .is_ok_and(|root| root == requested_root)
+                    .is_ok_and(|root| root == requested_canonical)
         })
-        .ok_or_else(not_published)?;
-
-    request.workspace_root = workspace.root_path;
-    Ok(request)
+    {
+        return Ok(RequestedWorkspace::Published(workspace.clone()));
+    }
+    // Reaching this point means no published pair matched. A row that carries
+    // the requested root still tells the client which of its two inputs was
+    // wrong: the mode it asked for, or the directory the authority recorded.
+    let mut missing = None;
+    let mut mismatched = None;
+    for (_, workspace) in &workspaces {
+        if Path::new(&workspace.root_path) != requested_root {
+            continue;
+        }
+        let root_resolves = Path::new(&workspace.root_path).canonicalize().is_ok();
+        if workspace.mode == request.workspace_mode && !root_resolves {
+            missing = Some(workspace.clone());
+            break;
+        }
+        if workspace.mode != request.workspace_mode && root_resolves && mismatched.is_none() {
+            mismatched = Some(workspace.clone());
+        }
+    }
+    if let Some(workspace) = missing {
+        return Ok(RequestedWorkspace::RootMissing(workspace));
+    }
+    if let Some(workspace) = mismatched {
+        return Ok(RequestedWorkspace::ModeMismatch(workspace));
+    }
+    Err(VibexError::validation(
+        "remote_agent_workspace_not_published",
+        "the requested workspace is not published by the authority",
+    ))
 }
 
 fn remote_runtime_selection(
@@ -5091,7 +5202,7 @@ async fn dispatch_workbench_request(
                 Some(request_id),
                 correlation_id,
             )?;
-            let root = ensure_temporary_session_root()?;
+            let root = ensure_temporary_session_root(runtime.temp_session_root())?;
             // Publish the root before a create can target it: a remote client
             // may only create sessions in workspaces the authority knows.
             let connection = open_migrated_database(&runtime.db_path)?;
@@ -7625,6 +7736,181 @@ mod tests {
         cleanup_db(db_path);
     }
 
+    /// A published workspace whose directory is gone is a different failure
+    /// from an unpublished root: the device already lists that workspace, so
+    /// the authority can name the missing directory instead of rejecting the
+    /// request with an unexplainable error.
+    #[tokio::test]
+    async fn remote_session_create_reports_a_published_workspace_whose_root_is_gone() {
+        let (db_path, manager) = test_agent_manager("workspace-root-missing");
+        let session = create_mock_session(&manager, "Workspace root missing").await;
+        std::fs::remove_dir_all(&session.workspace_root).unwrap();
+
+        let error = published_agent_session_request(
+            &manager,
+            vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: remote_test_selection(&session),
+                workspace_root: session.workspace_root.clone(),
+                workspace_mode: session.workspace_mode,
+                title: Some("Missing root".to_string()),
+                safety: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "remote_agent_workspace_root_missing");
+        assert!(error.recovery_hint.is_some());
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "workspaceId"
+                    && diagnostic.value == session.workspace_id.as_str()),
+            "the rejection has to identify the workspace without naming its path"
+        );
+        assert!(
+            !error.message.contains(&session.workspace_root),
+            "the rejection must not echo the authority's filesystem paths"
+        );
+
+        // An unpublished root keeps the dedicated rejection.
+        let unpublished = published_agent_session_request(
+            &manager,
+            vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: remote_test_selection(&session),
+                workspace_root: "/tmp/vibex-unpublished-root-sentinel".to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("Unpublished root".to_string()),
+                safety: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(unpublished.code, "remote_agent_workspace_not_published");
+
+        cleanup_db(db_path);
+    }
+
+    /// A client that changes the workspace mode without creating that
+    /// workspace asks for a pair the authority never published; the rejection
+    /// names the mismatch so the client bug is visible instead of anonymous.
+    #[tokio::test]
+    async fn remote_session_create_reports_a_published_workspace_mode_mismatch() {
+        let (db_path, manager) = test_agent_manager("workspace-mode-mismatch");
+        let session = create_mock_session(&manager, "Workspace mode mismatch").await;
+
+        let error = published_agent_session_request(
+            &manager,
+            vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: remote_test_selection(&session),
+                workspace_root: session.workspace_root.clone(),
+                workspace_mode: WorkspaceMode::VibexWorktree,
+                title: Some("Mode mismatch".to_string()),
+                safety: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "remote_agent_workspace_mode_mismatch");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "workspaceId"
+                    && diagnostic.value == session.workspace_id.as_str())
+        );
+
+        cleanup_db(db_path);
+    }
+
+    /// Temporary session workspaces are authoritative state: they live beside
+    /// the database (the runtime home, and the only volume a container
+    /// deployment persists) instead of in the operating system's temporary
+    /// directory, which does not survive a container recreation.
+    #[test]
+    fn temporary_session_roots_live_beside_the_authoritative_database() {
+        assert_eq!(
+            temporary_session_root_for_database(Path::new("/data/vibex.db")),
+            PathBuf::from("/data/tmp/vibex/sessions")
+        );
+        assert_eq!(
+            temporary_session_root_for_database(Path::new("vibex.db")),
+            PathBuf::from("tmp/vibex/sessions")
+        );
+
+        let (db_path, _) = test_agent_manager("temporary-root-derivation");
+        let runtime = RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new());
+        assert_eq!(
+            runtime.temp_session_root(),
+            db_path
+                .parent()
+                .unwrap()
+                .join("tmp")
+                .join("vibex")
+                .join("sessions")
+        );
+        cleanup_db(db_path);
+    }
+
+    /// The root a client asks for when it has no workspace of its own is
+    /// published before it is returned, so the create that follows can only
+    /// succeed.
+    #[tokio::test]
+    async fn remote_temporary_session_root_is_published_and_usable() {
+        let (db_path, manager) = test_agent_manager("temporary-root-published");
+        let auth = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let temp_root = temp_workspace_root("temporary-root");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager.clone(),
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new())
+                .with_temp_session_root(temp_root.clone()),
+        );
+
+        let response = post_workbench(
+            router,
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::EnsureTemporarySessionRoot(
+                vibex_core::RemoteWorkbenchTemporarySessionRootRequest { auth },
+            ),
+        )
+        .await;
+        assert_eq!(response.status, RemoteEnvelopeStatus::Ok);
+        let payload: RemoteWorkbenchTemporarySessionRootResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(&payload.root),
+            temp_root.canonicalize().unwrap()
+        );
+
+        let accepted = published_agent_session_request(
+            &manager,
+            vibex_core::CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: remote_test_runtime_selection(AgentId::parse("codex").unwrap()),
+                workspace_root: payload.root.clone(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("Temporary session".to_string()),
+                safety: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.workspace_root, payload.root);
+
+        cleanup_db(db_path);
+        cleanup_workspace(temp_root);
+    }
+
     #[tokio::test]
     async fn remote_runtime_query_reports_unavailable_without_production_wiring() {
         let (db_path, manager) = test_agent_manager("runtime-query-unavailable");
@@ -9485,8 +9771,12 @@ mod tests {
     }
 
     fn remote_test_selection(session: &AgentSession) -> SessionRuntimeSelection {
+        remote_test_runtime_selection(session.agent_id.clone())
+    }
+
+    fn remote_test_runtime_selection(agent_id: AgentId) -> SessionRuntimeSelection {
         SessionRuntimeSelection::provider(
-            session.agent_id.clone(),
+            agent_id,
             vibex_core::ProviderProfileId::parse("provider_acp_remote_test").unwrap(),
             "mock-remote",
         )

@@ -2331,11 +2331,35 @@ RemoteMutationContract {
 
 ### 3. Contracts
 
-- Session creation accepts only a workspace already published by the desktop.
+- Session creation accepts only a workspace already published by the authority
+  (the Desktop, or the headless `vibex-server` that owns the runtime).
   `crates/remote` canonicalizes the requested root, finds an active
   `WorkspaceRepository::list()` entry with both the same canonical root and
   `WorkspaceMode`, and replaces the client-supplied root with the stored
   authoritative root before calling `AgentManager::create_session`.
+- The authority names the recoverable failures instead of collapsing them into
+  the unpublished rejection. It reports `remote_agent_workspace_root_missing`
+  when an active row carries the requested root and mode but that directory no
+  longer resolves on the authority host, and
+  `remote_agent_workspace_mode_mismatch` when the root is published with a
+  different mode. Both are only reachable for a root the device already sees
+  through `ListWorkspaces`, so neither adds a filesystem oracle. Diagnostic
+  detail stays limited to the workspace id: a rejection never echoes an
+  authority path, and the unpublished case stays indistinguishable from a
+  nonexistent path.
+- A client may only request the mode the authority recorded for the workspace.
+  Changing the mode is a worktree-create operation: the client creates the
+  worktree first and targets the workspace that operation returns. Sending a
+  `WorkspaceMode` the workspace was never published with is a client bug, and
+  the authority reports it as `remote_agent_workspace_mode_mismatch` instead of
+  publishing a workspace the client invented.
+- Temporary session workspaces are authoritative state, not scratch space: a
+  session keeps referencing its root by workspace id, so the root
+  `EnsureTemporarySessionRoot` creates and publishes lives beside the
+  authoritative database (`<runtime home>/tmp/vibex/sessions`) instead of in
+  the operating system's temporary directory. A container recreation or a host
+  reboot empties the latter while the workspace row survives in the database,
+  which leaves a published workspace whose directory is gone.
 - Session create, rename, archive, and delete require
   `RemoteActionClass::MutateAgentSession` (`full_control`). Their audit rows
   contain only operation, stable target id, and success metadata; titles,
@@ -2374,9 +2398,17 @@ RemoteMutationContract {
 
 ### 4. Validation & Error Matrix
 
-- Session root cannot be canonicalized, is not published, has a different
-  `WorkspaceMode`, or is no longer active ->
+- Session root is not published by the authority, cannot be canonicalized, or
+  is no longer active ->
   `validation/remote_agent_workspace_not_published` with no path diagnostic.
+- A published workspace's recorded directory no longer resolves on the
+  authority host -> `validation/remote_agent_workspace_root_missing`; the
+  client is told to open the workspace again or choose another project, and no
+  authority path is echoed.
+- The requested root is published with a different `WorkspaceMode` ->
+  `validation/remote_agent_workspace_mode_mismatch`; a session uses the mode
+  the authority recorded, so the client has to select the workspace again
+  rather than retarget it.
 - `read_only` or `approve_only` attempts any lifecycle/workbench/Provider/
   runtime mutation -> `permission/remote_permission_denied` before side effects.
 - File save revision differs from desktop ->
@@ -2415,7 +2447,11 @@ RemoteMutationContract {
   fields are absent.
 - `vibex-remote`: lifecycle permission and redacted audit coverage; published
   workspace canonical-root plus `WorkspaceMode` acceptance; unpublished,
-  mismatched, and malicious-root rejection without path diagnostics.
+  mismatched, and malicious-root rejection without path diagnostics; a
+  published workspace whose root directory was removed reports
+  `remote_agent_workspace_root_missing` with the workspace id as its only
+  diagnostic; the temporary session root is derived from the database location
+  and stays usable after the authority publishes it.
 - `vibex-remote-client`: lifecycle dispatch/capability mapping, mutation
   revision/generation propagation, and decoded Agent summaries remain the
   dedicated redacted DTO.
