@@ -886,6 +886,14 @@ RuntimeBinding {
 - `target_auth_source` and `target_auth_source_revision` are persisted in the
   switch row before any process/session side effect. The prepared binding must
   carry the exact same source and revision or preparation/commit fails closed.
+- A durable binding keeps the auth-source revision it committed with, so any
+  later Profile write or Agent-account relogin makes it stale. A stale binding
+  is never rebuilt in place: the ACP backend reports
+  `runtime_auth_source_revision_stale`, and the runtime lifecycle service hands
+  the session to this service, which drives a durable switch for the effective
+  selection and then materializes the replacement once. Legacy Provider
+  bindings with revision `0` keep their lenient handling, because the launch
+  path resolves their revision from the Profile.
 - Provider launches retain Provider projection and isolated Provider state-home
   behavior. Agent-account launches use the Agent default state home, omit
   Provider projection, and unset the Registry-declared credential/provider
@@ -934,6 +942,7 @@ RuntimeBinding {
 | Explicit account model is not in current snapshot | `agent_auth_model_no_longer_available`; old effective binding remains. |
 | `AgentDefault` is selected | omit model override; do not serialize `default` as a provider model. |
 | Prepared binding source/revision differs from intent | `runtime_switch_prepared_binding_mismatch`; fail closed. |
+| Materialization finds a binding older than its auth source revision | `runtime_auth_source_revision_stale`; drive a durable switch for the effective selection, then materialize the replacement. |
 | Restore candidate uses another source/revision/home | mark incompatible and use fresh-and-bridge when policy permits. |
 | Authentication expires during a turn | invalidate the exact account revision, fail the turn safely, and never auto-fallback. |
 | App restarts with stale pending account revision | reconciliation re-resolves/revalidates; do not activate stale credentials. |
@@ -969,7 +978,10 @@ RuntimeBinding {
   rollback, caller drop, and startup reconciliation.
 - ACP tests assert Provider projection is present only for Provider sources,
   Registry env unsets are present only for Agent accounts, and process reuse
-  keys include source kind/id/revision.
+  keys include source kind/id/revision. They also assert a binding whose Profile
+  revision moved is reported as stale, and that materializing it replaces the
+  binding through a committed switch at the current revision instead of failing
+  the restore identity check.
 - Message/Timeline tests assert the next prompt reaches only the committed
   binding and attribution remains attached to the source that executed each
   historical turn.
