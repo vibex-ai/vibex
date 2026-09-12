@@ -3316,6 +3316,17 @@ fn mistral_vibe_model_entry(provider_id: &str, model_id: &str) -> serde_json::Va
     })
 }
 
+/// Reasoning-effort levels projected for a DeepSeek Harness route Model.
+///
+/// Each key is a level the selector offers; the value is the spelling pi-ai's
+/// dispatch sends on the wire, and `None` is pi-ai's "offered, send nothing".
+/// The set mirrors the levels the Harness's own `deepseek` route exposes
+/// (`off`/`high`/`max`), so a Vibex route Model offers the same choices as an
+/// Agent-account Model. `low` and `medium` are deliberately absent: pi-ai pins
+/// an undeclared level to unsupported, and DeepSeek has no such budget.
+const DEEPSEEK_HARNESS_REASONING_EFFORTS: [(&str, Option<&str>); 3] =
+    [("off", None), ("high", Some("high")), ("max", Some("max"))];
+
 fn deepseek_harness_model_entry(
     provider: &ModelProviderProfile,
     model: Option<&AgentConfiguredModelBinding>,
@@ -3355,8 +3366,32 @@ fn deepseek_harness_model_entry(
         }
         model_entry.insert("input".to_string(), serde_json::json!(input));
     }
-    if capabilities.and_then(|capabilities| capabilities.reasoning) == Some(false) {
-        model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
+    // The Harness only advertises its `effort` ACP control when the Model's
+    // `reasoning` metadata carries at least two levels, and it resolves that
+    // metadata from the installed pi-ai catalog entry of the same id under the
+    // same route. A Vibex route id is never a pi-ai provider, so a route Model
+    // has no installed entry to inherit from: an omitted `reasoningEfforts`
+    // means "does not reason" and the run options lose the thinking-depth
+    // selector entirely. Project the Harness's own DeepSeek vocabulary so the
+    // control exists and each selected level reaches the request. Only an
+    // explicit `reasoning: false` opts a Model out.
+    match capabilities.and_then(|capabilities| capabilities.reasoning) {
+        Some(false) => {
+            model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
+        }
+        _ => {
+            let mut reasoning_efforts = serde_json::Map::new();
+            for (level, wire) in DEEPSEEK_HARNESS_REASONING_EFFORTS {
+                reasoning_efforts.insert(
+                    level.to_string(),
+                    wire.map_or(serde_json::Value::Null, |wire| serde_json::json!(wire)),
+                );
+            }
+            model_entry.insert(
+                "reasoningEfforts".to_string(),
+                serde_json::Value::Object(reasoning_efforts),
+            );
+        }
     }
     serde_json::Value::Object(model_entry)
 }
@@ -4300,6 +4335,26 @@ mod tests {
             assert_eq!(route["models"][0]["maxTokens"].as_u64(), Some(16_384));
             assert_eq!(route["models"][0]["input"][1].as_str(), Some("image"));
             assert_eq!(yaml_strings(&route["defaultInput"]), ["text", "image"]);
+            let reasoning_efforts = route["models"][0]
+                .get("reasoningEfforts")
+                .expect("every route Model must project its reasoning levels");
+            assert_eq!(reasoning_efforts.get("off"), Some(&serde_yaml::Value::Null));
+            assert_eq!(
+                reasoning_efforts
+                    .get("high")
+                    .and_then(serde_yaml::Value::as_str),
+                Some("high")
+            );
+            assert_eq!(
+                reasoning_efforts
+                    .get("max")
+                    .and_then(serde_yaml::Value::as_str),
+                Some("max")
+            );
+            assert!(
+                reasoning_efforts.get("low").is_none(),
+                "an undeclared level must not be offered: {overlay}"
+            );
             assert_eq!(
                 settings["agent-default-model"]["provider"].as_str(),
                 Some("fake")
@@ -4365,6 +4420,71 @@ mod tests {
         // A declared `false` beats the route default, so a text-only endpoint
         // keeps the Harness's placeholder projection.
         assert_eq!(yaml_strings(&route["models"][0]["input"]), ["text"]);
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_projects_reasoning_efforts_unless_disabled() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        assert!(
+            provider.configured_models[0]
+                .capabilities
+                .reasoning
+                .is_none(),
+            "fixture must not declare reasoning"
+        );
+
+        // A Vibex route id is never a pi-ai provider, so an omitted
+        // `reasoningEfforts` means "does not reason" and the Harness never
+        // advertises its `effort` control. Both an undeclared and an explicit
+        // `true` capability must project the Harness's own `off`/`high`/`max`
+        // vocabulary: the selector needs at least two levels, and each level's
+        // wire spelling is what dispatch actually sends.
+        for reasoning in [None, Some(true)] {
+            provider.configured_models[0].capabilities.reasoning = reasoning;
+            let overlay = deepseek_harness_overlay(
+                &provider,
+                &binding,
+                provider.endpoints.first(),
+                binding.configured_models.first(),
+                "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+            )
+            .unwrap();
+            let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+            let efforts = settings["llm-pi-ai"]["providers"]["fake"]["models"][0]
+                .get("reasoningEfforts")
+                .unwrap_or_else(|| panic!("missing reasoningEfforts for {reasoning:?}: {overlay}"));
+
+            assert_eq!(efforts.get("off"), Some(&serde_yaml::Value::Null));
+            assert_eq!(
+                efforts.get("high").and_then(serde_yaml::Value::as_str),
+                Some("high")
+            );
+            assert_eq!(
+                efforts.get("max").and_then(serde_yaml::Value::as_str),
+                Some("max")
+            );
+            assert!(
+                efforts.get("low").is_none() && efforts.get("medium").is_none(),
+                "only the projected levels may be offered: {overlay}"
+            );
+        }
+
+        // Only an explicit `false` opts a Model out of reasoning.
+        provider.configured_models[0].capabilities.reasoning = Some(false);
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        assert_eq!(
+            settings["llm-pi-ai"]["providers"]["fake"]["models"][0]["reasoningEfforts"],
+            serde_yaml::Value::Bool(false)
+        );
     }
 
     #[test]
