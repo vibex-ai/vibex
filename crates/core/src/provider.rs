@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent_config::{AgentId, agent_id_for_provider_kind};
@@ -1133,6 +1135,206 @@ impl ProviderModelWireApi {
     }
 }
 
+/// One level an Agent's thinking-depth control can offer.
+///
+/// The vocabulary belongs to the Agent, not to the Model: a Model declares
+/// which of these levels it offers and what each one spells on the wire. The
+/// set mirrors pi-ai's `ModelThinkingLevel`, the gate the DeepSeek Harness
+/// applies to a route's `reasoningEfforts`; a level outside it is refused by
+/// the Harness rather than ignored, so a declaration surface must not invent
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningEffortLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ProviderReasoningEffortLevel {
+    /// Every level, in escalation order.
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The level a declaration key names, or `None` for a name outside the
+    /// vocabulary. Case-insensitive; the wire spelling never is.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|level| value.eq_ignore_ascii_case(level.as_str()))
+    }
+}
+
+impl std::fmt::Display for ProviderReasoningEffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The reasoning levels one Model offers, declared per Model.
+///
+/// Each key is a level a selector offers, and each value is the wire spelling
+/// dispatch sends for it. `None` is "offered, send nothing" — the one spelling
+/// only `Off` may leave empty. The table is the whole answer: a level absent
+/// from it is not offered, which is what lets two Models on the same provider
+/// route show different thinking depths. `None` on the capability field means
+/// "not declared" and leaves the Agent's own default in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderModelReasoningEfforts(
+    pub BTreeMap<ProviderReasoningEffortLevel, Option<String>>,
+);
+
+impl ProviderModelReasoningEfforts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn insert(&mut self, level: ProviderReasoningEffortLevel, wire: Option<String>) {
+        self.0.insert(level, wire);
+    }
+
+    /// The declared levels in escalation order, with the wire spelling each
+    /// one sends.
+    pub fn declared_levels(
+        &self,
+    ) -> impl Iterator<Item = (ProviderReasoningEffortLevel, Option<&str>)> {
+        ProviderReasoningEffortLevel::ALL
+            .into_iter()
+            .filter_map(|level| self.0.get(&level).map(|wire| (level, wire.as_deref())))
+    }
+
+    /// Checks the declaration against what a thinking-depth control consumes.
+    ///
+    /// The reason is user-facing text because the callers are a projection
+    /// diagnostic and an editor error line, not parsers.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.is_empty() {
+            return Err(
+                "declares no level; declare the offered levels or leave the field unset"
+                    .to_string(),
+            );
+        }
+        let mut thinking_levels = 0usize;
+        for (level, wire) in self.declared_levels() {
+            match wire {
+                Some(wire) if wire.trim().is_empty() => {
+                    return Err(format!("level \"{level}\" declares an empty wire spelling"));
+                }
+                Some(_) => {
+                    if level != ProviderReasoningEffortLevel::Off {
+                        thinking_levels += 1;
+                    }
+                }
+                None => {
+                    if level != ProviderReasoningEffortLevel::Off {
+                        return Err(format!(
+                            "level \"{level}\" needs the wire spelling dispatch sends; only \"off\" may leave it empty"
+                        ));
+                    }
+                }
+            }
+        }
+        if thinking_levels == 0 {
+            return Err(
+                "offers no level beyond \"off\"; declare a thinking level or mark the Model as non-reasoning"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads the compact declaration the Provider editor writes.
+    ///
+    /// Entries are comma separated; each is a level, or `level=wire` when the
+    /// endpoint spells that level differently. An empty input declares
+    /// nothing, and a declaration the thinking-depth control cannot consume is
+    /// an error rather than a silently repaired table.
+    pub fn parse(input: &str) -> Result<Option<Self>, String> {
+        let mut efforts = Self::new();
+        for entry in input.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (level, wire) = match entry.split_once('=') {
+                Some((level, wire)) => (level.trim(), Some(wire.trim())),
+                None => (entry, None),
+            };
+            let Some(level) = ProviderReasoningEffortLevel::parse(level) else {
+                return Err(format!(
+                    "\"{level}\" is not a thinking level; use one of {}",
+                    ProviderReasoningEffortLevel::ALL
+                        .map(ProviderReasoningEffortLevel::as_str)
+                        .join(", ")
+                ));
+            };
+            if efforts.0.contains_key(&level) {
+                return Err(format!("level \"{level}\" is declared more than once"));
+            }
+            let wire = match wire {
+                Some("") => {
+                    return Err(format!("level \"{level}\" declares an empty wire spelling"));
+                }
+                Some(wire) => Some(wire.to_string()),
+                None if level == ProviderReasoningEffortLevel::Off => None,
+                None => Some(level.as_str().to_string()),
+            };
+            efforts.insert(level, wire);
+        }
+        if efforts.is_empty() {
+            return Ok(None);
+        }
+        efforts.validate()?;
+        Ok(Some(efforts))
+    }
+}
+
+impl std::fmt::Display for ProviderModelReasoningEfforts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (level, wire) in self.declared_levels() {
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            match wire {
+                Some(wire) if wire != level.as_str() => write!(f, "{level}={wire}")?,
+                _ => f.write_str(level.as_str())?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Explicitly declared per-Model runtime capabilities.
 ///
 /// Every field is tri-state. `None` means "not declared", never "unsupported":
@@ -1140,7 +1342,7 @@ impl ProviderModelWireApi {
 /// is omitted from Agent projections so the Agent keeps its own defaults. Only
 /// an explicit declaration or live probe may associate a capability with a
 /// Model. See `.trellis/spec/backend/agent-session-protocol.md`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelCapabilities {
     /// Model performs internal reasoning. Agents that expose reasoning depth or
@@ -1162,6 +1364,12 @@ pub struct ProviderModelCapabilities {
     /// Maximum output tokens per response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// Reasoning levels this Model offers, when the Agent's own default must
+    /// be replaced. Only the declared levels are offered, and each one carries
+    /// the wire spelling dispatch sends for it. `None` leaves the Agent's own
+    /// answer in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<ProviderModelReasoningEfforts>,
 }
 
 impl ProviderModelCapabilities {
@@ -2388,7 +2596,7 @@ pub struct AdapterDiagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderConfiguredModel, ProviderModelWireApi};
+    use super::{ProviderConfiguredModel, ProviderModelWireApi, ProviderReasoningEffortLevel};
 
     #[test]
     fn model_wire_protocol_ids_round_trip_the_canonical_protocols() {
@@ -2427,5 +2635,66 @@ mod tests {
             anthropic.wire_api,
             Some(ProviderModelWireApi::AnthropicMessages)
         );
+    }
+
+    #[test]
+    fn reasoning_levels_round_trip_the_agents_vocabulary() {
+        assert_eq!(ProviderReasoningEffortLevel::ALL.len(), 7);
+        for level in ProviderReasoningEffortLevel::ALL {
+            assert_eq!(
+                ProviderReasoningEffortLevel::parse(level.as_str()),
+                Some(level)
+            );
+        }
+        // The key is the level, never the wire spelling: case-insensitive on
+        // the way in, canonical on the way out.
+        assert_eq!(
+            ProviderReasoningEffortLevel::parse(" XHigh "),
+            Some(ProviderReasoningEffortLevel::Xhigh)
+        );
+        assert_eq!(ProviderReasoningEffortLevel::parse("none"), None);
+        assert_eq!(ProviderReasoningEffortLevel::parse(""), None);
+    }
+
+    #[test]
+    fn reasoning_effort_declarations_round_trip_their_compact_form() {
+        let declared = super::ProviderModelReasoningEfforts::parse("off, low, high=HIGH, max=max")
+            .unwrap()
+            .expect("a non-empty declaration must parse");
+        // A spelling that repeats its level is canonicalized away, so the
+        // editor shows the same table however it was typed.
+        assert_eq!(declared.to_string(), "off, low, high=HIGH, max");
+        assert_eq!(
+            declared
+                .declared_levels()
+                .map(|(level, wire)| (level.as_str(), wire))
+                .collect::<Vec<_>>(),
+            [
+                ("off", None),
+                ("low", Some("low")),
+                ("high", Some("HIGH")),
+                ("max", Some("max")),
+            ]
+        );
+        assert_eq!(
+            super::ProviderModelReasoningEfforts::parse("  ").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_declarations_refuse_what_a_depth_control_cannot_consume() {
+        // Each answer the Agent would reject, named before it reaches a
+        // settings file: an unknown level, a duplicate, an empty spelling, a
+        // level with no spelling, and a table offering nothing to think with.
+        for broken in ["extreme", "low, low", "low=", "low, high=", "off", "off="] {
+            assert!(
+                super::ProviderModelReasoningEfforts::parse(broken).is_err(),
+                "\"{broken}\" must be refused"
+            );
+        }
+        // The one empty spelling the control does accept: not thinking is the
+        // parameter's absence.
+        assert!(super::ProviderModelReasoningEfforts::parse("off, high").is_ok());
     }
 }

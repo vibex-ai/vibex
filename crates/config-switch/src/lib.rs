@@ -70,9 +70,9 @@ use vibex_db::{
     AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository,
     CustomAgentDefinitionRepository, HookRepository, McpServerRepository, PromptRepository,
     ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
-    ProviderInjectionPreviewRepository, ProviderProfileRepository,
-    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
-    open_database,
+    ProviderInjectionPreviewRepository, ProviderModelRuntimeOptionSnapshotRepository,
+    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
+    SkillRepository, apply_migrations, open_database,
 };
 
 mod native_export;
@@ -1209,6 +1209,7 @@ impl ProviderConfigService {
                 )
                 .with_diagnostic("providerProfileId", request.provider_profile_id.as_str())
             })?;
+        let previous_models = profile.configured_models.clone();
 
         if let Some(display_name) = request.display_name {
             validate_display_name(&display_name)?;
@@ -1261,6 +1262,12 @@ impl ProviderConfigService {
         profile.updated_at_ms = unix_timestamp_ms();
 
         ProviderProfileRepository::update(&conn, &profile)?;
+        invalidate_changed_model_runtime_option_snapshots(
+            &conn,
+            &profile.id,
+            &previous_models,
+            &profile.configured_models,
+        )?;
         let updated = ProviderProfileRepository::get(&conn, &profile.id)?.ok_or_else(|| {
             VibexError::storage(
                 "provider_profile_update_readback_failed",
@@ -3718,6 +3725,36 @@ fn find_existing_mcp_server(
     Ok(McpServerRepository::list(conn)?
         .into_iter()
         .find(|server| mcp_candidate_matches_existing(server, candidate)))
+}
+
+/// Drops cached runtime-option evidence for Models whose projection answer
+/// changed.
+///
+/// A successful per-Model probe is reused by model id, and that key carries no
+/// part of the declaration the probe was projected from: the DeepSeek Harness
+/// run options, for one, advertise the reasoning levels the Profile declared.
+/// Without this, editing a Model's declared thinking depth leaves the previous
+/// vocabulary on screen and the edit looks like it did nothing.
+fn invalidate_changed_model_runtime_option_snapshots(
+    conn: &vibex_db::DbConnection,
+    provider_profile_id: &vibex_core::ProviderProfileId,
+    previous: &[ProviderConfiguredModel],
+    current: &[ProviderConfiguredModel],
+) -> VibexResult<()> {
+    for model in current {
+        let Some(before) = previous.iter().find(|before| before.id == model.id) else {
+            continue;
+        };
+        if before.wire_api == model.wire_api && before.capabilities == model.capabilities {
+            continue;
+        }
+        ProviderModelRuntimeOptionSnapshotRepository::delete_model(
+            conn,
+            provider_profile_id,
+            &model.id,
+        )?;
+    }
+    Ok(())
 }
 
 fn mcp_candidate_matches_existing(server: &McpServer, candidate: &McpServerCreateRequest) -> bool {
@@ -8759,6 +8796,132 @@ mod tests {
         };
 
         assert_eq!(error.code, "provider_option_key_conflict");
+    }
+
+    #[test]
+    fn editing_a_models_declared_capabilities_drops_its_runtime_option_snapshot() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("vibex.db");
+        let service = ProviderConfigService::new(db_path.clone());
+        let agent_id = AgentId::parse("codex").unwrap();
+        let model = ProviderConfiguredModel {
+            id: "gpt-test".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiResponses),
+            capabilities: Default::default(),
+        };
+        let profile = service
+            .create_agent_model_provider_profile(AgentModelProviderProfileCreateRequest {
+                agent_id: agent_id.clone(),
+                display_name: "Snapshot Invalidation".to_string(),
+                account_alias: None,
+                base_url: Some("https://api.example.invalid/v1".to_string()),
+                default_model: Some("gpt-test".to_string()),
+                small_model: None,
+                large_model: None,
+                configured_models: vec![model.clone()],
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+                secret_references: Vec::new(),
+            })
+            .unwrap();
+
+        let snapshot_model_ids = || {
+            let conn = open_database(&db_path).unwrap();
+            ProviderModelRuntimeOptionSnapshotRepository::list(&conn)
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.provider_profile_id == profile.id)
+                .map(|record| record.model_id)
+                .collect::<Vec<_>>()
+        };
+        let store_probe = || {
+            let conn = open_database(&db_path).unwrap();
+            ProviderModelRuntimeOptionSnapshotRepository::upsert_success(
+                &conn,
+                &vibex_db::ProviderModelRuntimeOptionSnapshotRecord {
+                    provider_profile_id: profile.id.clone(),
+                    model_id: "gpt-test".to_string(),
+                    agent_id: agent_id.clone(),
+                    session_config: Some(vibex_core::AgentSessionConfigProbe::default()),
+                    last_success_at_ms: Some(1),
+                    last_attempt_at_ms: 1,
+                    last_error_code: None,
+                },
+            )
+            .unwrap();
+        };
+        let update = |configured_models: Option<Vec<ProviderConfiguredModel>>| {
+            service
+                .update_agent_model_provider_profile(AgentModelProviderProfileUpdateRequest {
+                    agent_id: agent_id.clone(),
+                    provider_profile_id: profile.id.clone(),
+                    display_name: Some("Snapshot Invalidation".to_string()),
+                    status: None,
+                    account_alias: None,
+                    base_url: None,
+                    default_model: None,
+                    small_model: None,
+                    large_model: None,
+                    configured_models,
+                    reasoning_effort: None,
+                    sandbox_defaults: None,
+                    network_defaults: None,
+                    permission_defaults: None,
+                    provider_options: None,
+                })
+                .unwrap();
+        };
+
+        store_probe();
+        assert_eq!(snapshot_model_ids(), ["gpt-test"]);
+
+        // An edit that cannot change what a probe answers keeps the evidence:
+        // re-probing every launch would be the cost of dropping it.
+        update(None);
+        assert_eq!(snapshot_model_ids(), ["gpt-test"]);
+
+        // A changed declaration must drop it, or the run options keep
+        // advertising the vocabulary the previous declaration projected.
+        let mut declared = vibex_core::ProviderModelReasoningEfforts::new();
+        declared.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        declared.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("high".to_string()),
+        );
+        update(Some(vec![ProviderConfiguredModel {
+            capabilities: vibex_core::ProviderModelCapabilities {
+                reasoning: Some(true),
+                reasoning_efforts: Some(declared.clone()),
+                ..Default::default()
+            },
+            ..model.clone()
+        }]));
+        assert!(snapshot_model_ids().is_empty());
+        // The declaration itself has to survive the write: the projection reads
+        // it back from the stored Profile, so a dropped table would silently
+        // restore the Agent default.
+        let stored = ProviderProfileRepository::get(&open_database(&db_path).unwrap(), &profile.id)
+            .unwrap()
+            .expect("the updated Profile must still exist");
+        assert_eq!(
+            stored.configured_models[0].capabilities.reasoning_efforts,
+            Some(declared)
+        );
+
+        // The same for a wire-protocol change: the probe answer is per
+        // interface, not just per id.
+        store_probe();
+        assert_eq!(snapshot_model_ids(), ["gpt-test"]);
+        update(Some(vec![ProviderConfiguredModel {
+            wire_api: None,
+            ..model
+        }]));
+        assert!(snapshot_model_ids().is_empty());
     }
 
     #[test]

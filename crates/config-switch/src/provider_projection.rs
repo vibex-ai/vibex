@@ -3316,7 +3316,8 @@ fn mistral_vibe_model_entry(provider_id: &str, model_id: &str) -> serde_json::Va
     })
 }
 
-/// Reasoning-effort levels projected for a DeepSeek Harness route Model.
+/// Reasoning-effort levels projected for a DeepSeek Harness route Model that
+/// declares no table of its own.
 ///
 /// Each key is a level the selector offers; the value is the spelling pi-ai's
 /// dispatch sends on the wire, and `None` is pi-ai's "offered, send nothing".
@@ -3326,6 +3327,49 @@ fn mistral_vibe_model_entry(provider_id: &str, model_id: &str) -> serde_json::Va
 /// an undeclared level to unsupported, and DeepSeek has no such budget.
 const DEEPSEEK_HARNESS_REASONING_EFFORTS: [(&str, Option<&str>); 3] =
     [("off", None), ("high", Some("high")), ("max", Some("max"))];
+
+/// The reasoning levels one route Model's Harness entry carries.
+///
+/// A Model's own declaration wins: the installed pi-ai catalog cannot describe
+/// a Vibex route (`acp` is not a pi-ai provider), so only what the Provider
+/// profile declares is authoritative for these ids. An undeclared Model keeps
+/// the Harness's DeepSeek vocabulary, and an explicit `reasoning: false` is the
+/// one answer that removes the control entirely.
+fn deepseek_harness_reasoning_efforts(
+    capabilities: Option<&ProviderModelCapabilities>,
+    model_id: &str,
+) -> VibexResult<serde_json::Value> {
+    let declared = capabilities.and_then(|capabilities| capabilities.reasoning_efforts.as_ref());
+    let Some(declared) = declared else {
+        let mut fallback = serde_json::Map::new();
+        for (level, wire) in DEEPSEEK_HARNESS_REASONING_EFFORTS {
+            fallback.insert(
+                level.to_string(),
+                wire.map_or(serde_json::Value::Null, |wire| serde_json::json!(wire)),
+            );
+        }
+        return Ok(serde_json::Value::Object(fallback));
+    };
+    // The Harness refuses the whole settings file when a table offers nothing
+    // to think with, so the diagnostic names the Model here instead of leaving
+    // a route that cannot resolve.
+    declared.validate().map_err(|reason| {
+        VibexError::validation(
+            "deepseek_harness_reasoning_efforts_invalid",
+            "the Model's declared thinking depth cannot be projected to DeepSeek Harness",
+        )
+        .with_diagnostic("model", model_id)
+        .with_diagnostic("reason", reason)
+    })?;
+    let mut efforts = serde_json::Map::new();
+    for (level, wire) in declared.declared_levels() {
+        efforts.insert(
+            level.as_str().to_string(),
+            wire.map_or(serde_json::Value::Null, |wire| serde_json::json!(wire)),
+        );
+    }
+    Ok(serde_json::Value::Object(efforts))
+}
 
 /// Harness wire protocols whose pi-ai compatibility report reads
 /// `supportsDeveloperRole`.
@@ -3340,7 +3384,7 @@ fn deepseek_harness_model_entry(
     provider: &ModelProviderProfile,
     model: Option<&AgentConfiguredModelBinding>,
     model_id: &str,
-) -> serde_json::Value {
+) -> VibexResult<serde_json::Value> {
     let configured_model = model.and_then(|model| {
         provider.configured_models.iter().find(|configured| {
             configured.id == model.provider_model_id || configured.id == model.agent_model_id
@@ -3381,28 +3425,16 @@ fn deepseek_harness_model_entry(
     // same route. A Vibex route id is never a pi-ai provider, so a route Model
     // has no installed entry to inherit from: an omitted `reasoningEfforts`
     // means "does not reason" and the run options lose the thinking-depth
-    // selector entirely. Project the Harness's own DeepSeek vocabulary so the
-    // control exists and each selected level reaches the request. Only an
-    // explicit `reasoning: false` opts a Model out.
-    match capabilities.and_then(|capabilities| capabilities.reasoning) {
-        Some(false) => {
-            model_entry.insert("reasoningEfforts".to_string(), serde_json::json!(false));
-        }
-        _ => {
-            let mut reasoning_efforts = serde_json::Map::new();
-            for (level, wire) in DEEPSEEK_HARNESS_REASONING_EFFORTS {
-                reasoning_efforts.insert(
-                    level.to_string(),
-                    wire.map_or(serde_json::Value::Null, |wire| serde_json::json!(wire)),
-                );
-            }
-            model_entry.insert(
-                "reasoningEfforts".to_string(),
-                serde_json::Value::Object(reasoning_efforts),
-            );
-        }
-    }
-    serde_json::Value::Object(model_entry)
+    // selector entirely. A Model that declares its own levels gets exactly
+    // those; a Model that declares none gets the Harness's DeepSeek
+    // vocabulary, so the control exists and each selected level reaches the
+    // request. Only an explicit `reasoning: false` opts a Model out.
+    let reasoning_efforts = match capabilities.and_then(|capabilities| capabilities.reasoning) {
+        Some(false) => serde_json::json!(false),
+        _ => deepseek_harness_reasoning_efforts(capabilities, model_id)?,
+    };
+    model_entry.insert("reasoningEfforts".to_string(), reasoning_efforts);
+    Ok(serde_json::Value::Object(model_entry))
 }
 
 fn deepseek_harness_overlay(
@@ -3422,7 +3454,7 @@ fn deepseek_harness_overlay(
     let api = deepseek_harness_api(model);
     let group = overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
     let model_entries: Vec<serde_json::Value> = if group.is_empty() {
-        vec![deepseek_harness_model_entry(provider, model, model_id)]
+        vec![deepseek_harness_model_entry(provider, model, model_id)?]
     } else {
         group
             .iter()
@@ -3430,7 +3462,7 @@ fn deepseek_harness_overlay(
                 let model_id = projection_model_id(Some(model_binding)).unwrap_or("vibex-model");
                 deepseek_harness_model_entry(provider, Some(model_binding), model_id)
             })
-            .collect()
+            .collect::<VibexResult<Vec<_>>>()?
     };
 
     let mut route = serde_json::Map::new();
@@ -4518,6 +4550,183 @@ mod tests {
             settings["llm-pi-ai"]["providers"]["fake"]["models"][0]["reasoningEfforts"],
             serde_yaml::Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_projects_a_models_declared_reasoning_levels() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        let mut efforts = vibex_core::ProviderModelReasoningEfforts::new();
+        efforts.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::Low,
+            Some("low".to_string()),
+        );
+        // A wire spelling the level name does not predict: the declaration is
+        // the only place an endpoint's own vocabulary can come from, since the
+        // installed pi-ai catalog describes no Vibex route.
+        efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("HIGH".to_string()),
+        );
+        provider.configured_models[0].capabilities.reasoning = Some(true);
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(efforts);
+
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let projected = settings["llm-pi-ai"]["providers"]["fake"]["models"][0]
+            .get("reasoningEfforts")
+            .expect("a declared table must be projected");
+
+        assert_eq!(projected.get("off"), Some(&serde_yaml::Value::Null));
+        assert_eq!(
+            projected.get("low").and_then(serde_yaml::Value::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            projected.get("high").and_then(serde_yaml::Value::as_str),
+            Some("HIGH")
+        );
+        assert!(
+            projected.get("medium").is_none()
+                && projected.get("max").is_none()
+                && projected.get("minimal").is_none(),
+            "a declared table replaces the fallback instead of extending it: {overlay}"
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_rejects_a_declaration_the_harness_would_refuse() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        let mut off_only = vibex_core::ProviderModelReasoningEfforts::new();
+        off_only.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        let mut missing_wire = vibex_core::ProviderModelReasoningEfforts::new();
+        missing_wire.insert(vibex_core::ProviderReasoningEffortLevel::High, None);
+
+        // Each of these makes the Harness reject the whole settings file, which
+        // would surface as a failed session with no Model named. The projection
+        // refuses it first, while it still knows which Model is at fault.
+        for broken in [off_only, missing_wire] {
+            provider.configured_models[0].capabilities.reasoning_efforts = Some(broken);
+            let error = deepseek_harness_overlay(
+                &provider,
+                &binding,
+                provider.endpoints.first(),
+                binding.configured_models.first(),
+                "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "deepseek_harness_reasoning_efforts_invalid");
+        }
+
+        // A non-reasoning Model keeps its opt-out even beside a declared table:
+        // the flag is the Model's answer, and the table cannot override it.
+        let mut declared = vibex_core::ProviderModelReasoningEfforts::new();
+        declared.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("high".to_string()),
+        );
+        provider.configured_models[0].capabilities.reasoning = Some(false);
+        provider.configured_models[0].capabilities.reasoning_efforts = Some(declared);
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        assert_eq!(
+            settings["llm-pi-ai"]["providers"]["fake"]["models"][0]["reasoningEfforts"],
+            serde_yaml::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_projects_each_models_own_reasoning_levels() {
+        let (mut provider, _, binding, _) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        // Two Models of the same provider with different real vocabularies —
+        // the case the installed catalog distinguishes per Model and a Vibex
+        // route cannot inherit.
+        let mut first = provider.configured_models[0].clone();
+        let mut first_efforts = vibex_core::ProviderModelReasoningEfforts::new();
+        first_efforts.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        first_efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::Low,
+            Some("low".to_string()),
+        );
+        first_efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("high".to_string()),
+        );
+        first.capabilities.reasoning = Some(true);
+        first.capabilities.reasoning_efforts = Some(first_efforts);
+        let mut second = first.clone();
+        second.id = "model-b".to_string();
+        let mut second_efforts = vibex_core::ProviderModelReasoningEfforts::new();
+        second_efforts.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        second_efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("high".to_string()),
+        );
+        second_efforts.insert(
+            vibex_core::ProviderReasoningEffortLevel::Max,
+            Some("max".to_string()),
+        );
+        second.capabilities.reasoning_efforts = Some(second_efforts);
+        provider.configured_models = vec![first, second];
+        let mut binding = binding.clone();
+        binding.configured_models[0].provider_model_id = "model-a".to_string();
+        binding.configured_models[0].agent_model_id = "model-a".to_string();
+        let mut other = binding.configured_models[0].clone();
+        other.id = AgentConfiguredModelBindingId::new();
+        other.provider_model_id = "model-b".to_string();
+        other.agent_model_id = "model-b".to_string();
+        binding.configured_models.push(other);
+
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            binding.configured_models.first(),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let models = settings["llm-pi-ai"]["providers"]["fake"]["models"]
+            .as_sequence()
+            .expect("the route must list both Models");
+        let efforts_of = |id: &str| {
+            models
+                .iter()
+                .find(|model| model["id"].as_str() == Some(id))
+                .and_then(|model| model.get("reasoningEfforts"))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing reasoningEfforts for {id}: {overlay}"))
+        };
+
+        let first = efforts_of("model-a");
+        assert_eq!(
+            first.get("low").and_then(serde_yaml::Value::as_str),
+            Some("low")
+        );
+        assert!(first.get("max").is_none());
+        let second = efforts_of("model-b");
+        assert_eq!(
+            second.get("max").and_then(serde_yaml::Value::as_str),
+            Some("max")
+        );
+        assert!(second.get("low").is_none());
     }
 
     #[test]
@@ -5790,6 +5999,7 @@ mod tests {
             pdf_input: Some(true),
             context_tokens: Some(1_000_000),
             output_tokens: Some(128_000),
+            reasoning_efforts: None,
         };
         let endpoint = provider.endpoints.first().unwrap();
 
