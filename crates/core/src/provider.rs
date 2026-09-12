@@ -487,6 +487,15 @@ pub struct Skill {
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub content_preview: Option<String>,
+    /// Full Skill text, when Vibex owns the content.
+    ///
+    /// A `LocalFolder` Skill keeps its folder on disk as the authority and only
+    /// records a `source_uri`; a `Manual` Skill has no folder, so this field is
+    /// where its instructions live. Native Skill export needs the whole body —
+    /// `content_preview` is a 2 KiB summary and writing a Skill file from it
+    /// would silently truncate the instructions an Agent is supposed to follow.
+    #[serde(default)]
+    pub body: Option<String>,
     pub provider_matrix: Vec<SkillProviderMatrix>,
     pub agent_matrix: Vec<SkillAgentMatrix>,
     pub created_at_ms: i64,
@@ -545,6 +554,8 @@ pub struct SkillCreateRequest {
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub content_preview: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
     pub provider_matrix: Vec<SkillProviderMatrix>,
 }
 
@@ -562,6 +573,8 @@ pub struct SkillUpdateRequest {
     pub description: Option<String>,
     pub tags: Option<Vec<String>>,
     pub content_preview: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +629,11 @@ pub struct SkillDiscovery {
     pub command_name: String,
     pub description: Option<String>,
     pub content_preview: Option<String>,
+    /// Full manifest text read from the discovered `SKILL.md`, capped by the
+    /// scanner's read limit. Import persists it so native Skill export can
+    /// write a complete Agent-side manifest later.
+    #[serde(default)]
+    pub body: Option<String>,
     pub existing_skill_id: Option<SkillId>,
     pub diagnostics: Vec<ProviderBindingMetadata>,
 }
@@ -637,6 +655,8 @@ pub struct SkillImportSelection {
     pub command_name: String,
     pub description: Option<String>,
     pub content_preview: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
     pub enable_agent_ids: Vec<AgentId>,
 }
 
@@ -2175,6 +2195,16 @@ pub enum ProviderNativeConfigFileKind {
     ClaudeLegacyJson,
     ClaudeMcpJson,
     CcSwitchDatabase,
+    /// A standalone MCP server map, such as `~/.cursor/mcp.json`.
+    AgentMcpJson,
+    /// An Agent settings document that embeds its MCP servers.
+    AgentSettingsJson,
+    /// An Agent TOML document that embeds its MCP servers.
+    AgentConfigToml,
+    /// An Agent YAML document that embeds its MCP servers.
+    AgentConfigYaml,
+    /// A Skill manifest written into an Agent's own Skills folder.
+    AgentSkillManifest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2280,8 +2310,71 @@ pub struct ProviderNativeImportCreateResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderNativeExportSource {
+    /// The Agent the selected Provider Profile runs.
+    ///
+    /// MCP servers and Skills belong to an Agent, so a resource export always
+    /// targets the profile's own Agent. This variant says so explicitly and
+    /// works for every Agent, including the ones without a dedicated variant.
+    AgentDefault,
     Codex,
     Claude,
+    /// Agents whose native MCP or Skill files Vibex can write directly.
+    ///
+    /// These carry no provider-profile semantics: they exist so an Agent-scoped
+    /// MCP or Skill export can name the file set it targets.
+    Cursor,
+    Grok,
+    Gemini,
+    Kimi,
+    OpenCode,
+    QwenCode,
+    Cline,
+    CodeBuddy,
+    Copilot,
+    OpenClaw,
+    Hermes,
+}
+
+impl ProviderNativeExportSource {
+    /// Agent this source writes for, when it names one.
+    ///
+    /// `AgentDefault` names no Agent: the caller resolves it from the profile.
+    pub fn agent_id(self) -> Option<&'static str> {
+        Some(match self {
+            Self::AgentDefault => return None,
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Grok => "grok",
+            Self::Gemini => "gemini",
+            Self::Kimi => "kimi",
+            Self::OpenCode => "opencode",
+            Self::QwenCode => "qwen-code",
+            Self::Cline => "cline",
+            Self::CodeBuddy => "codebuddy-code",
+            Self::Copilot => "copilot",
+            Self::OpenClaw => "openclaw",
+            Self::Hermes => "hermes",
+        })
+    }
+
+    /// Whether the source can host a provider-profile export.
+    ///
+    /// Only the two Agents with a descriptor-backed provider projection have a
+    /// profile file Vibex understands; the rest are MCP and Skill targets only.
+    pub fn supports_provider_profile_export(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+    }
+
+    /// Whether this source may target `agent_id`.
+    ///
+    /// `AgentDefault` always may; a concrete source only for its own Agent,
+    /// because exporting one Agent's resources into another Agent's file would
+    /// install servers and Skills the user never assigned there.
+    pub fn targets_agent(self, agent_id: &str) -> bool {
+        self.agent_id()
+            .is_none_or(|source_agent| source_agent == agent_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

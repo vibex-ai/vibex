@@ -29,6 +29,11 @@ pub struct LocalSkillEntry {
     pub command_name: String,
     pub source_hash: String,
     pub content_preview: Option<String>,
+    /// Full manifest text, capped at [`LOCAL_SKILL_READ_LIMIT_BYTES`].
+    ///
+    /// Native Skill export writes an Agent-side `SKILL.md`; the preview alone
+    /// would truncate the instructions, so the whole manifest is carried here.
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -255,7 +260,10 @@ fn local_skill_entry(root: &LocalSkillRoot, path: &Path) -> Option<LocalSkillEnt
         description: metadata.description,
         command_name,
         source_hash: stable_hash_hex(&manifest_path),
-        content_preview: content.map(|value| value.chars().take(2048).collect()),
+        content_preview: content
+            .as_deref()
+            .map(|value| value.chars().take(2048).collect()),
+        body: content,
     })
 }
 

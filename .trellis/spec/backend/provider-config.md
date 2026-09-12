@@ -734,8 +734,51 @@ Agents independently. `ProviderKind` matrices may describe configuration or
 import provenance, but online runtime injection and command discovery resolve a
 concrete `agent_id` and an enabled ACP profile without ProviderKind fallback.
 
-Default behavior is Vibex session injection. Native config export follows the
-same diff, backup, atomic write, and rollback requirements as Provider export.
+### Delivery paths differ, and only one of them is automatic
+
+An Agent can only see a resource through a channel its own CLI implements. Vibex
+has two, and they are not interchangeable:
+
+| Resource | Automatic path | Explicit path |
+| --- | --- | --- |
+| MCP server | ACP `session/new.mcpServers`, for Agents whose dialect delivers wire entries | `ProviderNativeExportMode::Mcp` writes the Agent's own MCP config file |
+| Skill | none — ACP has no Skills field | `ProviderNativeExportMode::Skills` writes `SKILL.md` into the Agent's Skills folder |
+
+Two facts follow, and product surfaces must not contradict them:
+
+- **MCP wire forwarding is gated per Agent.** `McpWireDelivery` in
+  `crates/agent-acp/src/dialect.rs` classifies each Agent as `Delivered`,
+  `NativeConfig`, `AcceptedButDropped`, or `Rejected`. Only `Delivered` Agents
+  receive entries; for the others the runtime emits
+  `acp_mcp_wire_forwarding_skipped` and sends an empty array. An Agent marked
+  `NativeConfig` reads its own file at launch, so **native export is its only
+  delivery path** — configuring MCP for it without exporting changes nothing.
+- **A Skill is inert until it is exported.** Enabling a Skill for an Agent adds
+  a `$command` composer entry and changes the session's `skills_revision`
+  fingerprint (which restarts the Agent process so a stale session cannot keep
+  an old Skill set). It does not put the Skill anywhere the Agent reads. Native
+  export is what makes an Agent see it.
+
+Native export therefore follows the same preview → diff → backup → atomic write
+→ rollback requirements as Provider export, and adds three of its own:
+
+- **Never re-serialize a file Vibex does not own.** JSON files are edited by
+  replacing the byte span of the container value, preserving key order,
+  indentation and unrelated subtrees. TOML and YAML files cannot be spliced
+  safely without a format-preserving parser, so Vibex owns a marker-delimited
+  block and **refuses** a file whose container already exists outside it rather
+  than deleting servers the user configured by hand.
+- **Export targets come from the import scanner.** The Agent home and Skills
+  folder are resolved by `agent_native_home_roots` and
+  `import_scan_agent_skill_roots`, the same functions the discovery flow uses,
+  so everything Vibex writes is discoverable again. Export/import round trips
+  are covered by tests.
+- **MCP secrets are materialized; provider-profile secrets are not.** A native
+  config file is read by the Agent's own process, which cannot reach Vibex's
+  secret store, so `ProviderNativeExportMode::Mcp` resolves secret references
+  and writes the values. A secret that fails to resolve is dropped with a
+  diagnostic naming only its lookup key, never an empty placeholder that would
+  look configured. Provider-profile export still writes public settings only.
 
 ## Scenario: Skills Prompts Hooks Resource Management Baseline
 
@@ -777,12 +820,12 @@ provider_preview_injection(ProviderInjectionPreviewRequest)
   -> ProviderInjectionPreview { mcp_servers: Vec<String>, skills: Vec<String>, ... }
 ```
 
-SQLite schema version 8 owns:
+SQLite owns (Skills table as of schema version 55, which added `body`):
 
 ```text
 skills(
   skill_id, display_name, source_kind, status, scope_kind, project_id,
-  workspace_id, source_uri, description, tags_json, content_preview,
+  workspace_id, source_uri, description, tags_json, content_preview, body,
   created_at_ms, updated_at_ms, deleted_at_ms
 )
 
@@ -2057,22 +2100,48 @@ provider_native_export_file_operations(
   temp files in the target directory, then atomically rename into place.
 - If a write fails after backup creation, apply must attempt restore and return
   `failed_restored` when restoration succeeds.
-- Rollback restores only Vibex-created backup paths recorded in export file
-  operations. It must not guess or delete unrelated user-managed files.
-- Codex `config.toml` export is conservative: ready only when the file is
-  missing/empty or already contains a Vibex managed marker. Existing unmarked
-  TOML must return blocked diagnostics.
+- Rollback restores the Vibex-created backup recorded in export file
+  operations. A file the export *created* has no backup, so it is removed —
+  but only while it still holds exactly what Vibex wrote; once it has been
+  edited it is left in place with a
+  `provider_native_export_rollback_skipped` diagnostic. Rollback must never
+  guess at unrelated user-managed files.
+- Codex `config.toml` provider-profile export is conservative: ready only when
+  the file is missing/empty or already contains a Vibex managed marker.
+  Existing unmarked TOML must return blocked diagnostics. The guard is keyed on
+  the provider-profile marker so the MCP export, which appends its own separate
+  marker block, is still allowed to touch a user-managed file.
 - Claude `settings.json` export owns only the top-level `vibex` field and
   preserves other JSON object fields.
-- MCP, Skills, Prompts, and combined native export modes remain blocked until
-  marker ownership and provider-native shape are explicitly implemented.
+- `ProviderNativeExportMode::Mcp` and `Skills` are implemented for the Agents in
+  `crates/config-switch/src/native_surface.rs`, and `Combined` runs the profile,
+  MCP and Skill plans together. `Prompts` stays blocked with a diagnostic
+  because the composer expands a Prompt into the message it sends, so there is
+  no native file to own.
+- Resource modes target the Agent the selected profile runs. A concrete source
+  that names a different Agent is refused with
+  `provider_native_export_source_agent_mismatch`; `AgentDefault` always matches.
+- An Agent with no native MCP file returns a blocked plan whose reason comes
+  from `native_mcp_absent_reason`, never a silent no-op.
+- MCP export reports every entry it could not write as
+  `provider_native_export_entry_skipped`. TOML and YAML surfaces carry stdio
+  servers only.
+- Skill export refuses a Skill with no stored `body`
+  (`provider_native_export_skill_body_missing`): writing the 2 KiB preview
+  would ship truncated instructions.
 
 ### 4. Validation & Error Matrix
 
 - Missing profile -> `provider_native_export_profile_not_found`.
 - Missing persisted preview during apply -> `provider_native_export_preview_not_found`.
-- Existing unmarked Codex config -> blocked file plan with
-  `provider_native_export_blocked`.
+- Existing unmarked Codex config, provider-profile mode -> blocked file plan
+  with `provider_native_export_blocked`.
+- Target file already defines the container outside Vibex's block (TOML/YAML)
+  -> blocked file plan with `provider_native_export_capability_refused`.
+- Export source names a different Agent than the profile runs -> blocked file
+  plan with `provider_native_export_source_agent_mismatch`.
+- Unresolvable MCP secret -> entry dropped with
+  `provider_native_export_secret_unresolved` naming only the lookup key.
 - Unsafe target shape or changed post-preview target ->
   `provider_native_export_unsafe_target`.
 - Backup/temp/atomic/restore failures -> stable `provider_native_export_*`
@@ -2085,9 +2154,10 @@ provider_native_export_file_operations(
   user click.
 - Base: A machine without native files can preview a supported create plan
   without creating directories or files.
-- Bad: Preview writes a native file, stores plaintext secrets, overwrites
-  unmarked Codex TOML, installs hooks, or exports MCP/Skills native blocks
-  without a clear marker-owned shape.
+- Bad: Preview writes a native file, overwrites unmarked Codex TOML in
+  provider-profile mode, re-serializes a TOML/YAML file Vibex does not own,
+  installs hooks, writes a Skill from its truncated preview, or writes an MCP
+  secret as an empty placeholder.
 
 ### 6. Tests Required
 
@@ -2096,6 +2166,15 @@ provider_native_export_file_operations(
 - `cargo test -p vibex-config-switch native_export` must assert preview
   no-write behavior, redaction, blocked unsafe Codex target, apply backup +
   atomic write, failed write restore, and rollback restore.
+- The same suite must assert the resource modes: an MCP native write is read
+  back by `parse_mcp_candidates_for_path`, a TOML write keeps unrelated content
+  and stays parseable, a Skill write lands beside its sibling files, a
+  mismatched source and a body-less Skill are blocked, and rollback both removes
+  a created file and leaves an edited one alone.
+- `cargo test -p vibex-config-switch native_surface` must assert that JSON edits
+  preserve every untouched byte, that a nested key with the container's name is
+  not mistaken for it, and that text-format writes are idempotent and refuse a
+  container the user already owns.
 - `pnpm check:frontend` and `pnpm check` must pass after
   changing native export DTOs, commands, mocks, hooks, or UI.
 - Native export preview screenshots are optional visual evidence; capture them

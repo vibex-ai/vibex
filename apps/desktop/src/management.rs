@@ -661,6 +661,26 @@ pub struct ManagementCenter {
     mcp_import_open: bool,
     skill_import_open: bool,
     custom_agent_editor_open: bool,
+    /// Whether the MCP server editor is showing.
+    mcp_editor_open: bool,
+    /// Server being edited; `None` while creating a new one.
+    editing_mcp_server_id: Option<String>,
+    mcp_transport_draft: vibex_core::McpServerTransportKind,
+    mcp_scope_draft: vibex_core::McpServerScopeKind,
+    mcp_name_draft: Entity<InputState>,
+    mcp_command_draft: Entity<InputState>,
+    mcp_args_draft: Entity<TextareaState>,
+    mcp_url_draft: Entity<InputState>,
+    mcp_env_draft: Entity<TextareaState>,
+    mcp_headers_draft: Entity<TextareaState>,
+    mcp_description_draft: Entity<InputState>,
+    /// Whether the Skill editor is showing.
+    skill_editor_open: bool,
+    /// Skill being edited; `None` while creating a new one.
+    editing_skill_id: Option<String>,
+    skill_name_draft: Entity<InputState>,
+    skill_description_draft: Entity<InputState>,
+    skill_body_draft: Entity<TextareaState>,
     mcp_discovery: Option<vibex_core::McpServerDiscoveryResponse>,
     skill_discovery: Option<vibex_core::SkillDiscoveryResponse>,
     mcp_validation: Option<(String, String, bool)>,
@@ -788,6 +808,71 @@ impl ManagementCenter {
         });
         let mcp_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_mcp));
         let skill_search = cx.new(|cx| InputState::new(window, cx).placeholder(copy.search_skills));
+        let mcp_name_draft = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Server name, for example filesystem",
+                "服务名称，例如 filesystem",
+                "服務名稱，例如 filesystem",
+            ))
+        });
+        let mcp_command_draft = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Command, for example npx",
+                "命令，例如 npx",
+                "命令，例如 npx",
+            ))
+        });
+        let mcp_args_draft = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "Arguments, one per line",
+                "参数，每行一个",
+                "參數，每行一個",
+            ))
+        });
+        let mcp_url_draft =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.test/mcp"));
+        let mcp_env_draft = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "Environment: KEY=value, one per line (optional)",
+                "环境变量：KEY=value，每行一个（选填）",
+                "環境變數：KEY=value，每行一個（選填）",
+            ))
+        });
+        let mcp_headers_draft = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "Headers: Name=value, one per line (optional)",
+                "请求头：Name=value，每行一个（选填）",
+                "請求標頭：Name=value，每行一個（選填）",
+            ))
+        });
+        let mcp_description_draft = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Description (optional)",
+                "描述（选填）",
+                "描述（選填）",
+            ))
+        });
+        let skill_name_draft = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Skill name",
+                "技能名称",
+                "技能名稱",
+            ))
+        });
+        let skill_description_draft = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Description shown to the Agent (optional)",
+                "展示给 Agent 的描述（选填）",
+                "展示給 Agent 的描述（選填）",
+            ))
+        });
+        let skill_body_draft = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(management_locale_text(
+                "Skill instructions. Native export writes this as SKILL.md.",
+                "技能说明。原生导出会把它写成 SKILL.md。",
+                "技能說明。原生匯出會把它寫成 SKILL.md。",
+            ))
+        });
         let profile_name = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Profile name",
@@ -963,6 +1048,17 @@ impl ManagementCenter {
         let subscriptions = vec![
             cx.subscribe(&agent_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&mcp_name_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&mcp_command_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&mcp_args_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&mcp_url_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&mcp_description_draft, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
+            cx.subscribe(&skill_name_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&skill_description_draft, |_, _, _: &InputEvent, cx| {
+                cx.notify()
+            }),
             cx.subscribe(&skill_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&profile_name, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
@@ -1247,6 +1343,22 @@ impl ManagementCenter {
             agent_auth_terminal_monitor_task: None,
             discover_agents_after_refresh: false,
             mcp_import_open: false,
+            mcp_editor_open: false,
+            editing_mcp_server_id: None,
+            mcp_transport_draft: vibex_core::McpServerTransportKind::Stdio,
+            mcp_scope_draft: vibex_core::McpServerScopeKind::User,
+            mcp_name_draft,
+            mcp_command_draft,
+            mcp_args_draft,
+            mcp_url_draft,
+            mcp_env_draft,
+            mcp_headers_draft,
+            mcp_description_draft,
+            skill_editor_open: false,
+            editing_skill_id: None,
+            skill_name_draft,
+            skill_description_draft,
+            skill_body_draft,
             skill_import_open: false,
             custom_agent_editor_open: false,
             mcp_discovery: None,
@@ -6338,6 +6450,478 @@ impl ManagementCenter {
         });
     }
 
+    /// Opens the MCP editor, either for a new server or for an existing one.
+    fn open_mcp_editor(
+        &mut self,
+        server_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = server_id.as_deref().and_then(|id| {
+            self.snapshot
+                .mcp_servers
+                .iter()
+                .find(|server| server.id.as_str() == id)
+                .cloned()
+        });
+        self.mcp_transport_draft = existing
+            .as_ref()
+            .map(|server| server.transport_kind)
+            .unwrap_or(vibex_core::McpServerTransportKind::Stdio);
+        self.mcp_scope_draft = existing
+            .as_ref()
+            .map(|server| server.scope_kind)
+            .unwrap_or(vibex_core::McpServerScopeKind::User);
+        let set = |state: &Entity<InputState>,
+                   value: String,
+                   window: &mut Window,
+                   cx: &mut Context<Self>| {
+            state.update(cx, |state, cx| state.set_value(value, window, cx));
+        };
+        set(
+            &self.mcp_name_draft,
+            existing
+                .as_ref()
+                .map(|server| server.display_name.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        set(
+            &self.mcp_command_draft,
+            existing
+                .as_ref()
+                .and_then(|server| server.command.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        let args = existing
+            .as_ref()
+            .map(|server| server.args.join("\n"))
+            .unwrap_or_default();
+        self.mcp_args_draft
+            .update(cx, |state, cx| state.set_value(args, window, cx));
+        set(
+            &self.mcp_url_draft,
+            existing
+                .as_ref()
+                .and_then(|server| server.url.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        set(
+            &self.mcp_description_draft,
+            existing
+                .as_ref()
+                .and_then(|server| server.description.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        let env = existing
+            .as_ref()
+            .map(|server| {
+                server
+                    .env
+                    .iter()
+                    .map(|entry| format!("{}={}", entry.name, entry.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let headers = existing
+            .as_ref()
+            .map(|server| {
+                server
+                    .headers
+                    .iter()
+                    .map(|entry| format!("{}={}", entry.name, entry.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        self.mcp_env_draft
+            .update(cx, |state, cx| state.set_value(env, window, cx));
+        self.mcp_headers_draft
+            .update(cx, |state, cx| state.set_value(headers, window, cx));
+
+        self.editing_mcp_server_id = server_id;
+        self.mcp_editor_open = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn close_mcp_editor(&mut self, cx: &mut Context<Self>) {
+        self.mcp_editor_open = false;
+        self.editing_mcp_server_id = None;
+        cx.notify();
+    }
+
+    /// Persists the MCP editor, creating or updating as appropriate.
+    fn save_mcp_editor(&mut self, cx: &mut Context<Self>) {
+        let display_name = self.mcp_name_draft.read(cx).value().trim().to_string();
+        if display_name.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "An MCP server needs a name",
+                    "MCP 服务需要名称",
+                    "MCP 服務需要名稱",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let transport_kind = self.mcp_transport_draft;
+        let command = self.mcp_command_draft.read(cx).value().trim().to_string();
+        let url = self.mcp_url_draft.read(cx).value().trim().to_string();
+        let args = management_lines(self.mcp_args_draft.read(cx).value().as_ref());
+        let env = management_key_value_lines(self.mcp_env_draft.read(cx).value().as_ref());
+        let headers = management_key_value_lines(self.mcp_headers_draft.read(cx).value().as_ref());
+        let description = self
+            .mcp_description_draft
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if transport_kind == vibex_core::McpServerTransportKind::Stdio && command.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "A stdio MCP server needs a command",
+                    "stdio MCP 服务需要命令",
+                    "stdio MCP 服務需要命令",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if transport_kind != vibex_core::McpServerTransportKind::Stdio && url.is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "An HTTP or SSE MCP server needs a URL",
+                    "HTTP 或 SSE MCP 服务需要 URL",
+                    "HTTP 或 SSE MCP 服務需要 URL",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let scope_kind = self.mcp_scope_draft;
+        let editing_id = self.editing_mcp_server_id.clone();
+        let command_option =
+            (transport_kind == vibex_core::McpServerTransportKind::Stdio).then(|| command.clone());
+        let url_option =
+            (transport_kind != vibex_core::McpServerTransportKind::Stdio).then(|| url.clone());
+        let description = (!description.is_empty()).then_some(description);
+        let enabled_agents = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent.added && agent.id.as_str() == self.selected_mcp_source_agent().as_str()
+            })
+            .map(|agent| vibex_core::McpServerAgentMatrix {
+                agent_id: agent.id.clone(),
+                enabled: true,
+                source_kind: vibex_core::ResourceAgentMatrixSourceKind::Manual,
+                updated_at_ms: vibex_core::unix_timestamp_ms(),
+            })
+            .collect::<Vec<_>>();
+        let action = match &editing_id {
+            Some(id) => format!("edit:{id}"),
+            None => "create".to_string(),
+        };
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(ManagementMutation::McpAction(action), cx, async move {
+            let request = match editing_id {
+                Some(id) => {
+                    let mcp_server_id = vibex_core::McpServerId::parse(id.clone())?;
+                    backend
+                        .management()
+                        .update_mcp_server(MutationRequest::new(
+                            vibex_core::McpServerUpdateRequest {
+                                mcp_server_id,
+                                display_name: Some(display_name),
+                                transport_kind: Some(transport_kind),
+                                status: None,
+                                scope_kind: Some(scope_kind),
+                                project_id: None,
+                                workspace_id: None,
+                                command: command_option,
+                                args: Some(args),
+                                env: Some(
+                                    env.iter()
+                                        .map(|(name, value)| vibex_core::McpServerEnvEntry {
+                                            name: name.clone(),
+                                            value: value.clone(),
+                                        })
+                                        .collect(),
+                                ),
+                                url: url_option,
+                                headers: Some(
+                                    headers
+                                        .iter()
+                                        .map(|(name, value)| vibex_core::McpServerHeaderEntry {
+                                            name: name.clone(),
+                                            value: value.clone(),
+                                        })
+                                        .collect(),
+                                ),
+                                description,
+                                tags: None,
+                            },
+                        ))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?;
+                    None
+                }
+                None => Some(
+                    backend
+                        .management()
+                        .create_mcp_server(MutationRequest::new(
+                            vibex_core::McpServerCreateRequest {
+                                display_name,
+                                transport_kind,
+                                status: vibex_core::McpServerStatus::Enabled,
+                                scope_kind,
+                                project_id: None,
+                                workspace_id: None,
+                                command: command_option,
+                                args,
+                                env: env
+                                    .iter()
+                                    .map(|(name, value)| vibex_core::McpServerEnvEntry {
+                                        name: name.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                                url: url_option,
+                                headers: headers
+                                    .iter()
+                                    .map(|(name, value)| vibex_core::McpServerHeaderEntry {
+                                        name: name.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                                description,
+                                tags: Vec::new(),
+                                secret_references: Vec::new(),
+                                provider_matrix: Vec::new(),
+                            },
+                        ))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)?,
+                ),
+            };
+            if let (Some(server), enabled_agents) = (request, enabled_agents)
+                && !enabled_agents.is_empty()
+            {
+                backend
+                    .management()
+                    .set_mcp_server_agent_matrix(MutationRequest::new(
+                        vibex_core::McpServerSetAgentMatrixRequest {
+                            mcp_server_id: server.id.clone(),
+                            agent_matrix: enabled_agents,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+            }
+            Ok(management_locale_text_for(
+                active_locale,
+                "MCP server saved",
+                "MCP 服务已保存",
+                "MCP 服務已儲存",
+            )
+            .to_string())
+        });
+        self.mcp_editor_open = false;
+        self.editing_mcp_server_id = None;
+    }
+
+    /// Skill editor: opens for a new Skill or for an existing one.
+    fn open_skill_editor(
+        &mut self,
+        skill_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = skill_id.as_deref().and_then(|id| {
+            self.snapshot
+                .skills
+                .iter()
+                .find(|skill| skill.id.as_str() == id)
+                .cloned()
+        });
+        self.skill_name_draft.update(cx, |state, cx| {
+            state.set_value(
+                existing
+                    .as_ref()
+                    .map(|skill| skill.display_name.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.skill_description_draft.update(cx, |state, cx| {
+            state.set_value(
+                existing
+                    .as_ref()
+                    .and_then(|skill| skill.description.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.skill_body_draft.update(cx, |state, cx| {
+            state.set_value(
+                existing
+                    .as_ref()
+                    .and_then(|skill| skill.body.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.editing_skill_id = skill_id;
+        self.skill_editor_open = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn close_skill_editor(&mut self, cx: &mut Context<Self>) {
+        self.skill_editor_open = false;
+        self.editing_skill_id = None;
+        cx.notify();
+    }
+
+    /// Persists the Skill editor, creating or updating as appropriate.
+    fn save_skill_editor(&mut self, cx: &mut Context<Self>) {
+        let display_name = self.skill_name_draft.read(cx).value().trim().to_string();
+        if display_name.is_empty() {
+            self.error = Some(
+                management_error_text("A Skill needs a name", "技能需要名称", "技能需要名稱")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let description = self
+            .skill_description_draft
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let body = self.skill_body_draft.read(cx).value().to_string();
+        if body.trim().is_empty() {
+            self.error = Some(
+                management_error_text(
+                    "A Skill needs instructions; native export writes them as SKILL.md",
+                    "技能需要说明内容；原生导出会写成 SKILL.md",
+                    "技能需要說明內容；原生匯出會寫成 SKILL.md",
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let description = (!description.is_empty()).then_some(description);
+        let editing_id = self.editing_skill_id.clone();
+        let preview: String = body.chars().take(2048).collect();
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::SkillAction(match &editing_id {
+                Some(id) => format!("edit:{id}"),
+                None => "create".to_string(),
+            }),
+            cx,
+            async move {
+                match editing_id {
+                    Some(id) => {
+                        let skill_id = vibex_core::SkillId::parse(id.clone())?;
+                        backend
+                            .management()
+                            .update_skill(MutationRequest::new(vibex_core::SkillUpdateRequest {
+                                skill_id,
+                                display_name: Some(display_name),
+                                source_kind: None,
+                                status: None,
+                                scope_kind: None,
+                                project_id: None,
+                                workspace_id: None,
+                                source_uri: None,
+                                description,
+                                tags: None,
+                                content_preview: Some(preview),
+                                body: Some(body),
+                            }))
+                            .await
+                            .map_err(crate::app::remote_error_into_vibex)?;
+                    }
+                    None => {
+                        backend
+                            .management()
+                            .create_skill(MutationRequest::new(vibex_core::SkillCreateRequest {
+                                display_name,
+                                source_kind: vibex_core::SkillSourceKind::Manual,
+                                status: vibex_core::SkillStatus::Enabled,
+                                scope_kind: vibex_core::SkillScopeKind::User,
+                                project_id: None,
+                                workspace_id: None,
+                                source_uri: None,
+                                description,
+                                tags: Vec::new(),
+                                content_preview: Some(preview),
+                                body: Some(body),
+                                provider_matrix: Vec::new(),
+                            }))
+                            .await
+                            .map_err(crate::app::remote_error_into_vibex)?;
+                    }
+                }
+                Ok(management_locale_text_for(
+                    active_locale,
+                    "Skill saved",
+                    "技能已保存",
+                    "技能已儲存",
+                )
+                .to_string())
+            },
+        );
+        self.skill_editor_open = false;
+        self.editing_skill_id = None;
+    }
+
+    /// Agent a newly created MCP server is enabled for.
+    ///
+    /// The Config Center has no project-scoped selector, so a server authored
+    /// here is a user-scope resource; it is enabled for the Agent that is
+    /// currently selected so it can be used straight away.
+    fn selected_mcp_source_agent(&self) -> AgentId {
+        self.selected_agent_id
+            .as_deref()
+            .and_then(|id| AgentId::parse(id).ok())
+            .or_else(|| {
+                self.snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.added)
+                    .map(|agent| agent.id.clone())
+            })
+            .unwrap_or_else(|| AgentId::parse("claude").expect("builtin Agent id is valid"))
+    }
+
     fn open_mcp_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_import_dialog(ManagementImportKind::Mcp, window, cx);
     }
@@ -8426,6 +9010,241 @@ impl ManagementCenter {
             .into_any_element()
     }
 
+    /// Editor for a new or existing MCP server.
+    ///
+    /// Values are written into the Vibex record; delivery to each Agent happens
+    /// through the MCP resource's own Agent matrix, and the Advanced section's
+    /// native export can additionally place them in an Agent's own config file.
+    fn render_mcp_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let creating = self.editing_mcp_server_id.is_none();
+        let transport = self.mcp_transport_draft;
+        let scope = self.mcp_scope_draft;
+
+        let mut transport_row = h_flex().w_full().gap_1();
+        for (candidate, label) in [
+            (
+                vibex_core::McpServerTransportKind::Stdio,
+                management_locale_text("stdio", "stdio", "stdio"),
+            ),
+            (
+                vibex_core::McpServerTransportKind::Http,
+                management_locale_text("HTTP", "HTTP", "HTTP"),
+            ),
+            (
+                vibex_core::McpServerTransportKind::Sse,
+                management_locale_text("SSE", "SSE", "SSE"),
+            ),
+        ] {
+            transport_row = transport_row.child(
+                Button::new(SharedString::from(format!(
+                    "mcp-editor-transport-{candidate:?}"
+                )))
+                .small()
+                .ghost()
+                .flex_1()
+                .selected(transport == candidate)
+                .label(label)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.mcp_transport_draft != candidate {
+                        this.mcp_transport_draft = candidate;
+                        cx.notify();
+                    }
+                })),
+            );
+        }
+
+        let mut scope_row = h_flex().w_full().gap_1();
+        for (candidate, label) in [
+            (
+                vibex_core::McpServerScopeKind::User,
+                management_locale_text("User", "用户", "使用者"),
+            ),
+            (
+                vibex_core::McpServerScopeKind::Workspace,
+                management_locale_text("Workspace", "工作区", "工作區"),
+            ),
+        ] {
+            scope_row = scope_row.child(
+                Button::new(SharedString::from(format!(
+                    "mcp-editor-scope-{candidate:?}"
+                )))
+                .small()
+                .ghost()
+                .flex_1()
+                .selected(scope == candidate)
+                .label(label)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.mcp_scope_draft != candidate {
+                        this.mcp_scope_draft = candidate;
+                        cx.notify();
+                    }
+                })),
+            );
+        }
+
+        let stdio = transport == vibex_core::McpServerTransportKind::Stdio;
+        let mut form = v_flex()
+            .w_full()
+            .gap_2()
+            .child(management_input_field(
+                management_locale_text("Name", "名称", "名稱"),
+                &self.mcp_name_draft,
+                false,
+                cx,
+            ))
+            .child(transport_row)
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(management_field_label(management_locale_text(
+                        "Scope", "范围", "範圍",
+                    )))
+                    .child(scope_row),
+            );
+        if stdio {
+            form = form
+                .child(management_input_field(
+                    management_locale_text("Command", "命令", "命令"),
+                    &self.mcp_command_draft,
+                    false,
+                    cx,
+                ))
+                .child(management_textarea_field(
+                    management_locale_text("Arguments", "参数", "參數"),
+                    &self.mcp_args_draft,
+                    cx,
+                ))
+                .child(management_textarea_field(
+                    management_locale_text("Environment", "环境变量", "環境變數"),
+                    &self.mcp_env_draft,
+                    cx,
+                ));
+        } else {
+            form = form
+                .child(management_input_field(
+                    management_locale_text("URL", "URL", "URL"),
+                    &self.mcp_url_draft,
+                    false,
+                    cx,
+                ))
+                .child(management_textarea_field(
+                    management_locale_text("Headers", "请求头", "請求標頭"),
+                    &self.mcp_headers_draft,
+                    cx,
+                ));
+        }
+        form = form.child(management_input_field(
+            management_locale_text("Description", "描述", "描述"),
+            &self.mcp_description_draft,
+            false,
+            cx,
+        ));
+
+        let title = if creating {
+            management_locale_text("New MCP server", "新建 MCP 服务", "新建 MCP 服務")
+        } else {
+            management_locale_text("Edit MCP server", "编辑 MCP 服务", "編輯 MCP 服務")
+        };
+        let content = v_flex()
+            .w_full()
+            .gap_2()
+            .child(form)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("mcp-editor-cancel")
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Cancel", "取消", "取消"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_mcp_editor(cx))),
+                    )
+                    .child(
+                        Button::new("mcp-editor-save")
+                            .small()
+                            .primary()
+                            .label(management_locale_text("Save", "保存", "儲存"))
+                            .loading(pending)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_mcp_editor(cx))),
+                    ),
+            )
+            .into_any_element();
+        management_card(title, management_mcp_editor_description(), content, cx)
+    }
+
+    /// Editor for a new or existing Skill.
+    ///
+    /// The body is stored in full rather than as a preview, because native
+    /// Skill export writes it verbatim as the Agent-side `SKILL.md`.
+    fn render_skill_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let creating = self.editing_skill_id.is_none();
+        let title = if creating {
+            management_locale_text("New Skill", "新建技能", "新建技能")
+        } else {
+            management_locale_text("Edit Skill", "编辑技能", "編輯技能")
+        };
+        let content = v_flex()
+            .w_full()
+            .gap_2()
+            .child(management_input_field(
+                management_locale_text("Name", "名称", "名稱"),
+                &self.skill_name_draft,
+                false,
+                cx,
+            ))
+            .child(management_input_field(
+                management_locale_text("Description", "描述", "描述"),
+                &self.skill_description_draft,
+                false,
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(management_field_label(management_locale_text(
+                        "Instructions",
+                        "技能说明",
+                        "技能說明",
+                    )))
+                    .child(Textarea::new(&self.skill_body_draft).h(px(220.0)).w_full()),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("skill-editor-cancel")
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Cancel", "取消", "取消"))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_skill_editor(cx))),
+                    )
+                    .child(
+                        Button::new("skill-editor-save")
+                            .small()
+                            .primary()
+                            .label(management_locale_text("Save", "保存", "儲存"))
+                            .loading(pending)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_skill_editor(cx))),
+                    ),
+            )
+            .into_any_element();
+        management_card(title, management_skill_editor_description(), content, cx)
+    }
+
     fn render_mcp_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         let query = self.mcp_search.read(cx).value().trim().to_lowercase();
@@ -8459,7 +9278,21 @@ impl ManagementCenter {
                 management_mcp_resources_title(),
                 resource_count,
                 cx,
-            ));
+            ))
+            .child(
+                Button::new("management-mcp-new")
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .label(management_locale_text(
+                        "New MCP server",
+                        "新建 MCP 服务",
+                        "新建 MCP 服務",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_mcp_editor(None, window, cx)),
+                    ),
+            );
         if servers.is_empty() {
             rows = rows.child(compact_empty_state(
                 management_no_mcp_title(),
@@ -8621,7 +9454,17 @@ impl ManagementCenter {
                 management_skills_title(),
                 resource_count,
                 cx,
-            ));
+            ))
+            .child(
+                Button::new("management-skill-new")
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .label(management_locale_text("New Skill", "新建技能", "新建技能"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_skill_editor(None, window, cx)),
+                    ),
+            );
         if skills.is_empty() {
             rows = rows.child(compact_empty_state(
                 management_no_skills_title(),
@@ -11659,6 +12502,10 @@ impl ManagementCenter {
     }
 
     fn render_mcp(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.mcp_editor_open {
+            let editor = self.render_mcp_editor(cx);
+            return v_flex().w_full().gap_2().child(editor).into_any_element();
+        }
         let pending = self.mutation.is_some();
         let servers = self
             .snapshot
@@ -11703,6 +12550,7 @@ impl ManagementCenter {
                 Some(ManagementMutation::McpAction(action))
                     if action == &format!("validate:{id}")
             );
+            let edit_id = id.clone();
             let deleting = matches!(
                 &self.mutation,
                 Some(ManagementMutation::McpAction(action))
@@ -11823,6 +12671,16 @@ impl ManagementCenter {
                             .flex_wrap()
                             .gap_1()
                             .child(
+                                Button::new(SharedString::from(format!("mcp-edit-{edit_id}")))
+                                    .small()
+                                    .outline()
+                                    .label(management_edit_label())
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_mcp_editor(Some(edit_id.clone()), window, cx)
+                                    })),
+                            )
+                            .child(
                                 Button::new(SharedString::from(format!(
                                     "mcp-validate-{validate_id}"
                                 )))
@@ -11901,6 +12759,10 @@ impl ManagementCenter {
     }
 
     fn render_skills(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.skill_editor_open {
+            let editor = self.render_skill_editor(cx);
+            return v_flex().w_full().gap_2().child(editor).into_any_element();
+        }
         let pending = self.mutation.is_some();
         let skills = self
             .snapshot
@@ -11942,6 +12804,7 @@ impl ManagementCenter {
                 Some(ManagementMutation::SkillAction(action))
                     if action == &format!("validate:{id}")
             );
+            let edit_id = id.clone();
             let deleting = matches!(
                 &self.mutation,
                 Some(ManagementMutation::SkillAction(action))
@@ -12062,6 +12925,18 @@ impl ManagementCenter {
                             h_flex()
                                 .flex_wrap()
                                 .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "skill-edit-{edit_id}"
+                                    )))
+                                    .small()
+                                    .outline()
+                                    .label(management_edit_label())
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_skill_editor(Some(edit_id.clone()), window, cx)
+                                    })),
+                                )
                                 .child(
                                     Button::new(SharedString::from(format!(
                                         "skill-validate-{validate_id}"
@@ -12911,47 +13786,30 @@ impl ManagementCenter {
         let source = self.native_export_source;
         let mode = self.native_export_mode;
 
-        let source_controls = h_flex()
-            .w_full()
-            .gap_1()
-            .child(
-                Button::new("native-export-source-codex")
+        let source_controls = {
+            let mut row = h_flex().w_full().flex_wrap().gap_1();
+            for (candidate, label) in management_native_export_sources() {
+                let selected = source == candidate;
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "native-export-source-{candidate:?}"
+                    )))
                     .small()
                     .ghost()
-                    .flex_1()
-                    .selected(source == vibex_core::ProviderNativeExportSource::Codex)
-                    .label("Codex")
+                    .selected(selected)
+                    .label(label)
                     .disabled(pending)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.native_export_source
-                            != vibex_core::ProviderNativeExportSource::Codex
-                        {
-                            this.native_export_source =
-                                vibex_core::ProviderNativeExportSource::Codex;
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.native_export_source != candidate {
+                            this.native_export_source = candidate;
                             this.native_export_preview = None;
                             cx.notify();
                         }
                     })),
-            )
-            .child(
-                Button::new("native-export-source-claude")
-                    .small()
-                    .ghost()
-                    .flex_1()
-                    .selected(source == vibex_core::ProviderNativeExportSource::Claude)
-                    .label("Claude")
-                    .disabled(pending)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.native_export_source
-                            != vibex_core::ProviderNativeExportSource::Claude
-                        {
-                            this.native_export_source =
-                                vibex_core::ProviderNativeExportSource::Claude;
-                            this.native_export_preview = None;
-                            cx.notify();
-                        }
-                    })),
-            );
+                );
+            }
+            row
+        };
 
         let mut mode_controls = h_flex().w_full().flex_wrap().gap_1();
         for (candidate, label) in [
@@ -12985,6 +13843,20 @@ impl ManagementCenter {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.native_export_mode != candidate {
                         this.native_export_mode = candidate;
+                        // Resource modes target the profile's own Agent, while a
+                        // provider-profile export only exists for Codex and
+                        // Claude, so follow the mode instead of leaving a source
+                        // selected that the preview would refuse.
+                        this.native_export_source = match candidate {
+                            vibex_core::ProviderNativeExportMode::ProviderProfile => {
+                                if this.native_export_source.supports_provider_profile_export() {
+                                    this.native_export_source
+                                } else {
+                                    vibex_core::ProviderNativeExportSource::Codex
+                                }
+                            }
+                            _ => vibex_core::ProviderNativeExportSource::AgentDefault,
+                        };
                         this.native_export_preview = None;
                         cx.notify();
                     }
@@ -16047,6 +16919,111 @@ fn management_locale_text(
     management_locale_text_for(locale::current_locale(), en, zh_cn, zh_tw)
 }
 
+/// A muted field label matching `management_input_field`'s own label styling.
+fn management_field_label(label: impl Into<SharedString>) -> AnyElement {
+    div()
+        .text_xs()
+        .font_medium()
+        .child(label.into())
+        .into_any_element()
+}
+
+/// A labeled textarea field, matching `management_input_field`'s shape.
+fn management_textarea_field(
+    label: impl Into<SharedString>,
+    state: &Entity<TextareaState>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let _ = cx;
+    Form::new()
+        .child(
+            Field::new()
+                .label(label.into())
+                .child(Textarea::new(state).h(px(96.0)).w_full()),
+        )
+        .into_any_element()
+}
+
+/// Sources a native export can name.
+///
+/// `AgentDefault` comes first because MCP servers and Skills belong to the
+/// Agent the selected profile runs; the concrete Agent entries only exist so an
+/// explicit target can be chosen and checked.
+fn management_native_export_sources() -> Vec<(vibex_core::ProviderNativeExportSource, &'static str)>
+{
+    vec![
+        (
+            vibex_core::ProviderNativeExportSource::AgentDefault,
+            management_locale_text(
+                "This profile's Agent",
+                "当前配置的 Agent",
+                "當前設定的 Agent",
+            ),
+        ),
+        (vibex_core::ProviderNativeExportSource::Codex, "Codex"),
+        (vibex_core::ProviderNativeExportSource::Claude, "Claude"),
+        (vibex_core::ProviderNativeExportSource::Cursor, "Cursor"),
+        (vibex_core::ProviderNativeExportSource::Grok, "Grok"),
+        (vibex_core::ProviderNativeExportSource::Gemini, "Gemini"),
+        (vibex_core::ProviderNativeExportSource::Kimi, "Kimi"),
+        (vibex_core::ProviderNativeExportSource::OpenCode, "OpenCode"),
+        (
+            vibex_core::ProviderNativeExportSource::QwenCode,
+            "Qwen Code",
+        ),
+        (vibex_core::ProviderNativeExportSource::Cline, "Cline"),
+        (
+            vibex_core::ProviderNativeExportSource::CodeBuddy,
+            "CodeBuddy",
+        ),
+        (vibex_core::ProviderNativeExportSource::Copilot, "Copilot"),
+        (vibex_core::ProviderNativeExportSource::OpenClaw, "OpenClaw"),
+        (vibex_core::ProviderNativeExportSource::Hermes, "Hermes"),
+    ]
+}
+
+fn management_edit_label() -> &'static str {
+    management_locale_text("Edit", "编辑", "編輯")
+}
+
+fn management_mcp_editor_description() -> &'static str {
+    management_locale_text(
+        "MCP servers are stored once and enabled per Agent. Agents that read the ACP wire receive them at session start; use the Advanced section's native export to also write an Agent's own config file.",
+        "MCP 服务只存一份，按 Agent 启用。走 ACP 通道的 Agent 会在会话启动时收到；如需写入 Agent 自己的配置文件，请使用高级设置里的原生导出。",
+        "MCP 服務只存一份，按 Agent 啟用。走 ACP 通道的 Agent 會在會話啟動時收到；如需寫入 Agent 自己的設定檔，請使用進階設定裡的原生匯出。",
+    )
+}
+
+fn management_skill_editor_description() -> &'static str {
+    management_locale_text(
+        "Skills have no ACP wire field, so an Agent sees one only after a native export writes its SKILL.md into that Agent's Skills folder.",
+        "技能没有 ACP 通道字段，只有原生导出把 SKILL.md 写进 Agent 的技能目录后，Agent 才能看到。",
+        "技能沒有 ACP 通道欄位，只有原生匯出把 SKILL.md 寫進 Agent 的技能目錄後，Agent 才能看到。",
+    )
+}
+
+/// Splits a textarea into non-empty trimmed lines.
+fn management_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Splits `KEY=value` lines into pairs, ignoring blank and malformed lines.
+fn management_key_value_lines(value: &str) -> Vec<(String, String)> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .filter(|(key, _)| !key.is_empty())
+        .collect()
+}
+
 fn management_error_text(
     en: &'static str,
     _zh_cn: &'static str,
@@ -16211,6 +17188,7 @@ fn skill_import_selection_from_discovery(
         command_name: item.command_name,
         description: item.description,
         content_preview: item.content_preview,
+        body: item.body,
     })
 }
 
@@ -18585,6 +19563,7 @@ mod tests {
             command_name: "review".into(),
             description: Some("Review changes".into()),
             content_preview: Some("preview".into()),
+            body: Some("# Review\n\nReview changes.".into()),
             existing_skill_id: None,
             diagnostics: Vec::new(),
         })
@@ -19266,6 +20245,89 @@ mod tests {
         assert!(lifecycle.contains("preview_agent_auth_logout("));
         assert!(lifecycle.contains("logout_agent_auth_context("));
         assert!(lifecycle.contains("confirmed_affected_session_count"));
+    }
+
+    #[test]
+    fn mcp_editor_parses_arguments_and_key_value_lines() {
+        assert_eq!(
+            management_lines("  -y \n\n pkg \n"),
+            vec!["-y".to_string(), "pkg".to_string()]
+        );
+        assert!(management_lines("   \n").is_empty());
+        assert_eq!(
+            management_key_value_lines("TOKEN=abc=def\n\nBAD\n=empty\nSPACED = 1 \n"),
+            vec![
+                ("TOKEN".to_string(), "abc=def".to_string()),
+                ("SPACED".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_export_sources_start_with_the_profiles_own_agent() {
+        let sources = management_native_export_sources();
+        assert_eq!(
+            sources.first().map(|(source, _)| *source),
+            Some(vibex_core::ProviderNativeExportSource::AgentDefault)
+        );
+        // Every listed source must be able to name the Agent it targets, or the
+        // preview would refuse the selection the UI just offered.
+        for (source, label) in &sources {
+            assert!(!label.is_empty(), "{source:?} needs a label");
+            if *source != vibex_core::ProviderNativeExportSource::AgentDefault {
+                assert!(source.agent_id().is_some(), "{source:?} must name an Agent");
+            }
+        }
+    }
+
+    #[test]
+    fn resource_editors_are_reachable_and_save_through_the_backend() {
+        let source = include_str!("management.rs");
+        let mcp_editor = source
+            .split_once("    fn render_mcp_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_skill_editor("))
+            .map(|(body, _)| body)
+            .expect("MCP editor renderer should remain inspectable");
+        let skill_editor = source
+            .split_once("    fn render_skill_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp_sidebar("))
+            .map(|(body, _)| body)
+            .expect("Skill editor renderer should remain inspectable");
+        let mcp_save = source
+            .split_once("    fn save_mcp_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_skill_editor("))
+            .map(|(body, _)| body)
+            .expect("MCP save handler should remain inspectable");
+        let skill_save = source
+            .split_once("    fn save_skill_editor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn selected_mcp_source_agent("))
+            .map(|(body, _)| body)
+            .expect("Skill save handler should remain inspectable");
+
+        // Both editors have to be reachable from the sidebars, not just defined.
+        assert!(source.contains("management-mcp-new"));
+        assert!(source.contains("management-skill-new"));
+        assert!(source.contains("open_mcp_editor(Some(edit_id.clone())"));
+        assert!(source.contains("open_skill_editor(Some(edit_id.clone())"));
+
+        // Switching transport has to change which fields are collected, or a
+        // stdio server could be saved with a URL and the reverse.
+        assert!(mcp_editor.contains("mcp-editor-transport-{candidate:?}"));
+        assert!(mcp_editor.contains("if stdio {"));
+        assert!(mcp_editor.contains("mcp_command_draft"));
+
+        // Creating and updating both ride the backend facade.
+        assert!(mcp_save.contains("create_mcp_server("));
+        assert!(mcp_save.contains("update_mcp_server("));
+        // A new server is enabled for the current Agent, so it is usable
+        // without a second trip to the matrix.
+        assert!(mcp_save.contains("set_mcp_server_agent_matrix("));
+        assert!(skill_save.contains("create_skill("));
+        assert!(skill_save.contains("update_skill("));
+        // The body is what native export writes, so an empty one has to be
+        // refused rather than saved as an empty SKILL.md.
+        assert!(skill_save.contains("body: Some(body)"));
+        assert!(skill_editor.contains("skill_body_draft"));
     }
 
     #[test]

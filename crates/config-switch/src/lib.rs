@@ -77,6 +77,7 @@ use vibex_db::{
 
 mod native_export;
 mod native_import;
+mod native_surface;
 mod provider_projection;
 pub use provider_projection::*;
 pub mod secrets;
@@ -2160,6 +2161,9 @@ impl ProviderConfigService {
         if request.content_preview.is_some() {
             skill.content_preview = request.content_preview;
         }
+        if request.body.is_some() {
+            skill.body = request.body;
+        }
         validate_skill_record(&skill)?;
         skill.updated_at_ms = unix_timestamp_ms();
         SkillRepository::update(&conn, &skill)?;
@@ -2303,6 +2307,7 @@ impl ProviderConfigService {
                     command_name: entry.command_name,
                     description: entry.description,
                     content_preview: entry.content_preview,
+                    body: entry.body,
                     existing_skill_id,
                     diagnostics: Vec::new(),
                 }
@@ -2337,12 +2342,21 @@ impl ProviderConfigService {
                             description: selection.description.clone(),
                             tags: vec!["imported".to_string(), "local".to_string()],
                             content_preview: selection.content_preview.clone(),
+                            body: selection.body.clone(),
                             provider_matrix: Vec::new(),
                         },
                     ))
                 });
-            if SkillRepository::get(&conn, &skill.id)?.is_some() {
+            if let Some(existing) = SkillRepository::get(&conn, &skill.id)? {
                 updated_count += 1;
+                // Re-import refreshes the stored manifest: the folder on disk is
+                // the authority for a LocalFolder Skill, so a stale body would
+                // make native export write yesterday's instructions.
+                skill.body = selection.body.clone().or(existing.body);
+                skill.content_preview = selection
+                    .content_preview
+                    .clone()
+                    .or(existing.content_preview);
                 SkillRepository::update(&conn, &skill)?;
             } else {
                 SkillRepository::insert(&conn, &skill)?;
@@ -2834,6 +2848,30 @@ fn discover_mcp_sources_for_agent(
         discoveries,
         diagnostics,
     }
+}
+
+/// Home directories an Agent keeps its own configuration in.
+///
+/// Shared by the import scanner and by native export so both sides agree on
+/// where an Agent's files live: a native export that wrote somewhere the
+/// scanner never reads would look applied while the Agent saw nothing.
+pub(crate) fn agent_native_home_roots(agent: &AgentSnapshotEntry) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in configured_agent_paths(agent) {
+        match entry.kind {
+            ConfiguredAgentPathKind::SkillRoot | ConfiguredAgentPathKind::McpConfig => continue,
+            ConfiguredAgentPathKind::AgentRoot => {}
+        }
+        let Some(root) = agent_home_from_config_path(&agent.id, &entry.path) else {
+            continue;
+        };
+        push_path_unique_raw(&mut roots, &mut seen, root);
+    }
+    for root in fallback_agent_roots(&agent.id) {
+        push_path_unique_raw(&mut roots, &mut seen, root);
+    }
+    roots
 }
 
 pub(crate) fn import_scan_agent_skill_roots(agent: &AgentSnapshotEntry) -> Vec<PathBuf> {
@@ -7520,6 +7558,7 @@ fn validate_skill_create_request(request: &SkillCreateRequest) -> VibexResult<()
         request.source_uri.as_deref(),
         request.description.as_deref(),
         request.content_preview.as_deref(),
+        request.body.as_deref(),
     )
 }
 
@@ -7530,6 +7569,7 @@ fn validate_skill_record(skill: &Skill) -> VibexResult<()> {
         skill.source_uri.as_deref(),
         skill.description.as_deref(),
         skill.content_preview.as_deref(),
+        skill.body.as_deref(),
     )
 }
 
@@ -7538,14 +7578,16 @@ fn validate_skill_metadata(
     source_uri: Option<&str>,
     description: Option<&str>,
     content_preview: Option<&str>,
+    body: Option<&str>,
 ) -> VibexResult<()> {
     if source_kind == SkillSourceKind::Manual
         && description.is_none_or(|value| value.trim().is_empty())
         && content_preview.is_none_or(|value| value.trim().is_empty())
+        && body.is_none_or(|value| value.trim().is_empty())
     {
         return Err(VibexError::validation(
             "skill_manual_content_missing",
-            "manual Skills require a description or content preview",
+            "manual Skills require a description, content preview, or body",
         ));
     }
     if source_kind != SkillSourceKind::Manual && !skill_source_uri_shape_is_valid(source_uri) {
@@ -7576,11 +7618,15 @@ fn validate_skill_result(skill: &Skill) -> SkillValidationResult {
             .content_preview
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
+        && skill
+            .body
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
     {
         return skill_validation_result(
             SkillValidationStatus::Fail,
             "skill_manual_content_missing",
-            "Manual Skill is missing description/content preview; no native file was written",
+            "Manual Skill is missing a description, content preview, or body",
             checked_at_ms,
         );
     }
@@ -11782,6 +11828,7 @@ Authorization = "Bearer should-not-be-stored"
                     description: None,
                     tags: Vec::new(),
                     content_preview: None,
+                    body: None,
                     provider_matrix: Vec::new(),
                 }),
             })
@@ -11801,6 +11848,7 @@ Authorization = "Bearer should-not-be-stored"
                 description: Some("Prefer package-scoped cargo checks.".to_string()),
                 tags: vec!["rust".to_string()],
                 content_preview: Some("cargo test -p vibex-db skill".to_string()),
+                body: Some("cargo test -p vibex-db skill".to_string()),
                 provider_matrix: vec![SkillProviderMatrix {
                     provider_kind: ProviderKind::Codex,
                     enabled: true,
@@ -11934,6 +11982,7 @@ Authorization = "Bearer should-not-be-stored"
                     command_name: discovery.command_name,
                     description: discovery.description,
                     content_preview: discovery.content_preview,
+                    body: discovery.body,
                     enable_agent_ids: Vec::new(),
                 }],
             })

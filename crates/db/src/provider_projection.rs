@@ -2183,6 +2183,7 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
+                "55:skill_body",
             ]
         );
         assert_eq!(

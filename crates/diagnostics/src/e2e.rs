@@ -439,6 +439,7 @@ async fn agent_command_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> 
         description: Some("E2E local skill".to_string()),
         tags: vec!["e2e".to_string(), "skill".to_string()],
         content_preview: Some("Check Rust quality gates.".to_string()),
+        body: Some("Check Rust quality gates.".to_string()),
         provider_matrix: vec![SkillProviderMatrix {
             provider_kind: ProviderKind::Acp,
             enabled: true,

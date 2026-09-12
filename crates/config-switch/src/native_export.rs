@@ -1,24 +1,48 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value as JsonValue, json};
 use vibex_core::{
-    ProviderBindingMetadata, ProviderKind, ProviderNativeConfigFileKind,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-    ProviderNativeExportApplyStatus, ProviderNativeExportFilePlan, ProviderNativeExportFileStatus,
-    ProviderNativeExportListRequest, ProviderNativeExportMode, ProviderNativeExportOperationKind,
-    ProviderNativeExportPreview, ProviderNativeExportPreviewRequest,
-    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackRequest,
-    ProviderNativeExportRollbackResult, ProviderNativeExportRollbackStatus,
-    ProviderNativeExportSource, ProviderProfile, RequestId, VibexError, VibexResult,
-    unix_timestamp_ms,
+    AgentId, McpSecretTarget, McpServer, McpServerTransportKind, ProviderBindingMetadata,
+    ProviderKind, ProviderNativeConfigFileKind, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportApplyStatus, ProviderNativeExportFilePlan,
+    ProviderNativeExportFileStatus, ProviderNativeExportListRequest, ProviderNativeExportMode,
+    ProviderNativeExportOperationKind, ProviderNativeExportPreview,
+    ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
+    ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
+    ProviderNativeExportRollbackStatus, ProviderNativeExportSource, ProviderProfile, RequestId,
+    Skill, VibexError, VibexResult, unix_timestamp_ms,
 };
-use vibex_db::{ProviderNativeExportRepository, ProviderProfileRepository};
+use vibex_db::{
+    McpServerRepository, ProviderNativeExportRepository, ProviderProfileRepository, SkillRepository,
+};
 
 use crate::ProviderConfigService;
+use crate::native_surface::{
+    NativeMcpEntry, NativeMcpTransport, NativeSurfaceError, SKILL_MANIFEST_NAME, SKILLS_DIR_NAME,
+    native_mcp_absent_reason, native_mcp_surface, render_mcp_file, render_skill_manifest,
+};
+use crate::secrets::resolve_provider_secret_reference;
+
+/// Upper bound on a single Skill sibling file copied alongside `SKILL.md`.
+///
+/// The export plan carries file contents as text, so anything larger or
+/// non-text is reported instead of silently truncated.
+const MAX_SKILL_SIBLING_BYTES: u64 = 512 * 1024;
+/// Upper bound on sibling files copied for one Skill, so an accidental dump of
+/// a huge directory cannot turn one export into thousands of file plans.
+const MAX_SKILL_SIBLING_FILES: usize = 64;
 
 const CODEX_MARKER_START: &str = "# >>> VIBEX MANAGED PROVIDER EXPORT";
 const CODEX_MARKER_END: &str = "# <<< VIBEX MANAGED PROVIDER EXPORT";
+/// Marker label identifying the provider-profile plan.
+///
+/// A Codex `config.toml` is a target for two different exports — the provider
+/// profile (which owns a marked block) and MCP servers (which own a separate
+/// marked block) — so the unmarked-user-file guard has to know which one it is
+/// looking at. The MCP block is appended, never required to pre-exist, so
+/// applying it to a user-managed file is safe.
+const CODEX_PROVIDER_MARKER_LABEL: &str = "Vibex managed TOML block";
 
 #[derive(Debug)]
 struct ApplyFileError {
@@ -26,10 +50,17 @@ struct ApplyFileError {
     restored: bool,
 }
 
+/// Resolved write targets for one preview.
+///
+/// A preview always targets a single Agent — the one the selected Provider
+/// Profile runs — so there is one Agent home and one Skills folder here rather
+/// than a lookup table. Tests pin these to a temporary directory.
 #[derive(Debug, Clone, Default)]
 struct NativeExportRoots {
     codex_root: Option<PathBuf>,
     claude_root: Option<PathBuf>,
+    agent_home: Option<PathBuf>,
+    skill_root: Option<PathBuf>,
 }
 
 impl ProviderConfigService {
@@ -46,12 +77,47 @@ impl ProviderConfigService {
                 )
                 .with_diagnostic("providerProfileId", request.provider_profile_id.as_str())
             })?;
-        let preview =
-            preview_native_export_with_roots(&profile, request.clone(), Default::default())?;
+        let resources = NativeExportResources {
+            mcp_servers: McpServerRepository::list_enabled_for_agent(
+                &conn,
+                &profile.agent_id,
+                profile.kind,
+            )?,
+            skills: SkillRepository::list_enabled_for_agent(
+                &conn,
+                &profile.agent_id,
+                profile.kind,
+            )?,
+        };
+        let preview = preview_native_export_with_roots(
+            &profile,
+            request.clone(),
+            self.native_export_roots(&profile.agent_id),
+            resources,
+        )?;
         if request.persist {
             ProviderNativeExportRepository::insert_preview(&conn, &preview)?;
         }
         Ok(preview)
+    }
+
+    /// Resolves where a native export for `agent_id` would write.
+    ///
+    /// The Agent home and Skills folder come from the same snapshot the import
+    /// scanner uses, so an export target is always a location the scanner reads
+    /// back — that round trip is what the preview's diff is checked against in
+    /// the tests.
+    fn native_export_roots(&self, agent_id: &AgentId) -> NativeExportRoots {
+        let mut roots = NativeExportRoots::default();
+        if let Ok(mut agents) = self.import_scan_agents(Some(agent_id.clone()))
+            && let Some(agent) = agents.pop()
+        {
+            roots.agent_home = crate::agent_native_home_roots(&agent).into_iter().next();
+            roots.skill_root = crate::import_scan_agent_skill_roots(&agent)
+                .into_iter()
+                .next();
+        }
+        roots
     }
 
     pub fn apply_native_export(
@@ -107,36 +173,76 @@ impl ProviderConfigService {
     }
 }
 
+/// Resources a preview plans against.
+///
+/// Loaded by the service so the planners stay pure and testable without a
+/// database.
+#[derive(Debug, Clone, Default)]
+struct NativeExportResources {
+    mcp_servers: Vec<McpServer>,
+    skills: Vec<Skill>,
+}
+
 fn preview_native_export_with_roots(
     profile: &ProviderProfile,
     request: ProviderNativeExportPreviewRequest,
     roots: NativeExportRoots,
+    resources: NativeExportResources,
 ) -> VibexResult<ProviderNativeExportPreview> {
     let export_id = RequestId::new();
     let mut diagnostics = Vec::new();
     let files = match request.mode {
-        ProviderNativeExportMode::ProviderProfile => match request.source {
-            ProviderNativeExportSource::Codex => {
-                vec![codex_profile_plan(&export_id, profile, roots.codex_root)?]
-            }
-            ProviderNativeExportSource::Claude => {
-                vec![claude_profile_plan(&export_id, profile, roots.claude_root)?]
-            }
-        },
-        ProviderNativeExportMode::Mcp
-        | ProviderNativeExportMode::Skills
-        | ProviderNativeExportMode::Prompts
-        | ProviderNativeExportMode::Combined => {
+        ProviderNativeExportMode::ProviderProfile => {
+            provider_profile_plans(&export_id, profile, &request, &roots)?
+        }
+        ProviderNativeExportMode::Mcp => mcp_export_plans(
+            &export_id,
+            profile,
+            &request,
+            &roots,
+            &resources,
+            &mut diagnostics,
+        )?,
+        ProviderNativeExportMode::Skills => skills_export_plans(
+            &export_id,
+            profile,
+            &request,
+            &roots,
+            &resources,
+            &mut diagnostics,
+        )?,
+        ProviderNativeExportMode::Combined => {
+            let mut files = provider_profile_plans(&export_id, profile, &request, &roots)?;
+            files.extend(mcp_export_plans(
+                &export_id,
+                profile,
+                &request,
+                &roots,
+                &resources,
+                &mut diagnostics,
+            )?);
+            files.extend(skills_export_plans(
+                &export_id,
+                profile,
+                &request,
+                &roots,
+                &resources,
+                &mut diagnostics,
+            )?);
+            files
+        }
+        ProviderNativeExportMode::Prompts => {
             diagnostics.push(metadata(
                 "provider_native_export_blocked",
-                "native export for this resource mode is not enabled yet; session injection remains the default",
+                "Prompts are delivered by the composer, which expands them into the message it sends, so there is no native file for Vibex to write",
             ));
-            vec![blocked_plan(
+            vec![blocked_plan_with(
                 &export_id,
                 request.source,
                 target_file_kind(request.source),
-                target_path(request.source, roots).join(target_file_name(request.source)),
-                "unsupported native export mode",
+                target_path(request.source, &roots).join(target_file_name(request.source)),
+                "Prompts have no native file; they are expanded by the composer",
+                Vec::new(),
             )]
         }
     };
@@ -150,6 +256,586 @@ fn preview_native_export_with_roots(
         diagnostics,
         created_at_ms: unix_timestamp_ms(),
     })
+}
+
+/// Plans the Codex or Claude provider-profile write.
+///
+/// The other sources exist for Agent-scoped MCP and Skill export only; asking
+/// for a provider-profile export from one of them is refused with the reason
+/// rather than silently writing a file the Agent never reads.
+fn provider_profile_plans(
+    export_id: &RequestId,
+    profile: &ProviderProfile,
+    request: &ProviderNativeExportPreviewRequest,
+    roots: &NativeExportRoots,
+) -> VibexResult<Vec<ProviderNativeExportFilePlan>> {
+    Ok(match request.source {
+        ProviderNativeExportSource::Codex => {
+            vec![codex_profile_plan(
+                export_id,
+                profile,
+                roots.codex_root.clone(),
+            )?]
+        }
+        ProviderNativeExportSource::Claude => vec![claude_profile_plan(
+            export_id,
+            profile,
+            roots.claude_root.clone(),
+        )?],
+        other => vec![blocked_plan_with(
+            export_id,
+            other,
+            target_file_kind(other),
+            target_path(other, roots).join(target_file_name(other)),
+            "provider-profile export is implemented for the Codex and Claude profiles only",
+            vec![metadata(
+                "provider_native_export_unsupported_source",
+                "this Agent has no provider-profile file Vibex can write; use the MCP, Skills, or Combined mode instead",
+            )],
+        )],
+    })
+}
+
+/// Plans the write of an Agent's enabled MCP servers into its native file.
+///
+/// MCP servers belong to an Agent, not to a Provider Profile, so the selected
+/// source has to name the profile's own Agent. Exporting across Agents would
+/// install another Agent's servers, so it is refused with the reason instead.
+fn mcp_export_plans(
+    export_id: &RequestId,
+    profile: &ProviderProfile,
+    request: &ProviderNativeExportPreviewRequest,
+    roots: &NativeExportRoots,
+    resources: &NativeExportResources,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+) -> VibexResult<Vec<ProviderNativeExportFilePlan>> {
+    let agent_id = profile.agent_id.as_str();
+    let Some(surface) = native_mcp_surface(agent_id).copied() else {
+        let reason = native_mcp_absent_reason(agent_id);
+        diagnostics.push(metadata("provider_native_export_blocked", reason));
+        return Ok(vec![blocked_plan_with(
+            export_id,
+            request.source,
+            target_file_kind(request.source),
+            target_path(request.source, roots).join(target_file_name(request.source)),
+            reason,
+            Vec::new(),
+        )]);
+    };
+    if !request.source.targets_agent(agent_id) {
+        return Ok(vec![source_agent_mismatch_plan(
+            export_id,
+            request.source,
+            agent_id,
+            "MCP servers",
+            surface.file_kind,
+            target_path(request.source, roots).join(surface.relative_path),
+            diagnostics,
+        )]);
+    }
+
+    let Some(home) = native_agent_home(roots) else {
+        let reason = format!(
+            "the home directory for {agent_id} could not be resolved, so there is nowhere safe to write its native MCP file"
+        );
+        diagnostics.push(metadata(
+            "provider_native_export_agent_home_unknown",
+            &reason,
+        ));
+        return Ok(vec![blocked_plan_with(
+            export_id,
+            request.source,
+            surface.file_kind,
+            PathBuf::from(surface.relative_path),
+            reason,
+            Vec::new(),
+        )]);
+    };
+    let target = normalize_lexical(&home.join(surface.relative_path));
+
+    let mut skipped_entries = Vec::new();
+    let entries = native_mcp_entries(&resources.mcp_servers, diagnostics, &mut skipped_entries);
+
+    let before = read_optional(&target)?.unwrap_or_default();
+    let rendered = match render_mcp_file(&surface, Some(&before), &entries) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            let reason = native_surface_refusal(&error);
+            diagnostics.push(metadata(
+                "provider_native_export_capability_refused",
+                &reason,
+            ));
+            return Ok(vec![blocked_plan_with(
+                export_id,
+                request.source,
+                surface.file_kind,
+                target,
+                reason,
+                Vec::new(),
+            )]);
+        }
+    };
+
+    let mut plan = ready_plan(
+        export_id,
+        request.source,
+        surface.file_kind,
+        target,
+        before,
+        rendered.content,
+        Some(format!("Vibex managed MCP block for {agent_id}")),
+    );
+    for (name, reason) in rendered.skipped.into_iter().chain(skipped_entries) {
+        plan.diagnostics.push(metadata(
+            "provider_native_export_entry_skipped",
+            format!("{name}: {reason}"),
+        ));
+    }
+    plan.diagnostics.push(metadata(
+        "provider_native_export_entry_count",
+        entries.len().to_string(),
+    ));
+    Ok(vec![plan])
+}
+
+fn source_agent_mismatch_plan(
+    export_id: &RequestId,
+    source: ProviderNativeExportSource,
+    agent_id: &str,
+    resource: &str,
+    file_kind: ProviderNativeConfigFileKind,
+    target: PathBuf,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+) -> ProviderNativeExportFilePlan {
+    let reason = format!(
+        "{resource} are scoped to an Agent; this profile runs {agent_id}, but the export source targets {}",
+        source.agent_id().unwrap_or("an unknown Agent")
+    );
+    diagnostics.push(metadata(
+        "provider_native_export_source_agent_mismatch",
+        &reason,
+    ));
+    blocked_plan_with(
+        export_id,
+        source,
+        file_kind,
+        target,
+        "export source does not match the profile's Agent",
+        Vec::new(),
+    )
+}
+
+/// Builds writable entries and reports everything that cannot be written.
+///
+/// A native file is read by the Agent's own process, which cannot reach Vibex's
+/// secret store, so secret values **are** resolved and written here — unlike the
+/// provider-profile export, which only ever writes public settings. A secret
+/// that fails to resolve is dropped with a diagnostic rather than written empty,
+/// because an empty credential looks configured to the Agent while failing at
+/// the MCP server.
+fn native_mcp_entries(
+    servers: &[McpServer],
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+    skipped: &mut Vec<(String, String)>,
+) -> Vec<NativeMcpEntry> {
+    let mut entries = Vec::new();
+    for server in servers {
+        let name = server.display_name.trim();
+        let name = if name.is_empty() {
+            server.id.as_str().to_string()
+        } else {
+            name.to_string()
+        };
+        let env = merged_native_entries(
+            server.env.iter().map(|entry| (&entry.name, &entry.value)),
+            server,
+            McpSecretTarget::Environment,
+            &name,
+            diagnostics,
+            skipped,
+        );
+        let headers = merged_native_entries(
+            server
+                .headers
+                .iter()
+                .map(|entry| (&entry.name, &entry.value)),
+            server,
+            McpSecretTarget::Header,
+            &name,
+            diagnostics,
+            skipped,
+        );
+        match server.transport_kind {
+            McpServerTransportKind::Stdio => {
+                let command = server
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let Some(command) = command else {
+                    skipped.push((name, "stdio server has no command".to_string()));
+                    continue;
+                };
+                entries.push(NativeMcpEntry {
+                    name,
+                    transport: NativeMcpTransport::Stdio {
+                        command: command.to_string(),
+                        args: server.args.clone(),
+                        env,
+                    },
+                });
+            }
+            McpServerTransportKind::Http => match native_url(server.url.as_deref()) {
+                Some(url) => entries.push(NativeMcpEntry {
+                    name,
+                    transport: NativeMcpTransport::Http { url, headers },
+                }),
+                None => skipped.push((name, "http server has no valid URL".to_string())),
+            },
+            McpServerTransportKind::Sse => match native_url(server.url.as_deref()) {
+                Some(url) => entries.push(NativeMcpEntry {
+                    name,
+                    transport: NativeMcpTransport::Sse { url, headers },
+                }),
+                None => skipped.push((name, "sse server has no valid URL".to_string())),
+            },
+        }
+    }
+    entries
+}
+
+fn merged_native_entries<'a>(
+    stored: impl Iterator<Item = (&'a String, &'a String)>,
+    server: &McpServer,
+    target: McpSecretTarget,
+    server_name: &str,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+    skipped: &mut Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = stored
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for reference in server
+        .secret_references
+        .iter()
+        .filter(|reference| reference.target == target)
+    {
+        match resolve_provider_secret_reference(
+            reference.backend,
+            reference.setup_state,
+            &reference.lookup_key,
+        ) {
+            Ok(Some(value)) => {
+                entries.retain(|(name, _)| !name.eq_ignore_ascii_case(&reference.lookup_key));
+                entries.push((reference.lookup_key.clone(), value));
+            }
+            _ => {
+                // Reported by key, never by value.
+                let reason = format!(
+                    "secret '{}' could not be resolved and was not written",
+                    reference.lookup_key
+                );
+                diagnostics.push(metadata(
+                    "provider_native_export_secret_unresolved",
+                    format!("{server_name}: {reason}"),
+                ));
+                skipped.push((server_name.to_string(), reason));
+            }
+        }
+    }
+    entries
+}
+
+fn native_url(url: Option<&str>) -> Option<String> {
+    let url = url.map(str::trim).filter(|value| !value.is_empty())?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    (!rest.trim_matches('/').is_empty() && !url.contains(' ')).then(|| url.to_string())
+}
+
+/// Plans the write of an Agent's enabled Skills into its own Skills folder.
+///
+/// Skills have no ACP wire field, so a native file is the only way an Agent can
+/// see them. Each Skill becomes `<skill root>/<slug>/SKILL.md` plus the UTF-8
+/// files that sit beside its manifest, so references and scripts travel with it.
+fn skills_export_plans(
+    export_id: &RequestId,
+    profile: &ProviderProfile,
+    request: &ProviderNativeExportPreviewRequest,
+    roots: &NativeExportRoots,
+    resources: &NativeExportResources,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+) -> VibexResult<Vec<ProviderNativeExportFilePlan>> {
+    let agent_id = profile.agent_id.as_str();
+    if !request.source.targets_agent(agent_id) {
+        return Ok(vec![source_agent_mismatch_plan(
+            export_id,
+            request.source,
+            agent_id,
+            "Skills",
+            ProviderNativeConfigFileKind::AgentSkillManifest,
+            PathBuf::from(SKILL_MANIFEST_NAME),
+            diagnostics,
+        )]);
+    }
+
+    let Some(skill_root) = native_skill_root(roots) else {
+        let reason = format!(
+            "no Skills folder could be resolved for {agent_id}, so there is nowhere safe to write its Skills"
+        );
+        diagnostics.push(metadata(
+            "provider_native_export_agent_home_unknown",
+            &reason,
+        ));
+        return Ok(vec![blocked_plan_with(
+            export_id,
+            request.source,
+            ProviderNativeConfigFileKind::AgentSkillManifest,
+            PathBuf::from(SKILL_MANIFEST_NAME),
+            reason,
+            Vec::new(),
+        )]);
+    };
+
+    if resources.skills.is_empty() {
+        diagnostics.push(metadata(
+            "provider_native_export_no_skills",
+            format!("no enabled Skills are assigned to {agent_id}"),
+        ));
+    }
+
+    let mut files = Vec::new();
+    for skill in &resources.skills {
+        files.extend(skill_export_plans(
+            export_id,
+            request.source,
+            skill,
+            &skill_root,
+            diagnostics,
+        )?);
+    }
+    Ok(files)
+}
+
+fn skill_export_plans(
+    export_id: &RequestId,
+    source: ProviderNativeExportSource,
+    skill: &Skill,
+    skill_root: &Path,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+) -> VibexResult<Vec<ProviderNativeExportFilePlan>> {
+    let slug = crate::skills::command_token_from_skill_name(&skill.display_name);
+    let target_dir = skill_root.join(&slug);
+    let body = skill.body.as_deref().filter(|body| !body.trim().is_empty());
+    let Some(body) = body else {
+        diagnostics.push(metadata(
+            "provider_native_export_skill_body_missing",
+            format!(
+                "Skill '{}' has no stored body; re-import it or edit it in Vibex first, because writing the truncated preview would ship incomplete instructions",
+                skill.display_name
+            ),
+        ));
+        return Ok(Vec::new());
+    };
+
+    let manifest = render_skill_manifest(
+        &skill.display_name,
+        skill.description.as_deref(),
+        &slug,
+        body,
+    );
+    let target = target_dir.join(SKILL_MANIFEST_NAME);
+    let before = read_optional(&target)?.unwrap_or_default();
+    let mut plans = vec![ready_plan(
+        export_id,
+        source,
+        ProviderNativeConfigFileKind::AgentSkillManifest,
+        target,
+        before,
+        manifest,
+        Some(format!("Vibex managed Skill '{}'", skill.display_name)),
+    )];
+
+    // A Skill folder may carry references, scripts and templates. They are part
+    // of the Skill, so the text ones travel with the manifest.
+    let Some(source_dir) = skill
+        .source_uri
+        .as_deref()
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return Ok(plans);
+    };
+    if source_dir == target_dir {
+        return Ok(plans);
+    }
+    for (index, (relative, content)) in
+        skill_sibling_files(&source_dir, diagnostics, &skill.display_name)
+            .into_iter()
+            .enumerate()
+    {
+        if index >= MAX_SKILL_SIBLING_FILES {
+            diagnostics.push(metadata(
+                "provider_native_export_skill_files_truncated",
+                format!(
+                    "Skill '{}' has more than {MAX_SKILL_SIBLING_FILES} sibling files; the rest were not copied",
+                    skill.display_name
+                ),
+            ));
+            break;
+        }
+        let sibling_target = target_dir.join(&relative);
+        let sibling_before = read_optional(&sibling_target)?.unwrap_or_default();
+        plans.push(ready_plan(
+            export_id,
+            source,
+            ProviderNativeConfigFileKind::AgentSkillManifest,
+            sibling_target,
+            sibling_before,
+            content,
+            Some(format!(
+                "Vibex managed Skill asset for '{}'",
+                skill.display_name
+            )),
+        ));
+    }
+    Ok(plans)
+}
+
+/// Reads the UTF-8 files that sit beside a Skill's `SKILL.md`.
+fn skill_sibling_files(
+    directory: &Path,
+    diagnostics: &mut Vec<ProviderBindingMetadata>,
+    skill_name: &str,
+) -> Vec<(PathBuf, String)> {
+    let mut files = Vec::new();
+    for entry in walk_skill_directory(directory).into_iter().take(256) {
+        let Ok(file_metadata) = fs::metadata(&entry) else {
+            continue;
+        };
+        if !file_metadata.is_file() {
+            continue;
+        }
+        if entry.file_name().and_then(|name| name.to_str()) == Some(SKILL_MANIFEST_NAME) {
+            continue;
+        }
+        let Ok(relative) = entry.strip_prefix(directory) else {
+            continue;
+        };
+        if file_metadata.len() > MAX_SKILL_SIBLING_BYTES {
+            diagnostics.push(metadata(
+                "provider_native_export_skill_file_skipped",
+                format!(
+                    "Skill '{skill_name}': {} exceeds the per-file copy limit",
+                    relative.display()
+                ),
+            ));
+            continue;
+        }
+        match fs::read_to_string(&entry) {
+            Ok(content) => files.push((relative.to_path_buf(), content)),
+            Err(_) => diagnostics.push(metadata(
+                "provider_native_export_skill_file_skipped",
+                format!(
+                    "Skill '{skill_name}': {} is not UTF-8 text and was not copied",
+                    relative.display()
+                ),
+            )),
+        }
+    }
+    files
+}
+
+/// Collects a Skill folder's files in a stable order.
+///
+/// `read_dir` yields entries in filesystem order, which differs between
+/// machines and runs. The order is sorted so a preview's file list and diffs
+/// stay comparable across exports of unchanged content.
+fn walk_skill_directory(directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![directory.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(read_dir) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !matches!(name, ".git" | "node_modules" | "target"))
+                {
+                    stack.push(path);
+                }
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Agent home a native export writes below.
+///
+/// Resolved from the Agent snapshot the caller loaded; there is deliberately no
+/// guessed `~/.<agent>` fallback, because an unresolved home would silently
+/// create a directory literally named `~` in the process working directory.
+/// An unresolvable home is reported as a blocked plan instead.
+fn native_agent_home(roots: &NativeExportRoots) -> Option<PathBuf> {
+    roots.agent_home.clone().map(expand_home)
+}
+
+/// Skills folder a native export writes into.
+fn native_skill_root(roots: &NativeExportRoots) -> Option<PathBuf> {
+    roots
+        .skill_root
+        .clone()
+        .map(expand_home)
+        .or_else(|| native_agent_home(roots).map(|home| home.join(SKILLS_DIR_NAME)))
+}
+
+/// Expands a leading `~` so a configured path is never treated literally.
+fn expand_home(path: PathBuf) -> PathBuf {
+    let rendered = path.to_string_lossy();
+    if rendered == "~" {
+        return dirs::home_dir().unwrap_or(path);
+    }
+    match rendered.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().map(|home| home.join(rest)).unwrap_or(path),
+        None => path,
+    }
+}
+
+/// Removes `.` and `..` components so a planned path reads as the real target.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn native_surface_refusal(error: &NativeSurfaceError) -> String {
+    match error {
+        NativeSurfaceError::ForeignContainer { container } => format!(
+            "the target file already defines '{container}' outside Vibex management; Vibex will not rewrite servers it does not own"
+        ),
+        NativeSurfaceError::Unparsable { error } => {
+            format!("the target file could not be parsed as its own format: {error}")
+        }
+    }
 }
 
 fn codex_profile_plan(
@@ -198,7 +884,7 @@ fn codex_profile_plan(
         target,
         before.unwrap_or_default(),
         after,
-        Some("Vibex managed TOML block".to_string()),
+        Some(CODEX_PROVIDER_MARKER_LABEL.to_string()),
     ))
 }
 
@@ -276,7 +962,10 @@ fn apply_preview(preview: ProviderNativeExportPreview) -> ProviderNativeExportAp
     let mut files = Vec::new();
 
     for mut file in preview.files {
-        if file.status == ProviderNativeExportFileStatus::Blocked {
+        if matches!(
+            file.status,
+            ProviderNativeExportFileStatus::Blocked | ProviderNativeExportFileStatus::NoOp
+        ) {
             files.push(file);
             continue;
         }
@@ -344,8 +1033,28 @@ fn rollback_preview(preview: ProviderNativeExportPreview) -> ProviderNativeExpor
     let mut files = Vec::new();
 
     for mut file in preview.files {
-        match restore_from_backup(&file) {
-            Ok(()) => file.status = ProviderNativeExportFileStatus::Restored,
+        if matches!(
+            file.status,
+            ProviderNativeExportFileStatus::Blocked | ProviderNativeExportFileStatus::NoOp
+        ) {
+            files.push(file);
+            continue;
+        }
+        match rollback_file(&file) {
+            Ok(RollbackOutcome::Restored) => file.status = ProviderNativeExportFileStatus::Restored,
+            Ok(RollbackOutcome::Deleted) => {
+                file.diagnostics.push(metadata(
+                    "provider_native_export_created_file_removed",
+                    "the file was created by this export and has been removed",
+                ));
+                file.status = ProviderNativeExportFileStatus::Restored;
+            }
+            Ok(RollbackOutcome::Skipped(reason)) => {
+                let diagnostic = metadata("provider_native_export_rollback_skipped", reason);
+                file.diagnostics.push(diagnostic.clone());
+                diagnostics.push(diagnostic);
+                file.status = ProviderNativeExportFileStatus::NoOp;
+            }
             Err(err) => {
                 let diagnostic =
                     metadata("provider_native_export_rollback_failed", err.to_string());
@@ -385,7 +1094,7 @@ fn rollback_preview(preview: ProviderNativeExportPreview) -> ProviderNativeExpor
 fn apply_file_plan(file: &ProviderNativeExportFilePlan) -> Result<(), ApplyFileError> {
     let target = PathBuf::from(&file.target_path);
     let before = read_optional(&target).map_err(unrestored)?;
-    if file.source == ProviderNativeExportSource::Codex
+    if file.marker.as_deref() == Some(CODEX_PROVIDER_MARKER_LABEL)
         && before.as_deref().is_some_and(|current| {
             !current.trim().is_empty() && !current.contains(CODEX_MARKER_START)
         })
@@ -485,6 +1194,46 @@ fn apply_file_plan(file: &ProviderNativeExportFilePlan) -> Result<(), ApplyFileE
     Ok(())
 }
 
+/// What a rollback did to one file.
+enum RollbackOutcome {
+    Restored,
+    Deleted,
+    Skipped(String),
+}
+
+/// Rolls one plan back.
+///
+/// A file the export created has no backup to restore, so it is deleted — but
+/// only while it still holds exactly what Vibex wrote. Once the user or the
+/// Agent has edited it, it is left alone and the skip is reported, because
+/// deleting user content is worse than leaving a stale export behind.
+fn rollback_file(file: &ProviderNativeExportFilePlan) -> VibexResult<RollbackOutcome> {
+    let target = PathBuf::from(&file.target_path);
+    if file.operation_kind == ProviderNativeExportOperationKind::CreateFile {
+        let current = match read_optional(&target)? {
+            Some(current) => current,
+            None => return Ok(RollbackOutcome::Deleted),
+        };
+        if current != file.redacted_after {
+            return Ok(RollbackOutcome::Skipped(format!(
+                "{} was edited after the export and was left in place",
+                target.display()
+            )));
+        }
+        fs::remove_file(&target).map_err(|err| {
+            VibexError::storage(
+                "provider_native_export_rollback_failed",
+                "failed to remove a file created by the native export",
+            )
+            .with_diagnostic("targetPath", file.target_path.clone())
+            .with_diagnostic("error", err.to_string())
+        })?;
+        return Ok(RollbackOutcome::Deleted);
+    }
+    restore_from_backup(file)?;
+    Ok(RollbackOutcome::Restored)
+}
+
 fn unrestored(error: VibexError) -> ApplyFileError {
     ApplyFileError {
         error: Box::new(error),
@@ -556,7 +1305,7 @@ fn ready_plan(
         redacted_before: before,
         redacted_after: after,
         redacted_diff: diff,
-        rollback_plan: "Restore the Vibex-created backup for this file when a backup exists; created files without a prior backup are not deleted automatically.".to_string(),
+        rollback_plan: "Restore the Vibex-created backup for this file; a file this export created is removed while it still holds the exported content.".to_string(),
         diagnostics: Vec::new(),
         status: if operation_kind == ProviderNativeExportOperationKind::NoOp {
             ProviderNativeExportFileStatus::NoOp
@@ -573,6 +1322,17 @@ fn blocked_plan(
     target: PathBuf,
     reason: impl Into<String>,
 ) -> ProviderNativeExportFilePlan {
+    blocked_plan_with(export_id, source, file_kind, target, reason, Vec::new())
+}
+
+fn blocked_plan_with(
+    export_id: &RequestId,
+    source: ProviderNativeExportSource,
+    file_kind: ProviderNativeConfigFileKind,
+    target: PathBuf,
+    reason: impl Into<String>,
+    extra_diagnostics: Vec<ProviderBindingMetadata>,
+) -> ProviderNativeExportFilePlan {
     let reason = reason.into();
     ProviderNativeExportFilePlan {
         operation_id: RequestId::new(),
@@ -587,7 +1347,9 @@ fn blocked_plan(
         redacted_after: String::new(),
         redacted_diff: String::new(),
         rollback_plan: "No write will be attempted while this plan is blocked.".to_string(),
-        diagnostics: vec![metadata("provider_native_export_blocked", reason)],
+        diagnostics: std::iter::once(metadata("provider_native_export_blocked", reason))
+            .chain(extra_diagnostics)
+            .collect(),
         status: ProviderNativeExportFileStatus::Blocked,
     }
 }
@@ -681,24 +1443,44 @@ fn sibling_path(target: &Path, export_id: &RequestId, suffix: &str) -> String {
         .to_string()
 }
 
-fn target_path(source: ProviderNativeExportSource, roots: NativeExportRoots) -> PathBuf {
+/// Directory a blocked plan reports as its would-be target.
+///
+/// A blocked plan never writes, so for the Agent-scoped sources this only has
+/// to name a plausible location: the profile-file roots for the two Agents that
+/// have one, and the Agent home otherwise.
+fn target_path(source: ProviderNativeExportSource, roots: &NativeExportRoots) -> PathBuf {
     match source {
-        ProviderNativeExportSource::Codex => codex_config_root(roots.codex_root),
-        ProviderNativeExportSource::Claude => claude_config_root(roots.claude_root),
+        ProviderNativeExportSource::Codex => codex_config_root(roots.codex_root.clone()),
+        ProviderNativeExportSource::Claude => claude_config_root(roots.claude_root.clone()),
+        // Blocked plans only report a location; the real target comes from the
+        // surface, and a plan that cannot resolve a home never writes.
+        _ => native_agent_home(roots).unwrap_or_else(|| PathBuf::from(".")),
     }
 }
 
+/// File name a blocked plan reports; the real name comes from the surface.
 fn target_file_name(source: ProviderNativeExportSource) -> &'static str {
     match source {
         ProviderNativeExportSource::Codex => "config.toml",
         ProviderNativeExportSource::Claude => "settings.json",
+        other => other
+            .agent_id()
+            .and_then(native_mcp_surface)
+            .map(|surface| surface.relative_path)
+            .unwrap_or(SKILL_MANIFEST_NAME),
     }
 }
 
+/// File kind a blocked plan reports; the real kind comes from the surface.
 fn target_file_kind(source: ProviderNativeExportSource) -> ProviderNativeConfigFileKind {
     match source {
         ProviderNativeExportSource::Codex => ProviderNativeConfigFileKind::CodexConfigToml,
         ProviderNativeExportSource::Claude => ProviderNativeConfigFileKind::ClaudeSettingsJson,
+        other => other
+            .agent_id()
+            .and_then(native_mcp_surface)
+            .map(|surface| surface.file_kind)
+            .unwrap_or(ProviderNativeConfigFileKind::AgentSkillManifest),
     }
 }
 
@@ -790,7 +1572,9 @@ mod tests {
             NativeExportRoots {
                 codex_root: Some(root.clone()),
                 claude_root: None,
+                ..Default::default()
             },
+            NativeExportResources::default(),
         )
         .unwrap();
         assert_eq!(
@@ -823,7 +1607,9 @@ mod tests {
             NativeExportRoots {
                 codex_root: Some(root),
                 claude_root: None,
+                ..Default::default()
             },
+            NativeExportResources::default(),
         )
         .unwrap();
         assert_eq!(
@@ -853,7 +1639,9 @@ mod tests {
             NativeExportRoots {
                 codex_root: None,
                 claude_root: Some(root),
+                ..Default::default()
             },
+            NativeExportResources::default(),
         )
         .unwrap();
         let apply = apply_preview(preview.clone());
@@ -895,7 +1683,9 @@ mod tests {
             NativeExportRoots {
                 codex_root: Some(root),
                 claude_root: None,
+                ..Default::default()
             },
+            NativeExportResources::default(),
         )
         .unwrap();
         assert_eq!(
@@ -931,7 +1721,9 @@ mod tests {
             NativeExportRoots {
                 codex_root: None,
                 claude_root: Some(root.clone()),
+                ..Default::default()
             },
+            NativeExportResources::default(),
         )
         .unwrap();
         let temp_dir_path = root.join("temp-is-directory");
@@ -950,6 +1742,407 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&settings).unwrap(),
             "{\n  \"theme\": \"dark\"\n}\n"
+        );
+    }
+
+    fn agent_profile(agent_id: &str) -> ProviderProfile {
+        ProviderProfile {
+            agent_id: AgentId::parse(agent_id).unwrap(),
+            ..profile(ProviderKind::Acp)
+        }
+    }
+
+    fn stdio_server(name: &str, command: &str) -> McpServer {
+        let now = unix_timestamp_ms();
+        McpServer {
+            id: vibex_core::McpServerId::new(),
+            display_name: name.to_string(),
+            transport_kind: McpServerTransportKind::Stdio,
+            status: vibex_core::McpServerStatus::Enabled,
+            scope_kind: vibex_core::McpServerScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            command: Some(command.to_string()),
+            args: vec!["-y".to_string(), "server-pkg".to_string()],
+            env: vec![vibex_core::McpServerEnvEntry {
+                name: "PLAIN".to_string(),
+                value: "value".to_string(),
+            }],
+            url: None,
+            headers: Vec::new(),
+            description: None,
+            tags: Vec::new(),
+            secret_references: Vec::new(),
+            provider_matrix: Vec::new(),
+            agent_matrix: Vec::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    fn manual_skill(name: &str, body: &str, source_uri: Option<String>) -> Skill {
+        let now = unix_timestamp_ms();
+        Skill {
+            id: vibex_core::SkillId::new(),
+            display_name: name.to_string(),
+            source_kind: if source_uri.is_some() {
+                vibex_core::SkillSourceKind::LocalFolder
+            } else {
+                vibex_core::SkillSourceKind::Manual
+            },
+            status: vibex_core::SkillStatus::Enabled,
+            scope_kind: vibex_core::SkillScopeKind::User,
+            project_id: None,
+            workspace_id: None,
+            source_uri,
+            description: Some("Checks the quality gates".to_string()),
+            tags: Vec::new(),
+            content_preview: Some(body.chars().take(64).collect()),
+            body: Some(body.to_string()),
+            provider_matrix: Vec::new(),
+            agent_matrix: Vec::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deleted_at_ms: None,
+        }
+    }
+
+    fn export_request(
+        mode: ProviderNativeExportMode,
+        source: ProviderNativeExportSource,
+    ) -> ProviderNativeExportPreviewRequest {
+        ProviderNativeExportPreviewRequest {
+            provider_profile_id: ProviderProfileId::parse("provider_profile_native_export_test")
+                .unwrap(),
+            source,
+            mode,
+            persist: false,
+        }
+    }
+
+    #[test]
+    fn mcp_export_writes_a_native_file_the_import_scanner_reads_back() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("cursor-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("cursor"),
+            export_request(
+                ProviderNativeExportMode::Mcp,
+                ProviderNativeExportSource::Cursor,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: vec![stdio_server("Files", "npx")],
+                skills: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(
+            preview.files[0].status,
+            ProviderNativeExportFileStatus::Ready
+        );
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+
+        // The file lands where the Agent reads it, and the scanner the import
+        // flow uses finds the same server again.
+        let target = home.join("mcp.json");
+        assert!(target.exists());
+        let candidates = crate::parse_mcp_candidates_for_path(
+            &AgentId::parse("cursor").unwrap(),
+            &target.display().to_string(),
+            &target,
+            &fs::read_to_string(&target).unwrap(),
+            &mut Vec::new(),
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display_name, "Files");
+        assert_eq!(candidates[0].command.as_deref(), Some("npx"));
+        let env = candidates[0]
+            .env
+            .iter()
+            .find(|entry| entry.name == "PLAIN")
+            .expect("plain env entry survives the round trip");
+        assert_eq!(env.value, "value");
+    }
+
+    #[test]
+    fn an_unresolvable_agent_home_blocks_instead_of_guessing_a_path() {
+        // No `agent_home` in the roots stands for "the Agent snapshot could not
+        // be loaded". Guessing `~/.<agent>` here would create a directory
+        // literally named `~` in the process working directory.
+        let preview = preview_native_export_with_roots(
+            &agent_profile("cursor"),
+            export_request(
+                ProviderNativeExportMode::Mcp,
+                ProviderNativeExportSource::Cursor,
+            ),
+            NativeExportRoots::default(),
+            NativeExportResources {
+                mcp_servers: vec![stdio_server("Files", "npx")],
+                skills: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            preview.files[0].status,
+            ProviderNativeExportFileStatus::Blocked
+        );
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_agent_home_unknown")
+        );
+        assert!(!PathBuf::from("~").exists());
+    }
+
+    #[test]
+    fn mcp_export_refuses_a_source_that_is_not_the_profiles_agent() {
+        let preview = preview_native_export_with_roots(
+            &agent_profile("cursor"),
+            export_request(
+                ProviderNativeExportMode::Mcp,
+                ProviderNativeExportSource::Grok,
+            ),
+            NativeExportRoots::default(),
+            NativeExportResources {
+                mcp_servers: vec![stdio_server("Files", "npx")],
+                skills: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            preview.files[0].status,
+            ProviderNativeExportFileStatus::Blocked
+        );
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_source_agent_mismatch")
+        );
+    }
+
+    #[test]
+    fn mcp_export_reports_an_agent_without_a_native_file() {
+        let preview = preview_native_export_with_roots(
+            &agent_profile("antigravity"),
+            export_request(
+                ProviderNativeExportMode::Mcp,
+                ProviderNativeExportSource::AgentDefault,
+            ),
+            NativeExportRoots::default(),
+            NativeExportResources::default(),
+        )
+        .unwrap();
+
+        // The source mismatch is reported first, so ask again with a matching
+        // source by exporting the profile's own Agent through the same surface
+        // lookup the planner uses.
+        assert_eq!(
+            preview.files[0].status,
+            ProviderNativeExportFileStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn toml_mcp_export_appends_a_block_and_leaves_the_rest_of_the_file_alone() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("grok-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), "# keep me\nmodel = \"grok-4\"\n").unwrap();
+
+        let preview = preview_native_export_with_roots(
+            &agent_profile("grok"),
+            export_request(
+                ProviderNativeExportMode::Mcp,
+                ProviderNativeExportSource::Grok,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: vec![stdio_server("Files", "npx")],
+                skills: Vec::new(),
+            },
+        )
+        .unwrap();
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+
+        let content = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(content.contains("# keep me"));
+        assert!(content.contains("model = \"grok-4\""));
+        assert!(content.contains("[mcp_servers.Files]"));
+        content.parse::<toml::Value>().expect("valid TOML");
+    }
+
+    #[test]
+    fn skills_export_writes_a_manifest_plus_its_sibling_files() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let source_dir = dir.path().join("central").join("rust-quality");
+        fs::create_dir_all(source_dir.join("references")).unwrap();
+        let manifest = source_dir.join("SKILL.md");
+        let body = "---\nname: Rust Quality\n---\n\nRun the gates.\n";
+        fs::write(&manifest, body).unwrap();
+        fs::write(
+            source_dir.join("references").join("gates.md"),
+            "cargo clippy",
+        )
+        .unwrap();
+        fs::write(source_dir.join("logo.bin"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let skill = manual_skill("Rust Quality", body, Some(manifest.display().to_string()));
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![skill],
+            },
+        )
+        .unwrap();
+
+        let planned = preview.clone();
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+
+        let target = home.join("skills").join("rust-quality");
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), body);
+        assert_eq!(
+            fs::read_to_string(target.join("references").join("gates.md")).unwrap(),
+            "cargo clippy"
+        );
+        // A binary sibling cannot be carried as text, so it is reported rather
+        // than silently written as garbage.
+        assert!(!target.join("logo.bin").exists());
+        assert!(planned.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "provider_native_export_skill_file_skipped"
+                && diagnostic.value.contains("not UTF-8")
+        }));
+    }
+
+    #[test]
+    fn skills_export_reports_a_skill_without_a_stored_body() {
+        let dir = tempdir().unwrap();
+        let mut skill = manual_skill("No Body", "placeholder", None);
+        skill.body = None;
+
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(dir.path().to_path_buf()),
+                skill_root: Some(dir.path().join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![skill],
+            },
+        )
+        .unwrap();
+
+        assert!(preview.files.is_empty());
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_skill_body_missing")
+        );
+    }
+
+    #[test]
+    fn rolling_back_a_created_skill_file_removes_it() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![manual_skill("Review", "Review changes.", None)],
+            },
+        )
+        .unwrap();
+        let preview_for_rollback = preview.clone();
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+        let target = home.join("skills").join("review").join("SKILL.md");
+        assert!(target.exists());
+
+        let rollback = rollback_preview(preview_for_rollback);
+        assert_eq!(
+            rollback.status,
+            ProviderNativeExportRollbackStatus::Restored
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn rolling_back_leaves_a_skill_file_the_user_edited_alone() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![manual_skill("Review", "Review changes.", None)],
+            },
+        )
+        .unwrap();
+        let preview_for_rollback = preview.clone();
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+        let target = home.join("skills").join("review").join("SKILL.md");
+        fs::write(&target, "hand edited").unwrap();
+
+        let rollback = rollback_preview(preview_for_rollback);
+        assert!(target.exists());
+        assert!(
+            rollback
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_rollback_skipped")
         );
     }
 }

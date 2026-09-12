@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 54;
+pub const CURRENT_SCHEMA_VERSION: i64 = 55;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -7423,6 +7423,7 @@ impl SkillRepository {
             description: request.description,
             tags: request.tags,
             content_preview: request.content_preview,
+            body: request.body,
             provider_matrix: request
                 .provider_matrix
                 .into_iter()
@@ -7445,9 +7446,9 @@ impl SkillRepository {
             INSERT INTO skills (
                 skill_id, display_name, source_kind, status, scope_kind,
                 project_id, workspace_id, source_uri, description, tags_json,
-                content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+                content_preview, body, created_at_ms, updated_at_ms, deleted_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ",
             params![
                 skill.id.as_str(),
@@ -7461,6 +7462,7 @@ impl SkillRepository {
                 skill.description,
                 json_to_db(&skill.tags)?,
                 skill.content_preview,
+                skill.body,
                 skill.created_at_ms,
                 skill.updated_at_ms,
                 skill.deleted_at_ms
@@ -7478,7 +7480,7 @@ impl SkillRepository {
                 "
                 SELECT skill_id, display_name, source_kind, status, scope_kind,
                     project_id, workspace_id, source_uri, description, tags_json,
-                    content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+                    content_preview, body, created_at_ms, updated_at_ms, deleted_at_ms
                 FROM skills
                 WHERE deleted_at_ms IS NULL
                 ORDER BY updated_at_ms DESC, display_name ASC
@@ -7509,7 +7511,7 @@ impl SkillRepository {
                 "
                 SELECT s.skill_id, s.display_name, s.source_kind, s.status, s.scope_kind,
                     s.project_id, s.workspace_id, s.source_uri, s.description, s.tags_json,
-                    s.content_preview, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                    s.content_preview, s.body, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
                 FROM skills s
                 INNER JOIN skill_provider_matrix m ON m.skill_id = s.skill_id
                 WHERE s.deleted_at_ms IS NULL
@@ -7557,7 +7559,7 @@ impl SkillRepository {
                 "
                 SELECT DISTINCT s.skill_id, s.display_name, s.source_kind, s.status, s.scope_kind,
                     s.project_id, s.workspace_id, s.source_uri, s.description, s.tags_json,
-                    s.content_preview, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
+                    s.content_preview, s.body, s.created_at_ms, s.updated_at_ms, s.deleted_at_ms
                 FROM skills s
                 LEFT JOIN skill_agent_matrix am ON am.skill_id = s.skill_id
                 LEFT JOIN skill_provider_matrix pm ON pm.skill_id = s.skill_id
@@ -7609,7 +7611,7 @@ impl SkillRepository {
                 "
                 SELECT skill_id, display_name, source_kind, status, scope_kind,
                     project_id, workspace_id, source_uri, description, tags_json,
-                    content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+                    content_preview, body, created_at_ms, updated_at_ms, deleted_at_ms
                 FROM skills
                 WHERE skill_id = ?1 AND deleted_at_ms IS NULL
                 ",
@@ -7638,7 +7640,8 @@ impl SkillRepository {
                 description = ?9,
                 tags_json = ?10,
                 content_preview = ?11,
-                updated_at_ms = ?12
+                body = ?12,
+                updated_at_ms = ?13
             WHERE skill_id = ?1 AND deleted_at_ms IS NULL
             ",
             params![
@@ -7653,6 +7656,7 @@ impl SkillRepository {
                 skill.description,
                 json_to_db(&skill.tags)?,
                 skill.content_preview,
+                skill.body,
                 skill.updated_at_ms
             ],
         )
@@ -10584,6 +10588,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_agent_delegations(conn, &mut applied)?;
     apply_session_title_lock(conn, &mut applied)?;
     apply_local_history_import_index(conn, &mut applied)?;
+    apply_skill_body_column(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10629,6 +10634,37 @@ fn apply_local_history_import_index(
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record local history import migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Adds the Skill body column.
+///
+/// A `LocalFolder` Skill keeps its folder as the authority and only records a
+/// `source_uri`; a `Manual` Skill has no folder, and `content_preview` is a
+/// 2 KiB summary. Native Skill export has to write the whole manifest, so the
+/// full text needs a column of its own.
+fn apply_skill_body_column(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 55;
+    const NAME: &str = "skill_body";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    // `ALTER TABLE ... ADD COLUMN` is not idempotent, so the version check above
+    // is the guard; a database created before this migration has no `body`.
+    conn.execute_batch("ALTER TABLE skills ADD COLUMN body TEXT NULL;")
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to add the Skill body column",
+        ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record Skill body migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13157,11 +13193,12 @@ fn map_skill_without_children(row: &rusqlite::Row<'_>) -> rusqlite::Result<Skill
         description: row.get(8)?,
         tags: json_from_db_sql(row.get(9)?)?,
         content_preview: row.get(10)?,
+        body: row.get(11)?,
         provider_matrix: Vec::new(),
         agent_matrix: Vec::new(),
-        created_at_ms: row.get(11)?,
-        updated_at_ms: row.get(12)?,
-        deleted_at_ms: row.get(13)?,
+        created_at_ms: row.get(12)?,
+        updated_at_ms: row.get(13)?,
+        deleted_at_ms: row.get(14)?,
     })
 }
 
@@ -13997,7 +14034,8 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
-                "54:local_history_import_index"
+                "54:local_history_import_index",
+                "55:skill_body"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14136,6 +14174,7 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
+                "55:skill_body",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14254,7 +14293,8 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
-                "54:local_history_import_index"
+                "54:local_history_import_index",
+                "55:skill_body"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -14411,7 +14451,8 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
-                "54:local_history_import_index"
+                "54:local_history_import_index",
+                "55:skill_body"
             ]
         );
         assert_eq!(
@@ -15824,7 +15865,8 @@ mod tests {
                 "51:custom_acp_agent_definitions",
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
-                "54:local_history_import_index"
+                "54:local_history_import_index",
+                "55:skill_body"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -16651,6 +16693,50 @@ mod tests {
     }
 
     #[test]
+    fn skill_body_migration_is_idempotent_and_keeps_existing_rows() {
+        let temp = temp_db_path("skill-body-migration");
+        let mut conn = open_database(&temp).unwrap();
+        let first = apply_migrations(&mut conn).unwrap();
+        assert!(first.iter().any(|entry| entry == "55:skill_body"));
+        // A second run must be a no-op: the step is a plain `ALTER TABLE ADD
+        // COLUMN`, which would fail outright if it ran twice.
+        let second = apply_migrations(&mut conn).unwrap();
+        assert!(second.is_empty(), "second run applied {second:?}");
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        // A Skill stored before the column existed reads back with no body
+        // instead of failing to decode.
+        let now = unix_timestamp_ms();
+        conn.execute(
+            "INSERT INTO skills (
+                skill_id, display_name, source_kind, status, scope_kind,
+                project_id, workspace_id, source_uri, description, tags_json,
+                content_preview, created_at_ms, updated_at_ms, deleted_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, ?6, NULL, ?7, ?7, NULL)",
+            params![
+                "skill_legacy_body",
+                "Legacy",
+                enum_to_db(&SkillSourceKind::Manual).unwrap(),
+                enum_to_db(&SkillStatus::Enabled).unwrap(),
+                enum_to_db(&SkillScopeKind::User).unwrap(),
+                "[]",
+                now,
+            ],
+        )
+        .unwrap();
+        let loaded = SkillRepository::get(
+            &conn,
+            &vibex_core::SkillId::parse("skill_legacy_body").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(loaded.body.is_none());
+    }
+
+    #[test]
     fn skill_matrix_and_soft_delete_round_trip() {
         let temp = temp_db_path("skill");
         let mut conn = open_database(&temp).unwrap();
@@ -16667,6 +16753,7 @@ mod tests {
             description: Some("Use cargo package-scoped checks".to_string()),
             tags: vec!["rust".to_string(), "quality".to_string()],
             content_preview: Some("Run package-scoped cargo checks.".to_string()),
+            body: Some("Run package-scoped cargo checks.".to_string()),
             provider_matrix: vec![
                 SkillProviderMatrix {
                     provider_kind: ProviderKind::Codex,
@@ -16691,6 +16778,13 @@ mod tests {
 
         let loaded = SkillRepository::get(&conn, &skill_id).unwrap().unwrap();
         assert_eq!(loaded.display_name, "Rust workspace guide");
+        // Native Skill export writes the stored body verbatim, so it has to
+        // survive the round trip rather than being reconstructed from the
+        // truncated preview.
+        assert_eq!(
+            loaded.body.as_deref(),
+            Some("Run package-scoped cargo checks.")
+        );
         assert_eq!(loaded.provider_matrix.len(), 2);
         assert_eq!(loaded.agent_matrix.len(), 1);
         assert!(
