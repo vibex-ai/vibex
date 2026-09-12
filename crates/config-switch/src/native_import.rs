@@ -1799,15 +1799,16 @@ fn migrate_cc_switch_secret_reference(
     request.secret_references.retain(|secret| {
         !(secret.secret_kind == secret_kind && secret.backend == ProviderSecretBackend::Placeholder)
     });
+    let backend = secrets::provider_secret_write_backend();
     request
         .secret_references
         .push(ProviderSecretReferenceCreateRequest {
             secret_kind,
-            backend: ProviderSecretBackend::OsKeychain,
+            backend,
             setup_state: ProviderSecretSetupState::Available,
             lookup_key: lookup_key.clone(),
             display_label: env_key,
-            redacted_hint: "stored in Vibex OS keychain".to_string(),
+            redacted_hint: secrets::provider_secret_storage_hint(backend).to_string(),
         });
     Ok(CcSwitchSecretMigration {
         migrated_lookup_key: Some(lookup_key),

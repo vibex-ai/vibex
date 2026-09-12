@@ -1012,14 +1012,14 @@ impl ProviderConfigService {
 
         let mut next_secret = secret.clone();
         if request.clear {
-            if secret.backend == ProviderSecretBackend::OsKeychain {
+            if secrets::is_local_secret_backend(secret.backend) {
                 secrets::delete_provider_secret(&secret.lookup_key)?;
             }
             next_secret.backend = ProviderSecretBackend::Placeholder;
             next_secret.setup_state = ProviderSecretSetupState::Missing;
             next_secret.redacted_hint = "not configured".to_string();
         } else if let Some(value) = next_value {
-            let lookup_key = if secret.backend == ProviderSecretBackend::OsKeychain
+            let lookup_key = if secrets::is_local_secret_backend(secret.backend)
                 && !secret.lookup_key.trim().is_empty()
             {
                 secret.lookup_key.clone()
@@ -1027,10 +1027,11 @@ impl ProviderConfigService {
                 format!("vibex-provider-secret-{}", RequestId::new().as_str())
             };
             secrets::store_provider_secret(&lookup_key, value)?;
-            next_secret.backend = ProviderSecretBackend::OsKeychain;
+            let backend = secrets::provider_secret_write_backend();
+            next_secret.backend = backend;
             next_secret.setup_state = ProviderSecretSetupState::Available;
             next_secret.lookup_key = lookup_key;
-            next_secret.redacted_hint = "stored in Vibex OS keychain".to_string();
+            next_secret.redacted_hint = secrets::provider_secret_storage_hint(backend).to_string();
         }
         next_secret.revision = next_secret.revision.saturating_add(1).max(1);
         replace_credential_secret(&mut credential.credential, next_secret)?;

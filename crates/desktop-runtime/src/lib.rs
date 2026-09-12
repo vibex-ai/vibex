@@ -1980,6 +1980,30 @@ pub struct DesktopRuntime {
 const HOME_LOCK_RETRY_ATTEMPTS: u32 = 8;
 const HOME_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Chooses where this runtime stores provider secrets.
+///
+/// Desktop shells keep the OS keychain.  A headless server has no usable
+/// keychain — inside a container the keyutils syscalls behind the Linux keychain
+/// backend are rejected by the default seccomp profile — so it stores provider
+/// secrets in `<home>/provider-secrets.json` (owner-only) instead.
+/// `VIBEX_PROVIDER_SECRET_STORE=keychain|file` overrides the choice.
+fn provider_secret_store_config(
+    config: &DesktopRuntimeConfig,
+) -> vibex_config_switch::secrets::ProviderSecretStoreConfig {
+    use vibex_config_switch::secrets::ProviderSecretStoreConfig;
+
+    match environment_string("VIBEX_PROVIDER_SECRET_STORE").as_deref() {
+        Some("keychain") | Some("os_keychain") => ProviderSecretStoreConfig::os_keychain(),
+        Some("file") | Some("host_file") => {
+            ProviderSecretStoreConfig::host_file(config.home_dir.clone())
+        }
+        _ if config.mode == DesktopRuntimeMode::Headless => {
+            ProviderSecretStoreConfig::host_file(config.home_dir.clone())
+        }
+        _ => ProviderSecretStoreConfig::os_keychain(),
+    }
+}
+
 impl DesktopRuntime {
     pub async fn start(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
         let runtime_started = Instant::now();
@@ -2036,6 +2060,9 @@ impl DesktopRuntime {
 
     async fn start_inner(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
         startup_stage("runtime_config_validate", || config.validate())?;
+        vibex_config_switch::secrets::configure_provider_secret_store(
+            provider_secret_store_config(&config),
+        );
         let home_lock = startup_stage("runtime_home_prepare", || {
             std::fs::create_dir_all(&config.home_dir).map_err(|error| {
                 VibexError::storage(
@@ -3651,6 +3678,26 @@ mod tests {
         assert!(background.contains("tasks.push(tokio::spawn(async move"));
         assert!(background.contains("runtime_selection.reconcile_on_startup()"));
         assert!(background.contains("message_submission.reconcile_on_startup()"));
+    }
+
+    #[test]
+    fn headless_runtimes_store_provider_secrets_on_the_host() {
+        use vibex_config_switch::secrets::ProviderSecretStore;
+
+        if std::env::var_os("VIBEX_PROVIDER_SECRET_STORE").is_some() {
+            // The explicit override wins over the deployment-mode default.
+            return;
+        }
+        let mut config = DesktopRuntimeConfig::isolated_test("/tmp/vibex-secret-store-mode-test");
+        config.mode = DesktopRuntimeMode::Headless;
+        let headless = provider_secret_store_config(&config);
+        assert_eq!(headless.store(), ProviderSecretStore::HostFile);
+        assert_eq!(headless.root(), Some(config.home_dir.as_path()));
+
+        config.mode = DesktopRuntimeMode::Preview;
+        let desktop = provider_secret_store_config(&config);
+        assert_eq!(desktop.store(), ProviderSecretStore::OsKeychain);
+        assert_eq!(desktop.root(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

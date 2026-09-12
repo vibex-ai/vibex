@@ -19,8 +19,15 @@ Remote v2 gateway, so a paired mobile client cannot tell them apart.
 - the Remote v2 Gateway (`/ws/v2`, `/api/v2/*`) with device pairing,
 - workspaces, Git operations, terminals, and provider settings.
 
-Provider API keys are stored in the **server** database in cloud mode. That
-is the deliberate trade-off of self-hosting: the host operator is the user.
+Provider API keys are stored on the **server host**, never in the database and
+never returned to clients. A desktop runtime writes them to the OS keychain; a
+headless server has no usable keychain (the default container seccomp profile
+rejects the keyutils syscalls the Linux keychain backend needs), so it writes
+them to `provider-secrets.json` inside its runtime home (`/data` by default,
+owner-only file permissions) instead. That is the deliberate trade-off of
+self-hosting: the host operator is the user. Set
+`VIBEX_PROVIDER_SECRET_STORE=keychain` to force the OS keychain (for a server
+host that has a real one), or `=file` to force the host secret file.
 The gateway never logs secrets, pairing codes, or auth tokens; provider
 credential values are never returned to clients after storage (they are
 write-only), and device permissions gate every management operation.

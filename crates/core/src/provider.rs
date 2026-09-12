@@ -68,6 +68,9 @@ pub enum ProviderSecretKind {
 pub enum ProviderSecretBackend {
     Placeholder,
     OsKeychain,
+    /// A host-owned secret file for runtimes that have no usable OS keychain,
+    /// such as a headless server running in a container.
+    HostFile,
     Environment,
     External,
 }

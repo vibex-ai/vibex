@@ -15896,6 +15896,7 @@ fn provider_secret_backend_name(backend: ProviderSecretBackend) -> &'static str 
     match backend {
         ProviderSecretBackend::Placeholder => "placeholder",
         ProviderSecretBackend::OsKeychain => "os_keychain",
+        ProviderSecretBackend::HostFile => "host_file",
         ProviderSecretBackend::Environment => "environment",
         ProviderSecretBackend::External => "external",
     }

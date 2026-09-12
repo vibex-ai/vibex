@@ -1007,7 +1007,7 @@ impl ProviderConfigService {
         );
         let reusable_lookup_key = matching_secrets
             .iter()
-            .find(|secret| secret.backend == ProviderSecretBackend::OsKeychain)
+            .find(|secret| secrets::is_local_secret_backend(secret.backend))
             .map(|secret| secret.lookup_key.clone())
             .filter(|lookup_key| !lookup_key.trim().is_empty());
 
@@ -1019,6 +1019,7 @@ impl ProviderConfigService {
                 .unwrap_or_else(|| format!("vibex-provider-secret-{}", RequestId::new().as_str()));
             let value = next_value.as_deref().expect("value checked above");
             secrets::store_provider_secret(&lookup_key, value)?;
+            let backend = secrets::provider_secret_write_backend();
             Some(ProviderSecretReference {
                 id: matching_secrets
                     .first()
@@ -1026,11 +1027,11 @@ impl ProviderConfigService {
                     .unwrap_or_else(RequestId::new),
                 provider_profile_id: profile.id.clone(),
                 secret_kind,
-                backend: ProviderSecretBackend::OsKeychain,
+                backend,
                 setup_state: ProviderSecretSetupState::Available,
                 lookup_key,
                 display_label: display_label.clone(),
-                redacted_hint: "stored in Vibex OS keychain".to_string(),
+                redacted_hint: secrets::provider_secret_storage_hint(backend).to_string(),
                 created_at_ms: matching_secrets
                     .first()
                     .map(|secret| secret.created_at_ms)
@@ -1043,7 +1044,7 @@ impl ProviderConfigService {
             let replacement_reuses_lookup = replacement
                 .as_ref()
                 .is_some_and(|next| next.lookup_key == secret.lookup_key);
-            if secret.backend == ProviderSecretBackend::OsKeychain && !replacement_reuses_lookup {
+            if secrets::is_local_secret_backend(secret.backend) && !replacement_reuses_lookup {
                 secrets::delete_provider_secret(&secret.lookup_key)?;
             }
         }
@@ -1518,7 +1519,7 @@ impl ProviderConfigService {
                 && !projected_secret_is_existing
             {
                 profile.secrets.retain(|secret| secret.id != secret_id);
-                if backend == ProviderSecretBackend::OsKeychain {
+                if secrets::is_local_secret_backend(backend) {
                     secrets_to_delete.insert(lookup_key);
                 }
             }
@@ -1527,6 +1528,8 @@ impl ProviderConfigService {
                 continue;
             };
             if input.secret {
+                let write_backend = secrets::provider_secret_write_backend();
+                let storage_hint = secrets::provider_secret_storage_hint(write_backend);
                 let lookup_key = existing_reference
                     .as_ref()
                     .and_then(|reference| reference.secret_lookup_key.clone())
@@ -1541,21 +1544,21 @@ impl ProviderConfigService {
                     .iter_mut()
                     .find(|secret| secret.lookup_key == lookup_key)
                 {
-                    secret.backend = ProviderSecretBackend::OsKeychain;
+                    secret.backend = write_backend;
                     secret.setup_state = ProviderSecretSetupState::Available;
                     secret.display_label = name.to_string();
-                    secret.redacted_hint = "stored in Vibex OS keychain".to_string();
+                    secret.redacted_hint = storage_hint.to_string();
                     secret.updated_at_ms = now.max(secret.updated_at_ms.saturating_add(1));
                 } else {
                     profile.secrets.push(ProviderSecretReference {
                         id: RequestId::new(),
                         provider_profile_id: profile.id.clone(),
                         secret_kind: ProviderSecretKind::Environment,
-                        backend: ProviderSecretBackend::OsKeychain,
+                        backend: write_backend,
                         setup_state: ProviderSecretSetupState::Available,
                         lookup_key: lookup_key.clone(),
                         display_label: name.to_string(),
-                        redacted_hint: "stored in Vibex OS keychain".to_string(),
+                        redacted_hint: storage_hint.to_string(),
                         created_at_ms: now,
                         updated_at_ms: now,
                     });
@@ -1565,7 +1568,7 @@ impl ProviderConfigService {
                     source: AcpProviderEnvSource::SecretReference,
                     value: None,
                     secret_lookup_key: Some(lookup_key),
-                    redacted_hint: "stored in Vibex OS keychain".to_string(),
+                    redacted_hint: storage_hint.to_string(),
                 });
             } else {
                 config.env.push(AcpProviderEnvReference {
