@@ -167,18 +167,30 @@ jobs:
 
           sudo dpkg --add-architecture arm64
           sudo apt-get update
-          # libgraphite2-3 / libharfbuzz0b / libfreetype6 / libssl3 are
-          # Multi-Arch: same — their :amd64 and :arm64 copies must resolve to
-          # the exact same version. The preinstalled :amd64 copies can lag a
-          # security bump that the :arm64 webkit dev chain then requires, and
-          # apt refuses the mismatched pair. Upgrading the :amd64 copies first
-          # lets both architectures land on one version; --only-upgrade never
-          # installs anything new, so absent packages are simply skipped.
-          sudo apt-get install -y --only-upgrade \
-            libgraphite2-3 \
-            libharfbuzz0b \
-            libfreetype6 \
-            libssl3
+          # Multi-Arch: same packages must resolve to one version across
+          # architectures, and Ubuntu publishes amd64 and ports updates hours
+          # apart: the runner image ships the amd64 copies, so any pair that
+          # drifted — python3.12, libc6, graphite2, harfbuzz, freetype,
+          # libssl3 — makes apt reject the entire :arm64 set with "held broken
+          # packages". Align every installed :same package to the version
+          # published for arm64; --allow-downgrades covers the reverse case of
+          # a ports archive that still lags behind amd64. Packages without an
+          # arm64 candidate are skipped, so amd64-only libraries stay put.
+          align=()
+          while read -r name version; do
+            candidate="$(apt-cache policy "${name}:arm64" | sed -n 's/^  Candidate: //p')"
+            case "${candidate}" in
+              "" | "(none)" | "${version}") continue ;;
+            esac
+            align+=("${name}=${candidate}")
+          done < <(
+            dpkg-query -W -f '${Package} ${Version} ${Multi-Arch} ${db:Status-Abbrev}\n' \
+              | awk '$3 == "same" && $4 == "ii" { print $1, $2 }'
+          )
+          if [ "${#align[@]}" -gt 0 ]; then
+            printf 'Aligning native Multi-Arch packages: %s\n' "${align[*]}"
+            sudo apt-get install -y --allow-downgrades "${align[@]}"
+          fi
           sudo apt-get install -y \
             clang \
             pkg-config \

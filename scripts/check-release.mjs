@@ -185,6 +185,11 @@ function validatePackaging() {
     );
   }
   assert(
+    releaseWorkflow.includes("Multi-Arch: same packages must resolve to one version") &&
+      releaseWorkflow.includes("--allow-downgrades"),
+    "publish workflow lost the Linux arm64 Multi-Arch version alignment"
+  );
+  assert(
     releaseWorkflow.includes("name: desktop-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}"),
     "publish workflow artifact names lost their architecture segment"
   );

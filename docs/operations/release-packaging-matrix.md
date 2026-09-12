@@ -33,9 +33,14 @@ embeds the other product's assets.
   `cargo packager --target <triple>`.
 - Linux aarch64 cross-builds on the x86_64 runner require the Ubuntu ports
   apt sources, the `aarch64-linux-gnu` GNU toolchain, the `:arm64` GTK/WebKit
-  development packages, and the pkg-config/cargo cross environment. Multi-Arch
-  `:same` libraries (graphite2, harfbuzz, freetype, libssl3) must be version
-  aligned before the `:arm64` packages install.
+  development packages, and the pkg-config/cargo cross environment.
+- Multi-Arch `:same` packages must hold one version per architecture, so the
+  workflow aligns every installed `:same` package to the version published for
+  arm64 before the `:arm64` packages install (`--allow-downgrades` also covers
+  a ports archive that lags behind amd64). Ubuntu publishes amd64 and ports
+  updates hours apart, and a single drifted pair — python3.12, libc6,
+  graphite2, harfbuzz, freetype, libssl3 — otherwise makes apt reject the
+  whole `:arm64` set with "held broken packages".
 - The Linux aarch64 deb, macOS, and Windows packages carry no embedded PDFium
   runtime: distribution approval is scoped to linux-x86_64.
 
