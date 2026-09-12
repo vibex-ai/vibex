@@ -19282,7 +19282,7 @@ impl VibexWorkbench {
                             has_initial_message,
                         ));
                     }
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             let workspaces = list_workspace_records(&backend).await;
