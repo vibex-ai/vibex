@@ -325,18 +325,23 @@ developer or release pipeline.
 
 ### Self-hosted Relay
 
-The Relay is optional. Run it locally with:
+The Relay is optional. Pull the published image, or build it from source:
 
 ```bash
-docker compose -f deploy/relay/docker-compose.yml up --build -d relay-server
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.3
+docker compose -f deploy/relay/docker-compose.yml pull relay-server
+docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health
 docker compose -f deploy/relay/docker-compose.yml down
 ```
 
-Use [the Relay deployment guide](deploy/relay/README.md) for HTTPS through
-Caddy, private Tailnet publication, runtime limits, and the optional
-operator-owned push adapter. Keep the default loopback binding for local
-development.
+The headless runtime publishes `ghcr.io/vibex-ai/vibex-server` the same way; both
+images cover `linux/amd64` and `linux/arm64`. Use
+[the Relay deployment guide](deploy/relay/README.md) for HTTPS through Caddy,
+private Tailnet publication, runtime limits, and the optional operator-owned
+push adapter, and
+[the headless runtime guide](deploy/server/README.md#container-images) for the
+image tag rules. Keep the default loopback binding for local development.
 
 ## Architecture
 

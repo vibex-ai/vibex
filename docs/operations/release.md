@@ -3,7 +3,8 @@
 ## Scope
 
 Vibex release work covers the native desktop package, optional native Android/iOS
-clients, and the transport-only Relay service. Desktop remains the authority for
+clients, the transport-only Relay service, and the two published container
+images (`vibex-server`, `vibex-relay-server`). Desktop remains the authority for
 all Agent and workspace state.
 
 ## Preflight
@@ -108,3 +109,24 @@ out of the repository and evidence logs.
 Relay deployment remains zero-knowledge and transport-only. Run the local smoke,
 then validate the operator's TLS, reverse proxy, NAT, room limits, and health
 endpoints against the same source and Cargo lockfile.
+
+## Container images
+
+A tag push publishes `ghcr.io/vibex-ai/vibex-server` and
+`ghcr.io/vibex-ai/vibex-relay-server` from
+`.github/workflows/publish-container-images.yml`, independently of the desktop
+and mobile jobs: a packaging failure in one product must not withhold the other.
+The workflow verifies the tag against both container binaries, builds
+`linux/amd64` and `linux/arm64` natively, merges the digests into one manifest
+list, and boots each published image once before the run succeeds.
+
+- Release candidates publish `0.1.0-rc.x`, `v0.1.0-rc.x`, and the moving `rc`
+  tag; stable releases additionally move `latest`. The default branch publishes
+  `edge` and `sha-<commit>`.
+- Published version tags are immutable. Rollback pulls a previously verified
+  version tag; it never retags an existing version.
+- Both registry packages must be Public once, or operators have to authenticate
+  before an anonymous `docker pull` works. The workflow warns when a package is
+  still private.
+- A release is not complete until both images answer their health endpoint from
+  the published registry tag, not only from a local build.

@@ -34,6 +34,18 @@ write-only), and device permissions gate every management operation.
 
 ## Quick Start (local smoke)
 
+The image is published for every release, so the common path is a pull:
+
+```bash
+export VIBEX_SERVER_IMAGE=ghcr.io/vibex-ai/vibex-server:v0.1.0-rc.3
+docker compose -f deploy/server/docker-compose.yml pull vibex-server
+docker compose -f deploy/server/docker-compose.yml up -d --no-build vibex-server
+docker logs vibex-server | grep pairing_code=
+curl -fsS http://127.0.0.1:8765/api/v2/info
+```
+
+Building the same image from source works identically and needs no registry:
+
 ```bash
 docker compose -f deploy/server/docker-compose.yml up --build -d vibex-server
 docker logs vibex-server | grep pairing_code=
@@ -58,6 +70,44 @@ Stop it with:
 ```bash
 docker compose -f deploy/server/docker-compose.yml down
 ```
+
+## Container images
+
+`.github/workflows/publish-container-images.yml` builds and publishes both
+self-hosted services on every release tag and on every push to the default
+branch:
+
+| Service | Image | Built from |
+| --- | --- | --- |
+| Headless runtime | `ghcr.io/vibex-ai/vibex-server` | `deploy/server/Dockerfile` |
+| Relay | `ghcr.io/vibex-ai/vibex-relay-server` | `deploy/relay/Dockerfile` |
+
+Both are multi-architecture manifest lists (`linux/amd64` and `linux/arm64`),
+built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
+`docker pull` picks the right image on an ARM VPS or an Apple-silicon machine.
+
+| Trigger | Published tags |
+| --- | --- |
+| Release tag `v0.1.0-rc.3` | `0.1.0-rc.3`, `v0.1.0-rc.3`, `rc` |
+| Stable tag `v0.2.0` | `0.2.0`, `v0.2.0`, `latest` |
+| Push to the default branch | `edge`, `sha-<commit>` |
+| Manual workflow run | `edge`, `sha-<commit>` |
+
+`latest` only ever points at a stable release; `rc` tracks the newest release
+candidate and `edge` the default branch. Version tags are immutable — a
+rollback pulls an older version tag instead of moving one.
+
+The workflow verifies the tag against `vibex-server` and `vibex-relay-server`
+before building, starts each published image once (`/api/v2/info` and
+`/health`) before the run succeeds, and warns when the registry package is
+still private.
+
+> **Anonymous pulls need a public package.** Container packages on GitHub
+> Container Registry start out private even when they come from a public
+> repository. Set it once per image under **GitHub → Packages → the package →
+> Package settings → Change visibility → Public**, or keep it private and pull
+> with `docker login ghcr.io -u <user> -p <token>` where the token has
+> `read:packages`.
 
 The startup log prints `server_id`, `endpoint`, and a one-time numeric
 `pairing_code` (grouped `NNN-NNN-NNN`, expires after 5 minutes by default,

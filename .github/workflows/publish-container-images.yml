@@ -1,0 +1,290 @@
+name: Publish Container Images
+
+# Publishes the two deployable services as multi-arch images so an operator
+# never has to build them:
+#
+#   ghcr.io/<owner>/vibex-server         headless runtime (deploy/server)
+#   ghcr.io/<owner>/vibex-relay-server   transport-only Relay (deploy/relay)
+#
+# Release tags publish immutable version tags plus `latest` (stable only) and
+# `rc` (release candidates); `main` publishes the moving `edge` tag and the
+# commit tag. The workflow runs beside `release.yml` rather than inside it: a
+# desktop packaging failure must not stop a container image, and vice versa.
+#
+# Both GitHub Container Registry packages start out **private** even from a
+# public repository, so anonymous `docker pull` fails until an owner flips them
+# to Public once (GitHub -> Packages -> the package -> Package settings ->
+# Change visibility). The advisory check at the end of the publish job reports
+# when that has not happened yet.
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-container-images-${{ github.ref }}
+  # A tag publish is an immutable release: never cancel it. Branch and manual
+  # runs are just moving `edge`, so the newest push wins.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  verify-meta:
+    name: Verify image version identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify the release tag matches both container binaries
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "${version}" <<'PY'
+          import sys
+          import tomllib
+
+          version = sys.argv[1]
+          for manifest, package in (
+              ("apps/server/Cargo.toml", "vibex-server"),
+              ("apps/relay-server/Cargo.toml", "vibex-relay-server"),
+          ):
+              with open(manifest, "rb") as handle:
+                  declared = tomllib.load(handle)["package"]["version"]
+              if declared != version:
+                  raise SystemExit(
+                      f"tag {version} does not match {package} {declared} in {manifest}"
+                  )
+          print(f"tag {version} matches both container binaries")
+          PY
+
+  build:
+    name: Build ${{ matrix.service }} ${{ matrix.arch }}
+    needs: verify-meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: server
+            dockerfile: deploy/server/Dockerfile
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - service: server
+            dockerfile: deploy/server/Dockerfile
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - service: relay
+            dockerfile: deploy/relay/Dockerfile
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - service: relay
+            dockerfile: deploy/relay/Dockerfile
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The workspace patches gpui-pre to the vendor/zed submodule, so the
+          # build context is incomplete without it.
+          submodules: recursive
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          # Static identity labels, so the package links back to the repository
+          # and an operator can trace an image to its commit. Version labels are
+          # deliberately omitted: the published tag is the version.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.title=vibex-${{ matrix.service }}
+          # Each architecture publishes its own digest; the publish job merges
+          # them into one manifest list. Pushing the tag here would let the
+          # slower architecture overwrite the faster one.
+          outputs: >-
+            type=image,name=${{ env.REGISTRY }}/${{ github.repository }}-${{ matrix.service }},push-by-digest=true,name-canonical=true,push=true
+          # A release build leaves a multi-gigabyte target directory, so only
+          # the final layers are cached: a `mode=max` export would evict the
+          # repository's other caches (the GitHub cache budget is 10 GB).
+          cache-from: type=gha,scope=container-${{ matrix.service }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=container-${{ matrix.service }}-${{ matrix.arch }}
+          # Attestation manifests would be dropped by the manifest merge below;
+          # publishing them for real is a separate, deliberate follow-up.
+          provenance: false
+      - name: Export the image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "${digest}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ matrix.service }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.service }} manifest
+    needs: [verify-meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [server, relay]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.service }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}-${{ matrix.service }}
+          # `latest=auto` would tag every `type=ref,event=tag` run — including
+          # release candidates — as `latest`, so it is disabled and the only
+          # `latest` rule below is the guarded one.
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') }}
+            type=raw,value=rc,enable=${{ startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc.') }}
+            type=raw,value=edge,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=sha,format=short,prefix=sha-,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Create the multi-arch manifest list
+        id: publish
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}-${{ matrix.service }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          test "${#sources[@]}" -eq 2
+          tag_args=()
+          while IFS= read -r tag; do
+            test -z "${tag}" || tag_args+=(-t "${tag}")
+          done <<< "${TAGS}"
+          test "${#tag_args[@]}" -gt 0
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          first_tag="$(head -n 1 <<< "${TAGS}")"
+          architectures="$(
+            docker buildx imagetools inspect --raw "${first_tag}" \
+              | python3 -c 'import json,sys; print(" ".join(sorted(entry["platform"]["architecture"] for entry in json.load(sys.stdin)["manifests"])))'
+          )"
+          test "${architectures}" = "amd64 arm64"
+          echo "first_tag=${first_tag}" >> "${GITHUB_OUTPUT}"
+          docker buildx imagetools inspect "${first_tag}"
+      - name: Smoke the published server image
+        if: matrix.service == 'server'
+        env:
+          IMAGE_TAG: ${{ steps.publish.outputs.first_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The named volume inherits the image's /data ownership, so the
+          # non-root runtime user can create its home and database.
+          docker volume create vibex-image-smoke >/dev/null
+          trap 'docker rm -f vibex-image-smoke >/dev/null 2>&1 || true; docker volume rm vibex-image-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name vibex-image-smoke --network host \
+            -v vibex-image-smoke:/data "${IMAGE_TAG}"
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8765/api/v2/info >/dev/null; then
+              echo "the published server image answers /api/v2/info"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "the published server image never answered /api/v2/info" >&2
+          docker logs vibex-image-smoke >&2 || true
+          exit 1
+      - name: Smoke the published relay image
+        if: matrix.service == 'relay'
+        env:
+          IMAGE_TAG: ${{ steps.publish.outputs.first_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f vibex-image-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name vibex-image-smoke -p 19700:9700 "${IMAGE_TAG}"
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:19700/health >/dev/null; then
+              echo "the published relay image answers /health"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "the published relay image never answered /health" >&2
+          docker logs vibex-image-smoke >&2 || true
+          exit 1
+      - name: Check anonymous pull access
+        continue-on-error: true
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}-${{ matrix.service }}
+          IMAGE_TAG: ${{ steps.publish.outputs.first_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="$(cut -d/ -f2- <<< "${IMAGE}" | tr '[:upper:]' '[:lower:]')"
+          tag="${IMAGE_TAG##*:}"
+          token="$(
+            curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${repository}:pull" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
+          )"
+          status="$(
+            curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              "https://${REGISTRY}/v2/${repository}/manifests/${tag}"
+          )"
+          if [ "${status}" != "200" ]; then
+            echo "::warning title=Container package is not public::Anonymous pull of ${IMAGE}:${tag} returns ${status}. Open GitHub -> Packages -> ${IMAGE#*/} -> Package settings and change the visibility to Public so operators can pull without a token."
+          fi

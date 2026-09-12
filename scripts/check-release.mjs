@@ -212,6 +212,35 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
   }
+  // Container images publish from their own tag/branch-triggered workflow.
+  // Keep the registry, the build inputs, the architecture coverage, and the
+  // "latest only points at a stable release" guarantee under contract.
+  const containerWorkflow = workflowSource(".github/workflows/publish-container-images.yml");
+  for (const required of [
+    "ghcr.io",
+    "deploy/server/Dockerfile",
+    "deploy/relay/Dockerfile",
+    "apps/server/Cargo.toml",
+    "apps/relay-server/Cargo.toml",
+    "linux/amd64",
+    "linux/arm64",
+    "ubuntu-24.04-arm",
+    "push-by-digest=true",
+    "type=raw,value=rc,enable=",
+    "type=raw,value=latest,enable=",
+    "latest=false"
+  ]) {
+    assert(
+      containerWorkflow.includes(required),
+      `container image workflow is missing ${required}`
+    );
+  }
+  const latestTagRule =
+    containerWorkflow.split("\n").find((line) => line.includes("value=latest,enable=")) ?? "";
+  assert(
+    latestTagRule.includes("refs/tags/") && latestTagRule.includes("contains(github.ref_name, '-')"),
+    "container image workflow must not publish latest for a prerelease tag"
+  );
   for (const required of [
     "sign-android-release.sh",
     "VIBEX_ANDROID_KEYSTORE_BASE64",

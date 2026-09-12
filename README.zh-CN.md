@@ -278,15 +278,18 @@ pnpm build:mobile:ios
 
 ### 自托管 Relay
 
-Relay 是可选组件。可以这样在本地运行:
+Relay 是可选组件。可以直接拉取已发布的镜像，也可以从源码构建:
 
 ```bash
-docker compose -f deploy/relay/docker-compose.yml up --build -d relay-server
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.3
+docker compose -f deploy/relay/docker-compose.yml pull relay-server
+docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health
 docker compose -f deploy/relay/docker-compose.yml down
 ```
 
-关于通过 Caddy 使用 HTTPS、在私有 Tailnet 中发布、运行时限制以及可选的运营方推送适配器, 请阅读 [Relay 部署指南](deploy/relay/README.md)。本地开发请保持默认的 loopback 绑定。
+无头运行时同样发布 `ghcr.io/vibex-ai/vibex-server`，两个镜像都覆盖
+`linux/amd64` 与 `linux/arm64`。关于通过 Caddy 使用 HTTPS、在私有 Tailnet 中发布、运行时限制以及可选的运营方推送适配器, 请阅读 [Relay 部署指南](deploy/relay/README.md)；镜像 tag 规则见 [无头运行时部署指南](deploy/server/README.md#container-images)。本地开发请保持默认的 loopback 绑定。
 
 ## 架构
 

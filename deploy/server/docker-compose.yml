@@ -5,7 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/server/Dockerfile
-    image: vibex-server:local
+    image: ${VIBEX_SERVER_IMAGE:-vibex-server:local}
     container_name: vibex-server
     restart: unless-stopped
     # Host networking: the container shares the host network namespace, so

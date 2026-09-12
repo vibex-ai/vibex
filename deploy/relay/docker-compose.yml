@@ -5,7 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/relay/Dockerfile
-    image: vibex-relay-server:local
+    image: ${VIBEX_RELAY_IMAGE:-vibex-relay-server:local}
     container_name: vibex-relay-server
     restart: unless-stopped
     environment:

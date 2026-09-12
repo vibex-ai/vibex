@@ -14,7 +14,17 @@ The Relay must not decrypt, authorize, store, or log Vibex business payloads.
 
 ## Quick Start
 
-Run the Relay locally from the repository root:
+The image is published for every release, so the common path is a pull:
+
+```bash
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.3
+docker compose -f deploy/relay/docker-compose.yml pull relay-server
+docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
+curl -fsS http://127.0.0.1:9700/health
+curl -fsS http://127.0.0.1:9700/api/info
+```
+
+Building the same image from source works identically and needs no registry:
 
 ```bash
 docker compose -f deploy/relay/docker-compose.yml up --build -d relay-server
@@ -27,6 +37,13 @@ Stop it with:
 ```bash
 docker compose -f deploy/relay/docker-compose.yml down
 ```
+
+`ghcr.io/vibex-ai/vibex-relay-server` is published for `linux/amd64` and
+`linux/arm64` alongside the headless runtime image;
+[Container images](../server/README.md#container-images) documents the tag
+rules (`latest` for stable releases, `rc` for release candidates, `edge` and
+`sha-<commit>` for the default branch), the immutability rule, and the one-time
+step that makes the registry package publicly pullable.
 
 Compose publishes `127.0.0.1:9700` by default. Keep that default when Caddy or
 Tailscale Serve runs on the same host. For an explicitly managed host network,
