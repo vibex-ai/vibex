@@ -17386,15 +17386,7 @@ impl VibexWorkbench {
         let dialog_view: Entity<DirectoryPickerDialog> = cx.new(|cx| {
             DirectoryPickerDialog::new(locale_mode, initial_dir, source, on_pick, window, cx)
         });
-        let title = if remote {
-            locale::text(
-                "Choose project directory on the paired runtime",
-                "选择已配对运行时上的项目目录",
-                "選擇已配對執行階段上的專案目錄",
-            )
-        } else {
-            locale::text("Choose project directory", "选择项目目录", "選擇專案目錄")
-        };
+        let title = locale::text("Choose project directory", "选择项目目录", "選擇專案目錄");
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 48.0).clamp(420.0, 640.0);
         let dialog_height = (f32::from(viewport.height) - 48.0).clamp(1.0, 520.0);
