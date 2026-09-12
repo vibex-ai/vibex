@@ -24,6 +24,14 @@ crates/core/bindings/
 # Local controlled-environment E2E state (credentials, harness homes, relay logs)
 .e2e-local-env/
 
+# Local deployment environment files. The deploy compose files interpolate
+# ${VAR:-default}, so an operator keeps image tags, bind addresses, TLS paths,
+# and push-adapter tokens in a project .env; none of it may reach the public
+# repository. A committed example file stays trackable.
+.env
+.env.*
+!.env.example
+
 # Private Trellis task tree. These paths live in the working tree but belong to a
 # separate task repository (git dir .trellis/.taskgit, work tree .trellis).
 # The rules must stay in THIS file rather than .trellis/.gitignore: the task
