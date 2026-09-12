@@ -698,6 +698,9 @@ pub struct ManagementCenter {
     profile_configured_models: Vec<vibex_core::ProviderConfiguredModel>,
     profile_model_edit_index: Option<usize>,
     profile_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
+    /// The Model's declared thinking-depth opt-out: `true` writes
+    /// `reasoning: false`, which is the one answer that removes the control.
+    profile_model_edit_reasoning_disabled: bool,
     profile_provider_options: vibex_core::ProviderOptions,
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
@@ -718,6 +721,7 @@ pub struct ManagementCenter {
     profile_model_draft: Entity<InputState>,
     profile_model_edit_id: Entity<InputState>,
     profile_model_edit_name: Entity<InputState>,
+    profile_model_edit_efforts: Entity<InputState>,
     profile_api_key: Entity<InputState>,
     acp_command: Entity<InputState>,
     acp_args: Entity<InputState>,
@@ -814,6 +818,13 @@ impl ManagementCenter {
                 "Display name",
                 "显示名称",
                 "顯示名稱",
+            ))
+        });
+        let profile_model_edit_efforts = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "off, low, high, max — or level=wire",
+                "off, low, high, max —— 或 档位=线格式",
+                "off, low, high, max —— 或 檔位=線格式",
             ))
         });
         let profile_api_key = cx.new(|cx| {
@@ -989,6 +1000,29 @@ impl ManagementCenter {
                 |this, _, event: &InputEvent, cx| {
                     if !management_input_changed(event) {
                         return;
+                    }
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(
+                &profile_model_edit_efforts,
+                |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    // A written table is the more specific answer, so typing one
+                    // leaves the non-reasoning choice behind instead of letting
+                    // Apply silently ignore what the field shows.
+                    if !this
+                        .profile_model_edit_efforts
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .is_empty()
+                    {
+                        this.profile_model_edit_reasoning_disabled = false;
                     }
                     this.projection_editor.mark_draft_changed();
                     this.navigation.mark_dirty(ManagementSection::Agents, true);
@@ -1213,6 +1247,7 @@ impl ManagementCenter {
             profile_configured_models: Vec::new(),
             profile_model_edit_index: None,
             profile_model_edit_wire_api: None,
+            profile_model_edit_reasoning_disabled: false,
             profile_provider_options: vibex_core::ProviderOptions::empty(),
             selected_acp_profile_id: None,
             acp_config_draft: None,
@@ -1233,6 +1268,7 @@ impl ManagementCenter {
             profile_model_draft,
             profile_model_edit_id,
             profile_model_edit_name,
+            profile_model_edit_efforts,
             profile_api_key,
             acp_command,
             acp_args,
@@ -1340,6 +1376,14 @@ impl ManagementCenter {
             (
                 &self.profile_model_edit_name,
                 ("Display name", "显示名称", "顯示名稱"),
+            ),
+            (
+                &self.profile_model_edit_efforts,
+                (
+                    "off, low, high, max — or level=wire",
+                    "off, low, high, max —— 或 档位=线格式",
+                    "off, low, high, max —— 或 檔位=線格式",
+                ),
             ),
             (&self.acp_command, ("ACP command", "ACP 命令", "ACP 命令")),
             (
@@ -3802,6 +3846,8 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_name
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -3816,6 +3862,7 @@ impl ManagementCenter {
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_reasoning_disabled = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.rebuild_profile_protocol_base_urls(window, cx);
         self.profile_editor_open = true;
@@ -3869,6 +3916,8 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_name
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -3880,6 +3929,7 @@ impl ManagementCenter {
             .unwrap_or_default();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_reasoning_disabled = false;
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
@@ -4105,6 +4155,7 @@ impl ManagementCenter {
             self.profile_model_edit_index = match self.profile_model_edit_index {
                 Some(edit_index) if edit_index == index => {
                     self.profile_model_edit_wire_api = None;
+                    self.profile_model_edit_reasoning_disabled = false;
                     None
                 }
                 Some(edit_index) if edit_index > index => Some(edit_index - 1),
@@ -4131,6 +4182,18 @@ impl ManagementCenter {
         self.profile_model_edit_name.update(cx, |state, cx| {
             state.set_value(model.display_name.unwrap_or_default(), window, cx)
         });
+        // Three answers share one control: an opt-out, a declared table, and
+        // "not declared". The table's wire spellings are shown as they were
+        // declared — the field is the only copy the user has.
+        self.profile_model_edit_reasoning_disabled = model.capabilities.reasoning == Some(false);
+        let efforts = model
+            .capabilities
+            .reasoning_efforts
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value(efforts, window, cx));
         self.profile_model_edit_index = Some(index);
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
@@ -4140,6 +4203,7 @@ impl ManagementCenter {
     fn close_profile_model_editor(&mut self, cx: &mut Context<Self>) {
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_reasoning_disabled = false;
         cx.notify();
     }
 
@@ -4171,17 +4235,54 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_string();
+        // Parse before mutating anything: a rejected declaration must leave the
+        // editor open with the text the user typed, not close on a half-applied
+        // Model. The Agent refuses the same tables, so refusing here is what
+        // keeps the error attributable to a Model instead of to a session that
+        // will not start.
+        let efforts_text = self
+            .profile_model_edit_efforts
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let declared_efforts = match vibex_core::ProviderModelReasoningEfforts::parse(&efforts_text)
+        {
+            Ok(declared) => declared,
+            Err(reason) => {
+                self.error = Some(format!("agent_model_reasoning_efforts_invalid: {reason}"));
+                cx.notify();
+                return;
+            }
+        };
         let Some(model) = self.profile_configured_models.get_mut(index) else {
             self.profile_model_edit_index = None;
             self.profile_model_edit_wire_api = None;
+            self.profile_model_edit_reasoning_disabled = false;
             cx.notify();
             return;
         };
         model.id = model_id;
         model.display_name = (!display_name.is_empty()).then_some(display_name);
         model.wire_api = self.profile_model_edit_wire_api;
+        if self.profile_model_edit_reasoning_disabled {
+            model.capabilities.reasoning = Some(false);
+            model.capabilities.reasoning_efforts = None;
+        } else {
+            // Declaring levels is declaring the capability; an emptied field
+            // returns the Model to the Agent's default, which also clears an
+            // opt-out this editor wrote.
+            model.capabilities.reasoning =
+                match (declared_efforts.is_some(), model.capabilities.reasoning) {
+                    (true, _) => Some(true),
+                    (false, Some(false)) => None,
+                    (false, declared) => declared,
+                };
+            model.capabilities.reasoning_efforts = declared_efforts;
+        }
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_reasoning_disabled = false;
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
     }
@@ -4205,6 +4306,31 @@ impl ManagementCenter {
             self.navigation.mark_dirty(ManagementSection::Agents, true);
             cx.notify();
         }
+    }
+
+    /// Writes one thinking-depth choice into the open Model editor.
+    ///
+    /// `disabled` is the Model's opt-out; otherwise `declaration` is the
+    /// compact table the editor will parse on apply. The presets come through
+    /// here too: they fill the field with an editable starting table rather
+    /// than storing an inference, which is why a user can correct one the
+    /// endpoint spells differently.
+    fn set_profile_model_reasoning_draft(
+        &mut self,
+        index: usize,
+        disabled: bool,
+        declaration: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_model_edit_index != Some(index) {
+            return;
+        }
+        self.profile_model_edit_reasoning_disabled = disabled;
+        self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value(declaration, window, cx));
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
     }
 
     /// Selects a Model from the Agent-owned catalogue.
@@ -4697,7 +4823,13 @@ impl ManagementCenter {
                             // An authoritative catalogue replaces the draft:
                             // ids the bridge no longer advertises cannot be
                             // selected, so keeping them would offer dead rows.
-                            this.profile_configured_models = result.models;
+                            // A Model that survives the refresh keeps its
+                            // declared capabilities, which the catalogue does
+                            // not carry.
+                            replace_provider_models_keeping_capabilities(
+                                &mut this.profile_configured_models,
+                                result.models,
+                            );
                         } else {
                             merge_provider_models(
                                 &mut this.profile_configured_models,
@@ -4706,6 +4838,7 @@ impl ManagementCenter {
                         }
                         this.profile_model_edit_index = None;
                         this.profile_model_edit_wire_api = None;
+                        this.profile_model_edit_reasoning_disabled = false;
                         this.navigation.mark_dirty(ManagementSection::Agents, true);
                         this.notice = Some(match active_locale {
                             ResolvedLocale::En => format!("Fetched {count} model(s)"),
@@ -8638,6 +8771,18 @@ impl ManagementCenter {
         {
             let enabled = model.enabled;
             let edit_index = index;
+            // The declaration is per Model, so the row states it: otherwise the
+            // only way to tell two Models' depths apart is to open each editor.
+            let depth = match (
+                model.capabilities.reasoning,
+                model.capabilities.reasoning_efforts.as_ref(),
+            ) {
+                (Some(false), _) => {
+                    Some(management_locale_text("Non-reasoning", "不推理", "不推理").to_string())
+                }
+                (_, Some(efforts)) if !efforts.is_empty() => Some(efforts.to_string()),
+                _ => None,
+            };
             model_rows = model_rows.child(
                 h_flex()
                     .w_full()
@@ -8671,21 +8816,24 @@ impl ManagementCenter {
                                     .truncate()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(match model.wire_api {
-                                        Some(wire_api) => format!(
-                                            "{} · {}",
-                                            model.id,
-                                            provider_wire_api_label(wire_api)
-                                        ),
-                                        None => format!(
-                                            "{} · {}",
-                                            model.id,
-                                            management_locale_text(
+                                    .child({
+                                        let protocol = match model.wire_api {
+                                            Some(wire_api) => {
+                                                provider_wire_api_label(wire_api).to_string()
+                                            }
+                                            None => management_locale_text(
                                                 "Inherit provider default",
                                                 "继承供应商默认值",
                                                 "繼承供應商預設值",
                                             )
-                                        ),
+                                            .to_string(),
+                                        };
+                                        match &depth {
+                                            Some(depth) => {
+                                                format!("{} · {protocol} · {depth}", model.id)
+                                            }
+                                            None => format!("{} · {protocol}", model.id),
+                                        }
                                     }),
                             ),
                     )
@@ -8889,6 +9037,125 @@ impl ManagementCenter {
                                         )),
                                 )
                                 .child(wire_controls)
+                        })
+                        .child({
+                            // The field is the whole declaration: a preset only
+                            // fills it, and the endpoint's own spelling stays
+                            // editable. Nothing here infers a vocabulary from
+                            // the Model id.
+                            let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
+                            let current = self
+                                .profile_model_edit_efforts
+                                .read(cx)
+                                .value()
+                                .trim()
+                                .to_string();
+                            let presets: [(&'static str, String, &'static str, bool); 5] = [
+                                (
+                                    "default",
+                                    management_locale_text(
+                                        "Follow Agent default",
+                                        "跟随 Agent 默认",
+                                        "跟隨 Agent 預設",
+                                    )
+                                    .to_string(),
+                                    "",
+                                    false,
+                                ),
+                                (
+                                    "none",
+                                    management_locale_text(
+                                        "Non-reasoning",
+                                        "不推理",
+                                        "不推理",
+                                    )
+                                    .to_string(),
+                                    "",
+                                    true,
+                                ),
+                                ("deepseek", "DeepSeek".to_string(), "off, low, high, max", false),
+                                (
+                                    "openai",
+                                    management_locale_text(
+                                        "OpenAI-compatible",
+                                        "通用 OpenAI 兼容",
+                                        "通用 OpenAI 相容",
+                                    )
+                                    .to_string(),
+                                    "off, low, medium, high",
+                                    false,
+                                ),
+                                (
+                                    "anthropic",
+                                    "Anthropic Messages".to_string(),
+                                    "off, low, medium, high, max",
+                                    false,
+                                ),
+                            ];
+                            let mut controls = h_flex().w_full().flex_wrap().gap_1();
+                            for (key, label, declaration, opt_out) in presets {
+                                let selected = if opt_out {
+                                    reasoning_disabled
+                                } else if declaration.is_empty() {
+                                    !reasoning_disabled && current.is_empty()
+                                } else {
+                                    !reasoning_disabled && current == declaration
+                                };
+                                controls = controls.child(
+                                    Button::new(SharedString::from(format!(
+                                        "provider-model-reasoning-{index}-{key}"
+                                    )))
+                                    .small()
+                                    .ghost()
+                                    .selected(selected)
+                                    .label(label)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_profile_model_reasoning_draft(
+                                            index,
+                                            opt_out,
+                                            declaration,
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                                );
+                            }
+                            v_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(management_locale_text(
+                                            "Thinking depth",
+                                            "思考深度",
+                                            "思考深度",
+                                        )),
+                                )
+                                .child(controls)
+                                .child(management_input_field(
+                                    management_locale_text(
+                                        "Declared levels",
+                                        "档位声明",
+                                        "檔位宣告",
+                                    ),
+                                    &self.profile_model_edit_efforts,
+                                    false,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(management_locale_text(
+                                            "Only the declared levels are offered to the run options. Leave it empty to keep the Agent default; write level=wire when the endpoint spells a level differently.",
+                                            "运行选项只显示这里声明的档位。留空沿用 Agent 默认；端点拼写不同时写 档位=线格式。",
+                                            "執行選項只顯示這裡宣告的檔位。留空沿用 Agent 預設；端點拼寫不同時寫 檔位=線格式。",
+                                        )),
+                                )
                         })
                         .child(
                             h_flex().w_full().justify_end().gap_2().child(
@@ -15860,10 +16127,36 @@ fn normalized_provider_models(
                 .map(str::to_string),
             enabled: model.enabled,
             wire_api: model.wire_api,
-            capabilities: Default::default(),
+            // Declared capabilities are user data: the editor is the only
+            // place a thinking-depth table can come from, so saving must not
+            // normalize it away.
+            capabilities: model.capabilities.clone(),
         });
     }
     normalized
+}
+
+/// Replaces the draft catalogue while keeping the declared capabilities of
+/// every Model that survives the refresh.
+///
+/// An Agent-owned catalogue answers which Models exist and which wire protocol
+/// each speaks; it does not carry a thinking-depth table, so replacing the
+/// draft wholesale would silently drop the user's declaration for a Model the
+/// catalogue still advertises.
+fn replace_provider_models_keeping_capabilities(
+    current: &mut Vec<vibex_core::ProviderConfiguredModel>,
+    incoming: Vec<vibex_core::ProviderConfiguredModel>,
+) {
+    let previous = std::mem::take(current);
+    *current = incoming
+        .into_iter()
+        .map(|mut model| {
+            if let Some(existing) = previous.iter().find(|existing| existing.id == model.id) {
+                model.capabilities = existing.capabilities.clone();
+            }
+            model
+        })
+        .collect();
 }
 
 fn merge_provider_models(
@@ -17929,6 +18222,76 @@ mod tests {
             Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
         );
         assert_eq!(models[1].id, "claude-sonnet");
+    }
+
+    #[test]
+    fn model_capabilities_survive_normalization_merge_and_catalogue_refresh() {
+        let mut declared = vibex_core::ProviderModelReasoningEfforts::new();
+        declared.insert(vibex_core::ProviderReasoningEffortLevel::Off, None);
+        declared.insert(
+            vibex_core::ProviderReasoningEffortLevel::High,
+            Some("HIGH".into()),
+        );
+        let capabilities = vibex_core::ProviderModelCapabilities {
+            reasoning: Some(true),
+            reasoning_efforts: Some(declared),
+            ..Default::default()
+        };
+        let declared_model = vibex_core::ProviderConfiguredModel {
+            id: "model-a".into(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: capabilities.clone(),
+        };
+        let mut models = vec![declared_model.clone()];
+
+        // Saving the profile normalizes the draft; a declaration is user data
+        // and must come out unchanged, or the projection would fall back to the
+        // Agent default the user just overrode.
+        let normalized = normalized_provider_models(&models);
+        assert_eq!(normalized[0].capabilities, capabilities);
+
+        // "Fetch models" merges new ids and refreshes metadata, but a Model that
+        // survives keeps what it declared.
+        merge_provider_models(
+            &mut models,
+            vec![vibex_core::ProviderConfiguredModel {
+                id: "model-a".into(),
+                display_name: Some("Model A".into()),
+                enabled: true,
+                wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                capabilities: Default::default(),
+            }],
+        );
+        assert_eq!(models[0].capabilities, capabilities);
+        assert_eq!(models[0].display_name.as_deref(), Some("Model A"));
+
+        // An authoritative Agent catalogue replaces the draft; a Model the
+        // catalogue still advertises keeps its declaration, a dropped one goes
+        // with the rest of the draft.
+        replace_provider_models_keeping_capabilities(
+            &mut models,
+            vec![
+                vibex_core::ProviderConfiguredModel {
+                    id: "model-a".into(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: Some(vibex_core::ProviderModelWireApi::OpenaiChatCompletions),
+                    capabilities: Default::default(),
+                },
+                vibex_core::ProviderConfiguredModel {
+                    id: "model-b".into(),
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].capabilities, capabilities);
+        assert_eq!(models[1].capabilities, Default::default());
     }
 
     #[test]
