@@ -5964,7 +5964,7 @@ mod tests {
     fn relay_transport_requires_mobile_protocol_capabilities() {
         let mut info = RelayEndpointInfo {
             service_name: "Relay".to_string(),
-            server_version: "0.1.0-rc.2".to_string(),
+            server_version: "0.1.0-rc.3".to_string(),
             protocol_version: vibex_core::RelayProtocolVersion::foundation(),
             features: RelayEndpointFeatures {
                 pc_websocket: true,

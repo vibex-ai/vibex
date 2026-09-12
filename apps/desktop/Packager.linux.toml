@@ -1,6 +1,6 @@
 name = "vibex-desktop"
 productName = "Vibex Preview"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 identifier = "dev.vibex.desktop.preview"
 description = "Vibex native GPUI preview with Terminal, PDF, and Office content surfaces"
 authors = ["Vibex"]
