@@ -2158,6 +2158,10 @@ impl DesktopRuntime {
             RuntimeSelectionServiceConfig::default(),
         )?);
         manager.install_runtime_selection_service(&runtime_selection)?;
+        // A materialization that finds a binding whose authentication source
+        // revision moved hands the session to the runtime selection service,
+        // which drives the durable switch that replaces the binding.
+        runtime_lifecycle.install_runtime_selection_service(&runtime_selection)?;
         let message_submission = Arc::new(MessageSubmissionCoordinator::new_with_observability(
             &db_path,
             runtime_selection.clone(),

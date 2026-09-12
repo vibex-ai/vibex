@@ -20,6 +20,13 @@ use vibex_core::{
     RuntimeStreamId, VibexError, VibexResult, VibexSessionId,
 };
 
+use crate::runtime_selection::RuntimeSelectionService;
+
+/// Backend error code for a durable binding whose authentication source
+/// revision moved. The binding may only be replaced by a durable switch, so the
+/// lifecycle service hands the session to the runtime selection service once.
+const STALE_AUTH_SOURCE_REVISION_CODE: &str = "runtime_auth_source_revision_stale";
+
 pub const DEFAULT_RUNTIME_CLIENT_HEARTBEAT: Duration = Duration::from_secs(30);
 pub const DEFAULT_RUNTIME_CLIENT_TTL: Duration = Duration::from_secs(90);
 pub const DEFAULT_RUNTIME_EVENT_CAPACITY: usize = 256;
@@ -156,6 +163,10 @@ struct RuntimeLifecycleInner {
     state: Mutex<LifecycleState>,
     mutation_gate: AsyncRwLock<()>,
     session_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Installed by the shell once the runtime selection service exists. A
+    /// materialization that finds a stale durable binding hands the session to
+    /// it, because only a durable switch may replace the binding.
+    runtime_selection: Mutex<Option<Weak<RuntimeSelectionService>>>,
     events: broadcast::Sender<RuntimeSessionEvent>,
     sweep_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -198,6 +209,7 @@ impl RuntimeLifecycleService {
             state: Mutex::new(LifecycleState::default()),
             mutation_gate: AsyncRwLock::new(()),
             session_locks: Mutex::new(HashMap::new()),
+            runtime_selection: Mutex::new(None),
             events,
             sweep_task: Mutex::new(None),
         });
@@ -209,6 +221,28 @@ impl RuntimeLifecycleService {
 
     pub fn config(&self) -> &RuntimeLifecycleConfig {
         &self.inner.config
+    }
+
+    /// Installs the runtime selection service used to replace a durable binding
+    /// whose authentication source revision moved. A weak reference keeps the
+    /// shell's ownership of the service authoritative.
+    pub fn install_runtime_selection_service(
+        &self,
+        runtime_selection: &Arc<RuntimeSelectionService>,
+    ) -> VibexResult<()> {
+        let mut installed = self
+            .inner
+            .runtime_selection
+            .lock()
+            .map_err(|_| lifecycle_lock_error("runtimeSelection"))?;
+        if installed.is_some() {
+            return Err(VibexError::conflict(
+                "runtime_selection_service_already_installed",
+                "runtime selection service is already installed on the runtime lifecycle",
+            ));
+        }
+        *installed = Some(Arc::downgrade(runtime_selection));
+        Ok(())
     }
 
     pub fn stream_id(&self) -> RuntimeStreamId {
@@ -438,6 +472,21 @@ impl RuntimeLifecycleService {
             ));
         }
         let scope = bounded_scope(scope.into())?;
+        match self.attach_locked(&request, &scope).await {
+            Err(error) if error.code == STALE_AUTH_SOURCE_REVISION_CODE => {
+                self.refresh_stale_runtime_selection(&request.session_id)
+                    .await?;
+                self.attach_locked(&request, &scope).await
+            }
+            result => result,
+        }
+    }
+
+    async fn attach_locked(
+        &self,
+        request: &AttachRuntimeRequest,
+        scope: &str,
+    ) -> VibexResult<AttachRuntimeResponse> {
         let _mutation_guard = self.inner.mutation_gate.read().await;
         let session_lock = self.session_lock(&request.session_id)?;
         let _guard = session_lock.lock().await;
@@ -470,7 +519,7 @@ impl RuntimeLifecycleService {
             self.inner.backend.touch(&target, now)?;
             let (lease_id, changed) = self.upsert_client_lease(
                 &request.session_id,
-                &scope,
+                scope,
                 &request.client_id,
                 request.role,
                 target,
@@ -525,15 +574,39 @@ impl RuntimeLifecycleService {
                 "internal materialization requires a backend worker role",
             ));
         }
+        let holder = holder.into();
+        match self
+            .materialize_internal_locked(&session_id, role, &holder)
+            .await
+        {
+            Err(error) if error.code == STALE_AUTH_SOURCE_REVISION_CODE => {
+                // A durable binding whose authentication source revision moved
+                // may only be replaced by a durable switch. That path takes the
+                // lifecycle locks itself, so release them before re-selecting
+                // and then materialize the replacement exactly once.
+                self.refresh_stale_runtime_selection(&session_id).await?;
+                self.materialize_internal_locked(&session_id, role, &holder)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn materialize_internal_locked(
+        self: &Arc<Self>,
+        session_id: &VibexSessionId,
+        role: RuntimeLeaseRole,
+        holder: &str,
+    ) -> VibexResult<RuntimeLeaseGuard> {
         let _mutation_guard = self.inner.mutation_gate.read().await;
-        let session_lock = self.session_lock(&session_id)?;
+        let session_lock = self.session_lock(session_id)?;
         let _guard = session_lock.lock().await;
         self.ensure_running()?;
-        let mut backend = self.inner.backend.snapshot(&session_id)?;
+        let mut backend = self.inner.backend.snapshot(session_id)?;
         if backend.attachment.is_none()
             || backend.materialization_status != RuntimeMaterializationStatus::Available
         {
-            backend = self.inner.backend.materialize_owner(&session_id).await?;
+            backend = self.inner.backend.materialize_owner(session_id).await?;
         }
         let attachment = backend.attachment.as_ref().ok_or_else(|| {
             VibexError::conflict(
@@ -542,7 +615,33 @@ impl RuntimeLifecycleService {
             )
         })?;
         let target = attachment_target(attachment);
-        self.acquire_internal_locked(session_id, target, role, holder)
+        self.acquire_internal_locked(session_id.clone(), target, role, holder)
+    }
+
+    /// Hands a session whose durable binding is stale to the runtime selection
+    /// service, which drives the durable switch that replaces the binding. The
+    /// lifecycle locks must not be held: the switch machinery takes them itself.
+    async fn refresh_stale_runtime_selection(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<()> {
+        let runtime_selection = self
+            .inner
+            .runtime_selection
+            .lock()
+            .map_err(|_| lifecycle_lock_error("runtimeSelection"))?
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                VibexError::process(
+                    "runtime_selection_service_unavailable",
+                    "runtime selection service is unavailable to refresh the session runtime",
+                )
+            })?;
+        runtime_selection
+            .refresh_stale_auth_source_revision(session_id)
+            .await?;
+        Ok(())
     }
 
     pub async fn detach(

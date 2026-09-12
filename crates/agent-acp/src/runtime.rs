@@ -7627,6 +7627,65 @@ impl AcpRuntimeSwitchBridge {
         Ok(())
     }
 
+    /// Resolves the revision the given authentication source currently mints
+    /// for new bindings.
+    fn current_auth_source_revision(&self, auth_source: &RuntimeAuthSource) -> VibexResult<i64> {
+        match auth_source {
+            RuntimeAuthSource::ProviderProfile {
+                provider_profile_id,
+            } => Ok(self
+                .client
+                .config_service
+                .get_profile(provider_profile_id)?
+                .ok_or_else(|| {
+                    VibexError::validation(
+                        "provider_profile_not_found",
+                        "Provider Profile was not found while rebuilding the ACP runtime",
+                    )
+                    .with_diagnostic("providerProfileId", provider_profile_id.as_str())
+                })?
+                .updated_at_ms),
+            RuntimeAuthSource::AgentAccount { auth_context_id } => {
+                let conn = open_database(&self.db_path)?;
+                Ok(AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
+                    .ok_or_else(|| {
+                        VibexError::validation(
+                            "agent_auth_context_not_found",
+                            "Agent authentication context was not found while rebuilding the ACP runtime",
+                        )
+                        .with_diagnostic("authContextId", auth_context_id.as_str())
+                    })?
+                    .revision)
+            }
+        }
+    }
+
+    /// Fails when a durable binding predates the current authentication source
+    /// revision, so a caller can replace the binding through a durable switch
+    /// instead of rebuilding it in place.
+    fn ensure_auth_source_revision_is_current(&self, binding: &RuntimeBinding) -> VibexResult<()> {
+        // A zero revision is the documented legacy marker for a Provider
+        // Profile binding captured before auth-source revisions existed. The
+        // launch path resolves it from the profile, so it is not stale.
+        if binding.auth_source_revision == 0 && binding.auth_source.provider_profile_id().is_some()
+        {
+            return Ok(());
+        }
+        let current = self.current_auth_source_revision(&binding.auth_source)?;
+        if current == binding.auth_source_revision {
+            return Ok(());
+        }
+        Err(VibexError::conflict(
+            "runtime_auth_source_revision_stale",
+            "durable runtime binding predates the current authentication source revision",
+        )
+        .with_diagnostic(
+            "bindingAuthSourceRevision",
+            binding.auth_source_revision.to_string(),
+        )
+        .with_diagnostic("currentAuthSourceRevision", current.to_string()))
+    }
+
     /// Rebuilds the durable current binding on demand. This is shared by
     /// public Owner attach and background work so neither path invents a
     /// provider-specific restore sequence.
@@ -7689,6 +7748,15 @@ impl AcpRuntimeSwitchBridge {
             }
             self.client.detach_attachment(existing.fence()).await;
         }
+
+        // The durable binding records the authentication source revision it was
+        // committed with, and every Provider Profile write (or Agent account
+        // re-authentication) restamps it. Rebuilding in place would resolve the
+        // launch context at the new revision while the binding still carries the
+        // old one, which the restore identity check rejects. Only the durable
+        // switch machinery may replace the binding, so report the staleness and
+        // let the runtime selection service drive that switch.
+        self.ensure_auth_source_revision_is_current(&binding)?;
 
         let expected_generation = runtime_state.activation_generation;
         let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
@@ -26933,6 +27001,151 @@ for line in sys.stdin:
         assert_eq!(state.runtime_selection_error_code, None);
         drop(conn);
         fixture.client.detach_attachment(rebuilt.fence()).await;
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// Moves a Provider Profile revision past the binding committed for the
+    /// fixture session and detaches the live attachment, which is the state a
+    /// restart or an authority handover leaves behind.
+    async fn move_profile_revision_past_binding(fixture: &RuntimeSwitchFixture) -> i64 {
+        let previous = fixture
+            .client
+            .current_attachment(&fixture.session.id)
+            .unwrap();
+        fixture.client.detach_attachment(previous.fence()).await;
+
+        // Any Provider Profile write restamps `updated_at_ms`, which is the
+        // auth-source revision the launch context is resolved from.
+        {
+            let conn = open_database(&fixture.fixture.db_path).unwrap();
+            conn.execute(
+                "UPDATE provider_profiles SET updated_at_ms = updated_at_ms + 1000
+                 WHERE provider_profile_id = ?1",
+                [fixture.source_binding.auth_source.id()],
+            )
+            .unwrap();
+        }
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let profile = vibex_db::ProviderProfileRepository::get(
+            &conn,
+            fixture
+                .source_binding
+                .auth_source
+                .provider_profile_id()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            profile.updated_at_ms, fixture.source_binding.auth_source_revision,
+            "the profile revision must have moved past the committed binding"
+        );
+        profile.updated_at_ms
+    }
+
+    /// Regression test for `restore_auth_source_revision_mismatch`: rebuilding a
+    /// durable binding whose authentication source revision moved must report
+    /// the staleness instead of failing deep inside the restore identity check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_materialization_reports_a_binding_whose_profile_revision_moved() {
+        let Some(fixture) = runtime_switch_fixture("lifecycle-materialize-stale-revision").await
+        else {
+            return;
+        };
+        move_profile_revision_past_binding(&fixture).await;
+
+        let error = fixture
+            .bridge
+            .materialize_current_runtime(&fixture.session.id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "runtime_auth_source_revision_stale");
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "bindingAuthSourceRevision"
+                && diagnostic.value == fixture.source_binding.auth_source_revision.to_string()
+        }));
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// The stale binding is replaced through the durable switch machinery, and
+    /// the session becomes materializable again at the current revision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_materialization_replaces_a_stale_binding_through_a_switch() {
+        let Some(fixture) = runtime_switch_fixture("lifecycle-materialize-stale-refresh").await
+        else {
+            return;
+        };
+        let lifecycle = Arc::new(
+            RuntimeLifecycleService::new(
+                Arc::new(AcpRuntimeLifecycleBackend::new(fixture.bridge.clone())),
+                vibex_agent::RuntimeLifecycleConfig::default(),
+            )
+            .unwrap(),
+        );
+        fixture
+            .bridge
+            .install_runtime_lifecycle(&lifecycle)
+            .unwrap();
+        lifecycle
+            .install_runtime_selection_service(&fixture.runtime_selection)
+            .unwrap();
+        let current_revision = move_profile_revision_past_binding(&fixture).await;
+
+        let lease = lifecycle
+            .materialize_internal(
+                fixture.session.id.clone(),
+                RuntimeLeaseRole::BackgroundWorker,
+                "stale-auth-source-test",
+            )
+            .await
+            .unwrap();
+
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(&conn, &fixture.session.id)
+            .unwrap()
+            .unwrap();
+        let current_binding_id = state
+            .current_binding_id
+            .clone()
+            .expect("refresh switch must leave a current binding");
+        assert_ne!(
+            current_binding_id, fixture.source_binding.binding_id,
+            "the stale binding must be replaced, not rebuilt"
+        );
+        let binding = RuntimeBindingRepository::get(&conn, &current_binding_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.auth_source_revision, current_revision);
+        assert_eq!(binding.binding_state, BindingState::Current);
+        assert_eq!(
+            state.runtime_selection_status,
+            Some(vibex_core::SessionRuntimeSelectionStatus::Ready)
+        );
+        assert_eq!(state.runtime_selection_error_code, None);
+        assert_eq!(state.pending_switch_id, None);
+        drop(conn);
+        assert_eq!(
+            fixture
+                .client
+                .current_attachment(&fixture.session.id)
+                .unwrap()
+                .binding_id(),
+            &current_binding_id
+        );
+
+        drop(lease);
+        drop(lifecycle);
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
         drop(fixture.manager);
         drop(fixture.bridge);
         drop(fixture.client);

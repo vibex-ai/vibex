@@ -18,9 +18,9 @@ use vibex_core::{
 };
 use vibex_db::{
     AgentSessionRuntimeRepository, DesiredRuntimeSwitchEnqueueRequest,
-    DesiredRuntimeSwitchEnqueueResult, MessageSubmissionRepository, RuntimeSwitchEventRepository,
-    RuntimeSwitchRecord, RuntimeSwitchRepository, SessionRepository, apply_migrations,
-    open_database,
+    DesiredRuntimeSwitchEnqueueResult, MessageSubmissionRepository, RuntimeBindingRepository,
+    RuntimeSwitchEventRepository, RuntimeSwitchRecord, RuntimeSwitchRepository, SessionRepository,
+    apply_migrations, open_database,
 };
 
 use crate::adapter::ProviderEvent;
@@ -385,6 +385,78 @@ impl RuntimeSelectionService {
             .resolve(session_id, desired, None)
             .await?
             .selection)
+    }
+
+    /// Replaces a durable current binding whose authentication source revision
+    /// moved underneath it.
+    ///
+    /// A Provider Profile write (or an Agent account re-authentication) restamps
+    /// the revision a binding was committed with. The launch context then
+    /// resolves a different revision, so the binding may no longer be rebuilt in
+    /// place and only the durable switch machinery may replace it. Returns
+    /// `true` when a switch was driven, `false` when the binding still matches
+    /// the resolved revision.
+    pub(crate) async fn refresh_stale_auth_source_revision(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<bool> {
+        let state = self.required_runtime_state(session_id)?;
+        let (Some(selection), Some(binding_id)) = (
+            state.effective_runtime_selection.clone(),
+            state.current_binding_id.clone(),
+        ) else {
+            return Ok(false);
+        };
+        let binding = {
+            let conn = open_database(self.inner.coordinator.database_path())?;
+            RuntimeBindingRepository::get(&conn, &binding_id)?
+        };
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        let resolved = self
+            .inner
+            .resolver
+            .resolve(session_id, &selection, None)
+            .await?;
+        if resolved.auth_source_revision == binding.auth_source_revision {
+            return Ok(false);
+        }
+        let outcome = self
+            .inner
+            .coordinator
+            .request_switch(RuntimeSwitchRequest {
+                session_id: session_id.clone(),
+                // Deterministic per (binding, revision) so a retry after an
+                // interrupted attempt replays the same durable switch instead
+                // of reserving another one.
+                idempotency_key: format!(
+                    "runtime-refresh:{}:{}",
+                    binding_id.as_str(),
+                    resolved.auth_source_revision
+                ),
+                expected_revision: state.revision,
+                expected_current_binding_id: Some(binding_id),
+                desired_selection_revision: state.selection_revision,
+                target_adapter_id: resolved.adapter_id,
+                target_auth_source_revision: resolved.auth_source_revision,
+                target_selection: resolved.selection,
+                requested_policy: RuntimeSwitchPolicy::Automatic,
+                active_work_policy: self.seamless_active_work_policy(),
+                requested_session_config: resolved.session_config,
+            })
+            .await?;
+        if outcome.status != RuntimeSwitchStatus::Committed {
+            return Err(VibexError::process(
+                "runtime_auth_source_refresh_failed",
+                "runtime could not be refreshed after its authentication source changed",
+            )
+            .with_diagnostic("switchId", outcome.switch_id.as_str())
+            .with_diagnostic("status", format!("{:?}", outcome.status))
+            .with_diagnostic("causeCode", outcome.error_code.unwrap_or_default()));
+        }
+        self.emit_authoritative(session_id)?;
+        Ok(true)
     }
 
     pub async fn switch_runtime(
