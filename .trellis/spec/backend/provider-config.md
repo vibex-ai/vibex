@@ -337,6 +337,7 @@ environment key and the final ACP authentication decision.
 - Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
 - Name that environment reference `DEEPSEEK_API_KEY`. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`.
 - Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens and 32,768 output tokens when those limits are undeclared.
+- A Vibex route id is never a pi-ai catalog provider, so the projected `contextWindow` / `maxTokens` are the only limits the Harness knows for that Model: they are what it carries as the run's model metadata and reports back as the session's context window. The same model on an Agent account resolves the Harness's own catalog entry instead (a 1,000,000-token DeepSeek model reports 1.0m there and 262.1k on a Vibex route that declares nothing). Declaring the real limits is what makes a BYOK route report the same window as the account route. See "Declared Model Context And Output Limits".
 - Write the model `input` modality only when the Model declares it: `image_input: true` -> `[text, image]`, `image_input: false` -> `[text]`. An undeclared modality omits `input` entirely, because the Harness resolves an absent entry from its own pi-ai catalog first. Projecting an explicit `[text]` for an undeclared Model makes the Harness replace every prompt image with `[image omitted because this model accepts text only; ...]` before the request leaves the process, so the Agent never receives the image and no error surfaces.
 - Declare the route-level `defaultInput: [text, image]`. A Vibex-generated route id never matches a pi-ai catalog provider, so this route default is the only modality answer available to a Model the catalog does not describe. A declared `image_input: false` still wins for its own Model, and an image sent to a genuinely text-only endpoint fails loudly at the provider instead of being silently dropped.
 - Project the Model's `reasoningEfforts` for every Model that does not declare `reasoning: false`. The Harness advertises its `effort` select only when the Model's reasoning metadata carries at least two levels, and it resolves that metadata from the installed pi-ai entry of the same id under the same route. A Vibex route id is never a pi-ai provider, so an omitted `reasoningEfforts` means "does not reason": the run options lose the thinking-depth selector while the same Agent on an Agent account keeps it. Project the levels the Harness's own DeepSeek route exposes — `off: null`, `high: high`, `max: max` — so selecting a depth reaches the request: `session/set_config_option { configId: "effort" }` feeds pi-ai's `thinkingLevelMap`, which is the spelling that goes on the wire.
@@ -356,6 +357,27 @@ environment key and the final ACP authentication decision.
 - Provider editor tests assert a declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh for a Model the catalogue still advertises.
 - Projection tests assert the developer-role pin is present with value `false` exactly on the Chat Completions and Responses routes and absent — with no `compat` key at all — on the Anthropic Messages route, and that a reasoning route Model keeps its projected `reasoningEfforts` alongside the pin.
 - The typed projector matrix asserts the private `settings.yaml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
+
+## Scenario: Declared Model Context And Output Limits
+
+### 1. Scope / Trigger
+
+- Trigger: the Provider Model editor declares a Model's context window or maximum output tokens, and a projection carries that limit into an Agent's own configuration.
+- Only the projections whose Agent config owns a limit read the declaration: DeepSeek Harness, OpenCode, and ZCode. Every other Agent resolves its window from its own catalogue or API, so the declaration must not be invented for it.
+
+### 2. Contracts
+
+- `ProviderModelCapabilities.context_tokens` and `output_tokens` are authored data, entered per Model in the Provider Model editor. Never infer either from a Model id, endpoint, or vendor, and never expect a catalogue refresh to carry one: an Agent-owned catalogue answers ids and wire protocols only.
+- An empty field means "not declared", and the projection omits the key or keeps its own default. Zero is rejected by the editor rather than read as unknown, so clearing the field is the only way back to the Agent default.
+- The editor parses both fields before it mutates the Model, so a rejected value leaves the draft exactly as it was instead of half-applying the edit.
+- DeepSeek Harness writes `contextWindow` / `maxTokens` (undeclared -> 262,144 / 32,768), OpenCode writes `limit.context` and `limit.output` only when both are declared, and ZCode writes `limit.context`.
+- The declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh, like every other declared capability.
+
+### 3. Tests Required
+
+- Editor parse unit: an empty pair returns undeclared, whole positive numbers are accepted, and zero, negative, fractional, or oversized values are rejected with the field named.
+- Round-trip unit: declared limits survive profile normalization, catalogue merge, and an authoritative catalogue refresh.
+- Projection units assert each Agent's keys for a declared and an undeclared Model.
 
 ## Scenario: Kimi Code CLI Provider Projection
 

@@ -5,6 +5,7 @@
 //! durable records and side effects stay behind `DesktopRuntime::management`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::num::IntErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -722,6 +723,8 @@ pub struct ManagementCenter {
     profile_model_edit_id: Entity<InputState>,
     profile_model_edit_name: Entity<InputState>,
     profile_model_edit_efforts: Entity<InputState>,
+    profile_model_edit_context_tokens: Entity<InputState>,
+    profile_model_edit_output_tokens: Entity<InputState>,
     profile_api_key: Entity<InputState>,
     acp_command: Entity<InputState>,
     acp_args: Entity<InputState>,
@@ -825,6 +828,20 @@ impl ManagementCenter {
                 "off, low, high, max — or level=wire",
                 "off, low, high, max —— 或 档位=线格式",
                 "off, low, high, max —— 或 檔位=線格式",
+            ))
+        });
+        let profile_model_edit_context_tokens = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "e.g. 1000000",
+                "例如 1000000",
+                "例如 1000000",
+            ))
+        });
+        let profile_model_edit_output_tokens = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "e.g. 128000",
+                "例如 128000",
+                "例如 128000",
             ))
         });
         let profile_api_key = cx.new(|cx| {
@@ -1023,6 +1040,28 @@ impl ManagementCenter {
                         .is_empty()
                     {
                         this.profile_model_edit_reasoning_disabled = false;
+                    }
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(
+                &profile_model_edit_context_tokens,
+                |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
+                    }
+                    this.projection_editor.mark_draft_changed();
+                    this.navigation.mark_dirty(ManagementSection::Agents, true);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(
+                &profile_model_edit_output_tokens,
+                |this, _, event: &InputEvent, cx| {
+                    if !management_input_changed(event) {
+                        return;
                     }
                     this.projection_editor.mark_draft_changed();
                     this.navigation.mark_dirty(ManagementSection::Agents, true);
@@ -1269,6 +1308,8 @@ impl ManagementCenter {
             profile_model_edit_id,
             profile_model_edit_name,
             profile_model_edit_efforts,
+            profile_model_edit_context_tokens,
+            profile_model_edit_output_tokens,
             profile_api_key,
             acp_command,
             acp_args,
@@ -1384,6 +1425,14 @@ impl ManagementCenter {
                     "off, low, high, max —— 或 档位=线格式",
                     "off, low, high, max —— 或 檔位=線格式",
                 ),
+            ),
+            (
+                &self.profile_model_edit_context_tokens,
+                ("e.g. 1000000", "例如 1000000", "例如 1000000"),
+            ),
+            (
+                &self.profile_model_edit_output_tokens,
+                ("e.g. 128000", "例如 128000", "例如 128000"),
             ),
             (&self.acp_command, ("ACP command", "ACP 命令", "ACP 命令")),
             (
@@ -3848,6 +3897,10 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_efforts
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_context_tokens
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_output_tokens
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -3917,6 +3970,10 @@ impl ManagementCenter {
         self.profile_model_edit_name
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_context_tokens
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_edit_output_tokens
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_api_key.update(cx, |state, cx| {
             state.set_masked(true, window, cx);
@@ -4194,6 +4251,21 @@ impl ManagementCenter {
             .unwrap_or_default();
         self.profile_model_edit_efforts
             .update(cx, |state, cx| state.set_value(efforts, window, cx));
+        // A declared limit is shown as the number the user will write back; an
+        // undeclared one stays an empty field, which is what "not declared"
+        // looks like everywhere else in this editor.
+        let context_tokens = model
+            .capabilities
+            .context_tokens
+            .map_or_else(String::new, |tokens| tokens.to_string());
+        let output_tokens = model
+            .capabilities
+            .output_tokens
+            .map_or_else(String::new, |tokens| tokens.to_string());
+        self.profile_model_edit_context_tokens
+            .update(cx, |state, cx| state.set_value(context_tokens, window, cx));
+        self.profile_model_edit_output_tokens
+            .update(cx, |state, cx| state.set_value(output_tokens, window, cx));
         self.profile_model_edit_index = Some(index);
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
@@ -4255,6 +4327,30 @@ impl ManagementCenter {
                 return;
             }
         };
+        // The declared limits are parsed here for the same reason: a rejected
+        // number must leave the Model untouched instead of half-applying an
+        // edit the user still has to correct.
+        let context_tokens_text = self
+            .profile_model_edit_context_tokens
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let output_tokens_text = self
+            .profile_model_edit_output_tokens
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let (declared_context_tokens, declared_output_tokens) =
+            match declared_token_limits(&context_tokens_text, &output_tokens_text) {
+                Ok(limits) => limits,
+                Err(error) => {
+                    self.error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            };
         let Some(model) = self.profile_configured_models.get_mut(index) else {
             self.profile_model_edit_index = None;
             self.profile_model_edit_wire_api = None;
@@ -4280,6 +4376,11 @@ impl ManagementCenter {
                 };
             model.capabilities.reasoning_efforts = declared_efforts;
         }
+        // Both limits are always written from the field: an emptied field is
+        // the "not declared" answer, so it clears a previous declaration
+        // instead of preserving it.
+        model.capabilities.context_tokens = declared_context_tokens;
+        model.capabilities.output_tokens = declared_output_tokens;
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
@@ -8783,6 +8884,17 @@ impl ManagementCenter {
                 (_, Some(efforts)) if !efforts.is_empty() => Some(efforts.to_string()),
                 _ => None,
             };
+            // A declared limit is per Model, so the row states the exact number
+            // the user declared; the token ring reports whatever the Agent
+            // later reports from it.
+            let context_limit =
+                model
+                    .capabilities
+                    .context_tokens
+                    .map(|tokens| match locale::current_locale() {
+                        ResolvedLocale::En => format!("{tokens} context"),
+                        ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {tokens}"),
+                    });
             model_rows = model_rows.child(
                 h_flex()
                     .w_full()
@@ -8828,12 +8940,14 @@ impl ManagementCenter {
                                             )
                                             .to_string(),
                                         };
-                                        match &depth {
-                                            Some(depth) => {
-                                                format!("{} · {protocol} · {depth}", model.id)
-                                            }
-                                            None => format!("{} · {protocol}", model.id),
+                                        let mut parts = vec![model.id.clone(), protocol];
+                                        if let Some(context_limit) = &context_limit {
+                                            parts.push(context_limit.clone());
                                         }
+                                        if let Some(depth) = &depth {
+                                            parts.push(depth.clone());
+                                        }
+                                        parts.join(" · ")
                                     }),
                             ),
                     )
@@ -9154,6 +9268,55 @@ impl ManagementCenter {
                                             "Only the declared levels are offered to the run options. Leave it empty to keep the Agent default; write level=wire when the endpoint spells a level differently.",
                                             "运行选项只显示这里声明的档位。留空沿用 Agent 默认；端点拼写不同时写 档位=线格式。",
                                             "執行選項只顯示這裡宣告的檔位。留空沿用 Agent 預設；端點拼寫不同時寫 檔位=線格式。",
+                                        )),
+                                )
+                        })
+                        .child({
+                            // Only three projections can carry a declared limit,
+                            // so the copy names them instead of implying every
+                            // Agent reads it.
+                            v_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(management_locale_text(
+                                            "Context and output limits",
+                                            "上下文与输出上限",
+                                            "上下文與輸出上限",
+                                        )),
+                                )
+                                .child(management_input_field(
+                                    management_locale_text(
+                                        "Context window (tokens)",
+                                        "上下文窗口（Token）",
+                                        "上下文視窗（Token）",
+                                    ),
+                                    &self.profile_model_edit_context_tokens,
+                                    false,
+                                    cx,
+                                ))
+                                .child(management_input_field(
+                                    management_locale_text(
+                                        "Max output tokens",
+                                        "最大输出 Token",
+                                        "最大輸出 Token",
+                                    ),
+                                    &self.profile_model_edit_output_tokens,
+                                    false,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(management_locale_text(
+                                            "Written to the Agents that read a projected limit — DeepSeek Harness, OpenCode, and ZCode. Empty keeps the Agent default; DeepSeek Harness then assumes 262,144.",
+                                            "写入会读取投影上限的 Agent —— DeepSeek Harness、OpenCode 与 ZCode。留空沿用 Agent 默认；DeepSeek Harness 默认按 262,144 处理。",
+                                            "寫入會讀取投影上限的 Agent —— DeepSeek Harness、OpenCode 與 ZCode。留空沿用 Agent 預設；DeepSeek Harness 預設按 262,144 處理。",
                                         )),
                                 )
                         })
@@ -16104,6 +16267,42 @@ fn updated_skill_agent_matrix(
     matrix
 }
 
+/// Parses one declared token limit from the Model editor.
+///
+/// An empty field is the "not declared" answer, never a zero: an undeclared
+/// limit leaves the Agent's own default in place, while a zero window is not a
+/// value any Agent could use. A rejected field is named by the caller, so the
+/// error points at the input the user has to correct.
+fn parse_declared_token_limit(value: &str) -> Result<Option<u32>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.parse::<u32>() {
+        Ok(tokens) if tokens > 0 => Ok(Some(tokens)),
+        Ok(_) => Err("must be greater than zero"),
+        Err(error) if matches!(error.kind(), IntErrorKind::PosOverflow) => {
+            Err("is larger than a token limit can be")
+        }
+        Err(_) => Err("must be a whole number of tokens"),
+    }
+}
+
+/// Parses the editor's two declared limits together.
+///
+/// Both fields are read before either is returned, so a rejected value leaves
+/// the Model exactly as it was instead of half-applying an edit.
+fn declared_token_limits(
+    context_window: &str,
+    max_output_tokens: &str,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    let context = parse_declared_token_limit(context_window)
+        .map_err(|reason| format!("agent_model_context_tokens_invalid: {reason}"))?;
+    let output = parse_declared_token_limit(max_output_tokens)
+        .map_err(|reason| format!("agent_model_output_tokens_invalid: {reason}"))?;
+    Ok((context, output))
+}
+
 fn normalized_provider_models(
     models: &[vibex_core::ProviderConfiguredModel],
 ) -> Vec<vibex_core::ProviderConfiguredModel> {
@@ -18235,6 +18434,8 @@ mod tests {
         let capabilities = vibex_core::ProviderModelCapabilities {
             reasoning: Some(true),
             reasoning_efforts: Some(declared),
+            context_tokens: Some(1_000_000),
+            output_tokens: Some(128_000),
             ..Default::default()
         };
         let declared_model = vibex_core::ProviderConfiguredModel {
@@ -18292,6 +18493,53 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].capabilities, capabilities);
         assert_eq!(models[1].capabilities, Default::default());
+    }
+
+    #[test]
+    fn declared_token_limits_accept_only_positive_whole_numbers() {
+        // An empty field is "not declared", which is what every projection
+        // needs to keep the Agent's own default.
+        assert_eq!(declared_token_limits("", ""), Ok((None, None)));
+        assert_eq!(
+            declared_token_limits(" 1000000 ", "128000"),
+            Ok((Some(1_000_000), Some(128_000)))
+        );
+        // One declared side does not require the other; OpenCode ignores a
+        // half-declared pair while ZCode and the Harness still write theirs.
+        assert_eq!(
+            declared_token_limits("262144", ""),
+            Ok((Some(262_144), None))
+        );
+
+        // A zero window is not a window, and a rejected field is named so the
+        // error points at the input the user has to correct.
+        let zero = declared_token_limits("0", "128000").unwrap_err();
+        assert!(
+            zero.starts_with("agent_model_context_tokens_invalid:"),
+            "{zero}"
+        );
+        assert_eq!(
+            declared_token_limits("1000000", "0").unwrap_err(),
+            "agent_model_output_tokens_invalid: must be greater than zero"
+        );
+        assert_eq!(
+            declared_token_limits("abc", "").unwrap_err(),
+            "agent_model_context_tokens_invalid: must be a whole number of tokens"
+        );
+        assert_eq!(
+            declared_token_limits("1.5", "").unwrap_err(),
+            "agent_model_context_tokens_invalid: must be a whole number of tokens"
+        );
+        assert_eq!(
+            declared_token_limits("", "-1").unwrap_err(),
+            "agent_model_output_tokens_invalid: must be a whole number of tokens"
+        );
+        // Beyond u32 is not a declaration either; it is a typo, and it says so
+        // instead of claiming a whole number was not whole.
+        assert_eq!(
+            declared_token_limits("4294967296", "").unwrap_err(),
+            "agent_model_context_tokens_invalid: is larger than a token limit can be"
+        );
     }
 
     #[test]
