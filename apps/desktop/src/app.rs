@@ -198,6 +198,18 @@ struct DesktopRemoteClient {
     backend: Arc<WebRemoteBackend>,
 }
 
+/// How the operator handed over the pairing entry: a typed address plus code,
+/// or the connection link `vibex-server` printed.
+enum RemotePairingEntry {
+    Code {
+        server_url: String,
+        pairing_code: String,
+    },
+    Link {
+        pairing_link: String,
+    },
+}
+
 impl DesktopRemoteClient {
     /// Builds the backend from the credential, verifies the handshake, and
     /// only then persists the credential: a failed connect leaves no stored
@@ -6603,6 +6615,24 @@ impl VibexWorkbench {
         pairing_code: String,
         cx: &mut Context<Self>,
     ) {
+        self.begin_remote_pairing(
+            RemotePairingEntry::Code {
+                server_url,
+                pairing_code,
+            },
+            cx,
+        );
+    }
+
+    /// Pairs from the connection link a `vibex-server` operator printed. The
+    /// link also carries the certificate of a runtime that serves its own, so
+    /// this is the only entry point that works without a publicly trusted
+    /// certificate or a system CA.
+    fn claim_remote_pairing_link(&mut self, pairing_link: String, cx: &mut Context<Self>) {
+        self.begin_remote_pairing(RemotePairingEntry::Link { pairing_link }, cx);
+    }
+
+    fn begin_remote_pairing(&mut self, entry: RemotePairingEntry, cx: &mut Context<Self>) {
         if self.remote_client.is_some() || matches!(self.runtime_status, RuntimeStatus::Starting) {
             return;
         }
@@ -6611,7 +6641,13 @@ impl VibexWorkbench {
         };
         self.detach_local_runtime(cx);
         self.runtime_status = RuntimeStatus::Starting;
-        self.runtime_note = Some("Claiming pairing code…".to_string());
+        self.runtime_note = Some(
+            match entry {
+                RemotePairingEntry::Code { .. } => "Claiming pairing code…",
+                RemotePairingEntry::Link { .. } => "Pairing from connection string…",
+            }
+            .to_string(),
+        );
         // The Pair button listener runs inside FoundationSettings::update. Defer
         // the busy-flag update of that same entity until the GPUI update cycle
         // finishes to avoid a re-entrant borrow panic.
@@ -6624,12 +6660,26 @@ impl VibexWorkbench {
         });
         let allow_insecure_local_dev = cfg!(debug_assertions);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let credential = crate::remote_client::claim_server_pairing_code(
-                server_url,
-                pairing_code,
-                allow_insecure_local_dev,
-            )
-            .await?;
+            let credential = match entry {
+                RemotePairingEntry::Code {
+                    server_url,
+                    pairing_code,
+                } => {
+                    crate::remote_client::claim_server_pairing_code(
+                        server_url,
+                        pairing_code,
+                        allow_insecure_local_dev,
+                    )
+                    .await?
+                }
+                RemotePairingEntry::Link { pairing_link } => {
+                    crate::remote_client::claim_server_pairing_link(
+                        pairing_link,
+                        allow_insecure_local_dev,
+                    )
+                    .await?
+                }
+            };
             DesktopRemoteClient::start(credential, home_dir).await
         });
         self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
@@ -46826,6 +46876,7 @@ struct FoundationSettings {
     proxy_input: Entity<InputState>,
     remote_server_url_input: Entity<InputState>,
     remote_pairing_code_input: Entity<InputState>,
+    remote_pairing_link_input: Entity<InputState>,
     remote_connect_busy: bool,
     search: Entity<InputState>,
     search_selected_index: usize,
@@ -46917,6 +46968,13 @@ impl FoundationSettings {
                 "Pairing code (NNN-NNN-NNN)",
                 "配对码（NNN-NNN-NNN）",
                 "配對碼（NNN-NNN-NNN）",
+            ))
+        });
+        let remote_pairing_link_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "vibex://pair#/code/…",
+                "vibex://pair#/code/…",
+                "vibex://pair#/code/…",
             ))
         });
         let search = cx.new(|cx| {
@@ -47045,6 +47103,7 @@ impl FoundationSettings {
                 proxy_input,
                 remote_server_url_input,
                 remote_pairing_code_input,
+                remote_pairing_link_input,
                 remote_connect_busy: false,
                 search,
                 search_selected_index: 0,
@@ -49690,19 +49749,24 @@ impl FoundationSettings {
     }
 
     fn render_remote_runtime_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (mode, server_url) = self
+        let (mode, server_url, certificate_fingerprint) = self
             .workbench
             .read_with(cx, |this, _| match &this.remote_client {
                 Some(client) => (
                     RemoteClientSettingsMode::Connected,
                     client.credential.record.server_url.clone(),
+                    client
+                        .credential
+                        .pinned_tls_certificate_der
+                        .as_deref()
+                        .and_then(pinned_certificate_fingerprint),
                 ),
                 None if matches!(this.runtime_status, RuntimeStatus::Starting) => {
-                    (RemoteClientSettingsMode::Connecting, String::new())
+                    (RemoteClientSettingsMode::Connecting, String::new(), None)
                 }
-                None => (RemoteClientSettingsMode::Local, String::new()),
+                None => (RemoteClientSettingsMode::Local, String::new(), None),
             })
-            .unwrap_or((RemoteClientSettingsMode::Local, String::new()));
+            .unwrap_or((RemoteClientSettingsMode::Local, String::new(), None));
         let inputs_disabled = mode != RemoteClientSettingsMode::Local;
         let mode_label = match mode {
             RemoteClientSettingsMode::Local => locale::text(
@@ -49787,6 +49851,46 @@ impl FoundationSettings {
                     .workbench
                     .update(cx, |workbench, cx| workbench.disconnect_remote_client(cx));
             }));
+        let pairing_link_input = self.remote_pairing_link_input.clone();
+        let link_control = h_flex()
+            .items_center()
+            .gap_1()
+            .when(self.remote_connect_busy, |row| {
+                row.child(Spinner::new().xsmall())
+            })
+            .child(
+                div().w(px(420.0)).child(
+                    Input::new(&self.remote_pairing_link_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
+            )
+            .child(
+                Button::new("claim-server-pairing-link")
+                    .small()
+                    .outline()
+                    .label(locale::text("Pair", "配对", "配對"))
+                    .disabled(connect_disabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let pairing_link = pairing_link_input.read(cx).value().trim().to_string();
+                        if pairing_link.is_empty() {
+                            this.operation_note = Some(
+                                locale::text(
+                                    "Paste the connection string printed by vibex-server.",
+                                    "请粘贴 vibex-server 打印的连接串。",
+                                    "請貼上 vibex-server 列印的連接串。",
+                                )
+                                .to_string(),
+                            );
+                            cx.notify();
+                            return;
+                        }
+                        let _ = this.workbench.update(cx, |workbench, cx| {
+                            workbench.claim_remote_pairing_link(pairing_link, cx)
+                        });
+                    })),
+            );
         settings_page(
             locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
             locale::text(
@@ -49825,6 +49929,30 @@ impl FoundationSettings {
                         "輸入伺服器位址及其啟動時列印的一次性配對碼。",
                     ),
                     connect_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Pair with connection string", "连接串配对", "連接串配對"),
+                    locale::text(
+                        "Paste the whole vibex:// link vibex-server printed. It also carries the certificate of a server that uses its own, so no system CA is needed.",
+                        "粘贴 vibex-server 打印的完整 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需系统 CA。",
+                        "貼上 vibex-server 列印的完整 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需系統 CA。",
+                    ),
+                    link_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Server certificate", "服务器证书", "伺服器憑證"),
+                    locale::text(
+                        "The certificate pinned for this server. Compare it with the fingerprint vibex-server printed.",
+                        "为此服务器固定的证书指纹。请与 vibex-server 打印的指纹核对。",
+                        "為此伺服器固定的憑證指紋。請與 vibex-server 列印的指紋核對。",
+                    ),
+                    settings_value_chip(certificate_fingerprint.clone().unwrap_or_else(|| {
+                        locale::text("System roots", "系统根证书", "系統根憑證").to_string()
+                    })),
                     stacked,
                     cx,
                 ),
@@ -51159,6 +51287,17 @@ fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
         .max_w_full()
         .font_medium()
         .child(text.into())
+}
+
+/// `sha256:…` fingerprint of a base64url DER certificate, so the operator can
+/// compare it with the value `vibex-server` printed. `None` when the stored
+/// value is not decodable.
+fn pinned_certificate_fingerprint(encoded: &str) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    Some(vibex_core::certificate_fingerprint(&bytes))
 }
 
 fn decode_html_data_image(html: &str) -> Option<(gpui::ImageFormat, Vec<u8>)> {

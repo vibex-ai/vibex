@@ -36,6 +36,11 @@ pub struct DesktopRemoteCredential {
     pub allow_insecure_local_dev: bool,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Base64url DER of the certificate to trust for this server, set when the
+    /// runtime serves its own self-signed certificate. The value came from the
+    /// operator's pairing link, never from the server itself.
+    #[serde(default)]
+    pub pinned_tls_certificate_der: Option<String>,
 }
 
 impl std::fmt::Debug for DesktopRemoteCredential {
@@ -56,6 +61,10 @@ impl std::fmt::Debug for DesktopRemoteCredential {
                 "has_expected_server_id",
                 &!self.expected_server_id.is_empty(),
             )
+            .field(
+                "has_pinned_tls_certificate",
+                &self.pinned_tls_certificate_der.is_some(),
+            )
             .finish()
     }
 }
@@ -64,6 +73,7 @@ impl DesktopRemoteCredential {
     fn from_parts(
         bundle: vibex_remote_client::PairingCodeClientBundle,
         allow_insecure_local_dev: bool,
+        pinned_tls_certificate_der: Option<String>,
     ) -> BackendResult<Self> {
         let credential = Self {
             schema_version: DESKTOP_CREDENTIAL_SCHEMA_VERSION.to_string(),
@@ -72,6 +82,7 @@ impl DesktopRemoteCredential {
             expected_server_id: bundle.server_id,
             allow_insecure_local_dev,
             display_name: None,
+            pinned_tls_certificate_der,
         };
         credential.validate()?;
         Ok(credential)
@@ -129,6 +140,7 @@ impl DesktopRemoteCredential {
         config.client_id = DESKTOP_CLIENT_ID.to_string();
         config.client_type = RemoteClientType::DesktopWeb;
         config.allow_insecure_local_dev = self.allow_insecure_local_dev && cfg!(debug_assertions);
+        config.pinned_tls_certificate_der = self.pinned_tls_certificate_der.clone();
         config.validate()?;
         Ok(config)
     }
@@ -141,7 +153,7 @@ impl DesktopRemoteCredential {
                 url: self.record.server_url.clone(),
                 label: "remote-runtime".to_string(),
                 priority: 0,
-                tls_certificate_der: None,
+                tls_certificate_der: self.pinned_tls_certificate_der.clone(),
             }],
             relay: None,
         })?;
@@ -166,7 +178,34 @@ pub async fn claim_server_pairing_code(
         allow_insecure_local_dev,
     )
     .await?;
-    DesktopRemoteCredential::from_parts(bundle, allow_insecure_local_dev)
+    DesktopRemoteCredential::from_parts(bundle, allow_insecure_local_dev, None)
+}
+
+/// Pair from the connection link a `vibex-server` operator printed.
+///
+/// The link carries the address, the one-time code, and — when the runtime
+/// serves its own certificate — that certificate. The certificate is pinned
+/// before the claim request, so the first TLS handshake is already verified
+/// against a value that arrived through the operator's screen rather than
+/// through the network.
+pub async fn claim_server_pairing_link(
+    pairing_link: String,
+    allow_insecure_local_dev: bool,
+) -> BackendResult<DesktopRemoteCredential> {
+    let link = vibex_core::RemotePairingCodeLink::parse(&pairing_link)
+        .map_err(|error| BackendError::failed(error.code.clone(), error.message.clone()))?;
+    let pinned_tls_certificate_der = link.tls_certificate_der.clone();
+    let bundle = vibex_remote_client::claim_pairing_code_link_with_identity(
+        link,
+        "Vibex Desktop".to_string(),
+        allow_insecure_local_dev,
+    )
+    .await?;
+    DesktopRemoteCredential::from_parts(
+        bundle,
+        allow_insecure_local_dev,
+        pinned_tls_certificate_der,
+    )
 }
 
 /// Restrictive-permission credential file under the desktop home. Reads and
@@ -299,6 +338,7 @@ mod tests {
             expected_server_id: "server-test".to_string(),
             allow_insecure_local_dev: false,
             display_name: None,
+            pinned_tls_certificate_der: None,
         };
         (credential, identity)
     }
@@ -375,5 +415,70 @@ mod tests {
             !config.allow_insecure_local_dev,
             "release builds never allow plain HTTP"
         );
+        assert!(
+            config.pinned_tls_certificate_der.is_none(),
+            "a credential paired by address keeps using the system roots"
+        );
+    }
+
+    #[test]
+    fn stored_pin_reaches_both_the_transport_and_the_direct_candidate() {
+        let (mut credential, _) = sample_record();
+        credential.record.server_url = "https://192.168.1.10:8765".to_string();
+        credential.pinned_tls_certificate_der = Some(base64_url(&certificate_envelope()));
+        credential.validate().expect("pinned credential");
+
+        let config = credential.client_config().expect("pinned config");
+        assert!(config.pinned_tls_certificate_der.is_some());
+        assert!(
+            !config.allow_insecure_local_dev,
+            "a pinned LAN route is still HTTPS-only in release builds"
+        );
+    }
+
+    /// The pin is what makes a LAN runtime reachable at all, so it has to come
+    /// back out of the credential file exactly as it went in.
+    #[test]
+    fn a_pinned_certificate_survives_the_credentials_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DesktopRemoteCredentialStore::new(dir.path());
+        let (mut credential, _) = sample_record();
+        credential.record.server_url = "https://192.168.1.10:8765".to_string();
+        credential.pinned_tls_certificate_der = Some(base64_url(&certificate_envelope()));
+
+        store.save(&credential).expect("save");
+        let loaded = store.load().expect("loaded");
+        assert_eq!(loaded, credential);
+        assert!(
+            loaded
+                .client_config()
+                .expect("loaded config")
+                .pinned_tls_certificate_der
+                .is_some(),
+            "a reloaded credential still verifies its server against the pin"
+        );
+    }
+
+    #[test]
+    fn a_pin_without_local_https_is_rejected() {
+        let (mut credential, _) = sample_record();
+        credential.pinned_tls_certificate_der = Some(base64_url(&certificate_envelope()));
+        let error = credential
+            .validate()
+            .expect_err("a pin must never be attached to a public host");
+        assert_eq!(error.code, "remote_pinned_tls_route_invalid");
+    }
+
+    /// A minimal DER envelope: the transport only decodes and pins it, the TLS
+    /// stack is what validates the certificate itself.
+    fn certificate_envelope() -> Vec<u8> {
+        let mut certificate = vec![0x30, 0x82, 0x01, 0x00];
+        certificate.extend(std::iter::repeat_n(0x41_u8, 252));
+        certificate
+    }
+
+    fn base64_url(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 }

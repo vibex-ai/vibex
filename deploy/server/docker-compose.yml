@@ -27,7 +27,14 @@ services:
       #   TLS and forwards), or
       #   VIBEX_TLS_MODE=server_certificate with VIBEX_TLS_CERT_FILE /
       #   VIBEX_TLS_KEY_FILE mounted into the container.
-      VIBEX_BIND_ADDR: 127.0.0.1:8765
+      # A local/LAN deployment (desktop and phone on the same network, no
+      # domain and no CA) uses the pinned profile:
+      #   VIBEX_BIND_ADDR=0.0.0.0:8765 VIBEX_DEPLOYMENT_MODE=lan
+      #   VIBEX_TLS_MODE=pinned_certificate VIBEX_PUBLIC_HOST=<host-lan-ip>:8765
+      # The runtime then serves a self-signed certificate derived from its own
+      # identity and prints a `vibex://` connection string and QR that carry
+      # it. See README.md.
+      VIBEX_BIND_ADDR: ${VIBEX_BIND_ADDR:-127.0.0.1:8765}
       VIBEX_DEPLOYMENT_MODE: ${VIBEX_DEPLOYMENT_MODE:-loopback}
       VIBEX_TLS_MODE: ${VIBEX_TLS_MODE:-loopback_http}
       VIBEX_PUBLIC_HOST: ${VIBEX_PUBLIC_HOST:-}
@@ -51,8 +58,15 @@ services:
       VIBEX_DELEGATION_SIDECAR_COMMAND: ${VIBEX_DELEGATION_SIDECAR_COMMAND:-}
     volumes:
       - vibex-server-data:/data
+    # Health probe. Follows VIBEX_TLS_MODE through VIBEX_HEALTHCHECK_URL:
+    # plain HTTP by default, HTTPS for pinned/self-signed and proxied
+    # deployments. `-k` only ever applies to the container's own loopback.
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/api/v2/info"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsSk '${VIBEX_HEALTHCHECK_URL:-http://127.0.0.1:8765/api/v2/info}'",
+        ]
       interval: 30s
       timeout: 5s
       retries: 5

@@ -45,6 +45,16 @@ impl fmt::Debug for LocalLanTlsIdentity {
     }
 }
 
+/// Base64url DER of the deterministic certificate a `pinned_certificate`
+/// Gateway serves, derived from the runtime identity.
+///
+/// The value is stable for the lifetime of the identity, so an operator-facing
+/// pairing link keeps working across restarts and clients that pinned it once
+/// keep verifying.
+pub fn pinned_tls_certificate_base64(identity: &RemoteIdentity) -> VibexResult<String> {
+    Ok(derive_local_lan_tls_identity(identity)?.certificate_base64)
+}
+
 pub(crate) fn derive_local_lan_tls_identity(
     identity: &RemoteIdentity,
 ) -> VibexResult<LocalLanTlsIdentity> {

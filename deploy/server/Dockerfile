@@ -40,7 +40,9 @@ COPY --from=builder /workspace/target/release/vibex-server /usr/local/bin/vibex-
 # VIBEX_DEPLOYMENT_MODE and a TLS policy explicitly; RemoteGatewayConfig::validate
 # enforces the mode/bind/TLS combination at startup (loopback mode refuses
 # non-loopback binds), so a misconfigured container refuses to boot instead of
-# silently exposing an unauthenticated runtime.
+# silently exposing an unauthenticated runtime. A LAN runtime uses
+# `lan` + `pinned_certificate`: the gateway serves a self-signed certificate
+# that the printed pairing link carries to the client out of band.
 ENV VIBEX_HOME=/data \
     VIBEX_DB_PATH=/data/vibex.db \
     VIBEX_BIND_ADDR=127.0.0.1:8765 \
@@ -59,9 +61,12 @@ VOLUME ["/data"]
 
 # /api/v2/info is unauthenticated but rate-limited and answers with the
 # server identity, so a 200 proves the listener, database, and identity
-# subsystems came up.
+# subsystems came up. The probe follows VIBEX_TLS_MODE through
+# VIBEX_HEALTHCHECK_URL: plain HTTP by default, HTTPS once the runtime
+# terminates its own TLS (pinned_certificate / server_certificate) or sits
+# behind a proxy. `-k` only ever applies to the container's own loopback.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=5 \
-    CMD curl -fsS http://127.0.0.1:8765/api/v2/info >/dev/null || exit 1
+    CMD curl -fsSk "${VIBEX_HEALTHCHECK_URL:-http://127.0.0.1:8765/api/v2/info}" >/dev/null || exit 1
 
 ENTRYPOINT ["vibex-server"]
 CMD ["serve"]

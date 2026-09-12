@@ -938,6 +938,20 @@ impl RemoteGateway {
         Ok(info)
     }
 
+    /// Base64url DER of the certificate this Gateway terminates TLS with when
+    /// its policy is [`RemoteGatewayTlsPolicy::PinnedCertificate`].
+    ///
+    /// The value is what an operator-facing pairing link carries, and it is
+    /// derived from the runtime identity, so it stays stable across restarts
+    /// and for the lifetime of the home directory.
+    pub fn pinned_tls_certificate_base64(&self) -> VibexResult<Option<String>> {
+        if self.current_config().tls_policy != RemoteGatewayTlsPolicy::PinnedCertificate {
+            return Ok(None);
+        }
+        let identity = self.identity()?;
+        Ok(Some(crate::pinned_tls_certificate_base64(&identity)?))
+    }
+
     pub fn local_lan_gateway_info(&self) -> Option<LocalLanGatewayInfo> {
         self.inner.lifecycle.lock().ok().and_then(|lifecycle| {
             lifecycle
@@ -1968,26 +1982,53 @@ impl RemoteGateway {
             .with_diagnostic("errorKind", format!("{:?}", error.kind()))
         })?;
         let service = router.into_make_service_with_connect_info::<SocketAddr>();
-        let (shutdown, tls_handle, task) = if tls_policy
-            == RemoteGatewayTlsPolicy::ServerCertificate
-        {
-            let identity = tls_identity.ok_or_else(|| {
-                VibexError::validation(
-                    "remote_gateway_tls_identity_missing",
-                    "the server certificate TLS policy requires a certificate chain and private key",
+        // `server_certificate` uses the operator's PEM chain; `pinned_certificate`
+        // derives a deterministic self-signed certificate from the runtime
+        // identity, which is what lets a local/LAN deployment run without any
+        // CA. Every other policy keeps the plaintext listener: `loopback_http`
+        // is loopback-only by validation, and `trusted_https_proxy` is
+        // terminated by the operator's own proxy in front of it.
+        let tls_config = match tls_policy {
+            RemoteGatewayTlsPolicy::ServerCertificate => {
+                let identity = tls_identity.ok_or_else(|| {
+                    VibexError::validation(
+                        "remote_gateway_tls_identity_missing",
+                        "the server certificate TLS policy requires a certificate chain and private key",
+                    )
+                })?;
+                Some(
+                    RustlsConfig::from_pem(
+                        identity.certificate_chain_pem,
+                        identity.private_key_pem,
+                    )
+                    .await
+                    .map_err(|_| {
+                        VibexError::validation(
+                            "remote_gateway_tls_identity_invalid",
+                            "RemoteGateway TLS certificate chain or private key could not be parsed",
+                        )
+                    })?,
                 )
-            })?;
-            let tls_config = RustlsConfig::from_pem(
-                identity.certificate_chain_pem,
-                identity.private_key_pem,
-            )
-            .await
-            .map_err(|_| {
-                VibexError::validation(
-                    "remote_gateway_tls_identity_invalid",
-                    "RemoteGateway TLS certificate chain or private key could not be parsed",
+            }
+            RemoteGatewayTlsPolicy::PinnedCertificate => {
+                let identity = self.identity()?;
+                let derived = derive_local_lan_tls_identity(&identity)?;
+                Some(
+                    RustlsConfig::from_der(vec![derived.certificate_der], derived.private_key_der)
+                        .await
+                        .map_err(|_| {
+                            VibexError::validation(
+                                "remote_gateway_tls_identity_invalid",
+                                "the derived pinned TLS certificate could not be parsed",
+                            )
+                        })?,
                 )
-            })?;
+            }
+            RemoteGatewayTlsPolicy::LoopbackHttp | RemoteGatewayTlsPolicy::TrustedHttpsProxy => {
+                None
+            }
+        };
+        let (shutdown, tls_handle, task) = if let Some(tls_config) = tls_config {
             let std_listener = listener.into_std().map_err(|error| {
                 VibexError::process(
                     "remote_gateway_listener_config_failed",
@@ -5362,14 +5403,8 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn is_local_lan_host(host: &str) -> bool {
-    host.parse::<IpAddr>().is_ok_and(|address| match address {
-        IpAddr::V4(address) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        IpAddr::V6(address) => {
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
-        }
-    })
+    host.parse::<IpAddr>()
+        .is_ok_and(vibex_core::is_local_network_address)
 }
 
 fn validate_origin_value(origin: &str) -> VibexResult<()> {

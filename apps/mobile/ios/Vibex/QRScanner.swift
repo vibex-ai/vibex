@@ -114,7 +114,7 @@ private final class QRScannerViewController: UIViewController, AVCaptureMetadata
         guard !handled,
               let code = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
               let value = code.stringValue,
-              value.hasPrefix("vibex://open/") else {
+              value.hasPrefix("vibex://open/") || value.hasPrefix("vibex://pair#") else {
             return
         }
         handled = true

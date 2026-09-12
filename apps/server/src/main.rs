@@ -1,12 +1,14 @@
 use std::error::Error;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use tokio::signal;
-use vibex_core::{RemoteCreatePairingCodeRequest, RemoteDevicePermissionLevel, VibexError};
+use vibex_core::{
+    RemoteCreatePairingCodeRequest, RemoteDevicePermissionLevel, RemotePairingCodeLink, VibexError,
+};
 use vibex_db::{apply_migrations, open_database};
 use vibex_desktop_runtime::{
     DesktopHomeLock, DesktopRuntime, DesktopRuntimeConfig, DesktopRuntimeFacade,
 };
-use vibex_remote::RemoteTrustService;
+use vibex_remote::{RemoteIdentity, RemoteIdentityStore, RemoteTrustService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -37,9 +39,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let config = headless_config()?;
             config_check(&config)?;
             let response = create_pairing_code(&config, permission, ttl_ms)?;
-            println!("pairing_code={}", response.pairing_code);
-            println!("expires_at_ms={}", response.pairing.expires_at_ms);
-            println!("permission={:?}", response.pairing.permission_level);
+            let certificate = pinned_certificate_for_config(&config)?;
+            print_pairing_entry(&config, None, &response, certificate);
             println!("warning=one-time code; it is not stored in plaintext");
         }
         Command::Serve { pairing } => serve(pairing).await?,
@@ -138,8 +139,8 @@ async fn serve(print_pairing: bool) -> Result<(), Box<dyn Error>> {
     if print_pairing {
         match create_pairing_code(&config, RemoteDevicePermissionLevel::FullControl, None) {
             Ok(response) => {
-                println!("pairing_code={}", response.pairing_code);
-                println!("pairing_expires_at_ms={}", response.pairing.expires_at_ms);
+                let certificate = runtime.remote().gateway().pinned_tls_certificate_base64()?;
+                print_pairing_entry(&config, status.bound_addr, &response, certificate);
             }
             Err(error) => eprintln!("pairing_code=unavailable error_code={}", error.code),
         }
@@ -195,6 +196,170 @@ fn create_pairing_code(
             ttl_ms,
         },
     )
+}
+
+/// Prints the one-time code together with everything a client needs to reach
+/// this runtime: the certificate fingerprint, the copyable `vibex://` pairing
+/// link, and a scannable rendering of that link.
+///
+/// The link is the only channel that carries a self-signed certificate, and it
+/// goes from this console to the operator's screen. A client that pairs from it
+/// pins the certificate before its first request, so nothing about the trust
+/// decision depends on the network.
+fn print_pairing_entry(
+    config: &DesktopRuntimeConfig,
+    bound: Option<SocketAddr>,
+    response: &vibex_core::RemoteCreatePairingCodeResponse,
+    certificate: Option<String>,
+) {
+    println!("pairing_code={}", response.pairing_code);
+    println!("pairing_expires_at_ms={}", response.pairing.expires_at_ms);
+    println!("permission={:?}", response.pairing.permission_level);
+    let link = match pairing_link(config, bound, &response.pairing_code, certificate) {
+        Ok(link) => link,
+        Err(error) => {
+            println!("pairing_link=unavailable");
+            eprintln!("pairing_link_unavailable={}", error.message);
+            return;
+        }
+    };
+    if let Ok(Some(fingerprint)) = link.tls_fingerprint() {
+        println!("tls_fingerprint={fingerprint}");
+    }
+    match link.encode() {
+        Ok(encoded) => {
+            println!("pairing_link={encoded}");
+            println!("pairing_hint=desktop: paste the pairing link; mobile: scan the QR below");
+            // Reed-Solomon level L keeps the symbol as small as possible: the
+            // code is scanned off a clean screen, not off damaged paper.
+            match qrcode::QrCode::with_error_correction_level(
+                encoded.as_bytes(),
+                qrcode::EcLevel::L,
+            ) {
+                Ok(code) => {
+                    let rendered = code.render::<qrcode::render::unicode::Dense1x2>().build();
+                    print!("{rendered}");
+                    if !rendered.ends_with('\n') {
+                        println!();
+                    }
+                }
+                Err(_) => eprintln!("pairing_qr=unavailable"),
+            }
+        }
+        Err(error) => eprintln!("pairing_link=unavailable error_code={}", error.code),
+    }
+}
+
+fn pairing_link(
+    config: &DesktopRuntimeConfig,
+    bound: Option<SocketAddr>,
+    pairing_code: &str,
+    certificate: Option<String>,
+) -> Result<RemotePairingCodeLink, VibexError> {
+    let endpoint = advertised_endpoint(config, bound).ok_or_else(|| {
+        VibexError::validation(
+            "server_pairing_link_endpoint_unavailable",
+            "no address is known for the pairing link; set VIBEX_PUBLIC_HOST to the address clients should use",
+        )
+    })?;
+    RemotePairingCodeLink::new(endpoint, pairing_code, certificate)
+}
+
+/// Address clients should use, which is not always the bind address: a
+/// wildcard bind (`0.0.0.0`) is not dialable, so it falls back to the default
+/// route interface.
+fn advertised_endpoint(config: &DesktopRuntimeConfig, bound: Option<SocketAddr>) -> Option<String> {
+    let scheme = if config.remote_gateway.tls_policy.requires_https() {
+        "https"
+    } else {
+        "http"
+    };
+    if let Some(candidate) = config
+        .remote_gateway
+        .pairing_routes
+        .direct_candidates
+        .first()
+    {
+        return Some(with_bound_port(&candidate.url, bound));
+    }
+    let address = bound.or_else(|| config.remote_gateway.service.bind_addr.parse().ok())?;
+    let ip = if address.ip().is_unspecified() {
+        default_route_ip()?
+    } else {
+        address.ip()
+    };
+    let host = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    Some(format!("{scheme}://{host}:{}", address.port()))
+}
+
+/// `VIBEX_PUBLIC_HOST` may omit the port, in which case the listener port is
+/// the only sensible default. An explicit port, `443`, and a hostname that is
+/// fronted by a proxy on the default port are all left untouched.
+fn with_bound_port(url: &str, bound: Option<SocketAddr>) -> String {
+    let url = url.trim_end_matches('/');
+    let Some(port) = bound.map(|address| address.port()) else {
+        return url.to_string();
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let has_explicit_port = match rest.strip_prefix('[') {
+        Some(rest) => rest.contains("]:"),
+        None => rest.contains(':'),
+    };
+    if has_explicit_port || port == 443 {
+        return url.to_string();
+    }
+    format!("{scheme}://{rest}:{port}")
+}
+
+/// Source address of the default route. A UDP `connect` performs no handshake
+/// and sends no packet; it only asks the kernel which address it would use.
+fn default_route_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    socket
+        .local_addr()
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| !ip.is_unspecified())
+}
+
+/// Certificate the runtime terminates TLS with when it serves its own pinned
+/// certificate. Loading the identity here keeps `pairing-code` working without
+/// a running runtime.
+fn pinned_certificate_for_config(
+    config: &DesktopRuntimeConfig,
+) -> Result<Option<String>, VibexError> {
+    if config.remote_gateway.tls_policy != vibex_remote::RemoteGatewayTlsPolicy::PinnedCertificate {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&config.home_dir).map_err(|_| {
+        VibexError::storage(
+            "server_home_create_failed",
+            "headless runtime home could not be created",
+        )
+    })?;
+    let identity = load_remote_identity(config)?;
+    Ok(Some(vibex_remote::pinned_tls_certificate_base64(
+        &identity,
+    )?))
+}
+
+fn load_remote_identity(config: &DesktopRuntimeConfig) -> Result<RemoteIdentity, VibexError> {
+    let path = config.home_dir.join("relay/desktop-identity.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| {
+            VibexError::storage(
+                "server_identity_directory_failed",
+                "headless runtime identity directory could not be created",
+            )
+        })?;
+    }
+    RemoteIdentityStore::new(path).load_or_create()
 }
 
 fn status() -> Result<(), VibexError> {
@@ -298,9 +463,13 @@ fn print_help() {
     println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check]");
     println!("  serve [--no-pairing]                 run the authoritative headless runtime");
     println!("  pairing-code [--permission full-control] [--ttl-ms N]");
+    println!("                                       mint a one-time code plus its pairing link");
     println!("  revoke DEVICE_ID [--reason TEXT]     revoke a paired device");
     println!("  config-check                          validate VIBEX_* deployment settings");
     println!("Environment: VIBEX_HOME, VIBEX_DB_PATH, VIBEX_BIND_ADDR, VIBEX_DEPLOYMENT_MODE,");
     println!("  VIBEX_PUBLIC_HOST, VIBEX_ALLOWED_HOSTS, VIBEX_ALLOWED_ORIGINS, VIBEX_TLS_MODE,");
     println!("  VIBEX_TLS_CERT_FILE, VIBEX_TLS_KEY_FILE and VIBEX_*_LIMIT settings.");
+    println!("VIBEX_TLS_MODE=pinned_certificate serves a self-signed certificate derived from the");
+    println!("  runtime identity, so no CA is needed on the client; VIBEX_PUBLIC_HOST should then");
+    println!("  name the address clients reach, for example 192.168.1.10:8765.");
 }

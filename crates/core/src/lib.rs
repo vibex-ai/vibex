@@ -19,6 +19,7 @@ pub mod file;
 pub mod git;
 pub mod ids;
 pub mod local_history;
+pub mod pairing_code_link;
 pub mod permission;
 pub mod provider;
 pub mod provider_projection;
@@ -163,6 +164,12 @@ pub use local_history::{
     LocalHistoryMaterializedSession, LocalHistoryScanDiagnostic, LocalHistoryScanFolder,
     LocalHistoryScanResult, LocalHistoryScanSession, LocalHistorySelection,
     LocalHistorySessionSummary, LocalHistorySource, LocalHistoryTimelineEntry,
+};
+pub use pairing_code_link::{
+    MAX_PAIRING_CODE_CERTIFICATE_BYTES, MAX_PAIRING_CODE_CHARS, MAX_PAIRING_CODE_LINK_BYTES,
+    PAIRING_CODE_FRAGMENT_PREFIX, PAIRING_CODE_LINK_HOST, PAIRING_CODE_LINK_PREFIX,
+    PAIRING_CODE_LINK_SCHEMA_VERSION, PAIRING_CODE_LINK_SCHEME, RemotePairingCodeLink,
+    certificate_fingerprint, is_local_network_address, url_host_is_local_network,
 };
 pub use permission::{
     PermissionActionDetail, PermissionMode, PermissionRequest, PermissionRequestStatus,

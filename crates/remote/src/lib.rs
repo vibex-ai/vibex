@@ -86,6 +86,7 @@ pub use gateway::{
     RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes, RemoteGatewayPeerLimits,
     RemoteGatewayStatus, RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy,
 };
+pub use zero_config_pairing::pinned_tls_certificate_base64;
 
 pub type RemoteRouter = Router;
 

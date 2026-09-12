@@ -9882,6 +9882,7 @@ dependencies = [
 name = "vibex-core"
 version = "0.1.0-rc.2"
 dependencies = [
+ "base64",
  "js-sys",
  "semver 1.0.28",
  "serde",
@@ -9889,6 +9890,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "thiserror 2.0.18",
+ "url",
  "uuid",
 ]
 
@@ -10212,6 +10214,7 @@ dependencies = [
 name = "vibex-server"
 version = "0.1.0-rc.2"
 dependencies = [
+ "qrcode",
  "tokio",
  "vibex-agent",
  "vibex-core",

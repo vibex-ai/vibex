@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
-    DeviceId, RelayPeerId, RemoteAuthProof, RemoteClientType, RemoteDeviceStatus,
-    RemoteLanPairingStatusResponse, RemotePairingOffer, RemotePairingTransport, RequestId,
+    DeviceId, PAIRING_CODE_FRAGMENT_PREFIX, RelayPeerId, RemoteAuthProof, RemoteClientType,
+    RemoteDeviceStatus, RemoteLanPairingStatusResponse, RemotePairingCodeLink, RemotePairingOffer,
+    RemotePairingTransport, RequestId,
 };
 use vibex_remote_client::{
     AutoRemoteTransport, AutoRemoteTransportConfig, ClientDeviceIdentity, DirectCandidate,
@@ -217,7 +218,7 @@ impl MobileCredentialBundle {
         Ok(Arc::new(WebRemoteBackend::from_auto(transport)))
     }
 
-    fn auto_transport_config(&self) -> BackendResult<AutoRemoteTransportConfig> {
+    pub(crate) fn auto_transport_config(&self) -> BackendResult<AutoRemoteTransportConfig> {
         let config = self.client_config()?;
         let route = self.route.as_ref().ok_or_else(|| {
             BackendError::failed(
@@ -315,7 +316,60 @@ pub async fn claim_server_pairing_code(
     Ok(bundle)
 }
 
+/// Pair from the connection string a `vibex-server` operator printed.
+///
+/// The link carries the address, the one-time code, and — when the runtime
+/// serves its own certificate — that certificate. Android's HTTP stack only
+/// trusts bundled public roots and never user or system stores, so a pinned
+/// certificate is the only way this client reaches a LAN runtime that has no
+/// public CA at all.
+pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobileCredentialBundle> {
+    let link = RemotePairingCodeLink::parse(&link)?;
+    let server_url = link.normalized_server_url()?;
+    let pinned_tls_certificate_der = link.tls_certificate_der.clone();
+    let bundle = vibex_remote_client::claim_pairing_code_link_with_identity(
+        link,
+        "Vibex Mobile".to_string(),
+        cfg!(debug_assertions),
+    )
+    .await?;
+    let bundle = MobileCredentialBundle {
+        schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+        record: bundle.credential,
+        identity_private_key: bundle.identity.private_key_base64(),
+        expected_server_id: bundle.server_id,
+        client_type: RemoteClientType::Mobile,
+        allow_insecure_local_dev: cfg!(debug_assertions),
+        display_name: None,
+        route: Some(MobileRemoteRouteBundle {
+            local_network: pinned_tls_certificate_der
+                .clone()
+                .map(|tls_certificate_der| MobileLocalNetworkCandidate {
+                    url: server_url.clone(),
+                    tls_certificate_der,
+                }),
+            // A pinned route is the only route: an unpinned duplicate of the
+            // same address could never verify, and keeping it would invite a
+            // fallback that silently ignores the pin.
+            direct_candidates: if pinned_tls_certificate_der.is_some() {
+                Vec::new()
+            } else {
+                vec![server_url]
+            },
+            relay: None,
+        }),
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
 pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle> {
+    // A `vibex-server` connection string is a different entry point than the
+    // desktop-advertised pairing offer, but it reaches the phone through the
+    // same scanner, so both shapes are accepted here.
+    if is_pairing_code_link(&link) {
+        return claim_pairing_code_link(link).await;
+    }
     let now_ms = vibex_core::unix_timestamp_ms();
     let offer = parse_pairing_offer_fragment(&link, now_ms)?;
     let transport = pairing_link_transport(&link)?.unwrap_or(preferred_transport(&offer)?);
@@ -465,6 +519,15 @@ pub async fn claim_zero_config_lan_pairing(
     Ok(bundle)
 }
 
+/// True when the scanned or pasted entry is a `vibex-server` connection
+/// string.
+///
+/// An offer link can never match: everything after its `#/pair/` marker is
+/// base64url, which cannot contain the `/` in `#/code/`.
+fn is_pairing_code_link(link: &str) -> bool {
+    link.contains(PAIRING_CODE_FRAGMENT_PREFIX)
+}
+
 fn pairing_link_transport(link: &str) -> BackendResult<Option<RemotePairingTransport>> {
     let link = link.trim();
     if link.starts_with(PAIRING_FRAGMENT_PREFIX) {
@@ -575,6 +638,18 @@ fn invalid_pairing_entry() -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanned_entries_route_to_the_matching_pairing_flow() {
+        assert!(is_pairing_code_link("vibex://pair#/code/eyJzY2hlbWE"));
+        assert!(is_pairing_code_link("#/code/eyJzY2hlbWE"));
+        assert!(!is_pairing_code_link(
+            "vibex://open/direct#/pair/encoded-offer"
+        ));
+        assert!(!is_pairing_code_link(
+            "https://host.example/#/pair/encoded-offer"
+        ));
+    }
 
     #[test]
     fn credential_debug_output_redacts_secrets() {

@@ -538,7 +538,7 @@ mod tests {
     use vibex_core::{AgentTimelineReasoningDisplayMode, RemoteAuthProof, RemoteClientType};
     use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
 
-    use crate::pairing::MobileRemoteRouteBundle;
+    use crate::pairing::{MobileLocalNetworkCandidate, MobileRemoteRouteBundle};
 
     fn fixture() -> MobileCredentialBundle {
         let identity = ClientDeviceIdentity::generate(vibex_core::DeviceId::new()).unwrap();
@@ -728,6 +728,50 @@ mod tests {
 
         let loaded = storage.load().unwrap().unwrap();
         assert!(loaded.route.unwrap().local_network.is_none());
+    }
+
+    /// A connection-string pairing stores the server's own certificate in the
+    /// route. Losing it on reload would silently drop the phone back to the
+    /// public roots, which no LAN runtime is signed by.
+    #[test]
+    fn a_pinned_local_certificate_survives_a_reload() {
+        use base64::Engine as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        // A minimal DER envelope: the transport decodes and pins it, while the
+        // TLS stack is what validates the certificate itself.
+        let mut certificate = vec![0x30, 0x82, 0x01, 0x00];
+        certificate.extend(std::iter::repeat_n(0x41_u8, 252));
+        let encoded_certificate =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&certificate);
+
+        let mut bundle = fixture();
+        bundle.record.server_url = "https://192.168.1.10:8765".to_string();
+        bundle.route = Some(MobileRemoteRouteBundle {
+            local_network: Some(MobileLocalNetworkCandidate {
+                url: "https://192.168.1.10:8765".to_string(),
+                tls_certificate_der: encoded_certificate.clone(),
+            }),
+            direct_candidates: Vec::new(),
+            relay: None,
+        });
+        storage.save(&bundle).unwrap();
+
+        let loaded = storage.load().unwrap().unwrap();
+        let route = loaded.route.clone().unwrap();
+        assert_eq!(
+            route.local_network.unwrap().tls_certificate_der,
+            encoded_certificate
+        );
+        let config = loaded.auto_transport_config().unwrap();
+        let candidate = config.direct_candidates.first().expect("pinned route");
+        assert_eq!(candidate.label, "local-network");
+        assert_eq!(candidate.priority, 0);
+        assert_eq!(
+            candidate.tls_certificate_der.as_deref(),
+            Some(encoded_certificate.as_str())
+        );
     }
 
     #[cfg(unix)]

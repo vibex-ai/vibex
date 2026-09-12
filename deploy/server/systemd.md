@@ -27,11 +27,24 @@ publicly reachable deployment raise `VIBEX_DEPLOYMENT_MODE=public` and choose
 a TLS mode; the gateway refuses to start a Public listener without trusted
 TLS, and every unauthenticated endpoint is rate-limited per peer.
 
+For a desktop and phone on the same LAN — no domain, no CA — serve the
+runtime's own certificate instead:
+
+```bash
+VIBEX_BIND_ADDR=0.0.0.0:8765
+VIBEX_DEPLOYMENT_MODE=lan
+VIBEX_TLS_MODE=pinned_certificate
+VIBEX_PUBLIC_HOST=192.168.1.10:8765
+```
+
+Clients pair from the printed `pairing_link` / QR, which carries that
+certificate; see README.md → "Local network (home or office LAN)".
+
 Read the pairing code after the first start:
 
 ```bash
-journalctl -u vibex-server -o cat | grep pairing_code=
-# or mint a fresh code any time:
+journalctl -u vibex-server -o cat | grep -E 'pairing_(code|link)|tls_fingerprint'
+# or mint a fresh code and link any time:
 sudo -u vibex VIBEX_HOME=/var/lib/vibex-server vibex-server pairing-code \
     --permission full-control
 ```

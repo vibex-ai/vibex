@@ -7,12 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 similar = "3.1.1"
 thiserror.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::net::IpAddr;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -132,8 +131,15 @@ fn remote_http_client_for_config(config: &RemoteClientConfig) -> BackendResult<r
     let Some(encoded) = config.pinned_tls_certificate_der.as_deref() else {
         return remote_http_client_for_url(&config.validate()?);
     };
-    let certificate_der = decode_pinned_tls_certificate(encoded)?;
-    let certificate = reqwest::Certificate::from_der(&certificate_der).map_err(|_| {
+    pinned_remote_http_client(&decode_pinned_tls_certificate(encoded)?)
+}
+
+/// HTTP client that trusts exactly one certificate. Used for local-network
+/// routes whose certificate arrived out of band, including the pairing-code
+/// link flow, where the certificate travels on the operator's own screen.
+#[cfg(not(target_family = "wasm"))]
+fn pinned_remote_http_client(certificate_der: &[u8]) -> BackendResult<reqwest::Client> {
+    let certificate = reqwest::Certificate::from_der(certificate_der).map_err(|_| {
         BackendError::failed(
             "remote_tls_certificate_invalid",
             "pinned local network TLS certificate is invalid",
@@ -355,12 +361,7 @@ impl RemoteClientConfig {
         }
         if let Some(certificate) = self.pinned_tls_certificate_der.as_deref() {
             decode_pinned_tls_certificate(certificate)?;
-            if !secure
-                || !url
-                    .host_str()
-                    .and_then(|host| host.parse::<IpAddr>().ok())
-                    .is_some_and(is_local_network_ip)
-            {
+            if !secure || !vibex_core::url_host_is_local_network(&url) {
                 return Err(BackendError::failed(
                     "remote_pinned_tls_route_invalid",
                     "pinned TLS requires an HTTPS/WSS local numeric address",
@@ -439,22 +440,10 @@ fn decode_pinned_tls_certificate(encoded: &str) -> BackendResult<Vec<u8>> {
     Ok(certificate)
 }
 
-fn is_local_network_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        IpAddr::V6(address) => {
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
-        }
-    }
-}
-
 fn is_proxy_bypassed_remote_url(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host.parse::<IpAddr>().is_ok_and(is_local_network_ip)
-    })
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+        || vibex_core::url_host_is_local_network(url)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,6 +657,21 @@ pub fn claim_pairing_code(
     request: RemoteClaimPairingCodeRequest,
     allow_insecure_local_dev: bool,
 ) -> BackendFuture<'static, RemoteClaimPairingCodeResponse> {
+    claim_pairing_code_with_pinned_certificate(base_url, request, allow_insecure_local_dev, None)
+}
+
+/// Claim a pairing code from a runtime that serves its own certificate.
+///
+/// `pinned_certificate_der` must have reached the caller out of band — in this
+/// codebase, through the operator-facing pairing link — because the claim
+/// request is the first TLS handshake and there is no other authenticated
+/// channel to learn the certificate from.
+pub fn claim_pairing_code_with_pinned_certificate(
+    base_url: impl Into<String>,
+    request: RemoteClaimPairingCodeRequest,
+    allow_insecure_local_dev: bool,
+    pinned_certificate_der: Option<Vec<u8>>,
+) -> BackendFuture<'static, RemoteClaimPairingCodeResponse> {
     let base_url = base_url.into();
     Box::pin(async move {
         if request.pairing_code.trim().is_empty() || request.display_name.trim().is_empty() {
@@ -697,6 +701,9 @@ pub fn claim_pairing_code(
                 "pairing code claim requires an HTTP(S) URL without embedded credentials",
             ));
         }
+        if pinned_certificate_der.is_some() {
+            validate_pinned_claim_url(&url)?;
+        }
         let loopback = url
             .host_str()
             .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
@@ -710,12 +717,50 @@ pub fn claim_pairing_code(
         url.set_fragment(None);
         let endpoint = endpoint_url(&url, "/api/v2/pairing/code/claim")?;
         http_json(
-            remote_http_client_for_url(&url)?
+            remote_http_client_for_claim(&url, pinned_certificate_der.as_deref())?
                 .post(endpoint)
                 .json(&request),
         )
         .await
     })
+}
+
+/// A pinned route must be HTTPS to a numeric local address. This mirrors
+/// `RemoteClientConfig::validate` so a link cannot quietly create a pinned
+/// route to an arbitrary Internet host.
+fn validate_pinned_claim_url(url: &Url) -> BackendResult<()> {
+    if url.scheme() != "https" || !vibex_core::url_host_is_local_network(url) {
+        return Err(BackendError::failed(
+            "remote_pinned_tls_route_invalid",
+            "pinned pairing requires an HTTPS/WSS local numeric address",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn remote_http_client_for_claim(
+    url: &Url,
+    pinned_certificate_der: Option<&[u8]>,
+) -> BackendResult<reqwest::Client> {
+    match pinned_certificate_der {
+        Some(certificate) => pinned_remote_http_client(certificate),
+        None => remote_http_client_for_url(url),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn remote_http_client_for_claim(
+    url: &Url,
+    pinned_certificate_der: Option<&[u8]>,
+) -> BackendResult<reqwest::Client> {
+    if pinned_certificate_der.is_some() {
+        return Err(BackendError::unsupported(
+            "remote_pinned_tls_unsupported",
+            "pinned TLS pairing is unavailable on this platform",
+        ));
+    }
+    remote_http_client_for_url(url)
 }
 
 /// Complete a headless pairing-code claim with a fresh client identity and a
@@ -754,53 +799,107 @@ pub fn claim_pairing_code_with_identity(
     let pairing_code = pairing_code.into();
     let display_name = display_name.into();
     Box::pin(async move {
-        let provisional = ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?;
-        let request = RemoteClaimPairingCodeRequest {
+        complete_pairing_code_claim(
+            base_url,
             pairing_code,
             display_name,
-            public_key: Some(provisional.public_key_base64()),
-        };
-        let response =
-            claim_pairing_code(base_url.clone(), request, allow_insecure_local_dev).await?;
-        if response.device.status != vibex_core::RemoteDeviceStatus::Active
-            || response.auth_token.trim().is_empty()
-        {
-            return Err(BackendError::failed(
-                "remote_pairing_claim_response_invalid",
-                "pairing code claim did not return an active device grant",
-            ));
-        }
-        if response.device.public_key.as_deref() != Some(provisional.public_key_base64().as_str()) {
-            return Err(BackendError::permission(
-                "remote_client_identity_mismatch",
-                "server returned a different client identity key",
-            ));
-        }
-        let identity = ClientDeviceIdentity::from_private_key_base64(
-            response.device.device_id.clone(),
-            &provisional.private_key_base64(),
-        )?;
-        let base = Url::parse(&base_url).map_err(|_| {
-            BackendError::failed("remote_url_invalid", "remote server URL is invalid")
-        })?;
-        let info: RemoteGatewayInfo =
-            http_json(remote_http_client_for_url(&base)?.get(endpoint_url(&base, "/api/v2/info")?))
-                .await?;
-        let credential = RemoteCredentialRecord {
-            server_url: base_url,
-            auth: vibex_core::RemoteAuthProof {
-                device_id: response.device.device_id.clone(),
-                auth_token: response.auth_token.clone(),
-            },
-            device_identity_public_key: identity.public_key_base64(),
-            server_identity_public_key: Some(info.server_identity_public_key.clone()),
-        };
-        Ok(PairingCodeClientBundle {
-            response,
-            identity,
-            credential,
-            server_id: info.server_id,
-        })
+            allow_insecure_local_dev,
+            None,
+        )
+        .await
+    })
+}
+
+/// Pair from an operator-supplied connection link.
+///
+/// The link carries the server URL, the one-time code, and — for a runtime
+/// that serves its own certificate — that certificate. Because the link comes
+/// from the runtime's own console (copied or scanned by the operator), the
+/// certificate is authenticated out of band, so it can be pinned before the
+/// first request. Everything after pairing verifies against that pin.
+pub fn claim_pairing_code_link_with_identity(
+    link: vibex_core::RemotePairingCodeLink,
+    display_name: impl Into<String>,
+    allow_insecure_local_dev: bool,
+) -> BackendFuture<'static, PairingCodeClientBundle> {
+    let display_name = display_name.into();
+    Box::pin(async move {
+        link.validate()?;
+        let server_url = link.normalized_server_url()?;
+        let certificate = link.certificate_der()?;
+        complete_pairing_code_claim(
+            server_url,
+            link.pairing_code.clone(),
+            display_name,
+            allow_insecure_local_dev,
+            certificate,
+        )
+        .await
+    })
+}
+
+async fn complete_pairing_code_claim(
+    base_url: String,
+    pairing_code: String,
+    display_name: String,
+    allow_insecure_local_dev: bool,
+    pinned_certificate_der: Option<Vec<u8>>,
+) -> BackendResult<PairingCodeClientBundle> {
+    let provisional = ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?;
+    let request = RemoteClaimPairingCodeRequest {
+        pairing_code,
+        display_name,
+        public_key: Some(provisional.public_key_base64()),
+    };
+    let response = claim_pairing_code_with_pinned_certificate(
+        base_url.clone(),
+        request,
+        allow_insecure_local_dev,
+        pinned_certificate_der.clone(),
+    )
+    .await?;
+    if response.device.status != vibex_core::RemoteDeviceStatus::Active
+        || response.auth_token.trim().is_empty()
+    {
+        return Err(BackendError::failed(
+            "remote_pairing_claim_response_invalid",
+            "pairing code claim did not return an active device grant",
+        ));
+    }
+    if response.device.public_key.as_deref() != Some(provisional.public_key_base64().as_str()) {
+        return Err(BackendError::permission(
+            "remote_client_identity_mismatch",
+            "server returned a different client identity key",
+        ));
+    }
+    let identity = ClientDeviceIdentity::from_private_key_base64(
+        response.device.device_id.clone(),
+        &provisional.private_key_base64(),
+    )?;
+    let base = Url::parse(&base_url)
+        .map_err(|_| BackendError::failed("remote_url_invalid", "remote server URL is invalid"))?;
+    // The identity probe runs through the same trust decision as the
+    // claim: a pinned pairing must not read the server key over a channel
+    // the pin does not cover.
+    let info: RemoteGatewayInfo = http_json(
+        remote_http_client_for_claim(&base, pinned_certificate_der.as_deref())?
+            .get(endpoint_url(&base, "/api/v2/info")?),
+    )
+    .await?;
+    let credential = RemoteCredentialRecord {
+        server_url: base_url,
+        auth: vibex_core::RemoteAuthProof {
+            device_id: response.device.device_id.clone(),
+            auth_token: response.auth_token.clone(),
+        },
+        device_identity_public_key: identity.public_key_base64(),
+        server_identity_public_key: Some(info.server_identity_public_key.clone()),
+    };
+    Ok(PairingCodeClientBundle {
+        response,
+        identity,
+        credential,
+        server_id: info.server_id,
     })
 }
 

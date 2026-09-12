@@ -47,6 +47,13 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
 
     private static final int CAMERA_PERMISSION_REQUEST = 100;
     private static final String PAIRING_PREFIX = "vibex://open/";
+    // A vibex-server console prints a connection string and a QR rendering of
+    // it; the same scanner accepts both pairing entry points.
+    private static final String SERVER_PAIRING_PREFIX = "vibex://pair#";
+
+    private static boolean isPairingEntry(String value) {
+        return value.startsWith(PAIRING_PREFIX) || value.startsWith(SERVER_PAIRING_PREFIX);
+    }
 
     private static native void nativeOnPairingQrScanned(String value);
 
@@ -173,7 +180,7 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
                 .addOnSuccessListener(barcodes -> {
                     for (Barcode barcode : barcodes) {
                         String value = barcode.getRawValue();
-                        if (value != null && value.startsWith(PAIRING_PREFIX)) {
+                        if (value != null && isPairingEntry(value)) {
                             finishScan(value);
                             break;
                         }

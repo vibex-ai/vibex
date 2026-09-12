@@ -55,7 +55,7 @@ use vibex_ui::{
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{
-    MobileCredentialBundle, claim_pairing_link, claim_server_pairing_code,
+    MobileCredentialBundle, claim_pairing_code_link, claim_pairing_link, claim_server_pairing_code,
     claim_zero_config_lan_pairing,
 };
 use crate::selection_menu::SelectionMenu;
@@ -401,6 +401,7 @@ enum DrawerPage {
 enum InputField {
     PairingServerUrl,
     PairingCode,
+    PairingLink,
     NewSessionTitle,
     NewSessionPrompt,
     SidebarName,
@@ -615,6 +616,7 @@ pub struct MobileApp {
     pairing_busy: bool,
     pairing_server_url_input: Entity<InputState>,
     pairing_code_input: Entity<InputState>,
+    pairing_link_input: Entity<InputState>,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -890,6 +892,13 @@ impl MobileApp {
                     "Pairing code",
                     "配对码",
                     "配對碼",
+                ))
+            }),
+            pairing_link_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(locale::text(
+                    "Connection string (vibex://pair#/code/…)",
+                    "连接串（vibex://pair#/code/…）",
+                    "連接串（vibex://pair#/code/…）",
                 ))
             }),
             nearby_pairing_state: NearbyPairingState::Idle,
@@ -1824,6 +1833,65 @@ impl MobileApp {
                             .push((InputField::PairingServerUrl, String::new()));
                         this.pending_input_writes
                             .push((InputField::PairingCode, String::new()));
+                        match this.storage.save(&bundle) {
+                            Ok(()) => this.install_bundle(bundle, cx),
+                            Err(error) => this.error = Some(error),
+                        }
+                    }
+                    Ok(Err(error)) => this.error = Some(error),
+                    Err(_) => {
+                        this.error = Some(BackendError::failed(
+                            "remote_pairing_task_failed",
+                            locale::text(
+                                "Pairing stopped unexpectedly.",
+                                "配对意外停止。",
+                                "配對意外停止。",
+                            ),
+                        ))
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.tasks.push(task);
+        cx.notify();
+    }
+
+    /// Pairs from the connection string a `vibex-server` operator printed —
+    /// the same string the QR code on that console encodes. It carries the
+    /// address, the one-time code, and the server's own certificate when it
+    /// serves one, which is what lets a phone reach a LAN runtime without a
+    /// public CA.
+    fn claim_entered_pairing_link(&mut self, cx: &mut Context<Self>) {
+        if self.pairing_busy || self.mode != RootMode::Pairing {
+            return;
+        }
+        let link = self.pairing_link_input.read(cx).value().trim().to_string();
+        if link.is_empty() {
+            self.error = Some(BackendError::failed(
+                "remote_pairing_code_request_invalid",
+                locale::text(
+                    "Paste the connection string printed by vibex-server.",
+                    "请粘贴 vibex-server 打印的连接串。",
+                    "請貼上 vibex-server 列印的連接串。",
+                )
+                .to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        self.pairing_busy = true;
+        self.error = None;
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_code_link(link).await });
+        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.pairing_busy = false;
+                match outcome {
+                    Ok(Ok(bundle)) => {
+                        this.pending_input_writes
+                            .push((InputField::PairingLink, String::new()));
                         match this.storage.save(&bundle) {
                             Ok(()) => this.install_bundle(bundle, cx),
                             Err(error) => this.error = Some(error),
@@ -5625,6 +5693,57 @@ impl MobileApp {
                         locale::common("Pairing...")
                     } else {
                         locale::text("Pair with Code", "使用配对码连接", "使用配對碼連線")
+                    }),
+            )
+            .child(
+                div()
+                    .pt(px(theme::SPACING_XS))
+                    .text_size(px(theme::FONT_DETAIL))
+                    .text_color(theme::text_muted())
+                    .child(locale::text(
+                        "Or paste the vibex:// connection string from the server console. It also carries the certificate of a server that serves its own, so no public CA is needed.",
+                        "或粘贴服务器控制台打印的 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需公共 CA。",
+                        "或貼上伺服器主控台列印的 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需公共 CA。",
+                    )),
+            )
+            .child(
+                div()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .child(Input::new(&self.pairing_link_input).appearance(false)),
+            )
+            .child(
+                div()
+                    .id("claim-server-pairing-link")
+                    .h(px(theme::TOUCH_TARGET))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_default())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(theme::FONT_HEADING))
+                    .text_color(theme::text_primary())
+                    .when(ready, |button| {
+                        button
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.7))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    this.claim_entered_pairing_link(cx);
+                                }),
+                            )
+                    })
+                    .child(if self.pairing_busy {
+                        locale::common("Pairing...")
+                    } else {
+                        locale::text(
+                            "Pair with Connection String",
+                            "使用连接串连接",
+                            "使用連接串連線",
+                        )
                     }),
             )
             .into_any_element()
@@ -12418,6 +12537,7 @@ impl Render for MobileApp {
             let input = match field {
                 InputField::PairingServerUrl => &self.pairing_server_url_input,
                 InputField::PairingCode => &self.pairing_code_input,
+                InputField::PairingLink => &self.pairing_link_input,
                 InputField::NewSessionTitle => &self.new_session_title_input,
                 InputField::NewSessionPrompt => &self.new_session_prompt_input,
                 InputField::SidebarName => &self.sidebar_name_input,
