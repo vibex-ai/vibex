@@ -3327,6 +3327,15 @@ fn mistral_vibe_model_entry(provider_id: &str, model_id: &str) -> serde_json::Va
 const DEEPSEEK_HARNESS_REASONING_EFFORTS: [(&str, Option<&str>); 3] =
     [("off", None), ("high", Some("high")), ("max", Some("max"))];
 
+/// Harness wire protocols whose pi-ai compatibility report reads
+/// `supportsDeveloperRole`.
+///
+/// Anthropic Messages carries no such switch, and the Harness refuses a
+/// route-level switch no Model on the route can apply rather than leaving it
+/// looking applied, so the pin must not be written for it.
+const DEEPSEEK_HARNESS_DEVELOPER_ROLE_PROTOCOLS: [&str; 2] =
+    ["openai-completions", "openai-responses"];
+
 fn deepseek_harness_model_entry(
     provider: &ModelProviderProfile,
     model: Option<&AgentConfiguredModelBinding>,
@@ -3410,6 +3419,7 @@ fn deepseek_harness_overlay(
             .as_deref()
             .unwrap_or_else(|| provider.id.as_str()),
     );
+    let api = deepseek_harness_api(model);
     let group = overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
     let model_entries: Vec<serde_json::Value> = if group.is_empty() {
         vec![deepseek_harness_model_entry(provider, model, model_id)]
@@ -3429,10 +3439,7 @@ fn deepseek_harness_overlay(
         serde_json::json!(provider.display_name),
     );
     route.insert("apiKeyEnv".to_string(), serde_json::json!(secret_env_key));
-    route.insert(
-        "api".to_string(),
-        serde_json::json!(deepseek_harness_api(model)),
-    );
+    route.insert("api".to_string(), serde_json::json!(api));
     // Vibex-owned routes are unknown to the Harness's pi-ai catalog, so this
     // route default is what every Model without its own declaration resolves
     // to. Admitting images keeps attachments usable; a Model that declares
@@ -3443,6 +3450,24 @@ fn deepseek_harness_overlay(
         "defaultInput".to_string(),
         serde_json::json!(["text", "image"]),
     );
+    // `reasoningEfforts` makes pi-ai treat the Model as reasoning, and pi-ai
+    // sends a reasoning Model's system prompt in the `developer` role unless
+    // the endpoint's compatibility report says the endpoint takes it. It
+    // resolves that report by detecting the provider id and the endpoint,
+    // neither of which recognizes a Vibex route, so the OpenAI default `true`
+    // stays in force — and a gateway that only speaks OpenAI's older
+    // vocabulary rejects the whole request (`400`, unknown variant
+    // `developer`), failing every turn while the same Model on an Agent
+    // account keeps working. `system` is the role every OpenAI-compatible
+    // endpoint accepts, so the route pins it for every Model it serves. The
+    // switch is written only where pi-ai reads it: the Harness refuses a route
+    // switch no Model on the route can apply.
+    if DEEPSEEK_HARNESS_DEVELOPER_ROLE_PROTOCOLS.contains(&api) {
+        route.insert(
+            "compat".to_string(),
+            serde_json::json!({"supportsDeveloperRole": false}),
+        );
+    }
     json_string_if_present(
         &mut route,
         "baseURL",
@@ -4297,18 +4322,21 @@ mod tests {
         provider.configured_models[0].capabilities.output_tokens = Some(16_384);
         provider.configured_models[0].capabilities.image_input = Some(true);
 
-        for (protocol, expected_api) in [
+        for (protocol, expected_api, takes_developer_role_switch) in [
             (
                 vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
                 "openai-completions",
+                true,
             ),
             (
                 vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
                 "openai-responses",
+                true,
             ),
             (
                 vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
                 "anthropic-messages",
+                false,
             ),
         ] {
             let mut model = binding.configured_models[0].clone();
@@ -4335,6 +4363,11 @@ mod tests {
             assert_eq!(route["models"][0]["maxTokens"].as_u64(), Some(16_384));
             assert_eq!(route["models"][0]["input"][1].as_str(), Some("image"));
             assert_eq!(yaml_strings(&route["defaultInput"]), ["text", "image"]);
+            assert_eq!(
+                route["compat"]["supportsDeveloperRole"].as_bool(),
+                takes_developer_role_switch.then_some(false),
+                "the developer-role pin belongs only to a protocol that reads it: {overlay}"
+            );
             let reasoning_efforts = route["models"][0]
                 .get("reasoningEfforts")
                 .expect("every route Model must project its reasoning levels");
@@ -4484,6 +4517,61 @@ mod tests {
         assert_eq!(
             settings["llm-pi-ai"]["providers"]["fake"]["models"][0]["reasoningEfforts"],
             serde_yaml::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_overlay_keeps_the_system_role_for_reasoning_route_models() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        // A route Model newer than the Harness's pi-ai catalog: nothing about
+        // the id or the endpoint is recognizable, so pi-ai's compatibility
+        // detection answers for an OpenAI gateway and would send the system
+        // prompt in the `developer` role as soon as the Model reasons. A
+        // gateway that only speaks OpenAI's older vocabulary answers `400`
+        // instead of a completion, which reaches the run options as a bare
+        // JSON-RPC failure.
+        let mut model = binding.configured_models[0].clone();
+        model.wire_protocol_id = vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string();
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&model),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let route = &settings["llm-pi-ai"]["providers"]["fake"];
+
+        assert!(
+            route["models"][0].get("reasoningEfforts").is_some(),
+            "the fixture must project the reasoning levels this pin travels with: {overlay}"
+        );
+        assert_eq!(
+            route["compat"]["supportsDeveloperRole"].as_bool(),
+            Some(false),
+            "a reasoning route Model must keep the role every endpoint accepts: {overlay}"
+        );
+
+        // Anthropic Messages takes no such switch, and the Harness refuses a
+        // route switch none of its Models can apply, so the route must not
+        // carry one: writing it there would fail the whole settings file.
+        let mut model = binding.configured_models[0].clone();
+        model.wire_protocol_id = vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(&model),
+            "VIBEX_DEEPSEEK_HARNESS_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        assert!(
+            settings["llm-pi-ai"]["providers"]["fake"]
+                .get("compat")
+                .is_none(),
+            "Anthropic Messages must not carry an OpenAI-only switch: {overlay}"
         );
     }
 
