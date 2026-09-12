@@ -1410,6 +1410,7 @@ pub enum RemoteWorkbenchOperationKind {
     ListWorkspaces,
     OpenWorkspace,
     EnsureTemporarySessionRoot,
+    BrowseDirectories,
     DeleteWorkspace,
     DeleteProject,
     FileListTree,
@@ -1483,6 +1484,47 @@ pub struct RemoteWorkbenchOpenWorkspaceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteWorkbenchOpenWorkspaceResponse {
     pub summary: ProjectWorkspaceSummary,
+}
+
+/// Asks the authority to list a directory of its own filesystem, so a paired
+/// client can pick a project directory that exists where the Agent runs
+/// instead of browsing the machine in front of the user.
+///
+/// `path` is resolved by the authority and has to stay inside the browse roots
+/// it was configured with; `None` lists the first configured root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchBrowseDirectoriesRequest {
+    pub auth: RemoteAuthProof,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkbenchBrowseDirectoriesResponse {
+    pub listing: RemoteWorkspaceDirectoryListing,
+}
+
+/// One resolved directory listing on the authority host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkspaceDirectoryListing {
+    /// Canonical browse roots, so the client can offer them as quick
+    /// locations and stop navigation at the boundary.
+    pub roots: Vec<String>,
+    /// Canonical directory that produced `entries`.
+    pub path: String,
+    /// Canonical parent, absent when `path` is a browse root: the client
+    /// cannot climb above the roots.
+    pub parent: Option<String>,
+    pub entries: Vec<RemoteWorkspaceDirectoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkspaceDirectoryEntry {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1971,6 +2013,7 @@ pub enum RemoteWorkbenchRequest {
     ListWorkspaces(RemoteWorkbenchListWorkspacesRequest),
     OpenWorkspace(RemoteWorkbenchOpenWorkspaceRequest),
     EnsureTemporarySessionRoot(RemoteWorkbenchTemporarySessionRootRequest),
+    BrowseDirectories(RemoteWorkbenchBrowseDirectoriesRequest),
     DeleteWorkspace(RemoteWorkbenchDeleteWorkspaceRequest),
     DeleteProject(RemoteWorkbenchDeleteProjectRequest),
     FileListTree(RemoteFileTreeRequest),
@@ -2028,6 +2071,7 @@ impl RemoteWorkbenchRequest {
             Self::EnsureTemporarySessionRoot(_) => {
                 RemoteWorkbenchOperationKind::EnsureTemporarySessionRoot
             }
+            Self::BrowseDirectories(_) => RemoteWorkbenchOperationKind::BrowseDirectories,
             Self::DeleteWorkspace(_) => RemoteWorkbenchOperationKind::DeleteWorkspace,
             Self::DeleteProject(_) => RemoteWorkbenchOperationKind::DeleteProject,
             Self::FileListTree(_) => RemoteWorkbenchOperationKind::FileListTree,
@@ -4711,6 +4755,60 @@ mod tests {
         );
         assert_eq!(settings_json["type"], "get_timeline_display_settings");
         assert!(!format!("{settings:?}").contains("timeline-settings-token"));
+    }
+
+    #[test]
+    fn remote_workbench_browse_directories_uses_a_stable_tag_and_operation_kind() {
+        let request =
+            RemoteWorkbenchRequest::BrowseDirectories(RemoteWorkbenchBrowseDirectoriesRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "browse-token".to_string(),
+                },
+                path: Some("/data/repos".to_string()),
+            });
+
+        assert_eq!(
+            request.operation_kind(),
+            RemoteWorkbenchOperationKind::BrowseDirectories
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "browse_directories");
+        assert_eq!(value["data"]["path"], "/data/repos");
+        let decoded: RemoteWorkbenchRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, request);
+        assert!(!format!("{request:?}").contains("browse-token"));
+
+        // A browse without a requested path lists the authority's first root.
+        let defaulted =
+            RemoteWorkbenchRequest::BrowseDirectories(RemoteWorkbenchBrowseDirectoriesRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "browse-token".to_string(),
+                },
+                path: None,
+            });
+        let value = serde_json::to_value(&defaulted).unwrap();
+        assert_eq!(value["data"]["path"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn remote_workbench_directory_listing_round_trips() {
+        let listing = RemoteWorkspaceDirectoryListing {
+            roots: vec!["/data".to_string()],
+            path: "/data/repos".to_string(),
+            parent: Some("/data".to_string()),
+            entries: vec![RemoteWorkspaceDirectoryEntry {
+                name: "vibex".to_string(),
+                path: "/data/repos/vibex".to_string(),
+            }],
+        };
+        let value = serde_json::to_value(&listing).unwrap();
+        assert_eq!(value["roots"][0], "/data");
+        assert_eq!(value["parent"], "/data");
+        assert_eq!(value["entries"][0]["name"], "vibex");
+        let decoded: RemoteWorkspaceDirectoryListing = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, listing);
     }
 
     #[test]

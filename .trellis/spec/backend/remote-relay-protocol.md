@@ -266,6 +266,111 @@ bounded per-connection RPC semaphore + bounded outbound queue
 create_pairing_offer request -> Gateway injects RemoteGatewayPairingRoutes
 ```
 
+## Scenario: Authority Directory Browsing
+
+### 1. Scope / Trigger
+
+- Trigger: changing how a paired client picks a project directory on the
+  authority host, the `browse_directories` workbench RPC, or the
+  `VIBEX_WORKSPACE_ROOTS` deployment contract.
+- The desktop picker is the consumer: in remote-client mode it must browse the
+  runtime that will run the Agent, not the machine in front of the user.
+
+### 2. Signatures
+
+```text
+RemoteWorkbenchRequest::BrowseDirectories(RemoteWorkbenchBrowseDirectoriesRequest { auth, path: Option<String> })
+RemoteWorkbenchBrowseDirectoriesResponse { listing: RemoteWorkspaceDirectoryListing }
+RemoteWorkspaceDirectoryListing { roots: Vec<String>, path: String, parent: Option<String>,
+  entries: Vec<RemoteWorkspaceDirectoryEntry { name, path }> }
+BackendOperation::WorkspaceBrowseDirectories
+WorkspaceBackend::browse_authority_directories(path: Option<String>)
+RemoteWorkbenchRuntime::with_browse_roots / browse_roots
+VIBEX_WORKSPACE_ROOTS   # comma-separated absolute paths, default: the runtime home
+```
+
+### 3. Contracts
+
+- `browse_directories` is a read: no idempotency key, authorized as
+  `RemoteActionClass::ReadProject`, so a read-only device may browse.
+- The authority resolves `path` and refuses anything that does not resolve
+  inside a configured browse root; `None` lists the first root. Roots are
+  canonicalized per request, so a mount that is not there yet matches nothing
+  instead of widening the boundary.
+- `parent` is absent exactly when `path` is a root: the client cannot climb
+  above the boundary and must not synthesize a parent from the path string.
+- Listings contain directories only, skip hidden entries, and sort
+  case-insensitively, matching the desktop's local picker.
+- Entry paths stay lexically inside the listing root (symlinks are not
+  resolved), so following a symlinked directory re-runs the boundary check
+  instead of smuggling an out-of-root path into the listing.
+- Errors never echo a path the device was not allowed to see:
+  `remote_directory_outside_roots`, `remote_directory_unavailable`,
+  `remote_directory_not_directory`, `remote_directory_browse_unavailable`.
+- `VIBEX_WORKSPACE_ROOTS` entries must be absolute and free of parent
+  traversal; the headless environment parser and
+  `DesktopRuntimeConfig::validate` both refuse the runtime otherwise.
+- Only a backend that implements the RPC advertises the capability;
+  `BackendCapabilitySnapshot::desktop_native_v1` omits it, so a native
+  authority keeps browsing locally. A client paired with an authority that does
+  not advertise it falls back to the local picker.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| `path` resolves outside every browse root | `remote_directory_outside_roots`; no listing and no path echo. |
+| `path` does not resolve | `remote_directory_unavailable`. |
+| `path` is a file | `remote_directory_not_directory`. |
+| Runtime has no browse roots | `remote_directory_browse_unavailable`. |
+| Symlink inside a root points outside it | The entry is listed with its in-root path; following it returns `remote_directory_outside_roots`. |
+| `VIBEX_WORKSPACE_ROOTS` entry is relative or contains `..` | Startup fails with `workspace_browse_root_invalid` / `desktop_runtime_browse_root_invalid`. |
+| Read-only device calls the RPC | Allowed (read class); the advertised capability follows `ReadProject`. |
+
+### 5. Good / Base / Bad Cases
+
+- Good: a desktop paired with a containerized `vibex-server` opens **Choose
+  another directory**, sees `/data` and `/data/repos` under Places, browses into
+  a checkout, and opens it; `open_workspace` then resolves the same path on the
+  authority.
+- Base: a runtime without `VIBEX_WORKSPACE_ROOTS` browses only its home, which
+  is the only path the documented compose file persists.
+- Bad: browse this machine and submit the local path to the authority; let the
+  client compute `parent` itself and climb to `/`; list files or hidden
+  entries; expose ancestors of a root as browse roots.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-remote --lib browse` — root containment, boundary
+  parent, hidden/file filtering, sorting, missing path, symlink escape, default
+  root, and the dispatch-level read-only device case.
+- `cargo test -p vibex-core --lib remote_workbench` — wire tag, operation kind,
+  and listing round-trip.
+- `cargo test -p vibex-remote-client --lib workspace` — the capability follows
+  `ReadProject` for full-control and read-only devices.
+- `cargo test -p vibex-desktop --lib directory_picker` — query-reads-as-path
+  per filesystem, and root-folding breadcrumbs.
+- `vibex-server config-check` with an invalid `VIBEX_WORKSPACE_ROOTS` entry
+  must fail.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+picker browses this machine, then submits the local path to the authority
+browse_directories { path: "/home/ada/repo" } -> workspace_root_missing
+roots: ["/"], parent: computed by the client from the path string
+```
+
+#### Correct
+
+```text
+picker browses the authority inside VIBEX_WORKSPACE_ROOTS and submits a path it listed
+browse_directories { path: null } -> roots ["/data", "/data/repos"], path "/data"
+follow-up browse uses the returned parent; none is offered at a root
+```
+
 ## Scenario: LAN Discovery Pairing
 
 ### 1. Scope / Trigger

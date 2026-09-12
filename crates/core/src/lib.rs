@@ -444,12 +444,14 @@ pub use remote::{
     RemoteTerminalKillResponse, RemoteTerminalListRequest, RemoteTerminalListResponse,
     RemoteTerminalResizeRequest, RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest,
     RemoteTerminalSnapshotResponse, RemoteTerminalWriteRequest, RemoteTerminalWriteResponse,
+    RemoteWorkbenchBrowseDirectoriesRequest, RemoteWorkbenchBrowseDirectoriesResponse,
     RemoteWorkbenchDeleteProjectRequest, RemoteWorkbenchDeleteProjectResponse,
     RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
     RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
     RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
     RemoteWorkbenchOperationKind, RemoteWorkbenchRequest,
     RemoteWorkbenchTemporarySessionRootRequest, RemoteWorkbenchTemporarySessionRootResponse,
+    RemoteWorkspaceDirectoryEntry, RemoteWorkspaceDirectoryListing,
     redact_agent_snapshot_for_remote,
 };
 pub use remote_v2::*;

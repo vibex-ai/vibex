@@ -26,6 +26,10 @@ pub enum BackendOperation {
     AgentSidebarOrganizationMutate,
     WorkspaceList,
     WorkspaceOpen,
+    /// The backend can list directories of the authority host, which is what
+    /// lets a paired client pick a project root that exists where the Agent
+    /// runs. Native backends browse locally instead and do not report it.
+    WorkspaceBrowseDirectories,
     WorkspaceDelete,
     FileTree,
     FileSearch,

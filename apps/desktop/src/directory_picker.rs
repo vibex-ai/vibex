@@ -23,6 +23,7 @@ use gpui_component::{
     spinner::Spinner,
     v_flex,
 };
+use vibex_backend::BackendFacade;
 use vibex_desktop_model::LocaleMode;
 
 use crate::locale::{self, ResolvedLocale};
@@ -47,6 +48,76 @@ enum BrowsePhase {
 enum QuickLocation {
     Home,
     Drive(usize),
+    /// One browse root of a paired authority.
+    Root(usize),
+}
+
+/// Where a picker listing comes from.
+///
+/// A local authority and this machine share one filesystem, so the picker
+/// browses it directly. A paired authority does not: its directories are the
+/// only ones an Agent can run in, and they are listed over Remote v2 within
+/// the browse roots the runtime was configured with.
+#[derive(Clone)]
+pub enum DirectoryBrowseTarget {
+    Local,
+    Authority(BackendFacade),
+}
+
+/// One resolved listing, whichever filesystem produced it.
+struct DirectoryListing {
+    /// The directory that produced `entries`.
+    path: PathBuf,
+    /// Parent directory, absent when `path` is a browse root.
+    parent: Option<PathBuf>,
+    entries: Vec<DirectoryEntry>,
+    /// Browse roots of a paired authority; empty for a local listing.
+    roots: Vec<PathBuf>,
+}
+
+impl DirectoryBrowseTarget {
+    /// Whether listings come from a paired authority.
+    pub(crate) fn is_authority(&self) -> bool {
+        matches!(self, Self::Authority(_))
+    }
+
+    /// Lists `target`, or the authority's first browse root when it is `None`.
+    /// Runs on the tokio runtime; keep it free of GPUI state.
+    async fn list(&self, target: Option<PathBuf>) -> Result<DirectoryListing, String> {
+        match self {
+            Self::Local => {
+                let target = target.unwrap_or_default();
+                let entries = list_directories(&target)?;
+                Ok(DirectoryListing {
+                    parent: target.parent().map(Path::to_path_buf),
+                    path: target,
+                    entries,
+                    roots: Vec::new(),
+                })
+            }
+            Self::Authority(backend) => {
+                let requested = target.map(|path| path.to_string_lossy().into_owned());
+                let listing = backend
+                    .workspace()
+                    .browse_authority_directories(requested)
+                    .await
+                    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                Ok(DirectoryListing {
+                    path: PathBuf::from(listing.path),
+                    parent: listing.parent.map(PathBuf::from),
+                    entries: listing
+                        .entries
+                        .into_iter()
+                        .map(|entry| DirectoryEntry {
+                            name: entry.name,
+                            path: PathBuf::from(entry.path),
+                        })
+                        .collect(),
+                    roots: listing.roots.into_iter().map(PathBuf::from).collect(),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -116,17 +187,29 @@ fn text(locale: ResolvedLocale) -> PickerText {
 /// the host to close the dialog (path accepted); `false` keeps it open.
 pub type DirectoryPickHandler = Arc<dyn Fn(String, &mut Window, &mut App) -> bool + 'static>;
 
+/// Row-id offset that keeps authority browse roots apart from local volumes in
+/// the quick-location rail.
+const ROOT_QUICK_LOCATION_ROW_OFFSET: usize = 1024;
+
 pub struct DirectoryPickerDialog {
     locale_mode: LocaleMode,
+    /// Filesystem the listings come from.
+    source: DirectoryBrowseTarget,
     /// Confirm-with-the-primary-action candidate; tracks the browse root.
     selected: Option<PathBuf>,
     /// The current browse root; `None` until the first listing resolves.
     browse_root: Option<PathBuf>,
+    /// Parent of the current browse root as reported by the source. `None`
+    /// means the root is the top of what may be browsed, so "Up" is disabled
+    /// instead of climbing out of the authority's browse roots.
+    parent: Option<PathBuf>,
     /// The directory the pending (or failed) browse targeted, for retry.
     retry_target: Option<PathBuf>,
     home: Option<PathBuf>,
     /// This machine's mounted volumes (best-effort; failures just hide rows).
     drives: Vec<PathBuf>,
+    /// Browse roots of a paired authority, offered as quick locations.
+    roots: Vec<PathBuf>,
     entries: Vec<DirectoryEntry>,
     phase: BrowsePhase,
     search_input: Entity<InputState>,
@@ -144,6 +227,7 @@ impl DirectoryPickerDialog {
     pub fn new(
         locale_mode: LocaleMode,
         initial_dir: Option<PathBuf>,
+        source: DirectoryBrowseTarget,
         on_pick: DirectoryPickHandler,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -160,13 +244,17 @@ impl DirectoryPickerDialog {
                 cx.notify();
             }
         });
+        let local = !source.is_authority();
         let mut dialog = Self {
             locale_mode,
+            source,
             selected: None,
             browse_root: None,
+            parent: None,
             retry_target: None,
-            home: user_home_directory(),
+            home: local.then(user_home_directory).flatten(),
             drives: Vec::new(),
+            roots: Vec::new(),
             entries: Vec::new(),
             phase: BrowsePhase::Loading,
             search_input,
@@ -179,7 +267,9 @@ impl DirectoryPickerDialog {
             _search_events: search_events,
         };
         dialog.browse(initial_dir, cx);
-        dialog.load_drives(cx);
+        if local {
+            dialog.load_drives(cx);
+        }
         dialog
     }
 
@@ -207,28 +297,44 @@ impl DirectoryPickerDialog {
         }));
     }
 
-    /// Browses `target` (or the default root) and resets the selection to it.
+    /// Browses `target`. A local browse always resolves to a concrete
+    /// directory; an authority browse lets the runtime answer with its first
+    /// browse root when the caller has none to suggest.
     fn browse(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
-        let target = target.unwrap_or_else(|| self.default_root());
-        self.retry_target = Some(target.clone());
+        let target = match &self.source {
+            DirectoryBrowseTarget::Local => Some(target.unwrap_or_else(|| self.default_root())),
+            DirectoryBrowseTarget::Authority(_) => target,
+        };
+        self.retry_target = target.clone();
         self.phase = BrowsePhase::Loading;
         self.entries.clear();
         self.active = 0;
         self.browse_task = Some({
-            let browse_target = target.clone();
+            let source = self.source.clone();
+            let browse_target = target;
             let runner =
-                gpui_tokio::Tokio::spawn(cx, async move { list_directories(&browse_target) });
+                gpui_tokio::Tokio::spawn(cx, async move { source.list(browse_target).await });
             cx.spawn(async move |this, cx| {
                 let listing = runner.await.unwrap_or_else(|error| Err(error.to_string()));
                 let _ = this.update(cx, |this, cx| {
                     match listing {
-                        Ok(entries) => {
-                            this.browse_root = Some(target);
-                            this.selected = this.browse_root.clone();
-                            this.entries = entries;
+                        Ok(listing) => {
+                            this.browse_root = Some(listing.path.clone());
+                            this.selected = Some(listing.path);
+                            this.parent = listing.parent;
+                            if !listing.roots.is_empty() {
+                                this.roots = listing.roots;
+                            }
+                            this.entries = listing.entries;
                             this.phase = BrowsePhase::Ready;
                         }
                         Err(error) => {
+                            // An authority that never answered has no roots to
+                            // offer yet, so Retry falls back to its first root
+                            // instead of repeating the path that just failed.
+                            if this.source.is_authority() && this.roots.is_empty() {
+                                this.retry_target = None;
+                            }
                             this.phase = BrowsePhase::Error(error);
                         }
                     }
@@ -244,7 +350,7 @@ impl DirectoryPickerDialog {
     /// instead.
     fn filtered_entries(&self, cx: &App) -> Vec<DirectoryEntry> {
         let query = self.search_input.read(cx).value().trim().to_string();
-        if Path::new(&query).is_absolute() || query.starts_with('~') {
+        if query_reads_as_path(&query, self.source.is_authority()) {
             return Vec::new();
         }
         if query.is_empty() {
@@ -265,11 +371,24 @@ impl DirectoryPickerDialog {
     }
 
     /// Follows the search query as a path when it names a directory.
+    ///
+    /// A local browse can check the filesystem before asking for a listing; an
+    /// authority browse cannot, so the query goes to the runtime, which either
+    /// resolves it or explains why it will not.
     fn descend_into_query(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let query = self.search_input.read(cx).value().trim().to_string();
-        let query = expand_query(&query, self.home.as_deref());
+        let query = if self.source.is_authority() {
+            query
+        } else {
+            expand_query(&query, self.home.as_deref())
+        };
         if query.is_empty() {
             return false;
+        }
+        if self.source.is_authority() {
+            self.clear_query(window, cx);
+            self.browse(Some(PathBuf::from(query)), cx);
+            return true;
         }
         let path = PathBuf::from(&query);
         if path.is_dir() {
@@ -295,11 +414,7 @@ impl DirectoryPickerDialog {
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
-        if let Some(parent) = self
-            .browse_root
-            .clone()
-            .and_then(|current| current.parent().map(Path::to_path_buf))
-        {
+        if let Some(parent) = self.parent.clone() {
             self.browse(Some(parent), cx);
         }
     }
@@ -308,6 +423,7 @@ impl DirectoryPickerDialog {
         let target = match &location {
             QuickLocation::Home => self.home.clone(),
             QuickLocation::Drive(ix) => self.drives.get(*ix).cloned(),
+            QuickLocation::Root(ix) => self.roots.get(*ix).cloned(),
         };
         if let Some(target) = target {
             self.browse(Some(target), cx);
@@ -442,17 +558,26 @@ impl gpui::Render for DirectoryPickerDialog {
             _ => None,
         };
         let query = self.search_input.read(cx).value().trim().to_string();
-        let query_is_path =
-            (Path::new(&query).is_absolute() || query.starts_with('~')) && !query.is_empty();
+        let query_is_path = query_reads_as_path(&query, self.source.is_authority());
 
         let browse_root = self.browse_root.clone();
-        let can_go_up = browse_root
-            .as_ref()
-            .and_then(|path| path.parent())
-            .is_some();
+        let can_go_up = self.parent.is_some();
 
-        // Quick-location rail rows: home first, then mounted volumes.
-        let quick_rows: Vec<(QuickLocation, SharedString)> = {
+        // Quick-location rail rows: a local browse offers this machine's home
+        // and mounted volumes; a paired authority offers the roots it allows
+        // browsing, which is the only place its directories can be reached.
+        let quick_rows: Vec<(QuickLocation, SharedString)> = if self.source.is_authority() {
+            self.roots
+                .iter()
+                .enumerate()
+                .map(|(ix, root)| {
+                    (
+                        QuickLocation::Root(ix),
+                        SharedString::from(root.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        } else {
             let mut rows = vec![(QuickLocation::Home, SharedString::from(strings.home))];
             rows.extend(self.drives.iter().enumerate().map(|(ix, drive)| {
                 let label = drive
@@ -464,7 +589,12 @@ impl gpui::Render for DirectoryPickerDialog {
             rows
         };
         let active_location: Option<QuickLocation> = browse_root.as_ref().and_then(|root| {
-            if self.home.as_ref().is_some_and(|home| root == home) {
+            if self.source.is_authority() {
+                self.roots
+                    .iter()
+                    .position(|candidate| candidate == root)
+                    .map(QuickLocation::Root)
+            } else if self.home.as_ref().is_some_and(|home| root == home) {
                 Some(QuickLocation::Home)
             } else {
                 self.drives
@@ -474,9 +604,27 @@ impl gpui::Render for DirectoryPickerDialog {
             }
         });
 
+        // Breadcrumbs fold the authority's browse root into one crumb, so the
+        // trail can never offer a target above the boundary the runtime set.
         let breadcrumbs = browse_root
             .as_ref()
-            .map(|root| breadcrumb_segments(root, self.home.as_deref(), strings.home))
+            .map(|root| {
+                if self.source.is_authority() {
+                    let base = self
+                        .roots
+                        .iter()
+                        .filter(|candidate| root.starts_with(candidate))
+                        .max_by_key(|candidate| candidate.components().count());
+                    match base {
+                        Some(base) => {
+                            breadcrumb_segments(root, Some(base), &base.to_string_lossy())
+                        }
+                        None => breadcrumb_segments(root, None, strings.home),
+                    }
+                } else {
+                    breadcrumb_segments(root, self.home.as_deref(), strings.home)
+                }
+            })
             .unwrap_or_default();
         let last_crumb = breadcrumbs.len().saturating_sub(1);
 
@@ -645,10 +793,14 @@ impl gpui::Render for DirectoryPickerDialog {
                 let icon = match location {
                     QuickLocation::Home => IconName::CircleUser,
                     QuickLocation::Drive(_) => IconName::HardDrive,
+                    QuickLocation::Root(_) => IconName::Globe,
                 };
                 let row_key = match location {
                     QuickLocation::Home => 0usize,
                     QuickLocation::Drive(ix) => ix + 1,
+                    // Local volumes and authority roots never share a rail;
+                    // the offset keeps their row ids distinct anyway.
+                    QuickLocation::Root(ix) => ix + ROOT_QUICK_LOCATION_ROW_OFFSET,
                 };
                 h_flex()
                     .id(("directory-picker-location", row_key))
@@ -1009,6 +1161,22 @@ fn decode_mount_path(raw: &str) -> String {
     decoded
 }
 
+/// Whether a query reads as a path to navigate to rather than a filter.
+///
+/// An authority reports POSIX paths, and a Windows client would not call
+/// `/data/repo` absolute, so the leading separator decides there. `~` means
+/// this machine's home and stays a path only for a local browse.
+fn query_reads_as_path(query: &str, authority: bool) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if authority {
+        query.starts_with('/')
+    } else {
+        Path::new(query).is_absolute() || query.starts_with('~')
+    }
+}
+
 /// Expands a leading `~` in a search query to the user home.
 fn expand_query(query: &str, home: Option<&Path>) -> String {
     if query == "~" {
@@ -1089,5 +1257,45 @@ mod tests {
         assert_eq!(expand_query("~/docs", Some(home)), "/home/ada/docs");
         assert_eq!(expand_query("/opt", Some(home)), "/opt");
         assert_eq!(expand_query("~", None), "");
+    }
+
+    #[test]
+    fn query_reads_as_path_follows_the_browsed_filesystem() {
+        // Local: this machine's absolute paths and its home shorthand.
+        assert!(query_reads_as_path("/opt/vibex", false));
+        assert!(query_reads_as_path("~/docs", false));
+        assert!(!query_reads_as_path("", false));
+        assert!(!query_reads_as_path("vibex", false));
+        // Authority: its POSIX paths stay paths even on a Windows client,
+        // while `~` keeps meaning this machine's home and only filters there.
+        assert!(query_reads_as_path("/data/repos", true));
+        assert!(!query_reads_as_path("~/docs", true));
+        assert!(!query_reads_as_path("", true));
+        assert!(!query_reads_as_path("repos", true));
+    }
+
+    #[test]
+    fn breadcrumb_segments_fold_an_authority_root_into_one_crumb() {
+        let crumbs = breadcrumb_segments(
+            Path::new("/data/repos/vibex"),
+            Some(Path::new("/data/repos")),
+            "/data/repos",
+        );
+        assert_eq!(
+            crumbs
+                .iter()
+                .map(|crumb| crumb.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/data/repos"), Path::new("/data/repos/vibex")]
+        );
+        let labels: Vec<&str> = crumbs.iter().map(|crumb| crumb.label.as_ref()).collect();
+        assert_eq!(labels, vec!["/data/repos", "vibex"]);
+    }
+
+    #[test]
+    fn breadcrumb_segments_at_an_authority_root_show_single_crumb() {
+        let crumbs = breadcrumb_segments(Path::new("/data"), Some(Path::new("/data")), "/data");
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(crumbs[0].label.as_ref(), "/data");
     }
 }

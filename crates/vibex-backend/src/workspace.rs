@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use vibex_core::{OpenWorkspaceRequest, ProjectId, ProjectRecord, WorkspaceId, WorkspaceRecord};
+use vibex_core::{
+    OpenWorkspaceRequest, ProjectId, ProjectRecord, RemoteWorkspaceDirectoryListing, WorkspaceId,
+    WorkspaceRecord,
+};
 
 use crate::{BackendBound, BackendFuture, MutationRequest};
 
@@ -38,6 +41,23 @@ pub trait WorkspaceBackend: BackendBound {
             Err(crate::BackendError::unsupported(
                 "temporary_session_root_unavailable",
                 "temporary session roots are unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Lists one directory of the authority's filesystem, so a paired client
+    /// can pick a project root that exists where the Agent runs instead of
+    /// one that only exists on the machine in front of the user. The
+    /// authority bounds the listing with its configured browse roots;
+    /// `path` of `None` lists the first root.
+    fn browse_authority_directories(
+        &self,
+        _path: Option<String>,
+    ) -> BackendFuture<'_, RemoteWorkspaceDirectoryListing> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "directory_browse_unavailable",
+                "this backend cannot browse the authority's directories",
             ))
         })
     }

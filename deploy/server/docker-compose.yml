@@ -21,6 +21,12 @@ services:
       VIBEX_DB_PATH: /data/vibex.db
       VIBEX_APPLICATION_ID: dev.vibex.server
 
+      # Directories a paired client may browse when it picks a project. Unset
+      # keeps the runtime home, the only path this compose file persists; add
+      # each mounted repository path (for example /data:/data/repos) so the
+      # desktop and mobile pickers can reach it.
+      VIBEX_WORKSPACE_ROOTS: ${VIBEX_WORKSPACE_ROOTS:-}
+
       # Listener. The container default is loopback HTTP; a cloud deployment
       # MUST override VIBEX_DEPLOYMENT_MODE=public and choose one of:
       #   VIBEX_TLS_MODE=trusted_https_proxy (Caddy profile below terminates

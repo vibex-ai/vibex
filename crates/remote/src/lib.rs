@@ -59,12 +59,13 @@ use vibex_core::{
     RemoteSidebarOrganizationResponse, RemoteSidebarOrganizationSnapshot,
     RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
-    RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
-    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootResponse, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
-    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
-    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteWorkbenchBrowseDirectoriesResponse, RemoteWorkbenchDeleteProjectResponse,
+    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesResponse,
+    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest,
+    RemoteWorkbenchTemporarySessionRootResponse, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession,
+    TerminalStatus, TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus,
+    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -601,6 +602,11 @@ pub struct RemoteWorkbenchRuntime {
     /// Derived from the database location, so it follows the runtime home
     /// rather than the operating system's temporary directory.
     temp_session_root: PathBuf,
+    /// Directories a paired client may browse before it proposes a workspace
+    /// root. Defaults to the runtime home, the only path the documented
+    /// container deployment persists; deployments that mount repositories
+    /// elsewhere widen it through `VIBEX_WORKSPACE_ROOTS`.
+    browse_roots: Vec<PathBuf>,
     terminals: TerminalManager,
     worktrees: Option<Arc<dyn RemoteWorktreeSnapshotSource>>,
     worktree_lifecycle: Option<Arc<dyn RemoteWorktreeLifecycleSource>>,
@@ -610,9 +616,14 @@ impl RemoteWorkbenchRuntime {
     pub fn new(db_path: impl Into<PathBuf>, terminals: TerminalManager) -> Self {
         let db_path = db_path.into();
         let temp_session_root = temporary_session_root_for_database(&db_path);
+        let browse_roots = db_path
+            .parent()
+            .map(|home| vec![home.to_path_buf()])
+            .unwrap_or_default();
         Self {
             db_path,
             temp_session_root,
+            browse_roots,
             terminals,
             worktrees: None,
             worktree_lifecycle: None,
@@ -628,6 +639,19 @@ impl RemoteWorkbenchRuntime {
 
     pub fn temp_session_root(&self) -> &Path {
         &self.temp_session_root
+    }
+
+    /// Overrides the directories a paired client may browse. An empty list
+    /// keeps the runtime home derived from the database.
+    pub fn with_browse_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        if !roots.is_empty() {
+            self.browse_roots = roots;
+        }
+        self
+    }
+
+    pub fn browse_roots(&self) -> &[PathBuf] {
+        &self.browse_roots
     }
 
     pub fn with_worktree_snapshot_source(
@@ -4968,6 +4992,136 @@ fn ensure_temporary_session_root(root: &Path) -> VibexResult<String> {
         })
 }
 
+/// Lists one directory a paired client may browse on the authority host.
+///
+/// Browsing is bounded by the runtime's configured browse roots: the client
+/// supplies a path, the authority resolves it and refuses anything that
+/// canonicalizes outside those roots, so a paired device cannot walk the
+/// authority's filesystem. The client never has to know a path in advance,
+/// which is what makes the picker usable against a container whose mount
+/// namespace differs from the machine that drives it.
+fn browse_authority_directories(
+    runtime: &RemoteWorkbenchRuntime,
+    requested: Option<&str>,
+) -> VibexResult<vibex_core::RemoteWorkspaceDirectoryListing> {
+    let roots = resolved_browse_roots(runtime.browse_roots())?;
+    let target = match requested.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => roots[0].clone(),
+    };
+    let canonical = target.canonicalize().map_err(|error| {
+        VibexError::validation(
+            "remote_directory_unavailable",
+            "the requested directory does not exist on the authority host",
+        )
+        .with_recovery_hint("Choose one of the listed browse roots, or a directory inside one")
+        .with_diagnostic("error", error.to_string())
+    })?;
+    if !canonical.is_dir() {
+        return Err(VibexError::validation(
+            "remote_directory_not_directory",
+            "the requested path is not a directory on the authority host",
+        )
+        .with_recovery_hint("Choose one of the listed browse roots, or a directory inside one"));
+    }
+    let root = roots
+        .iter()
+        .find(|root| canonical.starts_with(root))
+        .ok_or_else(|| {
+            VibexError::validation(
+                "remote_directory_outside_roots",
+                "the requested directory is outside the authority's browse roots",
+            )
+            .with_recovery_hint("Browse one of the roots the runtime exposes")
+        })?;
+    let entries = list_browse_directories(&canonical)?;
+    let parent = (canonical != *root)
+        .then(|| canonical.parent().map(Path::to_path_buf))
+        .flatten()
+        .filter(|parent| parent.starts_with(root))
+        .map(|parent| parent.to_string_lossy().into_owned());
+    Ok(vibex_core::RemoteWorkspaceDirectoryListing {
+        roots: roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+        path: canonical.to_string_lossy().into_owned(),
+        parent,
+        entries,
+    })
+}
+
+/// Canonical browse roots, in configuration order. A root that cannot be
+/// resolved yet (a volume that is not mounted) simply matches nothing until it
+/// appears, so an unavailable mount cannot widen the boundary.
+fn resolved_browse_roots(roots: &[PathBuf]) -> VibexResult<Vec<PathBuf>> {
+    let resolved: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect();
+    if resolved.is_empty() {
+        return Err(VibexError::capability(
+            "remote_directory_browse_unavailable",
+            "this runtime has no directory browse roots configured",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Subdirectories of `root`, hidden entries excluded and sorted
+/// case-insensitively, so an authority-side browse reads exactly like the
+/// desktop's local picker.
+///
+/// Entry paths stay lexically inside `root`: a symlinked directory keeps its
+/// in-root path, and following it later re-runs the same root check instead of
+/// smuggling an out-of-root path into the listing.
+fn list_browse_directories(
+    root: &Path,
+) -> VibexResult<Vec<vibex_core::RemoteWorkspaceDirectoryEntry>> {
+    let read_dir = std::fs::read_dir(root).map_err(|error| {
+        VibexError::storage(
+            "remote_directory_list_failed",
+            "the requested directory could not be listed",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let mut entries = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A symlinked directory is browsable; a broken link fails `metadata`
+        // and is skipped rather than failing the listing.
+        let is_dir = if file_type.is_symlink() {
+            entry
+                .path()
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        entries.push(vibex_core::RemoteWorkspaceDirectoryEntry {
+            name,
+            path: entry.path().to_string_lossy().into_owned(),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
 /// How the workspace a remote client asked for relates to the workspaces the
 /// authority published.
 enum RequestedWorkspace {
@@ -5208,6 +5362,18 @@ async fn dispatch_workbench_request(
             let connection = open_migrated_database(&runtime.db_path)?;
             WorkspaceRepository::ensure(&connection, &root, WorkspaceMode::CurrentCheckout)?;
             serde_json::to_value(RemoteWorkbenchTemporarySessionRootResponse { root })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteWorkbenchRequest::BrowseDirectories(request) => {
+            authorize_workbench_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProject,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let listing = browse_authority_directories(runtime, request.path.as_deref())?;
+            serde_json::to_value(RemoteWorkbenchBrowseDirectoriesResponse { listing })
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::DeleteWorkspace(request) => {
@@ -6647,14 +6813,14 @@ mod tests {
         RemoteProviderHealthSummaryListRequest, RemoteProviderInjectionPreviewRequest,
         RemoteProviderProfileListRequest, RemoteProviderProfileListResponse, RemoteProviderRequest,
         RemoteProviderRunHealthProbesRequest, RemoteProviderRunHealthProbesResponse,
-        RemoteTerminalWriteRequest, RemoteWorkbenchRequest, RuntimeAttachmentSnapshot,
-        RuntimeAttachmentStatus, RuntimeClientId, RuntimeLeaseRole, RuntimeLeaseRoleCounts,
-        RuntimeMaterializationStatus, RuntimeOptionAvailability, RuntimeProcessId,
-        RuntimeProcessSnapshot, RuntimeSelectionInteraction, RuntimeSwitchId,
-        SendAgentMessageRequest, SessionConfigValue, SessionRuntimeOption,
-        SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-        TerminalId, TerminalSession, TerminalStatus, TerminalWriteRequest, WorkspaceMode,
-        unix_timestamp_ms,
+        RemoteTerminalWriteRequest, RemoteWorkbenchBrowseDirectoriesRequest,
+        RemoteWorkbenchRequest, RuntimeAttachmentSnapshot, RuntimeAttachmentStatus,
+        RuntimeClientId, RuntimeLeaseRole, RuntimeLeaseRoleCounts, RuntimeMaterializationStatus,
+        RuntimeOptionAvailability, RuntimeProcessId, RuntimeProcessSnapshot,
+        RuntimeSelectionInteraction, RuntimeSwitchId, SendAgentMessageRequest, SessionConfigValue,
+        SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+        SetDesiredAgentSessionRuntimeRequest, TerminalId, TerminalSession, TerminalStatus,
+        TerminalWriteRequest, WorkspaceMode, unix_timestamp_ms,
     };
     use vibex_core::{
         ProviderHealthProbeKind, ProviderInjectionPreviewRequest, ProviderOptions,
@@ -8561,6 +8727,46 @@ mod tests {
         cleanup_workspace(workspace_root);
     }
 
+    /// Directory browsing rides the workbench RPC as a read: a paired device —
+    /// including a read-only one — may list the authority's browse roots, and
+    /// the answer is the same listing the picker renders.
+    #[tokio::test]
+    async fn remote_workbench_read_only_browses_authority_directories() {
+        let (db_path, manager) = test_agent_manager("workbench-browse");
+        let browse_root = temp_workspace_root("browse");
+        std::fs::create_dir_all(browse_root.join("projects")).unwrap();
+        let auth = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let router = build_router_with_agent_and_workbench(
+            RemoteServiceConfig::loopback_disabled(),
+            manager,
+            RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new())
+                .with_browse_roots(vec![browse_root.clone()]),
+        );
+
+        let response = post_workbench(
+            router,
+            RemoteOperationKind::WorkspaceFile,
+            RemoteWorkbenchRequest::BrowseDirectories(RemoteWorkbenchBrowseDirectoriesRequest {
+                auth,
+                path: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status, RemoteEnvelopeStatus::Ok);
+        let payload: RemoteWorkbenchBrowseDirectoriesResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(
+            payload.listing.path,
+            browse_root.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(payload.listing.entries[0].name, "projects");
+
+        cleanup_db(db_path);
+        cleanup_workspace(browse_root);
+    }
+
     #[tokio::test]
     async fn remote_workbench_workspace_delete_is_full_control_only_and_removes_listing() {
         let (db_path, manager) = test_agent_manager("workbench-delete");
@@ -9863,6 +10069,136 @@ mod tests {
             device_id: claimed.device.device_id,
             auth_token: claimed.auth_token,
         }
+    }
+
+    /// A paired client browses the authority's directories inside the roots the
+    /// runtime was configured with: directories only, hidden entries excluded,
+    /// and a boundary the client cannot climb above.
+    #[test]
+    fn authority_directory_browse_stays_inside_the_configured_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        std::fs::create_dir_all(projects.join("vibex")).unwrap();
+        std::fs::create_dir_all(root.path().join("Alpha")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not a directory").unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+
+        let runtime = RemoteWorkbenchRuntime::new(temp_db_path("browse"), TerminalManager::new())
+            .with_browse_roots(vec![root.path().to_path_buf()]);
+
+        let listing = browse_authority_directories(&runtime, None).unwrap();
+        assert_eq!(listing.path, canonical_root.to_string_lossy());
+        assert_eq!(listing.roots, vec![canonical_root.to_string_lossy()]);
+        assert!(
+            listing.parent.is_none(),
+            "the first browse root is the top of the boundary"
+        );
+        let names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "projects"]);
+
+        let nested =
+            browse_authority_directories(&runtime, Some(&projects.to_string_lossy())).unwrap();
+        assert_eq!(
+            nested.path,
+            projects.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            nested.parent.as_deref(),
+            Some(canonical_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(nested.entries.len(), 1);
+        assert_eq!(nested.entries[0].name, "vibex");
+        assert_eq!(
+            nested.entries[0].path,
+            projects
+                .join("vibex")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+    }
+
+    /// The boundary is a property of the authority, not of the request: a
+    /// paired device cannot talk its way out of the configured roots, and the
+    /// rejection never names a path it was not allowed to see.
+    #[test]
+    fn authority_directory_browse_refuses_paths_outside_its_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not a directory").unwrap();
+        let runtime =
+            RemoteWorkbenchRuntime::new(temp_db_path("browse-bound"), TerminalManager::new())
+                .with_browse_roots(vec![root.path().to_path_buf()]);
+
+        let escaped =
+            browse_authority_directories(&runtime, Some(&outside.path().to_string_lossy()))
+                .unwrap_err();
+        assert_eq!(escaped.code, "remote_directory_outside_roots");
+        assert!(
+            !escaped
+                .message
+                .contains(&outside.path().to_string_lossy().to_string()),
+            "the rejection must not echo an out-of-root path"
+        );
+
+        let missing =
+            browse_authority_directories(&runtime, Some("/vibex-browse-missing-root-sentinel"))
+                .unwrap_err();
+        assert_eq!(missing.code, "remote_directory_unavailable");
+
+        let file = browse_authority_directories(
+            &runtime,
+            Some(&root.path().join("notes.txt").to_string_lossy()),
+        )
+        .unwrap_err();
+        assert_eq!(file.code, "remote_directory_not_directory");
+    }
+
+    /// A symlinked directory is visible from inside the root, but following it
+    /// re-runs the boundary check against the resolved target.
+    #[cfg(unix)]
+    #[test]
+    fn authority_directory_browse_refuses_a_symlink_out_of_its_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let runtime =
+            RemoteWorkbenchRuntime::new(temp_db_path("browse-link"), TerminalManager::new())
+                .with_browse_roots(vec![root.path().to_path_buf()]);
+
+        let listing = browse_authority_directories(&runtime, None).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "escape");
+        assert!(
+            Path::new(&listing.entries[0].path).starts_with(root.path().canonicalize().unwrap()),
+            "the listing keeps the in-root path so following it is re-checked"
+        );
+
+        let escaped =
+            browse_authority_directories(&runtime, Some(&listing.entries[0].path)).unwrap_err();
+        assert_eq!(escaped.code, "remote_directory_outside_roots");
+    }
+
+    /// Without an explicit contract the runtime home stays the only browsable
+    /// path, which is also the only path the documented container deployment
+    /// persists.
+    #[test]
+    fn authority_directory_browse_defaults_to_the_runtime_home() {
+        let db_path = temp_db_path("browse-default");
+        let runtime = RemoteWorkbenchRuntime::new(db_path.clone(), TerminalManager::new());
+        assert_eq!(
+            runtime.browse_roots(),
+            [db_path.parent().unwrap().to_path_buf()]
+        );
+        assert_eq!(
+            runtime.clone().with_browse_roots(Vec::new()).browse_roots(),
+            [db_path.parent().unwrap().to_path_buf()]
+        );
     }
 
     fn temp_db_path(label: &str) -> PathBuf {

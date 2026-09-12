@@ -153,7 +153,7 @@ use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
-use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
+use crate::directory_picker::{DirectoryBrowseTarget, DirectoryPickHandler, DirectoryPickerDialog};
 use crate::glass;
 use crate::gpui_ext::button_with_aria_label;
 use crate::image_editor::{
@@ -17351,11 +17351,29 @@ impl VibexWorkbench {
         }
         let locale_mode = self.ui_state.appearance.locale;
         let workbench = cx.weak_entity();
+        // A paired authority owns the directories an Agent can run in, so the
+        // picker browses the runtime instead of this machine. An authority
+        // that predates the browse capability keeps the local picker.
+        let source = match &self.backend {
+            Some(backend)
+                if self.remote_client.is_some()
+                    && backend
+                        .capabilities()
+                        .workspace
+                        .supports(BackendOperation::WorkspaceBrowseDirectories) =>
+            {
+                DirectoryBrowseTarget::Authority(backend.clone())
+            }
+            _ => DirectoryBrowseTarget::Local,
+        };
+        let remote = source.is_authority();
         // Start at the selected project's root when there is one, so the
-        // common "sibling of the current project" case is one step away.
+        // common "sibling of the current project" case is one step away. A
+        // remote root is only known to exist on the authority, which answers
+        // the first listing either way, so it is never pre-checked here.
         let initial_dir = {
             let project_root = self.new_session_workspace.project_root.trim();
-            (!project_root.is_empty() && Path::new(project_root).is_dir())
+            (!project_root.is_empty() && (remote || Path::new(project_root).is_dir()))
                 .then(|| PathBuf::from(project_root))
         };
         let on_pick: DirectoryPickHandler = Arc::new(move |root_path, window, cx| {
@@ -17365,9 +17383,18 @@ impl VibexWorkbench {
                 })
                 .is_ok()
         });
-        let dialog_view: Entity<DirectoryPickerDialog> =
-            cx.new(|cx| DirectoryPickerDialog::new(locale_mode, initial_dir, on_pick, window, cx));
-        let title = locale::text("Choose project directory", "选择项目目录", "選擇專案目錄");
+        let dialog_view: Entity<DirectoryPickerDialog> = cx.new(|cx| {
+            DirectoryPickerDialog::new(locale_mode, initial_dir, source, on_pick, window, cx)
+        });
+        let title = if remote {
+            locale::text(
+                "Choose project directory on the paired runtime",
+                "选择已配对运行时上的项目目录",
+                "選擇已配對執行階段上的專案目錄",
+            )
+        } else {
+            locale::text("Choose project directory", "选择项目目录", "選擇專案目錄")
+        };
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 48.0).clamp(420.0, 640.0);
         let dialog_height = (f32::from(viewport.height) - 48.0).clamp(1.0, 520.0);

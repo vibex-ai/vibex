@@ -212,6 +212,12 @@ pub struct DesktopRuntimeConfig {
     pub agent_uv_runtime: AgentUvRuntimeOptions,
     pub acquire_home_lock: bool,
     pub remote_gateway: RemoteGatewayConfig,
+    /// Directories a paired client may browse before it proposes a workspace
+    /// root. Defaults to the runtime home — the only path the documented
+    /// container deployment persists — and is widened through
+    /// `VIBEX_WORKSPACE_ROOTS` for deployments that mount repositories
+    /// elsewhere.
+    pub workspace_browse_roots: Vec<PathBuf>,
     /// Executable used for the session-scoped delegation MCP sidecar. `None`
     /// keeps isolated/test runtimes from exposing a subprocess entry point.
     pub delegation_sidecar_command: Option<PathBuf>,
@@ -342,6 +348,7 @@ impl DesktopRuntimeConfig {
                 },
             );
         }
+        let workspace_browse_roots = parse_workspace_browse_roots(&home_dir)?;
         Ok(Self {
             mode: DesktopRuntimeMode::Headless,
             application_id: environment_string("VIBEX_APPLICATION_ID")
@@ -355,6 +362,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: environment_bool("VIBEX_ACQUIRE_HOME_LOCK").unwrap_or(true),
             remote_gateway,
+            workspace_browse_roots,
             delegation_sidecar_command: std::env::var_os("VIBEX_DELEGATION_SIDECAR_COMMAND")
                 .map(PathBuf::from),
         })
@@ -371,6 +379,7 @@ impl DesktopRuntimeConfig {
                     "desktop database path has no runtime home parent",
                 )
             })?;
+        let workspace_browse_roots = vec![home_dir.clone()];
         Ok(Self {
             mode: DesktopRuntimeMode::Stable,
             application_id: STABLE_DESKTOP_APP_ID.to_string(),
@@ -382,12 +391,14 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            workspace_browse_roots,
             delegation_sidecar_command: None,
         })
     }
 
     pub fn isolated_preview(base_home: impl AsRef<Path>) -> Self {
         let home_dir = base_home.as_ref().join(PREVIEW_HOME_DIRECTORY);
+        let workspace_browse_roots = vec![home_dir.clone()];
         Self {
             mode: DesktopRuntimeMode::Preview,
             application_id: PREVIEW_APP_ID.to_string(),
@@ -399,6 +410,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            workspace_browse_roots,
             delegation_sidecar_command: None,
         }
     }
@@ -412,6 +424,7 @@ impl DesktopRuntimeConfig {
     /// intentionally no helper that silently promotes it to the stable home.
     pub fn isolated_release_candidate(base_home: impl AsRef<Path>) -> Self {
         let home_dir = base_home.as_ref().join(RC_HOME_DIRECTORY);
+        let workspace_browse_roots = vec![home_dir.clone()];
         Self {
             mode: DesktopRuntimeMode::ReleaseCandidate,
             application_id: RC_APP_ID.to_string(),
@@ -423,6 +436,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            workspace_browse_roots,
             delegation_sidecar_command: None,
         }
     }
@@ -437,6 +451,7 @@ impl DesktopRuntimeConfig {
     /// channel over the same data.
     pub fn isolated_release_stable(base_home: impl AsRef<Path>) -> Self {
         let home_dir = base_home.as_ref().join(RELEASE_STABLE_HOME_DIRECTORY);
+        let workspace_browse_roots = vec![home_dir.clone()];
         Self {
             mode: DesktopRuntimeMode::ReleaseStable,
             application_id: STABLE_DESKTOP_APP_ID.to_string(),
@@ -448,6 +463,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            workspace_browse_roots,
             delegation_sidecar_command: None,
         }
     }
@@ -459,6 +475,7 @@ impl DesktopRuntimeConfig {
 
     pub fn isolated_test(home_dir: impl Into<PathBuf>) -> Self {
         let home_dir = home_dir.into();
+        let workspace_browse_roots = vec![home_dir.clone()];
         Self {
             mode: DesktopRuntimeMode::Preview,
             application_id: "dev.vibex.desktop.test".to_string(),
@@ -470,6 +487,7 @@ impl DesktopRuntimeConfig {
             agent_uv_runtime: AgentUvRuntimeOptions::default(),
             acquire_home_lock: true,
             remote_gateway: RemoteGatewayConfig::default(),
+            workspace_browse_roots,
             delegation_sidecar_command: None,
         }
     }
@@ -497,6 +515,19 @@ impl DesktopRuntimeConfig {
             return Err(VibexError::validation(
                 "desktop_runtime_database_outside_home",
                 "desktop runtime database must be contained by its selected home",
+            ));
+        }
+        if self.workspace_browse_roots.is_empty()
+            || self.workspace_browse_roots.iter().any(|root| {
+                !root.is_absolute()
+                    || root
+                        .components()
+                        .any(|component| component == Component::ParentDir)
+            })
+        {
+            return Err(VibexError::validation(
+                "desktop_runtime_browse_root_invalid",
+                "workspace browse roots must be absolute paths without parent traversal",
             ));
         }
         match self.mode {
@@ -578,6 +609,45 @@ fn required_environment_path(name: &str) -> VibexResult<PathBuf> {
             format!("{name} must be set when server TLS is enabled"),
         )
     })
+}
+
+/// Directories a paired client may browse before it proposes a workspace root.
+///
+/// Defaults to the runtime home — the only path the documented container
+/// deployment persists — and is widened with `VIBEX_WORKSPACE_ROOTS`. Entries
+/// must be absolute: a daemon's working directory is not a stable base for a
+/// deployment contract, and a relative root would silently move with it.
+fn parse_workspace_browse_roots(home_dir: &Path) -> VibexResult<Vec<PathBuf>> {
+    configured_browse_roots(environment_list("VIBEX_WORKSPACE_ROOTS"), home_dir)
+}
+
+/// Validates the configured entries and keeps them in declaration order.
+fn configured_browse_roots(
+    configured: Option<Vec<String>>,
+    home_dir: &Path,
+) -> VibexResult<Vec<PathBuf>> {
+    let Some(configured) = configured else {
+        return Ok(vec![home_dir.to_path_buf()]);
+    };
+    let mut roots: Vec<PathBuf> = Vec::with_capacity(configured.len());
+    for value in configured {
+        let root = PathBuf::from(&value);
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(VibexError::validation(
+                "workspace_browse_root_invalid",
+                "VIBEX_WORKSPACE_ROOTS entries must be absolute paths without parent traversal",
+            )
+            .with_diagnostic("entry", value));
+        }
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
 }
 
 fn parse_deployment_mode(value: &str) -> VibexResult<RemoteGatewayDeploymentMode> {
@@ -2216,6 +2286,7 @@ impl DesktopRuntime {
             runtime_lifecycle.clone(),
             message_submission.clone(),
             RemoteWorkbenchRuntime::new(db_path.clone(), terminals.clone())
+                .with_browse_roots(config.workspace_browse_roots.clone())
                 .with_worktree_snapshot_source(Arc::new(git.clone()))
                 .with_worktree_lifecycle_source(Arc::new(git.clone())),
         );
@@ -3682,6 +3753,40 @@ mod tests {
         assert!(background.contains("tasks.push(tokio::spawn(async move"));
         assert!(background.contains("runtime_selection.reconcile_on_startup()"));
         assert!(background.contains("message_submission.reconcile_on_startup()"));
+    }
+
+    #[test]
+    fn workspace_browse_roots_default_to_the_runtime_home_and_reject_unsafe_entries() {
+        let home = Path::new("/data");
+        assert_eq!(
+            configured_browse_roots(None, home).unwrap(),
+            vec![PathBuf::from("/data")]
+        );
+        assert_eq!(
+            configured_browse_roots(
+                Some(vec![
+                    "/data".to_string(),
+                    "/data/repos".to_string(),
+                    "/data".to_string(),
+                ]),
+                home,
+            )
+            .unwrap(),
+            vec![PathBuf::from("/data"), PathBuf::from("/data/repos")],
+            "entries keep declaration order and collapse duplicates"
+        );
+
+        for entry in ["repos", "./repos", "/data/../etc", "/data/repos/.."] {
+            let error = configured_browse_roots(Some(vec![entry.to_string()]), home)
+                .expect_err("an unusable browse root must fail the runtime config");
+            assert_eq!(error.code, "workspace_browse_root_invalid");
+            assert!(
+                error
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.key == "entry" && diagnostic.value == entry)
+            );
+        }
     }
 
     #[test]

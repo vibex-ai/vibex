@@ -196,6 +196,7 @@ match `VIBEX_ALLOWED_ORIGINS` (`403` otherwise). Native clients send no
 | --- | --- | --- |
 | `VIBEX_HOME` | `/data` | Runtime home; database, agent installs, identity keys. |
 | `VIBEX_DB_PATH` | `$VIBEX_HOME/vibex.db` | Authoritative SQLite path. |
+| `VIBEX_WORKSPACE_ROOTS` | `$VIBEX_HOME` | Comma-separated absolute directories a paired client may browse when it picks a project. Entries must be absolute; a mount that is not there yet simply matches nothing until it appears. |
 | `VIBEX_BIND_ADDR` | `127.0.0.1:8765` | Gateway listener address. |
 | `VIBEX_DEPLOYMENT_MODE` | `loopback` | `loopback`, `lan`, or `public`. |
 | `VIBEX_TLS_MODE` | `loopback_http` for loopback, `trusted_https_proxy` otherwise | `loopback_http`, `trusted_https_proxy`, `pinned_certificate`, `server_certificate`. |
@@ -267,6 +268,14 @@ remain client-side.
   unmounted volume, a removed checkout) cannot start sessions: clients report
   it as `remote_agent_workspace_root_missing`, and the operator either restores
   the directory or deletes the stale workspace from a client.
+- A paired client picks a project directory through the runtime, not through
+  its own machine: **Choose another directory** browses the authority over
+  Remote v2, and the browse stays inside `VIBEX_WORKSPACE_ROOTS` (the runtime
+  home by default). To work on a repository that lives on the host, mount it
+  into the container and add the **container** path to the list, for example
+  `- /srv/repos:/data/repos` together with
+  `VIBEX_WORKSPACE_ROOTS=/data:/data/repos`. The picker then lists `/data` and
+  `/data/repos` under **Places** and opens any project inside them.
 - Back up `/data` (database + `relay/desktop-identity.json`): losing the
   identity key forces every device to re-pair.
 - Keep the database and TLS keys owned by the runtime user; the container

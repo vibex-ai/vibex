@@ -106,20 +106,21 @@ use vibex_core::{
     RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
     RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
     RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse, RemoteWorkbenchDeleteProjectRequest,
-    RemoteWorkbenchDeleteWorkspaceRequest, RemoteWorkbenchDeleteWorkspaceResponse,
-    RemoteWorkbenchListWorkspacesRequest, RemoteWorkbenchListWorkspacesResponse,
-    RemoteWorkbenchOpenWorkspaceRequest, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootRequest,
-    RemoteWorkbenchTemporarySessionRootResponse, RenameAgentSessionRequest,
-    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem, TimelineLiveEvent,
-    TimelinePage, VibexSessionId, WorkspaceId,
+    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse,
+    RemoteWorkbenchBrowseDirectoriesRequest, RemoteWorkbenchBrowseDirectoriesResponse,
+    RemoteWorkbenchDeleteProjectRequest, RemoteWorkbenchDeleteWorkspaceRequest,
+    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesRequest,
+    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceRequest,
+    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest,
+    RemoteWorkbenchTemporarySessionRootRequest, RemoteWorkbenchTemporarySessionRootResponse,
+    RemoteWorkspaceDirectoryListing, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
+    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::binary::{
@@ -1885,6 +1886,33 @@ impl WorkspaceBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteWorkbenchTemporarySessionRootResponse>(value)?.root)
+        })
+    }
+
+    fn browse_authority_directories(
+        &self,
+        path: Option<String>,
+    ) -> BackendFuture<'_, RemoteWorkspaceDirectoryListing> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteWorkbenchRequest::BrowseDirectories(
+                RemoteWorkbenchBrowseDirectoriesRequest {
+                    auth: this.auth(),
+                    path,
+                },
+            );
+            // A read: no request id and no mutation contract, so a retry after
+            // a dropped response is safe and nothing is cached per path.
+            let value = this
+                .rpc(
+                    RemoteOperationKind::WorkspaceFile,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteWorkbenchBrowseDirectoriesResponse>(value)?.listing)
         })
     }
 
@@ -6063,6 +6091,10 @@ fn remote_capabilities_for_grant(
                     permits(RemoteActionClass::ReadProject),
                 ),
                 (
+                    BackendOperation::WorkspaceBrowseDirectories,
+                    permits(RemoteActionClass::ReadProject),
+                ),
+                (
                     BackendOperation::WorkspaceDelete,
                     permits(RemoteActionClass::MutateFile),
                 ),
@@ -6739,6 +6771,12 @@ mod tests {
         let full = remote_capabilities(Some(&full_control_server_info(&["workspace_file"])));
         assert!(full.workspace.supports(BackendOperation::WorkspaceList));
         assert!(full.workspace.supports(BackendOperation::WorkspaceDelete));
+        // Browsing is a read of the authority's own namespace, so it follows
+        // `ReadProject` rather than the mutation permission.
+        assert!(
+            full.workspace
+                .supports(BackendOperation::WorkspaceBrowseDirectories)
+        );
 
         let mut read_only = full_control_server_info(&["workspace_file"]);
         read_only.device_permissions = vibex_core::remote_permissions_for_level(
@@ -6749,6 +6787,11 @@ mod tests {
             read_only
                 .workspace
                 .supports(BackendOperation::WorkspaceList)
+        );
+        assert!(
+            read_only
+                .workspace
+                .supports(BackendOperation::WorkspaceBrowseDirectories)
         );
         assert!(
             !read_only
