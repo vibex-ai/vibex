@@ -397,6 +397,196 @@ pub struct SidebarUiState {
     pub worktree_titles: BTreeMap<String, String>,
     #[serde(default)]
     pub organization: SidebarOrganizationState,
+    /// Runtime authority that owns the arrangement in the fields above.
+    /// `None` means the embedded runtime ([`SidebarUiState::LOCAL_AUTHORITY`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement_authority: Option<String>,
+    /// Arrangements parked for the other runtime authorities, keyed by
+    /// authority. Nothing here is rendered; a parked arrangement is restored
+    /// when the client returns to that authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authority_arrangements: BTreeMap<String, SidebarAuthorityArrangement>,
+}
+
+/// The sidebar arrangement owned by one runtime authority.
+///
+/// Ordering and folder ids only mean something inside the runtime that produced
+/// them: a project id from a paired server does not exist in the embedded
+/// runtime, and vice versa.  Keeping one arrangement per authority is what
+/// allows a client to alternate between its embedded runtime and a paired
+/// server without the reconcile pass of one authority deleting the other
+/// authority's order and folders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarAuthorityArrangement {
+    #[serde(default)]
+    pub project_order: Vec<String>,
+    #[serde(default)]
+    pub session_order: Vec<String>,
+    #[serde(default)]
+    pub session_order_anchored_at_ms: i64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_order: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub pinned_session_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub collapsed_project_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub collapsed_workspace_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub project_location_preferences: BTreeMap<String, NewSessionLocation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_appearances: BTreeMap<String, SidebarProjectAppearance>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktree_titles: BTreeMap<String, String>,
+    #[serde(default)]
+    pub organization: SidebarOrganizationState,
+}
+
+impl SidebarAuthorityArrangement {
+    pub fn is_empty(&self) -> bool {
+        self.project_order.is_empty()
+            && self.session_order.is_empty()
+            && self.workspace_order.is_empty()
+            && self.pinned_session_ids.is_empty()
+            && self.collapsed_project_ids.is_empty()
+            && self.collapsed_workspace_ids.is_empty()
+            && self.project_location_preferences.is_empty()
+            && self.project_appearances.is_empty()
+            && self.worktree_titles.is_empty()
+            && self.organization.folders.is_empty()
+            && self.organization.placements.is_empty()
+            && self.organization.collapsed_folder_ids.is_empty()
+    }
+}
+
+impl SidebarUiState {
+    /// Authority key for the runtime embedded in this client.
+    pub const LOCAL_AUTHORITY: &'static str = "local";
+    /// How many other authorities a client remembers arrangements for.
+    const AUTHORITY_ARRANGEMENT_LIMIT: usize = 8;
+
+    /// Authority whose arrangement is currently loaded into the live fields.
+    pub fn active_authority(&self) -> &str {
+        self.arrangement_authority
+            .as_deref()
+            .unwrap_or(Self::LOCAL_AUTHORITY)
+    }
+
+    /// Parks the live arrangement under the active authority and restores the
+    /// arrangement remembered for `authority`.
+    pub fn switch_authority(&mut self, authority: &str) {
+        let authority = authority.trim();
+        if authority.is_empty() || self.active_authority() == authority {
+            return;
+        }
+        let previous = self.active_authority().to_string();
+        let live = self.arrangement();
+        self.authority_arrangements.insert(previous, live);
+        let next = self
+            .authority_arrangements
+            .remove(authority)
+            .unwrap_or_default();
+        self.set_arrangement(next);
+        self.arrangement_authority = Some(authority.to_string());
+        self.normalize_authority_arrangements();
+    }
+
+    /// Snapshot of the authority-scoped fields.
+    pub fn arrangement(&self) -> SidebarAuthorityArrangement {
+        SidebarAuthorityArrangement {
+            project_order: self.project_order.clone(),
+            session_order: self.session_order.clone(),
+            session_order_anchored_at_ms: self.session_order_anchored_at_ms,
+            workspace_order: self.workspace_order.clone(),
+            pinned_session_ids: self.pinned_session_ids.clone(),
+            collapsed_project_ids: self.collapsed_project_ids.clone(),
+            collapsed_workspace_ids: self.collapsed_workspace_ids.clone(),
+            project_location_preferences: self.project_location_preferences.clone(),
+            project_appearances: self.project_appearances.clone(),
+            worktree_titles: self.worktree_titles.clone(),
+            organization: self.organization.clone(),
+        }
+    }
+
+    /// Replaces the authority-scoped fields with `arrangement`.
+    pub fn set_arrangement(&mut self, arrangement: SidebarAuthorityArrangement) {
+        self.project_order = arrangement.project_order;
+        self.session_order = arrangement.session_order;
+        self.session_order_anchored_at_ms = arrangement.session_order_anchored_at_ms;
+        self.workspace_order = arrangement.workspace_order;
+        self.pinned_session_ids = arrangement.pinned_session_ids;
+        self.collapsed_project_ids = arrangement.collapsed_project_ids;
+        self.collapsed_workspace_ids = arrangement.collapsed_workspace_ids;
+        self.project_location_preferences = arrangement.project_location_preferences;
+        self.project_appearances = arrangement.project_appearances;
+        self.worktree_titles = arrangement.worktree_titles;
+        self.organization = arrangement.organization;
+    }
+
+    fn normalize_authority_arrangements(&mut self) {
+        let active_authority = self.active_authority().to_string();
+        self.authority_arrangements = std::mem::take(&mut self.authority_arrangements)
+            .into_iter()
+            .filter_map(|(authority, mut arrangement)| {
+                let authority = bounded_required(&authority, 128)?;
+                if authority == active_authority {
+                    return None;
+                }
+                Self::normalize_arrangement(&mut arrangement);
+                (!arrangement.is_empty()).then_some((authority, arrangement))
+            })
+            .take(Self::AUTHORITY_ARRANGEMENT_LIMIT)
+            .collect();
+    }
+
+    fn normalize_arrangement(arrangement: &mut SidebarAuthorityArrangement) {
+        normalize_ids(&mut arrangement.project_order, 1_000);
+        normalize_ids(&mut arrangement.session_order, 2_000);
+        arrangement.session_order_anchored_at_ms =
+            arrangement.session_order_anchored_at_ms.clamp(0, i64::MAX);
+        arrangement.workspace_order = std::mem::take(&mut arrangement.workspace_order)
+            .into_iter()
+            .filter_map(|(project_id, mut workspace_ids)| {
+                let project_id = bounded_required(&project_id, 256)?;
+                normalize_ids(&mut workspace_ids, 2_000);
+                (!workspace_ids.is_empty()).then_some((project_id, workspace_ids))
+            })
+            .take(1_000)
+            .collect();
+        normalize_set(&mut arrangement.pinned_session_ids, 2_000);
+        normalize_set(&mut arrangement.collapsed_project_ids, 1_000);
+        normalize_set(&mut arrangement.collapsed_workspace_ids, 2_000);
+        arrangement.project_location_preferences =
+            std::mem::take(&mut arrangement.project_location_preferences)
+                .into_iter()
+                .filter_map(|(project_id, preference)| {
+                    bounded_required(&project_id, 256).map(|project_id| (project_id, preference))
+                })
+                .take(1_000)
+                .collect();
+        arrangement.project_appearances = std::mem::take(&mut arrangement.project_appearances)
+            .into_iter()
+            .filter_map(|(project_id, mut appearance)| {
+                let project_id = bounded_required(&project_id, 256)?;
+                appearance.custom_logo_file =
+                    bounded_optional(appearance.custom_logo_file.take(), 128)
+                        .filter(|file_name| sidebar_project_custom_logo_file_is_valid(file_name));
+                Some((project_id, appearance))
+            })
+            .take(1_000)
+            .collect();
+        arrangement.worktree_titles = std::mem::take(&mut arrangement.worktree_titles)
+            .into_iter()
+            .filter_map(|(workspace_id, title)| {
+                let workspace_id = bounded_required(&workspace_id, 256)?;
+                let title = bounded_required(&title, 160)?;
+                Some((workspace_id, title))
+            })
+            .take(2_000)
+            .collect();
+        arrangement.organization.normalize();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -695,51 +885,13 @@ impl DesktopUiStateV1 {
         self.workbench.right_rail_width =
             bounded_f32(self.workbench.right_rail_width, 224.0, 720.0, 336.0);
 
-        normalize_ids(&mut self.sidebar.project_order, 1_000);
-        normalize_ids(&mut self.sidebar.session_order, 2_000);
-        self.sidebar.session_order_anchored_at_ms =
-            self.sidebar.session_order_anchored_at_ms.clamp(0, i64::MAX);
-        self.sidebar.workspace_order = std::mem::take(&mut self.sidebar.workspace_order)
-            .into_iter()
-            .filter_map(|(project_id, mut workspace_ids)| {
-                let project_id = bounded_required(&project_id, 256)?;
-                normalize_ids(&mut workspace_ids, 2_000);
-                (!workspace_ids.is_empty()).then_some((project_id, workspace_ids))
-            })
-            .take(1_000)
-            .collect();
-        normalize_set(&mut self.sidebar.pinned_session_ids, 2_000);
-        normalize_set(&mut self.sidebar.collapsed_project_ids, 1_000);
-        normalize_set(&mut self.sidebar.collapsed_workspace_ids, 2_000);
-        self.sidebar.project_location_preferences =
-            std::mem::take(&mut self.sidebar.project_location_preferences)
-                .into_iter()
-                .filter_map(|(project_id, preference)| {
-                    bounded_required(&project_id, 256).map(|project_id| (project_id, preference))
-                })
-                .take(1_000)
-                .collect();
-        self.sidebar.project_appearances = std::mem::take(&mut self.sidebar.project_appearances)
-            .into_iter()
-            .filter_map(|(project_id, mut appearance)| {
-                let project_id = bounded_required(&project_id, 256)?;
-                appearance.custom_logo_file =
-                    bounded_optional(appearance.custom_logo_file.take(), 128)
-                        .filter(|file_name| sidebar_project_custom_logo_file_is_valid(file_name));
-                Some((project_id, appearance))
-            })
-            .take(1_000)
-            .collect();
-        self.sidebar.worktree_titles = std::mem::take(&mut self.sidebar.worktree_titles)
-            .into_iter()
-            .filter_map(|(workspace_id, title)| {
-                let workspace_id = bounded_required(&workspace_id, 256)?;
-                let title = bounded_required(&title, 160)?;
-                Some((workspace_id, title))
-            })
-            .take(2_000)
-            .collect();
-        self.sidebar.organization.normalize();
+        let mut sidebar_arrangement = self.sidebar.arrangement();
+        SidebarUiState::normalize_arrangement(&mut sidebar_arrangement);
+        self.sidebar.set_arrangement(sidebar_arrangement);
+        self.sidebar.arrangement_authority =
+            bounded_optional(self.sidebar.arrangement_authority.take(), 128)
+                .filter(|authority| !authority.trim().is_empty());
+        self.sidebar.normalize_authority_arrangements();
         normalize_ids(&mut self.preview.pinned_tab_ids, 500);
         self.preview.focused_pane_id = bounded_optional(self.preview.focused_pane_id.take(), 256);
         self.preview.split_sizes =
@@ -1486,6 +1638,94 @@ mod tests {
         let round_trip: DesktopUiStateV1 =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(round_trip.sidebar.organization, state.sidebar.organization);
+    }
+
+    #[test]
+    fn switching_authority_keeps_one_arrangement_per_runtime() {
+        let mut state = DesktopUiStateV1::default();
+        state.sidebar.project_order = vec!["project-local".into()];
+        state
+            .sidebar
+            .collapsed_project_ids
+            .insert("project-local".into());
+        assert!(state.sidebar.organization.create_folder(
+            "folder-local",
+            "Local work",
+            Some("project-local".into()),
+            None,
+        ));
+
+        state.sidebar.switch_authority("server:abc");
+        assert_eq!(state.sidebar.active_authority(), "server:abc");
+        assert!(state.sidebar.project_order.is_empty());
+        assert!(state.sidebar.organization.folders.is_empty());
+        assert!(state.sidebar.collapsed_project_ids.is_empty());
+
+        state.sidebar.project_order = vec!["project-remote".into()];
+        state
+            .sidebar
+            .switch_authority(SidebarUiState::LOCAL_AUTHORITY);
+        assert_eq!(state.sidebar.project_order, vec!["project-local"]);
+        assert!(
+            state
+                .sidebar
+                .organization
+                .folders
+                .contains_key("folder-local")
+        );
+        assert!(
+            state
+                .sidebar
+                .collapsed_project_ids
+                .contains("project-local")
+        );
+        assert_eq!(
+            state
+                .sidebar
+                .authority_arrangements
+                .get("server:abc")
+                .expect("the paired arrangement stays parked")
+                .project_order,
+            vec!["project-remote"]
+        );
+
+        // A parked arrangement survives a persist/reload cycle, and the active
+        // authority stays out of the parked map.
+        state.normalize().unwrap();
+        assert!(
+            !state
+                .sidebar
+                .authority_arrangements
+                .contains_key(SidebarUiState::LOCAL_AUTHORITY)
+        );
+        let round_trip: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.sidebar.authority_arrangements,
+            state.sidebar.authority_arrangements
+        );
+        assert_eq!(
+            round_trip.sidebar.active_authority(),
+            SidebarUiState::LOCAL_AUTHORITY
+        );
+        assert_eq!(round_trip.sidebar.project_order, vec!["project-local"]);
+    }
+
+    #[test]
+    fn legacy_sidebar_state_reads_as_the_local_authority() {
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        let sidebar = legacy["sidebar"].as_object_mut().unwrap();
+        sidebar.remove("arrangementAuthority");
+        sidebar.remove("authorityArrangements");
+        sidebar["projectOrder"] = serde_json::json!(["project-legacy"]);
+
+        let restored: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.sidebar.active_authority(),
+            SidebarUiState::LOCAL_AUTHORITY
+        );
+        assert_eq!(restored.sidebar.project_order, vec!["project-legacy"]);
+        assert!(restored.sidebar.authority_arrangements.is_empty());
     }
 
     #[test]

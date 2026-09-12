@@ -112,17 +112,18 @@ use vibex_desktop_model::{
     SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
     SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
     SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    SidebarProjectProjection, SidebarState, SidebarWorkspaceProjection, StartupDestination,
-    TerminalWorkingDirectory, ThemeMode as ModelThemeMode, ThrottledUiStateWriter,
-    TimelineConversationTurn, TimelineDelegationProjection, TimelineFollowState, TimelineModel,
-    TimelineProcessActivityGroup, TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind,
-    WorkbenchRoute, WorkspaceContextProjection, WorktreeLifecycleDisplayState,
-    active_collaborations, complete_string_order, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
-    move_strings_relative, ordered_agent_ids, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
+    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorktreeLifecycleDisplayState, active_collaborations, complete_string_order,
+    composer_trigger_at, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
@@ -230,6 +231,12 @@ impl DesktopRemoteClient {
             backend,
         })
     }
+}
+
+/// Sidebar authority key for a paired server, derived from the credential so
+/// the arrangement survives reconnects to the same runtime.
+fn remote_authority_key(credential: &DesktopRemoteCredential) -> String {
+    format!("server:{}", credential.expected_server_id)
 }
 
 struct ForkSessionNotification;
@@ -5971,6 +5978,10 @@ impl VibexWorkbench {
                             } else {
                                 this.ui_writer = None;
                             }
+                            // Sidebar order and folder ids are authority-scoped:
+                            // restore the embedded runtime's arrangement before
+                            // any project list can be reconciled against it.
+                            this.activate_sidebar_authority(SidebarUiState::LOCAL_AUTHORITY, cx);
                             if let Some(note) = persistence_note {
                                 this.persistence_note = Some(note);
                             }
@@ -6717,8 +6728,10 @@ impl VibexWorkbench {
     /// slots the native path fills, so no view is aware of the transport.
     fn install_remote_client(&mut self, client: DesktopRemoteClient, cx: &mut Context<Self>) {
         let backend = client.backend.clone();
-        self.runtime = None;
+        let sidebar_authority = remote_authority_key(&client.credential);
+        self.retire_local_runtime(cx);
         self.remote_client = Some(client);
+        self.activate_sidebar_authority(&sidebar_authority, cx);
         let facade = backend.facade();
         self.shared_workflow = Some(AgentFileGitController::from_facade(&facade));
         self.shared_terminal = Some(TerminalWorkflowController::new(
@@ -6770,6 +6783,10 @@ impl VibexWorkbench {
         credential: DesktopRemoteCredential,
         cx: &mut Context<Self>,
     ) {
+        // The workbench is switching authorities: park the embedded runtime's
+        // sidebar arrangement before the server's project list can reconcile
+        // against it.
+        self.activate_sidebar_authority(&remote_authority_key(&credential), cx);
         let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
             self.finish_startup_loading(cx);
             self.runtime_status = RuntimeStatus::Failed {
@@ -8354,6 +8371,32 @@ impl VibexWorkbench {
     fn invalidate_sidebar_projection_cache(&mut self) {
         self.sidebar_projection_revision = self.sidebar_projection_revision.wrapping_add(1);
         self.sidebar_projection_cache = None;
+    }
+
+    /// Parks the sidebar arrangement of the runtime authority the workbench is
+    /// leaving and restores the arrangement remembered for `authority`.
+    ///
+    /// Sidebar order and folder ids only mean something inside the runtime that
+    /// produced them.  Without this switch, connecting to a paired server would
+    /// reconcile — and then persist — the embedded runtime's arrangement
+    /// against the server's project list, deleting the user's project order and
+    /// folders.
+    fn activate_sidebar_authority(&mut self, authority: &str, cx: &mut Context<Self>) {
+        if self.ui_state.sidebar.active_authority() == authority {
+            return;
+        }
+        // Flush the live selection state into the arrangement being parked.
+        self.queue_agent_ui_state();
+        self.ui_state.sidebar.switch_authority(authority);
+        self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
+        self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
+        self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
+        self.sidebar_state.clear_selection();
+        self.sidebar_move_selected_items.clear();
+        self.sidebar_move_selection_anchor = None;
+        self.invalidate_sidebar_projection_cache();
+        self.queue_agent_ui_state();
+        cx.notify();
     }
 
     fn sidebar_workspace_groups(&mut self, query: &str) -> Rc<Vec<SidebarProjectProjection>> {
