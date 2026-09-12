@@ -1975,6 +1975,11 @@ pub struct DesktopRuntime {
     shutting_down: AtomicBool,
 }
 
+/// How long [`DesktopRuntime::start_with_home_lock_retry`] waits for a previous
+/// owner of the same home to release its exclusive lock.
+const HOME_LOCK_RETRY_ATTEMPTS: u32 = 8;
+const HOME_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl DesktopRuntime {
     pub async fn start(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
         let runtime_started = Instant::now();
@@ -1986,6 +1991,47 @@ impl DesktopRuntime {
             result.as_ref().err(),
         );
         result
+    }
+
+    /// Starts the runtime, briefly retrying while another owner releases the
+    /// home lock.
+    ///
+    /// One home is handed between runtime instances over the life of a desktop
+    /// shell: a paired authority replaces the embedded runtime, and a restarted
+    /// shell process takes the home over from the process that is exiting.  The
+    /// previous owner drops `<home>/.vibex-runtime.lock` asynchronously, so the
+    /// immediate re-acquisition can lose that race even though nothing is
+    /// wrong.  A genuine second owner still surfaces
+    /// `desktop_runtime_home_locked` after the retry budget is spent.
+    pub async fn start_with_home_lock_retry(
+        config: DesktopRuntimeConfig,
+    ) -> VibexResult<Arc<Self>> {
+        Self::start_with_home_lock_retry_for(
+            config,
+            HOME_LOCK_RETRY_ATTEMPTS,
+            HOME_LOCK_RETRY_DELAY,
+        )
+        .await
+    }
+
+    async fn start_with_home_lock_retry_for(
+        config: DesktopRuntimeConfig,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> VibexResult<Arc<Self>> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match Self::start_inner(config.clone()).await {
+                Ok(runtime) => return Ok(runtime),
+                Err(error) => {
+                    if error.code != "desktop_runtime_home_locked" || attempt >= attempts {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn start_inner(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
@@ -3621,6 +3667,50 @@ mod tests {
         runtime.shutdown().await.unwrap();
         let replacement = DesktopRuntime::start(config).await.unwrap();
         replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn home_lock_retry_recovers_when_the_previous_owner_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DesktopRuntimeConfig::isolated_test(dir.path());
+        // Hold the home lock directly: a real runtime's shutdown can take
+        // seconds, which would make this test slow without making it more
+        // truthful about the retry it covers.
+        let held =
+            crate::home_lock::DesktopHomeLock::acquire(dir.path(), &config.application_id).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            drop(held);
+        });
+        let replacement = DesktopRuntime::start_with_home_lock_retry_for(
+            config,
+            8,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("a released home lock must be re-acquired");
+        replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn home_lock_retry_still_reports_a_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DesktopRuntimeConfig::isolated_test(dir.path());
+        let runtime = DesktopRuntime::start(config.clone()).await.unwrap();
+        let started = Instant::now();
+        let error = match DesktopRuntime::start_with_home_lock_retry_for(
+            config,
+            3,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        {
+            Ok(_) => panic!("a live owner must keep the home locked"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "desktop_runtime_home_locked");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

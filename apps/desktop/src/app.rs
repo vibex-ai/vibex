@@ -64,7 +64,7 @@ use gpui_component::{
 use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_app_update::{CheckReason, UpdateSnapshot, UpdateState};
 use vibex_backend::{
@@ -246,6 +246,9 @@ enum ReleaseChannel {
 }
 
 const WORKBENCH_NAVIGATION_LIMIT: usize = 60;
+/// Upper bound on waiting for a retired local runtime to release its home lock
+/// before the embedded runtime is booted again.
+const RUNTIME_RETIRE_WAIT: Duration = Duration::from_secs(5);
 const TITLE_BAR_HEIGHT: f32 = 50.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
@@ -5009,6 +5012,12 @@ pub struct VibexWorkbench {
     worktree_assistance_operation_id: Option<RequestId>,
     runtime_heartbeat_task: Option<Task<()>>,
     agent_poll_task: Option<Task<()>>,
+    /// Keeps a retired local runtime's shutdown running.  Dropping a GPUI task
+    /// handle aborts the work behind it, so each retirement parks its keeper
+    /// here for the life of the process.
+    retired_runtime_shutdowns: Vec<Task<()>>,
+    /// Resolves once the retired local runtime released its home lock.
+    runtime_shutdown_done: Option<oneshot::Receiver<()>>,
     composer_attachment_task: Option<Task<()>>,
     startup_loading_indicator_task: Option<Task<()>>,
     startup_loading_release_task: Option<Task<()>>,
@@ -5784,6 +5793,8 @@ impl VibexWorkbench {
             worktree_assistance_operation_id: None,
             runtime_heartbeat_task: None,
             agent_poll_task: None,
+            retired_runtime_shutdowns: Vec::new(),
+            runtime_shutdown_done: None,
             composer_attachment_task: None,
             startup_loading_indicator_task: None,
             startup_loading_release_task: None,
@@ -5898,25 +5909,19 @@ impl VibexWorkbench {
             };
             return;
         };
-        self.runtime = None;
-        self.remote_client = None;
-        self.backend = None;
-        self.code_workbench
-            .update(cx, |workbench, cx| workbench.clear_backend(cx));
-        self.shared_workflow = None;
-        self.shared_terminal = None;
-        self.shared_management = None;
-        self.management_view
-            .update(cx, |management, cx| management.clear_runtime(cx));
-        self.usage_view
-            .update(cx, |usage, cx| usage.clear_backend(cx));
         self.runtime_status = RuntimeStatus::Starting;
         self.runtime_note = None;
-        self.event_task = None;
+        self.detach_local_runtime(cx);
+        let pending_shutdown = self.runtime_shutdown_done.take();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let boot_started = Instant::now();
             eprintln!("vibex-startup: stage-begin stage=desktop_boot");
-            let runtime = match DesktopRuntime::start(config).await {
+            // A retired runtime releases `<home>/.vibex-runtime.lock` while it
+            // shuts down; wait for it (bounded) instead of racing it.
+            if let Some(pending) = pending_shutdown {
+                let _ = tokio::time::timeout(RUNTIME_RETIRE_WAIT, pending).await;
+            }
+            let runtime = match DesktopRuntime::start_with_home_lock_retry(config).await {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     Self::log_desktop_startup_stage_end("desktop_boot", boot_started, Some(&error));
@@ -6801,10 +6806,40 @@ impl VibexWorkbench {
         }));
     }
 
+    /// Releases the local authority before another runtime claims the same home.
+    ///
+    /// Detaching the shell's own references is not enough: the session poll and
+    /// runtime heartbeat tasks hold their own `Arc<DesktopRuntime>`, so the
+    /// runtime would outlive an authority switch and keep
+    /// `<home>/.vibex-runtime.lock` locked, making the next embedded boot fail
+    /// with `desktop_runtime_home_locked`.  Cancelling those tasks and shutting
+    /// the runtime down explicitly releases the lock even while other clones
+    /// are still alive.
+    fn retire_local_runtime(&mut self, cx: &mut Context<Self>) {
+        self.agent_poll_task = None;
+        self.runtime_heartbeat_task = None;
+        self.agent_load_task = None;
+        self.agent_projection_task = None;
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.runtime_shutdown_done = Some(done_rx);
+        let shutdown = gpui_tokio::Tokio::spawn(cx, async move {
+            let result = runtime.shutdown().await;
+            let _ = done_tx.send(());
+            result
+        });
+        self.retired_runtime_shutdowns
+            .push(cx.spawn(async move |_, _| {
+                let _ = shutdown.await;
+            }));
+    }
+
     /// Drops the local runtime ownership without tearing the process down:
     /// views are cleared so the remote install path can refill them.
     fn detach_local_runtime(&mut self, cx: &mut Context<Self>) {
-        self.runtime = None;
+        self.retire_local_runtime(cx);
         self.backend = None;
         self.remote_client = None;
         self.code_workbench
