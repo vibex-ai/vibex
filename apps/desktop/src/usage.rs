@@ -1,14 +1,16 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use chrono::{Datelike as _, NaiveDate};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, Context, Edges, Entity, Hsla, InteractiveElement as _,
-    IntoElement, Render, SharedString, Styled as _, Task, WeakEntity, Window, canvas, div, point,
-    prelude::*, px, quad, transparent_black,
+    AnimationExt as _, AnyElement, App, BorderStyle, Bounds, Context, Edges, ElementId, Entity,
+    Hsla, InteractiveElement as _, IntoElement, Pixels, Render, SharedString, Styled as _, Task,
+    WeakEntity, Window, canvas, div, point, prelude::*, px, quad, size, transparent_black,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
-    StyledExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
+    Sizable as _, Size, StyledExt as _,
     button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -26,7 +28,7 @@ use vibex_core::{
     ProviderProfileId, VibexSessionId,
 };
 
-use crate::{gpui_ext::button_with_aria_label, locale, theme};
+use crate::{gpui_ext::button_with_aria_label, locale, motion, theme};
 
 const USAGE_CHART_HEIGHT: f32 = 176.0;
 const USAGE_CHART_AXIS_WIDTH: f32 = 48.0;
@@ -39,6 +41,29 @@ const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
 const USAGE_MODEL_LIMIT: usize = 10;
 const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
 const USAGE_AGENT_DEFAULT_MODEL_ID: &str = "__vibex_agent_default_model__";
+
+/// The time ranges the toolbar offers, in the order the slider lays them out.
+/// The segment list and the thumb's slots both read this one order, so the pill
+/// always lands on the segment it belongs to.
+const USAGE_RANGES: [AgentUsageRange; 4] = [
+    AgentUsageRange::Today,
+    AgentUsageRange::Last7Days,
+    AgentUsageRange::Last30Days,
+    AgentUsageRange::AllTime,
+];
+
+/// The shell's padding, the inset that keeps the thumb clear of the segment it
+/// sits on, and the amount by which the thumb's radius steps down from the
+/// shell's so the two curves stay concentric.
+const USAGE_RANGE_INSET: f32 = 2.0;
+
+/// Width of the shell's hairline.
+const USAGE_RANGE_BORDER: f32 = 1.0;
+
+/// Height of one segment. The shell adds [`USAGE_RANGE_INSET`] and its hairline
+/// on both edges, which lands the slider on the height of the toolbar's outline
+/// controls beside it.
+const USAGE_RANGE_SEGMENT_HEIGHT: f32 = 18.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageFilterKind {
@@ -93,6 +118,10 @@ pub struct UsageView {
     trend_view: UsageTrendView,
     enabled_trend_metrics: Vec<AgentUsageTrendMetric>,
     model_metric: UsageModelMetric,
+    /// Segment the range slider's thumb travels from on the next paint: the
+    /// range that was selected before the latest switch. Registered when the
+    /// range changes so a switch reads as one move instead of a jump.
+    range_thumb_from: usize,
     table: Option<Entity<TableState<UsageTableDelegate>>>,
     generation: u64,
     refresh_task: Option<Task<()>>,
@@ -106,9 +135,11 @@ impl Default for UsageView {
 
 impl UsageView {
     pub fn new() -> Self {
+        let request = AgentUsageStatisticsRequest::default();
         Self {
             backend: None,
-            request: AgentUsageStatisticsRequest::default(),
+            range_thumb_from: usage_range_index(request.range),
+            request,
             statistics: None,
             loading: false,
             stale: false,
@@ -216,6 +247,8 @@ impl UsageView {
 
     fn choose_range(&mut self, range: AgentUsageRange, cx: &mut Context<Self>) {
         if self.request.range != range {
+            // The slider's thumb starts its travel where the old selection sat.
+            self.range_thumb_from = usage_range_index(self.request.range);
             self.request.range = range;
             self.refresh(cx);
         }
@@ -312,39 +345,8 @@ impl UsageView {
         self.refresh(cx);
     }
 
-    fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let ranges = [
-            (
-                AgentUsageRange::Today,
-                locale::text("Today", "今天", "今天"),
-            ),
-            (
-                AgentUsageRange::Last7Days,
-                locale::text("7 days", "7 天", "7 天"),
-            ),
-            (
-                AgentUsageRange::Last30Days,
-                locale::text("30 days", "30 天", "30 天"),
-            ),
-            (
-                AgentUsageRange::AllTime,
-                locale::text("All", "全部", "全部"),
-            ),
-        ];
-        let selected_range = self.request.range;
-        let range_control = ButtonGroup::new("usage-range")
-            .small()
-            .outline()
-            .children(ranges.iter().map(|(range, label)| {
-                Button::new(SharedString::from(format!("usage-range-{range:?}")))
-                    .label(*label)
-                    .selected(*range == selected_range)
-            }))
-            .on_click(cx.listener(move |this, selected: &Vec<usize>, _, cx| {
-                if let Some((range, _)) = selected.first().and_then(|index| ranges.get(*index)) {
-                    this.choose_range(*range, cx);
-                }
-            }));
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let range_control = self.render_range_slider(window, cx);
 
         let options = self
             .statistics
@@ -432,6 +434,137 @@ impl UsageView {
             .into_any_element()
     }
 
+    /// The time-range slider: one shell, one thumb that travels between the
+    /// four range segments.
+    ///
+    /// The ranges are a single choice, so only the selected one carries a fill.
+    /// The segments stay real [`Button`]s — focus, keyboard activation, and the
+    /// announced selected and pressed states remain the component's — and take
+    /// the width their label needs, so a locale that spells "30 days" wider
+    /// gets a wider segment instead of a clipped one. The thumb is paint behind
+    /// them: it reads where the segments landed and travels to the newly
+    /// selected one over the app's movement spec.
+    fn render_range_slider(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.request.range;
+        let selected_index = usage_range_index(selected);
+        let thumb_from = self.range_thumb_from;
+        // Segment boxes are measured during prepaint, so the thumb can only be
+        // placed on the frame after the first layout. Bumping this state is
+        // what asks the window for that frame; until it arrives the selected
+        // segment keeps the component's own fill so the choice stays visible.
+        let slots = window
+            .use_keyed_state("usage-range-slots", cx, |_, _| {
+                Rc::new(RefCell::new(UsageRangeSlots::default()))
+            })
+            .read(cx)
+            .clone();
+        let measured = window.use_keyed_state("usage-range-measured", cx, |_, _| false);
+        let thumb_boxes = slots.borrow().thumb(thumb_from, selected_index);
+        if thumb_boxes.is_none() && !*measured.read(cx) {
+            measured.update(cx, |value, _| *value = true);
+        }
+        // The pill steps its radius down from the shell's, so the two curves
+        // stay concentric at the inset the shell pads by.
+        let thumb_radius = (cx.theme().radius - px(USAGE_RANGE_INSET)).max(px(0.0));
+        let foreground = cx.theme().foreground;
+        let muted_foreground = cx.theme().muted_foreground;
+        // Every switch gets its own animation element: a new id starts the
+        // travel from the segment the range came from rather than resuming a
+        // finished slide, and the element the switch replaced drops its state.
+        let thumb_id =
+            SharedString::from(format!("usage-range-thumb-{thumb_from}-{selected_index}"));
+        let thumb = thumb_boxes.map(|(from, to)| {
+            let travel = move |progress: f32| {
+                (
+                    motion::lerp(f32::from(from.origin.x), f32::from(to.origin.x), progress),
+                    motion::lerp(
+                        f32::from(from.size.width),
+                        f32::from(to.size.width),
+                        progress,
+                    ),
+                )
+            };
+            div()
+                .debug_selector(|| "usage-range-thumb".to_string())
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .with_animation(
+                    thumb_id,
+                    motion::SEGMENT_SLIDE.animation(),
+                    move |thumb, progress| {
+                        let (left, width) = travel(progress);
+                        thumb.left(px(left)).w(px(width))
+                    },
+                )
+                .child(
+                    div()
+                        .size_full()
+                        .rounded(thumb_radius)
+                        .bg(cx.theme().secondary),
+                )
+                .into_any_element()
+        });
+        let thumb_ready = thumb.is_some();
+        let segments = h_flex().children(USAGE_RANGES.iter().enumerate().map(|(index, range)| {
+            let is_selected = *range == selected;
+            let segment_slots = slots.clone();
+            // A measuring wrapper, because it is the segment's own box the
+            // thumb has to land on.
+            div()
+                .flex_shrink_0()
+                .debug_selector(move || format!("usage-range-segment-{index}"))
+                .on_prepaint(move |bounds, _, _| {
+                    segment_slots.borrow_mut().set_segment(index, bounds);
+                })
+                .child(
+                    Button::new(SharedString::from(format!("usage-range-{range:?}")))
+                        .accessibility_label(usage_range_label(*range))
+                        // The label is a plain nowrap child rather than the
+                        // button's own label slot: it must never ellipsize,
+                        // because the segment is sized from it.
+                        .child(
+                            div()
+                                .debug_selector(move || format!("usage-range-label-{index}"))
+                                .whitespace_nowrap()
+                                .child(usage_range_label(*range)),
+                        )
+                        .selected(is_selected)
+                        .toggled(is_selected)
+                        .on_click(cx.listener(move |this, _, _, cx| this.choose_range(*range, cx)))
+                        .h(px(USAGE_RANGE_SEGMENT_HEIGHT))
+                        .rounded(thumb_radius)
+                        // The thumb owns the selected fill once it is placed; a
+                        // button background would double it.
+                        .when(thumb_ready || !is_selected, |button| {
+                            button.bg(transparent_black())
+                        })
+                        .text_color(if is_selected {
+                            foreground
+                        } else {
+                            muted_foreground
+                        }),
+                )
+        }));
+        div()
+            .debug_selector(|| "usage-range-slider".to_string())
+            .rounded(cx.theme().radius)
+            .border(px(USAGE_RANGE_BORDER))
+            .border_color(cx.theme().border)
+            .p(px(USAGE_RANGE_INSET))
+            .child(
+                h_flex()
+                    .relative()
+                    .on_prepaint({
+                        let slots = slots.clone();
+                        move |bounds, _, _| slots.borrow_mut().set_track(bounds)
+                    })
+                    .children(thumb)
+                    .child(segments),
+            )
+            .into_any_element()
+    }
+
     fn render_filter_button(
         &self,
         kind: UsageFilterKind,
@@ -461,6 +594,11 @@ impl UsageView {
             .small()
             .outline()
             .selected(selected_count > 0)
+            .debug_selector(move || format!("usage-filter-{kind:?}"))
+            // The page runs its controls a step quieter than the component's
+            // outline default: the shared hairline keeps the toolbar's buttons
+            // in the same family as the range slider's shell.
+            .border_color(cx.theme().border)
             // The trigger is a labeled menu, so it takes the component's own
             // icon slot and caret instead of ad-hoc children: both scale with
             // the control size and follow its hover, pressed, and selected
@@ -648,22 +786,31 @@ impl UsageView {
                                     .small()
                                     .outline()
                                     .child(
-                                        Button::new("usage-trend-view-bars")
-                                            .icon(IconName::ChartPie)
-                                            .label(locale::text("Trend", "趋势", "趨勢"))
-                                            .selected(trend_view == UsageTrendView::Bars),
+                                        usage_outline_option(
+                                            "usage-trend-view-bars",
+                                            trend_view == UsageTrendView::Bars,
+                                            cx,
+                                        )
+                                        .icon(IconName::ChartPie)
+                                        .label(locale::text("Trend", "趋势", "趨勢")),
                                     )
                                     .child(
-                                        Button::new("usage-trend-view-heatmap")
-                                            .icon(IconName::LayoutDashboard)
-                                            .label(locale::text("Heatmap", "热力", "熱力"))
-                                            .selected(trend_view == UsageTrendView::Heatmap),
+                                        usage_outline_option(
+                                            "usage-trend-view-heatmap",
+                                            trend_view == UsageTrendView::Heatmap,
+                                            cx,
+                                        )
+                                        .icon(IconName::LayoutDashboard)
+                                        .label(locale::text("Heatmap", "热力", "熱力")),
                                     )
                                     .child(
-                                        Button::new("usage-trend-view-models")
-                                            .icon(IconName::ChartPie)
-                                            .label(locale::text("Models", "模型", "模型"))
-                                            .selected(trend_view == UsageTrendView::Models),
+                                        usage_outline_option(
+                                            "usage-trend-view-models",
+                                            trend_view == UsageTrendView::Models,
+                                            cx,
+                                        )
+                                        .icon(IconName::ChartPie)
+                                        .label(locale::text("Models", "模型", "模型")),
                                     )
                                     .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
                                         if selected.contains(&0) {
@@ -714,14 +861,20 @@ impl UsageView {
             .small()
             .outline()
             .child(
-                Button::new("usage-model-metric-requests")
-                    .label(locale::text("Turns", "对话轮次", "對話輪次"))
-                    .selected(self.model_metric == UsageModelMetric::Requests),
+                usage_outline_option(
+                    "usage-model-metric-requests",
+                    self.model_metric == UsageModelMetric::Requests,
+                    cx,
+                )
+                .label(locale::text("Turns", "对话轮次", "對話輪次")),
             )
             .child(
-                Button::new("usage-model-metric-tokens")
-                    .label(locale::text("Total tokens", "总 Token", "總 Token"))
-                    .selected(self.model_metric == UsageModelMetric::TotalTokens),
+                usage_outline_option(
+                    "usage-model-metric-tokens",
+                    self.model_metric == UsageModelMetric::TotalTokens,
+                    cx,
+                )
+                .label(locale::text("Total tokens", "总 Token", "總 Token")),
             )
             .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
                 if selected.contains(&0) {
@@ -938,7 +1091,7 @@ impl Render for UsageView {
                     .w_full()
                     .gap_4()
                     .children(status)
-                    .child(self.render_toolbar(cx))
+                    .child(self.render_toolbar(window, cx))
                     .child(self.render_summary(&statistics.totals, viewport_width, cx))
                     .child(self.render_trend(&statistics, cx))
                     .child(self.render_dimensions(window, cx))
@@ -962,7 +1115,7 @@ impl Render for UsageView {
                 .w_full()
                 .gap_4()
                 .children(status)
-                .child(self.render_toolbar(cx))
+                .child(self.render_toolbar(window, cx))
                 .child(
                     v_flex()
                         .h(px(200.0))
@@ -984,7 +1137,7 @@ impl Render for UsageView {
                 .w_full()
                 .gap_4()
                 .children(status)
-                .child(self.render_toolbar(cx))
+                .child(self.render_toolbar(window, cx))
                 .child(centered_message(
                     locale::text(
                         "Usage data is not available",
@@ -1043,6 +1196,82 @@ fn bounded_usage_session_filter_label(value: &str) -> String {
     }
     output.push_str("...");
     output
+}
+
+/// Where the range slider's segments landed, in the slider track's coordinates.
+///
+/// The segments take the width their labels need, so the thumb cannot be placed
+/// by a fraction of the track: it reads the boxes the segments reported during
+/// prepaint, on the render that follows.
+#[derive(Default)]
+struct UsageRangeSlots {
+    track: Option<Bounds<Pixels>>,
+    segments: [Option<Bounds<Pixels>>; USAGE_RANGES.len()],
+}
+
+impl UsageRangeSlots {
+    fn set_track(&mut self, bounds: Bounds<Pixels>) {
+        self.track = Some(bounds);
+    }
+
+    fn set_segment(&mut self, index: usize, bounds: Bounds<Pixels>) {
+        if let Some(slot) = self.segments.get_mut(index) {
+            *slot = Some(bounds);
+        }
+    }
+
+    /// The thumb's travel for a switch from `from` to `to`, insetted inside the
+    /// segment box so the pill keeps the shell's padding. `None` until the
+    /// slider has been laid out once.
+    fn thumb(&self, from: usize, to: usize) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+        Some((self.segment_box(from)?, self.segment_box(to)?))
+    }
+
+    fn segment_box(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let track = self.track?;
+        let segment = self.segments.get(index).copied().flatten()?;
+        let inset = px(USAGE_RANGE_INSET);
+        let width = segment.size.width - px(2.0 * USAGE_RANGE_INSET);
+        if width <= px(0.0) || segment.size.height <= px(0.0) || track.size.width <= px(0.0) {
+            return None;
+        }
+        Some(Bounds {
+            origin: point(segment.origin.x - track.origin.x + inset, px(0.0)),
+            size: size(width, segment.size.height),
+        })
+    }
+}
+
+/// One option of a page-local outline [`ButtonGroup`].
+///
+/// The component draws an outline button's border with `input`, a step
+/// brighter than the hairline the usage page runs its controls at; every
+/// option takes the shared `border` token instead so the page holds one
+/// border weight.
+fn usage_outline_option(id: impl Into<ElementId>, selected: bool, cx: &App) -> Button {
+    Button::new(id)
+        .selected(selected)
+        .border_color(cx.theme().border)
+}
+
+/// Position of `range` in the slider's segment order.
+///
+/// Unknown values fall back to the leading segment: the slider always has a
+/// thumb, and a request the toolbar cannot place is still one of the four.
+fn usage_range_index(range: AgentUsageRange) -> usize {
+    USAGE_RANGES
+        .iter()
+        .position(|candidate| *candidate == range)
+        .unwrap_or(0)
+}
+
+fn usage_range_label(range: AgentUsageRange) -> &'static str {
+    match range {
+        AgentUsageRange::Today => locale::text("Today", "今天", "今天"),
+        AgentUsageRange::Last7Days => locale::text("7 days", "7 天", "7 天"),
+        AgentUsageRange::Last30Days => locale::text("30 days", "30 天", "30 天"),
+        AgentUsageRange::AllTime => locale::text("All", "全部", "全部"),
+    }
 }
 
 /// Leading glyph for a cross-filter trigger.
@@ -2968,6 +3197,138 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+    }
+
+    #[test]
+    fn usage_range_slider_covers_every_offered_range() {
+        for (index, range) in USAGE_RANGES.iter().enumerate() {
+            assert_eq!(usage_range_index(*range), index);
+            assert!(!usage_range_label(*range).is_empty());
+        }
+        assert_eq!(USAGE_RANGES.len(), 4);
+
+        // The toolbar keeps one shell with one moving thumb: the segments must
+        // not fall back to per-segment outline fills.
+        let source = include_str!("usage.rs");
+        let slider = source
+            .split_once("    fn render_range_slider(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_filter_button("))
+            .map(|(body, _)| body)
+            .expect("usage range slider should remain inspectable");
+        assert!(slider.contains(".with_animation("));
+        assert!(slider.contains("motion::SEGMENT_SLIDE"));
+        assert!(slider.contains("set_segment("));
+    }
+
+    #[gpui::test]
+    fn usage_range_slider_thumb_lands_on_the_selected_segment(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| UsageView::new());
+        view.update(cx, |view, cx| {
+            view.statistics = Some(usage_statistics());
+            view.loading = false;
+            view.stale = false;
+            cx.notify();
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+
+        let slider = cx
+            .debug_bounds("usage-range-slider")
+            .expect("usage range slider should be laid out");
+        // The slider sits level with the filter buttons beside it: one segment
+        // plus the shell's inset and hairline on both edges.
+        let filter = cx
+            .debug_bounds("usage-filter-Agent")
+            .expect("usage agent filter should be laid out");
+        assert_eq!(slider.size.height, filter.size.height);
+        assert_eq!(slider.size.height, px(24.0));
+        let thumb = cx
+            .debug_bounds("usage-range-thumb")
+            .expect("usage range thumb should be placed once the segments are measured");
+        assert_eq!(thumb.size.height, px(USAGE_RANGE_SEGMENT_HEIGHT));
+
+        // The segments are laid out in range order, each one as wide as its
+        // label needs, and the track is exactly their sum.
+        let segments: Vec<Bounds<Pixels>> = [
+            "usage-range-segment-0",
+            "usage-range-segment-1",
+            "usage-range-segment-2",
+            "usage-range-segment-3",
+        ]
+        .into_iter()
+        .map(|selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"))
+        })
+        .collect();
+        let mut track_width = px(0.0);
+        for pair in segments.windows(2) {
+            assert_eq!(pair[1].origin.x, pair[0].origin.x + pair[0].size.width);
+        }
+        for segment in &segments {
+            assert!(segment.size.width > px(0.0));
+            track_width += segment.size.width;
+        }
+        let track_inset = px(USAGE_RANGE_INSET + USAGE_RANGE_BORDER);
+        assert_eq!(segments[0].origin.x - slider.origin.x, track_inset);
+        assert_eq!(slider.size.width, track_width + track_inset * 2.0);
+
+        // The thumb is the selected segment's box, insetted by the shell's
+        // padding, and it travels with the selection instead of the selected
+        // button painting its own fill.
+        // Every segment takes the width its label needs, with the same button
+        // padding around it: a clipped label would collapse that difference.
+        let labels: Vec<Bounds<Pixels>> = [
+            "usage-range-label-0",
+            "usage-range-label-1",
+            "usage-range-label-2",
+            "usage-range-label-3",
+        ]
+        .into_iter()
+        .map(|selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"))
+        })
+        .collect();
+        for (segment, label) in segments.iter().zip(&labels) {
+            let padding = segment.size.width - label.size.width;
+            assert_eq!(padding, segments[0].size.width - labels[0].size.width);
+            assert!(padding > px(0.0));
+        }
+
+        let selected_index = view.update(cx, |view, _| usage_range_index(view.request.range));
+        assert_eq!(
+            thumb.origin.x,
+            segments[selected_index].origin.x + px(USAGE_RANGE_INSET)
+        );
+        assert_eq!(
+            thumb.size.width,
+            segments[selected_index].size.width - px(2.0 * USAGE_RANGE_INSET)
+        );
+
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        view.update(cx, |view, cx| {
+            view.choose_range(AgentUsageRange::AllTime, cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let thumb = cx
+            .debug_bounds("usage-range-thumb")
+            .expect("usage range thumb should stay placed");
+        assert_eq!(thumb.origin.x, segments[3].origin.x + px(USAGE_RANGE_INSET));
+        assert_eq!(
+            thumb.size.width,
+            segments[3].size.width - px(2.0 * USAGE_RANGE_INSET)
+        );
     }
 
     #[test]

@@ -204,6 +204,9 @@ pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
 pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
+/// Segmented-control thumb travel: 200ms ease-out, the same movement class a
+/// region uses when it changes place.
+pub const SEGMENT_SLIDE: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
 /// blend every interactive hover wash rides.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
