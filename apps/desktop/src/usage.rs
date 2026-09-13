@@ -333,9 +333,8 @@ impl UsageView {
         ];
         let selected_range = self.request.range;
         let range_control = ButtonGroup::new("usage-range")
-            .xsmall()
+            .small()
             .outline()
-            .compact()
             .children(ranges.iter().map(|(range, label)| {
                 Button::new(SharedString::from(format!("usage-range-{range:?}")))
                     .label(*label)
@@ -459,20 +458,24 @@ impl UsageView {
         };
         let entity = cx.weak_entity();
         Button::new(SharedString::from(format!("usage-filter-{kind:?}")))
-            .xsmall()
+            .small()
             .outline()
             .selected(selected_count > 0)
+            // The trigger is a labeled menu, so it takes the component's own
+            // icon slot and caret instead of ad-hoc children: both scale with
+            // the control size and follow its hover, pressed, and selected
+            // states.
+            .icon(usage_filter_icon(kind).opacity(0.72))
+            .dropdown_caret(true)
             // The visible content is the applied value, so the announced name
             // states the dimension it filters.
             .accessibility_label(accessibility_label)
             .child(
-                h_flex()
+                div()
                     .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .child(usage_filter_icon(kind).size(px(13.0)).opacity(0.72))
-                    .child(div().max_w(px(150.0)).truncate().child(trigger_label))
-                    .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
+                    .max_w(px(150.0))
+                    .truncate()
+                    .child(trigger_label),
             )
             .disabled(options.is_empty() && selected.is_empty())
             .dropdown_menu(move |menu, _, _| {
@@ -642,9 +645,8 @@ impl UsageView {
                             )))
                             .child(
                                 ButtonGroup::new("usage-trend-view-toggle")
-                                    .xsmall()
+                                    .small()
                                     .outline()
-                                    .compact()
                                     .child(
                                         Button::new("usage-trend-view-bars")
                                             .icon(IconName::ChartPie)
@@ -709,9 +711,8 @@ impl UsageView {
 
     fn render_model_metric_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
         ButtonGroup::new("usage-model-metric")
-            .xsmall()
+            .small()
             .outline()
-            .compact()
             .child(
                 Button::new("usage-model-metric-requests")
                     .label(locale::text("Turns", "对话轮次", "對話輪次"))
@@ -760,8 +761,10 @@ impl UsageView {
         for (dimension, label) in dimensions {
             controls = controls.child(
                 Button::new(SharedString::from(format!("usage-dimension-{dimension:?}")))
-                    .xsmall()
+                    .small()
                     .ghost()
+                    // The tab strip keeps its own row height while the control
+                    // takes the standard small padding.
                     .h(px(28.0))
                     .selected(dimension == selected)
                     .label(label)

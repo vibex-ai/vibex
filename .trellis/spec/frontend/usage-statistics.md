@@ -63,7 +63,8 @@ session entry is a standard `gpui_component::button::Button` wrapped with
   and the five cross-filters trail the row as one trailing group, so scope and
   filters read as two decisions; both groups wrap without overlapping when the
   window narrows. Each cross-filter trigger keeps one leading dimension icon and
-  the same control size as the range control, and names the value it applies
+  the standard small control frame shared with the range control, and names the
+  value it applies
   instead of only the dimension: the first applied value, plus a `+N` suffix for
   further selections, the dimension name while it filters nothing, or the
   dimension with its count when no offered option can name the applied value.
