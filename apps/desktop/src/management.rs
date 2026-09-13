@@ -599,6 +599,55 @@ impl ManagedDeleteTarget {
     }
 }
 
+/// Resource family whose enabled entries a native export writes into an Agent's
+/// own configuration file.
+///
+/// MCP servers and Skills belong to an Agent, so each family owns its card on
+/// its own Config Center page instead of sharing the Provider-profile card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementResourceExport {
+    Mcp,
+    Skills,
+}
+
+impl ManagementResourceExport {
+    const fn mode(self) -> vibex_core::ProviderNativeExportMode {
+        match self {
+            Self::Mcp => vibex_core::ProviderNativeExportMode::Mcp,
+            Self::Skills => vibex_core::ProviderNativeExportMode::Skills,
+        }
+    }
+
+    /// Element-id prefix; two cards never share one.
+    const fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp-native-export",
+            Self::Skills => "skill-native-export",
+        }
+    }
+}
+
+/// Everything a native-export card needs to know about the surface it renders
+/// on.
+///
+/// The Advanced card offers every mode and follows the Agent selected in the
+/// Agent section; a resource card offers exactly its own mode and lets the user
+/// pick one of the Agents the resource is enabled for.
+struct NativeExportCardSpec {
+    /// Unique prefix for this card's element ids.
+    id_prefix: &'static str,
+    /// Modes the surface offers. The first is the fallback whenever the shared
+    /// export draft holds a mode this surface does not show.
+    modes: Vec<vibex_core::ProviderNativeExportMode>,
+    /// Source chips. Empty means "always the selected Agent's own file", which
+    /// is all a resource export needs.
+    sources: Vec<(vibex_core::ProviderNativeExportSource, &'static str)>,
+    /// Agent chips for a resource card; empty for the Provider-profile card.
+    agent_choices: Vec<(String, String)>,
+    selected_agent_id: Option<String>,
+    selected_profile: Option<vibex_core::ProviderProfile>,
+}
+
 pub struct ManagementCenter {
     runtime: Option<Arc<DesktopRuntime>>,
     /// Authority-agnostic handle for the sections whose Remote v2 contract is
@@ -685,6 +734,11 @@ pub struct ManagementCenter {
     skill_discovery: Option<vibex_core::SkillDiscoveryResponse>,
     mcp_validation: Option<(String, String, bool)>,
     skill_validation: Option<(String, String, bool)>,
+    /// Agent whose native file the MCP and Skills export cards target.
+    ///
+    /// `None` — and any value that is not enabled for the selected resource —
+    /// falls back to the first Agent the resource is enabled for.
+    resource_export_agent_id: Option<String>,
     selected_agent_id: Option<String>,
     selected_provider_profile_id: Option<String>,
     agent_auth_scope: Option<(String, Option<String>)>,
@@ -1365,6 +1419,7 @@ impl ManagementCenter {
             skill_discovery: None,
             mcp_validation: None,
             skill_validation: None,
+            resource_export_agent_id: None,
             provider_display_order_drop_target: None,
             selected_agent_id: None,
             selected_provider_profile_id: None,
@@ -9025,8 +9080,8 @@ impl ManagementCenter {
     /// Editor for a new or existing MCP server.
     ///
     /// Values are written into the Vibex record; delivery to each Agent happens
-    /// through the MCP resource's own Agent matrix, and the Advanced section's
-    /// native export can additionally place them in an Agent's own config file.
+    /// through the MCP resource's own Agent matrix, and the MCP page's native
+    /// export card can additionally place them in an Agent's own config file.
     fn render_mcp_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let creating = self.editing_mcp_server_id.is_none();
@@ -12551,6 +12606,9 @@ impl ManagementCenter {
             .cloned()
             .collect::<Vec<_>>();
         let mut rows = v_flex().gap_2();
+        // At most one server is selected, so the export card is built inside the
+        // loop and then placed under the resource card as a sibling.
+        let mut native_export_card = None;
         for server in servers.clone() {
             let id = server.id.as_str().to_string();
             let validate_id = id.clone();
@@ -12590,6 +12648,17 @@ impl ManagementCenter {
                 .as_ref()
                 .filter(|(resource_id, _, _)| resource_id == &id)
                 .map(|(_, message, failed)| (message.clone(), *failed));
+            let export_agents = server
+                .agent_matrix
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.agent_id.clone())
+                .collect::<Vec<_>>();
+            native_export_card = Some(self.render_resource_native_export_card(
+                ManagementResourceExport::Mcp,
+                &export_agents,
+                cx,
+            ));
             let mut agent_matrix_rows = v_flex().w_full().gap_1();
             for agent in matrix_agents.clone() {
                 let agent_id = agent.id.clone();
@@ -12784,6 +12853,7 @@ impl ManagementCenter {
             } else {
                 rows.into_any_element()
             })
+            .when_some(native_export_card, |layout, card| layout.child(card))
             .into_any_element()
     }
 
@@ -12808,6 +12878,9 @@ impl ManagementCenter {
             .cloned()
             .collect::<Vec<_>>();
         let mut rows = v_flex().gap_2();
+        // At most one Skill is selected, so the export card is built inside the
+        // loop and then placed under the resource card as a sibling.
+        let mut native_export_card = None;
         for skill in skills.clone() {
             let id = skill.id.as_str().to_string();
             let validate_id = id.clone();
@@ -12844,6 +12917,17 @@ impl ManagementCenter {
                 .as_ref()
                 .filter(|(resource_id, _, _)| resource_id == &id)
                 .map(|(_, message, failed)| (message.clone(), *failed));
+            let export_agents = skill
+                .agent_matrix
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.agent_id.clone())
+                .collect::<Vec<_>>();
+            native_export_card = Some(self.render_resource_native_export_card(
+                ManagementResourceExport::Skills,
+                &export_agents,
+                cx,
+            ));
             let mut agent_matrix_rows = v_flex().w_full().gap_1();
             for agent in matrix_agents.clone() {
                 let agent_id = agent.id.clone();
@@ -13041,6 +13125,7 @@ impl ManagementCenter {
             } else {
                 rows.into_any_element()
             })
+            .when_some(native_export_card, |layout, card| layout.child(card))
             .into_any_element()
     }
 
@@ -13326,8 +13411,16 @@ impl ManagementCenter {
         }
     }
 
-    fn selected_management_provider_profile(&self) -> Option<vibex_core::ProviderProfile> {
-        let agent_id = self.selected_agent_id.as_deref()?;
+    /// Provider profile a native export for `agent_id` would run under.
+    ///
+    /// A native export is keyed on the profile's Agent — the backend loads the
+    /// Agent's enabled MCP servers and Skills from it — so the MCP and Skills
+    /// pages resolve a profile per Agent instead of relying on whichever Agent
+    /// the Agent section happens to have selected.
+    fn management_provider_profile_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Option<vibex_core::ProviderProfile> {
         let profile_ids = self
             .provider_profiles
             .iter()
@@ -13352,6 +13445,10 @@ impl ManagementCenter {
             .iter()
             .find(|profile| profile.id.as_str() == preferred_id)
             .cloned()
+    }
+
+    fn selected_management_provider_profile(&self) -> Option<vibex_core::ProviderProfile> {
+        self.management_provider_profile_for_agent(self.selected_agent_id.as_deref()?)
     }
 
     fn prepare_acp_config_editor(
@@ -13801,27 +13898,69 @@ impl ManagementCenter {
         )
     }
 
-    fn render_native_export_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let selected_profile = self.selected_management_provider_profile();
-        let selected_profile_id = selected_profile
-            .as_ref()
-            .map(|profile| profile.id.as_str().to_string());
+    /// Native export card shared by the Advanced surface and the resource
+    /// pages.
+    ///
+    /// The card owns no draft of its own: it reads the Config Center's shared
+    /// export draft and coerces it to something `spec` can show, so a resource
+    /// page never renders a Provider-profile preview (or vice versa).
+    fn render_native_export_card(
+        &mut self,
+        spec: NativeExportCardSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pending = self.mutation.is_some();
         let previewing = matches!(
             &self.mutation,
             Some(ManagementMutation::ProviderPreview(action))
                 if action.starts_with("native-export:")
         );
-        let source = self.native_export_source;
-        let mode = self.native_export_mode;
+        let id_prefix = spec.id_prefix;
+        let mode = if spec.modes.contains(&self.native_export_mode) {
+            self.native_export_mode
+        } else {
+            spec.modes[0]
+        };
+        // A resource export always targets the Agent the selected profile runs,
+        // so those surfaces hide the source chips and pin the source instead.
+        let source = if spec.sources.is_empty() {
+            vibex_core::ProviderNativeExportSource::AgentDefault
+        } else {
+            self.native_export_source
+        };
+        let selected_profile = spec.selected_profile.clone();
+        let selected_profile_id = selected_profile
+            .as_ref()
+            .map(|profile| profile.id.as_str().to_string());
+
+        let mut agent_controls = h_flex().w_full().flex_wrap().gap_1();
+        for (agent_id, label) in spec.agent_choices.iter().cloned() {
+            let selected = spec.selected_agent_id.as_deref() == Some(agent_id.as_str());
+            let switch_id = format!("{id_prefix}-agent-{agent_id}");
+            agent_controls = agent_controls.child(
+                Button::new(SharedString::from(switch_id))
+                    .small()
+                    .ghost()
+                    .selected(selected)
+                    .label(label)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.resource_export_agent_id.as_deref() != Some(agent_id.as_str()) {
+                            this.resource_export_agent_id = Some(agent_id.clone());
+                            this.native_export_preview = None;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
 
         let source_controls = {
             let mut row = h_flex().w_full().flex_wrap().gap_1();
-            for (candidate, label) in management_native_export_sources() {
+            for (candidate, label) in spec.sources.iter().copied() {
                 let selected = source == candidate;
                 row = row.child(
                     Button::new(SharedString::from(format!(
-                        "native-export-source-{candidate:?}"
+                        "{id_prefix}-source-{candidate:?}"
                     )))
                     .small()
                     .ghost()
@@ -13841,56 +13980,41 @@ impl ManagementCenter {
         };
 
         let mut mode_controls = h_flex().w_full().flex_wrap().gap_1();
-        for (candidate, label) in [
-            (
-                vibex_core::ProviderNativeExportMode::ProviderProfile,
-                management_locale_text("Provider profile", "供应商配置", "供應商配置"),
-            ),
-            (
-                vibex_core::ProviderNativeExportMode::Combined,
-                management_locale_text("Combined", "组合", "組合"),
-            ),
-            (vibex_core::ProviderNativeExportMode::Mcp, "MCP"),
-            (
-                vibex_core::ProviderNativeExportMode::Skills,
-                management_locale_text("Skills", "技能", "技能"),
-            ),
-            (
-                vibex_core::ProviderNativeExportMode::Prompts,
-                management_locale_text("Prompts", "提示词", "提示詞"),
-            ),
-        ] {
-            mode_controls = mode_controls.child(
-                Button::new(SharedString::from(format!(
-                    "native-export-mode-{candidate:?}"
-                )))
-                .small()
-                .ghost()
-                .selected(mode == candidate)
-                .label(label)
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.native_export_mode != candidate {
-                        this.native_export_mode = candidate;
-                        // Resource modes target the profile's own Agent, while a
-                        // provider-profile export only exists for Codex and
-                        // Claude, so follow the mode instead of leaving a source
-                        // selected that the preview would refuse.
-                        this.native_export_source = match candidate {
-                            vibex_core::ProviderNativeExportMode::ProviderProfile => {
-                                if this.native_export_source.supports_provider_profile_export() {
-                                    this.native_export_source
-                                } else {
-                                    vibex_core::ProviderNativeExportSource::Codex
+        if spec.modes.len() > 1 {
+            for candidate in spec.modes.iter().copied() {
+                mode_controls = mode_controls.child(
+                    Button::new(SharedString::from(format!(
+                        "{id_prefix}-mode-{candidate:?}"
+                    )))
+                    .small()
+                    .ghost()
+                    .selected(mode == candidate)
+                    .label(management_native_export_mode_label(candidate))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.native_export_mode != candidate {
+                            this.native_export_mode = candidate;
+                            // Resource modes target the profile's own Agent, while
+                            // a provider-profile export only exists for Codex and
+                            // Claude, so follow the mode instead of leaving a
+                            // source selected that the preview would refuse.
+                            this.native_export_source = match candidate {
+                                vibex_core::ProviderNativeExportMode::ProviderProfile => {
+                                    if this.native_export_source.supports_provider_profile_export()
+                                    {
+                                        this.native_export_source
+                                    } else {
+                                        vibex_core::ProviderNativeExportSource::Codex
+                                    }
                                 }
-                            }
-                            _ => vibex_core::ProviderNativeExportSource::AgentDefault,
-                        };
-                        this.native_export_preview = None;
-                        cx.notify();
-                    }
-                })),
-            );
+                                _ => vibex_core::ProviderNativeExportSource::AgentDefault,
+                            };
+                            this.native_export_preview = None;
+                            cx.notify();
+                        }
+                    })),
+                );
+            }
         }
 
         let active_export_preview = self.native_export_preview.clone().filter(|preview| {
@@ -13986,7 +14110,7 @@ impl ManagementCenter {
             .flex_wrap()
             .gap_2()
             .child(
-                Button::new("native-export-preview-current")
+                Button::new(SharedString::from(format!("{id_prefix}-preview-current")))
                     .small()
                     .primary()
                     .icon(IconName::ArrowDown)
@@ -13999,12 +14123,16 @@ impl ManagementCenter {
                     .disabled(pending || preview_profile_id.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(profile_id) = preview_profile_id.clone() {
+                            // Pin the shared draft to what this card shows, so
+                            // the preview that comes back matches it.
+                            this.native_export_source = source;
+                            this.native_export_mode = mode;
                             this.preview_native_export(profile_id, cx);
                         }
                     })),
             )
             .child(
-                Button::new("native-export-apply-current")
+                Button::new(SharedString::from(format!("{id_prefix}-apply-current")))
                     .small()
                     .secondary()
                     .label(management_locale_text("Apply", "应用", "套用"))
@@ -14016,7 +14144,7 @@ impl ManagementCenter {
                     })),
             )
             .child(
-                Button::new("native-export-rollback-current")
+                Button::new(SharedString::from(format!("{id_prefix}-rollback-current")))
                     .small()
                     .outline()
                     .label(management_locale_text("Rollback", "回滚", "回復"))
@@ -14096,7 +14224,7 @@ impl ManagementCenter {
                     )
                     .child(
                         Button::new(SharedString::from(format!(
-                            "native-export-history-rollback-{rollback_id}"
+                            "{id_prefix}-history-rollback-{rollback_id}"
                         )))
                         .small()
                         .outline()
@@ -14113,6 +14241,63 @@ impl ManagementCenter {
             );
         }
 
+        let mut content = v_flex().w_full().gap_3();
+        if !spec.agent_choices.is_empty() {
+            content = content
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .child(management_locale_text(
+                            "Target Agent",
+                            "目标 Agent",
+                            "目標 Agent",
+                        )),
+                )
+                .child(agent_controls);
+        }
+        if let Some(profile) = selected_profile {
+            content = content.child(stat_line(
+                management_locale_text("Profile", "配置", "配置"),
+                profile.display_name,
+                cx,
+            ));
+        } else {
+            content = content.child(status_line(
+                management_locale_text(
+                    "This Agent has no Provider profile yet, so there is nothing to export.",
+                    "该 Agent 暂无供应商配置，暂时无法导出。",
+                    "該 Agent 尚無供應商配置，暫時無法匯出。",
+                )
+                .to_string(),
+                true,
+                cx,
+            ));
+        }
+        if !spec.sources.is_empty() {
+            content = content.child(source_controls);
+        }
+        if spec.modes.len() > 1 {
+            content = content.child(mode_controls);
+        }
+        content = content
+            .child(actions)
+            .child(preview_rows)
+            .child(
+                div()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.70))
+                    .text_sm()
+                    .font_semibold()
+                    .child(management_locale_text(
+                        "Export history",
+                        "导出历史",
+                        "匯出歷史",
+                    )),
+            )
+            .child(history_rows);
+
         management_card(
             management_locale_text("Native export", "原生配置导出", "原生配置匯出"),
             management_locale_text(
@@ -14120,35 +14305,58 @@ impl ManagementCenter {
                 "写入 Agent 原生配置前先检查脱敏文件变更。",
                 "寫入 Agent 原生配置前先檢查遮罩檔案變更。",
             ),
-            v_flex()
-                .w_full()
-                .gap_3()
-                .when_some(selected_profile, |content, profile| {
-                    content.child(stat_line(
-                        management_locale_text("Profile", "配置", "配置"),
-                        profile.display_name,
-                        cx,
-                    ))
-                })
-                .child(source_controls)
-                .child(mode_controls)
-                .child(actions)
-                .child(preview_rows)
-                .child(
-                    div()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(cx.theme().border.opacity(0.70))
-                        .text_sm()
-                        .font_semibold()
-                        .child(management_locale_text(
-                            "Export history",
-                            "导出历史",
-                            "匯出歷史",
-                        )),
-                )
-                .child(history_rows)
-                .into_any_element(),
+            content.into_any_element(),
+            cx,
+        )
+    }
+
+    /// Native export card for one resource family on its own page.
+    ///
+    /// Only the Agents the resource is enabled for are offered, because the
+    /// backend builds the exported file from that Agent's enabled entries — an
+    /// Agent the resource is not enabled for would export an empty file.
+    fn render_resource_native_export_card(
+        &mut self,
+        kind: ManagementResourceExport,
+        enabled_agent_ids: &[vibex_core::AgentId],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let choices = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent.added && enabled_agent_ids.iter().any(|enabled| enabled == &agent.id)
+            })
+            .map(|agent| (agent.id.as_str().to_string(), agent.label.clone()))
+            .collect::<Vec<_>>();
+        let Some(selected_agent_id) =
+            resource_export_target_agent_id(self.resource_export_agent_id.as_deref(), &choices)
+        else {
+            return compact_empty_state(
+                management_locale_text(
+                    "No Agent enabled",
+                    "尚未为任何 Agent 启用",
+                    "尚未為任何 Agent 啟用",
+                ),
+                management_locale_text(
+                    "Enable this resource for an Agent above, then export it into that Agent's native files.",
+                    "请先在上方为某个 Agent 启用，再把它导出到该 Agent 的原生配置。",
+                    "請先在上方為某個 Agent 啟用，再把它匯出到該 Agent 的原生設定。",
+                ),
+                cx,
+            );
+        };
+        let selected_profile = self.management_provider_profile_for_agent(&selected_agent_id);
+        self.render_native_export_card(
+            NativeExportCardSpec {
+                id_prefix: kind.id_prefix(),
+                modes: vec![kind.mode()],
+                sources: Vec::new(),
+                agent_choices: choices,
+                selected_agent_id: Some(selected_agent_id),
+                selected_profile,
+            },
             cx,
         )
     }
@@ -14156,7 +14364,23 @@ impl ManagementCenter {
     fn render_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let extra_wide = f32::from(window.viewport_size().width) >= 1536.0;
         let acp_card = self.render_acp_config_card(window, cx);
-        let native_export_card = self.render_native_export_card(cx);
+        let native_export_card = self.render_native_export_card(
+            NativeExportCardSpec {
+                id_prefix: "native-export",
+                modes: vec![
+                    vibex_core::ProviderNativeExportMode::ProviderProfile,
+                    vibex_core::ProviderNativeExportMode::Combined,
+                    vibex_core::ProviderNativeExportMode::Mcp,
+                    vibex_core::ProviderNativeExportMode::Skills,
+                    vibex_core::ProviderNativeExportMode::Prompts,
+                ],
+                sources: management_native_export_sources(),
+                agent_choices: Vec::new(),
+                selected_agent_id: self.selected_agent_id.clone(),
+                selected_profile: self.selected_management_provider_profile(),
+            },
+            cx,
+        );
         let prompts_hooks = self.render_prompts_hooks(extra_wide, cx);
         let pending = self.mutation.is_some();
         let mut health_rows = v_flex().w_full().gap_1();
@@ -17011,15 +17235,46 @@ fn management_native_export_sources() -> Vec<(vibex_core::ProviderNativeExportSo
     ]
 }
 
+/// Caption of a native-export mode chip.
+fn management_native_export_mode_label(mode: vibex_core::ProviderNativeExportMode) -> &'static str {
+    match mode {
+        vibex_core::ProviderNativeExportMode::ProviderProfile => {
+            management_locale_text("Provider profile", "供应商配置", "供應商配置")
+        }
+        vibex_core::ProviderNativeExportMode::Combined => {
+            management_locale_text("Combined", "组合", "組合")
+        }
+        vibex_core::ProviderNativeExportMode::Mcp => "MCP",
+        vibex_core::ProviderNativeExportMode::Skills => {
+            management_locale_text("Skills", "技能", "技能")
+        }
+        vibex_core::ProviderNativeExportMode::Prompts => {
+            management_locale_text("Prompts", "提示词", "提示詞")
+        }
+    }
+}
+
+/// Agent a resource export targets: the explicit pick while it is still one of
+/// the Agents the resource is enabled for, else the first choice.
+fn resource_export_target_agent_id(
+    override_id: Option<&str>,
+    choices: &[(String, String)],
+) -> Option<String> {
+    override_id
+        .filter(|id| choices.iter().any(|(candidate, _)| candidate == id))
+        .map(str::to_string)
+        .or_else(|| choices.first().map(|(id, _)| id.clone()))
+}
+
 fn management_edit_label() -> &'static str {
     management_locale_text("Edit", "编辑", "編輯")
 }
 
 fn management_mcp_editor_description() -> &'static str {
     management_locale_text(
-        "MCP servers are stored once and enabled per Agent. Agents that read the ACP wire receive them at session start; use the Advanced section's native export to also write an Agent's own config file.",
-        "MCP 服务只存一份，按 Agent 启用。走 ACP 通道的 Agent 会在会话启动时收到；如需写入 Agent 自己的配置文件，请使用高级设置里的原生导出。",
-        "MCP 服務只存一份，按 Agent 啟用。走 ACP 通道的 Agent 會在會話啟動時收到；如需寫入 Agent 自己的設定檔，請使用進階設定裡的原生匯出。",
+        "MCP servers are stored once and enabled per Agent. Agents that read the ACP wire receive them at session start; the Native export card below writes them into an Agent's own config file.",
+        "MCP 服务只存一份，按 Agent 启用。走 ACP 通道的 Agent 会在会话启动时收到；下方的原生导出可将其写入 Agent 自己的配置文件。",
+        "MCP 服務只存一份，按 Agent 啟用。走 ACP 通道的 Agent 會在會話啟動時收到；下方的原生匯出可將其寫入 Agent 自己的設定檔。",
     )
 }
 
@@ -18425,17 +18680,17 @@ fn management_append_runtime_option_probe(
 
 fn management_mcp_description() -> &'static str {
     management_locale_text(
-        "Managed servers, validation, and Agent enablement.",
-        "管理服务、验证状态及 Agent 启用范围。",
-        "管理服務、驗證狀態及 Agent 啟用範圍。",
+        "Managed servers, validation, Agent enablement, and native export.",
+        "管理服务、验证状态、Agent 启用范围与原生导出。",
+        "管理服務、驗證狀態、Agent 啟用範圍與原生匯出。",
     )
 }
 
 fn management_skills_description() -> &'static str {
     management_locale_text(
-        "Reusable Skills, discovery, and Agent enablement.",
-        "管理可复用技能、发现来源及 Agent 启用范围。",
-        "管理可重用技能、探索來源及 Agent 啟用範圍。",
+        "Reusable Skills, discovery, Agent enablement, and native export.",
+        "管理可复用技能、发现来源、Agent 启用范围与原生导出。",
+        "管理可重用技能、探索來源、Agent 啟用範圍與原生匯出。",
     )
 }
 
@@ -19162,6 +19417,91 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Mcp"));
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    #[test]
+    fn resource_pages_own_their_native_export_cards() {
+        let source = include_str!("management.rs");
+        let mcp = source
+            .split_once("    fn render_mcp(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_skills("))
+            .map(|(body, _)| body)
+            .expect("MCP renderer should remain inspectable");
+        let skills = source
+            .split_once("    fn render_skills(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_prompts_hooks("))
+            .map(|(body, _)| body)
+            .expect("Skills renderer should remain inspectable");
+        let advanced = source
+            .split_once("    fn render_advanced(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_scheduled_editor("))
+            .map(|(body, _)| body)
+            .expect("Advanced renderer should remain inspectable");
+
+        // Each resource page exports its own family through the Agent that
+        // resource is enabled for; the Advanced page keeps the Provider-profile
+        // export it is not reachable for anyway.
+        assert!(mcp.contains("render_resource_native_export_card("));
+        assert!(mcp.contains("ManagementResourceExport::Mcp"));
+        assert!(skills.contains("render_resource_native_export_card("));
+        assert!(skills.contains("ManagementResourceExport::Skills"));
+        assert!(advanced.contains("render_native_export_card("));
+        assert!(advanced.contains("ProviderNativeExportMode::ProviderProfile"));
+    }
+
+    #[test]
+    fn resource_export_card_pins_its_mode_and_hides_the_source_choices() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("    fn render_resource_native_export_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_advanced("))
+            .map(|(body, _)| body)
+            .expect("resource export card should remain inspectable");
+
+        assert!(card.contains("modes: vec![kind.mode()]"));
+        assert!(card.contains("sources: Vec::new()"));
+        assert!(card.contains("resource_export_target_agent_id("));
+        assert!(card.contains("management_provider_profile_for_agent("));
+        assert_eq!(
+            ManagementResourceExport::Mcp.id_prefix(),
+            "mcp-native-export"
+        );
+        assert_eq!(
+            ManagementResourceExport::Skills.id_prefix(),
+            "skill-native-export"
+        );
+        assert_eq!(
+            ManagementResourceExport::Mcp.mode(),
+            vibex_core::ProviderNativeExportMode::Mcp
+        );
+        assert_eq!(
+            ManagementResourceExport::Skills.mode(),
+            vibex_core::ProviderNativeExportMode::Skills
+        );
+    }
+
+    #[test]
+    fn resource_export_target_prefers_the_explicit_pick_then_the_first_enabled_agent() {
+        let choices = vec![
+            ("claude".to_string(), "Claude Code".to_string()),
+            ("codex".to_string(), "Codex".to_string()),
+        ];
+
+        assert_eq!(
+            resource_export_target_agent_id(Some("codex"), &choices).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            resource_export_target_agent_id(None, &choices).as_deref(),
+            Some("claude")
+        );
+        // A pick that is no longer enabled for the selected resource falls back
+        // instead of exporting for an Agent whose file would be empty.
+        assert_eq!(
+            resource_export_target_agent_id(Some("gemini"), &choices).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(resource_export_target_agent_id(Some("codex"), &[]), None);
     }
 
     #[test]
