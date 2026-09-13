@@ -3349,8 +3349,11 @@ host seam keeps terminal execution provider-neutral.
 - Trigger: OpenCode returns `end_turn` without any non-empty Agent message,
   thought, or new tool-call update after the model transport failed before the
   first token.
-- This fallback is OpenCode-specific. Generic ACP agents must continue to use
-  standard JSON-RPC responses and process lifecycle errors.
+- The stderr bridge and its error codes are OpenCode-specific. Generic ACP
+  agents must continue to use standard JSON-RPC responses and process lifecycle
+  errors, except for the transport-agnostic empty-completed-turn guard in
+  [Empty Completed ACP Turn](#scenario-empty-completed-acp-turn), which applies
+  to every Adapter.
 
 ### 2. Signatures
 
@@ -3519,6 +3522,124 @@ stderr retryable error -> show correlated retry state
 
 The bridge restores a bounded provider-neutral turn lifecycle while keeping the
 non-standard stderr dependency isolated to the OpenCode profile.
+
+## Scenario: Empty Completed ACP Turn
+
+### 1. Scope / Trigger
+
+- Trigger: `session/prompt` resolves with `stopReason: "end_turn"` while the
+  turn was completely silent — no non-empty Agent message, no thought, no tool
+  call, no plan update, and not even a title, command-catalogue, mode,
+  configuration, or usage `session/update` — and no permission, elicitation, or
+  terminal request is pending.
+- Observed cause: an Adapter swallows an internal provider failure (invalid API
+  key, unreachable endpoint, malformed HTTP 200) and answers the prompt as if it
+  completed. Vibex would otherwise treat the turn as successful and persist an
+  empty final Agent message, which renders as a vanished answer with no error
+  and no recovery hint.
+- This guard is transport-agnostic and applies to every ACP Adapter. OpenCode
+  keeps its dedicated code from the scenario above.
+
+### 2. Signatures
+
+```text
+AcpSessionAttachment::has_turn_output() -> bool
+AcpSessionAttachment::has_turn_activity() -> bool
+AcpSessionAttachment::turn_cancel_requested() -> bool
+AcpSessionAttachment::mark_turn_cancel_requested()
+provider/acp_turn_without_output          // every Adapter except OpenCode
+provider/opencode_model_api_error         // OpenCode bridge, unchanged
+```
+
+### 3. Contracts
+
+- Turn-output evidence is recorded in `record_opencode_stream_progress`, the one
+  funnel that every non-empty `agent_message_chunk`, `agent_thought_chunk`,
+  `tool_call`, and `plan` update passes through, and stored as
+  `ActiveTurn::turn_output_seen`. The recorder's name is historical; the flag is
+  generic and must stay the single source of "the user saw something".
+- Turn-activity evidence is recorded by `handle_session_update` for every
+  recognized `sessionUpdate` kind and stored as `ActiveTurn::turn_activity_seen`.
+  It covers acknowledgements that carry no model output, so a locally handled
+  slash command is never mistaken for a provider failure.
+- `end_turn` + no pending host input + no user cancel + no turn output + no turn
+  activity → `provider/acp_turn_without_output`. The turn aborts as `Failed` and
+  emits no final Agent message, so the failure reaches the timeline as an error
+  card with a recovery hint instead of an empty answer.
+- OpenCode keeps `provider/opencode_model_api_error` and its API-root recovery
+  hint, and its bridge keeps requiring model-stream progress specifically, so an
+  `end_turn` with only non-output updates still fails there.
+- A user-requested stop is never a provider failure.
+  `AcpRuntimeClient::interrupt` marks `ActiveTurn::cancel_requested` before the
+  Adapter receives `session/cancel`; an `end_turn` that arrives afterwards for
+  that turn completes normally even with no output.
+- `stopReason` travels as a redacted diagnostic. The message and recovery hint
+  must not embed stderr, prompt text, model ids, or credentials; they point at
+  the Agent's own log instead.
+
+### 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| `end_turn`, turn output seen | normal completion |
+| `end_turn`, no output, any session update seen | normal completion |
+| `end_turn`, no output, permission/elicitation/terminal pending | `needs_input`, no failure |
+| `end_turn`, no output, user cancel requested | normal completion |
+| `end_turn`, no output, no activity, OpenCode bridge enabled | `provider/opencode_model_api_error` |
+| `end_turn`, no output, no activity, any other Adapter | `provider/acp_turn_without_output` |
+| non-`end_turn`, not user-cancelled | `provider/acp_turn_stopped_abnormally` (unchanged) |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a Kimi-style Adapter answers `end_turn` after its provider rejected the
+  API key; the timeline shows a provider error with a recovery hint instead of a
+  blank answer.
+- Good: a slash command acknowledges locally with a mode or configuration
+  update and no model output; the turn completes without an error card.
+- Good: the user stops a turn and the Adapter answers the cancelled prompt with
+  `end_turn`; the turn completes without an error card.
+- Base: an Adapter streams only a thought and then answers `end_turn`; the turn
+  is treated as normal because output was observed.
+- Base: an Adapter ends `end_turn` while an approval is pending; the session
+  stays `needs_input`.
+- Bad: persisting `{"type":"agent_message","data":{"text":"","isFinal":true}}`
+  for an Adapter that internally failed.
+- Bad: reporting a provider failure after the user explicitly stopped the turn.
+- Bad: reporting a provider failure for a command that answered with only a
+  non-output session update.
+
+### 6. Tests Required
+
+- Mock-process tests return `end_turn` without message, thought, tool, or
+  pending permission activity for a non-OpenCode Agent and assert
+  `acp_turn_without_output` with no final Agent message.
+- Mock-process tests return `end_turn` after a single non-output session update
+  and assert the turn completes without an error.
+- Mock-process tests hold the prompt open, deliver `session/cancel`, then answer
+  `end_turn` with no output, and assert the turn completes without an error.
+- The existing OpenCode empty-`end_turn` test continues to assert
+  `opencode_model_api_error`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+session/prompt -> Adapter's provider rejects the API key
+               -> Adapter answers end_turn with no content and no update
+               -> Vibex persists an empty final Agent message
+               -> the timeline shows a user message and nothing else
+```
+
+#### Correct
+
+```text
+session/prompt -> end_turn
+               -> no assistant/thought/tool/plan output, no session update
+               -> no pending input and no user cancel
+               -> provider/acp_turn_without_output
+               -> error timeline item with recovery hint, session error
+```
 
 ## Scenario: ACP Session Runtime Configuration State And Operation Gate
 
