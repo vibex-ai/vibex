@@ -37,6 +37,46 @@ impl fmt::Debug for RemoteCredentialRecord {
     }
 }
 
+/// Longest runtime name a picker renders. Longer names are clipped rather
+/// than wrapped so row geometry stays stable across locales.
+pub const RUNTIME_DISPLAY_NAME_MAX_CHARS: usize = 48;
+
+/// The human name for a paired runtime, shared by every client surface so the
+/// desktop and the phone agree on what a runtime is called.
+///
+/// Priority: the operator's local rename, then the name the runtime published
+/// when it was paired, then the authority of the saved server URL, and finally
+/// a bounded fragment of the server id so a relay-only credential still has a
+/// stable label. Returns an empty string when the caller must supply its own
+/// localized fallback.
+pub fn runtime_display_name(
+    override_name: Option<&str>,
+    published_name: Option<&str>,
+    server_url: &str,
+    server_id: &str,
+) -> String {
+    fn bounded(value: &str) -> String {
+        value
+            .trim()
+            .chars()
+            .take(RUNTIME_DISPLAY_NAME_MAX_CHARS)
+            .collect()
+    }
+
+    for candidate in [override_name, published_name] {
+        if let Some(value) = candidate.map(str::trim).filter(|value| !value.is_empty()) {
+            return bounded(value);
+        }
+    }
+    if let Ok(parsed) = url::Url::parse(server_url)
+        && let Some(host) = parsed.host_str()
+        && !host.trim().is_empty()
+    {
+        return bounded(host);
+    }
+    bounded(server_id)
+}
+
 pub trait CredentialStore: BackendBound {
     fn load(&self) -> BackendFuture<'_, Option<RemoteCredentialRecord>>;
     fn save(&self, record: RemoteCredentialRecord) -> BackendFuture<'_, ()>;

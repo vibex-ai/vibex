@@ -145,8 +145,8 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    GoToLineInEditor, NavigateBack, NavigateForward, OpenConversationFind, OpenSettings,
-    RedoImageEdit, RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview,
+    GoToLineInEditor, NavigateBack, NavigateForward, OpenConversationFind, OpenRuntimeManager,
+    OpenSettings, RedoImageEdit, RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview,
     ToggleRightRail, ToggleSidebar, UndoImageEdit,
 };
 use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
@@ -169,12 +169,15 @@ use crate::platform::{
     send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
 };
 use crate::remote_access_pairing::open_remote_access_pairing;
-use crate::remote_client::DesktopRemoteCredential;
+use crate::remote_client::{
+    DesktopRemoteCredential, DesktopRuntimeRegistry, DesktopRuntimeRegistryStore, LOCAL_RUNTIME_ID,
+    RegisteredRuntime,
+};
 use crate::responsive::WorkbenchVisibility;
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::usage::UsageView;
 use crate::{DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, resize_seam, theme};
-use vibex_remote_client::WebRemoteBackend;
+use vibex_remote_client::{RemoteConnectionState, WebRemoteBackend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeStatus {
@@ -183,20 +186,39 @@ enum RuntimeStatus {
     Failed { code: String, message: String },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RemoteClientSettingsMode {
-    Local,
-    Connecting,
-    Connected,
+/// A paired remote runtime driving this workbench. Holds the runtime's
+/// registry id and the backend built from its credential; the workbench
+/// consumes the same facade slots the native backend fills, so no view knows
+/// which one is live.
+struct DesktopRemoteClient {
+    runtime_id: String,
+    credential: DesktopRemoteCredential,
+    backend: Arc<WebRemoteBackend>,
 }
 
-/// A paired remote runtime driving this workbench. Holds the persisted
-/// credential and the backend built from it; the workbench consumes the same
-/// facade slots the native backend fills, so no view knows which one is live.
-struct DesktopRemoteClient {
-    credential: DesktopRemoteCredential,
-    store: Arc<crate::remote_client::DesktopRemoteCredentialStore>,
-    backend: Arc<WebRemoteBackend>,
+/// Which stage of the runtime manager panel is showing. The panel keeps one
+/// floating surface and swaps its body, so management never stacks overlays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeManagerStage {
+    List,
+    Detail,
+}
+
+/// Which pairing entry the add-runtime dialog is collecting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RuntimeAddTab {
+    #[default]
+    Code,
+    Link,
+}
+
+/// Why a remote runtime is being connected: the first frame of a session, or
+/// an operator switching authorities. Only the boot case may fall back to the
+/// embedded runtime, because only the boot case has nothing installed yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeConnectOrigin {
+    Boot,
+    Switch,
 }
 
 /// How the operator handed over the pairing entry: a typed address plus code,
@@ -212,22 +234,15 @@ enum RemotePairingEntry {
 }
 
 impl DesktopRemoteClient {
-    /// Builds the backend from the credential, verifies the handshake, and
-    /// only then persists the credential: a failed connect leaves no stored
-    /// grant behind.
-    async fn start(
-        credential: DesktopRemoteCredential,
-        home_dir: std::path::PathBuf,
-    ) -> BackendResult<Self> {
-        let store = Arc::new(crate::remote_client::DesktopRemoteCredentialStore::new(
-            &home_dir,
-        ));
+    /// Builds the backend from the credential and verifies the handshake. The
+    /// caller writes the registry only after this succeeds, so a failed
+    /// connect leaves no stored grant behind.
+    async fn start(runtime_id: String, credential: DesktopRemoteCredential) -> BackendResult<Self> {
         let backend = credential.backend()?;
         backend.connect().await?;
-        store.save(&credential)?;
         Ok(Self {
+            runtime_id,
             credential,
-            store,
             backend,
         })
     }
@@ -274,6 +289,16 @@ const TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH: f32 = 36.0;
 const TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH: f32 = 44.0;
 const TITLE_BAR_SESSION_TITLE_MAX_WIDTH: f32 = 320.0;
 const TITLE_BAR_SESSION_MENU_WIDTH: f32 = 220.0;
+/// The runtime manager rides one floating panel whose body swaps between the
+/// list and the detail stage, so management never stacks overlays.
+const RUNTIME_MANAGER_PANEL_WIDTH: f32 = 360.0;
+const RUNTIME_MANAGER_PANEL_MAX_HEIGHT: f32 = 420.0;
+const RUNTIME_MANAGER_ROW_HEIGHT: f32 = 46.0;
+const RUNTIME_ADD_DIALOG_WIDTH: f32 = 420.0;
+const RUNTIME_DETAIL_LABEL_WIDTH: f32 = 76.0;
+/// The runtime stack glyph. `Boxes` is not part of gpui-component's
+/// compatibility enum, so the panel resolves it from the app asset bundle.
+const RUNTIME_MANAGER_ICON: &str = "icons/boxes.svg";
 const TITLE_BAR_SESSION_MENU_TITLE_MAX_CHARS: usize = 16;
 const SIDEBAR_FLOATING_MAX_WIDTH: f32 = 320.0;
 const SIDEBAR_FLOATING_VIEWPORT_RATIO: f32 = 0.88;
@@ -4759,6 +4784,31 @@ pub struct VibexWorkbench {
     open_settings_on_start: bool,
     settings_view: Entity<FoundationSettings>,
     remote_client: Option<DesktopRemoteClient>,
+    /// Every runtime this desktop can drive, plus the id of the active one.
+    /// Client-side state, so it stays readable while another authority is
+    /// displayed — that is what makes switching non-destructive.
+    runtime_registry: DesktopRuntimeRegistry,
+    runtime_registry_store: Option<Arc<DesktopRuntimeRegistryStore>>,
+    runtime_manager_open: bool,
+    runtime_manager_stage: RuntimeManagerStage,
+    /// The runtime whose detail stage is showing, or whose rename is running.
+    runtime_manager_target: Option<String>,
+    runtime_rename_input: Entity<InputState>,
+    runtime_rename_active: bool,
+    /// The runtime id a switch is connecting to; blocks a second switch.
+    runtime_switch_pending: Option<String>,
+    runtime_add_open: bool,
+    runtime_add_tab: RuntimeAddTab,
+    runtime_add_server_url_input: Entity<InputState>,
+    runtime_add_code_input: Entity<InputState>,
+    runtime_add_link_input: Entity<InputState>,
+    runtime_add_busy: bool,
+    /// The runtime a removal is confirming.
+    runtime_remove_pending: Option<String>,
+    /// Why a runtime last refused to connect, keyed by runtime id. A failed
+    /// boot falls back to the embedded runtime, so the panel is the only place
+    /// that can still explain what happened.
+    runtime_connect_errors: BTreeMap<String, String>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
     code_preview_visible: bool,
@@ -5127,6 +5177,37 @@ impl VibexWorkbench {
         let sidebar_rename_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(initial_strings.sidebar_rename_placeholder)
         });
+        let runtime_rename_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text("Runtime name", "运行时名称", "執行階段名稱"))
+                .submit_on_enter(true)
+        });
+        let runtime_add_server_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "https://host:8787",
+                "https://主机:8787",
+                "https://主機:8787",
+            ))
+        });
+        let runtime_add_code_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text("Pairing code", "配对码", "配對碼"))
+                .submit_on_enter(true)
+        });
+        let runtime_add_link_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text("vibex://…", "vibex://…", "vibex://…"))
+                .submit_on_enter(true)
+        });
+        // The registry is read once at boot: it names every runtime the manager
+        // renders and decides whether the first connection is local or remote.
+        let runtime_registry_store = config
+            .as_ref()
+            .map(|config| Arc::new(DesktopRuntimeRegistryStore::new(&config.home_dir)));
+        let runtime_registry = runtime_registry_store
+            .as_ref()
+            .map(|store| store.load_or_migrate())
+            .unwrap_or_default();
         let user_message_edit_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(locale::text("Edit message", "编辑消息", "編輯訊息"))
@@ -5543,6 +5624,22 @@ impl VibexWorkbench {
             open_settings_on_start: settings_open_on_start,
             settings_view,
             remote_client: None,
+            runtime_registry,
+            runtime_registry_store,
+            runtime_manager_open: false,
+            runtime_manager_stage: RuntimeManagerStage::List,
+            runtime_manager_target: None,
+            runtime_rename_input,
+            runtime_rename_active: false,
+            runtime_switch_pending: None,
+            runtime_add_open: false,
+            runtime_add_tab: RuntimeAddTab::default(),
+            runtime_add_server_url_input,
+            runtime_add_code_input,
+            runtime_add_link_input,
+            runtime_add_busy: false,
+            runtime_remove_pending: None,
+            runtime_connect_errors: BTreeMap::new(),
             code_workbench,
             preview_fullscreen_active: false,
             code_preview_visible: false,
@@ -5901,13 +5998,27 @@ impl VibexWorkbench {
     }
 
     fn begin_runtime_start(&mut self, cx: &mut Context<Self>) {
-        // A paired remote credential switches the workbench into remote-client
-        // mode at boot. "Forget this runtime" in Remote Runtime settings clears
-        // it and returns the desktop to the local authority.
-        if let Some(credential) = self.stored_remote_client_credential() {
-            self.begin_remote_client_start(credential, cx);
+        // The runtime registry decides which authority this shell boots into.
+        // The embedded runtime stays the fallback whenever the active remote
+        // cannot be reached, so a stale pairing never strands the workbench.
+        if let Some(runtime) = self.boot_remote_runtime() {
+            self.begin_active_remote_start(runtime, cx);
             return;
         }
+        self.boot_local_runtime(cx);
+    }
+
+    /// The remote runtime a fresh shell should connect to, if any. The escape
+    /// hatch keeps the embedded authority reachable while a paired server is
+    /// being migrated.
+    fn boot_remote_runtime(&self) -> Option<RegisteredRuntime> {
+        if std::env::var_os("VIBEX_DISABLE_REMOTE_CLIENT").is_some() {
+            return None;
+        }
+        self.runtime_registry.active_remote().cloned()
+    }
+
+    fn boot_local_runtime(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.config.clone() else {
             self.finish_startup_loading(cx);
             self.runtime_status = RuntimeStatus::Failed {
@@ -5985,46 +6096,7 @@ impl VibexWorkbench {
                             if let Some(note) = persistence_note {
                                 this.persistence_note = Some(note);
                             }
-                            this.runtime = Some(runtime.clone());
-                            this.sync_timeline_display_settings_to_runtime();
-                            this.start_sidebar_organization_bridge(&runtime, cx);
-                            let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
-                            this.shared_workflow =
-                                Some(AgentFileGitController::from_facade(&facade));
-                            this.shared_terminal = Some(TerminalWorkflowController::new(
-                                facade.terminal().clone(),
-                                TerminalWorkflowCapabilities::from_backend(&facade.capabilities()),
-                            ));
-                            this.shared_management = Some(ManagementWorkflowController::new(
-                                facade.management().clone(),
-                                facade.device().clone(),
-                                ManagementWorkflowCapabilities::from_backend(
-                                    &facade.capabilities(),
-                                ),
-                            ));
-                            this.usage_view
-                                .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
-                            let terminal_manager = runtime.terminals().manager();
-                            this.code_workbench.update(cx, |workbench, cx| {
-                                workbench.set_backend(facade.clone(), cx);
-                                // A local authority renders terminals from its
-                                // in-process manager; a remote authority serves
-                                // the same surface from the Remote v2 transport.
-                                workbench.set_terminal_transport(
-                                    Some(crate::code_workbench::local_terminal_surface_transport(
-                                        terminal_manager,
-                                    )),
-                                    cx,
-                                );
-                            });
-                            this.management_view.update(cx, |management, cx| {
-                                management.set_backend(facade.clone(), cx);
-                                management.set_runtime(runtime.clone(), cx);
-                            });
-                            this.backend = Some(facade);
-                            this.attach_update_status(runtime.clone(), cx);
-                            this.attach_event_stream(runtime, cx);
-                            this.load_agent_overview(cx);
+                            this.install_local_runtime(runtime, cx);
                         }
                         Ok(Err(error)) => {
                             eprintln!("vibex-foundation: runtime-failed code={}", error.code);
@@ -6621,10 +6693,10 @@ impl VibexWorkbench {
         ));
     }
 
-    /// Claims a pairing code against a headless runtime and switches this
-    /// workbench to remote-client mode on success. The claim and handshake
-    /// happen off the UI thread; the stored credential pins the server
-    /// identity and is written only after the connect succeeded.
+    /// Claims a pairing code against a headless runtime, registers it as a
+    /// runtime and switches the workbench to it. The claim happens off the UI
+    /// thread; the credential pins the server identity and reaches the
+    /// registry only after the claim succeeded.
     fn claim_remote_pairing_code(
         &mut self,
         server_url: String,
@@ -6648,35 +6720,44 @@ impl VibexWorkbench {
         self.begin_remote_pairing(RemotePairingEntry::Link { pairing_link }, cx);
     }
 
+    /// The add-runtime flow: claim, register, then connect. The currently
+    /// installed authority is left alone until the new runtime answers, so a
+    /// mistyped code costs nothing.
     fn begin_remote_pairing(&mut self, entry: RemotePairingEntry, cx: &mut Context<Self>) {
-        if self.remote_client.is_some() || matches!(self.runtime_status, RuntimeStatus::Starting) {
+        if self.runtime_add_busy || self.runtime_switch_pending.is_some() {
             return;
         }
-        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
+        if self.runtime_registry_store.is_none() {
+            self.runtime_note = Some(
+                locale::text(
+                    "No writable home for the runtime list",
+                    "无法写入运行时列表",
+                    "無法寫入執行階段清單",
+                )
+                .to_string(),
+            );
+            cx.notify();
             return;
-        };
-        self.detach_local_runtime(cx);
-        self.runtime_status = RuntimeStatus::Starting;
+        }
+        self.runtime_add_busy = true;
         self.runtime_note = Some(
             match entry {
-                RemotePairingEntry::Code { .. } => "Claiming pairing code…",
-                RemotePairingEntry::Link { .. } => "Pairing from connection string…",
+                RemotePairingEntry::Code { .. } => locale::text(
+                    "Claiming the pairing code…",
+                    "正在领取配对码…",
+                    "正在領取配對碼…",
+                ),
+                RemotePairingEntry::Link { .. } => locale::text(
+                    "Pairing from the connection string…",
+                    "正在使用连接串配对…",
+                    "正在使用連接串配對…",
+                ),
             }
             .to_string(),
         );
-        // The Pair button listener runs inside FoundationSettings::update. Defer
-        // the busy-flag update of that same entity until the GPUI update cycle
-        // finishes to avoid a re-entrant borrow panic.
-        let settings_view = self.settings_view.clone();
-        cx.defer(move |cx| {
-            settings_view.update(cx, |settings, cx| {
-                settings.remote_connect_busy = true;
-                cx.notify();
-            });
-        });
         let allow_insecure_local_dev = cfg!(debug_assertions);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let credential = match entry {
+            match entry {
                 RemotePairingEntry::Code {
                     server_url,
                     pairing_code,
@@ -6686,34 +6767,33 @@ impl VibexWorkbench {
                         pairing_code,
                         allow_insecure_local_dev,
                     )
-                    .await?
+                    .await
                 }
                 RemotePairingEntry::Link { pairing_link } => {
                     crate::remote_client::claim_server_pairing_link(
                         pairing_link,
                         allow_insecure_local_dev,
                     )
-                    .await?
+                    .await
                 }
-            };
-            DesktopRemoteClient::start(credential, home_dir).await
+            }
         });
         self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
-                this.settings_view.update(cx, |settings, cx| {
-                    settings.remote_connect_busy = false;
-                    cx.notify();
-                });
+                this.runtime_add_busy = false;
                 match outcome {
-                    Ok(Ok(client)) => {
-                        this.install_remote_client(client, cx);
+                    Ok(Ok(credential)) => {
+                        let id = this.register_runtime(credential);
+                        this.persist_runtime_registry(cx);
+                        this.runtime_add_open = false;
+                        this.switch_to_runtime(id, cx);
                     }
-                    Ok(Err(error)) => this.finish_remote_client_failure(error, cx),
-                    Err(_) => this.finish_remote_client_failure(
+                    Ok(Err(error)) => this.finish_runtime_add_failure(error, cx),
+                    Err(_) => this.finish_runtime_add_failure(
                         BackendError::offline(
-                            "desktop_remote_client_boot_task_failed",
-                            "the remote client connection task stopped unexpectedly",
+                            "desktop_remote_pairing_task_failed",
+                            "the pairing task stopped unexpectedly",
                         ),
                         cx,
                     ),
@@ -6723,13 +6803,192 @@ impl VibexWorkbench {
         }));
     }
 
-    /// Wires the whole workbench to a freshly connected remote backend and
-    /// starts its event pump. Every consumer keeps using the same facade
-    /// slots the native path fills, so no view is aware of the transport.
+    /// A failed pairing keeps the dialog open with its inputs intact so the
+    /// operator can correct the address or the code.
+    fn finish_runtime_add_failure(&mut self, error: BackendError, cx: &mut Context<Self>) {
+        self.runtime_note = Some(format!("{} — {}", error.code, error.message));
+        cx.notify();
+    }
+
+    fn clear_runtime_add_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.runtime_add_server_url_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.runtime_add_code_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.runtime_add_link_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
+    fn toggle_runtime_manager(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_manager_open {
+            self.close_runtime_manager(cx);
+        } else {
+            self.runtime_manager_open = true;
+            self.runtime_manager_stage = RuntimeManagerStage::List;
+            self.runtime_manager_target = None;
+            self.runtime_rename_active = false;
+            self.runtime_remove_pending = None;
+            self.runtime_note = None;
+            cx.notify();
+        }
+    }
+
+    /// Closes the panel and drops every transient stage it owns, so reopening
+    /// never lands in a half-finished rename or a stale removal confirmation.
+    fn close_runtime_manager(&mut self, cx: &mut Context<Self>) {
+        self.runtime_manager_open = false;
+        self.runtime_manager_stage = RuntimeManagerStage::List;
+        self.runtime_manager_target = None;
+        self.runtime_rename_active = false;
+        self.runtime_remove_pending = None;
+        cx.notify();
+    }
+
+    fn open_runtime_detail(&mut self, id: String, cx: &mut Context<Self>) {
+        self.runtime_manager_stage = RuntimeManagerStage::Detail;
+        self.runtime_rename_active = false;
+        self.runtime_remove_pending = None;
+        self.runtime_manager_target = Some(id);
+        cx.notify();
+    }
+
+    /// Escape walks back one stage at a time: an editor or a confirmation
+    /// closes first, then the detail stage, and only then the panel.
+    fn runtime_manager_dismiss_one_level(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_rename_active {
+            self.runtime_rename_active = false;
+        } else if self.runtime_remove_pending.is_some() {
+            self.runtime_remove_pending = None;
+        } else if self.runtime_manager_stage == RuntimeManagerStage::Detail {
+            self.runtime_manager_stage = RuntimeManagerStage::List;
+            self.runtime_manager_target = None;
+        } else {
+            self.runtime_manager_open = false;
+        }
+        cx.notify();
+    }
+
+    fn begin_runtime_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime_registry.remote(&id) else {
+            return;
+        };
+        let name = runtime.display_label();
+        self.runtime_manager_target = Some(id);
+        self.runtime_rename_active = true;
+        self.runtime_remove_pending = None;
+        self.runtime_rename_input.update(cx, |input, cx| {
+            input.set_value(name.clone(), window, cx);
+            input.set_selected_range(0..name.len(), cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn commit_runtime_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.runtime_manager_target.clone() else {
+            self.runtime_rename_active = false;
+            return;
+        };
+        let name = self.runtime_rename_input.read(cx).value().to_string();
+        self.runtime_rename_active = false;
+        if self.runtime_registry.rename(&id, &name) {
+            self.persist_runtime_registry(cx);
+        }
+        cx.notify();
+    }
+
+    fn open_runtime_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.runtime_manager_open = false;
+        self.runtime_add_open = true;
+        self.runtime_add_tab = RuntimeAddTab::default();
+        self.runtime_note = None;
+        self.clear_runtime_add_inputs(window, cx);
+        window.focus(
+            &self.runtime_add_server_url_input.read(cx).focus_handle(cx),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn close_runtime_add(&mut self, cx: &mut Context<Self>) {
+        self.runtime_add_open = false;
+        self.runtime_add_busy = false;
+        cx.notify();
+    }
+
+    fn submit_runtime_add(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_add_busy {
+            return;
+        }
+        match self.runtime_add_tab {
+            RuntimeAddTab::Code => {
+                let server_url = self
+                    .runtime_add_server_url_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                let pairing_code = self
+                    .runtime_add_code_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                if server_url.is_empty() || pairing_code.is_empty() {
+                    self.runtime_note = Some(
+                        locale::text(
+                            "Enter the server address and the pairing code.",
+                            "请输入服务器地址和配对码。",
+                            "請輸入伺服器位址和配對碼。",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.claim_remote_pairing_code(server_url, pairing_code, cx);
+            }
+            RuntimeAddTab::Link => {
+                let pairing_link = self
+                    .runtime_add_link_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                if pairing_link.is_empty() {
+                    self.runtime_note = Some(
+                        locale::text(
+                            "Paste the connection string printed by vibex-server.",
+                            "请粘贴 vibex-server 打印的连接串。",
+                            "請貼上 vibex-server 列印的連接串。",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.claim_remote_pairing_link(pairing_link, cx);
+            }
+        }
+    }
+
+    /// The removal confirmation is the one destructive decision in the panel,
+    /// so it names the runtime and states what survives on the server.
+    fn confirm_remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        self.runtime_remove_pending = Some(id);
+        cx.notify();
+    }
+
+    /// Attaches the workbench to a remote runtime, parks the embedded one, and
+    /// records the switch. The embedded runtime keeps running, so its
+    /// terminals and Agent turns survive the round trip and switching back
+    /// needs no boot.
     fn install_remote_client(&mut self, client: DesktopRemoteClient, cx: &mut Context<Self>) {
+        self.park_local_runtime(cx);
+        let runtime_id = client.runtime_id.clone();
+        self.runtime_connect_errors.remove(&runtime_id);
         let backend = client.backend.clone();
         let sidebar_authority = remote_authority_key(&client.credential);
-        self.retire_local_runtime(cx);
         self.remote_client = Some(client);
         self.activate_sidebar_authority(&sidebar_authority, cx);
         let facade = backend.facade();
@@ -6760,70 +7019,297 @@ impl VibexWorkbench {
         self.attach_remote_event_stream(backend, cx);
         self.load_agent_overview(cx);
         self.runtime_status = RuntimeStatus::Ready;
-        self.runtime_note = Some("Authoritative remote runtime connected".to_string());
+        self.runtime_note = Some(
+            locale::text(
+                "Driving a remote runtime",
+                "正在驱动远程运行时",
+                "正在驅動遠端執行階段",
+            )
+            .to_string(),
+        );
+        self.mark_runtime_active(&runtime_id, cx);
         self.finish_startup_loading(cx);
         cx.notify();
     }
 
-    /// A stored credential from an earlier pairing restores remote-client
-    /// mode across restarts. The escape hatch keeps the local authority
-    /// reachable when the paired server is being migrated.
-    fn stored_remote_client_credential(&self) -> Option<DesktopRemoteCredential> {
-        if std::env::var_os("VIBEX_DISABLE_REMOTE_CLIENT").is_some() {
-            return None;
-        }
-        let home_dir = self.config.as_ref()?.home_dir.clone();
-        crate::remote_client::DesktopRemoteCredentialStore::new(&home_dir).load()
+    /// Reconnects to the registry's active remote runtime at boot. A failed
+    /// connect falls back to the embedded runtime instead of leaving the shell
+    /// without an authority.
+    fn begin_active_remote_start(&mut self, runtime: RegisteredRuntime, cx: &mut Context<Self>) {
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Boot, cx);
     }
 
-    /// Boot twin of [`Self::claim_remote_pairing_code`] for a stored
-    /// credential: reconnect to the paired runtime before the first frame.
-    fn begin_remote_client_start(
+    /// Connects to a registered remote runtime and installs it once the
+    /// handshake succeeds. The runtime that is currently authoritative keeps
+    /// running until then, so a failed switch leaves the workbench exactly
+    /// where it was instead of tearing the authority down first.
+    fn begin_remote_connect(
         &mut self,
-        credential: DesktopRemoteCredential,
+        runtime: RegisteredRuntime,
+        origin: RuntimeConnectOrigin,
         cx: &mut Context<Self>,
     ) {
-        // The workbench is switching authorities: park the embedded runtime's
-        // sidebar arrangement before the server's project list can reconcile
-        // against it.
-        self.activate_sidebar_authority(&remote_authority_key(&credential), cx);
-        let Some(home_dir) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
-            self.finish_startup_loading(cx);
-            self.runtime_status = RuntimeStatus::Failed {
-                code: "desktop_runtime_config_unavailable".to_string(),
-                message: "The isolated GPUI runtime could not be configured.".to_string(),
-            };
+        if self.runtime_switch_pending.is_some() {
             return;
-        };
-        self.detach_local_runtime(cx);
-        self.runtime_status = RuntimeStatus::Starting;
-        self.runtime_note = None;
-        self.event_task = None;
+        }
+        self.runtime_switch_pending = Some(runtime.id.clone());
+        self.runtime_note = Some(locale::text("Connecting…", "正在连接…", "正在連線…").to_string());
+        if matches!(origin, RuntimeConnectOrigin::Boot) {
+            self.runtime_status = RuntimeStatus::Starting;
+        }
+        let runtime_id = runtime.id.clone();
+        let credential = runtime.credential.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            DesktopRemoteClient::start(credential, home_dir).await
+            DesktopRemoteClient::start(runtime_id, credential).await
         });
         self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(client)) => {
+                        this.runtime_switch_pending = None;
                         this.install_remote_client(client, cx);
                     }
-                    Ok(Err(error)) => this.finish_remote_client_failure(error, cx),
-                    Err(_) => this.finish_remote_client_failure(
-                        BackendError::offline(
-                            "desktop_remote_client_boot_task_failed",
-                            "the remote client connection task stopped unexpectedly",
-                        ),
-                        cx,
-                    ),
+                    Ok(Err(error)) => {
+                        this.finish_runtime_connect_failure(error, origin, cx);
+                        this.runtime_switch_pending = None;
+                    }
+                    Err(_) => {
+                        this.finish_runtime_connect_failure(
+                            BackendError::offline(
+                                "desktop_remote_client_boot_task_failed",
+                                "the remote client connection task stopped unexpectedly",
+                            ),
+                            origin,
+                            cx,
+                        );
+                        this.runtime_switch_pending = None;
+                    }
                 }
                 cx.notify();
             });
         }));
     }
 
-    /// Releases the local authority before another runtime claims the same home.
+    /// Reports a failed connect without moving the workbench. At boot there is
+    /// no authority yet, so the embedded runtime takes over; a switch keeps
+    /// whatever was already installed.
+    fn finish_runtime_connect_failure(
+        &mut self,
+        error: BackendError,
+        origin: RuntimeConnectOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        let message = format!("{} — {}", error.code, error.message);
+        self.runtime_note = Some(message.clone());
+        if let Some(id) = self.runtime_switch_pending.clone() {
+            self.runtime_connect_errors.insert(id, message);
+        }
+        match origin {
+            RuntimeConnectOrigin::Boot => {
+                // A stale pairing must not strand the shell.
+                self.runtime_registry.set_active(LOCAL_RUNTIME_ID);
+                self.persist_runtime_registry(cx);
+                self.boot_local_runtime(cx);
+            }
+            RuntimeConnectOrigin::Switch => {
+                self.runtime_status = if self.backend.is_some() {
+                    RuntimeStatus::Ready
+                } else {
+                    RuntimeStatus::Starting
+                };
+                self.finish_startup_loading(cx);
+            }
+        }
+    }
+
+    /// Attaches the workbench to the embedded runtime that is already running.
+    /// Shared by the first boot and by switching back from a remote runtime,
+    /// which is why it neither starts nor stops the runtime itself.
+    fn install_local_runtime(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
+        self.runtime_status = RuntimeStatus::Ready;
+        self.runtime_note = Some(
+            locale::text(
+                "Driving this device's runtime",
+                "正在驱动本机运行时",
+                "正在驅動本機執行階段",
+            )
+            .to_string(),
+        );
+        self.runtime = Some(runtime.clone());
+        self.sync_timeline_display_settings_to_runtime();
+        self.start_sidebar_organization_bridge(&runtime, cx);
+        let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
+        self.shared_workflow = Some(AgentFileGitController::from_facade(&facade));
+        self.shared_terminal = Some(TerminalWorkflowController::new(
+            facade.terminal().clone(),
+            TerminalWorkflowCapabilities::from_backend(&facade.capabilities()),
+        ));
+        self.shared_management = Some(ManagementWorkflowController::new(
+            facade.management().clone(),
+            facade.device().clone(),
+            ManagementWorkflowCapabilities::from_backend(&facade.capabilities()),
+        ));
+        self.usage_view
+            .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
+        let terminal_manager = runtime.terminals().manager();
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_backend(facade.clone(), cx);
+            // A local authority renders terminals from its in-process manager;
+            // a remote authority serves the same surface from Remote v2.
+            workbench.set_terminal_transport(
+                Some(crate::code_workbench::local_terminal_surface_transport(
+                    terminal_manager,
+                )),
+                cx,
+            );
+        });
+        self.management_view.update(cx, |management, cx| {
+            management.set_backend(facade.clone(), cx);
+            management.set_runtime(runtime.clone(), cx);
+        });
+        self.backend = Some(facade);
+        self.attach_update_status(runtime.clone(), cx);
+        self.attach_event_stream(runtime, cx);
+        self.load_agent_overview(cx);
+        self.finish_startup_loading(cx);
+        cx.notify();
+    }
+
+    /// Stops every workbench attachment to the embedded runtime but leaves the
+    /// runtime running. Its terminals, database and Agent turns stay alive, so
+    /// switching to a remote runtime does not destroy local work and switching
+    /// back needs no boot.
+    ///
+    /// The sidebar bridge stops with the attachments: it answers the embedded
+    /// runtime's remote clients from the arrangement the shell is displaying,
+    /// which is another authority's while a remote runtime is installed.
+    fn park_local_runtime(&mut self, cx: &mut Context<Self>) {
+        self.agent_poll_task = None;
+        self.runtime_heartbeat_task = None;
+        self.agent_load_task = None;
+        self.agent_projection_task = None;
+        self.update_status_task = None;
+        self.event_task = None;
+        self.sidebar_organization_task = None;
+        self.backend = None;
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.clear_backend(cx));
+        self.shared_workflow = None;
+        self.shared_terminal = None;
+        self.shared_management = None;
+        self.management_view
+            .update(cx, |management, cx| management.clear_runtime(cx));
+        self.usage_view
+            .update(cx, |usage, cx| usage.clear_backend(cx));
+    }
+
+    /// Makes the embedded runtime authoritative again. A parked runtime is
+    /// reused as-is; only a shell that never started one pays for a boot.
+    fn activate_local_runtime(&mut self, cx: &mut Context<Self>) {
+        if self.remote_client.take().is_some() {
+            self.event_task = None;
+            self.management_view
+                .update(cx, |management, cx| management.clear_runtime(cx));
+        }
+        self.activate_sidebar_authority(SidebarUiState::LOCAL_AUTHORITY, cx);
+        self.mark_runtime_active(LOCAL_RUNTIME_ID, cx);
+        match self.runtime.clone() {
+            Some(runtime) => self.install_local_runtime(runtime, cx),
+            None => self.boot_local_runtime(cx),
+        }
+    }
+
+    /// The single entry point for changing the authoritative runtime. Every
+    /// manager action funnels through here so the registry, the persistence
+    /// and the installed backend cannot drift apart.
+    fn switch_to_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.runtime_switch_pending.is_some() {
+            return;
+        }
+        self.close_runtime_manager(cx);
+        if self.runtime_registry.active_runtime_id() == id
+            && (id == LOCAL_RUNTIME_ID || self.remote_client.is_some())
+        {
+            // Already driving this runtime: recording it is a no-op, and
+            // re-installing would drop live view state for nothing.
+            self.mark_runtime_active(&id, cx);
+            return;
+        }
+        if id == LOCAL_RUNTIME_ID {
+            self.activate_local_runtime(cx);
+            return;
+        }
+        let Some(runtime) = self.runtime_registry.remote(&id).cloned() else {
+            return;
+        };
+        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+    }
+
+    /// Records which runtime is authoritative and persists the registry.
+    fn mark_runtime_active(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id != LOCAL_RUNTIME_ID {
+            self.runtime_registry
+                .touch_connected(id, unix_timestamp_ms());
+        }
+        if self.runtime_registry.active_runtime_id() != id {
+            self.runtime_registry.set_active(id);
+        }
+        self.persist_runtime_registry(cx);
+        cx.notify();
+    }
+
+    fn persist_runtime_registry(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.runtime_registry_store.clone() else {
+            return;
+        };
+        if let Err(error) = store.save(&self.runtime_registry) {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "The runtime registry could not be persisted"
+            );
+            self.runtime_note = Some(
+                locale::text(
+                    "The runtime list could not be saved",
+                    "运行时列表保存失败",
+                    "執行階段清單儲存失敗",
+                )
+                .to_string(),
+            );
+            cx.notify();
+        }
+    }
+
+    /// Registers a freshly paired credential and returns its runtime id.
+    fn register_runtime(&mut self, credential: DesktopRemoteCredential) -> String {
+        self.runtime_registry
+            .upsert(credential, unix_timestamp_ms())
+    }
+
+    /// Removes a runtime and its stored grant. Removing the active runtime
+    /// returns the workbench to the embedded authority.
+    fn remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.runtime_registry.remove(&id) {
+            return;
+        }
+        self.runtime_remove_pending = None;
+        if self
+            .remote_client
+            .as_ref()
+            .map(|client| client.runtime_id.as_str())
+            == Some(id.as_str())
+        {
+            self.remote_client = None;
+            self.persist_runtime_registry(cx);
+            self.activate_local_runtime(cx);
+            return;
+        }
+        self.persist_runtime_registry(cx);
+        cx.notify();
+    }
+
+    /// Releases the local authority so it can be handed to another runtime.
     ///
     /// Detaching the shell's own references is not enough: the session poll and
     /// runtime heartbeat tasks hold their own `Arc<DesktopRuntime>`, so the
@@ -6853,47 +7339,835 @@ impl VibexWorkbench {
             }));
     }
 
-    /// Drops the local runtime ownership without tearing the process down:
-    /// views are cleared so the remote install path can refill them.
+    /// Drops every local reference and shuts the runtime down. Only the
+    /// teardown paths use this; an authority switch parks instead.
     fn detach_local_runtime(&mut self, cx: &mut Context<Self>) {
         self.retire_local_runtime(cx);
-        self.backend = None;
-        self.remote_client = None;
-        self.code_workbench
-            .update(cx, |workbench, cx| workbench.clear_backend(cx));
-        self.shared_workflow = None;
-        self.shared_terminal = None;
-        self.shared_management = None;
-        self.management_view
-            .update(cx, |management, cx| management.clear_runtime(cx));
-        self.usage_view
-            .update(cx, |usage, cx| usage.clear_backend(cx));
-        self.event_task = None;
+        self.park_local_runtime(cx);
     }
 
-    fn finish_remote_client_failure(&mut self, error: BackendError, cx: &mut Context<Self>) {
-        self.finish_startup_loading(cx);
-        self.runtime_status = RuntimeStatus::Failed {
-            code: error.code.clone(),
-            message: error.message.clone(),
+    /// The title-bar entry point. An icon-only button carries the active
+    /// runtime's state as a dot plus a tooltip that names it, because a switch
+    /// rebinds every session, Agent and terminal to another machine.
+    fn render_runtime_manager_trigger(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (state, label) = self.active_runtime_presentation(cx);
+        let tooltip = format!("{}: {label}", locale::text("Runtime", "运行时", "執行階段"));
+        let dot = runtime_state_color(state, cx);
+        let open = self.runtime_manager_open;
+        let trigger = Button::new("open-runtime-manager")
+            .small()
+            .ghost()
+            .compact()
+            .size(px(32.0))
+            .px_0()
+            .selected(open)
+            .tooltip(tooltip)
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(Icon::default().path(RUNTIME_MANAGER_ICON).size(px(18.0)))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(0.0))
+                            .bottom(px(0.0))
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(dot),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_runtime_manager(cx)));
+        let panel = self.render_runtime_manager_panel(cx);
+        div()
+            .flex_none()
+            .child(
+                Popover::new("runtime-manager-popover")
+                    .anchor(Anchor::TopRight)
+                    .appearance(false)
+                    .open(open)
+                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                        if *open {
+                            this.runtime_manager_open = true;
+                            cx.notify();
+                        } else {
+                            this.close_runtime_manager(cx);
+                        }
+                    }))
+                    .trigger(trigger)
+                    .child(panel)
+                    .top(px(6.0)),
+            )
+            .into_any_element()
+    }
+
+    fn render_runtime_manager_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel = match self.runtime_manager_stage {
+            RuntimeManagerStage::List => self.render_runtime_manager_list(cx),
+            RuntimeManagerStage::Detail => self.render_runtime_manager_detail(cx),
         };
-        self.set_settings_operation_note(Some(error.message.clone()), cx);
+        v_flex()
+            .id("runtime-manager-content")
+            .role(Role::ListBox)
+            .w(px(RUNTIME_MANAGER_PANEL_WIDTH))
+            .max_h(px(RUNTIME_MANAGER_PANEL_MAX_HEIGHT))
+            .min_h_0()
+            .overflow_hidden()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .p(px(6.0))
+            .child(panel)
+            .into_any_element()
     }
 
-    /// Returns the workbench to the local authority: drops the paired
-    /// credential and its backend, then boots the native runtime again.
-    fn disconnect_remote_client(&mut self, cx: &mut Context<Self>) {
-        if let Some(client) = self.remote_client.take()
-            && let Err(error) = client.store.clear()
-        {
-            tracing::warn!(
-                target: "vibex_desktop",
-                error_code = %error.code,
-                "Stored remote credential could not be removed"
+    fn render_runtime_manager_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let active_id = self.runtime_registry.active_runtime_id().to_string();
+        let remotes = self.runtime_registry.runtimes.clone();
+        let switching = self.runtime_switch_pending.clone();
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(remotes.len() + 1);
+
+        rows.push(self.render_runtime_row(
+            LOCAL_RUNTIME_ID,
+            &self.local_runtime_label(),
+            &self.local_runtime_meta(cx),
+            active_id == LOCAL_RUNTIME_ID,
+            self.runtime_state(RuntimeTarget::Local),
+            switching.is_none(),
+            false,
+            cx,
+        ));
+
+        if remotes.is_empty() {
+            rows.push(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .px_2()
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .child(locale::text(
+                                "No remote runtimes yet",
+                                "还没有远程运行时",
+                                "還沒有遠端執行階段",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_normal()
+                            .child(locale::text(
+                                "Run vibex-server on a host and pair with it to drive that machine from here.",
+                                "在服务器上运行 vibex-server 并与之配对，就能从这里驱动那台机器。",
+                                "在伺服器上執行 vibex-server 並與之配對，就能從這裡驅動那台機器。",
+                            )),
+                    )
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(divider_lane(cx).into_any_element());
+            for runtime in remotes {
+                let id = runtime.id.clone();
+                let is_active = active_id == id;
+                let state = self.runtime_state(RuntimeTarget::Remote(runtime.id.as_str()));
+                let meta = self.remote_runtime_meta(&runtime, is_active, state, cx);
+                let label = runtime.display_label();
+                let pending = switching.as_deref() == Some(id.as_str());
+                rows.push(self.render_runtime_row(
+                    &id,
+                    &label,
+                    &meta,
+                    is_active,
+                    state,
+                    switching.is_none() || pending,
+                    true,
+                    cx,
+                ));
+            }
+        }
+
+        let mut body = v_flex()
+            .w_full()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .children(rows);
+        if let Some(note) = self.runtime_note.clone() {
+            body = body.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(note),
             );
         }
-        self.detach_local_runtime(cx);
-        self.begin_runtime_start(cx);
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text("Runtimes", "运行时", "執行階段")),
+            )
+            .child(body)
+            .child(divider_lane(cx))
+            .child(
+                Button::new("runtime-manager-add")
+                    .small()
+                    .ghost()
+                    .w_full()
+                    .h(px(32.0))
+                    .flex_none()
+                    .px_2()
+                    .justify_start()
+                    .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
+                    .disabled(self.runtime_switch_pending.is_some())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Icon::new(IconName::Plus).size(px(14.0)))
+                            .child(locale::text("Add runtime…", "添加运行时…", "新增執行階段…")),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_runtime_add(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_runtime_row(
+        &self,
+        id: &str,
+        label: &str,
+        meta: &str,
+        selected: bool,
+        state: RuntimeStatePresentation,
+        enabled: bool,
+        detail_available: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let switch_id = id.to_string();
+        let detail_id = id.to_string();
+        let dot = runtime_state_color(state, cx);
+        let row = Button::new(SharedString::from(format!("runtime-row-{id}")))
+            .small()
+            .ghost()
+            .flex_1()
+            .min_w_0()
+            .flex_none()
+            .h(px(RUNTIME_MANAGER_ROW_HEIGHT))
+            .px_2()
+            .justify_start()
+            .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
+            .selected(selected)
+            .disabled(!enabled)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(dot))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(selected, |this| this.font_medium())
+                                    .child(label.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(meta.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(runtime_state_text_color(state, cx))
+                            .child(runtime_state_label(state)),
+                    )
+                    .when(selected, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .child(Icon::new(IconName::Check).size(px(14.0))),
+                        )
+                    }),
+            )
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.switch_to_runtime(switch_id.clone(), cx)),
+            );
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(row)
+            .when(detail_available, |this| {
+                // A two-target row, matching the title bar's session heading
+                // plus its actions menu: the body switches, the trailing lane
+                // inspects without changing the authority.
+                this.child(
+                    Button::new(SharedString::from(format!("runtime-detail-{id}")))
+                        .small()
+                        .ghost()
+                        .compact()
+                        .size(px(28.0))
+                        .px_0()
+                        .flex_none()
+                        .tooltip(locale::text("Details", "详情", "詳細資料"))
+                        .child(Icon::new(IconName::ChevronRight).size(px(14.0)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_runtime_detail(detail_id.clone(), cx)
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_runtime_manager_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(id) = self.runtime_manager_target.clone() else {
+            return self.render_runtime_manager_list(cx);
+        };
+        let is_local = id == LOCAL_RUNTIME_ID;
+        let runtime = self.runtime_registry.remote(&id).cloned();
+        if !is_local && runtime.is_none() {
+            // The runtime disappeared while its detail stage was open.
+            return self.render_runtime_manager_list(cx);
+        }
+        let label = runtime
+            .as_ref()
+            .map(|runtime| runtime.display_label())
+            .unwrap_or_else(|| self.local_runtime_label());
+        let state = self.runtime_state(if is_local {
+            RuntimeTarget::Local
+        } else {
+            RuntimeTarget::Remote(id.as_str())
+        });
+        let is_active = self.runtime_registry.active_runtime_id() == id;
+        let switching = self.runtime_switch_pending.is_some();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.push(runtime_detail_row(
+            locale::text("Type", "类型", "類型"),
+            if is_local {
+                locale::text("This device", "本机", "本機").to_string()
+            } else {
+                locale::text("Remote runtime", "远程运行时", "遠端執行階段").to_string()
+            },
+            cx,
+        ));
+        rows.push(runtime_detail_row(
+            locale::text("Status", "状态", "狀態"),
+            runtime_state_label(state).to_string(),
+            cx,
+        ));
+        if let Some(runtime) = runtime.as_ref() {
+            rows.push(runtime_detail_row(
+                locale::text("Address", "地址", "位址"),
+                runtime.credential.record.server_url.clone(),
+                cx,
+            ));
+            rows.push(runtime_detail_row(
+                locale::text("Server ID", "服务器 ID", "伺服器 ID"),
+                runtime.id.clone(),
+                cx,
+            ));
+            rows.push(runtime_detail_row(
+                locale::text("Certificate", "证书", "憑證"),
+                runtime
+                    .credential
+                    .pinned_tls_certificate_der
+                    .as_deref()
+                    .and_then(pinned_certificate_fingerprint)
+                    .unwrap_or_else(|| {
+                        locale::text("System roots", "系统根证书", "系統根憑證").to_string()
+                    }),
+                cx,
+            ));
+            if let Some(reason) = self.runtime_connect_errors.get(&id) {
+                rows.push(runtime_detail_row(
+                    locale::text("Last error", "上次错误", "上次錯誤"),
+                    reason.clone(),
+                    cx,
+                ));
+            }
+            rows.push(runtime_detail_row(
+                locale::text("Last connected", "最近连接", "最近連線"),
+                runtime
+                    .last_connected_at_ms
+                    .map(|at| relative_time_label(at, cx))
+                    .unwrap_or_else(|| locale::text("Never", "从未", "從未").to_string()),
+                cx,
+            ));
+        }
+
+        let mut actions = h_flex().w_full().gap_1().flex_none().pt_1();
+        actions = actions.child(
+            Button::new("runtime-detail-connect")
+                .small()
+                .outline()
+                .label(if is_active {
+                    locale::text("In use", "正在使用", "正在使用")
+                } else {
+                    locale::text(
+                        "Switch to this runtime",
+                        "切换到此运行时",
+                        "切換到此執行階段",
+                    )
+                })
+                .disabled(is_active || switching)
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| this.switch_to_runtime(id.clone(), cx)
+                })),
+        );
+        if runtime.is_some() {
+            actions = actions.child(
+                Button::new("runtime-detail-rename")
+                    .small()
+                    .ghost()
+                    .label(locale::text("Rename", "重命名", "重新命名"))
+                    .disabled(switching)
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| this.begin_runtime_rename(id.clone(), window, cx)
+                    })),
+            );
+        }
+        actions = actions.child(div().flex_1());
+        if runtime.is_some() {
+            actions = actions.child(
+                Button::new("runtime-detail-remove")
+                    .small()
+                    .ghost()
+                    .danger()
+                    .label(locale::text("Remove", "移除", "移除"))
+                    .disabled(switching)
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.confirm_remove_runtime(id.clone(), cx)
+                    })),
+            );
+        }
+
+        if self.runtime_remove_pending.as_deref() == Some(id.as_str()) {
+            rows.push(self.render_runtime_remove_confirmation(&label, cx));
+        } else if self.runtime_rename_active {
+            rows.push(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text("Name", "名称", "名稱")),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(Input::new(&self.runtime_rename_input).small().h(px(28.0)))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("runtime-rename-save")
+                                            .small()
+                                            .label(locale::text("Save", "保存", "儲存"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.commit_runtime_rename(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("runtime-rename-cancel")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text("Cancel", "取消", "取消"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.runtime_rename_active = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Button::new("runtime-detail-back")
+                            .small()
+                            .ghost()
+                            .compact()
+                            .size(px(24.0))
+                            .px_0()
+                            .tooltip(locale::text("Back", "返回", "返回"))
+                            .child(Icon::new(IconName::ChevronLeft).size(px(14.0)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.runtime_manager_stage = RuntimeManagerStage::List;
+                                this.runtime_manager_target = None;
+                                this.runtime_rename_active = false;
+                                this.runtime_remove_pending = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(label),
+                    ),
+            )
+            .child(v_flex().min_h_0().overflow_y_scrollbar().children(rows))
+            .child(divider_lane(cx))
+            .child(actions)
+            .into_any_element()
+    }
+
+    /// Removal is the one irreversible action here, so it names the runtime and
+    /// states what survives on the server.
+    fn render_runtime_remove_confirmation(
+        &self,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = self.runtime_remove_pending.clone().unwrap_or_default();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .whitespace_normal()
+                    .child(self.runtime_remove_title(label)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "The saved device credential is deleted. The device authorization stays on the server until it is revoked there.",
+                        "本机保存的设备凭据会被删除。服务器上的设备授权仍然存在，需要在那台服务器上撤销。",
+                        "本機儲存的裝置憑證會被刪除。伺服器上的裝置授權仍然存在，需要在該伺服器上撤銷。",
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .pt_1()
+                    .child(
+                        Button::new("runtime-remove-confirm")
+                            .small()
+                            .danger()
+                            .label(locale::text("Remove", "移除", "移除"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_runtime(id.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("runtime-remove-cancel")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.runtime_remove_pending = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The add-runtime dialog. It reuses the pairing claim path the manager
+    /// calls, so there is exactly one implementation of pairing.
+    fn render_runtime_add_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.runtime_add_busy;
+        let code_tab = self.runtime_add_tab == RuntimeAddTab::Code;
+        let mut body = v_flex().w_full().gap_3().child(
+            TabBar::new("runtime-add-tabs")
+                .small()
+                .selected_index(if code_tab { 0 } else { 1 })
+                .on_click(cx.listener(|this, index: &usize, _, cx| {
+                    this.runtime_add_tab = if *index == 0 {
+                        RuntimeAddTab::Code
+                    } else {
+                        RuntimeAddTab::Link
+                    };
+                    this.runtime_note = None;
+                    cx.notify();
+                }))
+                .child(Tab::new().label(locale::text("Pairing code", "配对码", "配對碼")))
+                .child(Tab::new().label(locale::text("Connection string", "连接串", "連接串"))),
+        );
+        if code_tab {
+            body = body
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text("Server address", "服务器地址", "伺服器位址")),
+                        )
+                        .child(
+                            Input::new(&self.runtime_add_server_url_input)
+                                .small()
+                                .h(px(28.0)),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "One-time pairing code",
+                                    "一次性配对码",
+                                    "一次性配對碼",
+                                )),
+                        )
+                        .child(Input::new(&self.runtime_add_code_input).small().h(px(28.0))),
+                )
+                .child(runtime_add_hint(
+                    locale::text(
+                        "Run vibex-server on the host; it prints the pairing code at startup.",
+                        "在服务器上运行 vibex-server，它会在启动时打印配对码。",
+                        "在伺服器上執行 vibex-server，它會在啟動時列印配對碼。",
+                    ),
+                    cx,
+                ));
+        } else {
+            body = body
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Connection string",
+                                    "连接串",
+                                    "連接串",
+                                )),
+                        )
+                        .child(Input::new(&self.runtime_add_link_input).small().h(px(28.0))),
+                )
+                .child(runtime_add_hint(
+                    locale::text(
+                        "Paste the whole vibex:// link vibex-server printed. It also carries the certificate of a server that uses its own, so no system CA is needed.",
+                        "粘贴 vibex-server 打印的完整 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需系统 CA。",
+                        "貼上 vibex-server 列印的完整 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需系統 CA。",
+                    ),
+                    cx,
+                ));
+        }
+        if let Some(note) = self.runtime_note.clone() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .whitespace_normal()
+                    .child(note),
+            );
+        }
+
+        v_flex()
+            .id("runtime-add-dialog")
+            .w(px(RUNTIME_ADD_DIALOG_WIDTH))
+            .gap_3()
+            .child(body)
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("runtime-add-cancel")
+                            .small()
+                            .ghost()
+                            .label(locale::text("Cancel", "取消", "取消"))
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_runtime_add(cx))),
+                    )
+                    .child(
+                        Button::new("runtime-add-submit")
+                            .small()
+                            .label(locale::text("Pair", "配对", "配對"))
+                            .disabled(busy)
+                            .loading(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_runtime_add(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// `locale::text` needs a `'static` string, so a title that interpolates
+    /// the runtime's name writes each locale out.
+    fn runtime_remove_title(&self, label: &str) -> String {
+        match self.resolved_locale() {
+            locale::ResolvedLocale::ZhCn => format!("移除“{label}”？"),
+            locale::ResolvedLocale::ZhTw => format!("移除「{label}」？"),
+            locale::ResolvedLocale::En => format!("Remove \u{201c}{label}\u{201d}?"),
+        }
+    }
+
+    fn local_runtime_label(&self) -> String {
+        locale::text("This device", "本机", "本機").to_string()
+    }
+
+    fn local_runtime_meta(&self, _cx: &App) -> String {
+        let host = self
+            .config
+            .as_ref()
+            .and_then(|config| config.home_dir.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let state = self.runtime_state(RuntimeTarget::Local);
+        if host.is_empty() {
+            return runtime_state_label(state).to_string();
+        }
+        format!("{host} · {}", runtime_state_label(state))
+    }
+
+    fn remote_runtime_meta(
+        &self,
+        runtime: &RegisteredRuntime,
+        is_active: bool,
+        state: RuntimeStatePresentation,
+        cx: &App,
+    ) -> String {
+        let address = runtime.credential.record.server_url.clone();
+        if is_active {
+            return format!("{address} · {}", runtime_state_label(state));
+        }
+        if self
+            .runtime_connect_errors
+            .contains_key(runtime.id.as_str())
+        {
+            return format!(
+                "{address} · {}",
+                locale::text("last attempt failed", "上次连接失败", "上次連線失敗")
+            );
+        }
+        match runtime.last_connected_at_ms {
+            Some(at) => format!(
+                "{address} · {} {}",
+                locale::text("last connected", "上次连接", "上次連線"),
+                relative_time_label(at, cx)
+            ),
+            None => format!(
+                "{address} · {}",
+                locale::text("not connected", "未连接", "未連線")
+            ),
+        }
+    }
+
+    /// The active runtime's user-visible state, with a label that never relies
+    /// on the dot's color alone.
+    fn active_runtime_presentation(&self, _cx: &App) -> (RuntimeStatePresentation, String) {
+        if self.runtime_registry.is_local_active() {
+            let state = self.runtime_state(RuntimeTarget::Local);
+            return (
+                state,
+                format!(
+                    "{} · {}",
+                    self.local_runtime_label(),
+                    runtime_state_label(state)
+                ),
+            );
+        }
+        let id = self.runtime_registry.active_runtime_id().to_string();
+        let state = self.runtime_state(RuntimeTarget::Remote(id.as_str()));
+        let label = self
+            .runtime_registry
+            .remote(&id)
+            .map(|runtime| runtime.display_label())
+            .unwrap_or_default();
+        (state, format!("{label} · {}", runtime_state_label(state)))
+    }
+
+    fn runtime_state(&self, target: RuntimeTarget<'_>) -> RuntimeStatePresentation {
+        match target {
+            RuntimeTarget::Local => {
+                let running = self.runtime.is_some();
+                match (&self.runtime_status, running) {
+                    (RuntimeStatus::Starting, _) => RuntimeStatePresentation::Connecting,
+                    (RuntimeStatus::Failed { .. }, _) => RuntimeStatePresentation::Failed,
+                    (RuntimeStatus::Ready, true) => RuntimeStatePresentation::Ready,
+                    (RuntimeStatus::Ready, false) => RuntimeStatePresentation::Stopped,
+                }
+            }
+            RuntimeTarget::Remote(id) => {
+                let is_active = self.runtime_registry.active_runtime_id() == id;
+                if !is_active {
+                    return RuntimeStatePresentation::Stopped;
+                }
+                if self.runtime_switch_pending.as_deref() == Some(id) {
+                    return RuntimeStatePresentation::Connecting;
+                }
+                match self.remote_client.as_ref() {
+                    Some(client) => match client.backend.connection_state().state {
+                        RemoteConnectionState::Online => RuntimeStatePresentation::Ready,
+                        RemoteConnectionState::Degraded => RuntimeStatePresentation::Degraded,
+                        RemoteConnectionState::Reconnecting => {
+                            RuntimeStatePresentation::Reconnecting
+                        }
+                        RemoteConnectionState::Offline => RuntimeStatePresentation::Offline,
+                        RemoteConnectionState::Revoked => RuntimeStatePresentation::Revoked,
+                        RemoteConnectionState::Incompatible => {
+                            RuntimeStatePresentation::Incompatible
+                        }
+                        RemoteConnectionState::Idle
+                        | RemoteConnectionState::Resolving
+                        | RemoteConnectionState::Probing
+                        | RemoteConnectionState::Connecting
+                        | RemoteConnectionState::Authenticating
+                        | RemoteConnectionState::Syncing => RuntimeStatePresentation::Connecting,
+                    },
+                    None => RuntimeStatePresentation::Stopped,
+                }
+            }
+        }
     }
 
     /// Remote twin of [`Self::attach_event_stream`]: pumps backend events
@@ -23480,6 +24754,15 @@ impl VibexWorkbench {
         self.toggle_settings(window, cx);
     }
 
+    fn on_open_runtime_manager(
+        &mut self,
+        _: &OpenRuntimeManager,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_runtime_manager(cx);
+    }
+
     fn on_navigate_back(&mut self, _: &NavigateBack, window: &mut Window, cx: &mut Context<Self>) {
         if !self.navigate_back(window, cx) {
             cx.propagate();
@@ -24614,6 +25897,11 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
+                            .child(
+                                div()
+                                    .id("runtime-manager-hover")
+                                    .child(self.render_runtime_manager_trigger(cx)),
+                            )
                             .child(
                                 div()
                                     .id("pair-mobile-hover")
@@ -45804,7 +47092,6 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
 enum SettingsSection {
     General,
     Appearance,
-    RemoteRuntime,
     Workbench,
     Session,
     Terminal,
@@ -45917,6 +47204,7 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("toggle_right_rail", "cmd-shift-r"),
     ("toggle_composer_mode", "cmd-shift-t"),
     ("open_settings", "cmd-,"),
+    ("open_runtime_manager", "cmd-shift-o"),
     ("open_conversation_find", "cmd-f"),
     ("retry_runtime", "cmd-r"),
     ("save_active_file", "cmd-s"),
@@ -45949,6 +47237,7 @@ fn shortcut_action_label(action: &str) -> &'static str {
             "切換對話/終端機模式",
         ),
         "open_settings" => "Open settings",
+        "open_runtime_manager" => locale::text("Open runtimes", "打开运行时", "開啟執行階段"),
         "open_conversation_find" => "Find in conversation",
         "retry_runtime" => "Retry runtime",
         "save_active_file" => "Save active file",
@@ -45963,7 +47252,9 @@ fn shortcut_action_label(action: &str) -> &'static str {
 
 fn shortcut_action_group(action: &str) -> &'static str {
     match action {
-        "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" => "Workbench",
+        "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" | "open_runtime_manager" => {
+            "Workbench"
+        }
         "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
         "open_settings" | "open_conversation_find" => "Navigation",
         "retry_runtime" => "Runtime",
@@ -46155,24 +47446,6 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             strings.network_proxy_description,
             &[
                 "proxy", "network", "http", "https", "socks", "代理", "网络", "網路",
-            ],
-        ),
-        settings_search_candidate(
-            SettingsSection::RemoteRuntime,
-            locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
-            locale::text(
-                "Pair this desktop with a headless runtime and drive it over Remote v2.",
-                "将此桌面与无头运行时配对并通过 Remote v2 驱动它。",
-                "將此桌面與無頭執行階段配對並透過 Remote v2 驅動它。",
-            ),
-            &[
-                "remote",
-                "server",
-                "cloud",
-                "pairing",
-                "远程",
-                "服务器",
-                "雲端",
             ],
         ),
         settings_search_candidate(
@@ -46691,9 +47964,6 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => locale::text("General", "常规", "一般"),
         SettingsSection::Appearance => locale::text("Appearance", "外观", "外觀"),
-        SettingsSection::RemoteRuntime => {
-            locale::text("Remote Runtime", "远程运行时", "遠端執行階段")
-        }
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
@@ -46971,10 +48241,6 @@ struct FoundationSettings {
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     proxy_input: Entity<InputState>,
-    remote_server_url_input: Entity<InputState>,
-    remote_pairing_code_input: Entity<InputState>,
-    remote_pairing_link_input: Entity<InputState>,
-    remote_connect_busy: bool,
     search: Entity<InputState>,
     search_selected_index: usize,
     search_scroll: ScrollHandle,
@@ -47052,27 +48318,6 @@ impl FoundationSettings {
             InputState::new(window, cx)
                 .default_value(ui_state.network_proxy.proxy_url.clone().unwrap_or_default())
                 .placeholder(strings.network_proxy_placeholder)
-        });
-        let remote_server_url_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "https://vibex.example.com",
-                "https://vibex.example.com",
-                "https://vibex.example.com",
-            ))
-        });
-        let remote_pairing_code_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "Pairing code (NNN-NNN-NNN)",
-                "配对码（NNN-NNN-NNN）",
-                "配對碼（NNN-NNN-NNN）",
-            ))
-        });
-        let remote_pairing_link_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(locale::text(
-                "vibex://pair#/code/…",
-                "vibex://pair#/code/…",
-                "vibex://pair#/code/…",
-            ))
         });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
@@ -47198,10 +48443,6 @@ impl FoundationSettings {
                 reasoning_display_modes,
                 terminal_shells,
                 proxy_input,
-                remote_server_url_input,
-                remote_pairing_code_input,
-                remote_pairing_link_input,
-                remote_connect_busy: false,
                 search,
                 search_selected_index: 0,
                 search_scroll: ScrollHandle::new(),
@@ -48288,11 +49529,6 @@ impl FoundationSettings {
                 SettingsSection::Appearance,
                 strings.appearance,
                 IconName::Palette,
-            ),
-            (
-                SettingsSection::RemoteRuntime,
-                locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
-                IconName::Globe,
             ),
             (
                 SettingsSection::Workbench,
@@ -49845,230 +51081,6 @@ impl FoundationSettings {
         )
     }
 
-    fn render_remote_runtime_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (mode, server_url, certificate_fingerprint) = self
-            .workbench
-            .read_with(cx, |this, _| match &this.remote_client {
-                Some(client) => (
-                    RemoteClientSettingsMode::Connected,
-                    client.credential.record.server_url.clone(),
-                    client
-                        .credential
-                        .pinned_tls_certificate_der
-                        .as_deref()
-                        .and_then(pinned_certificate_fingerprint),
-                ),
-                None if matches!(this.runtime_status, RuntimeStatus::Starting) => {
-                    (RemoteClientSettingsMode::Connecting, String::new(), None)
-                }
-                None => (RemoteClientSettingsMode::Local, String::new(), None),
-            })
-            .unwrap_or((RemoteClientSettingsMode::Local, String::new(), None));
-        let inputs_disabled = mode != RemoteClientSettingsMode::Local;
-        let mode_label = match mode {
-            RemoteClientSettingsMode::Local => locale::text(
-                "This desktop is the authority",
-                "本机为权威运行时",
-                "本機為權威執行階段",
-            ),
-            RemoteClientSettingsMode::Connecting => {
-                locale::text("Connecting...", "正在连接...", "正在連線...")
-            }
-            RemoteClientSettingsMode::Connected => locale::text(
-                "Connected to remote runtime",
-                "已连接远程运行时",
-                "已連線遠端執行階段",
-            ),
-        };
-        let mode_chip = settings_value_chip(mode_label);
-        let server_summary = if server_url.is_empty() {
-            locale::text("—", "—", "—").to_string()
-        } else {
-            server_url
-        };
-        let server_url_input = self.remote_server_url_input.clone();
-        let pairing_code_input = self.remote_pairing_code_input.clone();
-        let connect_disabled = self.remote_connect_busy || inputs_disabled;
-        let connect_control = h_flex()
-            .items_center()
-            .gap_1()
-            .when(self.remote_connect_busy, |row| {
-                row.child(Spinner::new().xsmall())
-            })
-            .child(
-                div().w(px(240.0)).child(
-                    Input::new(&self.remote_server_url_input)
-                        .small()
-                        .h(px(28.0))
-                        .rounded(px(8.0)),
-                ),
-            )
-            .child(
-                div().w(px(150.0)).child(
-                    Input::new(&self.remote_pairing_code_input)
-                        .small()
-                        .h(px(28.0))
-                        .rounded(px(8.0)),
-                ),
-            )
-            .child(
-                Button::new("claim-server-pairing-code")
-                    .small()
-                    .outline()
-                    .label(locale::text("Pair", "配对", "配對"))
-                    .disabled(connect_disabled)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let server_url = server_url_input.read(cx).value().trim().to_string();
-                        let pairing_code = pairing_code_input.read(cx).value().trim().to_string();
-                        if server_url.is_empty() || pairing_code.is_empty() {
-                            this.operation_note = Some(
-                                locale::text(
-                                    "Enter the server address and the pairing code.",
-                                    "请输入服务器地址和配对码。",
-                                    "請輸入伺服器位址和配對碼。",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        }
-                        let _ = this.workbench.update(cx, |workbench, cx| {
-                            workbench.claim_remote_pairing_code(server_url, pairing_code, cx)
-                        });
-                    })),
-            );
-        let disconnect_control = Button::new("disconnect-remote-runtime")
-            .small()
-            .outline()
-            .danger()
-            .label(locale::text("Forget", "忘记", "忘記"))
-            .disabled(mode != RemoteClientSettingsMode::Connected)
-            .on_click(cx.listener(|this, _, _, cx| {
-                let _ = this
-                    .workbench
-                    .update(cx, |workbench, cx| workbench.disconnect_remote_client(cx));
-            }));
-        let pairing_link_input = self.remote_pairing_link_input.clone();
-        let link_control = h_flex()
-            .items_center()
-            .gap_1()
-            .when(self.remote_connect_busy, |row| {
-                row.child(Spinner::new().xsmall())
-            })
-            .child(
-                div().w(px(420.0)).child(
-                    Input::new(&self.remote_pairing_link_input)
-                        .small()
-                        .h(px(28.0))
-                        .rounded(px(8.0)),
-                ),
-            )
-            .child(
-                Button::new("claim-server-pairing-link")
-                    .small()
-                    .outline()
-                    .label(locale::text("Pair", "配对", "配對"))
-                    .disabled(connect_disabled)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let pairing_link = pairing_link_input.read(cx).value().trim().to_string();
-                        if pairing_link.is_empty() {
-                            this.operation_note = Some(
-                                locale::text(
-                                    "Paste the connection string printed by vibex-server.",
-                                    "请粘贴 vibex-server 打印的连接串。",
-                                    "請貼上 vibex-server 列印的連接串。",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                            return;
-                        }
-                        let _ = this.workbench.update(cx, |workbench, cx| {
-                            workbench.claim_remote_pairing_link(pairing_link, cx)
-                        });
-                    })),
-            );
-        settings_page(
-            locale::text("Remote Runtime", "远程运行时", "遠端執行階段"),
-            locale::text(
-                "Pair with a headless vibex-server and use it as this workbench's authoritative runtime.",
-                "与无头 vibex-server 配对，并将其作为本工作台的权威运行时。",
-                "與無頭 vibex-server 配對，並將其作為本工作台的權威執行階段。",
-            ),
-            vec![
-                setting_row(
-                    locale::text("Mode", "模式", "模式"),
-                    locale::text(
-                        "The workbench drives either this machine's runtime or a paired remote one.",
-                        "工作台驱动本机运行时或已配对的远程运行时。",
-                        "工作台驅動本機執行階段或已配對的遠端執行階段。",
-                    ),
-                    mode_chip,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Server", "服务器", "伺服器"),
-                    locale::text(
-                        "The paired runtime this desktop is a client of.",
-                        "此桌面作为客户端连接的已配对运行时。",
-                        "此桌面作為客戶端連線的已配對執行階段。",
-                    ),
-                    settings_value_chip(server_summary),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Pair with pairing code", "配对码配对", "配對碼配對"),
-                    locale::text(
-                        "Enter the address and the one-time code the server printed at startup.",
-                        "输入服务器地址及其启动时打印的一次性配对码。",
-                        "輸入伺服器位址及其啟動時列印的一次性配對碼。",
-                    ),
-                    connect_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Pair with connection string", "连接串配对", "連接串配對"),
-                    locale::text(
-                        "Paste the whole vibex:// link vibex-server printed. It also carries the certificate of a server that uses its own, so no system CA is needed.",
-                        "粘贴 vibex-server 打印的完整 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需系统 CA。",
-                        "貼上 vibex-server 列印的完整 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需系統 CA。",
-                    ),
-                    link_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Server certificate", "服务器证书", "伺服器憑證"),
-                    locale::text(
-                        "The certificate pinned for this server. Compare it with the fingerprint vibex-server printed.",
-                        "为此服务器固定的证书指纹。请与 vibex-server 打印的指纹核对。",
-                        "為此伺服器固定的憑證指紋。請與 vibex-server 列印的指紋核對。",
-                    ),
-                    settings_value_chip(certificate_fingerprint.clone().unwrap_or_else(|| {
-                        locale::text("System roots", "系统根证书", "系統根憑證").to_string()
-                    })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Forget this runtime", "忘记此运行时", "忘記此執行階段"),
-                    locale::text(
-                        "Clears the stored credential and returns the workbench to the local runtime.",
-                        "清除已存凭据并将工作台切回本机运行时。",
-                        "清除已存憑證並將工作台切回本機執行階段。",
-                    ),
-                    disconnect_control,
-                    stacked,
-                    cx,
-                ),
-            ],
-            cx,
-        )
-    }
-
     fn render_about_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let channel = release_channel()
             .map(|channel| format!("{channel:?}"))
@@ -50413,7 +51425,6 @@ impl Render for FoundationSettings {
             SettingsSection::Appearance => {
                 self.render_appearance_page(&appearance, stacked_rows, strings, cx)
             }
-            SettingsSection::RemoteRuntime => self.render_remote_runtime_page(stacked_rows, cx),
             SettingsSection::Session => {
                 self.render_session_page(&session, stacked_rows, strings, cx)
             }
@@ -50819,6 +51830,9 @@ impl Render for VibexWorkbench {
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
+        let runtime_add_dialog = self
+            .runtime_add_open
+            .then(|| runtime_add_dialog_overlay(self.render_runtime_add_dialog(cx), cx));
         v_flex()
             .id("vibex-foundation")
             .track_focus(&self.focus_handle)
@@ -50827,6 +51841,7 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_toggle_right_rail))
             .on_action(cx.listener(Self::on_toggle_composer_mode))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_runtime_manager))
             .on_action(cx.listener(Self::on_open_conversation_find))
             .on_action(cx.listener(Self::on_retry_runtime))
             .on_action(cx.listener(Self::on_save_active_file))
@@ -50850,7 +51865,13 @@ impl Render for VibexWorkbench {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.conversation_find_open && event.keystroke.key == "escape" {
+                if this.runtime_add_open && event.keystroke.key == "escape" {
+                    this.close_runtime_add(cx);
+                    cx.stop_propagation();
+                } else if this.runtime_manager_open && event.keystroke.key == "escape" {
+                    this.runtime_manager_dismiss_one_level(cx);
+                    cx.stop_propagation();
+                } else if this.conversation_find_open && event.keystroke.key == "escape" {
                     this.close_conversation_find(window, cx);
                     cx.stop_propagation();
                 } else if this.attachment_image_preview.is_some() && event.keystroke.key == "escape"
@@ -50926,6 +51947,7 @@ impl Render for VibexWorkbench {
                 this.child(preview)
             })
             .when_some(session_search_overlay, |this, overlay| this.child(overlay))
+            .when_some(runtime_add_dialog, |this, overlay| this.child(overlay))
             .when_some(startup_loading, |this, overlay| this.child(overlay))
     }
 }
@@ -50974,6 +51996,9 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
             push!(ToggleComposerMode, "vibex::ToggleComposerMode")
         }
         "open_settings" | "vibex::OpenSettings" => push!(OpenSettings, "vibex::OpenSettings"),
+        "open_runtime_manager" | "vibex::OpenRuntimeManager" => {
+            push!(OpenRuntimeManager, "vibex::OpenRuntimeManager")
+        }
         "open_conversation_find" | "vibex::OpenConversationFind" => {
             push!(OpenConversationFind, "vibex::OpenConversationFind")
         }
@@ -51001,6 +52026,7 @@ fn action_name(action: &str) -> &'static str {
         "toggle_right_rail" => "vibex::ToggleRightRail",
         "toggle_composer_mode" => "vibex::ToggleComposerMode",
         "open_settings" => "vibex::OpenSettings",
+        "open_runtime_manager" => "vibex::OpenRuntimeManager",
         "open_conversation_find" => "vibex::OpenConversationFind",
         "retry_runtime" => "vibex::RetryRuntime",
         "save_active_file" => "vibex::SaveActiveFile",
@@ -51378,6 +52404,169 @@ where
 /// Presents a read-only informational value (usage totals, versions) as a
 /// muted gpui-component [`Tag`] so it reads as data rather than an
 /// interactive control.
+/// Which runtime a status question is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeTarget<'a> {
+    Local,
+    Remote(&'a str),
+}
+
+/// The states the runtime manager shows. The transport's twelve states and the
+/// embedded runtime's four collapse into these so both sources read the same
+/// way in one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeStatePresentation {
+    Ready,
+    Connecting,
+    Degraded,
+    Reconnecting,
+    Offline,
+    Revoked,
+    Incompatible,
+    Failed,
+    Stopped,
+}
+
+/// Status is never carried by color alone: every dot is paired with this.
+fn runtime_state_label(state: RuntimeStatePresentation) -> &'static str {
+    match state {
+        RuntimeStatePresentation::Ready => locale::text("Ready", "已就绪", "已就緒"),
+        RuntimeStatePresentation::Connecting => locale::text("Connecting", "正在连接", "正在連線"),
+        RuntimeStatePresentation::Degraded => locale::text("Unstable", "连接不稳定", "連線不穩定"),
+        RuntimeStatePresentation::Reconnecting => {
+            locale::text("Reconnecting", "正在重连", "正在重新連線")
+        }
+        RuntimeStatePresentation::Offline => locale::text("Offline", "离线", "離線"),
+        RuntimeStatePresentation::Revoked => {
+            locale::text("Access revoked", "授权已失效", "授權已失效")
+        }
+        RuntimeStatePresentation::Incompatible => {
+            locale::text("Incompatible", "版本不兼容", "版本不相容")
+        }
+        RuntimeStatePresentation::Failed => locale::text("Failed", "启动失败", "啟動失敗"),
+        RuntimeStatePresentation::Stopped => locale::text("Not connected", "未连接", "未連線"),
+    }
+}
+
+fn runtime_state_color(state: RuntimeStatePresentation, cx: &App) -> Hsla {
+    let theme = cx.theme();
+    match state {
+        RuntimeStatePresentation::Ready => theme.success,
+        RuntimeStatePresentation::Connecting
+        | RuntimeStatePresentation::Degraded
+        | RuntimeStatePresentation::Reconnecting
+        | RuntimeStatePresentation::Incompatible => theme.warning,
+        RuntimeStatePresentation::Offline
+        | RuntimeStatePresentation::Revoked
+        | RuntimeStatePresentation::Failed => theme.danger,
+        RuntimeStatePresentation::Stopped => theme.muted_foreground.opacity(0.5),
+    }
+}
+
+fn runtime_state_text_color(state: RuntimeStatePresentation, cx: &App) -> Hsla {
+    match state {
+        RuntimeStatePresentation::Stopped => cx.theme().muted_foreground,
+        other => runtime_state_color(other, cx),
+    }
+}
+
+/// A hairline inside the runtime panel. The panel owns its dividers so the
+/// floating surface does not draw borders on its children.
+fn divider_lane(cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(1.0))
+        .my(px(4.0))
+        .bg(cx.theme().border.opacity(0.60))
+        .into_any_element()
+}
+
+/// A label/value pair in the runtime detail stage. Labels share one lane so
+/// the values form a single readable column.
+fn runtime_detail_row(label: &'static str, value: String, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_2()
+        .px_2()
+        .py(px(3.0))
+        .items_start()
+        .child(
+            div()
+                .w(px(RUNTIME_DETAIL_LABEL_WIDTH))
+                .flex_none()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .whitespace_normal()
+                .child(value),
+        )
+        .into_any_element()
+}
+
+fn runtime_add_hint(text: &'static str, cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .whitespace_normal()
+        .child(text)
+        .into_any_element()
+}
+
+/// "3 minutes ago" without a formatting dependency: the panel only needs
+/// enough resolution to separate "just now" from a stale pairing.
+fn relative_time_label(at_ms: i64, _cx: &App) -> String {
+    let now = unix_timestamp_ms();
+    let elapsed_seconds = ((now - at_ms) / 1_000).max(0);
+    if elapsed_seconds < 60 {
+        return locale::text("just now", "刚刚", "剛剛").to_string();
+    }
+    let minutes = elapsed_seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes} {}", locale::text("min ago", "分钟前", "分鐘前"));
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours} {}", locale::text("h ago", "小时前", "小時前"));
+    }
+    let days = hours / 24;
+    format!("{days} {}", locale::text("d ago", "天前", "天前"))
+}
+
+/// The add-runtime dialog layer. It sits above the shell but below the GPUI
+/// dialog layer, so a confirmation can still stack on top correctly.
+fn runtime_add_dialog_overlay(content: AnyElement, cx: &App) -> AnyElement {
+    div()
+        .id("runtime-add-overlay")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(cx.theme().background.opacity(0.55))
+        .child(
+            v_flex()
+                .w(px(RUNTIME_ADD_DIALOG_WIDTH + 40.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .shadow_lg()
+                .p_4()
+                .child(content),
+        )
+        .into_any_element()
+}
+
 fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
     Tag::secondary()
         .whitespace_normal()
@@ -55586,13 +56775,38 @@ mod tests {
             .expect("runtime startup should remain inspectable");
         assert!(boot.contains("self.finish_startup_loading(cx);"));
         assert!(boot.contains("this.finish_startup_loading(cx);"));
-        let ready = boot
-            .find("this.runtime_status = RuntimeStatus::Ready;")
-            .expect("runtime ready transition should remain inspectable");
-        let overview_load = boot[ready..]
-            .find("this.load_agent_overview(cx);")
-            .expect("runtime ready should still restore the agent overview");
-        assert!(!boot[ready..ready + overview_load].contains("this.finish_startup_loading(cx);"));
+
+        // Both authorities reach Ready through an install path that restores
+        // the Agent overview before it releases the startup overlay. A parked
+        // embedded runtime is reinstalled without a boot, so the ordering
+        // guard has to cover the install path rather than the boot path.
+        for install in [
+            "    fn install_local_runtime(",
+            "    fn install_remote_client(",
+        ] {
+            let body = source
+                .split_once(install)
+                .and_then(|(_, tail)| tail.split_once("\n    fn "))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{install} should remain inspectable"));
+            let ready = body
+                .find("RuntimeStatus::Ready;")
+                .unwrap_or_else(|| panic!("{install} should reach Ready"));
+            let overview = body
+                .find(".load_agent_overview(cx);")
+                .unwrap_or_else(|| panic!("{install} should restore the agent overview"));
+            let release = body
+                .rfind(".finish_startup_loading(cx);")
+                .unwrap_or_else(|| panic!("{install} should release the startup overlay"));
+            assert!(
+                ready < release,
+                "{install} must reach Ready before releasing"
+            );
+            assert!(
+                overview < release,
+                "{install} must restore the agent overview before releasing the overlay"
+            );
+        }
 
         let selection = source
             .split_once("    fn select_session_with_history(")

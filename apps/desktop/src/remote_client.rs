@@ -21,6 +21,11 @@ use vibex_remote_client::{
 
 pub const DESKTOP_CREDENTIAL_SCHEMA_VERSION: &str = "vibex-native-desktop-credentials.v1";
 const DESKTOP_CREDENTIALS_FILE: &str = "remote-client-credentials.json";
+pub const DESKTOP_RUNTIMES_SCHEMA_VERSION: &str = "vibex-native-desktop-runtimes.v2";
+const DESKTOP_RUNTIMES_FILE: &str = "remote-runtimes.json";
+/// The embedded runtime's synthetic id. It is never a real server id, so a
+/// paired server can never collide with it.
+pub const LOCAL_RUNTIME_ID: &str = "local";
 pub const DESKTOP_CLIENT_ID: &str = "vibex-desktop";
 
 /// One paired remote runtime. The record pins the server identity so a
@@ -208,6 +213,183 @@ pub async fn claim_server_pairing_link(
     )
 }
 
+/// One paired remote runtime: the persisted grant plus the client-side
+/// metadata the runtime manager renders. `id` is the server id the credential
+/// already pins, so a runtime keeps its identity across renames.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisteredRuntime {
+    pub id: String,
+    /// The operator's local rename. `None` falls back to the name the runtime
+    /// published when it was paired, then to its address.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub credential: DesktopRemoteCredential,
+    #[serde(default)]
+    pub added_at_ms: i64,
+    #[serde(default)]
+    pub last_connected_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for RegisteredRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisteredRuntime")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+impl RegisteredRuntime {
+    /// The name the runtime manager renders. The shared helper owns the
+    /// fallback chain so the desktop and the phone agree.
+    pub fn display_label(&self) -> String {
+        vibex_remote_client::runtime_display_name(
+            self.display_name.as_deref(),
+            self.credential.display_name.as_deref(),
+            &self.credential.record.server_url,
+            &self.id,
+        )
+    }
+}
+
+/// Every runtime this desktop can drive: the embedded one plus each paired
+/// remote. The registry is client-side state, so it survives switching the
+/// workbench to another authority — which is what makes switching
+/// non-destructive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopRuntimeRegistry {
+    pub schema_version: String,
+    /// [`LOCAL_RUNTIME_ID`] or the id of a registered remote runtime.
+    pub active_runtime_id: String,
+    #[serde(default)]
+    pub runtimes: Vec<RegisteredRuntime>,
+}
+
+impl Default for DesktopRuntimeRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: DESKTOP_RUNTIMES_SCHEMA_VERSION.to_string(),
+            active_runtime_id: LOCAL_RUNTIME_ID.to_string(),
+            runtimes: Vec::new(),
+        }
+    }
+}
+
+impl DesktopRuntimeRegistry {
+    pub fn validate(&self) -> BackendResult<()> {
+        if self.schema_version != DESKTOP_RUNTIMES_SCHEMA_VERSION {
+            return Err(BackendError::failed(
+                "desktop_runtimes_invalid",
+                "the stored runtime registry has an unknown schema version",
+            ));
+        }
+        for runtime in &self.runtimes {
+            runtime.credential.validate()?;
+            if runtime.id.trim().is_empty() || runtime.id != runtime.credential.expected_server_id {
+                return Err(BackendError::failed(
+                    "desktop_runtimes_invalid",
+                    "a stored runtime id does not match its pinned server identity",
+                ));
+            }
+        }
+        if !self.is_local_active() && self.remote(self.active_runtime_id()).is_none() {
+            return Err(BackendError::failed(
+                "desktop_runtimes_invalid",
+                "the active runtime is not present in the registry",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_local_active(&self) -> bool {
+        self.active_runtime_id == LOCAL_RUNTIME_ID
+    }
+
+    pub fn active_runtime_id(&self) -> &str {
+        self.active_runtime_id.as_str()
+    }
+
+    pub fn active_remote(&self) -> Option<&RegisteredRuntime> {
+        self.remote(self.active_runtime_id())
+    }
+
+    pub fn remote(&self, id: &str) -> Option<&RegisteredRuntime> {
+        self.runtimes.iter().find(|runtime| runtime.id == id)
+    }
+
+    pub fn remote_mut(&mut self, id: &str) -> Option<&mut RegisteredRuntime> {
+        self.runtimes.iter_mut().find(|runtime| runtime.id == id)
+    }
+
+    pub fn set_active(&mut self, id: &str) {
+        self.active_runtime_id = id.to_string();
+    }
+
+    /// Adds a freshly paired runtime, or refreshes the grant of one that is
+    /// already registered. Returns the runtime id either way so the caller can
+    /// switch to it.
+    pub fn upsert(&mut self, credential: DesktopRemoteCredential, now_ms: i64) -> String {
+        let id = credential.expected_server_id.clone();
+        match self.remote_mut(&id) {
+            Some(existing) => {
+                // Keep the operator's rename across a re-pair.
+                existing.credential = credential;
+            }
+            None => self.runtimes.push(RegisteredRuntime {
+                id: id.clone(),
+                display_name: None,
+                credential,
+                added_at_ms: now_ms,
+                last_connected_at_ms: None,
+            }),
+        }
+        id
+    }
+
+    /// Removes a runtime. The embedded runtime is not removable, and removing
+    /// the active remote falls back to the embedded authority.
+    pub fn remove(&mut self, id: &str) -> bool {
+        if id == LOCAL_RUNTIME_ID {
+            return false;
+        }
+        let before = self.runtimes.len();
+        self.runtimes.retain(|runtime| runtime.id != id);
+        if self.runtimes.len() == before {
+            return false;
+        }
+        if self.active_runtime_id == id {
+            self.active_runtime_id = LOCAL_RUNTIME_ID.to_string();
+        }
+        true
+    }
+
+    /// Sets or clears the operator's rename. An empty name clears it.
+    pub fn rename(&mut self, id: &str, name: &str) -> bool {
+        let name = name.trim();
+        let Some(runtime) = self.remote_mut(id) else {
+            return false;
+        };
+        let next = (!name.is_empty()).then(|| name.to_string());
+        if runtime.display_name == next {
+            return false;
+        }
+        runtime.display_name = next;
+        true
+    }
+
+    pub fn touch_connected(&mut self, id: &str, now_ms: i64) -> bool {
+        let Some(runtime) = self.remote_mut(id) else {
+            return false;
+        };
+        runtime.last_connected_at_ms = Some(now_ms);
+        true
+    }
+}
+
 /// Restrictive-permission credential file under the desktop home. Reads and
 /// writes are atomic; malformed or mismatched records are discarded instead
 /// of being trusted.
@@ -263,6 +445,96 @@ impl DesktopRemoteCredentialStore {
                 "the stored remote credential could not be removed",
             )),
         }
+    }
+}
+
+/// Durable home of the runtime registry.
+///
+/// Version 1 kept exactly one credential in `remote-client-credentials.json`,
+/// which is why switching back to the embedded runtime used to mean deleting
+/// the pairing. The v2 registry keeps every grant plus the id of the active
+/// runtime, so switching and removing are separate operations.
+pub struct DesktopRuntimeRegistryStore {
+    path: PathBuf,
+    /// The version 1 single-credential store, still the reader for a home that
+    /// has not been migrated yet.
+    legacy: DesktopRemoteCredentialStore,
+}
+
+impl DesktopRuntimeRegistryStore {
+    pub fn new(home_dir: &Path) -> Self {
+        Self {
+            path: home_dir.join(DESKTOP_RUNTIMES_FILE),
+            legacy: DesktopRemoteCredentialStore::new(home_dir),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn legacy_path(&self) -> &Path {
+        self.legacy.path()
+    }
+
+    /// Reads the registry, migrating a version 1 single-credential home the
+    /// first time it is seen. A corrupt or unrecognized registry is discarded
+    /// rather than trusted, matching the credential file's contract.
+    pub fn load_or_migrate(&self) -> DesktopRuntimeRegistry {
+        if let Some(registry) = self.load() {
+            return registry;
+        }
+        self.migrate_legacy().unwrap_or_default()
+    }
+
+    fn load(&self) -> Option<DesktopRuntimeRegistry> {
+        let bytes = std::fs::read(&self.path).ok()?;
+        let registry = serde_json::from_slice::<DesktopRuntimeRegistry>(&bytes).ok()?;
+        registry.validate().ok().map(|()| registry)
+    }
+
+    /// Wraps the version 1 credential into a one-entry registry and makes it
+    /// the active runtime, because a stored v1 credential is what the shell
+    /// booted into. The legacy file is removed only after the registry is on
+    /// disk, so a failed migration leaves the original pairing intact.
+    fn migrate_legacy(&self) -> Option<DesktopRuntimeRegistry> {
+        let credential = self.legacy.load()?;
+        let id = credential.expected_server_id.clone();
+        let mut registry = DesktopRuntimeRegistry::default();
+        registry.runtimes.push(RegisteredRuntime {
+            id: id.clone(),
+            display_name: credential.display_name.clone(),
+            credential,
+            added_at_ms: 0,
+            last_connected_at_ms: None,
+        });
+        registry.active_runtime_id = id;
+        if self.save(&registry).is_err() {
+            return None;
+        }
+        // The credential now lives in the registry. Leaving the v1 file behind
+        // would keep a second copy of the same device grant on disk.
+        let _ = self.legacy.clear();
+        Some(registry)
+    }
+
+    pub fn save(&self, registry: &DesktopRuntimeRegistry) -> BackendResult<()> {
+        registry.validate()?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| {
+                BackendError::failed(
+                    "desktop_runtimes_unwritable",
+                    "the desktop home could not be created for the runtime registry",
+                )
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(registry).map_err(|_| {
+            BackendError::failed(
+                "desktop_runtimes_encode_failed",
+                "the runtime registry could not be serialized",
+            )
+        })?;
+        write_private(&self.path, &bytes)
     }
 }
 
@@ -401,6 +673,151 @@ mod tests {
         store.clear().expect("clear");
         assert!(store.load().is_none());
         store.clear().expect("clear is idempotent");
+    }
+
+    fn second_record(id: &str) -> DesktopRemoteCredential {
+        let (mut credential, _) = sample_record();
+        credential.expected_server_id = id.to_string();
+        credential
+    }
+
+    #[test]
+    fn registry_round_trips_and_rejects_a_missing_active_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DesktopRuntimeRegistryStore::new(dir.path());
+        assert!(
+            store.load_or_migrate().is_local_active(),
+            "a fresh home starts on the embedded runtime"
+        );
+
+        let mut registry = DesktopRuntimeRegistry::default();
+        let id = registry.upsert(second_record("server-a"), 1_000);
+        registry.set_active(&id);
+        store.save(&registry).expect("save");
+        let loaded = store.load().expect("loaded");
+        assert_eq!(loaded, registry);
+        assert_eq!(loaded.active_runtime_id(), "server-a");
+
+        // A registry that names an active runtime it does not hold is not
+        // trusted: the manager must never render a runtime it cannot resolve.
+        let mut dangling = registry.clone();
+        dangling.active_runtime_id = "server-missing".to_string();
+        assert!(dangling.validate().is_err());
+        assert!(
+            store.save(&dangling).is_err(),
+            "an unresolvable active runtime is never written"
+        );
+    }
+
+    #[test]
+    fn registry_migrates_a_version_one_credential_into_the_active_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = DesktopRemoteCredentialStore::new(dir.path());
+        legacy
+            .save(&second_record("server-legacy"))
+            .expect("save v1");
+
+        let store = DesktopRuntimeRegistryStore::new(dir.path());
+        let registry = store.load_or_migrate();
+        assert_eq!(registry.active_runtime_id(), "server-legacy");
+        assert_eq!(registry.runtimes.len(), 1);
+        assert_eq!(
+            registry.active_remote().map(|runtime| runtime.id.as_str()),
+            Some("server-legacy")
+        );
+        // The registry is on disk before the v1 file is dropped, so a reader
+        // never sees a home with neither.
+        assert!(store.load().is_some(), "the migrated registry is persisted");
+        assert!(
+            !store.legacy_path().exists(),
+            "the single-credential file is removed once it has been wrapped"
+        );
+
+        // Migrating twice is a no-op rather than a duplicate runtime.
+        let again = store.load_or_migrate();
+        assert_eq!(again.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn removing_the_active_runtime_falls_back_to_the_embedded_one() {
+        let mut registry = DesktopRuntimeRegistry::default();
+        let a = registry.upsert(second_record("server-a"), 1_000);
+        let b = registry.upsert(second_record("server-b"), 2_000);
+        registry.set_active(&b);
+
+        assert!(
+            !registry.remove(LOCAL_RUNTIME_ID),
+            "the embedded runtime stays"
+        );
+        assert!(registry.remove(&b));
+        assert!(
+            registry.is_local_active(),
+            "removal falls back to the device"
+        );
+        assert!(registry.remote(&b).is_none());
+        assert!(registry.active_remote().is_none());
+        assert!(registry.validate().is_ok());
+
+        // Re-pairing the same server keeps one entry and the operator's name.
+        assert!(registry.rename(&a, "  dev box  "));
+        assert_eq!(
+            registry.remote(&a).map(RegisteredRuntime::display_label),
+            Some("dev box".to_string())
+        );
+        let rejoined = registry.upsert(second_record("server-a"), 3_000);
+        assert_eq!(rejoined, a);
+        assert_eq!(registry.runtimes.len(), 1);
+        assert_eq!(
+            registry.remote(&a).map(RegisteredRuntime::display_label),
+            Some("dev box".to_string()),
+            "a re-pair keeps the operator's rename"
+        );
+
+        // Clearing the name falls back to the published one, then the address.
+        assert!(registry.rename(&a, "   "));
+        assert_eq!(
+            registry.remote(&a).map(RegisteredRuntime::display_label),
+            Some("vibex.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_display_name_prefers_override_then_published_then_address() {
+        assert_eq!(
+            vibex_remote_client::runtime_display_name(
+                Some("mine"),
+                Some("published"),
+                "https://host.example:8787",
+                "server-id"
+            ),
+            "mine"
+        );
+        assert_eq!(
+            vibex_remote_client::runtime_display_name(
+                None,
+                Some("published"),
+                "https://host.example:8787",
+                "server-id"
+            ),
+            "published"
+        );
+        assert_eq!(
+            vibex_remote_client::runtime_display_name(
+                None,
+                None,
+                "https://host.example:8787",
+                "server-id"
+            ),
+            "host.example"
+        );
+        // A relay-only credential still gets a stable, bounded label.
+        let long = "s".repeat(vibex_remote_client::RUNTIME_DISPLAY_NAME_MAX_CHARS + 20);
+        let label =
+            vibex_remote_client::runtime_display_name(None, None, "not a url", long.as_str());
+        assert_eq!(
+            label.chars().count(),
+            vibex_remote_client::RUNTIME_DISPLAY_NAME_MAX_CHARS
+        );
     }
 
     #[test]

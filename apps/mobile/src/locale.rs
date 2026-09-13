@@ -220,6 +220,41 @@ pub fn common_for(locale: Locale, en: &'static str) -> &'static str {
         "Hosts" => ("主机", "主機"),
         "Switch host" => ("切换主机", "切換主機"),
         "Add host" => ("添加主机", "新增主機"),
+        // The product term for a paired peer is "runtime" everywhere; the
+        // "host" keys above are kept because the pairing flows still use them.
+        "Runtimes" => ("运行时", "執行環境"),
+        "Connect" => ("连接", "連線"),
+        "Add runtime" => ("添加运行时", "新增執行環境"),
+        "Runtime actions" => ("运行时操作", "執行環境操作"),
+        "Runtime details" => ("运行时详情", "執行環境詳細資料"),
+        "Details" => ("详情", "詳細資料"),
+        "Switch" => ("切换", "切換"),
+        "Remove" => ("移除", "移除"),
+        "Current connection" => ("当前连接", "目前連線"),
+        "All runtimes" => ("全部运行时", "所有執行環境"),
+        "No runtime connected" => ("未连接任何运行时", "尚未連線任何執行環境"),
+        "No runtimes yet" => ("还没有配对任何运行时", "尚未配對任何執行環境"),
+        "Open pairing on the desktop or server, then scan the QR code with the camera." => (
+            "在桌面端或服务器上打开配对，然后用摄像头扫描二维码。",
+            "在桌面版或伺服器上開啟配對，然後用相機掃描 QR Code。",
+        ),
+        "Leave this empty to use the name from the runtime." => (
+            "留空则使用运行时自身的名称。",
+            "留空則使用執行環境本身的名稱。",
+        ),
+        "Deletes the credential stored on this phone. The device authorization on the server is not revoked by this; revoke it there." => {
+            (
+                "只删除此手机上保存的凭据；服务器上的设备授权不会因此撤销，需要到服务器上撤销。",
+                "只刪除此手機上儲存的認證；伺服器上的裝置授權不會因此撤銷，需要到伺服器上撤銷。",
+            )
+        }
+        "Type" => ("类型", "類型"),
+        "Address" => ("地址", "位址"),
+        "Client identity" => ("客户端身份", "用戶端身分"),
+        "Last connected" => ("最近连接", "最近連線"),
+        "Added" => ("添加时间", "新增時間"),
+        "Device authorization" => ("设备授权", "裝置授權"),
+        "Can be revoked on the server" => ("可在服务器上撤销", "可在伺服器上撤銷"),
         "Connected" => ("已连接", "已連線"),
         "Connection" => ("连接", "連線"),
         "Host" => ("主机", "主機"),

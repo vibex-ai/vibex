@@ -20,6 +20,12 @@ pub struct ToggleComposerMode;
 #[action(namespace = vibex, no_json)]
 pub struct OpenSettings;
 
+/// Opens the runtime manager panel anchored beside the title bar's runtime
+/// button.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct OpenRuntimeManager;
+
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
 pub struct OpenConversationFind;

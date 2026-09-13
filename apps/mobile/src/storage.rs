@@ -14,7 +14,11 @@ const HOSTS_FILE: &str = "remote-hosts.json";
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MAX_HOSTS: usize = 32;
 const MAX_HOST_BYTES: u64 = 2 * 1024 * 1024;
-const HOSTS_SCHEMA_VERSION: &str = "vibex-native-mobile-hosts.v1";
+const HOSTS_SCHEMA_VERSION: &str = "vibex-native-mobile-hosts.v2";
+/// The v1 hosts file stored a bare credential bundle per host. It is still
+/// accepted and upgraded in place, so a phone that paired before the runtime
+/// list gained names and timestamps keeps its runtimes.
+const HOSTS_SCHEMA_VERSION_V1: &str = "vibex-native-mobile-hosts.v1";
 const TIMELINE_DISPLAY_SETTINGS_FILE: &str = "timeline-display-settings.json";
 const TIMELINE_DISPLAY_SETTINGS_SCHEMA_VERSION: &str =
     "vibex-native-mobile-timeline-display-settings.v1";
@@ -47,11 +51,46 @@ struct StoredAppSettings {
     language: Option<String>,
 }
 
+/// One paired runtime: the credential plus the mobile-owned metadata the
+/// runtime list shows. Keeping the metadata beside the bundle means a rename
+/// and the "last connected" history survive a re-pair and a restart.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredHostEntry {
+    pub bundle: MobileCredentialBundle,
+    /// A name the user typed on the phone. `None` means the label derived from
+    /// the credential (desktop-advertised name, route host, or server id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_override: Option<String>,
+    /// When this runtime was first paired. Zero marks a v1 entry migrated
+    /// before the timestamp existed.
+    #[serde(default)]
+    pub added_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at_ms: Option<i64>,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredHosts {
     schema_version: String,
+    hosts: Vec<StoredHostEntry>,
+}
+
+/// The pre-metadata file shape, read only to migrate it to [`StoredHosts`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredHostsV1 {
+    schema_version: String,
     hosts: Vec<MobileCredentialBundle>,
+}
+
+/// Reads just the discriminator, so the payload can then be decoded with the
+/// struct matching its schema version.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredHostsVersion {
+    schema_version: String,
 }
 
 /// Per-host mobile presentation overrides. `None` means that the desktop
@@ -167,7 +206,7 @@ impl CredentialStorage {
         outcome
     }
 
-    pub fn load_hosts(&self) -> BackendResult<Vec<MobileCredentialBundle>> {
+    pub fn load_hosts(&self) -> BackendResult<Vec<StoredHostEntry>> {
         let path = self.hosts_path();
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -178,27 +217,61 @@ impl CredentialStorage {
             return self.reject_invalid_hosts(&path);
         }
         let bytes = fs::read(&path).map_err(|_| storage_error("mobile_hosts_read_failed"))?;
-        let stored: StoredHosts = match serde_json::from_slice(&bytes) {
-            Ok(stored) => stored,
+        let version: StoredHostsVersion = match serde_json::from_slice(&bytes) {
+            Ok(version) => version,
             Err(_) => return self.reject_invalid_hosts(&path),
         };
-        if stored.schema_version != HOSTS_SCHEMA_VERSION || stored.hosts.len() > MAX_HOSTS {
-            return self.reject_invalid_hosts(&path);
-        }
-        for bundle in &stored.hosts {
-            if bundle.validate().is_err() {
-                return self.reject_invalid_hosts(&path);
+        match version.schema_version.as_str() {
+            HOSTS_SCHEMA_VERSION => {
+                let stored: StoredHosts = match serde_json::from_slice(&bytes) {
+                    Ok(stored) => stored,
+                    Err(_) => return self.reject_invalid_hosts(&path),
+                };
+                if stored.hosts.len() > MAX_HOSTS {
+                    return self.reject_invalid_hosts(&path);
+                }
+                for host in &stored.hosts {
+                    if host.bundle.validate().is_err() {
+                        return self.reject_invalid_hosts(&path);
+                    }
+                }
+                Ok(stored.hosts)
             }
+            HOSTS_SCHEMA_VERSION_V1 => {
+                let stored: StoredHostsV1 = match serde_json::from_slice(&bytes) {
+                    Ok(stored) => stored,
+                    Err(_) => return self.reject_invalid_hosts(&path),
+                };
+                if stored.hosts.len() > MAX_HOSTS {
+                    return self.reject_invalid_hosts(&path);
+                }
+                let mut migrated = Vec::with_capacity(stored.hosts.len());
+                for bundle in stored.hosts {
+                    if bundle.validate().is_err() {
+                        return self.reject_invalid_hosts(&path);
+                    }
+                    migrated.push(StoredHostEntry {
+                        bundle,
+                        name_override: None,
+                        added_at_ms: 0,
+                        last_connected_at_ms: None,
+                    });
+                }
+                // Best effort: the upgrade is a convenience, and a read-only or
+                // full data dir must not cost the user the hosts just decoded.
+                let _ = self.save_stored_hosts(&migrated);
+                Ok(migrated)
+            }
+            _ => self.reject_invalid_hosts(&path),
         }
-        Ok(stored.hosts)
     }
 
-    pub fn save_hosts(&self, hosts: &[MobileCredentialBundle]) -> BackendResult<()> {
+    pub fn save_stored_hosts(&self, hosts: &[StoredHostEntry]) -> BackendResult<()> {
         if hosts.len() > MAX_HOSTS {
             return Err(storage_error("mobile_hosts_invalid"));
         }
-        for bundle in hosts {
-            bundle.validate()?;
+        for host in hosts {
+            host.bundle.validate()?;
         }
         fs::create_dir_all(&self.data_dir)
             .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
@@ -211,41 +284,7 @@ impl CredentialStorage {
         if encoded.is_empty() || encoded.len() as u64 > MAX_HOST_BYTES {
             return Err(storage_error("mobile_hosts_invalid"));
         }
-        let path = self.hosts_path();
-        let temporary = temporary_path(&path);
-        match fs::remove_file(&temporary) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(storage_error("mobile_hosts_write_failed")),
-        }
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let outcome = (|| {
-            let mut file = options
-                .open(&temporary)
-                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
-            file.write_all(&encoded)
-                .and_then(|_| file.sync_all())
-                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
-            fs::rename(&temporary, &path)
-                .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                    .map_err(|_| storage_error("mobile_hosts_write_failed"))?;
-            }
-            Ok(())
-        })();
-        if outcome.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        outcome
+        write_atomic(&self.hosts_path(), &encoded, "mobile_hosts_write_failed")
     }
 
     pub fn load_timeline_display_settings_overrides(
@@ -461,7 +500,7 @@ impl CredentialStorage {
         }
     }
 
-    fn reject_invalid_hosts(&self, path: &Path) -> BackendResult<Vec<MobileCredentialBundle>> {
+    fn reject_invalid_hosts(&self, path: &Path) -> BackendResult<Vec<StoredHostEntry>> {
         match fs::remove_file(path) {
             Ok(()) => Err(storage_error("mobile_hosts_invalid")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -582,15 +621,106 @@ mod tests {
     fn hosts_round_trip_and_clear() {
         let temp = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let mut second = fixture();
+        second.expected_server_id = "second-desktop".to_string();
+        let entries = vec![
+            StoredHostEntry {
+                bundle: fixture(),
+                name_override: Some("Studio desktop".to_string()),
+                added_at_ms: 1_700_000_000_000,
+                last_connected_at_ms: Some(1_700_000_100_000),
+            },
+            StoredHostEntry {
+                bundle: second,
+                name_override: None,
+                added_at_ms: 1_700_000_200_000,
+                last_connected_at_ms: None,
+            },
+        ];
+        storage.save_stored_hosts(&entries).unwrap();
+        assert_eq!(storage.load_hosts().unwrap(), entries);
+        storage.clear_hosts().unwrap();
+        assert!(storage.load_hosts().unwrap().is_empty());
+    }
+
+    /// A phone that paired before the runtime list gained metadata must keep
+    /// every runtime, upgraded to the v2 shape on disk.
+    #[test]
+    fn v1_hosts_are_migrated_to_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
         let first = fixture();
         let mut second = fixture();
         second.expected_server_id = "second-desktop".to_string();
-        storage
-            .save_hosts(&[first.clone(), second.clone()])
-            .unwrap();
-        assert_eq!(storage.load_hosts().unwrap(), vec![first, second]);
-        storage.clear_hosts().unwrap();
-        assert!(storage.load_hosts().unwrap().is_empty());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.hosts_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": HOSTS_SCHEMA_VERSION_V1,
+                "hosts": [first, second],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = storage.load_hosts().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].bundle.expected_server_id, "desktop");
+        assert_eq!(loaded[1].bundle.expected_server_id, "second-desktop");
+        assert_eq!(loaded[0].name_override, None);
+        assert_eq!(loaded[0].added_at_ms, 0);
+        assert_eq!(loaded[0].last_connected_at_ms, None);
+
+        // The upgrade is persisted, so the next launch reads v2 directly.
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(storage.hosts_path()).unwrap()).unwrap();
+        assert_eq!(rewritten["schemaVersion"], HOSTS_SCHEMA_VERSION);
+        assert_eq!(rewritten["hosts"].as_array().unwrap().len(), 2);
+        assert_eq!(storage.load_hosts().unwrap().len(), 2);
+    }
+
+    /// The migration is a convenience: hosts that were already decoded must
+    /// survive a data dir that cannot be written.
+    #[test]
+    fn a_failed_v1_migration_still_returns_the_hosts() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.hosts_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": HOSTS_SCHEMA_VERSION_V1,
+                "hosts": [fixture()],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A directory where the atomic write wants its temporary file.
+        fs::create_dir(temporary_path(&storage.hosts_path())).unwrap();
+
+        let loaded = storage.load_hosts().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].bundle.expected_server_id, "desktop");
+    }
+
+    #[test]
+    fn unknown_hosts_schema_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(
+            storage.hosts_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": "vibex-native-mobile-hosts.v3",
+                "hosts": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = storage.load_hosts().unwrap_err();
+        assert_eq!(error.code, "mobile_hosts_invalid");
+        assert!(!storage.hosts_path().exists());
     }
 
     #[test]
