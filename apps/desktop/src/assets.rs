@@ -425,6 +425,241 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
             "/assets/icons/files.svg"
         )),
     ),
+    // The sidebar project-logo picker and the file/folder row actions ask for
+    // these; they shipped as files without being registered, so the surfaces
+    // that use them drew nothing at all.
+    (
+        "icons/vibex/folder.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/folder.svg"
+        )),
+    ),
+    (
+        "icons/vibex/box.svg",
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/box.svg")),
+    ),
+    (
+        "icons/vibex/globe.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/globe.svg"
+        )),
+    ),
+    (
+        "icons/vibex/server.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/server.svg"
+        )),
+    ),
+    (
+        "icons/vibex/cpu.svg",
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/cpu.svg")),
+    ),
+    (
+        "icons/vibex/layers.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/layers.svg"
+        )),
+    ),
+    (
+        "icons/vibex/rocket.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/rocket.svg"
+        )),
+    ),
+    (
+        "icons/vibex/wrench.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/wrench.svg"
+        )),
+    ),
+    (
+        "icons/vibex/gift.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/gift.svg"
+        )),
+    ),
+    (
+        "icons/vibex/package.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/package.svg"
+        )),
+    ),
+    (
+        "icons/vibex/palette.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/palette.svg"
+        )),
+    ),
+    (
+        "icons/vibex/gauge.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/gauge.svg"
+        )),
+    ),
+    (
+        "icons/vibex/workflow.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/workflow.svg"
+        )),
+    ),
+    (
+        "icons/vibex/briefcase.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/briefcase.svg"
+        )),
+    ),
+    (
+        "icons/vibex/braces.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/braces.svg"
+        )),
+    ),
+    (
+        "icons/vibex/chart-column.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/chart-column.svg"
+        )),
+    ),
+    (
+        "icons/vibex/scissors.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/scissors.svg"
+        )),
+    ),
+    (
+        "icons/vibex/circle-outline.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/circle-outline.svg"
+        )),
+    ),
+    (
+        "icons/vibex/mosaic.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/mosaic.svg"
+        )),
+    ),
+    (
+        "icons/vibex/rectangle-outline.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/rectangle-outline.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-text.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-text.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-plus.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-plus.svg"
+        )),
+    ),
+    (
+        "icons/vibex/folder-plus.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/folder-plus.svg"
+        )),
+    ),
+    (
+        "icons/vibex/pencil.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/pencil.svg"
+        )),
+    ),
+    (
+        "icons/vibex/audio-lines.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/audio-lines.svg"
+        )),
+    ),
+    (
+        "icons/vibex/clipboard-paste.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/clipboard-paste.svg"
+        )),
+    ),
+    (
+        "icons/vibex/coffee.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/coffee.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-cog.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-cog.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-key.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-key.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-lock.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-lock.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-spreadsheet.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-spreadsheet.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-symlink.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-symlink.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-type.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-type.svg"
+        )),
+    ),
+    (
+        "icons/vibex/file-video-camera.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/file-video-camera.svg"
+        )),
+    ),
 ];
 
 macro_rules! bundled_icon_asset {
@@ -1951,6 +2186,47 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registered path renders; an unregistered one renders nothing at all,
+    /// with no error and no placeholder, so a typo in a path produces an
+    /// invisible button rather than a visible failure. This scans every literal
+    /// icon path the workbench asks for and resolves it through the real asset
+    /// source.
+    #[test]
+    fn every_icon_path_the_workbench_requests_is_bundled() {
+        let assets = VibexAssets;
+        let mut checked = 0;
+        for (module, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("code_workbench.rs", include_str!("code_workbench.rs")),
+            ("management.rs", include_str!("management.rs")),
+            ("usage.rs", include_str!("usage.rs")),
+        ] {
+            for (index, _) in source.match_indices("icons/") {
+                let rest = &source[index..];
+                let Some(end) = rest.find('"') else {
+                    continue;
+                };
+                let path = &rest[..end];
+                // Skip interpolated paths: the test can only resolve literals.
+                if path.contains('{') || path.contains('\n') || !path.ends_with(".svg") {
+                    continue;
+                }
+                assert!(
+                    assets
+                        .load(path)
+                        .expect("asset lookup should not fail")
+                        .is_some(),
+                    "{module} asks for {path}, which is not in the asset bundle"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 10,
+            "the scan found only {checked} icon paths; it is probably not reading the app source"
+        );
+    }
 
     #[test]
     fn window_icon_is_high_contrast_and_rounded() {

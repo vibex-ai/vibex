@@ -7820,7 +7820,11 @@ impl CodeWorkbench {
                                     .h(px(20.0))
                                     .p_0()
                                     .tooltip(locale::text("Open file", "打开文件", "開啟檔案"))
-                                    .child(Icon::default().path("icons/pencil.svg").size(px(14.0)))
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/vibex/pencil.svg")
+                                            .size(px(14.0)),
+                                    )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.open_file(edit_path.clone(), false, window, cx)
                                     })),

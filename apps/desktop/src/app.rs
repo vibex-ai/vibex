@@ -4637,7 +4637,7 @@ impl Render for ComposerQueueDrag {
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
             .shadow_md()
-            .child(sidebar_icon("icons/grip-vertical.svg"))
+            .child(sidebar_icon("icons/vibex/grip-vertical.svg"))
             .child(div().min_w_0().truncate().child(self.label.clone()))
     }
 }
