@@ -11,16 +11,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, Context, DragMoveEvent, Empty,
-    Entity, EventEmitter, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation,
-    Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
-    prelude::*, px,
+    AccessibleAction, Anchor, AnyElement, App, Context, DragMoveEvent, Empty, Entity, EventEmitter,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render, Role,
+    SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _, Theme, WindowExt as _,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
+    collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
     form::{Field, Form},
     h_flex,
@@ -108,6 +108,28 @@ fn management_input_changed(event: &InputEvent) -> bool {
 pub(crate) enum ManagementEvent {
     AgentRegistryChanged,
 }
+
+/// Which control inside the open Model editor produced a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileModelEditField {
+    Id,
+    Reasoning,
+    Limits,
+}
+
+/// What one Model editor renders, resolved from the Agent projection once per
+/// frame instead of per row.
+struct ProfileModelEditorContext {
+    agent_owns_catalog: bool,
+    catalog_choices: Vec<(String, Option<vibex_core::ProviderModelWireApi>)>,
+    wire_api_choices: Vec<vibex_core::ProviderModelWireApi>,
+    shows_wire_api: bool,
+    pending: bool,
+}
+
+/// Disclosures the Provider editor owns, named so the toggle can find them.
+const PROFILE_MODEL_ADVANCED_DISCLOSURE_ID: &str = "provider-model-advanced";
+const PROFILE_PROTOCOL_DISCLOSURE_ID: &str = "provider-protocol-overrides";
 
 struct ManagementCenterFeedbackNotification;
 
@@ -700,7 +722,6 @@ pub struct ManagementCenter {
     refresh_pending: bool,
     agent_install_refresh_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
-    profile_secret_task: Option<Task<()>>,
     agent_mutation_tasks: BTreeMap<String, Task<()>>,
     agent_auth_task: Option<Task<()>>,
     agent_auth_operation_tasks: BTreeMap<String, Task<()>>,
@@ -768,14 +789,32 @@ pub struct ManagementCenter {
     compact_sidebar_resize_drag: Option<ManagementSidebarResizeDragState>,
     profile_editor_open: bool,
     editing_profile_id: Option<String>,
-    profile_secret_touched: bool,
-    profile_secret_loading: bool,
+    /// Whether the stored Secret exists, shown as state. The editor never reads
+    /// the value back: the field opens empty and blank means "keep it".
+    profile_secret_configured: bool,
+    /// Set only by the explicit Clear command, so an empty field on its own
+    /// never deletes a stored Secret.
+    profile_secret_clear: bool,
+    /// Provider-name problem, rendered under the field and cleared on edit.
+    profile_name_error: Option<String>,
+    /// The Provider editor's own failure, rendered next to its Save button
+    /// instead of riding the notification layer over the dialog.
+    profile_submit_error: Option<String>,
     profile_configured_models: Vec<vibex_core::ProviderConfiguredModel>,
     profile_model_edit_index: Option<usize>,
     profile_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
     /// The Model's declared thinking-depth opt-out: `true` writes
     /// `reasoning: false`, which is the one answer that removes the control.
     profile_model_edit_reasoning_disabled: bool,
+    /// The open Model editor's problem, tagged with the field it belongs to so
+    /// the message lands next to the control that produced it.
+    profile_model_edit_error: Option<(ProfileModelEditField, String)>,
+    /// The Model editor's advanced values are collapsed until asked for, and
+    /// open themselves when the Model already declares one.
+    profile_model_advanced_open: bool,
+    /// Per-protocol endpoint overrides stay behind a disclosure: most Providers
+    /// only ever configure the default address.
+    profile_protocol_advanced_open: bool,
     profile_provider_options: vibex_core::ProviderOptions,
     selected_acp_profile_id: Option<String>,
     acp_config_draft: Option<vibex_core::AcpProviderConfig>,
@@ -794,6 +833,7 @@ pub struct ManagementCenter {
     profile_base_url: Entity<InputState>,
     profile_protocol_base_urls: Vec<(vibex_core::ProviderModelWireApi, Entity<InputState>)>,
     profile_model_draft: Entity<InputState>,
+    profile_model_search: Entity<InputState>,
     profile_model_edit_id: Entity<InputState>,
     profile_model_edit_name: Entity<InputState>,
     profile_model_edit_efforts: Entity<InputState>,
@@ -943,9 +983,16 @@ impl ManagementCenter {
             cx.new(|cx| InputState::new(window, cx).placeholder("https://provider.example/v1"));
         let profile_model_draft = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
-                "Model id",
-                "模型 ID",
-                "模型 ID",
+                "e.g. deepseek-chat",
+                "例如 deepseek-chat",
+                "例如 deepseek-chat",
+            ))
+        });
+        let profile_model_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search models",
+                "搜索模型",
+                "搜尋模型",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -964,9 +1011,9 @@ impl ManagementCenter {
         });
         let profile_model_edit_efforts = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
-                "off, low, high, max — or level=wire",
-                "off, low, high, max —— 或 档位=线格式",
-                "off, low, high, max —— 或 檔位=線格式",
+                "off, low, high, max",
+                "off, low, high, max",
+                "off, low, high, max",
             ))
         });
         let profile_model_edit_context_tokens = cx.new(|cx| {
@@ -1118,6 +1165,7 @@ impl ManagementCenter {
                 if !management_input_changed(event) {
                     return;
                 }
+                this.profile_name_error = None;
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
@@ -1146,21 +1194,39 @@ impl ManagementCenter {
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
-            cx.subscribe(&profile_model_draft, |this, _, event: &InputEvent, cx| {
+            // Enter in the Model-id field adds the row it names. Enter is also
+            // the Dialog's own confirm, so this field answers it and stops it
+            // there instead of letting the keystroke reach Save.
+            cx.subscribe_in(
+                &profile_model_draft,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => {
+                        this.projection_editor.mark_draft_changed();
+                        this.navigation.mark_dirty(ManagementSection::Agents, true);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.add_profile_model(window, cx);
+                        cx.stop_propagation();
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {}
+                },
+            ),
+            cx.subscribe(&profile_model_search, |_, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
-                this.projection_editor.mark_draft_changed();
-                this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
             }),
+            // The Model editor has no Apply step: every field that still parses
+            // is the Model's new value, so nothing typed there can be left
+            // behind by the dialog's own Save.
             cx.subscribe(&profile_model_edit_id, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
-                this.projection_editor.mark_draft_changed();
-                this.navigation.mark_dirty(ManagementSection::Agents, true);
-                cx.notify();
+                this.apply_profile_model_edit(cx);
             }),
             cx.subscribe(
                 &profile_model_edit_name,
@@ -1168,9 +1234,7 @@ impl ManagementCenter {
                     if !management_input_changed(event) {
                         return;
                     }
-                    this.projection_editor.mark_draft_changed();
-                    this.navigation.mark_dirty(ManagementSection::Agents, true);
-                    cx.notify();
+                    this.apply_profile_model_edit(cx);
                 },
             ),
             cx.subscribe(
@@ -1180,8 +1244,7 @@ impl ManagementCenter {
                         return;
                     }
                     // A written table is the more specific answer, so typing one
-                    // leaves the non-reasoning choice behind instead of letting
-                    // Apply silently ignore what the field shows.
+                    // leaves the non-reasoning choice behind.
                     if !this
                         .profile_model_edit_efforts
                         .read(cx)
@@ -1191,9 +1254,7 @@ impl ManagementCenter {
                     {
                         this.profile_model_edit_reasoning_disabled = false;
                     }
-                    this.projection_editor.mark_draft_changed();
-                    this.navigation.mark_dirty(ManagementSection::Agents, true);
-                    cx.notify();
+                    this.apply_profile_model_edit(cx);
                 },
             ),
             cx.subscribe(
@@ -1202,9 +1263,7 @@ impl ManagementCenter {
                     if !management_input_changed(event) {
                         return;
                     }
-                    this.projection_editor.mark_draft_changed();
-                    this.navigation.mark_dirty(ManagementSection::Agents, true);
-                    cx.notify();
+                    this.apply_profile_model_edit(cx);
                 },
             ),
             cx.subscribe(
@@ -1213,18 +1272,24 @@ impl ManagementCenter {
                     if !management_input_changed(event) {
                         return;
                     }
-                    this.projection_editor.mark_draft_changed();
-                    this.navigation.mark_dirty(ManagementSection::Agents, true);
-                    cx.notify();
+                    this.apply_profile_model_edit(cx);
                 },
             ),
+            // Typing a value replaces the stored Secret; a value the user
+            // removes again only stops that replacement, it never clears what
+            // is stored. Clearing is its own command.
             cx.subscribe(&profile_api_key, |this, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
-                this.profile_secret_touched = true;
-                let clear = this.profile_api_key.read(cx).value().trim().is_empty();
-                this.projection_editor.set_secret_intent(true, clear);
+                let typed = !this.profile_api_key.read(cx).value().trim().is_empty();
+                if typed {
+                    this.profile_secret_clear = false;
+                }
+                this.projection_editor.set_secret_intent(
+                    typed || this.profile_secret_clear,
+                    this.profile_secret_clear,
+                );
                 this.projection_editor.mark_draft_changed();
                 this.navigation.mark_dirty(ManagementSection::Agents, true);
                 cx.notify();
@@ -1389,7 +1454,6 @@ impl ManagementCenter {
             refresh_pending: false,
             agent_install_refresh_task: None,
             mutation_task: None,
-            profile_secret_task: None,
             agent_mutation_tasks: BTreeMap::new(),
             agent_auth_task: None,
             agent_auth_operation_tasks: BTreeMap::new(),
@@ -1448,12 +1512,17 @@ impl ManagementCenter {
             compact_sidebar_resize_drag: None,
             profile_editor_open: false,
             editing_profile_id: None,
-            profile_secret_touched: false,
-            profile_secret_loading: false,
+            profile_secret_configured: false,
+            profile_secret_clear: false,
+            profile_name_error: None,
+            profile_submit_error: None,
             profile_configured_models: Vec::new(),
             profile_model_edit_index: None,
             profile_model_edit_wire_api: None,
             profile_model_edit_reasoning_disabled: false,
+            profile_model_edit_error: None,
+            profile_model_advanced_open: false,
+            profile_protocol_advanced_open: false,
             profile_provider_options: vibex_core::ProviderOptions::empty(),
             selected_acp_profile_id: None,
             acp_config_draft: None,
@@ -1472,6 +1541,7 @@ impl ManagementCenter {
             profile_base_url,
             profile_protocol_base_urls: Vec::new(),
             profile_model_draft,
+            profile_model_search,
             profile_model_edit_id,
             profile_model_edit_name,
             profile_model_edit_efforts,
@@ -1575,7 +1645,15 @@ impl ManagementCenter {
             (&self.profile_note, ("Note", "备注", "備註")),
             (
                 &self.profile_model_draft,
-                ("Model id", "模型 ID", "模型 ID"),
+                (
+                    "e.g. deepseek-chat",
+                    "例如 deepseek-chat",
+                    "例如 deepseek-chat",
+                ),
+            ),
+            (
+                &self.profile_model_search,
+                ("Search models", "搜索模型", "搜尋模型"),
             ),
             (
                 &self.profile_model_edit_id,
@@ -1588,9 +1666,9 @@ impl ManagementCenter {
             (
                 &self.profile_model_edit_efforts,
                 (
-                    "off, low, high, max — or level=wire",
-                    "off, low, high, max —— 或 档位=线格式",
-                    "off, low, high, max —— 或 檔位=線格式",
+                    "off, low, high, max",
+                    "off, low, high, max",
+                    "off, low, high, max",
                 ),
             ),
             (
@@ -4075,14 +4153,19 @@ impl ManagementCenter {
         });
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
-        self.profile_secret_touched = false;
+        self.profile_secret_configured = false;
+        self.profile_secret_clear = false;
+        self.profile_name_error = None;
+        self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
-        self.profile_secret_loading = false;
-        self.profile_secret_task = None;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
+        self.profile_model_edit_error = None;
+        self.profile_model_advanced_open = false;
+        self.profile_protocol_advanced_open = false;
+        self.profile_submit_error = None;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.rebuild_profile_protocol_base_urls(window, cx);
         self.profile_editor_open = true;
@@ -4132,6 +4215,8 @@ impl ManagementCenter {
         });
         self.profile_model_draft
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_id
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_name
@@ -4154,114 +4239,29 @@ impl ManagementCenter {
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
+        self.profile_model_edit_error = None;
+        self.profile_model_advanced_open = false;
         self.profile_provider_options = full_profile
             .map(|profile| profile.provider_options)
             .unwrap_or_else(vibex_core::ProviderOptions::empty);
         self.rebuild_profile_protocol_base_urls(window, cx);
+        // An override the user already set stays visible instead of hiding
+        // behind a disclosure that looks empty.
+        self.profile_protocol_advanced_open = self.pending_protocol_overrides() > 0;
         self.editing_profile_id = Some(profile.id.clone());
         self.projection_editor.draft_revision = 0;
-        self.profile_secret_touched = false;
+        // The stored Secret is never read back into the editor: the field opens
+        // blank, says that a Secret exists, and blank keeps it.
+        self.profile_secret_configured = profile.secret_configured;
+        self.profile_secret_clear = false;
+        self.profile_name_error = None;
+        self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
-        self.profile_secret_loading = profile.secret_configured;
-        self.profile_secret_task = None;
         self.profile_editor_open = true;
         self.error = None;
         self.navigation.mark_dirty(ManagementSection::Agents, false);
         self.present_profile_editor_dialog(window, cx);
-        if profile.secret_configured {
-            if let (Ok(agent_id), Ok(provider_profile_id)) = (
-                AgentId::parse(profile.agent_id),
-                vibex_core::ProviderProfileId::parse(profile.id),
-            ) {
-                self.load_profile_secret(agent_id, provider_profile_id, window.window_handle(), cx);
-            } else {
-                self.profile_secret_loading = false;
-            }
-        }
         cx.notify();
-    }
-
-    fn load_profile_secret(
-        &mut self,
-        agent_id: AgentId,
-        provider_profile_id: vibex_core::ProviderProfileId,
-        window_handle: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(runtime) = self.runtime.clone() else {
-            self.profile_secret_loading = false;
-            // A paired runtime never hands stored secrets back over the wire,
-            // so the editor opens empty and a typed value replaces the stored
-            // one. Say that instead of leaving the field silently blank.
-            self.profile_secret_touched = false;
-            self.projection_editor.set_secret_intent(false, false);
-            self.notice = Some(
-                management_locale_text(
-                    "Stored credentials stay on the connected runtime; enter a new value to replace them",
-                    "已保存的凭据保留在连接的运行时上，输入新值即可替换",
-                    "已儲存的憑證保留在連線的執行階段上，輸入新值即可取代",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let expected_agent_id = agent_id.as_str().to_string();
-        let expected_profile_id = provider_profile_id.as_str().to_string();
-        let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .management()
-                .providers()
-                .management()
-                .get_agent_model_provider_profile_secret_value(
-                    vibex_core::AgentModelProviderProfileSecretValueRequest {
-                        agent_id,
-                        provider_profile_id,
-                    },
-                )
-        });
-        self.profile_secret_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = runner.await;
-            let _ = cx.update_window(window_handle, |_, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if !profile_secret_scope_matches(
-                        this.profile_editor_open,
-                        this.selected_agent_id.as_deref(),
-                        this.editing_profile_id.as_deref(),
-                        &expected_agent_id,
-                        &expected_profile_id,
-                    ) {
-                        return;
-                    }
-                    this.profile_secret_loading = false;
-                    match outcome {
-                        Ok(Ok(secret)) => {
-                            this.profile_api_key.update(cx, |state, cx| {
-                                state.set_value(secret.value.unwrap_or_default(), window, cx)
-                            });
-                            this.profile_secret_touched = false;
-                            this.projection_editor.set_secret_intent(false, false);
-                            this.navigation.mark_dirty(ManagementSection::Agents, false);
-                        }
-                        Ok(Err(error)) => {
-                            this.error = Some(format!("{}: {}", error.code, error.message));
-                        }
-                        Err(error) => {
-                            this.error = Some(format!(
-                                "{}: {error}",
-                                management_error_text(
-                                    "API Key loading failed",
-                                    "API Key 加载失败",
-                                    "API Key 載入失敗",
-                                )
-                            ));
-                        }
-                    }
-                    cx.notify();
-                });
-            });
-        }));
     }
 
     fn close_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4279,13 +4279,16 @@ impl ManagementCenter {
         self.profile_editor_open = false;
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
-        self.profile_secret_touched = false;
+        self.profile_secret_configured = false;
+        self.profile_secret_clear = false;
+        self.profile_name_error = None;
         self.projection_editor.set_secret_intent(false, false);
-        self.profile_secret_loading = false;
-        self.profile_secret_task = None;
         self.profile_configured_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
+        self.profile_model_edit_error = None;
+        self.profile_model_advanced_open = false;
+        self.profile_protocol_advanced_open = false;
         self.profile_provider_options = vibex_core::ProviderOptions::empty();
         self.profile_protocol_base_urls.clear();
         self.navigation.mark_dirty(ManagementSection::Agents, false);
@@ -4317,9 +4320,24 @@ impl ManagementCenter {
         }
     }
 
+    /// Per-protocol endpoint overrides the user has already filled in.
+    fn pending_protocol_overrides(&self) -> usize {
+        self.profile_protocol_base_urls
+            .iter()
+            .filter(|(wire_api, _)| {
+                provider_option_value(
+                    &self.profile_provider_options,
+                    &wire_api.protocol_base_url_option_key(),
+                )
+                .is_some_and(|value| !value.trim().is_empty())
+            })
+            .count()
+    }
+
     fn present_profile_editor_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let center = cx.entity();
         let dialog_center = center.clone();
+        let confirm_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
         let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 544.0);
         let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
@@ -4330,12 +4348,21 @@ impl ManagementCenter {
         };
         window.open_dialog(cx, move |dialog, _, _| {
             let dialog_center = dialog_center.clone();
+            let confirm_center = confirm_center.clone();
             dialog
                 .title(title)
                 .w(px(dialog_width))
                 .max_w(px(dialog_width))
                 .h(px(dialog_height))
                 .child(dialog_content.clone())
+                // The Dialog answers Enter with its own confirm action, whose
+                // default is "close this overlay". Enter in a form means the
+                // form's commit, so it saves here, and the dialog is closed by
+                // the save path only after the backend accepted it.
+                .on_ok(move |_, _, cx| {
+                    confirm_center.update(cx, |center, cx| center.save_profile(cx));
+                    false
+                })
                 .on_close(move |_, window, cx| {
                     dialog_center.update(cx, |center, cx| {
                         center.reset_profile_editor_state(window, cx);
@@ -4390,6 +4417,20 @@ impl ManagementCenter {
         }
     }
 
+    /// Flips one of the Provider editor's disclosures.
+    fn toggle_profile_editor_disclosure(&mut self, id: &str, cx: &mut Context<Self>) {
+        match id {
+            PROFILE_PROTOCOL_DISCLOSURE_ID => {
+                self.profile_protocol_advanced_open = !self.profile_protocol_advanced_open;
+            }
+            PROFILE_MODEL_ADVANCED_DISCLOSURE_ID => {
+                self.profile_model_advanced_open = !self.profile_model_advanced_open;
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
     fn open_profile_model_editor(
         &mut self,
         index: usize,
@@ -4406,9 +4447,9 @@ impl ManagementCenter {
         self.profile_model_edit_name.update(cx, |state, cx| {
             state.set_value(model.display_name.unwrap_or_default(), window, cx)
         });
-        // Three answers share one control: an opt-out, a declared table, and
-        // "not declared". The table's wire spellings are shown as they were
-        // declared — the field is the only copy the user has.
+        // Two answers share the reasoning control: an opt-out and "not
+        // declared". The levels are the wire spellings the user declared, and
+        // the field is the only copy they have.
         self.profile_model_edit_reasoning_disabled = model.capabilities.reasoning == Some(false);
         let efforts = model
             .capabilities
@@ -4434,6 +4475,12 @@ impl ManagementCenter {
         self.profile_model_edit_output_tokens
             .update(cx, |state, cx| state.set_value(output_tokens, window, cx));
         self.profile_model_edit_index = Some(index);
+        self.profile_model_edit_error = None;
+        // Advanced values the Model already declares are shown instead of
+        // hiding behind a disclosure that looks untouched.
+        self.profile_model_advanced_open = model.capabilities.reasoning_efforts.is_some()
+            || model.capabilities.context_tokens.is_some()
+            || model.capabilities.output_tokens.is_some();
         self.navigation
             .mark_dirty(ManagementSection::Agents, was_dirty);
         cx.notify();
@@ -4443,60 +4490,42 @@ impl ManagementCenter {
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
+        self.profile_model_edit_error = None;
+        self.profile_model_advanced_open = false;
         cx.notify();
     }
 
-    fn save_profile_model_editor(&mut self, cx: &mut Context<Self>) {
+    /// Writes the open Model editor's fields into the draft as they are typed.
+    ///
+    /// The editor has no Apply step, so nothing typed here can be left behind
+    /// when the dialog saves. Each field is written only while it parses: a
+    /// half-typed level list or token count keeps the Model's previous value
+    /// and reports the problem under the field it came from.
+    fn apply_profile_model_edit(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.profile_model_edit_index else {
             return;
         };
+        if self.profile_configured_models.get(index).is_none() {
+            return;
+        }
         let model_id = self
             .profile_model_edit_id
             .read(cx)
             .value()
             .trim()
             .to_string();
-        if model_id.is_empty() {
-            self.error = Some(
-                management_error_text(
-                    "Model id is required",
-                    "模型 ID 不能为空",
-                    "模型 ID 不能為空",
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        }
         let display_name = self
             .profile_model_edit_name
             .read(cx)
             .value()
             .trim()
             .to_string();
-        // Parse before mutating anything: a rejected declaration must leave the
-        // editor open with the text the user typed, not close on a half-applied
-        // Model. The Agent refuses the same tables, so refusing here is what
-        // keeps the error attributable to a Model instead of to a session that
-        // will not start.
         let efforts_text = self
             .profile_model_edit_efforts
             .read(cx)
             .value()
             .trim()
             .to_string();
-        let declared_efforts = match vibex_core::ProviderModelReasoningEfforts::parse(&efforts_text)
-        {
-            Ok(declared) => declared,
-            Err(reason) => {
-                self.error = Some(format!("agent_model_reasoning_efforts_invalid: {reason}"));
-                cx.notify();
-                return;
-            }
-        };
-        // The declared limits are parsed here for the same reason: a rejected
-        // number must leave the Model untouched instead of half-applying an
-        // edit the user still has to correct.
         let context_tokens_text = self
             .profile_model_edit_context_tokens
             .read(cx)
@@ -4509,52 +4538,90 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_string();
-        let (declared_context_tokens, declared_output_tokens) =
-            match declared_token_limits(&context_tokens_text, &output_tokens_text) {
-                Ok(limits) => limits,
-                Err(error) => {
-                    self.error = Some(error);
-                    cx.notify();
-                    return;
+        let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
+
+        let mut error = None;
+        if model_id.is_empty() {
+            error = Some((
+                ProfileModelEditField::Id,
+                management_error_text(
+                    "Model id is required",
+                    "模型 ID 不能为空",
+                    "模型 ID 不能為空",
+                )
+                .to_string(),
+            ));
+        }
+        // `None` keeps the declared levels, `Some(None)` clears them, and
+        // `Some(Some(..))` replaces them. Both the opt-out and an emptied field
+        // are the "clear" answer.
+        let mut declared_efforts = None;
+        if reasoning_disabled || efforts_text.is_empty() {
+            declared_efforts = Some(None);
+        } else {
+            match vibex_core::ProviderModelReasoningEfforts::parse(&efforts_text) {
+                Ok(parsed) => declared_efforts = Some(parsed),
+                Err(reason) => {
+                    if error.is_none() {
+                        error = Some((
+                            ProfileModelEditField::Reasoning,
+                            declared_reasoning_efforts_error(&reason),
+                        ));
+                    }
                 }
-            };
+            }
+        }
+        let declared_limits = match declared_token_limits(&context_tokens_text, &output_tokens_text)
+        {
+            Ok(limits) => Some(limits),
+            Err(reason) => {
+                if error.is_none() {
+                    error = Some((
+                        ProfileModelEditField::Limits,
+                        declared_token_limit_error(&reason),
+                    ));
+                }
+                None
+            }
+        };
+
         let Some(model) = self.profile_configured_models.get_mut(index) else {
-            self.profile_model_edit_index = None;
-            self.profile_model_edit_wire_api = None;
-            self.profile_model_edit_reasoning_disabled = false;
-            cx.notify();
             return;
         };
-        model.id = model_id;
+        if !model_id.is_empty() {
+            model.id = model_id;
+        }
         model.display_name = (!display_name.is_empty()).then_some(display_name);
         model.wire_api = self.profile_model_edit_wire_api;
-        if self.profile_model_edit_reasoning_disabled {
+        if reasoning_disabled {
             model.capabilities.reasoning = Some(false);
             model.capabilities.reasoning_efforts = None;
-        } else {
+        } else if let Some(declared) = declared_efforts {
             // Declaring levels is declaring the capability; an emptied field
             // returns the Model to the Agent's default, which also clears an
             // opt-out this editor wrote.
-            model.capabilities.reasoning =
-                match (declared_efforts.is_some(), model.capabilities.reasoning) {
-                    (true, _) => Some(true),
-                    (false, Some(false)) => None,
-                    (false, declared) => declared,
-                };
-            model.capabilities.reasoning_efforts = declared_efforts;
+            model.capabilities.reasoning = match (declared.is_some(), model.capabilities.reasoning)
+            {
+                (true, _) => Some(true),
+                (false, Some(false)) => None,
+                (false, declared) => declared,
+            };
+            model.capabilities.reasoning_efforts = declared;
         }
-        // Both limits are always written from the field: an emptied field is
-        // the "not declared" answer, so it clears a previous declaration
-        // instead of preserving it.
-        model.capabilities.context_tokens = declared_context_tokens;
-        model.capabilities.output_tokens = declared_output_tokens;
-        self.profile_model_edit_index = None;
-        self.profile_model_edit_wire_api = None;
-        self.profile_model_edit_reasoning_disabled = false;
+        if let Some((context, output)) = declared_limits {
+            // Both limits are always written from the field: an emptied field is
+            // the "not declared" answer, so it clears a previous declaration
+            // instead of preserving it.
+            model.capabilities.context_tokens = context;
+            model.capabilities.output_tokens = output;
+        }
+        self.profile_model_edit_error = error;
+        self.projection_editor.mark_draft_changed();
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
     }
 
+    /// Keeps the per-Protocol interface selection consistent with the projection.
     fn set_profile_model_wire_api(
         &mut self,
         index: usize,
@@ -4571,17 +4638,15 @@ impl ManagementCenter {
         }
         if self.profile_model_edit_index == Some(index) {
             self.profile_model_edit_wire_api = wire_api;
-            self.navigation.mark_dirty(ManagementSection::Agents, true);
-            cx.notify();
+            self.apply_profile_model_edit(cx);
         }
     }
 
-    /// Writes one thinking-depth choice into the open Model editor.
+    /// Selects one answer of the Model's reasoning control.
     ///
     /// `disabled` is the Model's opt-out; otherwise `declaration` is the
-    /// compact table the editor will parse on apply. The presets come through
-    /// here too: they fill the field with an editable starting table rather
-    /// than storing an inference, which is why a user can correct one the
+    /// editable level list the preset fills in. The presets are starting points
+    /// rather than stored inferences, which is why a user can correct one the
     /// endpoint spells differently.
     fn set_profile_model_reasoning_draft(
         &mut self,
@@ -4597,8 +4662,7 @@ impl ManagementCenter {
         self.profile_model_edit_reasoning_disabled = disabled;
         self.profile_model_edit_efforts
             .update(cx, |state, cx| state.set_value(declaration, window, cx));
-        self.navigation.mark_dirty(ManagementSection::Agents, true);
-        cx.notify();
+        self.apply_profile_model_edit(cx);
     }
 
     /// Selects a Model from the Agent-owned catalogue.
@@ -4624,8 +4688,7 @@ impl ManagementCenter {
         {
             self.profile_model_edit_wire_api = Some(wire_api);
         }
-        self.navigation.mark_dirty(ManagementSection::Agents, true);
-        cx.notify();
+        self.apply_profile_model_edit(cx);
     }
 
     fn duplicate_provider_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
@@ -4689,7 +4752,7 @@ impl ManagementCenter {
         let Some(agent) = self.snapshot.agents.iter().find(|agent| {
             agent.added && self.selected_agent_id.as_deref() == Some(agent.id.as_str())
         }) else {
-            self.error = Some(
+            self.profile_submit_error = Some(
                 management_error_text(
                     "Select an Agent before creating a provider profile",
                     "请先选择 Agent，再创建供应商配置",
@@ -4701,15 +4764,18 @@ impl ManagementCenter {
             return;
         };
         let name = self.profile_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            self.error = Some(
-                management_error_text(
-                    "Provider profile name is required",
-                    "供应商配置名称不能为空",
-                    "供應商配置名稱不能為空",
-                )
-                .into(),
-            );
+        // The name is the one field the backend refuses outright, so it reports
+        // under its own control instead of in the dialog's status line.
+        self.profile_name_error = name.is_empty().then(|| {
+            management_error_text(
+                "Provider name is required",
+                "请填写供应商名称",
+                "請填寫供應商名稱",
+            )
+            .to_string()
+        });
+        if self.profile_name_error.is_some() {
+            self.error = None;
             cx.notify();
             return;
         }
@@ -4755,7 +4821,7 @@ impl ManagementCenter {
         {
             Ok(id) => id,
             Err(_) => {
-                self.error = Some(
+                self.profile_submit_error = Some(
                     management_error_text(
                         "Provider profile identity is invalid",
                         "供应商配置标识无效",
@@ -4768,10 +4834,13 @@ impl ManagementCenter {
             }
         };
         let agent_id = agent.id.clone();
-        let secret_touched = self.profile_secret_touched
-            && self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        // A typed value replaces the stored Secret; an untouched field keeps it,
+        // and only the explicit Clear command removes it.
+        let secret_surface =
+            self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        let secret_clear = secret_surface && self.profile_secret_clear;
         let Some(backend) = self.backend.clone() else {
-            self.error = Some(
+            self.profile_submit_error = Some(
                 management_error_text(
                     "Management runtime is not connected",
                     "配置中心运行时未连接",
@@ -4785,6 +4854,7 @@ impl ManagementCenter {
         if self.mutation.is_some() {
             return;
         }
+        self.profile_submit_error = None;
         self.mutation = Some(
             editing_profile_id
                 .as_ref()
@@ -4844,16 +4914,16 @@ impl ManagementCenter {
                     .map_err(crate::app::remote_error_into_vibex)?
             };
             let saved_profile_id = profile.id.as_str().to_string();
-            if (!updating && !api_key.is_empty()) || (updating && secret_touched) {
-                let clear = api_key.is_empty();
+            let replaces_secret = !api_key.is_empty();
+            if replaces_secret || secret_clear {
                 backend
                     .management()
                     .mutate_agent_model_provider_profile_secret(MutationRequest::new(
                         vibex_core::AgentModelProviderProfileSecretValueUpdateRequest {
                             agent_id: agent_id.clone(),
                             provider_profile_id: profile.id.clone(),
-                            value: (!clear).then_some(api_key),
-                            clear,
+                            value: replaces_secret.then_some(api_key),
+                            clear: secret_clear,
                         },
                     ))
                     .await
@@ -4888,17 +4958,18 @@ impl ManagementCenter {
                         this.profile_editor_open = false;
                         this.editing_profile_id = None;
                         this.selected_provider_profile_id = Some(saved_profile_id);
-                        this.profile_secret_touched = false;
+                        this.profile_secret_clear = false;
                         this.projection_editor.set_secret_intent(false, false);
                         this.notice = Some(message);
                         this.refresh(cx);
                     }
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        this.profile_submit_error =
+                            Some(format!("{}: {}", error.code, error.message));
                         cx.notify();
                     }
                     Err(error) => {
-                        this.error = Some(format!(
+                        this.profile_submit_error = Some(format!(
                             "{}: {error}",
                             management_error_text(
                                 "Provider configuration save failed",
@@ -4992,7 +5063,7 @@ impl ManagementCenter {
             AgentId::parse(agent_id),
             self.backend.clone(),
         ) else {
-            self.error = Some(
+            self.profile_submit_error = Some(
                 management_error_text(
                     "Provider profile identity is invalid",
                     "供应商配置标识无效",
@@ -5057,7 +5128,7 @@ impl ManagementCenter {
         self.mutation = Some(ManagementMutation::ProviderProbe(format!(
             "models:{profile_id}"
         )));
-        self.error = None;
+        self.profile_submit_error = None;
         let active_locale = locale::current_locale();
         let entity = cx.weak_entity();
         let agent_owns_catalog = vibex_core::agent_owns_model_catalog(&agent_id);
@@ -5127,10 +5198,13 @@ impl ManagementCenter {
                         });
                     }
                     Ok(Err(error)) => {
-                        this.error = Some(format!("{}: {}", error.code, error.message));
+                        // The Models section is inside the Provider dialog, so
+                        // its failures report next to the dialog's own actions.
+                        this.profile_submit_error =
+                            Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => {
-                        this.error = Some(format!(
+                        this.profile_submit_error = Some(format!(
                             "{}: {error}",
                             management_error_text(
                                 "Model detection failed",
@@ -9766,22 +9840,43 @@ impl ManagementCenter {
         let shows_wire_api = self
             .projection_editor
             .shows(vibex_core::AgentProjectionFormControl::WireProtocol);
-        let fetching_models = self.editing_profile_id.as_ref().is_some_and(|profile_id| {
+        let editing_profile_id = self.editing_profile_id.clone();
+        let fetching_models = editing_profile_id.as_ref().is_some_and(|profile_id| {
             matches!(
                 &self.mutation,
                 Some(ManagementMutation::ProviderProbe(action))
                     if action == &format!("models:{profile_id}")
             )
         });
-        let mut model_rows = v_flex().w_full().gap_1p5();
-        for (index, model) in self
+        let filter = self
+            .profile_model_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let visible_models = self
             .profile_configured_models
-            .clone()
-            .into_iter()
+            .iter()
             .enumerate()
-        {
+            .filter(|(_, model)| profile_model_matches(model, &filter))
+            .map(|(index, model)| (index, model.clone()))
+            .collect::<Vec<_>>();
+        let total = self.profile_configured_models.len();
+        let visible = visible_models.len();
+        // Everything the open Model editor needs from the projection, gathered
+        // once instead of threaded through every row.
+        let editor_context = ProfileModelEditorContext {
+            agent_owns_catalog,
+            catalog_choices,
+            wire_api_choices,
+            shows_wire_api,
+            pending,
+        };
+
+        let mut rows = v_flex().w_full().gap_1p5();
+        for (index, model) in visible_models {
             let enabled = model.enabled;
-            let edit_index = index;
+            let expanded = self.profile_model_edit_index == Some(index);
             // The declaration is per Model, so the row states it: otherwise the
             // only way to tell two Models' depths apart is to open each editor.
             let depth = match (
@@ -9805,7 +9900,29 @@ impl ManagementCenter {
                         ResolvedLocale::En => format!("{tokens} context"),
                         ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {tokens}"),
                     });
-            model_rows = model_rows.child(
+            let meta = {
+                let protocol = match model.wire_api {
+                    Some(wire_api) => provider_wire_api_label(wire_api).to_string(),
+                    None => management_locale_text(
+                        "Inherit provider default",
+                        "继承供应商默认值",
+                        "繼承供應商預設值",
+                    )
+                    .to_string(),
+                };
+                let mut parts = vec![model.id.clone(), protocol];
+                if let Some(context_limit) = &context_limit {
+                    parts.push(context_limit.clone());
+                }
+                if let Some(depth) = &depth {
+                    parts.push(depth.clone());
+                }
+                parts.join(" · ")
+            };
+            // One row treatment for both states: the switch says whether the
+            // Model is offered, and a disabled row only lowers its own contrast
+            // instead of swapping background for border.
+            rows = rows.child(
                 h_flex()
                     .w_full()
                     .min_w_0()
@@ -9814,10 +9931,8 @@ impl ManagementCenter {
                     .rounded(px(6.0))
                     .px_2p5()
                     .py_1p5()
-                    .when(enabled, |row| row.bg(cx.theme().muted.opacity(0.30)))
-                    .when(!enabled, |row| {
-                        row.border_1().border_color(cx.theme().border.opacity(0.60))
-                    })
+                    .when(expanded, |row| row.bg(cx.theme().primary.opacity(0.08)))
+                    .when(!expanded, |row| row.bg(cx.theme().muted.opacity(0.18)))
                     .child(
                         v_flex()
                             .min_w_0()
@@ -9838,27 +9953,7 @@ impl ManagementCenter {
                                     .truncate()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child({
-                                        let protocol = match model.wire_api {
-                                            Some(wire_api) => {
-                                                provider_wire_api_label(wire_api).to_string()
-                                            }
-                                            None => management_locale_text(
-                                                "Inherit provider default",
-                                                "继承供应商默认值",
-                                                "繼承供應商預設值",
-                                            )
-                                            .to_string(),
-                                        };
-                                        let mut parts = vec![model.id.clone(), protocol];
-                                        if let Some(context_limit) = &context_limit {
-                                            parts.push(context_limit.clone());
-                                        }
-                                        if let Some(depth) = &depth {
-                                            parts.push(depth.clone());
-                                        }
-                                        parts.join(" · ")
-                                    }),
+                                    .child(meta),
                             ),
                     )
                     .child(
@@ -9867,10 +9962,10 @@ impl ManagementCenter {
                             .ghost()
                             .compact()
                             .icon(IconName::Settings2)
-                            .tooltip(management_locale_text("Edit model", "编辑模型", "編輯模型"))
+                            .label(management_locale_text("Edit", "编辑", "編輯"))
                             .disabled(pending)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_profile_model_editor(edit_index, window, cx)
+                                this.open_profile_model_editor(index, window, cx)
                             })),
                     )
                     .child(
@@ -9886,483 +9981,636 @@ impl ManagementCenter {
                                 this.toggle_profile_model(index, *checked, cx)
                             },
                         )),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("provider-model-delete-{index}")))
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                            .tooltip(management_locale_text(
-                                "Delete model",
-                                "删除模型",
-                                "刪除模型",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_profile_model(index, cx)
-                            })),
                     ),
             );
+            // The editor opens under the row it belongs to, so the fields a
+            // click just revealed are the ones next to the pointer.
+            if expanded {
+                rows = rows.child(self.render_profile_model_editor(index, &editor_context, cx));
+            }
         }
 
-        let model_editor =
-            self.profile_model_edit_index
-                .filter(|index| self.profile_configured_models.get(*index).is_some())
-                .map(|index| (index, self.profile_model_edit_wire_api))
-                .map(|(index, wire_api)| {
-                    let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
-                    let candidates = std::iter::once(None)
-                        .chain(wire_api_choices.iter().copied().map(Some))
-                        .collect::<Vec<_>>();
-                    for candidate in candidates {
-                        let label = candidate.map_or_else(
-                            || management_locale_text("Inherit", "继承", "繼承").to_string(),
-                            |wire_api| {
-                                let support = self
-                                    .projection_editor
-                                    .wire_api_integration_kind(wire_api)
-                                    .map(provider_interface_integration_label)
-                                    .unwrap_or_else(|| {
-                                        management_locale_text("Unsupported", "不支持", "不支援")
-                                    });
-                                format!("{} · {support}", provider_wire_api_label(wire_api))
-                            },
-                        );
-                        wire_controls = wire_controls.child(
-                            Button::new(SharedString::from(format!(
-                                "provider-model-wire-{index}-{candidate:?}"
-                            )))
-                            .small()
-                            .ghost()
-                            .selected(wire_api == candidate)
-                            .label(label)
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.set_profile_model_wire_api(index, candidate, cx)
-                                },
-                            )),
-                        );
-                    }
-                    v_flex()
-                        .w_full()
-                        .gap_2p5()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().primary.opacity(0.35))
-                        .bg(cx.theme().primary.opacity(0.06))
-                        .p_2p5()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(div().text_sm().font_semibold().child(
-                                    management_locale_text("Edit model", "编辑模型", "編輯模型"),
-                                ))
-                                .child(
-                                    Button::new("provider-model-edit-cancel")
-                                        .xsmall()
-                                        .ghost()
-                                        .compact()
-                                        .icon(IconName::Close)
-                                        .tooltip(management_cancel_label())
-                                        .disabled(pending)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.close_profile_model_editor(cx)
-                                        })),
-                                ),
-                        )
-                        .when(agent_owns_catalog, |editor| {
-                            let mut choices = v_flex().w_full().gap_2();
-                            choices = choices.child(div().text_xs().font_medium().child(
-                                management_locale_text(
-                                    "Model (from the installed Agent)",
-                                    "模型（来自已安装的 Agent）",
-                                    "模型（來自已安裝的 Agent）",
-                                ),
-                            ));
-                            if catalog_choices.is_empty() {
-                                choices = choices.child(div().text_xs().opacity(0.7).child(
-                                    management_locale_text(
-                                        "Fetch models to load the catalogue this Agent advertises.",
-                                        "请先拉取模型，以载入该 Agent 自带的模型目录。",
-                                        "請先拉取模型，以載入該 Agent 自帶的模型目錄。",
-                                    ),
-                                ));
-                            } else {
-                                let mut options = h_flex().w_full().flex_wrap().gap_1();
-                                for (model_id, model_wire_api) in catalog_choices.iter().cloned() {
-                                    let selected =
-                                        self.profile_model_edit_id.read(cx).value().trim()
-                                            == model_id;
-                                    let label = model_wire_api.map_or_else(
-                                        || model_id.clone(),
-                                        |wire_api| {
-                                            format!(
-                                                "{model_id} · {}",
-                                                provider_wire_api_label(wire_api)
-                                            )
-                                        },
-                                    );
-                                    let click_id = model_id.clone();
-                                    options =
-                                        options.child(
-                                            Button::new(SharedString::from(format!(
-                                                "provider-model-catalog-{index}-{model_id}"
-                                            )))
-                                            .small()
-                                            .ghost()
-                                            .selected(selected)
-                                            .label(label)
-                                            .disabled(pending)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.set_profile_model_id_from_catalog(
-                                                    index,
-                                                    click_id.clone(),
-                                                    model_wire_api,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })),
-                                        );
-                                }
-                                choices = choices.child(options);
-                            }
-                            editor.child(choices)
-                        })
-                        .when(!agent_owns_catalog, |editor| {
-                            editor.child(management_input_field(
-                                management_locale_text("Model ID", "模型 ID", "模型 ID"),
-                                &self.profile_model_edit_id,
-                                false,
-                                cx,
-                            ))
-                        })
-                        .child(management_input_field(
-                            management_locale_text("Display name", "显示名称", "顯示名稱"),
-                            &self.profile_model_edit_name,
-                            false,
-                            cx,
-                        ))
-                        .when(shows_wire_api, |editor| {
-                            editor
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "Model API protocol",
-                                            "模型接口协议",
-                                            "模型介面協定",
-                                        )),
-                                )
-                                .child(wire_controls)
-                        })
-                        .child({
-                            // The field is the whole declaration: a preset only
-                            // fills it, and the endpoint's own spelling stays
-                            // editable. Nothing here infers a vocabulary from
-                            // the Model id.
-                            let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
-                            let current = self
-                                .profile_model_edit_efforts
-                                .read(cx)
-                                .value()
-                                .trim()
-                                .to_string();
-                            let presets: [(&'static str, String, &'static str, bool); 5] = [
-                                (
-                                    "default",
-                                    management_locale_text(
-                                        "Follow Agent default",
-                                        "跟随 Agent 默认",
-                                        "跟隨 Agent 預設",
-                                    )
-                                    .to_string(),
-                                    "",
-                                    false,
-                                ),
-                                (
-                                    "none",
-                                    management_locale_text(
-                                        "Non-reasoning",
-                                        "不推理",
-                                        "不推理",
-                                    )
-                                    .to_string(),
-                                    "",
-                                    true,
-                                ),
-                                ("deepseek", "DeepSeek".to_string(), "off, low, high, max", false),
-                                (
-                                    "openai",
-                                    management_locale_text(
-                                        "OpenAI-compatible",
-                                        "通用 OpenAI 兼容",
-                                        "通用 OpenAI 相容",
-                                    )
-                                    .to_string(),
-                                    "off, low, medium, high",
-                                    false,
-                                ),
-                                (
-                                    "anthropic",
-                                    "Anthropic Messages".to_string(),
-                                    "off, low, medium, high, max",
-                                    false,
-                                ),
-                            ];
-                            let mut controls = h_flex().w_full().flex_wrap().gap_1();
-                            for (key, label, declaration, opt_out) in presets {
-                                let selected = if opt_out {
-                                    reasoning_disabled
-                                } else if declaration.is_empty() {
-                                    !reasoning_disabled && current.is_empty()
-                                } else {
-                                    !reasoning_disabled && current == declaration
-                                };
-                                controls = controls.child(
-                                    Button::new(SharedString::from(format!(
-                                        "provider-model-reasoning-{index}-{key}"
-                                    )))
-                                    .small()
-                                    .ghost()
-                                    .selected(selected)
-                                    .label(label)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_profile_model_reasoning_draft(
-                                            index,
-                                            opt_out,
-                                            declaration,
-                                            window,
-                                            cx,
-                                        )
-                                    })),
-                                );
-                            }
-                            v_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "Thinking depth",
-                                            "思考深度",
-                                            "思考深度",
-                                        )),
-                                )
-                                .child(controls)
-                                .child(management_input_field(
-                                    management_locale_text(
-                                        "Declared levels",
-                                        "档位声明",
-                                        "檔位宣告",
-                                    ),
-                                    &self.profile_model_edit_efforts,
-                                    false,
-                                    cx,
-                                ))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "Only the declared levels are offered to the run options. Leave it empty to keep the Agent default; write level=wire when the endpoint spells a level differently.",
-                                            "运行选项只显示这里声明的档位。留空沿用 Agent 默认；端点拼写不同时写 档位=线格式。",
-                                            "執行選項只顯示這裡宣告的檔位。留空沿用 Agent 預設；端點拼寫不同時寫 檔位=線格式。",
-                                        )),
-                                )
-                        })
-                        .child({
-                            // Only three projections can carry a declared limit,
-                            // so the copy names them instead of implying every
-                            // Agent reads it.
-                            v_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "Context and output limits",
-                                            "上下文与输出上限",
-                                            "上下文與輸出上限",
-                                        )),
-                                )
-                                .child(management_input_field(
-                                    management_locale_text(
-                                        "Context window (tokens)",
-                                        "上下文窗口（Token）",
-                                        "上下文視窗（Token）",
-                                    ),
-                                    &self.profile_model_edit_context_tokens,
-                                    false,
-                                    cx,
-                                ))
-                                .child(management_input_field(
-                                    management_locale_text(
-                                        "Max output tokens",
-                                        "最大输出 Token",
-                                        "最大輸出 Token",
-                                    ),
-                                    &self.profile_model_edit_output_tokens,
-                                    false,
-                                    cx,
-                                ))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "Written to the Agents that read a projected limit — DeepSeek Harness, OpenCode, and ZCode. Empty keeps the Agent default; DeepSeek Harness then assumes 262,144.",
-                                            "写入会读取投影上限的 Agent —— DeepSeek Harness、OpenCode 与 ZCode。留空沿用 Agent 默认；DeepSeek Harness 默认按 262,144 处理。",
-                                            "寫入會讀取投影上限的 Agent —— DeepSeek Harness、OpenCode 與 ZCode。留空沿用 Agent 預設；DeepSeek Harness 預設按 262,144 處理。",
-                                        )),
-                                )
-                        })
-                        .child(
-                            h_flex().w_full().justify_end().gap_2().child(
-                                Button::new("provider-model-edit-apply")
-                                    .small()
-                                    .secondary()
-                                    .label(management_locale_text(
-                                        "Apply model changes",
-                                        "应用模型修改",
-                                        "套用模型修改",
-                                    ))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_profile_model_editor(cx)
-                                    })),
-                            ),
-                        )
-                        .into_any_element()
-                });
-
-        v_flex()
-            .w_full()
-            .gap_2p5()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().muted.opacity(0.18))
-            .p_3()
-            .child(
+        let mut content = v_flex().w_full().gap_2p5();
+        // Search and bulk switches only earn their space once the list is long
+        // enough to need them.
+        if total > 3 {
+            content = content.child(
                 h_flex()
                     .w_full()
-                    .flex_wrap()
+                    .min_w_0()
                     .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(management_locale_text("Models", "模型", "模型")),
-                            )
-                            .child(management_status_badge(
-                                if self.profile_configured_models.is_empty() {
-                                    management_locale_text("No models", "没有模型", "沒有模型")
-                                        .to_string()
-                                } else {
-                                    management_model_count(self.profile_configured_models.len())
-                                },
-                                cx,
-                            )),
-                    )
-                    .when_some(self.editing_profile_id.clone(), |header, profile_id| {
-                        let agent_id = selected_agent_id.clone();
-                        header.child(
-                            Button::new("provider-editor-fetch-models")
-                                .xsmall()
-                                .outline()
-                                .icon(IconName::Search)
-                                .label(if fetching_models {
-                                    management_locale_text("Fetching...", "获取中...", "取得中...")
-                                } else {
-                                    management_fetch_models_label()
-                                })
-                                .loading(fetching_models)
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.fetch_provider_models(
-                                        profile_id.clone(),
-                                        agent_id.clone(),
-                                        cx,
-                                    )
-                                })),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .w_full()
                     .gap_2()
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
-                            .child(Input::new(&self.profile_model_draft).small().w_full()),
+                            .child(management_search_input(&self.profile_model_search, cx)),
                     )
                     .child(
-                        Button::new("provider-model-add")
-                            .small()
-                            .secondary()
-                            .icon(IconName::Plus)
-                            .label(management_add_label())
+                        Button::new("provider-models-enable-all")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
                             .disabled(pending)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_profile_model(window, cx)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_visible_profile_models_enabled(true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("provider-models-disable-all")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .label(management_locale_text(
+                                "Disable all",
+                                "全部停用",
+                                "全部停用",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_visible_profile_models_enabled(false, cx)
                             })),
                     ),
-            )
-            .child(if self.profile_configured_models.is_empty() {
-                compact_empty_state(
-                    management_locale_text(
-                        "No configured models",
-                        "暂无已配置模型",
-                        "暫無已配置模型",
-                    ),
-                    management_locale_text(
-                        "Fetch models or add a model ID manually.",
-                        "可获取模型或手动添加模型 ID。",
-                        "可取得模型或手動新增模型 ID。",
-                    ),
+            );
+        }
+        content = content.child(
+            h_flex()
+                .w_full()
+                .items_end()
+                .gap_2()
+                .child(div().min_w_0().flex_1().child(management_input_field(
+                    management_locale_text("Model ID", "模型 ID", "模型 ID"),
+                    &self.profile_model_draft,
+                    false,
                     cx,
+                )))
+                .child(
+                    Button::new("provider-model-add")
+                        .small()
+                        .secondary()
+                        .icon(IconName::Plus)
+                        .label(management_add_label())
+                        .disabled(pending)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.add_profile_model(window, cx)),
+                        ),
+                ),
+        );
+        if total == 0 {
+            // The command that fetches models only exists once the Provider is
+            // saved, so the empty state promises exactly what is available.
+            let description = if editing_profile_id.is_some() {
+                management_locale_text(
+                    "Fetch models, or add a model ID below.",
+                    "可以拉取模型，也可以在下面手动添加模型 ID。",
+                    "可以擷取模型，也可以在下面手動新增模型 ID。",
                 )
             } else {
-                model_rows.into_any_element()
-            })
-            .when_some(model_editor, |models, editor| models.child(editor))
+                management_locale_text(
+                    "Save this Provider to fetch models, or add a model ID below.",
+                    "保存后可以拉取模型，也可以先在下面手动添加模型 ID。",
+                    "儲存後可以擷取模型，也可以先在下面手動新增模型 ID。",
+                )
+            };
+            content = content.child(compact_empty_state(
+                management_locale_text("No configured models", "暂无已配置模型", "暫無已配置模型"),
+                description,
+                cx,
+            ));
+        } else if visible == 0 {
+            content = content.child(
+                v_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.70))
+                    .p_4()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "No model matches this search.",
+                                "没有匹配该搜索的模型。",
+                                "沒有符合這個搜尋的模型。",
+                            )),
+                    )
+                    .child(
+                        Button::new("provider-models-clear-search")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .label(management_locale_text(
+                                "Clear search",
+                                "清除搜索",
+                                "清除搜尋",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.profile_model_search
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    ),
+            );
+        } else {
+            content = content.child(rows);
+        }
+
+        let mut trailing = vec![management_status_badge(
+            if total == 0 {
+                management_locale_text("No models", "没有模型", "沒有模型").to_string()
+            } else {
+                management_model_count(total)
+            },
+            cx,
+        )];
+        if let Some(profile_id) = editing_profile_id {
+            let agent_id = selected_agent_id.clone();
+            trailing.push(
+                Button::new("provider-editor-fetch-models")
+                    .xsmall()
+                    .outline()
+                    .icon(IconName::Search)
+                    .label(if fetching_models {
+                        management_locale_text("Fetching...", "获取中...", "取得中...")
+                    } else {
+                        management_fetch_models_label()
+                    })
+                    .loading(fetching_models)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
+        profile_editor_section(
+            management_locale_text("Models", "模型", "模型"),
+            Some(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .children(trailing)
+                    .into_any_element(),
+            ),
+            content.into_any_element(),
+            cx,
+        )
+    }
+
+    /// The editor for one Model, rendered under its own row.
+    ///
+    /// Every control writes into the draft immediately, so there is no Apply
+    /// step to forget and the dialog's single Save carries the whole editor.
+    fn render_profile_model_editor(
+        &mut self,
+        index: usize,
+        context: &ProfileModelEditorContext,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ProfileModelEditorContext {
+            agent_owns_catalog,
+            catalog_choices,
+            wire_api_choices,
+            shows_wire_api,
+            pending,
+        } = context;
+        let (agent_owns_catalog, shows_wire_api, pending) =
+            (*agent_owns_catalog, *shows_wire_api, *pending);
+        let field_error = |field: ProfileModelEditField| {
+            self.profile_model_edit_error
+                .as_ref()
+                .filter(|(current, _)| *current == field)
+                .map(|(_, message)| message.clone())
+        };
+        let id_error = field_error(ProfileModelEditField::Id);
+        let reasoning_error = field_error(ProfileModelEditField::Reasoning);
+        let limits_error = field_error(ProfileModelEditField::Limits);
+        let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
+        let advanced_open = self.profile_model_advanced_open;
+
+        let mut editor = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2p5()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().primary.opacity(0.35))
+            .bg(cx.theme().primary.opacity(0.06))
+            .p_2p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(management_locale_text("Edit model", "编辑模型", "編輯模型")),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "provider-model-collapse-{index}"
+                        )))
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Close)
+                        .tooltip(management_cancel_label())
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.close_profile_model_editor(cx)),
+                        ),
+                    ),
+            );
+
+        if agent_owns_catalog {
+            let mut choices = v_flex().w_full().gap_2();
+            choices = choices.child(div().text_xs().font_medium().child(management_locale_text(
+                "Model (from the installed Agent)",
+                "模型（来自已安装的 Agent）",
+                "模型（來自已安裝的 Agent）",
+            )));
+            if catalog_choices.is_empty() {
+                choices = choices.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text(
+                            "Fetch models to load the catalogue this Agent advertises.",
+                            "请先拉取模型，以载入该 Agent 自带的模型目录。",
+                            "請先擷取模型，以載入該 Agent 自帶的模型目錄。",
+                        )),
+                );
+            } else {
+                let mut options = h_flex().w_full().flex_wrap().gap_1();
+                for (model_id, model_wire_api) in catalog_choices.iter().cloned() {
+                    let selected = self.profile_model_edit_id.read(cx).value().trim() == model_id;
+                    let label = model_wire_api.map_or_else(
+                        || model_id.clone(),
+                        |wire_api| format!("{model_id} · {}", provider_wire_api_label(wire_api)),
+                    );
+                    let click_id = model_id.clone();
+                    options = options.child(
+                        Button::new(SharedString::from(format!(
+                            "provider-model-catalog-{index}-{model_id}"
+                        )))
+                        .small()
+                        .ghost()
+                        .selected(selected)
+                        .label(label)
+                        .disabled(pending)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.set_profile_model_id_from_catalog(
+                                    index,
+                                    click_id.clone(),
+                                    model_wire_api,
+                                    window,
+                                    cx,
+                                )
+                            },
+                        )),
+                    );
+                }
+                choices = choices.child(options);
+            }
+            editor = editor.child(choices);
+        } else {
+            editor = editor.child(management_input_field_with_error(
+                management_locale_text("Model ID", "模型 ID", "模型 ID"),
+                &self.profile_model_edit_id,
+                false,
+                id_error.as_deref(),
+                cx,
+            ));
+        }
+        editor = editor.child(management_input_field(
+            management_locale_text("Display name", "显示名称", "顯示名稱"),
+            &self.profile_model_edit_name,
+            false,
+            cx,
+        ));
+
+        if shows_wire_api {
+            let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
+            let candidates = std::iter::once(None)
+                .chain(wire_api_choices.iter().copied().map(Some))
+                .collect::<Vec<_>>();
+            for candidate in candidates {
+                let integration = candidate.and_then(|wire_api| {
+                    self.projection_editor.wire_api_integration_kind(wire_api)
+                });
+                let selected = self.profile_model_edit_wire_api == candidate;
+                let label = candidate.map_or_else(
+                    || management_locale_text("Inherit", "继承", "繼承").to_string(),
+                    |wire_api| {
+                        let support = integration.map_or_else(
+                            || management_locale_text("Unsupported", "不支持", "不支援"),
+                            provider_interface_integration_label,
+                        );
+                        format!("{} · {support}", provider_wire_api_label(wire_api))
+                    },
+                );
+                let unsupported = candidate.is_some() && integration.is_none();
+                wire_controls = wire_controls.child(
+                    Button::new(SharedString::from(format!(
+                        "provider-model-wire-{index}-{candidate:?}"
+                    )))
+                    .small()
+                    .ghost()
+                    .selected(selected)
+                    .label(label)
+                    .tooltip(if unsupported {
+                        management_locale_text(
+                            "This Agent cannot call this interface",
+                            "这个 Agent 还无法调用该接口",
+                            "這個 Agent 還無法呼叫該介面",
+                        )
+                    } else {
+                        management_locale_text("Model API protocol", "模型接口协议", "模型介面協定")
+                    })
+                    .disabled(pending || unsupported)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_profile_model_wire_api(index, candidate, cx)
+                    })),
+                );
+            }
+            editor = editor.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Model API protocol",
+                                "模型接口协议",
+                                "模型介面協定",
+                            )),
+                    )
+                    .child(wire_controls),
+            );
+        }
+
+        // Reasoning is two decisions, so it is two controls: whether the Model
+        // reasons at all, and which level table its endpoint accepts.
+        let mut reasoning = h_flex().w_full().flex_wrap().gap_1();
+        for (key, label, disabled) in [
+            (
+                "default",
+                management_locale_text(
+                    "Follow Agent default",
+                    "跟随 Agent 默认",
+                    "跟隨 Agent 預設",
+                ),
+                false,
+            ),
+            (
+                "none",
+                management_locale_text("Non-reasoning", "不支持推理", "不支援推理"),
+                true,
+            ),
+        ] {
+            let selected = reasoning_disabled == disabled;
+            reasoning = reasoning.child(
+                Button::new(SharedString::from(format!(
+                    "provider-model-reasoning-{index}-{key}"
+                )))
+                .small()
+                .ghost()
+                .selected(selected)
+                .label(label)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_profile_model_reasoning_draft(index, disabled, "", window, cx)
+                })),
+            );
+        }
+        editor = editor.child(
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text("Reasoning", "推理能力", "推理能力")),
+                )
+                .child(reasoning),
+        );
+
+        if !reasoning_disabled {
+            let current = self
+                .profile_model_edit_efforts
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            let mut presets = h_flex().w_full().flex_wrap().gap_1();
+            for (key, label, declaration) in [
+                ("deepseek", "DeepSeek", "off, low, high, max"),
+                (
+                    "openai",
+                    management_locale_text(
+                        "OpenAI-compatible",
+                        "通用 OpenAI 兼容",
+                        "通用 OpenAI 相容",
+                    ),
+                    "off, low, medium, high",
+                ),
+                (
+                    "anthropic",
+                    "Anthropic Messages",
+                    "off, low, medium, high, max",
+                ),
+            ] {
+                presets = presets.child(
+                    Button::new(SharedString::from(format!(
+                        "provider-model-efforts-preset-{index}-{key}"
+                    )))
+                    .small()
+                    .ghost()
+                    .selected(current == declaration)
+                    .label(label)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_profile_model_reasoning_draft(
+                            index,
+                            false,
+                            declaration,
+                            window,
+                            cx,
+                        )
+                    })),
+                );
+            }
+            editor = editor.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "Thinking levels",
+                                "思考档位",
+                                "思考檔位",
+                            )),
+                    )
+                    .child(presets)
+                    .child(management_input_field_with_error(
+                        management_locale_text("Declared levels", "档位列表", "檔位清單"),
+                        &self.profile_model_edit_efforts,
+                        false,
+                        reasoning_error.as_deref(),
+                        cx,
+                    ))
+                    .child(management_field_hint(
+                        management_locale_text(
+                            "Empty follows the Agent default. Write levels separated by commas, or level=wire when the endpoint spells one differently.",
+                            "留空沿用 Agent 默认。多个档位用逗号分隔；端点拼写不同时写成 档位=实际值。",
+                            "留空沿用 Agent 預設。多個檔位用逗號分隔；端點拼寫不同時寫成 檔位=實際值。",
+                        ),
+                        cx,
+                    )),
+            );
+        }
+
+        editor = editor.child(
+            Collapsible::new()
+                .w_full()
+                .open(advanced_open)
+                .child(profile_editor_disclosure(
+                    PROFILE_MODEL_ADVANCED_DISCLOSURE_ID,
+                    management_locale_text("Advanced", "高级", "進階").into(),
+                    advanced_open,
+                    None,
+                    cx,
+                ))
+                .content(
+                    v_flex()
+                        .w_full()
+                        .gap_2p5()
+                        .pt_2()
+                        .child(management_input_field_with_error(
+                            management_locale_text(
+                                "Context window (tokens)",
+                                "上下文窗口（Token）",
+                                "上下文視窗（Token）",
+                            ),
+                            &self.profile_model_edit_context_tokens,
+                            false,
+                            limits_error.as_deref(),
+                            cx,
+                        ))
+                        .child(management_input_field(
+                            management_locale_text(
+                                "Max output tokens",
+                                "最大输出 Token",
+                                "最大輸出 Token",
+                            ),
+                            &self.profile_model_edit_output_tokens,
+                            false,
+                            cx,
+                        ))
+                        .child(management_field_hint(
+                            management_locale_text(
+                                "Empty keeps the Agent's own default. Only Agents that read a declared limit are affected.",
+                                "留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
+                                "留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
+                            ),
+                            cx,
+                        )),
+                ),
+        );
+
+        editor
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!("provider-model-delete-{index}")))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .danger()
+                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                            .label(management_locale_text(
+                                "Delete this model",
+                                "删除该模型",
+                                "刪除該模型",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_profile_model(index, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("provider-model-done-{index}")))
+                            .small()
+                            .secondary()
+                            .label(management_locale_text("Done", "完成", "完成"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_profile_model_editor(cx)),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
-    fn render_projection_credential_control(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn set_visible_profile_models_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let filter = self
+            .profile_model_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let mut changed = false;
+        for model in self.profile_configured_models.iter_mut() {
+            if profile_model_matches(model, &filter) && model.enabled != enabled {
+                model.enabled = enabled;
+                changed = true;
+            }
+        }
+        if changed {
+            self.navigation.mark_dirty(ManagementSection::Agents, true);
+            cx.notify();
+        }
+    }
+
+    fn render_projection_credential_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let surface = self.projection_editor.credential_surface();
+        let auth_state = self
+            .projection_editor
+            .capability
+            .as_ref()
+            .map(|capability| capability.auth_state);
         if surface == ProjectionCredentialSurface::ApiKey {
-            return v_flex()
+            let configured = self.profile_secret_configured;
+            let clearing = self.profile_secret_clear;
+            let mut header = h_flex()
                 .w_full()
-                .gap_1p5()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .child(
                     h_flex()
-                        .w_full()
+                        .min_w_0()
                         .items_center()
-                        .justify_between()
                         .gap_2()
                         .child(
                             div()
@@ -10371,21 +10619,84 @@ impl ManagementCenter {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("API Key"),
                         )
-                        .when_some(
-                            self.projection_editor
-                                .capability
-                                .as_ref()
-                                .map(|capability| format!("{:?}", capability.auth_state)),
-                            |row, status| row.child(management_status_badge(status, cx)),
-                        ),
+                        .when(configured && !clearing, |row| {
+                            row.child(Tag::success().xsmall().child(management_locale_text(
+                                "Saved",
+                                "已保存",
+                                "已儲存",
+                            )))
+                        })
+                        .when(clearing, |row| {
+                            row.child(Tag::warning().xsmall().child(management_locale_text(
+                                "Will be cleared",
+                                "保存后清除",
+                                "儲存後清除",
+                            )))
+                        }),
+                );
+            if let Some(state) = auth_state {
+                header = header.child(projection_auth_state_badge(state, cx));
+            }
+            // The editor never reads the stored Secret back: blank is the
+            // "keep it" answer, typing replaces it, and clearing is a command.
+            let hint = if clearing {
+                management_locale_text(
+                    "Saving clears the stored key.",
+                    "保存后会清除已保存的密钥。",
+                    "儲存後會清除已儲存的密鑰。",
                 )
+            } else if configured {
+                management_locale_text(
+                    "A key is stored. Leave this empty to keep it, or type a new value to replace it.",
+                    "已保存密钥。留空保持不变，输入新值即可替换。",
+                    "已儲存密鑰。留空保持不變，輸入新值即可取代。",
+                )
+            } else {
+                management_locale_text(
+                    "No key is stored yet.",
+                    "还没有保存密钥。",
+                    "還沒有儲存密鑰。",
+                )
+            };
+            let mut footer = h_flex().w_full().min_w_0().items_center().gap_2().child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(management_field_hint(hint, cx)),
+            );
+            if configured {
+                footer = footer.child(
+                    Button::new("provider-secret-clear")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label(if clearing {
+                            management_locale_text("Keep stored key", "保留密钥", "保留密鑰")
+                        } else {
+                            management_locale_text("Clear", "清除", "清除")
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.profile_secret_clear = !this.profile_secret_clear;
+                            // Clearing is an intent of its own; dropping it again
+                            // leaves the stored Secret exactly as it was.
+                            let clear = this.profile_secret_clear;
+                            this.projection_editor.set_secret_intent(clear, clear);
+                            this.navigation.mark_dirty(ManagementSection::Agents, true);
+                            cx.notify();
+                        })),
+                );
+            }
+            return v_flex()
+                .w_full()
+                .gap_1p5()
+                .child(header)
                 .child(
                     Input::new(&self.profile_api_key)
                         .small()
                         .w_full()
-                        .mask_toggle()
-                        .disabled(self.profile_secret_loading),
+                        .mask_toggle(),
                 )
+                .child(footer)
                 .into_any_element();
         }
 
@@ -10477,13 +10788,7 @@ impl ManagementCenter {
                             )
                             .child(div().text_sm().font_medium().child(title)),
                     )
-                    .when_some(
-                        self.projection_editor
-                            .capability
-                            .as_ref()
-                            .map(|capability| format!("{:?}", capability.auth_state)),
-                        |row, status| row.child(management_status_badge(status, cx)),
-                    ),
+                    .children(auth_state.map(|state| projection_auth_state_badge(state, cx))),
             )
             .child(
                 div()
@@ -10506,33 +10811,26 @@ impl ManagementCenter {
             self.mutation,
             Some(ManagementMutation::ProfileCreate) | Some(ManagementMutation::ProfileUpdate(_))
         );
+        let testing = self.editing_profile_id.as_deref().is_some_and(|profile_id| {
+            matches!(&self.mutation, Some(ManagementMutation::ProviderProbe(action)) if action == profile_id)
+        });
+        // A probe is not a reason to trap the user in the dialog: it can take a
+        // while, and closing only discards the draft.
+        let cancel_disabled =
+            pending && !matches!(self.mutation, Some(ManagementMutation::ProviderProbe(_)));
         let shows_endpoint = self
             .projection_editor
             .shows(vibex_core::AgentProjectionFormControl::Endpoint);
         let shows_model = self
             .projection_editor
             .shows(vibex_core::AgentProjectionFormControl::Model);
-        let shows_api_key =
-            self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
         // An Agent-owned endpoint cannot be projected from the profile, so the
         // field is locked to the value the Agent actually calls and the
         // per-protocol overrides disappear with it.
         let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
         let credential_control = self.render_projection_credential_control(cx);
         let model_section =
-            shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
-        let protocol_endpoints = (shows_endpoint && fixed_endpoint.is_none()).then(|| {
-            let mut section = v_flex().w_full().gap_2p5();
-            for (wire_api, input) in &self.profile_protocol_base_urls {
-                section = section.child(management_input_field(
-                    provider_protocol_url_override_label(*wire_api),
-                    input,
-                    false,
-                    cx,
-                ));
-            }
-            section.into_any_element()
-        });
+            shows_model.then(|| self.render_profile_model_section(selected_agent_id.clone(), cx));
 
         // Identity: name, note, and website. Name gets the primary emphasis.
         let identity_section = profile_editor_section(
@@ -10541,10 +10839,11 @@ impl ManagementCenter {
             v_flex()
                 .w_full()
                 .gap_2p5()
-                .child(management_input_field(
+                .child(management_input_field_with_error(
                     management_locale_text("Provider name", "供应商名称", "供應商名稱"),
                     &self.profile_name,
                     false,
+                    self.profile_name_error.as_deref(),
                     cx,
                 ))
                 .child(
@@ -10570,6 +10869,8 @@ impl ManagementCenter {
         );
 
         // Connection: credential surface, base URL, and per-protocol overrides.
+        // The overrides stay collapsed because most Providers only ever set one
+        // address.
         let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
         if shows_endpoint {
             let endpoint_label = management_locale_text(
@@ -10588,16 +10889,44 @@ impl ManagementCenter {
                     ),
                     cx,
                 ),
-                None => management_input_field(
-                    endpoint_label,
-                    &self.profile_base_url,
-                    false,
-                    cx,
-                ),
+                None => {
+                    management_input_field(endpoint_label, &self.profile_base_url, false, cx)
+                }
             });
         }
-        if let Some(endpoints) = protocol_endpoints {
-            connection_content = connection_content.child(endpoints);
+        if shows_endpoint && fixed_endpoint.is_none() && !self.profile_protocol_base_urls.is_empty()
+        {
+            let open = self.profile_protocol_advanced_open;
+            let overrides = self.pending_protocol_overrides();
+            let mut fields = v_flex().w_full().gap_2p5();
+            for (wire_api, input) in &self.profile_protocol_base_urls {
+                fields = fields.child(management_input_field(
+                    provider_protocol_url_override_label(*wire_api),
+                    input,
+                    false,
+                    cx,
+                ));
+            }
+            connection_content = connection_content.child(
+                Collapsible::new()
+                    .w_full()
+                    .open(open)
+                    .child(profile_editor_disclosure(
+                        PROFILE_PROTOCOL_DISCLOSURE_ID,
+                        management_locale_text(
+                            "Set an address per protocol",
+                            "按协议分别设置地址",
+                            "按協定分別設定位址",
+                        )
+                        .into(),
+                        open,
+                        (overrides > 0).then(|| {
+                            management_status_badge(protocol_override_count(overrides), cx)
+                        }),
+                        cx,
+                    ))
+                    .content(fields),
+            );
         }
         let connection_section = profile_editor_section(
             management_locale_text("Connection & credentials", "连接与凭证", "連線與憑證"),
@@ -10606,56 +10935,15 @@ impl ManagementCenter {
             cx,
         );
 
-        let mut form = v_flex()
-            .w_full()
-            .gap_3()
-            .child(identity_section)
-            .child(connection_section);
-        if shows_api_key && self.profile_secret_loading {
-            form = form.child(status_line(
-                management_locale_text(
-                    "Loading saved API Key...",
-                    "正在加载已保存的 API Key...",
-                    "正在載入已儲存的 API Key...",
-                )
-                .to_string(),
-                false,
-                cx,
-            ));
-        }
-        if shows_api_key && updating && !self.profile_secret_touched {
-            form = form.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::Info)
-                            .size_3()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Saved Secret remains unchanged until this field is edited.",
-                                "只有编辑此字段后才会修改已保存的密钥。",
-                                "只有編輯此欄位後才會修改已儲存的金鑰。",
-                            )),
-                    ),
-            );
-        }
+        // The Models section sits between the name and the connection: it is
+        // the part of a Provider people come back to change, and the address
+        // below it is usually already right.
+        let mut sections = vec![identity_section];
         if let Some(section) = model_section {
-            form = form.child(section);
+            sections.push(section);
         }
-        if let Some(error) = self.error.clone() {
-            form = form.child(status_line(
-                locale::localize_error_message(&error),
-                true,
-                cx,
-            ));
-        }
+        sections.push(connection_section);
+        let form = v_flex().w_full().gap_3().children(sections);
 
         v_flex()
             .size_full()
@@ -10668,43 +10956,91 @@ impl ManagementCenter {
                     .pr_1()
                     .child(form),
             )
+            .children(
+                self.profile_submit_error
+                    .clone()
+                    .map(|error| status_line(locale::localize_error_message(&error), true, cx)),
+            )
             .child(
                 h_flex()
                     .w_full()
                     .flex_none()
                     .items_center()
-                    .justify_end()
+                    .justify_between()
                     .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .pt_3()
+                    .child(div().min_w_0().flex_1().when_some(
+                        self.editing_profile_id.clone(),
+                        |row, profile_id| {
+                            let agent_id = selected_agent_id.clone();
+                            row.child(
+                                Button::new("provider-profile-test")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::Network)
+                                    .label(if testing {
+                                        management_locale_text(
+                                            "Testing...",
+                                            "测试中...",
+                                            "測試中...",
+                                        )
+                                    } else {
+                                        management_locale_text(
+                                            "Test connection",
+                                            "测试连接",
+                                            "測試連線",
+                                        )
+                                    })
+                                    .loading(testing)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.test_provider_profile(
+                                            profile_id.clone(),
+                                            agent_id.clone(),
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        },
+                    ))
                     .child(
-                        Button::new("provider-profile-close")
-                            .small()
-                            .ghost()
-                            .label(management_locale_text("Cancel", "取消", "取消"))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_profile_editor(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("provider-profile-save")
-                            .small()
-                            .when(updating, |button| button.secondary())
-                            .when(!updating, |button| button.primary())
-                            .label(if updating {
-                                management_locale_text("Save changes", "保存修改", "儲存修改")
-                            } else {
-                                management_locale_text(
-                                    "Create provider",
-                                    "创建供应商",
-                                    "新增供應商",
-                                )
-                            })
-                            .loading(saving)
-                            .disabled(pending || self.profile_secret_loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("provider-profile-close")
+                                    .small()
+                                    .ghost()
+                                    .label(management_locale_text("Cancel", "取消", "取消"))
+                                    .disabled(cancel_disabled)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_profile_editor(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("provider-profile-save")
+                                    .small()
+                                    .primary()
+                                    .label(if updating {
+                                        management_locale_text(
+                                            "Save changes",
+                                            "保存修改",
+                                            "儲存修改",
+                                        )
+                                    } else {
+                                        management_locale_text(
+                                            "Create provider",
+                                            "创建供应商",
+                                            "新增供應商",
+                                        )
+                                    })
+                                    .loading(saving)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
+                            ),
                     ),
             )
             .into_any_element()
@@ -17044,18 +17380,6 @@ fn agent_auth_catalog_supports_reauthentication(catalog: &AgentAuthCatalog) -> b
     })
 }
 
-fn profile_secret_scope_matches(
-    editor_open: bool,
-    selected_agent_id: Option<&str>,
-    editing_profile_id: Option<&str>,
-    expected_agent_id: &str,
-    expected_profile_id: &str,
-) -> bool {
-    editor_open
-        && selected_agent_id == Some(expected_agent_id)
-        && editing_profile_id == Some(expected_profile_id)
-}
-
 fn agent_auth_scope_matches(
     current_generation: u64,
     current_scope: Option<&(String, Option<String>)>,
@@ -17565,6 +17889,73 @@ fn declared_token_limits(
     Ok((context, output))
 }
 
+/// Names the field a rejected level list belongs to.
+///
+/// The parser explains the problem in the endpoint's own vocabulary, which is
+/// the part a user can act on; the field name is what makes the message
+/// attributable while the editor writes as the user types.
+fn declared_reasoning_efforts_error(reason: &str) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("Thinking levels were not saved: {reason}"),
+        ResolvedLocale::ZhCn => format!("思考档位没有写入：{reason}"),
+        ResolvedLocale::ZhTw => format!("思考檔位沒有寫入：{reason}"),
+    }
+}
+
+/// Turns the declared-limit parser's code and reason into one field message.
+fn declared_token_limit_error(message: &str) -> String {
+    let (field, reason) = if message.starts_with("agent_model_context_tokens_invalid") {
+        (
+            management_locale_text("Context window", "上下文窗口", "上下文視窗"),
+            message.trim_start_matches("agent_model_context_tokens_invalid:"),
+        )
+    } else {
+        (
+            management_locale_text("Max output tokens", "最大输出 Token", "最大輸出 Token"),
+            message.trim_start_matches("agent_model_output_tokens_invalid:"),
+        )
+    };
+    let reason = match reason.trim() {
+        "must be greater than zero" => {
+            management_locale_text("must be greater than 0", "必须大于 0", "必須大於 0")
+        }
+        "is larger than a token limit can be" => management_locale_text(
+            "is larger than a token limit can be",
+            "超出了 Token 上限能表示的范围",
+            "超出了 Token 上限能表示的範圍",
+        ),
+        _ => management_locale_text(
+            "must be a whole number of tokens",
+            "必须是整数",
+            "必須是整數",
+        ),
+    };
+    format!("{field}: {reason}")
+}
+
+/// How many per-protocol addresses the Provider already overrides.
+fn protocol_override_count(count: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{count} set"),
+        ResolvedLocale::ZhCn => format!("已设置 {count} 项"),
+        ResolvedLocale::ZhTw => format!("已設定 {count} 項"),
+    }
+}
+
+/// Whether a Model row survives the editor's search box.
+///
+/// Both the id and the display name are searched, because the list shows both
+/// and a user may remember either one.
+fn profile_model_matches(model: &vibex_core::ProviderConfiguredModel, filter: &str) -> bool {
+    let filter = filter.trim().to_lowercase();
+    filter.is_empty()
+        || model.id.to_lowercase().contains(&filter)
+        || model
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase().contains(&filter))
+}
+
 fn normalized_provider_models(
     models: &[vibex_core::ProviderConfiguredModel],
 ) -> Vec<vibex_core::ProviderConfiguredModel> {
@@ -17842,6 +18233,100 @@ fn management_status_badge(label: String, _cx: &App) -> AnyElement {
     Tag::secondary().xsmall().child(label).into_any_element()
 }
 
+/// The credential state as interface language.
+///
+/// The projection reports an enum, and an enum name is not a sentence: it is
+/// translated here so the badge never shows `NotApplicable` to a user.
+fn projection_auth_state_badge(state: vibex_core::ProjectionAuthState, _cx: &App) -> AnyElement {
+    use vibex_core::ProjectionAuthState as State;
+    let (label, tag) = match state {
+        State::Ready => (
+            management_locale_text("Ready", "已就绪", "已就緒"),
+            Tag::success(),
+        ),
+        State::Missing => (
+            management_locale_text("Not configured", "未配置", "未設定"),
+            Tag::warning(),
+        ),
+        State::AgentManaged => (
+            management_locale_text("Managed by Agent", "由 Agent 管理", "由 Agent 管理"),
+            Tag::secondary(),
+        ),
+        State::NotApplicable => (
+            management_locale_text("Not required", "无需配置", "無需設定"),
+            Tag::secondary(),
+        ),
+        State::Unsupported => (
+            management_locale_text("Unsupported", "暂不支持", "暫不支援"),
+            Tag::warning(),
+        ),
+        State::Unknown => (
+            management_locale_text("Unknown", "未知", "未知"),
+            Tag::secondary(),
+        ),
+    };
+    tag.xsmall().child(label).into_any_element()
+}
+
+/// One red line under the control a message belongs to.
+fn management_field_error(message: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .text_xs()
+        .text_color(cx.theme().danger)
+        .child(message.into())
+        .into_any_element()
+}
+
+/// A quiet one-line hint under a control.
+fn management_field_hint(message: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(message.into())
+        .into_any_element()
+}
+
+/// A disclosure header: a quiet caption row that opens the content below it.
+///
+/// Collapsed by default so a rarely used group does not push the frequent
+/// fields off the dialog's first screen.
+fn profile_editor_disclosure(
+    id: &'static str,
+    label: SharedString,
+    open: bool,
+    trailing: Option<AnyElement>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let icon = if open {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    };
+    h_flex()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            Button::new(SharedString::from(format!("{id}-toggle")))
+                .xsmall()
+                .ghost()
+                .compact()
+                .icon(Icon::new(icon).size_3p5())
+                .label(label)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_profile_editor_disclosure(id, cx)
+                    }),
+                ),
+        )
+        .children(trailing)
+        .into_any_element()
+}
+
 fn provider_wire_api_label(wire_api: vibex_core::ProviderModelWireApi) -> &'static str {
     match wire_api {
         vibex_core::ProviderModelWireApi::OpenaiResponses => "OpenAI Responses",
@@ -17951,16 +18436,37 @@ fn management_input_field(
     label: impl Into<SharedString>,
     state: &Entity<InputState>,
     masked: bool,
-    _cx: &mut Context<ManagementCenter>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    management_input_field_with_error(label, state, masked, None, cx)
+}
+
+/// A labeled field that also reports its own problem.
+///
+/// The message sits directly under the control it belongs to, so a rejected
+/// value is visible without scrolling back to a status line at the end of the
+/// dialog.
+fn management_input_field_with_error(
+    label: impl Into<SharedString>,
+    state: &Entity<InputState>,
+    masked: bool,
+    error: Option<&str>,
+    cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     let label: SharedString = label.into();
-    let input = Input::new(state).small().w_full();
-    Form::new()
-        .child(
-            Field::new()
-                .label(label)
-                .child(if masked { input.mask_toggle() } else { input }),
-        )
+    let mut input = Input::new(state).small().w_full();
+    if masked {
+        input = input.mask_toggle();
+    }
+    if error.is_some() {
+        input = input.border_color(cx.theme().danger);
+    }
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(Form::new().child(Field::new().label(label).child(input)))
+        .children(error.map(|message| management_field_error(message.to_string(), cx)))
         .into_any_element()
 }
 
@@ -19137,7 +19643,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_api_key_editor_loads_saved_value_into_masked_input() {
+    fn provider_api_key_editor_never_reads_the_stored_secret_back() {
         let source = include_str!("management.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -19145,59 +19651,100 @@ mod tests {
             .expect("Management production source should remain inspectable");
         let editor = source
             .split_once("    fn open_profile_editor(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn load_profile_secret("))
-            .map(|(body, _)| body)
-            .expect("Provider editor should remain inspectable");
-        let loader = source
-            .split_once("    fn load_profile_secret(")
             .and_then(|(_, tail)| tail.split_once("\n    fn close_profile_editor("))
             .map(|(body, _)| body)
-            .expect("Provider Secret loader should remain inspectable");
+            .expect("Provider editor should remain inspectable");
         let credential_control = source
             .split_once("    fn render_projection_credential_control(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_profile_editor_dialog("))
             .map(|(body, _)| body)
             .expect("Provider credential control should remain inspectable");
+        let save = source
+            .split_once("    fn save_profile(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn run_provider_health_probe("))
+            .map(|(body, _)| body)
+            .expect("profile save handler should remain inspectable");
 
-        assert!(editor.contains("self.profile_secret_loading = profile.secret_configured;"));
-        assert!(editor.contains("self.load_profile_secret("));
+        // The editor states that a Secret exists instead of fetching it: blank
+        // keeps the stored value, typing replaces it, Clear removes it.
+        assert!(editor.contains("self.profile_secret_configured = profile.secret_configured;"));
         assert!(editor.contains("state.set_value(\"\", window, cx);"));
-        assert!(loader.contains("get_agent_model_provider_profile_secret_value"));
-        assert!(loader.contains("state.set_value(secret.value.unwrap_or_default(), window, cx)"));
-        assert!(loader.contains("profile_secret_scope_matches("));
-        assert!(credential_control.contains(".mask_toggle()"));
+        assert!(!production.contains("get_agent_model_provider_profile_secret_value"));
         assert!(!production.contains("PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER"));
+        assert!(credential_control.contains(".mask_toggle()"));
+        assert!(credential_control.contains("provider-secret-clear"));
+        assert!(save.contains("let replaces_secret = !api_key.is_empty();"));
+        assert!(save.contains("clear: secret_clear,"));
     }
 
     #[test]
-    fn provider_api_key_async_results_are_fenced_by_editor_scope() {
-        assert!(profile_secret_scope_matches(
-            true,
-            Some("codex"),
-            Some("profile-a"),
-            "codex",
-            "profile-a",
+    fn provider_dialog_answers_enter_with_save_instead_of_closing() {
+        let source = include_str!("management.rs");
+        let dialog = source
+            .split_once("    fn present_profile_editor_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn add_profile_model("))
+            .map(|(body, _)| body)
+            .expect("Provider dialog presenter should remain inspectable");
+        let model_draft = source
+            .split_once("                &profile_model_draft,")
+            .and_then(|(_, tail)| tail.split_once("InputEvent::Focus | InputEvent::Blur => {}"))
+            .map(|(body, _)| body)
+            .expect("Model-id field subscription should remain inspectable");
+
+        // The Dialog's own Enter binding confirms by closing the overlay, so
+        // the editor must claim the key: Save on Enter, and the Model-id field
+        // adding its row instead of saving the whole dialog.
+        assert!(dialog.contains(".on_ok(move |_, _, cx| {"));
+        assert!(dialog.contains("center.save_profile(cx)"));
+        assert!(dialog.contains("false"));
+        assert!(model_draft.contains("InputEvent::PressEnter"));
+        assert!(model_draft.contains("cx.stop_propagation();"));
+    }
+
+    #[test]
+    fn provider_model_editor_writes_through_without_an_apply_step() {
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .expect("Management production source should remain inspectable");
+        let apply = source
+            .split_once("    fn apply_profile_model_edit(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Keeps the per-Protocol interface selection")
+            })
+            .map(|(body, _)| body)
+            .expect("Model write-through should remain inspectable");
+
+        assert!(!production.contains("save_profile_model_editor"));
+        assert!(!production.contains("Apply model changes"));
+        assert!(apply.contains("ProfileModelEditField::Id"));
+        assert!(apply.contains("ProfileModelEditField::Reasoning"));
+        assert!(apply.contains("ProfileModelEditField::Limits"));
+        // A field that does not parse keeps the Model's previous value.
+        assert!(apply.contains("if let Some((context, output)) = declared_limits"));
+    }
+
+    #[test]
+    fn provider_model_search_matches_ids_and_display_names() {
+        let model = |id: &str, display_name: Option<&str>| vibex_core::ProviderConfiguredModel {
+            id: id.into(),
+            display_name: display_name.map(str::to_string),
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        };
+
+        assert!(profile_model_matches(&model("gpt-5-codex", None), ""));
+        assert!(profile_model_matches(&model("gpt-5-codex", None), "codex"));
+        assert!(profile_model_matches(&model("gpt-5-codex", None), "GPT-5"));
+        assert!(profile_model_matches(
+            &model("deepseek-chat", Some("DeepSeek Chat")),
+            "chat"
         ));
-        assert!(!profile_secret_scope_matches(
-            false,
-            Some("codex"),
-            Some("profile-a"),
-            "codex",
-            "profile-a",
-        ));
-        assert!(!profile_secret_scope_matches(
-            true,
-            Some("claude"),
-            Some("profile-a"),
-            "codex",
-            "profile-a",
-        ));
-        assert!(!profile_secret_scope_matches(
-            true,
-            Some("codex"),
-            Some("profile-b"),
-            "codex",
-            "profile-a",
+        assert!(!profile_model_matches(
+            &model("gpt-5-codex", None),
+            "claude"
         ));
     }
 
