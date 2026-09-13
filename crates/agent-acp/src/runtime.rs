@@ -5920,8 +5920,19 @@ impl AcpProcess {
                 if let Some(tool_call_id) = string_field(tool_call, &["toolCallId", "id"]) {
                     push_detail(&mut details, "toolCallId", &tool_call_id);
                 }
-                if let Some(raw_input) = tool_call.and_then(|call| call.get("rawInput")) {
-                    push_detail(&mut details, "input", &raw_input.to_string());
+                // Prefer the adapter's own readable rendering of the pending
+                // action over the machine-shaped `rawInput`; adapters that send
+                // no text content keep the previous rendering exactly.
+                if let Some(input_text) = tool_call_content_text(tool_call).or_else(|| {
+                    tool_call
+                        .and_then(|call| call.get("rawInput"))
+                        .map(Value::to_string)
+                }) {
+                    push_detail(&mut details, "input", &input_text);
+                }
+                let locations = tool_call_location_paths(tool_call);
+                if !locations.is_empty() {
+                    push_detail(&mut details, "path", &locations.join("\n"));
                 }
                 if !options.is_empty() {
                     push_detail(
@@ -18525,6 +18536,59 @@ fn permission_risk_source(tool_call: Option<&Value>, params: &Value, title: &str
     candidates.join(" ")
 }
 
+/// Human-readable text carried on a permission request's `toolCall.content`.
+///
+/// ACP types this as `ToolCallContent[]`. `zcode-acp-server` >= 0.34.0 fills it
+/// with the complete command (every line, not only the single line a popup
+/// title can hold) or a pretty-printed input object, alongside the
+/// machine-shaped `rawInput` it has always sent. The text blocks are preferred
+/// for the approval dialog because they are what the adapter itself considers
+/// readable; `diff`/`terminal` variants carry no plain instruction text and are
+/// skipped so the caller's `rawInput` fallback keeps covering them. Callers
+/// must treat `None` as "this adapter said nothing more than `rawInput`".
+fn tool_call_content_text(tool_call: Option<&Value>) -> Option<String> {
+    let items = tool_call?.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("content") {
+            continue;
+        }
+        let text = content_block_text(item.get("content"));
+        let text = text.trim();
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// File paths carried on a permission request's `toolCall.locations`.
+///
+/// Same 0.34.0 addition as [`tool_call_content_text`]. Paths are what the
+/// approval decision is usually about, so they get their own row; duplicates
+/// are collapsed and order is preserved. Adapters that omit the field yield an
+/// empty vector and therefore no row at all.
+fn tool_call_location_paths(tool_call: Option<&Value>) -> Vec<String> {
+    let Some(items) = tool_call
+        .and_then(|call| call.get("locations"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || paths.iter().any(|seen| seen == path) {
+            continue;
+        }
+        paths.push(path.to_string());
+    }
+    paths
+}
+
 fn string_field(value: Option<&Value>, keys: &[&str]) -> Option<String> {
     let object = value?.as_object()?;
     keys.iter().find_map(|key| {
@@ -19626,6 +19690,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permission_details_prefer_adapter_content_and_list_locations() {
+        // zcode-acp-server >= 0.34.0 puts the complete command (every line,
+        // unlike the single-line popup title) on `toolCall.content` next to the
+        // `rawInput` it always sent; the readable form is what the dialog shows.
+        let enriched = json!({
+            "toolCallId": "tool-1",
+            "kind": "execute",
+            "title": "bash: cargo build",
+            "content": [
+                {
+                    "type": "content",
+                    "content": { "type": "text", "text": "cargo build --release\ncargo test" }
+                },
+                { "type": "terminal", "terminalId": "term-1" }
+            ],
+            "locations": [
+                { "path": "/tmp/work/src/lib.rs" },
+                { "path": "/tmp/work/src/lib.rs" },
+                { "path": "   " }
+            ],
+            "rawInput": { "command": "cargo build --release\ncargo test" }
+        });
+        assert_eq!(
+            tool_call_content_text(Some(&enriched)).as_deref(),
+            Some("cargo build --release\ncargo test")
+        );
+        assert_eq!(
+            tool_call_location_paths(Some(&enriched)),
+            vec!["/tmp/work/src/lib.rs".to_string()]
+        );
+
+        // An adapter without the extension renders exactly what it did before:
+        // `toolCall.content` is absent, so `rawInput` stays authoritative.
+        let legacy = json!({
+            "toolCallId": "tool-2",
+            "kind": "execute",
+            "rawInput": { "command": "ls" }
+        });
+        assert_eq!(tool_call_content_text(Some(&legacy)), None);
+        assert!(tool_call_location_paths(Some(&legacy)).is_empty());
+        assert_eq!(
+            tool_call_content_text(Some(&legacy))
+                .or_else(|| legacy.get("rawInput").map(Value::to_string)),
+            Some("{\"command\":\"ls\"}".to_string())
+        );
+
+        // Non-text content variants carry no instruction text and must not be
+        // mistaken for one.
+        let diff_only = json!({
+            "content": [{ "type": "diff", "path": "/tmp/a.rs", "newText": "fn a() {}" }]
+        });
+        assert_eq!(tool_call_content_text(Some(&diff_only)), None);
+        assert_eq!(tool_call_content_text(None), None);
+        assert!(tool_call_location_paths(None).is_empty());
+    }
+
     fn test_acp_config(command: &str, args: Vec<String>) -> AcpProviderConfig {
         AcpProviderConfig {
             command: command.to_string(),
@@ -20233,6 +20354,13 @@ mod tests {
         let codex = agent_usage_reporting_contract(&AgentId::parse("codex").unwrap());
         assert_eq!(codex.counter_scope, AgentUsageCounterScope::Request);
         assert!(codex.usage_update_is_request_total);
+
+        // zcode-acp-server forwards the backend's per-turn usage object on the
+        // prompt result (no `_meta.dev.vibex/usageScope` declaration), while its
+        // `usage_update.used` stays context occupancy.
+        let zcode = agent_usage_reporting_contract(&AgentId::parse("zcode").unwrap());
+        assert_eq!(zcode.counter_scope, AgentUsageCounterScope::Turn);
+        assert!(!zcode.usage_update_is_request_total);
 
         let unknown = agent_usage_reporting_contract(&AgentId::parse("gemini").unwrap());
         assert_eq!(unknown.counter_scope, AgentUsageCounterScope::Session);

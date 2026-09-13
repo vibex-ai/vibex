@@ -198,6 +198,16 @@ pub fn agent_usage_reporting_contract(agent_id: &AgentId) -> AgentUsageReporting
             counter_scope: AgentUsageCounterScope::Request,
             usage_update_is_request_total: true,
         },
+        // zcode-acp-server (>=0.33.0): `turnResult()` forwards the backend's
+        // `turn.completed` usage object verbatim on the prompt result, and
+        // `docs/PROTOCOL.md` documents it as "per-turn scope, not
+        // session-cumulative" (zero-filled for the three required counters,
+        // null for unreported optional ones). Its `usage_update.used` is
+        // context occupancy (`contextUsed`/`inputTokens`), per the schema.
+        "zcode" => AgentUsageReportingContract {
+            counter_scope: AgentUsageCounterScope::Turn,
+            usage_update_is_request_total: false,
+        },
         _ => AgentUsageReportingContract {
             counter_scope: AgentUsageCounterScope::Session,
             usage_update_is_request_total: false,

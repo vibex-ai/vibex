@@ -41,9 +41,9 @@ pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-dSwQzl6JgsFe8L9i8xUnwRz9Vy8gn4
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
 pub const ZCODE_ADAPTER_PACKAGE: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.17.2";
-pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-mIB1G6vIA+d+htr/szXt4RVx0yYPGs/Ri5UhiCMjTYk98qhVHdAqURul1iyCP4t2XcqiMpgWgel4xSEzUU4x3g==";
-pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.17.2";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.37.1";
+pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-D8Ejw2RzkaxKtpO5ZJR/h41fRdpIjTKxHlPMCiO5hhCOLCe2+1k/U+fGWjBTp+IuKWDL8weEr/6VToyTWiV0DA==";
+pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.37.1";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -1127,15 +1127,37 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
         command_variants: vec![CommandVariant {
             bin_name: ZCODE_ADAPTER_ID.to_string(),
             args: Vec::new(),
-            // The published bridge is stdio-only and does not expose a version
-            // flag. Managed install identity is verified from package metadata.
+            // The bridge accepts `--version` ahead of subcommand dispatch, but
+            // it resolves its whole module graph first, so it is not a cheap
+            // probe. Managed install identity is verified from the npm package
+            // lock against `distribution.integrity` instead.
             version_args: Vec::new(),
         }],
-        // Keep the bridge's optional WebSocket/HTTP remote endpoint disabled;
-        // DesktopRuntime remains the sole remote/session authority.
-        required_launch_env: vec![("ZCODE_ACP_REMOTE".to_string(), "0".to_string())],
+        // Two launch-env pins, both load-bearing:
+        //
+        // `ZCODE_ACP_REMOTE=0` keeps the bridge's optional WebSocket/HTTP
+        // remote endpoint disabled; DesktopRuntime remains the sole
+        // remote/session authority. Since 0.23.0 the bridge also reads
+        // `~/.config/zcode-acp/config.json`, and that file outranks the
+        // environment per field, so this pin is no longer an absolute
+        // guarantee: a user config carrying `remote.enabled` AND a
+        // `remote.token` can still arm the bridge endpoint. Vibex unsets
+        // `ZCODE_ACP_REMOTE_TOKEN` (see `credential_env_keys_to_unset`), so
+        // an env-only remote setup stays disabled.
+        //
+        // `ZCODE_ACP_RUNTIME=node` pins the interpreter. Since 0.26.0 the
+        // bridge hands itself over to `bun --smol` whenever a Bun >= 1.4 is
+        // installed, which turns the process Vibex spawned into a supervisor
+        // for a Bun grandchild — a different process shape, a different
+        // runtime, and an extra `which`/`--version` probe on every launch.
+        // Pinning Node keeps one managed process per session and a
+        // deterministic runtime identity.
+        required_launch_env: vec![
+            ("ZCODE_ACP_REMOTE".to_string(), "0".to_string()),
+            ("ZCODE_ACP_RUNTIME".to_string(), "node".to_string()),
+        ],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: zcode-acp-server@0.17.2 forwards stdio MCP descriptors",
+            "real bridge contract schema v2: zcode-acp-server@0.37.1 forwards stdio MCP descriptors",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "Vibex launches one managed bridge per logical session",
@@ -1421,7 +1443,10 @@ mod tests {
         assert!(zcode.command_variants[0].version_args.is_empty());
         assert_eq!(
             zcode.required_launch_env,
-            vec![("ZCODE_ACP_REMOTE".to_string(), "0".to_string())]
+            vec![
+                ("ZCODE_ACP_REMOTE".to_string(), "0".to_string()),
+                ("ZCODE_ACP_RUNTIME".to_string(), "node".to_string()),
+            ]
         );
         assert_eq!(zcode.restore_policy, RestorePolicy::ResumeThenLoadThenNew);
         assert_eq!(zcode.event_enricher, AgentEventEnricherKind::Passthrough);
