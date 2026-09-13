@@ -283,6 +283,7 @@ impl DesktopRuntimeConfig {
                 ]
             });
         let mut remote_gateway = RemoteGatewayConfig::default();
+        remote_gateway.server_kind = vibex_core::RemoteServerKind::Headless;
         remote_gateway.service = RemoteServiceConfig {
             enabled: environment_bool("VIBEX_GATEWAY_ENABLED").unwrap_or(true),
             bind_addr,
@@ -390,10 +391,20 @@ impl DesktopRuntimeConfig {
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
-            remote_gateway: RemoteGatewayConfig::default(),
+            remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
         })
+    }
+
+    /// A gateway config for a desktop-hosted embedded runtime. Paired clients
+    /// see "desktop", which is what lets an operator tell this runtime apart
+    /// from a headless `vibex-server` over the same wire contract.
+    fn desktop_gateway() -> RemoteGatewayConfig {
+        RemoteGatewayConfig {
+            server_kind: vibex_core::RemoteServerKind::Desktop,
+            ..RemoteGatewayConfig::default()
+        }
     }
 
     pub fn isolated_preview(base_home: impl AsRef<Path>) -> Self {
@@ -409,7 +420,7 @@ impl DesktopRuntimeConfig {
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
-            remote_gateway: RemoteGatewayConfig::default(),
+            remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
         }
@@ -435,7 +446,7 @@ impl DesktopRuntimeConfig {
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
-            remote_gateway: RemoteGatewayConfig::default(),
+            remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
         }
@@ -462,7 +473,7 @@ impl DesktopRuntimeConfig {
             agent_node_runtime: AgentNodeRuntimeOptions::from_environment(),
             agent_uv_runtime: AgentUvRuntimeOptions::from_environment(),
             acquire_home_lock: true,
-            remote_gateway: RemoteGatewayConfig::default(),
+            remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
         }
@@ -486,7 +497,7 @@ impl DesktopRuntimeConfig {
             agent_node_runtime: AgentNodeRuntimeOptions::default(),
             agent_uv_runtime: AgentUvRuntimeOptions::default(),
             acquire_home_lock: true,
-            remote_gateway: RemoteGatewayConfig::default(),
+            remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
         }
@@ -4237,6 +4248,32 @@ mod tests {
                 .is_ok()
         );
         runtime.shutdown().await.unwrap();
+    }
+
+    /// A paired client tells a desktop it can also sit in front of apart from
+    /// a headless server through the gateway's advertised kind, so the two
+    /// constructors must never agree.
+    #[test]
+    fn the_gateway_advertises_whether_it_is_a_desktop_or_a_headless_server() {
+        let desktop = DesktopRuntimeConfig::isolated_preview("/tmp/vibex-home");
+        assert_eq!(
+            desktop.remote_gateway.server_kind,
+            vibex_core::RemoteServerKind::Desktop
+        );
+        let candidate = DesktopRuntimeConfig::isolated_release_candidate("/tmp/vibex-home");
+        assert_eq!(
+            candidate.remote_gateway.server_kind,
+            vibex_core::RemoteServerKind::Desktop
+        );
+
+        // The headless constructor reads only process environment and the
+        // filesystem; it builds a config without starting anything.
+        let headless = DesktopRuntimeConfig::headless_from_environment().expect("headless config");
+        assert_eq!(headless.mode, DesktopRuntimeMode::Headless);
+        assert_eq!(
+            headless.remote_gateway.server_kind,
+            vibex_core::RemoteServerKind::Headless
+        );
     }
 
     #[test]

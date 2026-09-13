@@ -6578,6 +6578,7 @@ mod tests {
 
     fn full_control_server_info(enabled_features: &[&str]) -> vibex_core::RemoteServerInfoV2 {
         vibex_core::RemoteServerInfoV2 {
+            server_kind: vibex_core::RemoteServerKind::Desktop,
             server_id: "server_test".to_string(),
             server_identity_public_key: "public".to_string(),
             desktop_version: "test".to_string(),

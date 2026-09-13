@@ -239,6 +239,40 @@ impl fmt::Debug for RemoteHello {
     }
 }
 
+/// What kind of process is hosting a runtime.
+///
+/// A paired client shows this so an operator can tell a headless
+/// `vibex-server` from another Vibex desktop, which behave the same on the
+/// wire but differ in what the operator can do on that machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteServerKind {
+    /// The embedded runtime inside a Vibex desktop shell.
+    Desktop,
+    /// A standalone `vibex-server` process.
+    Headless,
+    /// The peer predates the field, or has not answered yet. Clients keep
+    /// showing the runtime without claiming to know what it is.
+    #[default]
+    Unknown,
+}
+
+impl RemoteServerKind {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Headless => "headless",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether a paired client can drive this runtime's desktop shell, or only
+    /// its runtime services.
+    pub const fn is_desktop(self) -> bool {
+        matches!(self, Self::Desktop)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteServerInfoV2 {
@@ -255,6 +289,10 @@ pub struct RemoteServerInfoV2 {
     pub enabled_features: Vec<String>,
     #[serde(default)]
     pub device_permissions: Vec<RemoteActionClass>,
+    /// Absent from a runtime that predates the field; clients then render the
+    /// runtime without a kind rather than guessing one.
+    #[serde(default)]
+    pub server_kind: RemoteServerKind,
     pub session_epoch: u64,
     pub connection_id: RequestId,
     pub server_time_ms: i64,

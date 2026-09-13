@@ -41,6 +41,10 @@ pub struct DesktopRemoteCredential {
     pub allow_insecure_local_dev: bool,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// What the runtime called itself when it was paired. Absent from a
+    /// version 1 record, which reads back as `Unknown`.
+    #[serde(default)]
+    pub server_kind: vibex_core::RemoteServerKind,
     /// Base64url DER of the certificate to trust for this server, set when the
     /// runtime serves its own self-signed certificate. The value came from the
     /// operator's pairing link, never from the server itself.
@@ -87,6 +91,7 @@ impl DesktopRemoteCredential {
             expected_server_id: bundle.server_id,
             allow_insecure_local_dev,
             display_name: None,
+            server_kind: bundle.server_kind,
             pinned_tls_certificate_der,
         };
         credential.validate()?;
@@ -243,6 +248,22 @@ impl std::fmt::Debug for RegisteredRuntime {
 }
 
 impl RegisteredRuntime {
+    /// What the peer is, as far as the last claim or handshake revealed.
+    pub fn server_kind(&self) -> vibex_core::RemoteServerKind {
+        self.credential.server_kind
+    }
+
+    /// Records what a handshake revealed. Returns whether anything changed, so
+    /// the caller only persists a real update. A peer that does not answer
+    /// with a kind must not erase one that was learned earlier.
+    pub fn observe_server_kind(&mut self, kind: vibex_core::RemoteServerKind) -> bool {
+        if kind == vibex_core::RemoteServerKind::Unknown || self.credential.server_kind == kind {
+            return false;
+        }
+        self.credential.server_kind = kind;
+        true
+    }
+
     /// The name the runtime manager renders. The shared helper owns the
     /// fallback chain so the desktop and the phone agree.
     pub fn display_label(&self) -> String {
@@ -610,6 +631,7 @@ mod tests {
             expected_server_id: "server-test".to_string(),
             allow_insecure_local_dev: false,
             display_name: None,
+            server_kind: vibex_core::RemoteServerKind::Desktop,
             pinned_tls_certificate_der: None,
         };
         (credential, identity)
@@ -675,9 +697,11 @@ mod tests {
         store.clear().expect("clear is idempotent");
     }
 
+    /// A credential as a client paired before the peer advertised its kind.
     fn second_record(id: &str) -> DesktopRemoteCredential {
         let (mut credential, _) = sample_record();
         credential.expected_server_id = id.to_string();
+        credential.server_kind = vibex_core::RemoteServerKind::Unknown;
         credential
     }
 
@@ -817,6 +841,63 @@ mod tests {
         assert_eq!(
             label.chars().count(),
             vibex_remote_client::RUNTIME_DISPLAY_NAME_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn a_runtime_kind_survives_a_round_trip_and_is_never_erased_by_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DesktopRuntimeRegistryStore::new(dir.path());
+        let mut registry = DesktopRuntimeRegistry::default();
+        let id = registry.upsert(second_record("server-a"), 1_000);
+
+        // A version 1 credential never said what the peer was.
+        assert_eq!(
+            registry.remote(&id).map(RegisteredRuntime::server_kind),
+            Some(vibex_core::RemoteServerKind::Unknown)
+        );
+
+        let runtime = registry.remote_mut(&id).expect("runtime");
+        assert!(runtime.observe_server_kind(vibex_core::RemoteServerKind::Headless));
+        assert!(
+            !runtime.observe_server_kind(vibex_core::RemoteServerKind::Headless),
+            "an unchanged kind is not a new observation"
+        );
+        store.save(&registry).expect("save");
+        assert_eq!(
+            store
+                .load()
+                .and_then(|loaded| loaded.remote(&id).map(RegisteredRuntime::server_kind)),
+            Some(vibex_core::RemoteServerKind::Headless),
+            "the kind is persisted with the registry"
+        );
+
+        // A peer that stops reporting a kind must not erase what was learned.
+        let runtime = registry.remote_mut(&id).expect("runtime");
+        assert!(!runtime.observe_server_kind(vibex_core::RemoteServerKind::Unknown));
+        assert_eq!(
+            runtime.server_kind(),
+            vibex_core::RemoteServerKind::Headless
+        );
+        assert!(runtime.observe_server_kind(vibex_core::RemoteServerKind::Desktop));
+        assert_eq!(runtime.server_kind(), vibex_core::RemoteServerKind::Desktop);
+    }
+
+    #[test]
+    fn a_version_one_record_without_a_kind_still_migrates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut credential = second_record("server-legacy");
+        credential.server_kind = vibex_core::RemoteServerKind::Unknown;
+        DesktopRemoteCredentialStore::new(dir.path())
+            .save(&credential)
+            .expect("save v1");
+
+        let registry = DesktopRuntimeRegistryStore::new(dir.path()).load_or_migrate();
+        assert_eq!(registry.active_runtime_id(), "server-legacy");
+        assert_eq!(
+            registry.active_remote().map(RegisteredRuntime::server_kind),
+            Some(vibex_core::RemoteServerKind::Unknown),
+            "an older peer keeps the generic label instead of being guessed at"
         );
     }
 

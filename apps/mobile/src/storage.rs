@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use vibex_backend::{BackendError, BackendResult};
-use vibex_core::AgentTimelineReasoningDisplayMode;
+use vibex_core::{AgentTimelineReasoningDisplayMode, RemoteServerKind};
 
 use crate::pairing::MobileCredentialBundle;
 
@@ -68,6 +68,19 @@ pub struct StoredHostEntry {
     pub added_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_connected_at_ms: Option<i64>,
+    /// What the peer said it was, as observed at pairing or on the last
+    /// successful connect. Kept beside the credential rather than inside it:
+    /// the credential schema is frozen, while a hosts file written before this
+    /// key existed still loads and reads as [`RemoteServerKind::Unknown`].
+    ///
+    /// An unknown kind is not serialized, so a phone that never learned one
+    /// writes exactly the v2 file the previous build wrote.
+    #[serde(default, skip_serializing_if = "server_kind_is_unknown")]
+    pub server_kind: RemoteServerKind,
+}
+
+fn server_kind_is_unknown(kind: &RemoteServerKind) -> bool {
+    *kind == RemoteServerKind::Unknown
 }
 
 #[derive(Deserialize, Serialize)]
@@ -255,6 +268,7 @@ impl CredentialStorage {
                         name_override: None,
                         added_at_ms: 0,
                         last_connected_at_ms: None,
+                        server_kind: RemoteServerKind::Unknown,
                     });
                 }
                 // Best effort: the upgrade is a convenience, and a read-only or
@@ -629,18 +643,109 @@ mod tests {
                 name_override: Some("Studio desktop".to_string()),
                 added_at_ms: 1_700_000_000_000,
                 last_connected_at_ms: Some(1_700_000_100_000),
+                server_kind: RemoteServerKind::Desktop,
             },
             StoredHostEntry {
                 bundle: second,
                 name_override: None,
                 added_at_ms: 1_700_000_200_000,
                 last_connected_at_ms: None,
+                server_kind: RemoteServerKind::Headless,
             },
         ];
         storage.save_stored_hosts(&entries).unwrap();
         assert_eq!(storage.load_hosts().unwrap(), entries);
         storage.clear_hosts().unwrap();
         assert!(storage.load_hosts().unwrap().is_empty());
+    }
+
+    /// A hosts file written by the build before the runtime kind existed has no
+    /// `serverKind` key. It must load, and the kind must read as unknown rather
+    /// than as a runtime this phone claims to have identified.
+    #[test]
+    fn v2_hosts_without_a_server_kind_load_as_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        fs::create_dir_all(temp.path()).unwrap();
+        let mut host = serde_json::to_value(StoredHostEntry {
+            bundle: fixture(),
+            name_override: None,
+            added_at_ms: 1_700_000_000_000,
+            last_connected_at_ms: None,
+            server_kind: RemoteServerKind::Unknown,
+        })
+        .unwrap();
+        // Exactly the pre-field shape: the key is absent, not null.
+        host.as_object_mut().unwrap().remove("serverKind");
+        assert!(host.get("serverKind").is_none());
+        fs::write(
+            storage.hosts_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": HOSTS_SCHEMA_VERSION,
+                "hosts": [host],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = storage.load_hosts().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].server_kind, RemoteServerKind::Unknown);
+        assert_eq!(loaded[0].bundle.expected_server_id, "desktop");
+    }
+
+    /// The kind is mobile-side metadata: the credential schema stays frozen, so
+    /// a known kind must never appear inside the stored bundle.
+    #[test]
+    fn a_known_server_kind_round_trips_outside_the_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        storage
+            .save_stored_hosts(&[StoredHostEntry {
+                bundle: fixture(),
+                name_override: None,
+                added_at_ms: 1,
+                last_connected_at_ms: None,
+                server_kind: RemoteServerKind::Headless,
+            }])
+            .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(storage.hosts_path()).unwrap()).unwrap();
+        assert_eq!(rewritten["hosts"][0]["serverKind"], "headless");
+        assert!(
+            rewritten["hosts"][0]["bundle"].get("serverKind").is_none(),
+            "the credential schema must not carry the runtime kind"
+        );
+        assert_eq!(
+            storage.load_hosts().unwrap()[0].server_kind,
+            RemoteServerKind::Headless
+        );
+    }
+
+    /// An unknown kind writes no key at all, so the common case stays readable
+    /// by the build that wrote the previous v2 files.
+    #[test]
+    fn an_unknown_server_kind_is_not_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        storage
+            .save_stored_hosts(&[StoredHostEntry {
+                bundle: fixture(),
+                name_override: None,
+                added_at_ms: 1,
+                last_connected_at_ms: None,
+                server_kind: RemoteServerKind::Unknown,
+            }])
+            .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(storage.hosts_path()).unwrap()).unwrap();
+        assert!(rewritten["hosts"][0].get("serverKind").is_none());
+        assert_eq!(
+            storage.load_hosts().unwrap()[0].server_kind,
+            RemoteServerKind::Unknown
+        );
     }
 
     /// A phone that paired before the runtime list gained metadata must keep
@@ -670,6 +775,7 @@ mod tests {
         assert_eq!(loaded[0].name_override, None);
         assert_eq!(loaded[0].added_at_ms, 0);
         assert_eq!(loaded[0].last_connected_at_ms, None);
+        assert_eq!(loaded[0].server_kind, RemoteServerKind::Unknown);
 
         // The upgrade is persisted, so the next launch reads v2 directly.
         let rewritten: serde_json::Value =

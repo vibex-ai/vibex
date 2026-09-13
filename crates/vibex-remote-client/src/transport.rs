@@ -456,6 +456,9 @@ pub struct RemoteGatewayInfo {
     pub pairing_claim_path: String,
     pub ws_ticket_path: String,
     pub deployment_mode: String,
+    /// Absent from a runtime that predates the field.
+    #[serde(default)]
+    pub server_kind: vibex_core::RemoteServerKind,
     pub tls_policy: String,
     pub session_epoch: u64,
     #[serde(default)]
@@ -776,6 +779,9 @@ pub struct PairingCodeClientBundle {
     /// credential saved for one headless runtime is never replayed against a
     /// different one.
     pub server_id: String,
+    /// What the peer called itself during the claim. `Unknown` for a peer that
+    /// predates the field, which clients render without a kind.
+    pub server_kind: vibex_core::RemoteServerKind,
 }
 
 impl fmt::Debug for PairingCodeClientBundle {
@@ -900,6 +906,7 @@ async fn complete_pairing_code_claim(
         identity,
         credential,
         server_id: info.server_id,
+        server_kind: info.server_kind,
     })
 }
 
@@ -5867,6 +5874,7 @@ mod tests {
             pairing_claim_path: "/api/v2/pairing/claim".to_string(),
             ws_ticket_path: "/api/v2/ws-ticket".to_string(),
             deployment_mode: "lan".to_string(),
+            server_kind: vibex_core::RemoteServerKind::Desktop,
             tls_policy: "trusted_https_proxy".to_string(),
             session_epoch: 1,
             enabled_features: vec![],

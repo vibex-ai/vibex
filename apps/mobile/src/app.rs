@@ -24,16 +24,16 @@ use vibex_core::{
     AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
     ElicitationFieldKind, ElicitationResolutionAction, ForkAgentSessionRequest, MessageAttachment,
     OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PermissionRiskCategory,
-    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteSidebarDropPosition,
-    RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarOrganizationMutation,
-    RenameAgentSessionRequest, RequestId, ResolvePermissionRequest, RuntimeAuthSourceAvailability,
-    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TimelineItem, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    unix_timestamp_ms,
+    RemoteDeepLinkResolutionStatus, RemoteLanPairingRequestState, RemoteServerKind,
+    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    RemoteSidebarOrganizationMutation, RenameAgentSessionRequest, RequestId,
+    ResolvePermissionRequest, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
+    RuntimeAuthSourceSummary, RuntimeModelSelection, RuntimeOptionAvailability,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload,
+    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -49,14 +49,14 @@ use vibex_remote_client::{
 };
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
-    ElicitationFormDraft, ElicitationSurfaceModel, ShellKind,
+    ElicitationFormDraft, ElicitationSurfaceModel, ShellKind, locale::Locale,
 };
 
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{
-    MobileCredentialBundle, claim_pairing_code_link, claim_pairing_link, claim_server_pairing_code,
-    claim_zero_config_lan_pairing,
+    MobileCredentialBundle, MobilePairedRuntime, claim_pairing_code_link, claim_pairing_link,
+    claim_server_pairing_code, claim_zero_config_lan_pairing,
 };
 use crate::selection_menu::SelectionMenu;
 use crate::sidebar::{
@@ -195,7 +195,7 @@ enum NearbyPairingState {
 }
 
 enum LanPairingOutcome {
-    Bundle(Box<MobileCredentialBundle>),
+    Bundle(Box<MobilePairedRuntime>),
     Rejected,
     Expired,
 }
@@ -456,10 +456,13 @@ struct MobileHostEntry {
     /// the pre-metadata hosts file.
     added_at_ms: i64,
     last_connected_at_ms: Option<i64>,
+    /// What the peer reported itself to be, from the pairing claim or the last
+    /// successful connect. `Unknown` until one of those says otherwise.
+    server_kind: RemoteServerKind,
 }
 
 impl MobileHostEntry {
-    fn from_bundle(bundle: &MobileCredentialBundle) -> Self {
+    fn from_bundle(bundle: &MobileCredentialBundle, server_kind: RemoteServerKind) -> Self {
         Self {
             id: bundle.host_id().to_string(),
             label: bundle.host_label(),
@@ -467,6 +470,7 @@ impl MobileHostEntry {
             name_override: None,
             added_at_ms: unix_timestamp_ms(),
             last_connected_at_ms: None,
+            server_kind,
         }
     }
 
@@ -478,6 +482,7 @@ impl MobileHostEntry {
             name_override: stored.name_override,
             added_at_ms: stored.added_at_ms,
             last_connected_at_ms: stored.last_connected_at_ms,
+            server_kind: stored.server_kind,
         }
     }
 
@@ -487,6 +492,7 @@ impl MobileHostEntry {
             name_override: self.name_override.clone(),
             added_at_ms: self.added_at_ms,
             last_connected_at_ms: self.last_connected_at_ms,
+            server_kind: self.server_kind,
         }
     }
 
@@ -1192,7 +1198,9 @@ impl MobileApp {
             tasks: Vec::new(),
         };
         if let Ok(Some(bundle)) = stored {
-            app.defer_bundle_install(bundle, cx);
+            // The standalone credential file predates the runtime kind; the
+            // hosts entry for this runtime keeps whatever it already stored.
+            app.defer_bundle_install(bundle, RemoteServerKind::Unknown, cx);
         }
         app.start_scanner_result_stream(cx);
         app.start_notification_action_stream(cx);
@@ -1263,7 +1271,7 @@ impl MobileApp {
                             if this.app_backgrounded {
                                 return;
                             }
-                            this.record_active_host_connected();
+                            this.record_active_host_connected(&backend);
                             this.start_event_stream(cx);
                             this.refresh_sessions(cx);
                             this.refresh_timeline_display_settings(cx);
@@ -1410,14 +1418,24 @@ impl MobileApp {
         }
     }
 
-    fn defer_bundle_install(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
+    fn defer_bundle_install(
+        &mut self,
+        bundle: MobileCredentialBundle,
+        server_kind: RemoteServerKind,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let _ = entity.update(cx, |this, cx| this.install_bundle(bundle, cx));
+            let _ = entity.update(cx, |this, cx| this.install_bundle(bundle, server_kind, cx));
         });
         self.tasks.push(task);
     }
 
-    fn install_bundle(&mut self, bundle: MobileCredentialBundle, cx: &mut Context<Self>) {
+    fn install_bundle(
+        &mut self,
+        bundle: MobileCredentialBundle,
+        server_kind: RemoteServerKind,
+        cx: &mut Context<Self>,
+    ) {
         crate::discovery::stop();
         self.stop_connection_tasks();
         self.reset_runtime_options();
@@ -1426,7 +1444,7 @@ impl MobileApp {
         self.nearby_pairing_state = NearbyPairingState::Idle;
         match bundle.backend() {
             Ok(backend) => {
-                self.remember_host(&bundle);
+                self.remember_host(&bundle, server_kind);
                 if let Some(workbench) = self.workbench.take() {
                     workbench.update(cx, |workbench, _| workbench.suspend());
                 }
@@ -1462,8 +1480,8 @@ impl MobileApp {
         }
     }
 
-    fn remember_host(&mut self, bundle: &MobileCredentialBundle) {
-        let entry = MobileHostEntry::from_bundle(bundle);
+    fn remember_host(&mut self, bundle: &MobileCredentialBundle, server_kind: RemoteServerKind) {
+        let entry = MobileHostEntry::from_bundle(bundle, server_kind);
         let id = entry.id.clone();
         if let Some(existing) = self.known_hosts.iter_mut().find(|host| host.id == id) {
             let added_at_ms = if existing.added_at_ms > 0 {
@@ -1471,11 +1489,20 @@ impl MobileApp {
             } else {
                 entry.added_at_ms
             };
+            // A claim that could not observe the peer's kind — an offer-based
+            // pairing route — must not erase one an earlier claim or connect
+            // already learned.
+            let server_kind = if entry.server_kind == RemoteServerKind::Unknown {
+                existing.server_kind
+            } else {
+                entry.server_kind
+            };
             // A re-pair replaces the credential, not the user's name for it or
             // the connection history.
             existing.label = entry.label;
             existing.bundle = entry.bundle;
             existing.added_at_ms = added_at_ms;
+            existing.server_kind = server_kind;
         } else {
             self.known_hosts.push(entry);
         }
@@ -1526,15 +1553,30 @@ impl MobileApp {
     }
 
     /// Stamps the active runtime as successfully connected and persists it, so
-    /// the other runtimes can show when each was last reached.
-    fn record_active_host_connected(&mut self) {
+    /// the other runtimes can show when each was last reached. The same hook
+    /// refreshes what kind of runtime the peer is: the transport keeps the
+    /// `RemoteServerInfoV2` from the handshake that just completed, which is
+    /// the peer's own answer rather than an inference.
+    fn record_active_host_connected(&mut self, backend: &WebRemoteBackend) {
         let Some(host_id) = self.active_host_id.clone() else {
             return;
         };
+        let observed_kind = backend
+            .transport()
+            .server_info()
+            .map(|info| info.server_kind)
+            // A peer that predates the field reports `Unknown`; keep whatever
+            // was already stored instead of downgrading it.
+            .filter(|kind| *kind != RemoteServerKind::Unknown);
         let mut changed = false;
         if let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) {
             entry.last_connected_at_ms = Some(unix_timestamp_ms());
             changed = true;
+            if let Some(observed_kind) = observed_kind
+                && entry.server_kind != observed_kind
+            {
+                entry.server_kind = observed_kind;
+            }
         }
         if changed {
             self.persist_known_hosts();
@@ -1556,7 +1598,7 @@ impl MobileApp {
                         this.mode = RootMode::Workspace;
                         this.error = None;
                         this.notice = None;
-                        this.record_active_host_connected();
+                        this.record_active_host_connected(&backend);
                         this.start_event_stream(cx);
                         this.refresh_sessions(cx);
                         this.refresh_timeline_display_settings(cx);
@@ -1931,8 +1973,8 @@ impl MobileApp {
                 match status.state {
                     RemoteLanPairingRequestState::Pending => continue,
                     RemoteLanPairingRequestState::Approved => {
-                        let bundle = claim_zero_config_lan_pairing(&mut session, status).await?;
-                        return Ok(LanPairingOutcome::Bundle(Box::new(bundle)));
+                        let paired = claim_zero_config_lan_pairing(&mut session, status).await?;
+                        return Ok(LanPairingOutcome::Bundle(Box::new(paired)));
                     }
                     RemoteLanPairingRequestState::Rejected => {
                         return Ok(LanPairingOutcome::Rejected);
@@ -1960,7 +2002,11 @@ impl MobileApp {
                 this.pairing_busy = false;
                 this.lan_pairing_task = None;
                 match outcome {
-                    Ok(Ok(LanPairingOutcome::Bundle(mut bundle))) => {
+                    Ok(Ok(LanPairingOutcome::Bundle(paired))) => {
+                        let MobilePairedRuntime {
+                            mut bundle,
+                            server_kind,
+                        } = *paired;
                         // The advertised service name is the only human label
                         // the desktop publishes, so keep it with the credential.
                         let display_name = display_name.trim();
@@ -1968,7 +2014,7 @@ impl MobileApp {
                             bundle.display_name = Some(display_name.to_string());
                         }
                         match this.storage.save(&bundle) {
-                            Ok(()) => this.install_bundle(*bundle, cx),
+                            Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => {
                                 this.nearby_pairing_state = NearbyPairingState::Failed {
                                     message: error.message,
@@ -2016,9 +2062,12 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 this.pairing_busy = false;
                 match outcome {
-                    Ok(Ok(bundle)) => match this.storage.save(&bundle) {
+                    Ok(Ok(MobilePairedRuntime {
+                        bundle,
+                        server_kind,
+                    })) => match this.storage.save(&bundle) {
                         Ok(()) => {
-                            this.install_bundle(bundle, cx);
+                            this.install_bundle(bundle, server_kind, cx);
                         }
                         Err(error) => this.error = Some(error),
                     },
@@ -2079,13 +2128,16 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 this.pairing_busy = false;
                 match outcome {
-                    Ok(Ok(bundle)) => {
+                    Ok(Ok(MobilePairedRuntime {
+                        bundle,
+                        server_kind,
+                    })) => {
                         this.pending_input_writes
                             .push((InputField::PairingServerUrl, String::new()));
                         this.pending_input_writes
                             .push((InputField::PairingCode, String::new()));
                         match this.storage.save(&bundle) {
-                            Ok(()) => this.install_bundle(bundle, cx),
+                            Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => this.error = Some(error),
                         }
                     }
@@ -2140,11 +2192,14 @@ impl MobileApp {
             let _ = entity.update(cx, |this, cx| {
                 this.pairing_busy = false;
                 match outcome {
-                    Ok(Ok(bundle)) => {
+                    Ok(Ok(MobilePairedRuntime {
+                        bundle,
+                        server_kind,
+                    })) => {
                         this.pending_input_writes
                             .push((InputField::PairingLink, String::new()));
                         match this.storage.save(&bundle) {
-                            Ok(()) => this.install_bundle(bundle, cx),
+                            Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => this.error = Some(error),
                         }
                     }
@@ -4765,7 +4820,8 @@ impl MobileApp {
             return;
         }
         self.clear_overlay();
-        self.install_bundle(entry.bundle, cx);
+        let server_kind = entry.server_kind;
+        self.install_bundle(entry.bundle, server_kind, cx);
     }
 
     fn cancel_pairing_host(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -4785,7 +4841,8 @@ impl MobileApp {
             cx.notify();
             return;
         }
-        self.install_bundle(entry.bundle, cx);
+        let server_kind = entry.server_kind;
+        self.install_bundle(entry.bundle, server_kind, cx);
     }
 
     fn reload_selected_session(&mut self, cx: &mut Context<Self>) {
@@ -13509,10 +13566,12 @@ impl MobileApp {
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
                     .child(host_detail_field(
-                        // The credential records the client side only, so the
-                        // peer's kind cannot be told from it.
+                        // The kind comes from the peer itself — the pairing
+                        // claim, or the handshake of the last connect — so an
+                        // unknown one keeps the generic label rather than
+                        // claiming to know.
                         "Type",
-                        locale::common("Runtime"),
+                        host_kind_label(host.server_kind),
                         false,
                         false,
                     ))
@@ -16230,6 +16289,23 @@ fn host_sheet_action_row(
         .child(label.into())
 }
 
+/// The localized runtime-kind label for the detail page. `Unknown` keeps the
+/// generic "Runtime" copy: a peer that never reported a kind is shown without
+/// one rather than guessed at.
+fn host_kind_label_for(locale: Locale, kind: RemoteServerKind) -> &'static str {
+    match kind {
+        RemoteServerKind::Desktop => locale::text_for(locale, "Desktop", "桌面端", "桌面版"),
+        RemoteServerKind::Headless => {
+            locale::text_for(locale, "Headless server", "无头服务器", "無頭伺服器")
+        }
+        RemoteServerKind::Unknown => locale::common_for(locale, "Runtime"),
+    }
+}
+
+fn host_kind_label(kind: RemoteServerKind) -> &'static str {
+    host_kind_label_for(locale::current(), kind)
+}
+
 /// One read-only field of the runtime detail page: a label column and the
 /// stored value beside it.
 fn host_detail_field(
@@ -18608,7 +18684,10 @@ mod tests {
         app.update(cx, |app, _| {
             let bundle = host_bundle("studio-desktop", "studio.local");
             app.active_host_id = Some(bundle.host_id().to_string());
-            app.known_hosts = vec![MobileHostEntry::from_bundle(&bundle)];
+            app.known_hosts = vec![MobileHostEntry::from_bundle(
+                &bundle,
+                RemoteServerKind::Unknown,
+            )];
         });
         assert_eq!(
             app.read_with(cx, |app, _| app.active_host_label()),
@@ -18649,7 +18728,10 @@ mod tests {
         let bundle = host_bundle("studio-desktop", "studio.local");
         app.update(cx, |app, _| {
             app.active_host_id = Some(bundle.host_id().to_string());
-            app.known_hosts = vec![MobileHostEntry::from_bundle(&bundle)];
+            app.known_hosts = vec![MobileHostEntry::from_bundle(
+                &bundle,
+                RemoteServerKind::Unknown,
+            )];
         });
 
         for overlay in [
@@ -18663,7 +18745,12 @@ mod tests {
                 app.update(cx, |app, _| {
                     app.overlay = Some(overlay);
                     app.host_overlay_target = Some("studio-desktop".to_string());
-                    app.known_hosts = hosts.iter().map(MobileHostEntry::from_bundle).collect();
+                    app.known_hosts = hosts
+                        .iter()
+                        .map(|bundle| {
+                            MobileHostEntry::from_bundle(bundle, RemoteServerKind::Unknown)
+                        })
+                        .collect();
                 });
                 cx.update(|window, cx| {
                     let _ = window.draw(cx);
@@ -18676,7 +18763,10 @@ mod tests {
         app.update(cx, |app, cx| {
             app.overlay = None;
             app.host_overlay_target = None;
-            app.known_hosts = vec![MobileHostEntry::from_bundle(&bundle)];
+            app.known_hosts = vec![MobileHostEntry::from_bundle(
+                &bundle,
+                RemoteServerKind::Unknown,
+            )];
             app.active_host_id = Some(bundle.host_id().to_string());
             app.start_drawer_snap(DrawerPage::Sessions.open_offset(), None, cx);
         });
@@ -18725,5 +18815,106 @@ mod tests {
         );
         assert!(RuntimeStatus::Reconnecting.label(3).contains('3'));
         assert!(!RuntimeStatus::Reconnecting.label(1).contains('1'));
+    }
+
+    /// The detail page's type field is the only place the phone explains what
+    /// the peer is; an unreported kind must keep the generic runtime copy.
+    #[test]
+    fn runtime_kind_labels_are_localized_and_unknown_stays_generic() {
+        use vibex_ui::locale::Locale;
+
+        for locale in [Locale::En, Locale::ZhCn, Locale::ZhTw] {
+            assert_eq!(
+                host_kind_label_for(locale, RemoteServerKind::Unknown),
+                locale::common_for(locale, "Runtime"),
+                "{locale:?}"
+            );
+            // The generic copy is what every locale already showed, so a peer
+            // that never reported its kind renders exactly as before.
+            assert!(!host_kind_label_for(locale, RemoteServerKind::Unknown).is_empty());
+        }
+        assert_eq!(
+            host_kind_label_for(Locale::En, RemoteServerKind::Desktop),
+            "Desktop"
+        );
+        assert_eq!(
+            host_kind_label_for(Locale::En, RemoteServerKind::Headless),
+            "Headless server"
+        );
+        assert_eq!(
+            host_kind_label_for(Locale::ZhCn, RemoteServerKind::Desktop),
+            "桌面端"
+        );
+        assert_eq!(
+            host_kind_label_for(Locale::ZhCn, RemoteServerKind::Headless),
+            "无头服务器"
+        );
+        assert_eq!(
+            host_kind_label_for(Locale::ZhTw, RemoteServerKind::Desktop),
+            "桌面版"
+        );
+        assert_eq!(
+            host_kind_label_for(Locale::ZhTw, RemoteServerKind::Headless),
+            "無頭伺服器"
+        );
+        // Every kind resolves through all three locale arms rather than
+        // sharing one string, so no arm can silently fall back to English.
+        for kind in [
+            RemoteServerKind::Desktop,
+            RemoteServerKind::Headless,
+            RemoteServerKind::Unknown,
+        ] {
+            let labels = [
+                host_kind_label_for(Locale::En, kind),
+                host_kind_label_for(Locale::ZhCn, kind),
+                host_kind_label_for(Locale::ZhTw, kind),
+            ];
+            assert!(
+                labels.iter().all(|label| !label.is_empty()),
+                "{kind:?} has an empty label"
+            );
+            assert!(
+                labels[0] != labels[1] && labels[1] != labels[2] && labels[0] != labels[2],
+                "{kind:?} shares copy between locales: {labels:?}"
+            );
+        }
+    }
+
+    /// A claim route that cannot report the peer's kind must not erase one an
+    /// earlier claim or connect learned, while a claim that does report one
+    /// replaces it. Re-pairing over an offer link is the case that matters.
+    #[gpui::test]
+    fn remembering_a_host_never_downgrades_a_known_kind(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        let bundle = host_bundle("studio-desktop", "studio.local");
+
+        app.update(cx, |app, _| {
+            app.remember_host(&bundle, RemoteServerKind::Desktop);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.known_hosts[0].server_kind),
+            RemoteServerKind::Desktop
+        );
+
+        app.update(cx, |app, _| {
+            app.remember_host(&bundle, RemoteServerKind::Unknown);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.known_hosts[0].server_kind),
+            RemoteServerKind::Desktop
+        );
+
+        app.update(cx, |app, _| {
+            app.remember_host(&bundle, RemoteServerKind::Headless);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.known_hosts[0].server_kind),
+            RemoteServerKind::Headless
+        );
     }
 }

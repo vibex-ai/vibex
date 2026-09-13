@@ -7,7 +7,7 @@ use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{
     DeviceId, PAIRING_CODE_FRAGMENT_PREFIX, RelayPeerId, RemoteAuthProof, RemoteClientType,
     RemoteDeviceStatus, RemoteLanPairingStatusResponse, RemotePairingCodeLink, RemotePairingOffer,
-    RemotePairingTransport, RequestId,
+    RemotePairingTransport, RemoteServerKind, RequestId,
 };
 use vibex_remote_client::{
     AutoRemoteTransport, AutoRemoteTransportConfig, ClientDeviceIdentity, DirectCandidate,
@@ -123,6 +123,30 @@ impl fmt::Debug for MobileRelayCandidate {
             .debug_struct("MobileRelayCandidate")
             .field("has_pc_public_key", &!self.pc_public_key.is_empty())
             .finish()
+    }
+}
+
+/// A completed pairing claim: the credential the phone persists, plus the kind
+/// of runtime the peer reported while claiming.
+///
+/// The kind is deliberately kept out of [`MobileCredentialBundle`]. That struct
+/// is a `deny_unknown_fields` credential schema, so a key added there would
+/// make a hosts file written by this build unreadable — and therefore
+/// quarantined — by the build that wrote the previous one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MobilePairedRuntime {
+    pub bundle: MobileCredentialBundle,
+    /// `Unknown` when the claim route does not report the kind (offer-based
+    /// pairing); the first successful connect fills it in.
+    pub server_kind: RemoteServerKind,
+}
+
+impl MobilePairedRuntime {
+    fn unknown(bundle: MobileCredentialBundle) -> Self {
+        Self {
+            bundle,
+            server_kind: RemoteServerKind::Unknown,
+        }
     }
 }
 
@@ -289,7 +313,7 @@ impl MobileCredentialBundle {
 pub async fn claim_server_pairing_code(
     server_url: String,
     pairing_code: String,
-) -> BackendResult<MobileCredentialBundle> {
+) -> BackendResult<MobilePairedRuntime> {
     let server_url = server_url.trim().trim_end_matches('/').to_string();
     let bundle = vibex_remote_client::claim_pairing_code_with_identity(
         server_url.clone(),
@@ -298,6 +322,7 @@ pub async fn claim_server_pairing_code(
         cfg!(debug_assertions),
     )
     .await?;
+    let server_kind = bundle.server_kind;
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
         record: bundle.credential,
@@ -313,7 +338,10 @@ pub async fn claim_server_pairing_code(
         }),
     };
     bundle.validate()?;
-    Ok(bundle)
+    Ok(MobilePairedRuntime {
+        bundle,
+        server_kind,
+    })
 }
 
 /// Pair from the connection string a `vibex-server` operator printed.
@@ -323,7 +351,7 @@ pub async fn claim_server_pairing_code(
 /// trusts bundled public roots and never user or system stores, so a pinned
 /// certificate is the only way this client reaches a LAN runtime that has no
 /// public CA at all.
-pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobileCredentialBundle> {
+pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobilePairedRuntime> {
     let link = RemotePairingCodeLink::parse(&link)?;
     let server_url = link.normalized_server_url()?;
     let pinned_tls_certificate_der = link.tls_certificate_der.clone();
@@ -333,6 +361,7 @@ pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobileCreden
         cfg!(debug_assertions),
     )
     .await?;
+    let server_kind = bundle.server_kind;
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
         record: bundle.credential,
@@ -360,10 +389,13 @@ pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobileCreden
         }),
     };
     bundle.validate()?;
-    Ok(bundle)
+    Ok(MobilePairedRuntime {
+        bundle,
+        server_kind,
+    })
 }
 
-pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle> {
+pub async fn claim_pairing_link(link: String) -> BackendResult<MobilePairedRuntime> {
     // A `vibex-server` connection string is a different entry point than the
     // desktop-advertised pairing offer, but it reaches the phone through the
     // same scanner, so both shapes are accepted here.
@@ -450,13 +482,15 @@ pub async fn claim_pairing_link(link: String) -> BackendResult<MobileCredentialB
         route: Some(route_bundle(&offer)),
     };
     bundle.validate()?;
-    Ok(bundle)
+    // The pairing offer carries no runtime kind, so this route cannot report
+    // one; the claim response is a device grant only.
+    Ok(MobilePairedRuntime::unknown(bundle))
 }
 
 pub async fn claim_lan_pairing(
     session: &LanPairingSession,
     status: RemoteLanPairingStatusResponse,
-) -> BackendResult<MobileCredentialBundle> {
+) -> BackendResult<MobilePairedRuntime> {
     let claim = session.claim_approved(status).await?;
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
@@ -479,13 +513,13 @@ pub async fn claim_lan_pairing(
         route: Some(route_bundle(&claim.offer)),
     };
     bundle.validate()?;
-    Ok(bundle)
+    Ok(MobilePairedRuntime::unknown(bundle))
 }
 
 pub async fn claim_zero_config_lan_pairing(
     session: &mut ZeroConfigLanPairingSession,
     status: RemoteLanPairingStatusResponse,
-) -> BackendResult<MobileCredentialBundle> {
+) -> BackendResult<MobilePairedRuntime> {
     let claim = session.claim_approved(status).await?;
     let mut route = route_bundle(&claim.offer);
     route
@@ -516,7 +550,8 @@ pub async fn claim_zero_config_lan_pairing(
         route: Some(route),
     };
     bundle.validate()?;
-    Ok(bundle)
+    // No kind is available before the first connect on this route either.
+    Ok(MobilePairedRuntime::unknown(bundle))
 }
 
 /// True when the scanned or pasted entry is a `vibex-server` connection

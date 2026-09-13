@@ -7029,6 +7029,18 @@ impl VibexWorkbench {
         self.park_local_runtime(cx);
         let runtime_id = client.runtime_id.clone();
         self.runtime_connect_errors.remove(&runtime_id);
+        // The handshake repeats what the claim learned, so a runtime that was
+        // upgraded or re-hosted since it was paired corrects itself here.
+        if let Some(kind) = client
+            .backend
+            .transport()
+            .server_info()
+            .map(|info| info.server_kind)
+            && let Some(runtime) = self.runtime_registry.remote_mut(&runtime_id)
+            && runtime.observe_server_kind(kind)
+        {
+            self.persist_runtime_registry(cx);
+        }
         let backend = client.backend.clone();
         let sidebar_authority = remote_authority_key(&client.credential);
         self.remote_client = Some(client);
@@ -7714,10 +7726,22 @@ impl VibexWorkbench {
         let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(runtime_detail_row(
             locale::text("Type", "类型", "類型"),
-            if is_local {
-                locale::text("This device", "本机", "本機").to_string()
-            } else {
-                locale::text("Remote runtime", "远程运行时", "遠端執行階段").to_string()
+            match (
+                is_local,
+                runtime.as_ref().map(RegisteredRuntime::server_kind),
+            ) {
+                (true, _) => locale::text("This device", "本机", "本機").to_string(),
+                (false, Some(vibex_core::RemoteServerKind::Desktop)) => {
+                    locale::text("Desktop", "桌面端", "桌面版").to_string()
+                }
+                (false, Some(vibex_core::RemoteServerKind::Headless)) => {
+                    locale::text("Headless server", "无头服务器", "無頭伺服器").to_string()
+                }
+                // A peer that never said what it is keeps the generic label
+                // rather than being guessed at.
+                (false, _) => {
+                    locale::text("Remote runtime", "远程运行时", "遠端執行階段").to_string()
+                }
             },
             cx,
         ));

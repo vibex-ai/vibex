@@ -374,6 +374,10 @@ pub struct RemoteGatewayConfig {
     /// rate limits by spoofing it.
     pub trust_forwarded_headers: bool,
     pub peer_limits: RemoteGatewayPeerLimits,
+    /// What a paired client should call this runtime. The wire contract is
+    /// identical either way; the kind only tells the operator whether the peer
+    /// is a desktop they can also sit in front of or a headless server.
+    pub server_kind: vibex_core::RemoteServerKind,
 }
 
 impl Default for RemoteGatewayConfig {
@@ -385,6 +389,7 @@ impl Default for RemoteGatewayConfig {
             tls_identity: None,
             trust_forwarded_headers: false,
             peer_limits: RemoteGatewayPeerLimits::default(),
+            server_kind: vibex_core::RemoteServerKind::Unknown,
             allowed_hosts: vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
@@ -1506,6 +1511,7 @@ impl RemoteGateway {
             capabilities: gateway_capabilities(),
             enabled_features: gateway_features(&state),
             device_permissions: remote_permissions_for_level(auth.permission_level),
+            server_kind: state.config.server_kind,
             session_epoch: context.session_epoch,
             connection_id: RequestId::new(),
             server_time_ms: unix_timestamp_ms(),
@@ -2780,6 +2786,7 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "lanPairingStatusPath": "/api/v2/pairing/lan/status",
         "wsTicketPath": "/api/v2/ws-ticket",
         "deploymentMode": state.config.deployment_mode.wire_name(),
+        "serverKind": state.config.server_kind.wire_name(),
         "tlsPolicy": state.config.tls_policy.wire_name(),
         "sessionEpoch": state.session_epoch,
         "enabledFeatures": gateway_features(&state),
@@ -3143,6 +3150,7 @@ async fn run_v2_socket(socket: WebSocket, state: GatewayState, ticket: WsTicketR
         capabilities: gateway_capabilities(),
         enabled_features: gateway_features(&state),
         device_permissions: remote_permissions_for_level(ticket.auth.permission_level),
+        server_kind: state.config.server_kind,
         session_epoch: state.session_epoch,
         connection_id: connection_id.clone(),
         server_time_ms: unix_timestamp_ms(),
@@ -6284,6 +6292,52 @@ mod tests {
             Ok(_) => panic!("non-contributory identity key must be rejected"),
             Err(error) => assert_eq!(error.code, "remote_device_identity_key_invalid"),
         }
+    }
+
+    /// A paired client has to be able to tell a desktop it can also sit in
+    /// front of from a headless server, and the claim reads this endpoint
+    /// before the handshake ever happens.
+    #[tokio::test]
+    async fn info_endpoint_reports_the_server_kind() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let mut headless = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        headless.server_kind = vibex_core::RemoteServerKind::Headless;
+        let router = test_gateway(&directory, headless).router().unwrap();
+        let response = router
+            .oneshot(
+                HttpRequest::get("/api/v2/info")
+                    .header(HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("\"serverKind\":\"headless\""),
+            "the claim must be able to learn the peer kind: {body}"
+        );
+
+        let mut desktop = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        desktop.server_kind = vibex_core::RemoteServerKind::Desktop;
+        let router = test_gateway(&directory, desktop).router().unwrap();
+        let response = router
+            .oneshot(
+                HttpRequest::get("/api/v2/info")
+                    .header(HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"serverKind\":\"desktop\""),
+            "a desktop-hosted runtime must say so"
+        );
     }
 
     #[tokio::test]
