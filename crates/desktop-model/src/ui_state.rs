@@ -492,6 +492,22 @@ impl SidebarUiState {
         self.normalize_authority_arrangements();
     }
 
+    /// The arrangement remembered for `authority`.
+    ///
+    /// The embedded runtime's sidebar bridge answers clients that are paired to
+    /// this machine, so it needs the embedded arrangement even while the shell
+    /// is displaying another authority and the live fields hold that
+    /// authority's arrangement instead.
+    pub fn arrangement_for(&self, authority: &str) -> SidebarAuthorityArrangement {
+        if self.active_authority() == authority {
+            return self.arrangement();
+        }
+        self.authority_arrangements
+            .get(authority)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Snapshot of the authority-scoped fields.
     pub fn arrangement(&self) -> SidebarAuthorityArrangement {
         SidebarAuthorityArrangement {
@@ -1709,6 +1725,55 @@ mod tests {
             SidebarUiState::LOCAL_AUTHORITY
         );
         assert_eq!(round_trip.sidebar.project_order, vec!["project-local"]);
+    }
+
+    #[test]
+    fn a_parked_authority_keeps_answering_after_another_one_is_displayed() {
+        let mut state = DesktopUiStateV1::default();
+        state.sidebar.project_order = vec!["project-local".into()];
+        state
+            .sidebar
+            .collapsed_project_ids
+            .insert("project-local".into());
+
+        // While the embedded authority is displayed the live fields are its
+        // answer, which is what the sidebar bridge forwards.
+        assert_eq!(
+            state
+                .sidebar
+                .arrangement_for(SidebarUiState::LOCAL_AUTHORITY)
+                .project_order,
+            vec!["project-local"]
+        );
+
+        state.sidebar.switch_authority("server:abc");
+        state.sidebar.project_order = vec!["project-remote".into()];
+        state
+            .sidebar
+            .collapsed_project_ids
+            .insert("project-remote".into());
+
+        // The bridge belongs to the embedded runtime, so it must still answer
+        // with the embedded arrangement rather than the displayed one.
+        let parked = state
+            .sidebar
+            .arrangement_for(SidebarUiState::LOCAL_AUTHORITY);
+        assert_eq!(parked.project_order, vec!["project-local"]);
+        assert!(parked.collapsed_project_ids.contains("project-local"));
+        assert!(!parked.collapsed_project_ids.contains("project-remote"));
+
+        // The displayed authority keeps its own answer.
+        let displayed = state.sidebar.arrangement_for("server:abc");
+        assert_eq!(displayed.project_order, vec!["project-remote"]);
+
+        // An authority nothing was ever remembered for is empty, not the live
+        // arrangement misattributed to it.
+        assert!(
+            state
+                .sidebar
+                .arrangement_for("server:never-seen")
+                .is_empty()
+        );
     }
 
     #[test]

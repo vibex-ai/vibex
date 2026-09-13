@@ -6207,6 +6207,33 @@ impl VibexWorkbench {
         ));
     }
 
+    /// The sidebar arrangement the embedded runtime's remote clients see.
+    ///
+    /// The bridge only exists on the embedded runtime, so every caller is
+    /// paired to this machine and must be answered with the embedded
+    /// authority's arrangement — never with whichever authority this shell
+    /// happens to be displaying. While a remote runtime is installed the
+    /// embedded arrangement is parked, so the live fields are the wrong answer.
+    fn sidebar_organization_view_for(&self, authority: &str) -> SidebarOrganizationView {
+        let mut view = self.sidebar_organization_view();
+        if self.ui_state.sidebar.active_authority() == authority {
+            return view;
+        }
+        let parked = self.ui_state.sidebar.arrangement_for(authority);
+        view.organization = parked.organization;
+        view.collapsed_project_ids = parked.collapsed_project_ids;
+        view.collapsed_workspace_ids = parked.collapsed_workspace_ids;
+        view.pinned_session_ids = parked.pinned_session_ids;
+        view.session_order = parked.session_order;
+        view.session_order_anchored_at_ms = parked.session_order_anchored_at_ms;
+        view.project_order = parked.project_order;
+        view.workspace_order = parked.workspace_order;
+        view.project_appearances = parked.project_appearances;
+        view.worktree_titles = parked.worktree_titles;
+        view.project_location_preferences = parked.project_location_preferences;
+        view
+    }
+
     fn sidebar_organization_view(&self) -> SidebarOrganizationView {
         let mut view = SidebarOrganizationView {
             revision: 0,
@@ -6274,10 +6301,25 @@ impl VibexWorkbench {
         request: SidebarOrganizationRequest,
         cx: &mut Context<Self>,
     ) {
+        // The bridge belongs to the embedded runtime, so its callers are
+        // always talking about the embedded authority's arrangement.
+        let authority = SidebarUiState::LOCAL_AUTHORITY;
+        let showing_that_authority = self.ui_state.sidebar.active_authority() == authority;
         match request {
             SidebarOrganizationRequest::Snapshot { .. } => {
-                let snapshot = self.sidebar_organization_view().to_remote();
+                let snapshot = self.sidebar_organization_view_for(authority).to_remote();
                 request.respond(Ok(snapshot));
+            }
+            SidebarOrganizationRequest::Mutate { .. } if !showing_that_authority => {
+                // Reading the parked arrangement is safe; validating a change
+                // is not. A move is checked against the session-to-project map
+                // of the loaded sessions, and those belong to the runtime this
+                // shell is displaying, not to the embedded one. Refusing is
+                // better than accepting a change against the wrong tree.
+                request.respond(Err(vibex_core::VibexError::capability(
+                    "remote_sidebar_organization_authority_not_displayed",
+                    "the desktop is driving another runtime, so its sidebar cannot be rearranged right now",
+                )));
             }
             SidebarOrganizationRequest::Mutate {
                 ref mutation,
@@ -6285,7 +6327,7 @@ impl VibexWorkbench {
                 ..
             } => {
                 let mutation = mutation.as_ref().clone();
-                let mut view = self.sidebar_organization_view();
+                let mut view = self.sidebar_organization_view_for(authority);
                 if expected_revision.is_some_and(|revision| revision != view.revision) {
                     request.respond(Err(sidebar_mutation_error(
                         SidebarMutationRejection::StaleRevision,
@@ -6321,7 +6363,7 @@ impl VibexWorkbench {
                         self.invalidate_sidebar_projection_cache();
                         self.publish_sidebar_invalidation();
                         cx.notify();
-                        let snapshot = self.sidebar_organization_view().to_remote();
+                        let snapshot = self.sidebar_organization_view_for(authority).to_remote();
                         request.respond(Ok(snapshot));
                     }
                     // The request was already reflected in the tree — a toggle
@@ -6330,7 +6372,7 @@ impl VibexWorkbench {
                     // invalidation round trip and just hand back the current
                     // snapshot for the client to resynchronize with.
                     Ok(SidebarMutationOutcome::AlreadyApplied) => {
-                        let snapshot = self.sidebar_organization_view().to_remote();
+                        let snapshot = self.sidebar_organization_view_for(authority).to_remote();
                         request.respond(Ok(snapshot));
                     }
                     Err(rejection) => request.respond(Err(sidebar_mutation_error(rejection))),
@@ -7181,9 +7223,9 @@ impl VibexWorkbench {
     /// switching to a remote runtime does not destroy local work and switching
     /// back needs no boot.
     ///
-    /// The sidebar bridge stops with the attachments: it answers the embedded
-    /// runtime's remote clients from the arrangement the shell is displaying,
-    /// which is another authority's while a remote runtime is installed.
+    /// The sidebar bridge deliberately stays attached: the embedded runtime
+    /// keeps serving its own paired devices, and the bridge now answers them
+    /// from the parked embedded arrangement instead of the displayed one.
     fn park_local_runtime(&mut self, cx: &mut Context<Self>) {
         self.agent_poll_task = None;
         self.runtime_heartbeat_task = None;
@@ -7191,7 +7233,9 @@ impl VibexWorkbench {
         self.agent_projection_task = None;
         self.update_status_task = None;
         self.event_task = None;
-        self.sidebar_organization_task = None;
+        // The sidebar bridge stays attached: it answers the embedded runtime's
+        // own clients, and that runtime is still running. It reads the parked
+        // embedded arrangement rather than the displayed one.
         self.backend = None;
         self.code_workbench
             .update(cx, |workbench, cx| workbench.clear_backend(cx));
