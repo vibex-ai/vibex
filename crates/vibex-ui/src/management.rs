@@ -295,6 +295,12 @@ impl AgentProviderBindingEditorState {
             .is_some_and(|capability| capability.form_controls.contains(&control))
     }
 
+    /// The endpoint the Agent pins itself to when it accepts no caller-supplied
+    /// base URL. Clients keep the endpoint control visible but read-only.
+    pub fn fixed_endpoint(&self) -> Option<&str> {
+        self.capability.as_ref()?.fixed_endpoint()
+    }
+
     pub fn credential_surface(&self) -> ProjectionCredentialSurface {
         use vibex_core::AgentProjectionFormControl as Control;
         if self.shows(Control::ApiKey) {
@@ -2180,6 +2186,43 @@ mod tests {
         assert!(editor.shows(vibex_core::AgentProjectionFormControl::ApiKey));
         assert!(editor.shows(vibex_core::AgentProjectionFormControl::Endpoint));
         assert!(editor.shows(vibex_core::AgentProjectionFormControl::Model));
+    }
+
+    #[test]
+    fn cline_capability_pins_the_endpoint_that_the_agent_owns() {
+        let registry = vibex_core::AgentProviderProjectionRegistry::builtin().unwrap();
+        let identity = vibex_core::AgentRuntimeVersionIdentity {
+            route: vibex_core::AgentRuntimeRouteKey {
+                agent_id: AgentId::parse("cline").unwrap(),
+                transport_kind: vibex_core::TransportKind::Acp,
+                adapter_id: vibex_core::AcpAdapterId::parse("cline-acp").unwrap(),
+            },
+            adapter_version: None,
+            agent_version: Some("3.0.60".to_string()),
+            runtime_dependencies: std::collections::BTreeMap::new(),
+            source: vibex_core::AgentVersionSource::Detected,
+        };
+        let resolution = registry.resolve(&identity).unwrap();
+        let capability = vibex_core::AgentProviderProjectionCapability::from_resolution(
+            &identity,
+            &resolution,
+            vibex_core::ProjectionAuthState::Ready,
+        );
+        let mut editor = AgentProviderBindingEditorState::default();
+        assert_eq!(editor.fixed_endpoint(), None);
+        editor.replace_capability(capability);
+
+        // The endpoint control stays visible so the pinned value can be shown,
+        // but clients render it read-only.
+        assert!(editor.shows(vibex_core::AgentProjectionFormControl::Endpoint));
+        assert_eq!(
+            editor.fixed_endpoint(),
+            Some(vibex_core::CLINE_FIXED_BASE_URL)
+        );
+        assert_eq!(
+            editor.credential_surface(),
+            ProjectionCredentialSurface::ApiKey
+        );
     }
 
     #[test]

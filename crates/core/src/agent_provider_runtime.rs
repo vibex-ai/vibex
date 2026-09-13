@@ -33,6 +33,14 @@ pub const AGENT_RUNTIME_PROBE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROBE_TIMEOUT_MS: u64 = 300_000;
 pub const MIN_PROBE_TIMEOUT_MS: u64 = 1_000;
 
+/// The endpoint Cline's own provider clients fall back to. Its ACP bridge
+/// resolves `CLINE_PROVIDER`, `CLINE_MODEL`, and `CLINE_API_KEY` from the
+/// environment and never reads the managed provider store, so a caller-supplied
+/// base URL cannot reach the request: the endpoint stays fixed at
+/// `api.openai.com`. Profiles bound to Cline are pinned to this value and the
+/// editor renders it read-only.
+pub const CLINE_FIXED_BASE_URL: &str = "https://api.openai.com/v1";
+
 /// A descriptor's product boundary.  This is intentionally separate from
 /// `ProjectionEvidenceState`: a documented AgentManaged capability is useful
 /// even when no operator account is available for a runtime smoke.
@@ -291,6 +299,7 @@ impl CatalogProjectionShape {
             self.provider_control,
             AgentProviderControl::Environment { .. }
                 | AgentProviderControl::ManagedConfigOverlay { .. }
+                | AgentProviderControl::FixedEndpoint { .. }
                 | AgentProviderControl::AdvertisedSessionOption { .. }
         )
     }
@@ -355,12 +364,14 @@ fn catalog_projection_shape(
                 ],
             )),
             // Cline's ACP bridge reads its provider id, key, and model from the
-            // environment and its provider settings from
-            // `<CLINE_DATA_DIR>/settings/providers.json`. Only the two
-            // OpenAI-shaped provider ids accept a caller-supplied base URL, so
-            // those are the only interfaces Vibex can project.
-            "cline" => Ok(overlay_projection_shape(
-                ConfigOverlayStrategy::ClineProvidersJson,
+            // environment (`CLINE_PROVIDER`, `CLINE_MODEL`, `CLINE_API_KEY`) and
+            // never consumes `<CLINE_DATA_DIR>/settings/providers.json`, so a
+            // caller-supplied endpoint cannot reach the request. The endpoint is
+            // therefore pinned to what Cline actually calls instead of being
+            // projected from the profile. The Model is applied over the ACP
+            // `model` config option.
+            "cline" => Ok(fixed_endpoint_projection_shape(
+                CLINE_FIXED_BASE_URL,
                 "CLINE_API_KEY",
                 vec![
                     catalog_interface(WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, true, true),
@@ -676,6 +687,36 @@ fn overlay_projection_shape(
             accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
         },
         model_control: AgentModelControl::ManagedConfigOverlay { strategy },
+        credential_kinds: vec![AgentCredentialKind::ApiKey],
+        model_interfaces,
+        runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
+        switch_behavior: ProviderSwitchBehavior::RestartAndResume,
+        evidence_state: ProjectionEvidenceState::Documented,
+        capability_diagnostic_code: Some("agent_projection_runtime_verification_required"),
+    }
+}
+
+/// A replaceable-provider Agent that accepts an API key and a Model, but owns
+/// its own endpoint. The profile's base URL is pinned to `base_url` rather than
+/// projected, so clients render the endpoint control read-only.
+fn fixed_endpoint_projection_shape(
+    base_url: &str,
+    secret_env_key: &str,
+    model_interfaces: Vec<AgentModelInterfaceDescriptor>,
+) -> CatalogProjectionShape {
+    CatalogProjectionShape {
+        provider_control: AgentProviderControl::FixedEndpoint {
+            base_url: base_url.to_string(),
+        },
+        credential_control: AgentCredentialControl::Environment {
+            secret_env_key: secret_env_key.to_string(),
+            accepted_secret_kinds: vec![ProviderSecretKind::ApiKey],
+        },
+        // The Agent advertises and applies the standard ACP `model` config
+        // option, which is how the selected Model reaches the session.
+        model_control: AgentModelControl::AcpConfigOption {
+            aliases: vec!["model".to_string()],
+        },
         credential_kinds: vec![AgentCredentialKind::ApiKey],
         model_interfaces,
         runtime_home_strategy: AgentRuntimeHomeStrategy::VibexPrivate,
@@ -1745,6 +1786,7 @@ mod tests {
                     descriptor.provider_control,
                     AgentProviderControl::Environment { .. }
                         | AgentProviderControl::ManagedConfigOverlay { .. }
+                        | AgentProviderControl::FixedEndpoint { .. }
                 ));
                 assert!(matches!(
                     descriptor.credential_control,
@@ -1755,6 +1797,12 @@ mod tests {
                         AgentProviderControl::Environment { .. },
                         AgentModelControl::AcpConfigOption { .. },
                     ) if descriptor.route.agent_id.as_str() == "antigravity" => {}
+                    // An Agent-owned endpoint still applies the selected Model
+                    // over the ACP `model` config option.
+                    (
+                        AgentProviderControl::FixedEndpoint { .. },
+                        AgentModelControl::AcpConfigOption { .. },
+                    ) => {}
                     (
                         AgentProviderControl::Environment { .. },
                         AgentModelControl::ProcessEnvironment { .. },

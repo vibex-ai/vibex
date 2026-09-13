@@ -692,9 +692,12 @@ pub enum ConfigOverlayStrategy {
     StructuredJsonOverlay,
     StructuredTomlOverlay,
     StructuredYamlOverlay,
-    /// Cline CLI's `<CLINE_DATA_DIR>/settings/providers.json`. The bridge reads
-    /// the provider id, base URL and Model from this store, and the same
-    /// provider id has to be present in `CLINE_PROVIDER`.
+    /// Cline CLI's `<CLINE_DATA_DIR>/settings/providers.json`. Retained so
+    /// stored capability snapshots keep deserializing: Cline's ACP bridge reads
+    /// `CLINE_PROVIDER`, `CLINE_MODEL`, and `CLINE_API_KEY` from the
+    /// environment and never consumes this store, so no catalog descriptor
+    /// projects it and Cline declares
+    /// [`AgentProviderControl::FixedEndpoint`] instead.
     ClineProvidersJson,
     CrowCliYaml,
     DiracToml,
@@ -715,9 +718,21 @@ pub enum ConfigOverlayStrategy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentProviderControl {
-    Environment { base_url_key: Option<String> },
-    ManagedConfigOverlay { strategy: ConfigOverlayStrategy },
-    AdvertisedSessionOption { option_ids: Vec<String> },
+    Environment {
+        base_url_key: Option<String>,
+    },
+    ManagedConfigOverlay {
+        strategy: ConfigOverlayStrategy,
+    },
+    /// The Agent owns the endpoint: it accepts no caller-supplied base URL, so
+    /// the profile is pinned to `base_url` instead of projecting one. The
+    /// endpoint control stays visible but is not editable.
+    FixedEndpoint {
+        base_url: String,
+    },
+    AdvertisedSessionOption {
+        option_ids: Vec<String>,
+    },
     AgentManaged,
     LocalModel,
     ServiceMarketplace,
@@ -1170,6 +1185,15 @@ pub struct AgentProviderProjectionCapability {
 }
 
 impl AgentProviderProjectionCapability {
+    /// The endpoint the Agent pins itself to when it accepts no caller-supplied
+    /// base URL. Clients keep the endpoint control visible but read-only.
+    pub fn fixed_endpoint(&self) -> Option<&str> {
+        match &self.provider_control {
+            AgentProviderControl::FixedEndpoint { base_url } => Some(base_url.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn from_resolution(
         identity: &AgentRuntimeVersionIdentity,
         resolution: &AgentProviderProjectionResolution,
@@ -1179,7 +1203,8 @@ impl AgentProviderProjectionCapability {
         let mut controls = BTreeSet::from([AgentProjectionFormControl::ProjectionPreview]);
         match descriptor.provider_control {
             AgentProviderControl::Environment { .. }
-            | AgentProviderControl::ManagedConfigOverlay { .. } => {
+            | AgentProviderControl::ManagedConfigOverlay { .. }
+            | AgentProviderControl::FixedEndpoint { .. } => {
                 controls.insert(AgentProjectionFormControl::Endpoint);
             }
             AgentProviderControl::AgentManaged => {

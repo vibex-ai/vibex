@@ -1309,6 +1309,18 @@ fn project_provider_control(
                 value: option_ids.join(","),
             });
         }
+        AgentProviderControl::FixedEndpoint { base_url } => {
+            // The Agent owns the endpoint and accepts no caller-supplied base
+            // URL, so nothing is projected from the profile. The pinned origin
+            // is still previewed so the plan matches what the Agent will call.
+            targets.push(ProjectionTargetPreview {
+                field: "endpoint".to_string(),
+                target_kind: ProjectionTargetKind::AgentManaged,
+                target: "Agent-owned endpoint".to_string(),
+                value_preview: redact_endpoint(base_url),
+                secret: false,
+            });
+        }
         AgentProviderControl::AgentManaged => targets.push(state_target(
             ProjectionTargetKind::AgentManaged,
             "Agent account settings",
@@ -5060,6 +5072,7 @@ mod tests {
     struct TypedProjectionExpectation {
         agent_id: &'static str,
         base_url_key: Option<&'static str>,
+        fixed_base_url: Option<&'static str>,
         secret_env_key: &'static str,
         model_env_key: Option<&'static str>,
         overlay_path: Option<&'static str>,
@@ -5072,6 +5085,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "antigravity",
                 base_url_key: Some("GOOGLE_GEMINI_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "GEMINI_API_KEY",
                 model_env_key: None,
                 overlay_path: None,
@@ -5081,6 +5095,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "copilot",
                 base_url_key: Some("COPILOT_PROVIDER_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "COPILOT_PROVIDER_API_KEY",
                 model_env_key: Some("COPILOT_MODEL"),
                 overlay_path: None,
@@ -5090,15 +5105,17 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "cline",
                 base_url_key: None,
+                fixed_base_url: Some(vibex_core::CLINE_FIXED_BASE_URL),
                 secret_env_key: "CLINE_API_KEY",
                 model_env_key: None,
-                overlay_path: Some("settings/providers.json"),
-                overlay_format: Some("json"),
+                overlay_path: None,
+                overlay_format: None,
                 runtime_home_env_key: Some("CLINE_DATA_DIR"),
             },
             TypedProjectionExpectation {
                 agent_id: "codebuddy-code",
                 base_url_key: Some("CODEBUDDY_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "CODEBUDDY_API_KEY",
                 model_env_key: Some("CODEBUDDY_MODEL"),
                 overlay_path: None,
@@ -5108,6 +5125,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "codewhale",
                 base_url_key: Some("CODEWHALE_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "OPENAI_API_KEY",
                 model_env_key: Some("CODEWHALE_MODEL"),
                 overlay_path: None,
@@ -5117,6 +5135,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "crow-cli",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_CROW_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config.yaml"),
@@ -5126,6 +5145,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "deepseek-harness",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "DEEPSEEK_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("settings.yaml"),
@@ -5135,6 +5155,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "dirac",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "OPENAI_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("data/globalState.json"),
@@ -5144,6 +5165,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "factory-droid",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_FACTORY_DROID_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("settings.json"),
@@ -5153,6 +5175,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "gemini",
                 base_url_key: Some("GOOGLE_GEMINI_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "GEMINI_API_KEY",
                 model_env_key: Some("GEMINI_MODEL"),
                 overlay_path: None,
@@ -5162,6 +5185,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "glm-acp-agent",
                 base_url_key: Some("ACP_GLM_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "Z_AI_API_KEY",
                 model_env_key: Some("ACP_GLM_MODEL"),
                 overlay_path: None,
@@ -5171,6 +5195,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "goose",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_GOOSE_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config/custom_providers/vibex.json"),
@@ -5180,6 +5205,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "grok",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_GROK_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config.toml"),
@@ -5189,6 +5215,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "hermes",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_HERMES_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config.yaml"),
@@ -5198,6 +5225,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "kilo",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_KILO_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("kilo.json"),
@@ -5207,6 +5235,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "kimi",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_KIMI_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config.toml"),
@@ -5216,6 +5245,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "mistral-vibe",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_MISTRAL_VIBE_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("config.toml"),
@@ -5225,6 +5255,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "poolside",
                 base_url_key: Some("POOLSIDE_STANDALONE_BASE_URL"),
+                fixed_base_url: None,
                 secret_env_key: "POOLSIDE_API_KEY",
                 model_env_key: Some("POOLSIDE_STANDALONE_MODEL"),
                 overlay_path: None,
@@ -5234,6 +5265,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "pi",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_PI_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("models.json"),
@@ -5243,6 +5275,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "qwen-code",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_QWEN_CODE_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("settings.json"),
@@ -5252,6 +5285,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "stakpak",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "OPENAI_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("stakpak.toml"),
@@ -5261,6 +5295,7 @@ mod tests {
             TypedProjectionExpectation {
                 agent_id: "vtcode",
                 base_url_key: None,
+                fixed_base_url: None,
                 secret_env_key: "VIBEX_VTCODE_API_KEY",
                 model_env_key: None,
                 overlay_path: Some("vtcode.toml"),
@@ -5683,6 +5718,7 @@ mod tests {
                     descriptor.provider_control,
                     AgentProviderControl::Environment { .. }
                         | AgentProviderControl::ManagedConfigOverlay { .. }
+                        | AgentProviderControl::FixedEndpoint { .. }
                 )
             })
             .map(|descriptor| descriptor.route.agent_id.as_str())
@@ -5718,13 +5754,20 @@ mod tests {
             };
             assert_eq!(descriptor_secret_key, expected.secret_env_key);
 
-            match (&descriptor.provider_control, expected.base_url_key) {
-                (AgentProviderControl::Environment { base_url_key }, Some(expected_key)) => {
+            match (
+                &descriptor.provider_control,
+                expected.base_url_key,
+                expected.fixed_base_url,
+            ) {
+                (AgentProviderControl::Environment { base_url_key }, Some(expected_key), None) => {
                     assert_eq!(base_url_key.as_deref(), Some(expected_key))
                 }
-                (AgentProviderControl::ManagedConfigOverlay { .. }, None) => {}
-                (control, expected_key) => panic!(
-                    "{} provider control {control:?} does not match base URL expectation {expected_key:?}",
+                (AgentProviderControl::ManagedConfigOverlay { .. }, None, None) => {}
+                (AgentProviderControl::FixedEndpoint { base_url }, None, Some(expected_url)) => {
+                    assert_eq!(base_url, expected_url)
+                }
+                (control, expected_key, fixed_url) => panic!(
+                    "{} provider control {control:?} does not match base URL expectation {expected_key:?} / {fixed_url:?}",
                     expected.agent_id
                 ),
             }
@@ -5734,7 +5777,7 @@ mod tests {
                 }
                 (AgentModelControl::ManagedConfigOverlay { .. }, None) => {}
                 (AgentModelControl::AcpConfigOption { aliases }, None)
-                    if expected.agent_id == "antigravity" =>
+                    if matches!(expected.agent_id, "antigravity" | "cline") =>
                 {
                     assert_eq!(aliases, &["model"])
                 }
@@ -7039,22 +7082,24 @@ mod tests {
         }
     }
 
-    /// Cline's bridge reads a provider store plus `CLINE_PROVIDER` /
-    /// `CLINE_MODEL`, and only its two OpenAI-shaped ids accept a base URL.
+    /// Cline's bridge reads `CLINE_PROVIDER` / `CLINE_MODEL` from the
+    /// environment and ignores the profile's base URL, so the descriptor pins
+    /// the endpoint it actually calls and projects no provider store.
     #[test]
-    fn cline_projection_writes_the_provider_store_and_selects_the_provider_id() {
+    fn cline_projection_pins_the_agent_endpoint_and_selects_the_provider_id() {
         use vibex_core::{
-            WIRE_PROTOCOL_ANTHROPIC_MESSAGES, WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-            WIRE_PROTOCOL_OPENAI_RESPONSES,
+            AgentProviderControl, WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+            WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS, WIRE_PROTOCOL_OPENAI_RESPONSES,
         };
 
         let descriptor = provider_descriptor("cline");
-        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::ClineProvidersJson);
-        let endpoint = provider
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.kind == ModelProviderEndpointKind::Api)
-            .unwrap();
+        assert_eq!(
+            descriptor.provider_control,
+            AgentProviderControl::FixedEndpoint {
+                base_url: vibex_core::CLINE_FIXED_BASE_URL.to_string(),
+            }
+        );
+        let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
         let base = binding.configured_models[0].clone();
 
         for (protocol, expected_provider) in [
@@ -7063,18 +7108,34 @@ mod tests {
         ] {
             let mut model = base.clone();
             model.wire_protocol_id = protocol.to_string();
-            let overlay =
-                cline_overlay(&binding, Some(endpoint), Some(&model), "CLINE_API_KEY").unwrap();
-            let value: serde_json::Value = serde_json::from_str(&overlay).unwrap();
-            assert_eq!(value["version"], 1);
-            assert_eq!(value["lastUsedProvider"], expected_provider);
-            let settings = &value["providers"][expected_provider]["settings"];
-            assert_eq!(settings["provider"], expected_provider);
-            assert_eq!(settings["baseUrl"], endpoint.url);
-            assert_eq!(settings["model"], "model-a");
-            assert_eq!(
-                settings["apiKey"],
-                overlay_secret_placeholder("CLINE_API_KEY")
+            let mut binding = binding.clone();
+            binding.configured_models = vec![model.clone()];
+            let plan = AgentProviderProjectionEngine::plan(
+                &provider,
+                &runtime,
+                &binding,
+                &descriptor,
+                "cline-fixed-endpoint",
+            )
+            .unwrap();
+
+            // The profile endpoint is never projected, whatever it holds.
+            assert!(plan.overlay_files.is_empty());
+            let endpoint_targets = plan
+                .preview
+                .targets
+                .iter()
+                .filter(|target| target.field == "endpoint")
+                .collect::<Vec<_>>();
+            assert_eq!(endpoint_targets.len(), 1);
+            // The preview is redacted to the origin, so it can only assert the
+            // host; the pinned path is the descriptor contract asserted above.
+            assert_eq!(endpoint_targets[0].value_preview, "https://api.openai.com");
+            assert!(
+                !plan
+                    .non_secret_env
+                    .values()
+                    .any(|value| value.contains("provider.example.invalid"))
             );
 
             let mut env = BTreeMap::new();
@@ -7083,20 +7144,17 @@ mod tests {
                 env.get("CLINE_PROVIDER").map(String::as_str),
                 Some(expected_provider)
             );
-            assert_eq!(env.get("CLINE_MODEL").map(String::as_str), Some("model-a"));
+            assert_eq!(
+                env.get("CLINE_MODEL").map(String::as_str),
+                Some("agent-model")
+            );
         }
 
-        // A protocol Cline cannot point at a caller-supplied endpoint must not
-        // produce a provider id or an overlay.
+        // A protocol Cline cannot express through a provider id must not
+        // produce one.
         let mut anthropic = base.clone();
         anthropic.wire_protocol_id = WIRE_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
         assert!(cline_provider_id(Some(&anthropic)).is_none());
-        assert_eq!(
-            cline_overlay(&binding, Some(endpoint), Some(&anthropic), "CLINE_API_KEY")
-                .unwrap_err()
-                .code,
-            "agent_projection_cline_provider_unsupported"
-        );
     }
 
     fn provider_descriptor(agent_id: &str) -> AgentProviderProjectionDescriptor {

@@ -4660,7 +4660,13 @@ impl ManagementCenter {
         }
         let note = self.profile_note.read(cx).value().trim().to_string();
         let website_url = self.profile_website_url.read(cx).value().trim().to_string();
-        let base_url = self.profile_base_url.read(cx).value().trim().to_string();
+        // An Agent-owned endpoint is stored as the value the Agent calls, never
+        // as whatever the draft input happens to hold.
+        let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
+        let base_url = match &fixed_endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => self.profile_base_url.read(cx).value().trim().to_string(),
+        };
         let api_key = self.profile_api_key.read(cx).value().trim().to_string();
         let configured_models = normalized_provider_models(&self.profile_configured_models);
         let default_model = configured_models
@@ -4673,7 +4679,13 @@ impl ManagementCenter {
             (!website_url.is_empty()).then_some(website_url),
         );
         for (wire_api, input) in &self.profile_protocol_base_urls {
-            let value = input.read(cx).value().trim().to_string();
+            // A pinned endpoint cannot be overridden per protocol, so a stale
+            // override is cleared instead of being persisted.
+            let value = if fixed_endpoint.is_some() {
+                String::new()
+            } else {
+                input.read(cx).value().trim().to_string()
+            };
             provider_options = with_provider_option(
                 provider_options,
                 &wire_api.protocol_base_url_option_key(),
@@ -10447,10 +10459,14 @@ impl ManagementCenter {
             .shows(vibex_core::AgentProjectionFormControl::Model);
         let shows_api_key =
             self.projection_editor.credential_surface() == ProjectionCredentialSurface::ApiKey;
+        // An Agent-owned endpoint cannot be projected from the profile, so the
+        // field is locked to the value the Agent actually calls and the
+        // per-protocol overrides disappear with it.
+        let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
         let credential_control = self.render_projection_credential_control(cx);
         let model_section =
             shows_model.then(|| self.render_profile_model_section(selected_agent_id, cx));
-        let protocol_endpoints = shows_endpoint.then(|| {
+        let protocol_endpoints = (shows_endpoint && fixed_endpoint.is_none()).then(|| {
             let mut section = v_flex().w_full().gap_2p5();
             for (wire_api, input) in &self.profile_protocol_base_urls {
                 section = section.child(management_input_field(
@@ -10501,16 +10517,29 @@ impl ManagementCenter {
         // Connection: credential surface, base URL, and per-protocol overrides.
         let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
         if shows_endpoint {
-            connection_content = connection_content.child(management_input_field(
-                management_locale_text(
-                    "Default API request URL",
-                    "默认 API 请求地址",
-                    "預設 API 請求位址",
+            let endpoint_label = management_locale_text(
+                "Default API request URL",
+                "默认 API 请求地址",
+                "預設 API 請求位址",
+            );
+            connection_content = connection_content.child(match &fixed_endpoint {
+                Some(endpoint) => management_locked_field(
+                    endpoint_label,
+                    endpoint.clone(),
+                    management_locale_text(
+                        "The Cline Agent cannot change its base URL yet: it always calls api.openai.com.",
+                        "Cline 这个 Agent 暂时无法修改 baseUrl",
+                        "Cline 這個 Agent 暫時無法修改 baseUrl",
+                    ),
+                    cx,
                 ),
-                &self.profile_base_url,
-                false,
-                cx,
-            ));
+                None => management_input_field(
+                    endpoint_label,
+                    &self.profile_base_url,
+                    false,
+                    cx,
+                ),
+            });
         }
         if let Some(endpoints) = protocol_endpoints {
             connection_content = connection_content.child(endpoints);
@@ -17676,6 +17705,68 @@ fn management_input_field(
             Field::new()
                 .label(label)
                 .child(if masked { input.mask_toggle() } else { input }),
+        )
+        .into_any_element()
+}
+
+/// A labeled read-only field for a value the Agent owns. It mirrors
+/// `management_input_field`'s shape so the form keeps its rhythm, renders the
+/// value in a muted box instead of an editable input, and carries a Help
+/// affordance explaining why the value cannot be changed.
+fn management_locked_field(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    help: impl Into<SharedString>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let label: SharedString = label.into();
+    let value: SharedString = value.into();
+    let help: SharedString = help.into();
+    Form::new()
+        .child(
+            Field::new().label(label).child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_6()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().muted.opacity(0.3))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(value),
+                    )
+                    .child(
+                        div()
+                            .id("management-locked-field-help")
+                            .flex_none()
+                            .p_1()
+                            .cursor_default()
+                            .focusable()
+                            .tab_stop(true)
+                            .role(Role::Button)
+                            .aria_label(help.clone())
+                            .child(
+                                Icon::new(IconName::Info)
+                                    .size_3p5()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(help.clone()).build(window, cx)
+                            }),
+                    ),
+            ),
         )
         .into_any_element()
 }
