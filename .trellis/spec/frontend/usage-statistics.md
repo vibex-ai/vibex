@@ -59,9 +59,17 @@ session entry is a standard `gpui_component::button::Button` wrapped with
 - A committed usage fact invalidates the view. Refresh immediately only while
   Usage is visible; otherwise mark it stale and refresh on activation.
 - The toolbar exposes Today/7d/30d/All and Agent/Model Provider/Model/Project/
-  Session cross-filters in that order. The chart header exposes a local Trend/
-  Heatmap/Models segmented mode control. The dimension control exposes Time/
-  Agent/Project/Model Provider/Model.
+  Session cross-filters in that order. The range control owns the leading edge
+  and the five cross-filters trail the row as one trailing group, so scope and
+  filters read as two decisions; both groups wrap without overlapping when the
+  window narrows. Each cross-filter trigger keeps one leading dimension icon and
+  the same control size as the range control, and names the value it applies
+  instead of only the dimension: the first applied value, plus a `+N` suffix for
+  further selections, the dimension name while it filters nothing, or the
+  dimension with its count when no offered option can name the applied value.
+  Its accessibility label still states the dimension name. The chart header
+  exposes a local Trend/Heatmap/Models segmented mode control. The dimension
+  control exposes Time/Agent/Project/Model Provider/Model.
 - Render six stable summary metrics: total, requests, input, output, cached read,
   and cache hit rate. Each summary title has a distinct semantic icon; summary
   cards are separate bordered surfaces with the semantic card background and

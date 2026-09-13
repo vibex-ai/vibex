@@ -352,70 +352,83 @@ impl UsageView {
             .as_ref()
             .map(|statistics| statistics.filter_options.clone())
             .unwrap_or_default();
+        // Scope first, cross-filters second: the range control owns the leading
+        // edge and the filters trail the row as one group, so the toolbar reads
+        // as two decisions instead of six peer buttons. Both groups wrap, and a
+        // wrapped group starts at the leading edge rather than overlapping.
         h_flex()
             .w_full()
             .flex_wrap()
             .items_center()
+            .justify_between()
             .gap_2()
             .child(range_control)
             .child(
-                self.render_filter_button(
-                    UsageFilterKind::Agent,
-                    locale::text("Agent", "Agent", "Agent"),
-                    options.agents,
-                    self.request
-                        .agent_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect(),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_filter_button(
-                    UsageFilterKind::ProviderProfile,
-                    locale::text("Model provider", "模型供应商", "模型供應商"),
-                    options.provider_profiles,
-                    self.request
-                        .provider_profile_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect(),
-                    cx,
-                ),
-            )
-            .child(self.render_filter_button(
-                UsageFilterKind::Model,
-                locale::text("Model", "模型", "模型"),
-                options.models,
-                self.request.model_ids.clone(),
-                cx,
-            ))
-            .child(
-                self.render_filter_button(
-                    UsageFilterKind::Project,
-                    locale::text("Project", "项目", "專案"),
-                    options.projects,
-                    self.request
-                        .project_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect(),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_filter_button(
-                    UsageFilterKind::Session,
-                    locale::text("Session", "会话", "工作階段"),
-                    options.sessions,
-                    self.request
-                        .session_ids
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect(),
-                    cx,
-                ),
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        self.render_filter_button(
+                            UsageFilterKind::Agent,
+                            locale::text("Agent", "Agent", "Agent"),
+                            options.agents,
+                            self.request
+                                .agent_ids
+                                .iter()
+                                .map(|id| id.as_str().to_string())
+                                .collect(),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.render_filter_button(
+                            UsageFilterKind::ProviderProfile,
+                            locale::text("Model provider", "模型供应商", "模型供應商"),
+                            options.provider_profiles,
+                            self.request
+                                .provider_profile_ids
+                                .iter()
+                                .map(|id| id.as_str().to_string())
+                                .collect(),
+                            cx,
+                        ),
+                    )
+                    .child(self.render_filter_button(
+                        UsageFilterKind::Model,
+                        locale::text("Model", "模型", "模型"),
+                        options.models,
+                        self.request.model_ids.clone(),
+                        cx,
+                    ))
+                    .child(
+                        self.render_filter_button(
+                            UsageFilterKind::Project,
+                            locale::text("Project", "项目", "專案"),
+                            options.projects,
+                            self.request
+                                .project_ids
+                                .iter()
+                                .map(|id| id.as_str().to_string())
+                                .collect(),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.render_filter_button(
+                            UsageFilterKind::Session,
+                            locale::text("Session", "会话", "工作階段"),
+                            options.sessions,
+                            self.request
+                                .session_ids
+                                .iter()
+                                .map(|id| id.as_str().to_string())
+                                .collect(),
+                            cx,
+                        ),
+                    ),
             )
             .into_any_element()
     }
@@ -429,10 +442,15 @@ impl UsageView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected_count = selected.len();
-        let button_label = if selected_count == 0 {
-            label.to_string()
+        // The trigger names the applied value, so an active filter is readable
+        // without opening its menu; the dimension name moves into the
+        // accessibility label once a value replaces it on the button.
+        let trigger_label =
+            usage_filter_trigger_label(label, options.as_slice(), selected.as_slice());
+        let accessibility_label = if selected_count == 0 {
+            trigger_label.clone()
         } else {
-            format!("{label} ({selected_count})")
+            format!("{label}: {trigger_label}")
         };
         let all_label = match locale::current_locale() {
             locale::ResolvedLocale::En => format!("All {label}"),
@@ -442,15 +460,18 @@ impl UsageView {
         let entity = cx.weak_entity();
         Button::new(SharedString::from(format!("usage-filter-{kind:?}")))
             .xsmall()
-            .ghost()
-            .h(px(32.0))
-            .px_2()
+            .outline()
             .selected(selected_count > 0)
+            // The visible content is the applied value, so the announced name
+            // states the dimension it filters.
+            .accessibility_label(accessibility_label)
             .child(
                 h_flex()
                     .min_w_0()
+                    .items_center()
                     .gap_1()
-                    .child(div().max_w(px(150.0)).truncate().child(button_label))
+                    .child(usage_filter_icon(kind).size(px(13.0)).opacity(0.72))
+                    .child(div().max_w(px(150.0)).truncate().child(trigger_label))
                     .child(Icon::new(IconName::ChevronDown).size(px(13.0))),
             )
             .disabled(options.is_empty() && selected.is_empty())
@@ -1019,6 +1040,53 @@ fn bounded_usage_session_filter_label(value: &str) -> String {
     }
     output.push_str("...");
     output
+}
+
+/// Leading glyph for a cross-filter trigger.
+///
+/// The trigger names its active value rather than the dimension, so the icon
+/// carries which dimension the button filters.
+fn usage_filter_icon(kind: UsageFilterKind) -> Icon {
+    match kind {
+        UsageFilterKind::Agent => Icon::new(IconName::Bot),
+        UsageFilterKind::Project => Icon::new(IconName::Folder),
+        UsageFilterKind::ProviderProfile => Icon::default().path("icons/vibex/database.svg"),
+        UsageFilterKind::Model => Icon::default().path("icons/vibex/sparkles.svg"),
+        UsageFilterKind::Session => Icon::default().path("icons/vibex/message-square.svg"),
+    }
+}
+
+/// Label a cross-filter trigger shows for its current selection.
+///
+/// An unfiltered trigger keeps the dimension name; a filtered one names the
+/// first applied value and keeps the remaining count as a `+N` suffix, so the
+/// trigger stays honest about how many values are applied. A selection whose
+/// value the option list cannot name yet falls back to the dimension plus the
+/// count.
+fn usage_filter_trigger_label(
+    dimension_label: &str,
+    options: &[AgentUsageFilterOption],
+    selected: &[String],
+) -> String {
+    let mut labels = selected.iter().filter_map(|id| {
+        options
+            .iter()
+            .find(|option| &option.id == id)
+            .map(|option| option.label.as_str())
+    });
+    let Some(first) = labels.next() else {
+        return if selected.is_empty() {
+            dimension_label.to_string()
+        } else {
+            format!("{dimension_label} ({})", selected.len())
+        };
+    };
+    let remaining = labels.count();
+    if remaining == 0 {
+        first.to_string()
+    } else {
+        format!("{first} +{remaining}")
+    }
 }
 
 fn summary_metric_value(
@@ -2916,6 +2984,52 @@ mod tests {
         assert_eq!(values, ["one", "two"]);
         toggle_typed(&mut values, "one".to_string());
         assert_eq!(values, ["two"]);
+    }
+
+    #[test]
+    fn filter_trigger_names_the_active_value_without_losing_the_count() {
+        let options = vec![
+            AgentUsageFilterOption {
+                id: "agent-a".to_string(),
+                label: "Codex".to_string(),
+            },
+            AgentUsageFilterOption {
+                id: "agent-b".to_string(),
+                label: "Claude Code".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            usage_filter_trigger_label("Agent", &options, &[]),
+            "Agent",
+            "an unfiltered trigger keeps the dimension name"
+        );
+        assert_eq!(
+            usage_filter_trigger_label("Agent", &options, &["agent-a".to_string()]),
+            "Codex"
+        );
+        assert_eq!(
+            usage_filter_trigger_label(
+                "Agent",
+                &options,
+                &["agent-a".to_string(), "agent-b".to_string()]
+            ),
+            "Codex +1"
+        );
+        assert_eq!(
+            usage_filter_trigger_label(
+                "Agent",
+                &options,
+                &["agent-a".to_string(), "gone".to_string()]
+            ),
+            "Codex",
+            "a selection outside the offered options must not leak into the label"
+        );
+        assert_eq!(
+            usage_filter_trigger_label("Agent", &options, &["gone".to_string()]),
+            "Agent (1)",
+            "a selection the option list cannot name still reports that it filters"
+        );
     }
 
     #[test]
