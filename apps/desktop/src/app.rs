@@ -297,8 +297,9 @@ const RUNTIME_MANAGER_ROW_HEIGHT: f32 = 46.0;
 const RUNTIME_ADD_DIALOG_WIDTH: f32 = 420.0;
 const RUNTIME_DETAIL_LABEL_WIDTH: f32 = 76.0;
 /// The runtime stack glyph. `Boxes` is not part of gpui-component's
-/// compatibility enum, so the panel resolves it from the app asset bundle.
-const RUNTIME_MANAGER_ICON: &str = "icons/boxes.svg";
+/// compatibility enum, so the panel resolves it from the app asset bundle,
+/// which registers every vibex icon under `icons/vibex/`.
+const RUNTIME_MANAGER_ICON: &str = "icons/vibex/boxes.svg";
 const TITLE_BAR_SESSION_MENU_TITLE_MAX_CHARS: usize = 16;
 const SIDEBAR_FLOATING_MAX_WIDTH: f32 = 320.0;
 const SIDEBAR_FLOATING_VIEWPORT_RATIO: f32 = 0.88;
@@ -7410,13 +7411,15 @@ impl VibexWorkbench {
         let tooltip = format!("{}: {label}", locale::text("Runtime", "运行时", "執行階段"));
         let dot = runtime_state_color(state, cx);
         let open = self.runtime_manager_open;
+        // No `on_click`: `Popover` toggles the panel on mouse-down and applies
+        // its own selected state, so a second toggle here would close the panel
+        // again on mouse-up. `on_open_change` below is what records the state.
         let trigger = Button::new("open-runtime-manager")
             .small()
             .ghost()
             .compact()
             .size(px(32.0))
             .px_0()
-            .selected(open)
             .tooltip(tooltip)
             .child(
                 div()
@@ -7432,8 +7435,7 @@ impl VibexWorkbench {
                             .rounded_full()
                             .bg(dot),
                     ),
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_runtime_manager(cx)));
+            );
         let panel = self.render_runtime_manager_panel(cx);
         div()
             .flex_none()
@@ -63243,6 +63245,29 @@ mod tests {
 
         assert!(content < drag);
         assert!(drag < controls);
+    }
+
+    /// `Popover` toggles its panel from a mouse-down handler that also stops
+    /// propagation, and it applies the trigger's selected state itself. A
+    /// `click` handler on the trigger fires on mouse-up and toggled the panel
+    /// straight back closed, which looked like a panel that flashed open and
+    /// vanished.
+    #[test]
+    fn the_runtime_manager_trigger_leaves_toggling_to_the_popover() {
+        let source = include_str!("app.rs");
+        let trigger = source
+            .split_once("    fn render_runtime_manager_trigger(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the runtime manager trigger should remain inspectable");
+        assert!(
+            !trigger.contains(".on_click("),
+            "the popover owns the toggle; a click handler here closes the panel on mouse-up"
+        );
+        assert!(
+            trigger.contains(".on_open_change("),
+            "the panel's open state must be recorded from the popover callback"
+        );
     }
 
     #[test]
