@@ -10062,15 +10062,15 @@ impl ManagementCenter {
             // saved, so the empty state promises exactly what is available.
             let description = if editing_profile_id.is_some() {
                 management_locale_text(
-                    "Fetch models, or add a model ID below.",
-                    "可以拉取模型，也可以在下面手动添加模型 ID。",
-                    "可以擷取模型，也可以在下面手動新增模型 ID。",
+                    "Fetch models, or add a model ID directly.",
+                    "可以拉取模型，也可以直接添加模型 ID。",
+                    "可以擷取模型，也可以直接新增模型 ID。",
                 )
             } else {
                 management_locale_text(
-                    "Save this Provider to fetch models, or add a model ID below.",
-                    "保存后可以拉取模型，也可以先在下面手动添加模型 ID。",
-                    "儲存後可以擷取模型，也可以先在下面手動新增模型 ID。",
+                    "Save this Provider to fetch models, or add a model ID directly.",
+                    "保存后可以拉取模型，也可以直接添加模型 ID。",
+                    "儲存後可以擷取模型，也可以直接新增模型 ID。",
                 )
             };
             content = content.child(compact_empty_state(
@@ -10935,14 +10935,13 @@ impl ManagementCenter {
             cx,
         );
 
-        // The Models section sits between the name and the connection: it is
-        // the part of a Provider people come back to change, and the address
-        // below it is usually already right.
-        let mut sections = vec![identity_section];
+        // The connection comes before the Models: an address and a credential
+        // are what make a catalogue reachable, so they are filled in first and
+        // the list of Models reads as their result.
+        let mut sections = vec![identity_section, connection_section];
         if let Some(section) = model_section {
             sections.push(section);
         }
-        sections.push(connection_section);
         let form = v_flex().w_full().gap_3().children(sections);
 
         v_flex()
