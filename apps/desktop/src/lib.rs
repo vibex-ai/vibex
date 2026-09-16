@@ -16,6 +16,7 @@ pub mod office_surface;
 pub mod pdf_surface;
 #[allow(dead_code)]
 mod pdf_worker;
+pub mod performance_log;
 pub mod platform;
 pub mod primitives;
 pub mod remote_access_pairing;

@@ -283,13 +283,22 @@ mod tests {
         fs::write(root.path().join("runtime.log"), b"log").unwrap();
         fs::write(root.path().join("keep.txt"), b"keep").unwrap();
         fs::write(root.path().join("catalog.json"), b"catalog").unwrap();
+        // The developer FPS HUD records its samples into the diagnostics
+        // directory, so the same cleanup owns them.
+        fs::create_dir_all(root.path().join("diagnostics")).unwrap();
+        fs::write(
+            root.path().join("diagnostics/fps-monitor.jsonl"),
+            b"samples",
+        )
+        .unwrap();
 
         let (files, bytes) = clear_files(root.path(), FileCleanupKind::Diagnostics).unwrap();
-        assert_eq!(files, 3);
-        assert_eq!(bytes, 19);
+        assert_eq!(files, 4);
+        assert_eq!(bytes, 26);
         assert!(!root.path().join("backup-latest").exists());
         assert!(!root.path().join("diagnostics.json").exists());
         assert!(!root.path().join("runtime.log").exists());
+        assert!(!root.path().join("diagnostics").exists());
         assert!(root.path().join("keep.txt").exists());
         assert!(root.path().join("catalog.json").exists());
     }

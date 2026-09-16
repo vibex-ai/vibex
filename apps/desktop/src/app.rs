@@ -26,7 +26,7 @@ use gpui::{
     ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowOptions, div, img,
+    WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
@@ -165,6 +165,7 @@ use crate::local_history_import::LocalHistoryImportDialog;
 use crate::locale::{self, Strings};
 use crate::management::{ManagementCenter, ManagementEvent};
 use crate::motion::{self, hover_blend, hover_listener};
+use crate::performance_log;
 use crate::platform::{
     StorageUsage, launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
     send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
@@ -4831,6 +4832,9 @@ pub struct VibexWorkbench {
     /// releases GPUI's frame trace.
     fps_monitor: Option<Entity<FpsMonitor>>,
     fps_hud_drag: Option<FpsHudDragState>,
+    /// Records what the HUD measures into the diagnostics folder for as long as
+    /// the Developer switch is on. Dropping the task stops the sampling.
+    fps_monitor_recorder: Option<Task<()>>,
     pair_button_hovered: bool,
     update_snapshot: UpdateSnapshot,
     update_prompt_visible: bool,
@@ -5673,6 +5677,7 @@ impl VibexWorkbench {
             right_panel_resize_drag: None,
             fps_monitor: None,
             fps_hud_drag: None,
+            fps_monitor_recorder: None,
             pair_button_hovered: false,
             update_snapshot: UpdateSnapshot::default(),
             update_prompt_visible: false,
@@ -6007,6 +6012,9 @@ impl VibexWorkbench {
                 }
             }
         }));
+        if this.ui_state.developer.show_fps_monitor {
+            this.start_fps_monitor_recording(window.window_handle().window_id(), cx);
+        }
         this
     }
 
@@ -24080,6 +24088,64 @@ impl VibexWorkbench {
             self.queue_ui_state();
         }
         cx.notify();
+    }
+
+    fn set_fps_monitor_enabled(&mut self, enabled: bool, window: &Window, cx: &mut Context<Self>) {
+        self.ui_state.developer.show_fps_monitor = enabled;
+        if enabled {
+            self.start_fps_monitor_recording(window.window_handle().window_id(), cx);
+        } else {
+            // Dropping the monitor releases GPUI's frame trace and the HUD's
+            // resource sampler; dropping the recorder stops the sampling task.
+            self.fps_monitor = None;
+            self.fps_hud_drag = None;
+            self.fps_monitor_recorder = None;
+        }
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    /// Records what the developer FPS HUD measures into the diagnostics folder,
+    /// once per [`performance_log::SAMPLE_INTERVAL`], until the HUD is switched
+    /// off or the write fails.
+    fn start_fps_monitor_recording(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self.fps_monitor_recorder.is_some() {
+            return;
+        }
+        let Some(path) = self
+            .config
+            .as_ref()
+            .map(|config| performance_log::fps_monitor_log_path(&config.home_dir))
+        else {
+            return;
+        };
+        let workbench = cx.weak_entity();
+        self.fps_monitor_recorder = Some(cx.spawn(async move |_, cx| {
+            let mut recorder = performance_log::FpsMonitorRecorder::new(window_id, path);
+            loop {
+                cx.background_executor()
+                    .timer(performance_log::SAMPLE_INTERVAL)
+                    .await;
+                let Some(line) = recorder.sample_line() else {
+                    continue;
+                };
+                let path = recorder.path().to_path_buf();
+                let write = cx.background_spawn(async move {
+                    performance_log::append_sample_line(&path, &line)
+                });
+                if let Err(error) = write.await {
+                    // Writing is the whole point of the recording, so a failure
+                    // ends it and says so rather than losing samples quietly.
+                    let _ = workbench.update(cx, |this, cx| {
+                        this.persistence_note = Some(format!(
+                            "FPS monitor samples could not be written ({error})"
+                        ));
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        }));
     }
 
     fn adjust_right_panel_width(
@@ -48351,9 +48417,9 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             SettingsSection::Developer,
             locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
             locale::text(
-                "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it.",
-                "在工作台上叠加实时帧率、帧耗时与资源占用，拖动 HUD 可调整位置。",
-                "在工作台上疊加即時幀率、幀耗時與資源佔用，拖動 HUD 可調整位置。",
+                "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it; while it is on, one sample a second is recorded to the diagnostics folder.",
+                "在工作台上叠加实时帧率、帧耗时与资源占用，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                "在工作台上疊加即時幀率、幀耗時與資源佔用，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
             ),
             &[
                 "fps",
@@ -49709,18 +49775,9 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_show_fps_monitor(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_show_fps_monitor(&mut self, enabled: bool, window: &Window, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
-            this.ui_state.developer.show_fps_monitor = enabled;
-            if !enabled {
-                // Dropping the monitor releases GPUI's frame trace and the
-                // HUD's resource sampler instead of leaving both running behind
-                // a hidden overlay.
-                this.fps_monitor = None;
-                this.fps_hud_drag = None;
-            }
-            this.queue_ui_state();
-            cx.notify();
+            this.set_fps_monitor_enabled(enabled, window, cx)
         });
         cx.notify();
     }
@@ -51910,7 +51967,9 @@ impl FoundationSettings {
             .small()
             .checked(developer.show_fps_monitor)
             .tooltip(locale::text("FPS monitor", "帧率监视器", "幀率監視器"))
-            .on_click(cx.listener(|this, enabled, _, cx| this.set_show_fps_monitor(*enabled, cx)));
+            .on_click(cx.listener(|this, enabled, window, cx| {
+                this.set_show_fps_monitor(*enabled, window, cx)
+            }));
         settings_page(
             locale::text("Developer", "开发者", "開發者"),
             locale::text(
@@ -51921,9 +51980,9 @@ impl FoundationSettings {
             vec![setting_row(
                 locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
                 locale::text(
-                    "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it.",
-                    "在工作台上叠加实时帧率、帧耗时与资源占用，拖动 HUD 可调整位置。",
-                    "在工作台上疊加即時幀率、幀耗時與資源佔用，拖動 HUD 可調整位置。",
+                    "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it; while it is on, one sample a second is recorded to the diagnostics folder.",
+                    "在工作台上叠加实时帧率、帧耗时与资源占用，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                    "在工作台上疊加即時幀率、幀耗時與資源佔用，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
                 ),
                 fps_monitor_switch,
                 stacked,
@@ -63130,13 +63189,43 @@ mod tests {
         assert!(developer_page.contains("locale::text(\"Developer\", \"开发者\", \"開發者\")"));
 
         let switch = source
-            .split_once("    fn set_show_fps_monitor(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn set_queue_send_mode("))
+            .split_once("    fn set_fps_monitor_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_fps_monitor_recording("))
             .map(|(body, _)| body)
             .expect("developer switch should remain inspectable");
-        assert!(switch.contains("this.ui_state.developer.show_fps_monitor = enabled"));
-        assert!(switch.contains("this.fps_monitor = None"));
-        assert!(switch.contains("this.queue_ui_state()"));
+        assert!(switch.contains("self.ui_state.developer.show_fps_monitor = enabled"));
+        assert!(switch.contains("self.fps_monitor = None"));
+        assert!(switch.contains("self.fps_monitor_recorder = None"));
+        assert!(
+            switch.contains(
+                "self.start_fps_monitor_recording(window.window_handle().window_id(), cx)"
+            )
+        );
+        assert!(switch.contains("self.queue_ui_state()"));
+
+        let recording = source
+            .split_once("    fn start_fps_monitor_recording(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn adjust_right_panel_width("))
+            .map(|(body, _)| body)
+            .expect("performance recording should remain inspectable");
+        assert!(recording.contains("performance_log::fps_monitor_log_path(&config.home_dir)"));
+        assert!(recording.contains("performance_log::FpsMonitorRecorder::new(window_id, path)"));
+        assert!(recording.contains(".timer(performance_log::SAMPLE_INTERVAL)"));
+        assert!(recording.contains("performance_log::append_sample_line(&path, &line)"));
+        assert!(recording.contains("this.persistence_note = Some(format!("));
+
+        // A workbench that starts with the HUD on records from its first frame.
+        let workbench_setup = source
+            .split_once("    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_runtime_start("))
+            .map(|(body, _)| body)
+            .expect("workbench setup should remain inspectable");
+        assert!(workbench_setup.contains("if this.ui_state.developer.show_fps_monitor {"));
+        assert!(
+            workbench_setup.contains(
+                "this.start_fps_monitor_recording(window.window_handle().window_id(), cx);"
+            )
+        );
 
         let navigation = source
             .split_once("    fn render_navigation(")

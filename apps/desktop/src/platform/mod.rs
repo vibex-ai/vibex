@@ -1143,6 +1143,15 @@ mod tests {
             storage_bucket("terminal-output.log"),
             StorageBucket::Diagnostic
         );
+        // The developer FPS HUD's samples are diagnostics, so the usage report
+        // counts them and the diagnostics cleanup owns them.
+        assert_eq!(
+            storage_bucket(&format!(
+                "diagnostics/{}",
+                crate::performance_log::FPS_MONITOR_LOG_FILE
+            )),
+            StorageBucket::Diagnostic
+        );
         assert_eq!(
             storage_bucket("sessions/transcript.json"),
             StorageBucket::Session

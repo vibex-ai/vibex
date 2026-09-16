@@ -9983,6 +9983,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "sys-locale",
+ "sysinfo 0.37.2",
  "tempfile",
  "tokio",
  "tracing",
