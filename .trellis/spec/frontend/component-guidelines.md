@@ -94,17 +94,19 @@ button swaps to the restore glyph while `Window::is_maximized()` is true.
 ### Floating window chrome
 
 `render_title_bar` is an overlay, not a layout row: it is positioned against the
-window (`absolute().top_0().left_0().right_0()`), fills and outlines nothing, and
-paints above the shell but below overlays. Every column that must not underlap it
-reserves `TITLE_BAR_HEIGHT` at its top — the inline sidebar, the workbench column,
-the preview and right-rail panels, and the activity rail — so each column's own
-surface and seams still run to the window edge while its controls stay reachable.
+window (`absolute().top_0().left_0().right_0()`), paints above the shell but below
+overlays, and owns the strip's surface plus the bottom hairline that closes it.
+Every column that must not underlap it reserves `TITLE_BAR_HEIGHT` at its top — the
+inline sidebar, the workbench column, the preview and right-rail panels, and the
+activity rail — so a panel reads as a column under the bar instead of a surface
+behind it, while every column keeps its full height.
 
 Anything interactive placed in the top `TITLE_BAR_HEIGHT` of a column without that
 reservation is covered by the drag region, and a press on it starts a window move
-instead of the control's command. The sidebar segment is the one filled part of the
-strip: it keeps the rail tone for the collapsed state and carries the reserved
-width so the session title stays aligned with the workbench column. The management
+instead of the control's command. The sidebar segment carries the rail tone for the
+collapsed state and the reserved width, so the session title stays aligned with the
+workbench column. A collapsed right rail draws no seam of its own: the activity
+strip only adds its divider while the panel it belongs to is open. The management
 view's compact sidebar limits read `TITLE_BAR_HEIGHT` too, so the chrome height
 lives in one constant.
 

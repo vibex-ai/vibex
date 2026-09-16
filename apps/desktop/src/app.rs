@@ -24829,11 +24829,13 @@ impl VibexWorkbench {
             .flex_none()
             .items_center()
             .gap(px(RIGHT_ACTIVITY_ITEM_GAP))
-            .border_l_1()
-            .border_color(cx.theme().border)
+            // The seam belongs to the open panel: with every rail surface
+            // collapsed the workbench edge stays unbroken.
+            .when(panel_open, |this| {
+                this.border_l_1().border_color(cx.theme().border)
+            })
             .bg(cx.theme().background)
-            // Clear the floating chrome; the rail's own hairline still runs to
-            // the window edge.
+            // Clear the floating chrome.
             .pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
             .pb(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
             .children(activities)
@@ -25822,11 +25824,10 @@ impl VibexWorkbench {
         };
 
         // The bar floats above the shell instead of taking a row of it: every
-        // column keeps its full height and paints its own surface (sidebar
-        // tone, panel hairlines) up to the window edge underneath. A column
-        // that must not underlap the chrome reserves `TITLE_BAR_HEIGHT` at its
-        // top. Nothing here fills or outlines the strip, so the shell reads as
-        // one surface behind the controls.
+        // column keeps its full height underneath, and each one that must not
+        // underlap the chrome reserves `TITLE_BAR_HEIGHT` at its top. The strip
+        // owns its surface and the hairline that closes it, so a panel's tone
+        // and seams stay below the bar.
         div()
             .id("title-bar")
             .absolute()
@@ -25838,6 +25839,9 @@ impl VibexWorkbench {
             .items_center()
             .h(px(TITLE_BAR_HEIGHT))
             .overflow_hidden()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
@@ -42098,9 +42102,8 @@ impl VibexWorkbench {
                 .flex_none()
                 .border_r_1()
                 .border_color(cx.theme().border)
-                // The chrome floats above the sidebar, so the rail keeps its
-                // full height and tone while its content starts below the bar.
-                .bg(cx.theme().sidebar)
+                // The sidebar sits below the floating chrome: the rail keeps
+                // its full height and seam, its content starts under the bar.
                 .pt(px(TITLE_BAR_HEIGHT))
                 .child(
                     div()
@@ -42840,21 +42843,12 @@ impl VibexWorkbench {
                 cx,
             );
             let panel = self.render_right_rail_panel(window, cx);
-            // The rail's own surface continues into the chrome band: files and
-            // git render as a sidebar-toned column, the child-agent timeline as
-            // a workbench-toned one.
-            let rail_tone = if self.child_agent_panel_active {
-                cx.theme().background
-            } else {
-                cx.theme().sidebar
-            };
             div()
                 .relative()
                 .flex()
                 .flex_col()
                 .w_full()
                 .h_full()
-                .bg(rail_tone)
                 .border_l_1()
                 .border_color(cx.theme().border)
                 .child(
@@ -42862,8 +42856,8 @@ impl VibexWorkbench {
                         .flex_1()
                         .min_h_0()
                         .overflow_hidden()
-                        // Same chrome clearance as the preview panel: rail
-                        // content starts below the bar, its seam does not.
+                        // The rail starts below the floating chrome: the panel
+                        // is a column under the bar, not a surface behind it.
                         .pt(px(TITLE_BAR_HEIGHT))
                         .child(panel),
                 )
@@ -64133,6 +64127,10 @@ mod tests {
             activity_bar
                 .contains(".pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))")
         );
+        // The rail's seam belongs to an open panel: the strip itself draws no
+        // divider, so a collapsed rail leaves the workbench edge unbroken.
+        assert!(activity_bar.contains(".when(panel_open, |this| {"));
+        assert!(!activity_bar.contains("\n            .border_l_1()"));
     }
 
     #[test]
@@ -64323,9 +64321,9 @@ mod tests {
         assert!(session_title < session_menu);
 
         // The chrome floats over the shell: it is positioned against the
-        // window, drawn without a fill or an outline so the columns behind it
-        // are the band's surface, and the columns that must not underlap it
-        // reserve `TITLE_BAR_HEIGHT` at their top.
+        // window, owns the strip's surface and the hairline that closes it, and
+        // the columns that must not underlap it reserve `TITLE_BAR_HEIGHT` at
+        // their top.
         let root = &title_bar[title_bar
             .find(".id(\"title-bar\")")
             .expect("title bar root should exist")..sidebar_start];
@@ -64334,8 +64332,8 @@ mod tests {
         assert!(root.contains(".left_0()"));
         assert!(root.contains(".right_0()"));
         assert!(root.contains("h(px(TITLE_BAR_HEIGHT))"));
-        assert!(!root.contains(".border_b_1()"));
-        assert!(!root.contains(".bg("));
+        assert!(root.contains(".border_b_1()"));
+        assert!(root.contains(".bg(cx.theme().background)"));
 
         let sidebar = &title_bar[sidebar_start..main_start];
         assert!(sidebar.contains(".bg(cx.theme().sidebar)"));
@@ -64344,6 +64342,7 @@ mod tests {
         assert!(!sidebar.contains("title-workspace-context"));
 
         let main = &title_bar[main_start..];
+        // The segments sit on the strip's surface instead of repainting it.
         assert!(!main.contains(".bg(cx.theme().background)"));
         assert!(main.contains(".text_color(cx.theme().foreground)"));
         assert!(main.contains("title-session-title"));
