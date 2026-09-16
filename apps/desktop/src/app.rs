@@ -26,8 +26,8 @@ use gpui::{
     ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions, div, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, rgb, size,
+    WindowControlArea, WindowControls, WindowDecorations, WindowOptions, div, img,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -25631,6 +25631,12 @@ impl VibexWorkbench {
         let is_client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let drag_state = window.use_state(cx, |_, _| WorkbenchTitleBarState { should_move: false });
         let wide_window_controls = self.last_visibility.layout.viewport_width >= 760;
+        // Which caption buttons exist is a platform decision: macOS and a
+        // server-decorated Linux window draw none, Windows keeps its
+        // system-backed trio, and a client-decorated Linux window follows the
+        // desktop's own layout.
+        let window_controls = window_control_layout(window);
+        let window_controls_maximized = window.is_maximized();
         let show_update_entry = self.ui_state.desktop_behavior.show_update_prompts
             && self.update_snapshot.state.should_show_update_entry();
         let update_version = self
@@ -25685,6 +25691,15 @@ impl VibexWorkbench {
                     window.start_window_move();
                 }
             }))
+            .when(!window_controls.left.is_empty(), |this| {
+                this.child(workbench_window_controls(
+                    WindowControlSide::Left,
+                    &window_controls.left,
+                    wide_window_controls,
+                    window_controls_maximized,
+                    cx,
+                ))
+            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -26010,8 +26025,14 @@ impl VibexWorkbench {
                             ),
                     ),
             )
-            .when(!is_macos && !is_web, |this| {
-                this.child(workbench_window_controls(wide_window_controls, cx))
+            .when(!window_controls.right.is_empty(), |this| {
+                this.child(workbench_window_controls(
+                    WindowControlSide::Right,
+                    &window_controls.right,
+                    wide_window_controls,
+                    window_controls_maximized,
+                    cx,
+                ))
             })
             .into_any_element()
     }
@@ -46780,108 +46801,296 @@ fn workspace_display_name(workspace_root: &str) -> String {
         .to_string()
 }
 
-fn workbench_window_controls(wide: bool, cx: &App) -> AnyElement {
+/// A caption button a client-side-decorated window can draw in its title bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowControl {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+impl WindowControl {
+    const fn element_id(self) -> &'static str {
+        match self {
+            Self::Minimize => "window-minimize",
+            Self::Maximize => "window-maximize",
+            Self::Close => "window-close",
+        }
+    }
+
+    /// The system hit area Windows uses to run the caption command itself.
+    const fn area(self) -> WindowControlArea {
+        match self {
+            Self::Minimize => WindowControlArea::Min,
+            Self::Maximize => WindowControlArea::Max,
+            Self::Close => WindowControlArea::Close,
+        }
+    }
+}
+
+/// Which edge of the title bar a caption cluster sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowControlSide {
+    Left,
+    Right,
+}
+
+/// The platform whose caption conventions the window follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowControlPlatform {
+    Linux,
+    Windows,
+    Macos,
+    Web,
+}
+
+/// The caption buttons Vibex draws, split by title-bar edge.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WindowControlLayout {
+    left: Vec<WindowControl>,
+    right: Vec<WindowControl>,
+}
+
+impl WindowControlLayout {
+    /// The GNOME default order, used when the desktop expresses no preference.
+    fn right_trio() -> Self {
+        Self {
+            left: Vec::new(),
+            right: vec![
+                WindowControl::Minimize,
+                WindowControl::Maximize,
+                WindowControl::Close,
+            ],
+        }
+    }
+
+    /// Drops buttons the window cannot perform. Closing always survives: a
+    /// window can be removed even when the platform advertises nothing else.
+    fn retain_supported(&mut self, capabilities: WindowControls) {
+        let supported = |control: &WindowControl| match control {
+            WindowControl::Minimize => capabilities.minimize,
+            WindowControl::Maximize => capabilities.maximize,
+            WindowControl::Close => true,
+        };
+        self.left.retain(supported);
+        self.right.retain(supported);
+    }
+}
+
+fn current_window_control_platform() -> WindowControlPlatform {
+    if cfg!(target_os = "macos") {
+        WindowControlPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        WindowControlPlatform::Windows
+    } else if cfg!(target_family = "wasm") {
+        WindowControlPlatform::Web
+    } else {
+        WindowControlPlatform::Linux
+    }
+}
+
+/// Parses a desktop caption layout such as `appmenu:close` or
+/// `:minimize,maximize,close` (GTK's `gtk-decoration-layout`).
+///
+/// The value is `left:right`, where each side is a comma-separated list of
+/// button names. `None` means the value is not a layout Vibex can honor and the
+/// caller keeps the platform default. Slots Vibex has no equivalent for
+/// (`icon`, `appmenu`, `menu`, `spacer*`) are skipped, because desktops append
+/// their own slots to the layout.
+fn parse_window_control_layout(value: &str) -> Option<WindowControlLayout> {
+    let (left, right) = value.split_once(':')?;
+    Some(WindowControlLayout {
+        left: parse_window_control_side(left),
+        right: parse_window_control_side(right),
+    })
+}
+
+fn parse_window_control_side(value: &str) -> Vec<WindowControl> {
+    value
+        .split(',')
+        .filter_map(|entry| match entry.trim() {
+            "minimize" => Some(WindowControl::Minimize),
+            "maximize" => Some(WindowControl::Maximize),
+            "close" => Some(WindowControl::Close),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Decides which caption buttons the workbench draws, following whoever owns the
+/// caption on this platform.
+///
+/// Vibex never duplicates decoration the platform already draws. macOS keeps its
+/// AppKit traffic lights, and a Linux compositor that answered the
+/// `xdg-decoration` negotiation with server-side decorations paints its own, so
+/// both get nothing. Linux draws the buttons the desktop asked for only when the
+/// compositor negotiated client-side decorations; Windows keeps the right-hand
+/// trio because GPUI turns those into system hit areas (`WindowControlArea`)
+/// rather than negotiating decoration ownership.
+fn resolve_window_controls(
+    platform: WindowControlPlatform,
+    client_decorated: bool,
+    desktop_layout: Option<&str>,
+    capabilities: WindowControls,
+) -> WindowControlLayout {
+    let mut layout = match platform {
+        WindowControlPlatform::Macos | WindowControlPlatform::Web => WindowControlLayout::default(),
+        WindowControlPlatform::Windows => WindowControlLayout::right_trio(),
+        WindowControlPlatform::Linux => {
+            if !client_decorated {
+                WindowControlLayout::default()
+            } else {
+                desktop_layout
+                    .and_then(parse_window_control_layout)
+                    .unwrap_or_else(WindowControlLayout::right_trio)
+            }
+        }
+    };
+    layout.retain_supported(capabilities);
+    layout
+}
+
+/// The caption layout for this window: the platform's ownership of the caption
+/// plus, on Linux, the desktop's own button layout.
+fn window_control_layout(window: &Window) -> WindowControlLayout {
+    #[cfg(target_os = "linux")]
+    let desktop_layout = linux_window_control_layout();
+    #[cfg(not(target_os = "linux"))]
+    let desktop_layout: Option<String> = None;
+
+    resolve_window_controls(
+        current_window_control_platform(),
+        matches!(window.window_decorations(), Decorations::Client { .. }),
+        desktop_layout.as_deref(),
+        window.window_controls(),
+    )
+}
+
+/// Reads the desktop's caption layout from GTK, where GNOME, KDE, XFCE, and
+/// `~/.config/gtk-3.0/settings.ini` publish it.
+///
+/// GTK settings may only be read on the thread that initialized GTK, so an
+/// uninitialized or foreign thread falls back to the default order.
+#[cfg(target_os = "linux")]
+fn linux_window_control_layout() -> Option<String> {
+    use gtk::prelude::GtkSettingsExt as _;
+
+    if !gtk::is_initialized() || !gtk::is_initialized_main_thread() {
+        return None;
+    }
+    let layout = gtk::Settings::default()?.gtk_decoration_layout()?;
+    let layout = layout.to_string();
+    (!layout.trim().is_empty()).then_some(layout)
+}
+
+fn window_control_icon(control: WindowControl, maximized: bool) -> IconName {
+    match control {
+        WindowControl::Minimize => IconName::Minus,
+        WindowControl::Maximize if maximized => IconName::WindowRestore,
+        WindowControl::Maximize => IconName::WindowMaximize,
+        WindowControl::Close => IconName::Close,
+    }
+}
+
+/// One caption cluster. Its border faces the window content, so the cluster
+/// reads as attached to the edge it sits on.
+fn workbench_window_controls(
+    side: WindowControlSide,
+    controls: &[WindowControl],
+    wide: bool,
+    maximized: bool,
+    cx: &App,
+) -> AnyElement {
     let control_width = if wide {
         TITLE_BAR_WIDE_WINDOW_CONTROL_WIDTH
     } else {
         TITLE_BAR_NARROW_WINDOW_CONTROL_WIDTH
     };
-    let foreground = cx.theme().foreground.opacity(0.7);
-    let hover_background = cx.theme().sidebar_accent;
-    let hover_foreground = cx.theme().sidebar_accent_foreground;
-    let active_background = cx.theme().sidebar_accent.opacity(0.8);
-    let close_background = cx.theme().danger;
-    let close_foreground = cx.theme().danger_foreground;
+    let element_id = match side {
+        WindowControlSide::Left => "window-controls-left",
+        WindowControlSide::Right => "window-controls-right",
+    };
 
     h_flex()
-        .id("window-controls")
+        .id(element_id)
         .h_full()
         .flex_none()
         .items_stretch()
-        .border_l_1()
+        .when(side == WindowControlSide::Left, |this| this.border_r_1())
+        .when(side == WindowControlSide::Right, |this| this.border_l_1())
         .border_color(cx.theme().border)
         .bg(cx.theme().background)
-        .child(
-            div()
-                .id("window-minimize")
-                .flex()
-                .h_full()
-                .w(px(control_width))
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .text_color(foreground)
-                .hover(move |style| style.bg(hover_background).text_color(hover_foreground))
-                .active(move |style| style.bg(active_background).text_color(hover_foreground))
-                .when(cfg!(target_os = "windows"), |this| {
-                    this.window_control_area(WindowControlArea::Min)
-                })
-                .when(!cfg!(target_os = "windows"), |this| {
-                    this.on_mouse_down(MouseButton::Left, |_, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.minimize_window();
-                    })
-                })
-                .child(Icon::new(IconName::Minus).size(px(16.0))),
+        .children(
+            controls
+                .iter()
+                .map(|control| window_control_button(*control, control_width, maximized, cx)),
         )
-        .child(
-            div()
-                .id("window-maximize")
-                .flex()
-                .h_full()
-                .w(px(control_width))
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .text_color(foreground)
-                .hover(move |style| style.bg(hover_background).text_color(hover_foreground))
-                .active(move |style| style.bg(active_background).text_color(hover_foreground))
-                .when(cfg!(target_os = "windows"), |this| {
-                    this.window_control_area(WindowControlArea::Max)
-                })
-                .when(!cfg!(target_os = "windows"), |this| {
-                    this.on_mouse_down(MouseButton::Left, |_, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.zoom_window();
-                    })
-                })
-                .child(Icon::new(IconName::WindowMaximize).size(px(16.0))),
-        )
-        .child(
-            div()
-                .id("window-close")
-                .flex()
-                .h_full()
-                .w(px(control_width))
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .text_color(foreground)
-                .hover(move |style| style.bg(close_background).text_color(close_foreground))
-                .active(move |style| style.bg(close_background).text_color(close_foreground))
-                .when(cfg!(target_os = "windows"), |this| {
-                    this.window_control_area(WindowControlArea::Close)
-                })
-                .when(!cfg!(target_os = "windows"), |this| {
-                    this.on_mouse_down(MouseButton::Left, |_, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                    })
-                    .on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.remove_window();
-                    })
-                })
-                .child(Icon::new(IconName::Close).size(px(16.0))),
-        )
+        .into_any_element()
+}
+
+fn window_control_button(
+    control: WindowControl,
+    width: f32,
+    maximized: bool,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let label = match control {
+        WindowControl::Minimize => locale::text("Minimize", "最小化", "最小化"),
+        WindowControl::Maximize if maximized => locale::text("Restore", "还原", "還原"),
+        WindowControl::Maximize => locale::text("Maximize", "最大化", "最大化"),
+        WindowControl::Close => locale::text("Close window", "关闭窗口", "關閉視窗"),
+    };
+    let closes_window = control == WindowControl::Close;
+    let foreground = theme.foreground.opacity(0.7);
+    let hover_background = if closes_window {
+        theme.danger
+    } else {
+        theme.sidebar_accent
+    };
+    let hover_foreground = if closes_window {
+        theme.danger_foreground
+    } else {
+        theme.sidebar_accent_foreground
+    };
+    let active_background = if closes_window {
+        theme.danger
+    } else {
+        theme.sidebar_accent.opacity(0.8)
+    };
+
+    div()
+        .id(control.element_id())
+        .flex()
+        .h_full()
+        .w(px(width))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .text_color(foreground)
+        .role(Role::Button)
+        .aria_label(label)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .hover(move |style| style.bg(hover_background).text_color(hover_foreground))
+        .active(move |style| style.bg(active_background).text_color(hover_foreground))
+        .when(cfg!(target_os = "windows"), |this| {
+            this.window_control_area(control.area())
+        })
+        .when(!cfg!(target_os = "windows"), |this| {
+            this.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                match control {
+                    WindowControl::Minimize => window.minimize_window(),
+                    WindowControl::Maximize => window.zoom_window(),
+                    WindowControl::Close => window.remove_window(),
+                }
+            })
+        })
+        .child(Icon::new(window_control_icon(control, maximized)).size(px(16.0)))
         .into_any_element()
 }
 
@@ -63239,12 +63448,154 @@ mod tests {
         let drag = title_bar
             .find(".window_control_area(WindowControlArea::Drag)")
             .expect("title-bar drag region should exist");
-        let controls = title_bar
-            .find("workbench_window_controls(wide_window_controls, cx)")
-            .expect("native window controls should exist");
+        let left_controls = title_bar
+            .find("WindowControlSide::Left")
+            .expect("the left caption cluster should exist");
+        let right_controls = title_bar
+            .find("WindowControlSide::Right")
+            .expect("the right caption cluster should exist");
 
+        // A caption button must never sit inside the drag region, or pressing it
+        // would start a window move instead of the caption command.
+        assert!(left_controls < content);
         assert!(content < drag);
-        assert!(drag < controls);
+        assert!(drag < right_controls);
+    }
+
+    #[test]
+    fn a_server_decorated_window_draws_no_caption_buttons() {
+        // Hyprland answers the xdg-decoration negotiation with SERVER_SIDE, so
+        // the compositor owns the caption and Vibex must not paint a second one.
+        let layout = resolve_window_controls(
+            WindowControlPlatform::Linux,
+            false,
+            Some("appmenu:close"),
+            WindowControls::default(),
+        );
+
+        assert_eq!(layout, WindowControlLayout::default());
+    }
+
+    #[test]
+    fn a_client_decorated_window_follows_the_desktop_caption_layout() {
+        let layout = resolve_window_controls(
+            WindowControlPlatform::Linux,
+            true,
+            Some("close:minimize,maximize"),
+            WindowControls::default(),
+        );
+
+        assert_eq!(layout.left, vec![WindowControl::Close]);
+        assert_eq!(
+            layout.right,
+            vec![WindowControl::Minimize, WindowControl::Maximize]
+        );
+    }
+
+    #[test]
+    fn a_client_decorated_window_falls_back_to_the_default_trio() {
+        for desktop_layout in [
+            None,
+            // GTK always publishes `left:right`; anything else is not a layout
+            // Vibex can honor.
+            Some("minimize,maximize,close"),
+        ] {
+            let layout = resolve_window_controls(
+                WindowControlPlatform::Linux,
+                true,
+                desktop_layout,
+                WindowControls::default(),
+            );
+
+            assert_eq!(layout, WindowControlLayout::right_trio());
+        }
+    }
+
+    #[test]
+    fn a_desktop_layout_can_ask_for_no_caption_buttons() {
+        // `appmenu:` keeps the desktop's own menu slot and no caption button;
+        // drawing a default trio there would second-guess the desktop.
+        let layout = resolve_window_controls(
+            WindowControlPlatform::Linux,
+            true,
+            Some("appmenu:"),
+            WindowControls::default(),
+        );
+
+        assert_eq!(layout, WindowControlLayout::default());
+    }
+
+    #[test]
+    fn caption_buttons_the_window_cannot_perform_are_dropped() {
+        let capabilities = WindowControls {
+            minimize: false,
+            maximize: false,
+            ..WindowControls::default()
+        };
+        let layout = resolve_window_controls(
+            WindowControlPlatform::Linux,
+            true,
+            Some("close:minimize,maximize,close"),
+            capabilities,
+        );
+
+        assert_eq!(layout.left, vec![WindowControl::Close]);
+        assert_eq!(layout.right, vec![WindowControl::Close]);
+    }
+
+    #[test]
+    fn macos_and_web_never_draw_caption_buttons() {
+        for platform in [WindowControlPlatform::Macos, WindowControlPlatform::Web] {
+            let layout = resolve_window_controls(
+                platform,
+                true,
+                Some(":minimize,maximize,close"),
+                WindowControls::default(),
+            );
+
+            assert_eq!(layout, WindowControlLayout::default());
+        }
+    }
+
+    #[test]
+    fn windows_keeps_its_system_backed_trio_on_the_right() {
+        // Windows caption buttons are system hit areas, not decoration to
+        // negotiate, so a desktop layout must not move them.
+        let layout = resolve_window_controls(
+            WindowControlPlatform::Windows,
+            false,
+            Some("close:"),
+            WindowControls::default(),
+        );
+
+        assert_eq!(layout, WindowControlLayout::right_trio());
+    }
+
+    /// An icon path that is not in the asset bundle resolves to nothing, with no
+    /// error and no placeholder, so a missing registration would silently drop a
+    /// caption glyph at runtime.
+    #[test]
+    fn every_caption_button_icon_is_bundled() {
+        use gpui::AssetSource as _;
+        use gpui_kit_assets::IconNamed as _;
+
+        let assets = crate::assets::VibexAssets;
+        for control in [
+            WindowControl::Minimize,
+            WindowControl::Maximize,
+            WindowControl::Close,
+        ] {
+            for maximized in [false, true] {
+                let path = window_control_icon(control, maximized).path();
+                assert!(
+                    assets
+                        .load(path.as_ref())
+                        .expect("asset lookup should not fail")
+                        .is_some(),
+                    "caption button {control:?} asks for {path}, which is not in the asset bundle"
+                );
+            }
+        }
     }
 
     /// `Popover` toggles its panel from a mouse-down handler that also stops

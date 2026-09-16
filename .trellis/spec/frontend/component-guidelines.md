@@ -62,6 +62,35 @@ tooltip itself `Role::Tooltip` does not name its trigger. When both are present,
 the visible label wins so explanatory tooltip copy cannot replace the command's
 short accessible name.
 
+### Window Caption Controls
+
+The workbench draws its own minimize/maximize/close buttons only when it owns the
+caption. The decision is one platform policy in `apps/desktop/src/app.rs`
+(`resolve_window_controls`); the title bar only renders what that policy returns.
+
+- macOS keeps its AppKit traffic lights, so the workbench draws nothing.
+- Windows keeps the right-hand trio. GPUI maps those buttons to system hit areas
+  (`WindowControlArea`), so the system runs the command, owns Snap Layouts, and
+  keeps the native title-bar double click.
+- Linux draws caption buttons only when the compositor negotiated client-side
+  decorations. A compositor that answers `xdg-decoration` with `SERVER_SIDE`
+  (Hyprland does) owns the caption, and painting a second one duplicates it.
+- Web has no window to control and draws nothing.
+
+For a client-decorated Linux window the desktop's own layout decides which
+buttons exist and which edge they sit on: read GTK's `gtk-decoration-layout`
+(`appmenu:close`, `:minimize,maximize,close`) instead of hard-coding the GNOME
+order, fall back to the right-hand trio when the value cannot be read, and honor
+a layout that names no caption button as "no buttons". Drop buttons outside the
+window's advertised capabilities (`Window::window_controls`); closing always
+survives.
+
+Caption buttons render in `window-controls-left` / `window-controls-right`
+clusters that sit outside the `WindowControlArea::Drag` region, and each button
+stops mouse-down propagation so pressing a caption never starts a window move.
+Every button carries the localized tooltip as its `aria_label`, and the maximize
+button swaps to the restore glyph while `Window::is_maximized()` is true.
+
 ### GPUI Button hover ownership
 
 The locked `gpui-component` `Button` renderer owns the enabled/unselected hover
