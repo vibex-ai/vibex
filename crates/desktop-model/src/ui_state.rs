@@ -781,6 +781,19 @@ const fn default_update_prompts_enabled() -> bool {
     true
 }
 
+/// Developer-only diagnostics preferences.
+///
+/// Kept apart from [`DesktopBehaviorUiState`], which holds user-facing product
+/// behavior, so the Developer settings section can grow without widening that
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeveloperUiState {
+    /// Overlays the gpui-fps performance HUD on the workbench window.
+    #[serde(default)]
+    pub show_fps_monitor: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPreferencesUiState {
@@ -825,6 +838,8 @@ pub struct DesktopUiStateV1 {
     #[serde(default)]
     pub desktop_behavior: DesktopBehaviorUiState,
     #[serde(default)]
+    pub developer: DeveloperUiState,
+    #[serde(default)]
     pub keyboard: KeyboardUiState,
     #[serde(default)]
     pub composer: ComposerUiState,
@@ -854,6 +869,7 @@ impl Default for DesktopUiStateV1 {
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
+            developer: DeveloperUiState::default(),
             keyboard: KeyboardUiState::default(),
             composer: ComposerUiState::default(),
             terminal_tab_titles: BTreeMap::new(),
@@ -1628,6 +1644,25 @@ mod tests {
         let restored: PreviewUiState = serde_json::from_value(legacy).unwrap();
         assert!(!restored.editor_soft_wrap);
         assert!(!restored.editor_show_whitespaces);
+    }
+
+    #[test]
+    fn developer_preferences_default_off_and_round_trip() {
+        let mut legacy = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("developer");
+        let legacy: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.developer.show_fps_monitor);
+
+        let mut state = DesktopUiStateV1::default();
+        state.developer.show_fps_monitor = true;
+        state.normalize().unwrap();
+        assert_eq!(
+            serde_json::to_value(&state.developer).unwrap()["showFpsMonitor"],
+            serde_json::json!(true)
+        );
+        let round_trip: DesktopUiStateV1 =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(round_trip.developer.show_fps_monitor);
     }
 
     #[test]

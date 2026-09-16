@@ -61,6 +61,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
+use gpui_fps::fps_monitor;
 use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
@@ -104,8 +105,8 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopBehaviorUiState, DesktopUiStateV1, GitSelectionKey, GitWorkbenchMode, LocaleMode,
-    MessageSendKey, NavigationHistory, NetworkProxyUiState, NewSessionLocation,
+    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, GitSelectionKey, GitWorkbenchMode,
+    LocaleMode, MessageSendKey, NavigationHistory, NetworkProxyUiState, NewSessionLocation,
     NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
     RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
     RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
@@ -47376,6 +47377,7 @@ enum SettingsSection {
     Terminal,
     Shortcuts,
     Data,
+    Developer,
     About,
 }
 
@@ -47674,6 +47676,18 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "診斷",
     ]) {
         Some(SettingsSection::Data)
+    } else if matches(&[
+        "developer",
+        "fps",
+        "frame",
+        "performance",
+        "profiling",
+        "开发者",
+        "開發者",
+        "帧率",
+        "幀率",
+    ]) {
+        Some(SettingsSection::Developer)
     } else if matches(&[
         "about",
         "version",
@@ -48162,6 +48176,24 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             &["reset", "layout", "data", "重置", "重設"],
         ),
         settings_search_candidate(
+            SettingsSection::Developer,
+            locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
+            locale::text(
+                "Overlay realtime frame rate, frame time and resource usage on the workbench.",
+                "在工作台上叠加实时帧率、帧耗时与资源占用。",
+                "在工作台上疊加即時幀率、幀耗時與資源佔用。",
+            ),
+            &[
+                "fps",
+                "frame rate",
+                "performance",
+                "profiler",
+                "帧率",
+                "幀率",
+                "性能",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::About,
             locale::text("Software update", "软件更新", "軟體更新"),
             locale::text(
@@ -48248,6 +48280,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
         SettingsSection::Shortcuts => locale::text("Shortcuts", "快捷键", "快速鍵"),
         SettingsSection::Data => locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
+        SettingsSection::Developer => locale::text("Developer", "开发者", "開發者"),
         SettingsSection::About => locale::text("About", "关于", "關於"),
     }
 }
@@ -49154,6 +49187,12 @@ impl FoundationSettings {
             .unwrap_or_default()
     }
 
+    fn developer(&self, cx: &App) -> DeveloperUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.developer.clone())
+            .unwrap_or_default()
+    }
+
     fn keyboard_shortcuts(&self, cx: &App) -> BTreeMap<String, String> {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.keyboard.shortcuts.clone())
@@ -49498,6 +49537,15 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_show_fps_monitor(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.developer.show_fps_monitor = enabled;
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn set_queue_send_mode(&mut self, mode: ComposerQueueSendMode, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.composer.queue_send_mode = mode;
@@ -49833,6 +49881,11 @@ impl FoundationSettings {
                 SettingsSection::Data,
                 locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
                 IconName::HardDrive,
+            ),
+            (
+                SettingsSection::Developer,
+                locale::text("Developer", "开发者", "開發者"),
+                IconName::Cpu,
             ),
             (
                 SettingsSection::About,
@@ -51671,6 +51724,35 @@ impl FoundationSettings {
             cx,
         )
     }
+
+    fn render_developer_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let developer = self.developer(cx);
+        let fps_monitor_switch = Switch::new("developer-fps-monitor")
+            .small()
+            .checked(developer.show_fps_monitor)
+            .tooltip(locale::text("FPS monitor", "帧率监视器", "幀率監視器"))
+            .on_click(cx.listener(|this, enabled, _, cx| this.set_show_fps_monitor(*enabled, cx)));
+        settings_page(
+            locale::text("Developer", "开发者", "開發者"),
+            locale::text(
+                "Instrumentation for profiling the workbench itself.",
+                "用于诊断和分析工作台自身的性能。",
+                "用於診斷與分析工作台自身的效能。",
+            ),
+            vec![setting_row(
+                locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
+                locale::text(
+                    "Overlay realtime frame rate, frame time and resource usage on the workbench.",
+                    "在工作台上叠加实时帧率、帧耗时与资源占用。",
+                    "在工作台上疊加即時幀率、幀耗時與資源佔用。",
+                ),
+                fps_monitor_switch,
+                stacked,
+                cx,
+            )],
+            cx,
+        )
+    }
 }
 
 impl Render for FoundationSettings {
@@ -51711,6 +51793,7 @@ impl Render for FoundationSettings {
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
             SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, cx),
             SettingsSection::Data => self.render_data_page(stacked_rows, cx),
+            SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
             SettingsSection::About => self.render_about_page(stacked_rows, cx),
         };
         let has_changes = self.has_changes(cx);
@@ -52112,6 +52195,19 @@ impl Render for VibexWorkbench {
         let runtime_add_dialog = self
             .runtime_add_open
             .then(|| runtime_add_dialog_overlay(self.render_runtime_add_dialog(cx), cx));
+        // The developer HUD anchors below the title bar so it never covers the
+        // window controls, and sits under every modal layer so an open dialog
+        // stays readable.
+        let fps_hud = self.ui_state.developer.show_fps_monitor.then(|| {
+            div()
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT))
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .child(fps_monitor(window, cx))
+                .into_any_element()
+        });
         v_flex()
             .id("vibex-foundation")
             .track_focus(&self.focus_handle)
@@ -52214,6 +52310,7 @@ impl Render for VibexWorkbench {
             ))
             .child(self.render_title_bar(window, cx))
             .child(content)
+            .when_some(fps_hud, |this, hud| this.child(hud))
             .children(inline_composer_attachments)
             .when_some(floating_sidebar, |this, sidebar| this.child(sidebar))
             .when_some(composer_suggestion_overlay, |this, overlay| {
@@ -62802,6 +62899,49 @@ mod tests {
         assert!(navigation.contains(".w_full()"));
         assert!(navigation.contains(".h(px(SETTINGS_NAVIGATION_ROW_HEIGHT))"));
         assert!(navigation.contains(".flex_wrap()"));
+    }
+
+    #[test]
+    fn developer_settings_gate_the_fps_monitor_overlay() {
+        let source = include_str!("app.rs");
+        let developer_page = source
+            .split_once("    fn render_developer_page(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl Render for FoundationSettings"))
+            .map(|(body, _)| body)
+            .expect("developer settings page should remain inspectable");
+        assert!(developer_page.contains("Switch::new(\"developer-fps-monitor\")"));
+        assert!(developer_page.contains("developer.show_fps_monitor"));
+        assert!(developer_page.contains("set_show_fps_monitor"));
+        assert!(developer_page.contains("locale::text(\"Developer\", \"开发者\", \"開發者\")"));
+
+        let navigation = source
+            .split_once("    fn render_navigation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
+            .map(|(body, _)| body)
+            .expect("settings navigation should remain inspectable");
+        assert!(navigation.contains("SettingsSection::Developer"));
+        assert!(navigation.contains("IconName::Cpu"));
+
+        let render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(render.contains("self.ui_state.developer.show_fps_monitor.then("));
+        assert!(render.contains("child(fps_monitor(window, cx))"));
+        assert!(render.contains(".when_some(fps_hud, |this, hud| this.child(hud))"));
+
+        // The switch is discoverable from settings search and owns its query.
+        let english = locale::strings(locale::ResolvedLocale::En);
+        assert!(
+            settings_search_candidates_for_query("fps", english)
+                .iter()
+                .any(|candidate| candidate.section == SettingsSection::Developer)
+        );
+        assert_eq!(
+            settings_section_for_query("fps"),
+            Some(SettingsSection::Developer)
+        );
     }
 
     #[test]
