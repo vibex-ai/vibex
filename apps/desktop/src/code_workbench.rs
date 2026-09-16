@@ -10083,7 +10083,7 @@ impl CodeRightRail {
         v_flex()
             .size_full()
             .min_h_0()
-            .bg(cx.theme().sidebar.opacity(0.75))
+            .bg(rail_surface(cx).opacity(0.75))
             .child(self.render_file_search_controls(cx))
             .child(if search_active {
                 self.render_file_search_results(cx)
@@ -10858,7 +10858,7 @@ impl CodeRightRail {
                     .gap_2()
                     .px_3()
                     .py_3()
-                    .bg(cx.theme().sidebar.opacity(0.72))
+                    .bg(rail_surface(cx).opacity(0.72))
                     .child(
                         h_flex()
                             .w_full()
@@ -12019,7 +12019,7 @@ impl CodeRightRail {
                     .flex_none()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .bg(cx.theme().sidebar.opacity(0.95))
+                    .bg(rail_surface(cx).opacity(0.95))
                     .p_3()
                     .child(
                         h_flex().gap_2().mb_2().child(
@@ -13072,7 +13072,7 @@ impl CodeRightRail {
             .min_h_0()
             // The resize seam above owns the divider hairline at its bottom
             // edge, so the drawer paints no second border of its own.
-            .bg(cx.theme().sidebar)
+            .bg(rail_surface(cx))
             .child(
                 v_flex()
                     .flex_none()
@@ -13254,7 +13254,7 @@ impl CodeRightRail {
             .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().sidebar.opacity(0.30))
+            .bg(rail_surface(cx).opacity(0.30))
             .child(
                 Button::new("open-workspace-default")
                     .small()
@@ -13374,6 +13374,13 @@ impl CodeRightRail {
     }
 }
 
+/// The right rail's own surface. Every integrated panel — files, git, and the
+/// child Agent timeline — shares this base tone, so only the washes a section
+/// layers on top separate its regions.
+fn rail_surface(cx: &App) -> Hsla {
+    crate::theme::semantic_color("right-rail-surface", cx.theme().is_dark())
+}
+
 impl Render for CodeRightRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
@@ -13387,7 +13394,7 @@ impl Render for CodeRightRail {
             .id("code-workbench-right-rail")
             .size_full()
             .min_w_0()
-            .bg(cx.theme().sidebar)
+            .bg(rail_surface(cx))
             .child(
                 h_flex()
                     .h(px(48.0))

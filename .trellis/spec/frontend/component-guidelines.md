@@ -684,6 +684,11 @@ information.
 ## Styling
 
 - Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across desktop and native mobile GPUI.
+- Every panel integrated in the right rail — files, Git, and the child Agent
+  timeline — paints the shared `right-rail-surface` token as its base, and the
+  section washes inside it layer that same token rather than `sidebar` or
+  `background`. A rail panel that paints another surface token reads as a
+  different pane from its neighbours.
 - Preserve dark mode as a first-class path.
 - Use shared GPUI/gpui-component primitives; legacy React may keep shadcn/Radix until cutover.
 - GPUI delete, remove, clear, and destructive close actions must use the shared

@@ -36552,7 +36552,12 @@ impl VibexWorkbench {
             .size_full()
             .min_w_0()
             .min_h_0()
-            .bg(cx.theme().background)
+            // Same rail surface as the files and git panels: the child Agent
+            // timeline is another integrated panel of the same strip.
+            .bg(theme::semantic_color(
+                "right-rail-surface",
+                cx.theme().is_dark(),
+            ))
             .child(
                 h_flex()
                     .w_full()
@@ -42941,7 +42946,12 @@ impl VibexWorkbench {
                     .right(px(RIGHT_ACTIVITY_BAR_WIDTH))
                     .w(px(right_rail_width))
                     .max_w_full()
-                    .bg(cx.theme().background)
+                    // The floating rail frames its panel in the same surface,
+                    // so the slide reads as one card.
+                    .bg(theme::semantic_color(
+                        "right-rail-surface",
+                        cx.theme().is_dark(),
+                    ))
                     .occlude()
                     .border_l_1()
                     .border_color(cx.theme().border)
