@@ -22,7 +22,7 @@ use gpui::{
     DragMoveEvent, ElementId, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
     Focusable as _, FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
-    Orientation, ParentElement as _, Pixels, Render, Rgba, Role, ScrollAnchor, ScrollDelta,
+    Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor, ScrollDelta,
     ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
@@ -61,7 +61,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex, v_virtual_list,
 };
-use gpui_fps::fps_monitor;
+use gpui_fps::FpsMonitor;
 use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
@@ -105,14 +105,14 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, GitSelectionKey, GitWorkbenchMode,
-    LocaleMode, MessageSendKey, NavigationHistory, NetworkProxyUiState, NewSessionLocation,
-    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
-    SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
-    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
-    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, FpsMonitorPlacement,
+    GitSelectionKey, GitWorkbenchMode, LocaleMode, MessageSendKey, NavigationHistory,
+    NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
+    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
+    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome,
+    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
     SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
     StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
     ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
@@ -2278,6 +2278,63 @@ struct RightPanelResizeDrag;
 impl Render for RightPanelResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+/// How much of the developer HUD has to stay inside the window, so that however
+/// far it is dragged it can always be grabbed again.
+const FPS_HUD_MIN_VISIBLE: f32 = 24.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FpsHudDragState {
+    /// Pointer position when the drag started, in window coordinates.
+    start_cursor: Point<Pixels>,
+    placement: FpsMonitorPlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FpsHudDrag;
+
+impl Render for FpsHudDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// The placement a HUD drag lands on: the HUD follows the pointer by the same
+/// delta the pointer moved since the drag started, and stops with
+/// [`FPS_HUD_MIN_VISIBLE`] of itself still on screen.
+fn dragged_fps_hud_placement(
+    start: FpsMonitorPlacement,
+    start_cursor: Point<Pixels>,
+    cursor: Point<Pixels>,
+    viewport: Size<Pixels>,
+) -> FpsMonitorPlacement {
+    fps_hud_placement_within_window(
+        FpsMonitorPlacement {
+            top: start.top + f32::from(cursor.y - start_cursor.y),
+            right: start.right - f32::from(cursor.x - start_cursor.x),
+        },
+        viewport,
+    )
+}
+
+/// Pulls a placement back inside the window it is about to be drawn in.
+///
+/// The stored insets are what the user dragged to; clamping here rather than
+/// writing back means shrinking the window brings the HUD back into view while
+/// growing it again returns the HUD to the corner that was chosen for it.
+fn fps_hud_placement_within_window(
+    placement: FpsMonitorPlacement,
+    viewport: Size<Pixels>,
+) -> FpsMonitorPlacement {
+    // The HUD hangs below the title bar, so its travel ends a title bar above
+    // the bottom edge.
+    let max_top = (f32::from(viewport.height) - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE).max(0.0);
+    let max_right = (f32::from(viewport.width) - FPS_HUD_MIN_VISIBLE).max(0.0);
+    FpsMonitorPlacement {
+        top: placement.top.clamp(0.0, max_top),
+        right: placement.right.clamp(0.0, max_right),
     }
 }
 
@@ -4767,6 +4824,11 @@ pub struct VibexWorkbench {
     sidebar_project_logo_upload_task: Option<Task<()>>,
     sidebar_resize_drag: Option<SidebarResizeDragState>,
     right_panel_resize_drag: Option<RightPanelResizeDragState>,
+    /// The developer FPS HUD's monitor, created the first time the Developer
+    /// setting is on and dropped when it is turned off, which is also what
+    /// releases GPUI's frame trace.
+    fps_monitor: Option<Entity<FpsMonitor>>,
+    fps_hud_drag: Option<FpsHudDragState>,
     pair_button_hovered: bool,
     update_snapshot: UpdateSnapshot,
     update_prompt_visible: bool,
@@ -5607,6 +5669,8 @@ impl VibexWorkbench {
             sidebar_project_logo_upload_task: None,
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
+            fps_monitor: None,
+            fps_hud_drag: None,
             pair_button_hovered: false,
             update_snapshot: UpdateSnapshot::default(),
             update_prompt_visible: false,
@@ -23977,6 +24041,40 @@ impl VibexWorkbench {
         if (self.right_panel_width(drag.panel, self.last_visibility) - drag.start_width).abs()
             >= 1.0
         {
+            self.queue_ui_state();
+        }
+        cx.notify();
+    }
+
+    fn drag_fps_hud(
+        &mut self,
+        cursor: Point<Pixels>,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.fps_hud_drag else {
+            return;
+        };
+        if !cx.has_active_drag() {
+            // The pointer left the window without a mouse up reaching the
+            // workbench, so the HUD stops following it.
+            self.fps_hud_drag = None;
+            return;
+        }
+        let placement =
+            dragged_fps_hud_placement(drag.placement, drag.start_cursor, cursor, viewport);
+        if placement == self.ui_state.developer.fps_monitor_placement {
+            return;
+        }
+        self.ui_state.developer.fps_monitor_placement = placement;
+        cx.notify();
+    }
+
+    fn finish_fps_hud_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.fps_hud_drag.take() else {
+            return;
+        };
+        if self.ui_state.developer.fps_monitor_placement != drag.placement {
             self.queue_ui_state();
         }
         cx.notify();
@@ -48179,9 +48277,9 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             SettingsSection::Developer,
             locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
             locale::text(
-                "Overlay realtime frame rate, frame time and resource usage on the workbench.",
-                "在工作台上叠加实时帧率、帧耗时与资源占用。",
-                "在工作台上疊加即時幀率、幀耗時與資源佔用。",
+                "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it.",
+                "在工作台上叠加实时帧率、帧耗时与资源占用，拖动 HUD 可调整位置。",
+                "在工作台上疊加即時幀率、幀耗時與資源佔用，拖動 HUD 可調整位置。",
             ),
             &[
                 "fps",
@@ -49540,6 +49638,13 @@ impl FoundationSettings {
     fn set_show_fps_monitor(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.developer.show_fps_monitor = enabled;
+            if !enabled {
+                // Dropping the monitor releases GPUI's frame trace and the
+                // HUD's resource sampler instead of leaving both running behind
+                // a hidden overlay.
+                this.fps_monitor = None;
+                this.fps_hud_drag = None;
+            }
             this.queue_ui_state();
             cx.notify();
         });
@@ -51742,9 +51847,9 @@ impl FoundationSettings {
             vec![setting_row(
                 locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
                 locale::text(
-                    "Overlay realtime frame rate, frame time and resource usage on the workbench.",
-                    "在工作台上叠加实时帧率、帧耗时与资源占用。",
-                    "在工作台上疊加即時幀率、幀耗時與資源佔用。",
+                    "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it.",
+                    "在工作台上叠加实时帧率、帧耗时与资源占用，拖动 HUD 可调整位置。",
+                    "在工作台上疊加即時幀率、幀耗時與資源佔用，拖動 HUD 可調整位置。",
                 ),
                 fps_monitor_switch,
                 stacked,
@@ -52195,17 +52300,43 @@ impl Render for VibexWorkbench {
         let runtime_add_dialog = self
             .runtime_add_open
             .then(|| runtime_add_dialog_overlay(self.render_runtime_add_dialog(cx), cx));
-        // The developer HUD anchors below the title bar so it never covers the
+        // The developer HUD hangs below the title bar so it never covers the
         // window controls, and sits under every modal layer so an open dialog
-        // stays readable.
+        // stays readable. Its own insets place it rather than the overlay's
+        // fixed anchor, which is what lets a drag move it.
         let fps_hud = self.ui_state.developer.show_fps_monitor.then(|| {
+            let monitor = self
+                .fps_monitor
+                .get_or_insert_with(|| cx.new(|cx| FpsMonitor::new(window, cx)))
+                .clone();
+            let placement = fps_hud_placement_within_window(
+                self.ui_state.developer.fps_monitor_placement.clamped(),
+                window.viewport_size(),
+            );
+            let drag_target = cx.weak_entity();
             div()
+                .id("developer-fps-hud")
                 .absolute()
-                .top(px(TITLE_BAR_HEIGHT))
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .child(fps_monitor(window, cx))
+                .top(px(TITLE_BAR_HEIGHT + placement.top))
+                .right(px(placement.right))
+                .cursor_move()
+                .on_drag(FpsHudDrag, move |_, _, window, cx| {
+                    let start_cursor = window.mouse_position();
+                    let _ = drag_target.update(cx, |this, cx| {
+                        this.fps_hud_drag = Some(FpsHudDragState {
+                            start_cursor,
+                            // Start from where the HUD is drawn, so a window too
+                            // small for the stored insets still drags smoothly.
+                            placement: fps_hud_placement_within_window(
+                                this.ui_state.developer.fps_monitor_placement.clamped(),
+                                window.viewport_size(),
+                            ),
+                        });
+                        cx.notify();
+                    });
+                    cx.new(|_| FpsHudDrag)
+                })
+                .child(monitor)
                 .into_any_element()
         });
         v_flex()
@@ -52273,6 +52404,12 @@ impl Render for VibexWorkbench {
                     this.update_composer_terminal_resize(f32::from(event.event.position.y), cx);
                 },
             ))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<FpsHudDrag>, window, cx| {
+                    cx.stop_propagation();
+                    this.drag_fps_hud(event.event.position, window.viewport_size(), cx);
+                }),
+            )
             .capture_any_mouse_down(
                 cx.listener(|this, _, _, cx| this.clear_session_search_highlight(cx)),
             )
@@ -52282,6 +52419,7 @@ impl Render for VibexWorkbench {
                     this.finish_sidebar_resize(cx);
                     this.finish_right_panel_resize(cx);
                     this.finish_composer_terminal_resize(cx);
+                    this.finish_fps_hud_drag(cx);
                 }),
             )
             .on_mouse_up_out(
@@ -52290,6 +52428,7 @@ impl Render for VibexWorkbench {
                     this.finish_sidebar_resize(cx);
                     this.finish_right_panel_resize(cx);
                     this.finish_composer_terminal_resize(cx);
+                    this.finish_fps_hud_drag(cx);
                 }),
             )
             .size_full()
@@ -53263,7 +53402,7 @@ mod tests {
 
     use super::*;
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
-    use gpui::TestAppContext;
+    use gpui::{Modifiers, TestAppContext};
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
         AgentMessageDeltaPayload, AgentMessagePayload, FileOperationPayload, GitChange,
@@ -62914,6 +63053,15 @@ mod tests {
         assert!(developer_page.contains("set_show_fps_monitor"));
         assert!(developer_page.contains("locale::text(\"Developer\", \"开发者\", \"開發者\")"));
 
+        let switch = source
+            .split_once("    fn set_show_fps_monitor(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_queue_send_mode("))
+            .map(|(body, _)| body)
+            .expect("developer switch should remain inspectable");
+        assert!(switch.contains("this.ui_state.developer.show_fps_monitor = enabled"));
+        assert!(switch.contains("this.fps_monitor = None"));
+        assert!(switch.contains("this.queue_ui_state()"));
+
         let navigation = source
             .split_once("    fn render_navigation(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_general_page("))
@@ -62928,7 +63076,13 @@ mod tests {
             .map(|(body, _)| body)
             .expect("workbench renderer should remain inspectable");
         assert!(render.contains("self.ui_state.developer.show_fps_monitor.then("));
-        assert!(render.contains("child(fps_monitor(window, cx))"));
+        assert!(render.contains("FpsMonitor::new(window, cx)"));
+        assert!(render.contains("fps_hud_placement_within_window("));
+        assert!(render.contains(".on_drag(FpsHudDrag, move |_, _, window, cx|"));
+        assert!(
+            render.contains("this.drag_fps_hud(event.event.position, window.viewport_size(), cx)")
+        );
+        assert!(render.contains("this.finish_fps_hud_drag(cx)"));
         assert!(render.contains(".when_some(fps_hud, |this, hud| this.child(hud))"));
 
         // The switch is discoverable from settings search and owns its query.
@@ -62942,6 +63096,189 @@ mod tests {
             settings_section_for_query("fps"),
             Some(SettingsSection::Developer)
         );
+    }
+
+    #[test]
+    fn dragging_the_fps_hud_follows_the_pointer_and_stops_at_the_window_edge() {
+        let viewport = size(px(1200.0), px(800.0));
+        let start = FpsMonitorPlacement {
+            top: 12.0,
+            right: 12.0,
+        };
+        let press = point(px(1000.0), px(100.0));
+
+        // The HUD moves by the delta the pointer moved, so it keeps the point
+        // it was grabbed by under the cursor.
+        assert_eq!(
+            dragged_fps_hud_placement(start, press, point(px(900.0), px(140.0)), viewport),
+            FpsMonitorPlacement {
+                top: 52.0,
+                right: 112.0,
+            }
+        );
+
+        // Past an edge it parks against it with a grabbable strip still inside
+        // the window rather than leaving it off-screen.
+        let clamped =
+            dragged_fps_hud_placement(start, press, point(px(4000.0), px(4000.0)), viewport);
+        assert_eq!(clamped.top, 800.0 - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE);
+        assert_eq!(clamped.right, 0.0);
+
+        let clamped =
+            dragged_fps_hud_placement(start, press, point(px(-4000.0), px(-4000.0)), viewport);
+        assert_eq!(clamped.top, 0.0);
+        assert_eq!(clamped.right, 1200.0 - FPS_HUD_MIN_VISIBLE);
+
+        // A window shrunk after the HUD was parked in the far corner pulls it
+        // back into view instead of leaving it off-screen.
+        let parked = FpsMonitorPlacement {
+            top: 700.0,
+            right: 1100.0,
+        };
+        assert_eq!(
+            fps_hud_placement_within_window(parked, size(px(600.0), px(400.0))),
+            FpsMonitorPlacement {
+                top: 400.0 - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE,
+                right: 600.0 - FPS_HUD_MIN_VISIBLE,
+            }
+        );
+        // Growing the window again returns it to the corner that was chosen.
+        assert_eq!(fps_hud_placement_within_window(parked, viewport), parked);
+    }
+
+    /// Mirrors the developer HUD's interaction: an inner element whose click
+    /// handler stands in for the monitor's collapse toggle, wrapped in the
+    /// draggable container that moves it.
+    struct FpsHudDragProbe {
+        placement: FpsMonitorPlacement,
+        drag: Option<FpsHudDragState>,
+        toggles: Rc<Cell<usize>>,
+        moves: Rc<Cell<usize>>,
+    }
+
+    impl Render for FpsHudDragProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let drag_target = cx.weak_entity();
+            v_flex()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .id("fps-hud-drag-probe")
+                        .absolute()
+                        .top(px(TITLE_BAR_HEIGHT + self.placement.top))
+                        .right(px(self.placement.right))
+                        .cursor_move()
+                        .on_drag(FpsHudDrag, move |_, _, window, cx| {
+                            let start_cursor = window.mouse_position();
+                            let viewport = window.viewport_size();
+                            let _ = drag_target.update(cx, |this, cx| {
+                                this.drag = Some(FpsHudDragState {
+                                    start_cursor,
+                                    placement: fps_hud_placement_within_window(
+                                        this.placement,
+                                        viewport,
+                                    ),
+                                });
+                                cx.notify();
+                            });
+                            cx.new(|_| FpsHudDrag)
+                        })
+                        .child(
+                            div()
+                                .id("fps-hud-drag-probe-body")
+                                .w(px(172.0))
+                                .h(px(64.0))
+                                .on_click({
+                                    let toggles = self.toggles.clone();
+                                    move |_, _, _| toggles.set(toggles.get() + 1)
+                                }),
+                        ),
+                )
+                .on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<FpsHudDrag>, window, cx| {
+                        let Some(drag) = this.drag else {
+                            return;
+                        };
+                        this.placement = dragged_fps_hud_placement(
+                            drag.placement,
+                            drag.start_cursor,
+                            event.event.position,
+                            window.viewport_size(),
+                        );
+                        this.moves.set(this.moves.get() + 1);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.drag = None;
+                        cx.notify();
+                    }),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn dragging_the_fps_hud_moves_it_without_toggling_the_monitor(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let moves = Rc::new(Cell::new(0));
+        let (probe, cx) = cx.add_window_view(|_, _| FpsHudDragProbe {
+            placement: FpsMonitorPlacement::default(),
+            drag: None,
+            toggles: toggles.clone(),
+            moves: moves.clone(),
+        });
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let grab = point(viewport.width - px(40.0), px(TITLE_BAR_HEIGHT + 24.0));
+
+        // A plain click reaches the monitor, which is what collapses the HUD.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_click(grab, Modifiers::none());
+        assert_eq!(toggles.get(), 1);
+        assert_eq!(moves.get(), 0);
+
+        // A drag moves the HUD by the pointer delta and must not also reach the
+        // monitor's click handler, or every drag would collapse it. The first
+        // move arms the drag, so it is the second one that moves anything.
+        let armed = point(viewport.width - px(40.0), px(TITLE_BAR_HEIGHT + 44.0));
+        let drop = point(viewport.width - px(140.0), px(TITLE_BAR_HEIGHT + 64.0));
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(armed, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(drop, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_up(drop, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert_eq!(moves.get(), 1);
+        assert!(
+            cx.update(|_, cx| probe.read(cx).drag.is_none()),
+            "the mouse up has to finish the drag, which is what persists the placement"
+        );
+        assert_eq!(
+            cx.update(|_, cx| probe.read(cx).placement),
+            FpsMonitorPlacement {
+                top: 32.0,
+                right: 112.0,
+            }
+        );
+        assert_eq!(toggles.get(), 1, "a drag must not also toggle the monitor");
+
+        // Clicking the HUD where it landed still reaches the monitor, so the
+        // suppression above is about the drag gesture and not about a broken
+        // hitbox after the HUD moves.
+        cx.simulate_click(drop, Modifiers::none());
+        assert_eq!(toggles.get(), 2);
     }
 
     #[test]
