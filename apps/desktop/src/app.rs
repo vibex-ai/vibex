@@ -276,6 +276,13 @@ const RUNTIME_RETIRE_WAIT: Duration = Duration::from_secs(5);
 /// Height of the window chrome strip. The bar floats above the shell, so any
 /// column that must not underlap it reserves this much room at its top.
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 38.0;
+/// Chrome control metrics: square controls, a tight gap inside a group, a wider
+/// gap between groups, and the cluster's inset from the window edge.
+const TITLE_BAR_CONTROL_SIZE: f32 = 24.0;
+const TITLE_BAR_CONTROL_ICON_SIZE: f32 = 16.0;
+const TITLE_BAR_CONTROL_GAP: f32 = 2.0;
+const TITLE_BAR_GROUP_GAP: f32 = 8.0;
+const TITLE_BAR_CLUSTER_PAD: f32 = 10.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
@@ -25785,6 +25792,14 @@ impl VibexWorkbench {
         } else {
             TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH
         };
+        // The closing hairline spans the workbench only: while the docked
+        // sidebar is open its surface runs up through the band, so no line
+        // separates the rail from the chrome.
+        let hairline_left = if sidebar_inline_open {
+            sidebar_width
+        } else {
+            0.0
+        };
         let can_go_back = self.navigation_history.can_go_back();
         let can_go_forward = self.navigation_history.can_go_forward();
         let sidebar_tooltip = if sidebar_selected {
@@ -25825,9 +25840,10 @@ impl VibexWorkbench {
 
         // The bar floats above the shell instead of taking a row of it: every
         // column keeps its full height underneath, and each one that must not
-        // underlap the chrome reserves `TITLE_BAR_HEIGHT` at its top. The strip
-        // owns its surface and the hairline that closes it, so a panel's tone
-        // and seams stay below the bar.
+        // underlap the chrome reserves `TITLE_BAR_HEIGHT` at its top. Only the
+        // workbench end of the strip carries a surface and the hairline that
+        // closes it; the sidebar end stays transparent so the rail's own tone
+        // reaches the window edge.
         div()
             .id("title-bar")
             .absolute()
@@ -25839,9 +25855,6 @@ impl VibexWorkbench {
             .items_center()
             .h(px(TITLE_BAR_HEIGHT))
             .overflow_hidden()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
@@ -25902,16 +25915,15 @@ impl VibexWorkbench {
                             .w(px(sidebar_width))
                             .flex_none()
                             .items_center()
-                            .border_r_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().sidebar)
-                            .text_color(cx.theme().sidebar_foreground)
-                            .px_2()
+                            // The cluster sits on the chrome instead of owning a
+                            // surface: opening the sidebar lets the rail's tone
+                            // and seam run up behind these controls, and a
+                            // collapsed rail leaves the corner plain.
+                            .px(px(TITLE_BAR_CLUSTER_PAD))
                             .when(cfg!(target_os = "macos"), |this| this.pl(px(80.0)))
                             .child(
                                 h_flex()
                                     .items_center()
-                                    .gap(px(2.0))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation()
                                     })
@@ -25926,12 +25938,12 @@ impl VibexWorkbench {
                                                     .small()
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(32.0))
+                                                    .size(px(TITLE_BAR_CONTROL_SIZE))
                                                     .px_0()
                                                     .tooltip(sidebar_tooltip)
                                                     .child(
                                                         Icon::new(sidebar_toggle_icon)
-                                                            .size(px(18.0)),
+                                                            .size(px(TITLE_BAR_CONTROL_ICON_SIZE)),
                                                     )
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.toggle_sidebar(cx)
@@ -25939,32 +25951,48 @@ impl VibexWorkbench {
                                             ),
                                     )
                                     .child(
-                                        Button::new("navigate-back")
-                                            .small()
-                                            .ghost()
-                                            .compact()
-                                            .size(px(28.0))
-                                            .px_0()
-                                            .tooltip(strings.go_back)
-                                            .disabled(!can_go_back)
-                                            .child(Icon::new(IconName::ArrowLeft).size(px(17.0)))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.navigate_back(window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("navigate-forward")
-                                            .small()
-                                            .ghost()
-                                            .compact()
-                                            .size(px(28.0))
-                                            .px_0()
-                                            .tooltip(strings.go_forward)
-                                            .disabled(!can_go_forward)
-                                            .child(Icon::new(IconName::ArrowRight).size(px(17.0)))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.navigate_forward(window, cx);
-                                            })),
+                                        h_flex()
+                                            .items_center()
+                                            .gap(px(TITLE_BAR_CONTROL_GAP))
+                                            .ml(px(TITLE_BAR_GROUP_GAP))
+                                            .child(
+                                                Button::new("navigate-back")
+                                                    .small()
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(TITLE_BAR_CONTROL_SIZE))
+                                                    .px_0()
+                                                    .tooltip(strings.go_back)
+                                                    .disabled(!can_go_back)
+                                                    .child(
+                                                        Icon::new(IconName::ArrowLeft)
+                                                            .size(px(TITLE_BAR_CONTROL_ICON_SIZE)),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.navigate_back(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("navigate-forward")
+                                                    .small()
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(TITLE_BAR_CONTROL_SIZE))
+                                                    .px_0()
+                                                    .tooltip(strings.go_forward)
+                                                    .disabled(!can_go_forward)
+                                                    .child(
+                                                        Icon::new(IconName::ArrowRight)
+                                                            .size(px(TITLE_BAR_CONTROL_ICON_SIZE)),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.navigate_forward(window, cx);
+                                                        },
+                                                    )),
+                                            ),
                                     ),
                             ),
                     )
@@ -25978,6 +26006,9 @@ impl VibexWorkbench {
                             .gap_0()
                             .py_1()
                             .px_3()
+                            // The workbench end of the strip owns its surface,
+                            // so panels below never show through the chrome.
+                            .bg(cx.theme().background)
                             .text_color(cx.theme().foreground)
                             .when(management_open, |this| {
                                 this.child(
@@ -26116,6 +26147,9 @@ impl VibexWorkbench {
                             .items_center()
                             .gap_2()
                             .px_2()
+                            // Carries the strip's surface to the window edge so
+                            // the rail beneath cannot bleed into the band.
+                            .bg(cx.theme().background)
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .when(show_update_entry, |this| {
                                 this.child(
@@ -26210,6 +26244,18 @@ impl VibexWorkbench {
                     cx,
                 ))
             })
+            // The chrome's closing hairline, a child rather than a border so it
+            // can start past the sidebar instead of crossing it. It paints last,
+            // over the segments it closes.
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left(px(hairline_left))
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(cx.theme().border),
+            )
             .into_any_element()
     }
 
@@ -42102,8 +42148,10 @@ impl VibexWorkbench {
                 .flex_none()
                 .border_r_1()
                 .border_color(cx.theme().border)
-                // The sidebar sits below the floating chrome: the rail keeps
-                // its full height and seam, its content starts under the bar.
+                // The rail owns the left end of the floating chrome: its tone
+                // and seam run the full height, and its content starts under
+                // the bar.
+                .bg(cx.theme().sidebar)
                 .pt(px(TITLE_BAR_HEIGHT))
                 .child(
                     div()
@@ -64321,9 +64369,10 @@ mod tests {
         assert!(session_title < session_menu);
 
         // The chrome floats over the shell: it is positioned against the
-        // window, owns the strip's surface and the hairline that closes it, and
-        // the columns that must not underlap it reserve `TITLE_BAR_HEIGHT` at
-        // their top.
+        // window and carries no surface or outline of its own, so the rail's
+        // tone reaches the window edge where the sidebar is open and the
+        // closing hairline can start past it. Columns that must not underlap
+        // the chrome reserve `TITLE_BAR_HEIGHT` at their top.
         let root = &title_bar[title_bar
             .find(".id(\"title-bar\")")
             .expect("title bar root should exist")..sidebar_start];
@@ -64332,18 +64381,26 @@ mod tests {
         assert!(root.contains(".left_0()"));
         assert!(root.contains(".right_0()"));
         assert!(root.contains("h(px(TITLE_BAR_HEIGHT))"));
-        assert!(root.contains(".border_b_1()"));
-        assert!(root.contains(".bg(cx.theme().background)"));
+        assert!(!root.contains(".bg("));
+        assert!(!root.contains(".border_b_1()"));
+        assert!(title_bar.contains("let hairline_left = if sidebar_inline_open {"));
+        assert!(title_bar.contains(".left(px(hairline_left))"));
 
         let sidebar = &title_bar[sidebar_start..main_start];
-        assert!(sidebar.contains(".bg(cx.theme().sidebar)"));
-        assert!(sidebar.contains(".text_color(cx.theme().sidebar_foreground)"));
+        // The control cluster owns no surface either: the rail behind it shows,
+        // and the controls keep the shared chrome metrics.
+        assert!(!sidebar.contains(".bg("));
+        assert!(!sidebar.contains(".border_r_1()"));
+        assert!(sidebar.contains(".px(px(TITLE_BAR_CLUSTER_PAD))"));
+        assert!(sidebar.contains("size(px(TITLE_BAR_CONTROL_SIZE))"));
+        assert!(sidebar.contains("gap(px(TITLE_BAR_CONTROL_GAP))"));
+        assert!(sidebar.contains(".ml(px(TITLE_BAR_GROUP_GAP))"));
         assert!(!sidebar.contains("title-session-title"));
         assert!(!sidebar.contains("title-workspace-context"));
 
         let main = &title_bar[main_start..];
-        // The segments sit on the strip's surface instead of repainting it.
-        assert!(!main.contains(".bg(cx.theme().background)"));
+        // The workbench end of the strip paints the surface the hairline closes.
+        assert!(main.contains(".bg(cx.theme().background)"));
         assert!(main.contains(".text_color(cx.theme().foreground)"));
         assert!(main.contains("title-session-title"));
         assert!(main.contains("title_session_menu"));

@@ -94,21 +94,29 @@ button swaps to the restore glyph while `Window::is_maximized()` is true.
 ### Floating window chrome
 
 `render_title_bar` is an overlay, not a layout row: it is positioned against the
-window (`absolute().top_0().left_0().right_0()`), paints above the shell but below
-overlays, and owns the strip's surface plus the bottom hairline that closes it.
-Every column that must not underlap it reserves `TITLE_BAR_HEIGHT` at its top — the
-inline sidebar, the workbench column, the preview and right-rail panels, and the
-activity rail — so a panel reads as a column under the bar instead of a surface
-behind it, while every column keeps its full height.
+window (`absolute().top_0().left_0().right_0()`) and paints above the shell but below
+overlays. Every column that must not underlap it reserves `TITLE_BAR_HEIGHT` at its
+top — the inline sidebar, the workbench column, the preview and right-rail panels,
+and the activity rail — so a panel reads as a column under the bar instead of a
+surface behind it, while every column keeps its full height.
+
+The strip splits its treatment at the sidebar seam. The workbench end (the main
+segment and the right cluster) paints the chrome surface and the closing hairline,
+which is a child of the bar rather than a border so it can start past an open
+sidebar — a rail that is open runs its own tone and seam up to the window edge, and
+nothing separates it from the chrome. The control cluster owns no surface at all:
+it keeps only the reserved width (the docked sidebar's width, or the collapsed
+width) so the session title stays aligned with the workbench column, and its
+controls keep one set of metrics — a square `TITLE_BAR_CONTROL_SIZE` control, a
+`TITLE_BAR_CONTROL_GAP` inside a group, a `TITLE_BAR_GROUP_GAP` between groups, and a
+`TITLE_BAR_CLUSTER_PAD` inset.
 
 Anything interactive placed in the top `TITLE_BAR_HEIGHT` of a column without that
 reservation is covered by the drag region, and a press on it starts a window move
-instead of the control's command. The sidebar segment carries the rail tone for the
-collapsed state and the reserved width, so the session title stays aligned with the
-workbench column. A collapsed right rail draws no seam of its own: the activity
-strip only adds its divider while the panel it belongs to is open. The management
-view's compact sidebar limits read `TITLE_BAR_HEIGHT` too, so the chrome height
-lives in one constant.
+instead of the control's command. A collapsed right rail draws no seam of its own:
+the activity strip only adds its divider while the panel it belongs to is open. The
+management view's compact sidebar limits read `TITLE_BAR_HEIGHT` too, so the chrome
+height lives in one constant.
 
 ### GPUI Button hover ownership
 
