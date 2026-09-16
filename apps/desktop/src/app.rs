@@ -272,7 +272,9 @@ const WORKBENCH_NAVIGATION_LIMIT: usize = 60;
 /// Upper bound on waiting for a retired local runtime to release its home lock
 /// before the embedded runtime is booted again.
 const RUNTIME_RETIRE_WAIT: Duration = Duration::from_secs(5);
-const TITLE_BAR_HEIGHT: f32 = 50.0;
+/// Height of the window chrome strip. The bar floats above the shell, so any
+/// column that must not underlap it reserves this much room at its top.
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 38.0;
 const TITLE_BAR_COLLAPSED_SIDEBAR_WIDTH: f32 = 112.0;
 const SIDEBAR_PROJECT_LOGO_DIRECTORY: &str = "project-icons";
 const SIDEBAR_LOGO_DISPLAY_SIZE: f32 = 14.0;
@@ -24764,7 +24766,10 @@ impl VibexWorkbench {
             .border_l_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
-            .py(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
+            // Clear the floating chrome; the rail's own hairline still runs to
+            // the window edge.
+            .pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
+            .pb(px(RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))
             .children(activities)
             .child(div().flex_1())
             .into_any_element()
@@ -25750,18 +25755,23 @@ impl VibexWorkbench {
             locale::ResolvedLocale::ZhTw => format!("發現 Vibex {update_version}"),
         };
 
+        // The bar floats above the shell instead of taking a row of it: every
+        // column keeps its full height and paints its own surface (sidebar
+        // tone, panel hairlines) up to the window edge underneath. A column
+        // that must not underlap the chrome reserves `TITLE_BAR_HEIGHT` at its
+        // top. Nothing here fills or outlines the strip, so the shell reads as
+        // one surface behind the controls.
         div()
             .id("title-bar")
-            .relative()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
             .flex()
             .flex_row()
             .items_center()
             .h(px(TITLE_BAR_HEIGHT))
-            .flex_none()
             .overflow_hidden()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(is_linux, |this| {
                 this.on_double_click(|_, window, _| window.zoom_window())
@@ -25898,7 +25908,6 @@ impl VibexWorkbench {
                             .gap_0()
                             .py_1()
                             .px_3()
-                            .bg(cx.theme().background)
                             .text_color(cx.theme().foreground)
                             .when(management_open, |this| {
                                 this.child(
@@ -26036,8 +26045,6 @@ impl VibexWorkbench {
                             .flex_none()
                             .items_center()
                             .gap_2()
-                            .border_l_1()
-                            .border_color(cx.theme().border)
                             .px_2()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .when(show_update_entry, |this| {
@@ -42018,12 +42025,23 @@ impl VibexWorkbench {
         let panel = if animation_state.render_child {
             let mut panel = div()
                 .relative()
+                .flex()
+                .flex_col()
                 .w(px(sidebar_width))
                 .h_full()
                 .flex_none()
                 .border_r_1()
                 .border_color(cx.theme().border)
-                .child(self.render_agent_sidebar(cx));
+                // The chrome floats above the sidebar, so the rail keeps its
+                // full height and tone while its content starts below the bar.
+                .bg(cx.theme().sidebar)
+                .pt(px(TITLE_BAR_HEIGHT))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_agent_sidebar(cx)),
+                );
             if visible {
                 panel = panel.child(self.render_sidebar_resize_handle(
                     visibility,
@@ -42646,6 +42664,35 @@ impl VibexWorkbench {
             .min_w_0()
             .overflow_hidden()
             .child(inline_sidebar);
+        let center_content: AnyElement = if management_open {
+            div()
+                .id("management-shell")
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    self.management_view
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .into_any_element()
+        } else if usage_open {
+            div()
+                .id("usage-shell")
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    self.usage_view
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .into_any_element()
+        } else if new_session_open {
+            self.render_new_session_panel(strings, window, cx)
+        } else {
+            self.render_agent_workbench(window, cx)
+        };
         shell = shell.child(
             div()
                 .flex_1()
@@ -42653,35 +42700,20 @@ impl VibexWorkbench {
                 .min_h_0()
                 .self_stretch()
                 .overflow_hidden()
-                .child(if management_open {
+                .flex()
+                .flex_col()
+                // The chrome floats above the workbench: the column keeps the
+                // full height so its surface reaches the window edge, and its
+                // content starts below the bar.
+                .pt(px(TITLE_BAR_HEIGHT))
+                .child(
                     div()
-                        .id("management-shell")
-                        .size_full()
+                        .flex_1()
                         .min_w_0()
                         .min_h_0()
-                        .child(
-                            self.management_view
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
-                        )
-                        .into_any_element()
-                } else if usage_open {
-                    div()
-                        .id("usage-shell")
-                        .size_full()
-                        .min_w_0()
-                        .min_h_0()
-                        .child(
-                            self.usage_view
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
-                        )
-                        .into_any_element()
-                } else if new_session_open {
-                    self.render_new_session_panel(strings, window, cx)
-                } else {
-                    self.render_agent_workbench(window, cx)
-                }),
+                        .overflow_hidden()
+                        .child(center_content),
+                ),
         );
         let preview_animation = self.update_docked_panel_animation(
             "preview",
@@ -42699,14 +42731,25 @@ impl VibexWorkbench {
             );
             div()
                 .relative()
+                .flex()
+                .flex_col()
                 .w_full()
                 .h_full()
                 .border_l_1()
                 .border_color(cx.theme().border)
                 .child(
-                    self.code_workbench
-                        .clone()
-                        .cached(StyleRefinement::default().size_full()),
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        // The chrome floats above the panel; its content
+                        // starts below the bar while the seam stays full height.
+                        .pt(px(TITLE_BAR_HEIGHT))
+                        .child(
+                            self.code_workbench
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
                 )
                 .child(resize_handle)
                 .into_any_element()
@@ -42731,13 +42774,33 @@ impl VibexWorkbench {
                 cx,
             );
             let panel = self.render_right_rail_panel(window, cx);
+            // The rail's own surface continues into the chrome band: files and
+            // git render as a sidebar-toned column, the child-agent timeline as
+            // a workbench-toned one.
+            let rail_tone = if self.child_agent_panel_active {
+                cx.theme().background
+            } else {
+                cx.theme().sidebar
+            };
             div()
                 .relative()
+                .flex()
+                .flex_col()
                 .w_full()
                 .h_full()
+                .bg(rail_tone)
                 .border_l_1()
                 .border_color(cx.theme().border)
-                .child(panel)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        // Same chrome clearance as the preview panel: rail
+                        // content starts below the bar, its seam does not.
+                        .pt(px(TITLE_BAR_HEIGHT))
+                        .child(panel),
+                )
                 .child(resize_handle)
                 .into_any_element()
         });
@@ -42764,7 +42827,8 @@ impl VibexWorkbench {
                 let panel = self.render_right_rail_panel(window, cx);
                 div()
                     .absolute()
-                    .top_0()
+                    // Overlay panels start below the floating chrome too.
+                    .top(px(TITLE_BAR_HEIGHT))
                     .bottom_0()
                     .right(px(RIGHT_ACTIVITY_BAR_WIDTH))
                     .w(px(right_rail_width))
@@ -42788,7 +42852,7 @@ impl VibexWorkbench {
                     this.child(
                         div()
                             .absolute()
-                            .top_0()
+                            .top(px(TITLE_BAR_HEIGHT))
                             .bottom_0()
                             .right(px(40.0))
                             .w(px(visibility.layout.preview_min_width.max(280.0)))
@@ -42807,11 +42871,21 @@ impl VibexWorkbench {
             .when_some(floating_right_rail, |this, panel| this.child(panel))
             .when(preview_fullscreen, |this| {
                 this.child(
-                    div().absolute().inset_0().bg(cx.theme().background).child(
-                        self.code_workbench
-                            .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    ),
+                    // Full-bleed, but still below the floating chrome: the
+                    // editor keeps its own controls reachable in the band the
+                    // bar reserves.
+                    div()
+                        .absolute()
+                        .top(px(TITLE_BAR_HEIGHT))
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .bg(cx.theme().background)
+                        .child(
+                            self.code_workbench
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
                 )
             })
             .into_any_element()
@@ -52447,8 +52521,10 @@ impl Render for VibexWorkbench {
             .font_weight(FontWeight(
                 self.ui_state.appearance.interface_font.weight as f32,
             ))
-            .child(self.render_title_bar(window, cx))
             .child(content)
+            // The chrome floats over the shell, so it paints after it — and
+            // before the overlay layers, which still cover the bar.
+            .child(self.render_title_bar(window, cx))
             .when_some(fps_hud, |this, hud| this.child(hud))
             .children(inline_composer_attachments)
             .when_some(floating_sidebar, |this, sidebar| this.child(sidebar))
@@ -63940,6 +64016,37 @@ mod tests {
     }
 
     #[test]
+    fn columns_that_must_not_underlap_the_chrome_reserve_its_height() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_inline_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_floating_sidebar("))
+            .map(|(body, _)| body)
+            .expect("inline sidebar should remain inspectable");
+        assert!(sidebar.contains(".pt(px(TITLE_BAR_HEIGHT))"));
+
+        let shell = source
+            .split_once("    fn render_shell(")
+            .and_then(|(_, tail)| tail.split_once("\nfn localize_network_proxy_error("))
+            .map(|(body, _)| body)
+            .expect("shell should remain inspectable");
+        // Workbench column, preview panel, and right-rail panel each start
+        // below the bar; the floating panels anchor below it as well.
+        assert!(shell.matches(".pt(px(TITLE_BAR_HEIGHT))").count() >= 3);
+        assert!(shell.matches(".top(px(TITLE_BAR_HEIGHT))").count() >= 2);
+
+        let activity_bar = source
+            .split_once("    fn render_right_rail_activity_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
+            .map(|(body, _)| body)
+            .expect("activity bar should remain inspectable");
+        assert!(
+            activity_bar
+                .contains(".pt(px(TITLE_BAR_HEIGHT + RIGHT_ACTIVITY_BAR_VERTICAL_PADDING))")
+        );
+    }
+
+    #[test]
     fn a_server_decorated_window_draws_no_caption_buttons() {
         // Hyprland answers the xdg-decoration negotiation with SERVER_SIDE, so
         // the compositor owns the caption and Vibex must not paint a second one.
@@ -64126,6 +64233,21 @@ mod tests {
         assert!(main_start < session_title);
         assert!(session_title < session_menu);
 
+        // The chrome floats over the shell: it is positioned against the
+        // window, drawn without a fill or an outline so the columns behind it
+        // are the band's surface, and the columns that must not underlap it
+        // reserve `TITLE_BAR_HEIGHT` at their top.
+        let root = &title_bar[title_bar
+            .find(".id(\"title-bar\")")
+            .expect("title bar root should exist")..sidebar_start];
+        assert!(root.contains(".absolute()"));
+        assert!(root.contains(".top_0()"));
+        assert!(root.contains(".left_0()"));
+        assert!(root.contains(".right_0()"));
+        assert!(root.contains("h(px(TITLE_BAR_HEIGHT))"));
+        assert!(!root.contains(".border_b_1()"));
+        assert!(!root.contains(".bg("));
+
         let sidebar = &title_bar[sidebar_start..main_start];
         assert!(sidebar.contains(".bg(cx.theme().sidebar)"));
         assert!(sidebar.contains(".text_color(cx.theme().sidebar_foreground)"));
@@ -64133,7 +64255,7 @@ mod tests {
         assert!(!sidebar.contains("title-workspace-context"));
 
         let main = &title_bar[main_start..];
-        assert!(main.contains(".bg(cx.theme().background)"));
+        assert!(!main.contains(".bg(cx.theme().background)"));
         assert!(main.contains(".text_color(cx.theme().foreground)"));
         assert!(main.contains("title-session-title"));
         assert!(main.contains("title_session_menu"));

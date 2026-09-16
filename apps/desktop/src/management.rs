@@ -64,6 +64,7 @@ use vibex_desktop_runtime::{DesktopRuntime, validate_external_open_url};
 use vibex_markdown::code_font_weight;
 use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
+use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::button_with_aria_label;
 use crate::locale::{self, ResolvedLocale};
@@ -84,7 +85,6 @@ const MANAGEMENT_COMPACT_SIDEBAR_MAX_HEIGHT: f32 = 560.0;
 const MANAGEMENT_COMPACT_MAIN_MIN_HEIGHT: f32 = 192.0;
 const MANAGEMENT_COMPACT_RESIZE_HANDLE_HEIGHT: f32 = 12.0;
 const AGENT_AUTH_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MANAGEMENT_HOST_TITLE_BAR_HEIGHT: f32 = 50.0;
 const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
@@ -17210,7 +17210,7 @@ impl Render for ManagementCenter {
 
 fn management_compact_sidebar_height_limits(viewport_height: f32) -> (f32, f32) {
     let available = viewport_height
-        - MANAGEMENT_HOST_TITLE_BAR_HEIGHT
+        - TITLE_BAR_HEIGHT
         - MANAGEMENT_COMPACT_RESIZE_HANDLE_HEIGHT
         - MANAGEMENT_COMPACT_MAIN_MIN_HEIGHT;
     let max_height = available.clamp(
@@ -20073,7 +20073,7 @@ mod tests {
     fn compact_management_sidebar_preserves_a_reachable_main_panel() {
         assert_eq!(
             management_compact_sidebar_height_limits(620.0),
-            (192.0, 366.0)
+            (192.0, 378.0)
         );
         assert_eq!(
             management_compact_sidebar_height_limits(1_000.0),
