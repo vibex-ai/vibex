@@ -77,11 +77,11 @@ rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
 gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
-gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_platform = { package = "gpui-pre-platform", path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
-gpui-component = "0.6.1"
-gpui-fps = "0.6.1"
-gpui-kit-assets = "0.6.1"
+gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
+gpui-fps = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
 image = { version = "=0.25.10", default-features = false }
 tray-icon = { version = "0.24.2", default-features = false }
 markdown = { version = "=1.0.0", features = ["serde"] }
@@ -114,11 +114,13 @@ x25519-dalek = { version = "2", default-features = false, features = ["alloc", "
 zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [patch.crates-io]
-# gpui-component 0.6 consumes the gpui-pre-* family from crates.io; redirect the
-# whole family to the vendored vibex-ai/zed fork (gpui-mobile) so the tree has ONE gpui.
+# The gpui-kit family is pinned to gpui-kit main; redirect the whole gpui-pre-*
+# family it consumes to the vendored vibex-ai/zed fork so the tree has ONE gpui.
+# The fork publishes this family as gpui-pre 0.3.5 (upstream zed@d89e9c2).
 gpui-pre = { path = "vendor/zed/crates/gpui" }
 gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
 gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
+gpui-pre-platform = { path = "vendor/zed/crates/gpui_platform" }
 
 [profile.dev]
 incremental = true
