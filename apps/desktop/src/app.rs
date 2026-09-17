@@ -428,6 +428,9 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
+/// Top padding of the virtual timeline list before the first render reports the
+/// window's rem size. The list's `py_4` resolves to one rem.
+const AGENT_TIMELINE_LIST_PADDING_TOP_PX: f32 = 16.0;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 /// Settle window before a repeatable smaller intrinsic measurement may replace
@@ -3776,6 +3779,50 @@ fn timeline_should_auto_follow_content(
         && content_extent_changed
 }
 
+/// Locate the virtual timeline row under the viewport top for a scroll offset.
+///
+/// `offset_y` is the raw [`ScrollHandle`] offset (zero at the top, negative
+/// while scrolled down) and `padding_top` is the list's own top padding, which
+/// scrolls with the content. The returned offset is how far the viewport top
+/// sits below the row's top, so it is negative while the list is parked above
+/// the first row. Capturing this anchor lets a session switch or an
+/// authoritative replacement put the same conversation content back under the
+/// viewport after the virtual row extents changed.
+fn timeline_scroll_anchor_from_offset(
+    row_heights: &[f32],
+    offset_y: f32,
+    padding_top: f32,
+) -> Option<(usize, f32)> {
+    let viewport_top = -offset_y - padding_top;
+    let mut row_top = 0.0;
+    for (index, height) in row_heights.iter().enumerate() {
+        if row_top + height > viewport_top {
+            return Some((index, viewport_top - row_top));
+        }
+        row_top += height;
+    }
+    row_heights
+        .len()
+        .checked_sub(1)
+        .map(|index| (index, row_heights[index]))
+}
+
+/// Scroll offset that puts `row_index`'s top `offset_in_row` below the viewport
+/// top. The inverse of [`timeline_scroll_anchor_from_offset`], so an unchanged
+/// row table maps an offset back to itself.
+fn timeline_scroll_offset_for_anchor(
+    row_heights: &[f32],
+    row_index: usize,
+    offset_in_row: f32,
+    padding_top: f32,
+) -> Option<f32> {
+    if row_index >= row_heights.len() {
+        return None;
+    }
+    let row_top: f32 = row_heights[..row_index].iter().sum();
+    Some(-(padding_top + row_top + offset_in_row))
+}
+
 fn stable_streaming_timeline_height(
     previous_height: Option<f32>,
     measured_height: f32,
@@ -5275,6 +5322,8 @@ pub struct VibexWorkbench {
     timeline_follow: TimelineFollowState,
     timeline_scroll: VirtualListScrollHandle,
     timeline_scroll_to_latest_pending: bool,
+    timeline_scroll_anchor_pending: bool,
+    timeline_list_padding_top_px: f32,
     timeline_scroll_wheel_idle_task: Option<Task<()>>,
     timeline_bottom_control_visible: bool,
     timeline_bottom_control_mounted: bool,
@@ -6115,6 +6164,8 @@ impl VibexWorkbench {
             timeline_follow: TimelineFollowState::default(),
             timeline_scroll: VirtualListScrollHandle::new(),
             timeline_scroll_to_latest_pending: false,
+            timeline_scroll_anchor_pending: false,
+            timeline_list_padding_top_px: AGENT_TIMELINE_LIST_PADDING_TOP_PX,
             timeline_scroll_wheel_idle_task: None,
             timeline_bottom_control_visible: false,
             timeline_bottom_control_mounted: false,
@@ -12054,7 +12105,6 @@ impl VibexWorkbench {
     }
 
     fn stash_current_agent_session_view(&mut self) {
-        self.apply_pending_timeline_row_heights();
         let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
@@ -12063,6 +12113,13 @@ impl VibexWorkbench {
         {
             return;
         }
+        // Snapshot the reader's logical position before the view is parked, so
+        // the switch back can keep the same conversation content under the
+        // viewport even if the row extents were rebuilt in the meantime. This
+        // reads the row table that was actually painted: pending height
+        // corrections are only measured, not yet applied.
+        self.capture_timeline_scroll_anchor();
+        self.apply_pending_timeline_row_heights();
         *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
         let mut entry = AgentSessionViewCacheEntry {
             estimated_resident_bytes: 0,
@@ -12215,10 +12272,16 @@ impl VibexWorkbench {
         let content_width_changed = entry.content_width != self.ui_state.session.content_width;
         let turns_cache_changed = self.conversation_turns_cache_key.as_ref()
             != Some(&self.current_conversation_turns_cache_key());
-        if layout_width_changed || content_width_changed || turns_cache_changed {
+        // Measured row extents survive a switch unless the layout that produced
+        // them changed. The turns cache key also moves for view-local state such
+        // as the session's turn-pending flag, and re-estimating every row from
+        // that would resize the whole timeline and visibly scroll the restored
+        // viewport before its first paint.
+        let geometry_changed = layout_width_changed || content_width_changed;
+        if geometry_changed {
             self.invalidate_timeline_layout_measurements();
         }
-        if layout_width_changed || content_width_changed || turns_cache_changed {
+        if geometry_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
         // The streaming preserve policy keeps the largest measured extent while
@@ -12236,6 +12299,10 @@ impl VibexWorkbench {
             self.timeline_estimated_turn_heights.remove(&turn_id);
             self.rebuild_timeline_sizes();
         }
+        // A reader who was not following the bottom gets the anchored row back
+        // under the viewport once the render has rebuilt the row table.
+        self.timeline_scroll_anchor_pending =
+            !self.timeline_follow.following_bottom && self.timeline_follow.anchor_row_id.is_some();
         true
     }
 
@@ -13087,6 +13154,7 @@ impl VibexWorkbench {
         self.agent_turn_pending = self.session_turn_pending(&session_id);
         self.agent_error = None;
         self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_bottom_control_visible = false;
         self.timeline_bottom_control_mounted = false;
@@ -13265,6 +13333,10 @@ impl VibexWorkbench {
                     this.agent_loading = false;
                     match outcome {
                         Ok(Ok(items)) => {
+                            // Capture the reader's position against the extents
+                            // that are still on screen before the replacement
+                            // invalidates every measured row.
+                            this.capture_timeline_scroll_anchor();
                             let content_changed = this.timeline.session_id.as_ref()
                                 != Some(&session_id)
                                 || this.timeline.items != items;
@@ -13277,7 +13349,11 @@ impl VibexWorkbench {
                                 .replace_authoritative(session_id.clone(), items);
                             this.reconcile_optimistic_user_message();
                             this.auto_continue_probe_tasks.remove(session_id.as_str());
-                            this.request_timeline_scroll_to_latest();
+                            if this.timeline_follow.following_bottom {
+                                this.request_timeline_scroll_to_latest();
+                            } else {
+                                this.timeline_scroll_anchor_pending = true;
+                            }
                         }
                         Ok(Err(error)) => {
                             this.agent_error = Some(format!("{}: {}", error.code, error.message));
@@ -13317,6 +13393,10 @@ impl VibexWorkbench {
                     this.agent_loading = false;
                     match outcome {
                         Ok(Ok(items)) => {
+                            // Capture the reader's position against the extents
+                            // that are still on screen before the replacement
+                            // invalidates every measured row.
+                            this.capture_timeline_scroll_anchor();
                             let content_changed = this.timeline.session_id.as_ref()
                                 != Some(&session_id)
                                 || this.timeline.items != items;
@@ -13363,8 +13443,12 @@ impl VibexWorkbench {
                                 );
                             }
                             let search_jump_applied = this.apply_pending_session_search_jump(cx);
-                            if !search_jump_applied && this.timeline_follow.following_bottom {
-                                this.request_timeline_scroll_to_latest();
+                            if !search_jump_applied {
+                                if this.timeline_follow.following_bottom {
+                                    this.request_timeline_scroll_to_latest();
+                                } else {
+                                    this.timeline_scroll_anchor_pending = true;
+                                }
                             }
                         }
                         Ok(Err(error)) => {
@@ -15052,7 +15136,78 @@ impl VibexWorkbench {
             && !self.timeline_scrollbar_interaction_active
         {
             self.scroll_timeline_to_latest();
+            return;
         }
+        // A pending anchor resolves after the row table is current, so a
+        // switched-to session paints the anchored content in its first frame.
+        if std::mem::take(&mut self.timeline_scroll_anchor_pending) {
+            self.apply_timeline_scroll_anchor();
+        }
+    }
+
+    fn timeline_row_heights(&self) -> Vec<f32> {
+        self.timeline_row_sizes
+            .iter()
+            .map(|row_size| f32::from(row_size.height))
+            .collect()
+    }
+
+    /// Remember the row under the viewport top while the reader is not
+    /// following the bottom, so the same conversation content can be restored
+    /// after a session switch or an authoritative replacement.
+    fn capture_timeline_scroll_anchor(&mut self) {
+        if self.timeline_follow.following_bottom
+            || self.timeline_row_sizes.len() != self.conversation_turns_cache.len()
+        {
+            return;
+        }
+        let row_heights = self.timeline_row_heights();
+        let Some((row_index, offset_in_row)) = timeline_scroll_anchor_from_offset(
+            &row_heights,
+            f32::from(self.timeline_scroll.offset().y),
+            self.timeline_list_padding_top_px,
+        ) else {
+            return;
+        };
+        let Some(turn_id) = self
+            .conversation_turns_cache
+            .get(row_index)
+            .map(|turn| turn.id.clone())
+        else {
+            return;
+        };
+        self.timeline_follow
+            .preserve_anchor(turn_id, offset_in_row.round() as i32);
+    }
+
+    /// Put the captured anchor back under the viewport top against the current
+    /// row table. Returns whether an anchor was applied.
+    fn apply_timeline_scroll_anchor(&mut self) -> bool {
+        if self.timeline_follow.following_bottom {
+            return false;
+        }
+        let Some(turn_id) = self.timeline_follow.anchor_row_id.clone() else {
+            return false;
+        };
+        let Some(row_index) = self
+            .conversation_turns_cache
+            .iter()
+            .position(|turn| turn.id == turn_id)
+        else {
+            return false;
+        };
+        let row_heights = self.timeline_row_heights();
+        let Some(offset_y) = timeline_scroll_offset_for_anchor(
+            &row_heights,
+            row_index,
+            self.timeline_follow.anchor_offset_px as f32,
+            self.timeline_list_padding_top_px,
+        ) else {
+            return false;
+        };
+        self.timeline_scroll
+            .set_offset(point(px(0.0), px(offset_y)));
+        true
     }
 
     fn handle_timeline_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
@@ -15066,6 +15221,7 @@ impl VibexWorkbench {
 
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
         self.timeline_follow.set_following_bottom(false);
         let scrolled_toward_bottom = delta_y < 0.0;
         let generation = self.session_generation;
@@ -15110,6 +15266,7 @@ impl VibexWorkbench {
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_scrollbar_interaction_active = true;
         self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
         self.timeline_follow.set_following_bottom(false);
         cx.notify();
     }
@@ -15139,6 +15296,7 @@ impl VibexWorkbench {
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_follow.set_following_bottom(false);
         self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
         self.timeline_scroll
             .scroll_to_item(turn_index, ScrollStrategy::Top);
         cx.notify();
@@ -23500,6 +23658,7 @@ impl VibexWorkbench {
             self.timeline_scroll_wheel_idle_task = None;
             self.timeline_follow.set_following_bottom(false);
             self.timeline_scroll_to_latest_pending = false;
+            self.timeline_scroll_anchor_pending = false;
             self.timeline_scroll
                 .scroll_to_item(turn_index, ScrollStrategy::Center);
         }
@@ -23854,6 +24013,7 @@ impl VibexWorkbench {
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_follow.set_following_bottom(false);
         self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
         self.rebuild_timeline_sizes();
         self.timeline_scroll
             .scroll_to_item(turn_index, ScrollStrategy::Center);
@@ -33362,6 +33522,7 @@ impl VibexWorkbench {
                         this.timeline_scroll_wheel_idle_task = None;
                         this.timeline_follow.set_following_bottom(false);
                         this.timeline_scroll_to_latest_pending = false;
+                        this.timeline_scroll_anchor_pending = false;
                         this.timeline_scroll
                             .scroll_to_item(row_index, ScrollStrategy::Center);
                         cx.notify();
@@ -33453,6 +33614,9 @@ impl VibexWorkbench {
         self.sync_selected_composer_draft(window, cx);
         self.prune_elicitation_forms();
         self.apply_pending_timeline_row_heights();
+        // The virtual list pads itself with `py_4`; the scroll anchor needs the
+        // same rem-based top inset to map offsets to rows.
+        self.timeline_list_padding_top_px = f32::from(window.rem_size());
         let selected = self.selected_session().cloned();
         let mut turns = self.conversation_turns_cached();
         if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
@@ -57458,6 +57622,13 @@ mod tests {
         assert!(stash.contains("self.timeline_markdown_sources.clear();"));
         assert!(stash.contains("self.timeline_tool_card_projections.clear();"));
         assert!(!stash.contains("self.timeline.clone()"));
+        let capture_anchor = stash
+            .find("self.capture_timeline_scroll_anchor();")
+            .expect("the reader's position should be captured before the view is parked");
+        let park_follow = stash
+            .find("timeline_follow: std::mem::take(&mut self.timeline_follow),")
+            .expect("the follow state should still be parked with the view");
+        assert!(capture_anchor < park_follow);
 
         let restore = source
             .split_once("    fn restore_agent_session_view(")
@@ -57469,11 +57640,23 @@ mod tests {
         assert!(restore.contains("self.timeline_row_sizes = entry.timeline_row_sizes;"));
         assert!(restore.contains("self.timeline_measured_turn_layout_signatures ="));
         assert!(restore.contains("cached_timeline_layout_width"));
-        assert!(restore.contains("self.invalidate_timeline_layout_measurements();"));
         assert!(
             restore.contains("self.conversation_turns_cache = entry.conversation_turns_cache;")
         );
         assert!(restore.contains("entry.content_width != self.ui_state.session.content_width"));
+        // Only a real layout change may drop the measured row extents: the
+        // turns cache key also moves for view-local session state, and
+        // re-estimating the whole table there would scroll the restored view.
+        let geometry = restore
+            .find("let geometry_changed = layout_width_changed || content_width_changed;")
+            .expect("restoration should separate layout changes from projection changes");
+        let invalidate = restore
+            .find("self.invalidate_timeline_layout_measurements();")
+            .expect("a layout change should still invalidate the measurements");
+        assert!(geometry < invalidate);
+        assert!(restore.contains("if geometry_changed || turns_cache_changed {"));
+        assert!(restore.contains("self.timeline_scroll_anchor_pending ="));
+        assert!(restore.contains("!self.timeline_follow.following_bottom"));
 
         let selection = source
             .split_once("    fn select_session_with_history(")
@@ -57481,6 +57664,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session selection should remain inspectable");
         assert!(selection.contains("self.stash_current_agent_session_view();"));
+        assert!(selection.contains("self.timeline_scroll_anchor_pending = false;"));
         assert!(!selection.contains("latest_timeline_turn_ended_normally"));
         assert!(!selection.contains("cache_auto_continue_turn_status"));
 
@@ -57491,6 +57675,100 @@ mod tests {
             .expect("authoritative timeline load should remain inspectable");
         assert!(authoritative_load.contains("latest_timeline_turn_ended_normally"));
         assert!(authoritative_load.contains("cache_auto_continue_turn_status"));
+    }
+
+    #[test]
+    fn session_switch_restores_the_anchored_timeline_position() {
+        // The anchor helpers are exact inverses while the row table is
+        // unchanged, which is what lets a switch back paint the same
+        // conversation content in its first frame.
+        let row_heights = [100.0, 200.0, 300.0];
+        assert_eq!(
+            timeline_scroll_anchor_from_offset(&row_heights, 0.0, 16.0),
+            Some((0, -16.0))
+        );
+        assert_eq!(
+            timeline_scroll_anchor_from_offset(&row_heights, -200.0, 16.0),
+            Some((1, 84.0))
+        );
+        assert_eq!(
+            timeline_scroll_anchor_from_offset(&row_heights, -600.0, 16.0),
+            Some((2, 284.0))
+        );
+        assert_eq!(timeline_scroll_anchor_from_offset(&[], 0.0, 16.0), None);
+        for (row_index, offset_in_row) in [(0, -16.0), (1, 84.0), (2, 284.0)] {
+            let offset_y =
+                timeline_scroll_offset_for_anchor(&row_heights, row_index, offset_in_row, 16.0)
+                    .expect("a row in the table resolves an offset");
+            assert_eq!(
+                timeline_scroll_anchor_from_offset(&row_heights, offset_y, 16.0),
+                Some((row_index, offset_in_row))
+            );
+        }
+        assert_eq!(
+            timeline_scroll_offset_for_anchor(&row_heights, 3, 0.0, 16.0),
+            None
+        );
+
+        let source = include_str!("app.rs");
+        let apply = source
+            .split_once("    fn apply_pending_timeline_scroll(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_row_heights("))
+            .map(|(body, _)| body)
+            .expect("pending timeline scroll should remain inspectable");
+        assert!(apply.contains("self.apply_timeline_scroll_anchor();"));
+
+        let capture = source
+            .split_once("    fn capture_timeline_scroll_anchor(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Put the captured anchor back"))
+            .map(|(body, _)| body)
+            .expect("timeline anchor capture should remain inspectable");
+        assert!(capture.contains("self.timeline_follow.following_bottom"));
+        assert!(
+            capture
+                .contains("self.timeline_row_sizes.len() != self.conversation_turns_cache.len()")
+        );
+        assert!(capture.contains(".preserve_anchor(turn_id, offset_in_row.round() as i32);"));
+
+        let workbench = source
+            .split_once("    fn render_agent_workbench(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("agent workbench renderer should remain inspectable");
+        let padding = workbench
+            .find("self.timeline_list_padding_top_px = f32::from(window.rem_size());")
+            .expect("the list's rem-based top padding should be tracked");
+        let scroll = workbench
+            .find("self.apply_pending_timeline_scroll();")
+            .expect("pending scroll work should remain applied");
+        assert!(padding < scroll);
+
+        // Both authorities must anchor the reader before their authoritative
+        // replacement invalidates the measured extents.
+        for (loader, next) in [
+            (
+                "    fn load_agent_session_timeline(",
+                "\n    fn refresh_selected_agent_timeline(",
+            ),
+            (
+                "    fn load_agent_session_timeline_remote(",
+                "\n    fn load_agent_session_timeline(",
+            ),
+        ] {
+            let body = source
+                .split_once(loader)
+                .and_then(|(_, tail)| tail.split_once(next))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{loader} should remain inspectable"));
+            let capture = body
+                .find("this.capture_timeline_scroll_anchor();")
+                .expect("the reader's position should be captured before the replacement");
+            let replace = body
+                .find("this.timeline\n                                .replace_authoritative(")
+                .expect("the authoritative replacement should remain inspectable");
+            assert!(capture < replace);
+            assert!(body.contains("this.timeline_scroll_anchor_pending = true;"));
+        }
     }
 
     #[test]
