@@ -28,6 +28,7 @@ pub mod terminal_surface;
 pub mod terminal_transport;
 pub mod testing;
 pub mod theme;
+pub mod typography;
 pub mod usage;
 pub mod views;
 

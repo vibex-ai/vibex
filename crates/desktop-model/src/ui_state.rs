@@ -20,6 +20,7 @@ pub const MIN_UI_STATE_WRITE_DELAY_MS: u64 = 100;
 pub const MAX_UI_STATE_WRITE_DELAY_MS: u64 = 300;
 pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
 pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
+pub const RUNTIME_MODEL_FAVORITE_LIMIT: usize = 256;
 pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
 
 #[derive(Debug, Error)]
@@ -654,6 +655,27 @@ pub enum SessionContentWidthMode {
     Full,
 }
 
+/// One starred model in the provider/model picker.
+///
+/// Keyed by Agent plus the picker's own model key rather than by an auth
+/// source: a star follows the model across the account and provider-profile
+/// entries that may advertise it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeModelFavorite {
+    pub agent_id: AgentId,
+    pub model_key: String,
+}
+
+impl RuntimeModelFavorite {
+    pub fn new(agent_id: impl Into<AgentId>, model_key: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            model_key: model_key.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ComposerUiState {
@@ -664,10 +686,42 @@ pub struct ComposerUiState {
     pub runtime_selections_by_model: Vec<SessionRuntimeSelection>,
     #[serde(default)]
     pub default_runtime_selection: Option<SessionRuntimeSelection>,
+    /// Starred models, oldest first. Order is the tie-break inside the
+    /// favorites view, so it is preserved rather than sorted.
+    #[serde(default)]
+    pub favorite_runtime_models: Vec<RuntimeModelFavorite>,
     #[serde(default)]
     pub queue_send_mode: ComposerQueueSendMode,
     #[serde(default)]
     pub message_send_key: MessageSendKey,
+}
+
+impl ComposerUiState {
+    pub fn is_runtime_model_favorite(&self, agent_id: &AgentId, model_key: &str) -> bool {
+        self.favorite_runtime_models
+            .iter()
+            .any(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key)
+    }
+
+    /// Star/unstar one model. Returns `true` when the model is starred
+    /// afterwards. A new star past [`RUNTIME_MODEL_FAVORITE_LIMIT`] evicts the
+    /// oldest entry so the persisted list stays bounded.
+    pub fn toggle_runtime_model_favorite(&mut self, agent_id: &AgentId, model_key: &str) -> bool {
+        let existing = self
+            .favorite_runtime_models
+            .iter()
+            .position(|favorite| &favorite.agent_id == agent_id && favorite.model_key == model_key);
+        if let Some(index) = existing {
+            self.favorite_runtime_models.remove(index);
+            return false;
+        }
+        while self.favorite_runtime_models.len() >= RUNTIME_MODEL_FAVORITE_LIMIT {
+            self.favorite_runtime_models.remove(0);
+        }
+        self.favorite_runtime_models
+            .push(RuntimeModelFavorite::new(agent_id.clone(), model_key));
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1669,6 +1723,43 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn runtime_model_favorites_toggle_per_agent_and_model() {
+        let mut composer = ComposerUiState::default();
+        let claude = AgentId::parse("claude").expect("agent id");
+        let codex = AgentId::parse("codex").expect("agent id");
+
+        assert!(!composer.is_runtime_model_favorite(&claude, "model:opus"));
+        assert!(composer.toggle_runtime_model_favorite(&claude, "model:opus"));
+        assert!(composer.is_runtime_model_favorite(&claude, "model:opus"));
+        // The same model id under another Agent is a different star.
+        assert!(!composer.is_runtime_model_favorite(&codex, "model:opus"));
+        assert!(composer.toggle_runtime_model_favorite(&codex, "model:opus"));
+        assert_eq!(composer.favorite_runtime_models.len(), 2);
+        assert!(!composer.toggle_runtime_model_favorite(&claude, "model:opus"));
+        assert_eq!(composer.favorite_runtime_models.len(), 1);
+        assert!(composer.is_runtime_model_favorite(&codex, "model:opus"));
+    }
+
+    #[test]
+    fn runtime_model_favorites_stay_bounded_and_keep_insertion_order() {
+        let mut composer = ComposerUiState::default();
+        let agent = AgentId::parse("claude").expect("agent id");
+        for index in 0..RUNTIME_MODEL_FAVORITE_LIMIT + 3 {
+            composer.toggle_runtime_model_favorite(&agent, &format!("model:{index}"));
+        }
+        assert_eq!(
+            composer.favorite_runtime_models.len(),
+            RUNTIME_MODEL_FAVORITE_LIMIT
+        );
+        // The oldest stars are evicted first, so the newest one survives.
+        assert!(!composer.is_runtime_model_favorite(&agent, "model:0"));
+        assert!(composer.is_runtime_model_favorite(
+            &agent,
+            &format!("model:{}", RUNTIME_MODEL_FAVORITE_LIMIT + 2)
+        ));
+    }
 
     #[test]
     fn workbench_defaults_keep_optional_right_panels_closed() {

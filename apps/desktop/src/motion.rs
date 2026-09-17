@@ -1,9 +1,6 @@
 //! Motion kit — the shared easing curves, entrance specs, and animated hover
 //! washes used across the desktop workbench.
 //!
-//! Adapted from Zeron's `crates/ui/src/motion.rs` (MIT, Copyright 2026 Wing)
-//! under AGPL-3.0-or-later; trimmed to the pieces this app needs.
-//!
 //! GPUI's `.hover()` styles snap by construction — the wash applies the frame
 //! the pointer enters. The app-level convention is Tailwind `transition-colors`
 //! (150ms, cubic-bezier(0.4, 0, 0.2, 1)) on every interactive wash, so hover
@@ -200,6 +197,9 @@ pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
 pub const OVERLAY_FADE: MotionSpec = MotionSpec::new(200, EASE_OUT_EXPO);
 /// Popover-in: 0.14s, fade + translateY −2.
 pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
+/// Popover-out: 0.1s — quicker than the entrance (exits should get out of the
+/// way; the Radix convention of a shorter close than open).
+pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
 /// Dialog-in: 0.18s, fade + 2px rise.
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
@@ -268,6 +268,37 @@ where
 {
     element.with_animation(id, DIALOG_IN.animation(), |el, t| {
         el.relative().opacity(t).top(px(2.0 * (1.0 - t)))
+    })
+}
+
+/// Eased exit progress (0..=1) for a popover whose close began at `since`,
+/// computed from the wall clock at render time.
+///
+/// The exit runs off an [`Instant`] rather than a `with_animation` clock: a
+/// closing panel is re-rendered by its owner on every frame, and an
+/// element-id-keyed animation would replay from 0 if the panel remounted
+/// mid-exit. Deriving the progress from the timestamp is monotonic by
+/// construction.
+pub fn exit_progress(since: Instant) -> f32 {
+    let total = MENU_OUT.total().mul_f32(speed_scale()).as_secs_f32();
+    let raw = if total <= 0.0 {
+        1.0
+    } else {
+        (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0)
+    };
+    MENU_OUT.progress(raw)
+}
+
+/// Popover exit: the reverse of [`menu_in`] — fade to 0 + translateY 0→−2 over
+/// [`MENU_OUT`]. `t` is the eased progress from [`exit_progress`]; the element
+/// must stay mounted for the whole timeline, which is the owner's job (the
+/// state is held alive until [`MENU_OUT::total`](MotionSpec::total) elapses).
+pub fn menu_out<E>(id: impl Into<ElementId>, t: f32, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, MENU_OUT.animation(), move |el, _| {
+        el.relative().opacity(1.0 - t).top(px(-2.0 * t))
     })
 }
 
@@ -507,8 +538,8 @@ mod tests {
 
     #[test]
     fn eval_never_escapes_unit_interval_dense_sweep() {
-        // f32 rounding produced 1.000000119 near the tail of EASE_OUT_EXPO in
-        // Zeron, tripping gpui's `delta ∈ [0,1]` assert. Sweep densely,
+        // f32 rounding produced 1.000000119 near the tail of EASE_OUT_EXPO,
+        // tripping gpui's `delta ∈ [0,1]` assert. Sweep densely,
         // including the values right below 1.0 where Newton lands closest to
         // the endpoint.
         for curve in [EASE_OUT_EXPO, EASE_OUT, EASE, EASE_IN_OUT, EASE_TAILWIND] {
@@ -522,6 +553,27 @@ mod tests {
                 assert!((0.0..=1.0).contains(&y), "eval({x}) = {y} escaped [0,1]");
             }
         }
+    }
+
+    #[test]
+    fn exit_is_quicker_than_entry() {
+        // Exits get out of the way: a close must never outlast its open.
+        let pair = [(MENU_IN.duration_ms, MENU_OUT.duration_ms)];
+        for (open, close) in pair {
+            assert!(close < open, "close {close}ms must beat open {open}ms");
+        }
+        assert_eq!(MENU_OUT.delay_ms, MENU_IN.delay_ms);
+    }
+
+    #[test]
+    fn exit_progress_is_monotonic_and_bounded() {
+        let since = Instant::now();
+        let first = exit_progress(since);
+        assert!((0.0..=1.0).contains(&first), "progress escaped [0,1]");
+        // Wall-clock derived, so a fresh instant reads near the start and an
+        // elapsed timeline reads exactly 1 — never a replay from 0.
+        assert!(first < 0.5);
+        assert_eq!(exit_progress(since - MENU_OUT.total() * 2), 1.0);
     }
 
     #[test]
