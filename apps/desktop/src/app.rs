@@ -29668,7 +29668,10 @@ impl VibexWorkbench {
         let row_foreground = if selected || move_selected {
             cx.theme().sidebar_foreground
         } else {
-            cx.theme().sidebar_foreground.opacity(0.56)
+            // Unselected session titles sit one step below the selected row but
+            // stay legible: match the project/workspace row tint (0.72) rather
+            // than the older, washed-out 0.56.
+            cx.theme().sidebar_foreground.opacity(0.72)
         };
         let is_dark = cx.theme().is_dark();
         let session_hover_key = motion::hover_key("sidebar-session", &session_id_string);
@@ -30158,7 +30161,7 @@ impl VibexWorkbench {
                             .child(
                                 div()
                                     .flex_none()
-                                    .opacity(if selected { 1.0 } else { 0.725 })
+                                    .opacity(if selected { 1.0 } else { 0.90 })
                                     .group_hover(&hover_group, |style| style.opacity(1.0))
                                     .child(sidebar_agent_logo(sidebar_agent_id.as_str(), true, cx)),
                             )
@@ -59646,11 +59649,11 @@ mod tests {
             "normal and inline-rename rows should preserve the logo inset"
         );
         assert!(sidebar_session.contains(".top(px(8.0))"));
-        assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.56)"));
+        assert!(sidebar_session.contains("cx.theme().sidebar_foreground.opacity(0.72)"));
         assert!(sidebar_session.contains(
             "sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())"
         ));
-        assert!(sidebar_session.contains(".opacity(if selected { 1.0 } else { 0.725 })"));
+        assert!(sidebar_session.contains(".opacity(if selected { 1.0 } else { 0.90 })"));
         assert!(sidebar_session.contains(".group_hover(&hover_group, |style| style.opacity(1.0))"));
         assert!(
             sidebar_session.contains("sidebar_agent_logo(sidebar_agent_id.as_str(), true, cx)")
