@@ -61,7 +61,8 @@ release keystore secrets. The published APK is therefore installable without a
 separate signing step.
 
 Set `VIBEX_MOBILE_ANDROID_TARGETS` to a space-separated ABI list to override
-the defaults during local development.
+the defaults during local development. `VIBEX_MOBILE_ANDROID_API` overrides the
+NDK API level handed to `cargo ndk`, which defaults to `28` to match `minSdk`.
 
 ## iOS
 

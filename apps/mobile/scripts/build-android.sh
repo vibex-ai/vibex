@@ -8,6 +8,11 @@ GRADLE_TASKS=(assembleDebug)
 ANDROID_TARGETS=(arm64-v8a x86_64)
 GRADLE_ARGS=()
 
+# cargo-ndk defaults to API 21, but the NDK only ships libnativewindow.so from
+# API 26 on and gpui-pre-mobile links it. Keep this in step with minSdk in
+# apps/mobile/android/app/build.gradle.
+ANDROID_API="${VIBEX_MOBILE_ANDROID_API:-28}"
+
 if [[ "$PROFILE" == "release" ]]; then
   RUST_FLAGS+=(--release)
   GRADLE_TASKS=(assembleRelease bundleRelease)
@@ -35,6 +40,7 @@ command -v cargo-ndk >/dev/null || {
 
 cargo ndk \
   "${NDK_TARGET_ARGS[@]}" \
+  --platform "$ANDROID_API" \
   -o apps/mobile/android/app/src/main/jniLibs \
   build -p vibex-mobile --lib "${RUST_FLAGS[@]}"
 
