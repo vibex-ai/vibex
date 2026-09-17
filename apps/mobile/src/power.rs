@@ -10,7 +10,7 @@
 mod platform {
     use std::sync::{Mutex, OnceLock};
 
-    use gpui_android::AndroidApp;
+    use android_activity::AndroidApp;
     use jni::{JavaVM, objects::JObject, refs::Global};
 
     fn android_app() -> &'static Mutex<Option<AndroidApp>> {

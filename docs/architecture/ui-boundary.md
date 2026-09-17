@@ -11,8 +11,8 @@ projections and applies the native compact visual treatment used by Zedra.
 
 - `apps/desktop` is the complete local GPUI workbench and owns the
   `DesktopRuntime`.
-- `apps/mobile` is a native GPUI iOS/Android client built against
-  `vendor/zed`'s `gpui_ios` and `gpui_android` implementations.
+- `apps/mobile` is a native GPUI iOS/Android client built on the published
+  `gpui-pre` family plus `gpui-pre-mobile`'s Android/iOS platform layer.
 - Mobile renders a GUI Agent timeline: user messages, Markdown responses,
   process/tool details, approvals, and the composer. It does not replace the
   session page with a terminal UI.

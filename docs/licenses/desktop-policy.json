@@ -6,8 +6,8 @@
   "gplFallbackDisposition": {
     "status": "activated",
     "activated": true,
-    "rationale": "Vibex is licensed AGPL-3.0-or-later and intentionally uses the reviewed Zed fork's GPL-3.0-or-later tracing packages instead of maintaining a local compatibility shim.",
-    "activationGate": "GPL-3.0-or-later remains limited to the reviewed Zed fork tracing family; any additional copyleft family requires explicit allowlist review."
+    "rationale": "Vibex is licensed AGPL-3.0-or-later and uses the published gpui-pre family (a snapshot of zed) whose tracing packages are GPL-3.0-or-later, plus gpui-pre-mobile, which is tri-licensed and consumed under AGPL-3.0-or-later.",
+    "activationGate": "GPL-3.0-or-later remains limited to the published gpui-pre tracing family; any additional copyleft family requires explicit allowlist review."
   },
   "allowedLicenses": [
     {
@@ -266,8 +266,8 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 34,
-      "treeSha256": "4ef261305bc4ba1ce560b10053b1ffe6fdb9637af3523117afaec8168832b14d",
+      "expectedFileCount": 35,
+      "treeSha256": "4af6d4773e1b878b72eee77d09eb644c5f80d12313dcf749a873d2859e71d57b",
       "licenseExpression": "ISC",
       "source": "https://github.com/lucide-icons/lucide",
       "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
@@ -277,7 +277,7 @@
     {
       "id": "vibex-mobile-ibm-plex-sans",
       "name": "IBM Plex Sans mobile interface fonts",
-      "version": "vendor/zed@49d9758",
+      "version": "zed@49d9758",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/fonts/ibm-plex-sans",
       "extensions": [
@@ -289,6 +289,38 @@
       "licenseExpression": "OFL-1.1",
       "source": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans",
       "licenseEvidence": "Four upstream IBM Plex Sans faces and the complete SIL Open Font License 1.1 text are bundled for native mobile rendering."
+    },
+    {
+      "id": "vibex-desktop-ibm-plex-sans",
+      "name": "IBM Plex Sans desktop interface fonts",
+      "version": "zed@49d9758",
+      "ownerPackage": "vibex-desktop",
+      "root": "apps/desktop/assets/fonts/ibm-plex-sans",
+      "extensions": [
+        ".ttf",
+        ".txt"
+      ],
+      "expectedFileCount": 5,
+      "treeSha256": "550b0b7d6dee90b44ce68f78727b51c66216c9f0f0b2cf5ca0617b8e2876d784",
+      "licenseExpression": "OFL-1.1",
+      "source": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans",
+      "licenseEvidence": "Four upstream IBM Plex Sans faces and the complete SIL Open Font License 1.1 text, moved out of the removed vendor/zed submodule into the desktop asset tree so the app no longer reads fonts from a third-party checkout."
+    },
+    {
+      "id": "vibex-desktop-lilex",
+      "name": "Lilex desktop code fonts",
+      "version": "zed@49d9758",
+      "ownerPackage": "vibex-desktop",
+      "root": "apps/desktop/assets/fonts/lilex",
+      "extensions": [
+        ".ttf",
+        ".txt"
+      ],
+      "expectedFileCount": 5,
+      "treeSha256": "8e69f85c04197d912e78f4748a1eb1e75ac5cbdcc79caaf298e298eaebf8f7b1",
+      "licenseExpression": "OFL-1.1",
+      "source": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/lilex",
+      "licenseEvidence": "Four Lilex faces and the complete SIL Open Font License 1.1 text, moved out of the removed vendor/zed submodule into the desktop asset tree so the app no longer reads fonts from a third-party checkout."
     },
     {
       "id": "vibex-mobile-wqy-microhei",

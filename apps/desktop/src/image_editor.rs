@@ -358,7 +358,7 @@ fn editor_font_database() -> Arc<resvg::usvg::fontdb::Database> {
             database.load_font_data(
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+                    "/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
                 ))
                 .to_vec(),
             );

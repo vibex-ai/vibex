@@ -13,15 +13,8 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import parseSpdx from "spdx-expression-parse";
-import {
-  ZED_REPOSITORY,
-  ZED_SUBMODULE_PATH,
-  resolveZedSubmoduleRevision
-} from "./source-identities.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const ZED_ROOT = resolve(ROOT, ZED_SUBMODULE_PATH);
-const ZED_REVISION = resolveZedSubmoduleRevision(ROOT);
 const POLICY_PATH = "docs/licenses/desktop-policy.json";
 const SBOM_PATH = "docs/licenses/desktop.cdx.json";
 const NOTICES_PATH = "docs/licenses/desktop-third-party-notices.md";
@@ -81,11 +74,6 @@ function repositoryPath(absolutePath) {
     fail(`path escapes the repository: ${absolutePath}`);
   }
   return posixPath(relative(ROOT, resolvedPath)) || ".";
-}
-
-function packageIsInZedSubmodule(pkg) {
-  const manifestPath = resolve(pkg.manifest_path);
-  return manifestPath.startsWith(`${ZED_ROOT}${sep}`);
 }
 
 function packageSource(pkg) {
@@ -444,9 +432,7 @@ function auditInputs(policyState, runtime) {
 
 function externalReferences(pkg) {
   const references = [];
-  if (packageIsInZedSubmodule(pkg)) {
-    references.push({ type: "vcs", url: `${ZED_REPOSITORY}#${ZED_REVISION}` });
-  } else if (pkg.repository?.startsWith("http")) {
+  if (pkg.repository?.startsWith("http")) {
     references.push({ type: "vcs", url: pkg.repository });
   } else if (pkg.source?.startsWith("git+")) {
     references.push({ type: "vcs", url: pkg.source.slice(4) });

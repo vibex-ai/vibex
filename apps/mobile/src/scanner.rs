@@ -35,7 +35,7 @@ fn unavailable() -> BackendError {
 mod android {
     use std::sync::{Mutex, OnceLock};
 
-    use gpui_android::AndroidApp;
+    use android_activity::AndroidApp;
     use jni::{
         EnvUnowned, JavaVM,
         objects::{JClass, JObject, JString},

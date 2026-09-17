@@ -16,7 +16,6 @@ chrono = "0.4.45"
 futures-channel.workspace = true
 futures-util.workspace = true
 gpui.workspace = true
-gpui_platform.workspace = true
 gpui_tokio.workspace = true
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
@@ -34,8 +33,11 @@ vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-terminal-ui = { path = "../../crates/vibex-terminal-ui" }
 vibex-ui = { path = "../../crates/vibex-ui" }
 
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "4e4668d316325b04c9c051e7d0609f876eb5b1fe" }
+
 [target.'cfg(target_os = "android")'.dependencies]
-gpui_android = { path = "../../vendor/zed/crates/gpui_android" }
+android-activity = { version = "0.6", features = ["native-activity"] }
 jni = "0.22"
 rustls-platform-verifier = "0.7"
 

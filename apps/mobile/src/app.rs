@@ -58,6 +58,7 @@ use crate::pairing::{
     MobileCredentialBundle, MobilePairedRuntime, claim_pairing_code_link, claim_pairing_link,
     claim_server_pairing_code, claim_zero_config_lan_pairing,
 };
+use crate::platform::WindowInsetsExt as _;
 use crate::selection_menu::SelectionMenu;
 use crate::sidebar::{
     SidebarCard, SidebarCardEdge, SidebarDropPosition, SidebarDropTarget, SidebarProject,
@@ -721,9 +722,12 @@ gpui::actions!(mobile_app, [NavigateBack]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        // Android's back key/gesture arrives as the "back" keystroke (mapped by
-        // gpui_android). It pops the topmost screen; at the root the host
-        // Activity already falls back to its own back behavior.
+        // gpui-pre-mobile reports Android's back key/gesture as "escape" (see
+        // `gpui_mobile::android::keyboard`); the "back" alias stays bound so the
+        // same action still works anywhere that emits it. It pops the topmost
+        // screen; at the root the host Activity already falls back to its own
+        // back behavior.
+        KeyBinding::new("escape", NavigateBack, None),
         KeyBinding::new("back", NavigateBack, None),
     ]);
 }
@@ -1757,12 +1761,17 @@ impl MobileApp {
         self.resume_recovery_task = None;
     }
 
-    fn scan_pairing_code(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scan_pairing_code(
+        &mut self,
+        _: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.pairing_busy && self.lan_pairing_task.is_none() {
             return;
         }
         self.stop_nearby_pairing();
-        window.hide_soft_keyboard();
+        crate::platform::hide_keyboard();
         self.error = scanner::launch().err();
         cx.notify();
     }
@@ -4355,11 +4364,11 @@ impl MobileApp {
             self.push_back_screen(BackScreen::SidebarSearch);
             self.sidebar_search_input
                 .update(cx, |input, cx| input.focus(window, cx));
-            window.show_soft_keyboard();
+            crate::platform::show_keyboard();
         } else {
             self.sidebar_search_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
-            window.hide_soft_keyboard();
+            crate::platform::hide_keyboard();
         }
         cx.notify();
     }
@@ -4448,7 +4457,7 @@ impl MobileApp {
         let Some(screen) = self.back_stack.pop() else {
             return;
         };
-        window.hide_soft_keyboard();
+        crate::platform::hide_keyboard();
         match screen {
             BackScreen::SessionAction => {
                 if !self.session_action_busy {
@@ -4565,7 +4574,7 @@ impl MobileApp {
         };
         entry.name_override = if name.is_empty() { None } else { Some(name) };
         self.persist_known_hosts();
-        window.hide_soft_keyboard();
+        crate::platform::hide_keyboard();
         self.dismiss_overlay(Some(window), cx);
     }
 
@@ -4676,7 +4685,7 @@ impl MobileApp {
         self.show_overlay(MobileOverlay::NewProject, window, cx);
         self.new_project_input
             .update(cx, |input, cx| input.focus(window, cx));
-        window.show_soft_keyboard();
+        crate::platform::show_keyboard();
     }
 
     fn submit_new_project(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -4769,7 +4778,7 @@ impl MobileApp {
     fn begin_pairing_host(
         &mut self,
         _: &MouseUpEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.stop_connection_tasks();
@@ -4789,7 +4798,7 @@ impl MobileApp {
         self.workspaces.clear();
         self.workspace_summaries.clear();
         self.reset_sidebar_ui();
-        window.hide_soft_keyboard();
+        crate::platform::hide_keyboard();
         cx.notify();
     }
 
@@ -5341,8 +5350,8 @@ impl MobileApp {
             workbench.update(cx, |workbench, _| workbench.suspend());
         }
         self.drawer_snap_task = None;
-        if let Some(window) = window {
-            window.hide_soft_keyboard();
+        if window.is_some() {
+            crate::platform::hide_keyboard();
         }
         if (from - target).abs() < 0.001 {
             self.drawer_offset = target;
@@ -5912,7 +5921,7 @@ impl MobileApp {
                         }
                     }
                     DrawerPanDecision::Drag(page) => {
-                        window.hide_soft_keyboard();
+                        crate::platform::hide_keyboard();
                         if page == DrawerPage::Workbench && self.workbench.is_none() {
                             self.refresh_workspaces(cx);
                         }
@@ -6636,209 +6645,212 @@ impl MobileApp {
                 .supports(BackendOperation::AgentCreateSession)
         });
 
-        div()
-            .size_full()
-            .relative()
-            .capture_scroll_wheel(cx.listener(Self::drawer_pan))
-            .track_focus(&self.root_focus)
-            .on_action(cx.listener(Self::handle_navigate_back))
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(self.render_header(&title, state, cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .px_4()
-                            .py_4()
-                            .flex()
-                            .flex_col()
-                            .when(timeline_loading && turns.is_empty(), |timeline| {
-                                timeline.child(
-                                    div()
-                                        .py_8()
-                                        .text_size(px(theme::FONT_BODY))
-                                        .text_color(theme::text_muted())
-                                        .text_center()
-                                        .child(locale::common("Loading conversation...")),
-                                )
-                            })
-                            .when(!timeline_loading && turns.is_empty(), |timeline| {
-                                timeline.child(
-                                    div()
-                                        .py_8()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .gap_3()
-                                        .text_size(px(theme::FONT_BODY))
-                                        .text_color(theme::text_muted())
-                                        .text_center()
-                                        .child(locale::common("No messages yet"))
-                                        .when(no_selected_session, |empty| {
-                                            empty.child(
-                                                div()
-                                                    .id("create-first-session")
-                                                    .h(px(theme::TOUCH_TARGET))
-                                                    .px_4()
-                                                    .rounded(px(theme::RADIUS_CONTROL))
-                                                    .border_1()
-                                                    .border_color(theme::border_default())
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(theme::text_secondary())
-                                                    .when(can_create_session, |button| {
-                                                        button.cursor_pointer().on_mouse_up(
-                                                            MouseButton::Left,
-                                                            cx.listener(Self::create_session),
-                                                        )
-                                                    })
-                                                    .when(!can_create_session, |button| {
-                                                        button.opacity(0.55)
-                                                    })
-                                                    .child(locale::common("New session")),
-                                            )
-                                        }),
-                                )
-                            })
-                            .when(!turns.is_empty(), |timeline| {
-                                timeline.child(
-                                    list(
-                                        self.timeline_list.clone(),
-                                        cx.processor(move |this, index, window, cx| {
-                                            turns_for_list
-                                                .get(index)
-                                                .map(|turn| {
-                                                    div()
-                                                        .pb(px(theme::SPACING_XL))
-                                                        .child(this.render_turn(
-                                                            turn,
-                                                            index == 0,
-                                                            index + 1 == turns_for_list.len(),
-                                                            window,
-                                                            cx,
-                                                        ))
-                                                        .into_any_element()
-                                                })
-                                                .unwrap_or_else(|| div().into_any_element())
-                                        }),
-                                    )
-                                    .w_full()
-                                    .flex_1()
-                                    .min_h_0(),
-                                )
-                            }),
-                    )
-                    .when_some(self.notice.as_ref(), |workspace, notice| {
-                        workspace.child(
+        crate::scroll_capture::capture_scroll_wheel(
+            "mobile-workspace-scroll",
+            div()
+                .size_full()
+                .relative()
+                .track_focus(&self.root_focus)
+                .on_action(cx.listener(Self::handle_navigate_back))
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_header(&title, state, cx))
+                        .child(
                             div()
-                                .id("workspace-notice")
-                                .border_t_1()
-                                .border_color(theme::border_subtle())
-                                .bg(theme::bg_card_dim())
+                                .flex_1()
+                                .min_h_0()
                                 .px_4()
-                                .py_2()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::accent_yellow())
-                                .cursor_pointer()
-                                .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
-                                .child(notice.clone()),
+                                .py_4()
+                                .flex()
+                                .flex_col()
+                                .when(timeline_loading && turns.is_empty(), |timeline| {
+                                    timeline.child(
+                                        div()
+                                            .py_8()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_muted())
+                                            .text_center()
+                                            .child(locale::common("Loading conversation...")),
+                                    )
+                                })
+                                .when(!timeline_loading && turns.is_empty(), |timeline| {
+                                    timeline.child(
+                                        div()
+                                            .py_8()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .gap_3()
+                                            .text_size(px(theme::FONT_BODY))
+                                            .text_color(theme::text_muted())
+                                            .text_center()
+                                            .child(locale::common("No messages yet"))
+                                            .when(no_selected_session, |empty| {
+                                                empty.child(
+                                                    div()
+                                                        .id("create-first-session")
+                                                        .h(px(theme::TOUCH_TARGET))
+                                                        .px_4()
+                                                        .rounded(px(theme::RADIUS_CONTROL))
+                                                        .border_1()
+                                                        .border_color(theme::border_default())
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_color(theme::text_secondary())
+                                                        .when(can_create_session, |button| {
+                                                            button.cursor_pointer().on_mouse_up(
+                                                                MouseButton::Left,
+                                                                cx.listener(Self::create_session),
+                                                            )
+                                                        })
+                                                        .when(!can_create_session, |button| {
+                                                            button.opacity(0.55)
+                                                        })
+                                                        .child(locale::common("New session")),
+                                                )
+                                            }),
+                                    )
+                                })
+                                .when(!turns.is_empty(), |timeline| {
+                                    timeline.child(
+                                        list(
+                                            self.timeline_list.clone(),
+                                            cx.processor(move |this, index, window, cx| {
+                                                turns_for_list
+                                                    .get(index)
+                                                    .map(|turn| {
+                                                        div()
+                                                            .pb(px(theme::SPACING_XL))
+                                                            .child(this.render_turn(
+                                                                turn,
+                                                                index == 0,
+                                                                index + 1 == turns_for_list.len(),
+                                                                window,
+                                                                cx,
+                                                            ))
+                                                            .into_any_element()
+                                                    })
+                                                    .unwrap_or_else(|| div().into_any_element())
+                                            }),
+                                        )
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h_0(),
+                                    )
+                                }),
                         )
-                    })
-                    .child(self.render_composer(running, state, &turns, cx)),
-            )
-            .when_some(drawer_page, |root, page| {
-                let backdrop_base = div()
-                    .id("drawer-backdrop")
-                    .absolute()
-                    .inset_0()
-                    // Keep the root gesture host in the scroll hit chain while the
-                    // moving page is on top. Ordinary taps remain blocked below.
-                    .block_mouse_except_scroll()
-                    .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(Self::close_drawer_from_backdrop),
-                    );
-                let drawer_base = match page {
-                    DrawerPage::Sessions => self.render_drawer(cx),
-                    DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone()),
-                }
-                .w(px(page_width))
-                .block_mouse_except_scroll();
-                let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
-                    let duration = drawer_animation(snap.from, snap.target);
-                    let from_opacity = drawer_backdrop_opacity(snap.from);
-                    let target_opacity = drawer_backdrop_opacity(snap.target);
-                    (
-                        backdrop_base
-                            .with_animation(
-                                ElementId::NamedInteger(
-                                    "mobile-drawer-backdrop".into(),
-                                    snap.animation_id,
-                                ),
-                                duration.clone(),
-                                move |element, delta| {
-                                    element.bg(theme::backdrop(
-                                        from_opacity + (target_opacity - from_opacity) * delta,
-                                    ))
-                                },
+                        .when_some(self.notice.as_ref(), |workspace, notice| {
+                            workspace.child(
+                                div()
+                                    .id("workspace-notice")
+                                    .border_t_1()
+                                    .border_color(theme::border_subtle())
+                                    .bg(theme::bg_card_dim())
+                                    .px_4()
+                                    .py_2()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(theme::accent_yellow())
+                                    .cursor_pointer()
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::refresh))
+                                    .child(notice.clone()),
                             )
-                            .into_any_element(),
-                        drawer_base
-                            .with_animation(
-                                ElementId::NamedInteger(
-                                    "mobile-drawer-panel".into(),
-                                    snap.animation_id,
-                                ),
-                                duration,
-                                move |element, delta| {
-                                    let offset = snap.from + (snap.target - snap.from) * delta;
-                                    element.left(px(drawer_left(page, offset, page_width)))
-                                },
-                            )
-                            .into_any_element(),
-                    )
-                } else {
-                    (
-                        backdrop_base
-                            .bg(theme::backdrop(drawer_backdrop_opacity(self.drawer_offset)))
-                            .into_any_element(),
-                        drawer_base
-                            .left(px(drawer_left(page, self.drawer_offset, page_width)))
-                            .into_any_element(),
-                    )
-                };
-                root.child(backdrop).child(drawer)
-            })
-            .when_some(row_menu, |root, menu| {
-                root.child(self.render_sidebar_row_menu(&menu, cx))
-            })
-            .when_some(name_prompt, |root, prompt| {
-                root.child(self.render_folder_name_prompt(&prompt, cx))
-            })
-            .when_some(session_action, |root, prompt| {
-                root.child(self.render_session_action_prompt(&prompt, cx))
-            })
-            .when_some(self.workspace_action.as_ref(), |root, prompt| {
-                root.child(self.render_workspace_action_prompt(prompt, cx))
-            })
-            .when(self.runtime_options_open, |root| {
-                root.child(self.render_runtime_options_sheet(cx))
-            })
-            .when_some(overlay, |root, overlay| {
-                root.child(self.render_mobile_overlay(overlay, cx))
-            })
-            .when_some(attachment_preview, |root, preview| {
-                root.child(self.render_attachment_preview(preview, cx))
-            })
-            .when_some(attachment_preview_loading, |root, label| {
-                root.child(self.render_attachment_preview_loading(&label, cx))
-            })
+                        })
+                        .child(self.render_composer(running, state, &turns, cx)),
+                )
+                .when_some(drawer_page, |root, page| {
+                    let backdrop_base = div()
+                        .id("drawer-backdrop")
+                        .absolute()
+                        .inset_0()
+                        // Keep the root gesture host in the scroll hit chain while the
+                        // moving page is on top. Ordinary taps remain blocked below.
+                        .block_mouse_except_scroll()
+                        .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::close_drawer_from_backdrop),
+                        );
+                    let drawer_base = match page {
+                        DrawerPage::Sessions => self.render_drawer(cx),
+                        DrawerPage::Workbench => self.render_workbench_drawer(workbench.clone()),
+                    }
+                    .w(px(page_width))
+                    .block_mouse_except_scroll();
+                    let (backdrop, drawer) = if let Some(snap) = self.drawer_snap {
+                        let duration = drawer_animation(snap.from, snap.target);
+                        let from_opacity = drawer_backdrop_opacity(snap.from);
+                        let target_opacity = drawer_backdrop_opacity(snap.target);
+                        (
+                            backdrop_base
+                                .with_animation(
+                                    ElementId::NamedInteger(
+                                        "mobile-drawer-backdrop".into(),
+                                        snap.animation_id,
+                                    ),
+                                    duration.clone(),
+                                    move |element, delta| {
+                                        element.bg(theme::backdrop(
+                                            from_opacity + (target_opacity - from_opacity) * delta,
+                                        ))
+                                    },
+                                )
+                                .into_any_element(),
+                            drawer_base
+                                .with_animation(
+                                    ElementId::NamedInteger(
+                                        "mobile-drawer-panel".into(),
+                                        snap.animation_id,
+                                    ),
+                                    duration,
+                                    move |element, delta| {
+                                        let offset = snap.from + (snap.target - snap.from) * delta;
+                                        element.left(px(drawer_left(page, offset, page_width)))
+                                    },
+                                )
+                                .into_any_element(),
+                        )
+                    } else {
+                        (
+                            backdrop_base
+                                .bg(theme::backdrop(drawer_backdrop_opacity(self.drawer_offset)))
+                                .into_any_element(),
+                            drawer_base
+                                .left(px(drawer_left(page, self.drawer_offset, page_width)))
+                                .into_any_element(),
+                        )
+                    };
+                    root.child(backdrop).child(drawer)
+                })
+                .when_some(row_menu, |root, menu| {
+                    root.child(self.render_sidebar_row_menu(&menu, cx))
+                })
+                .when_some(name_prompt, |root, prompt| {
+                    root.child(self.render_folder_name_prompt(&prompt, cx))
+                })
+                .when_some(session_action, |root, prompt| {
+                    root.child(self.render_session_action_prompt(&prompt, cx))
+                })
+                .when_some(self.workspace_action.as_ref(), |root, prompt| {
+                    root.child(self.render_workspace_action_prompt(prompt, cx))
+                })
+                .when(self.runtime_options_open, |root| {
+                    root.child(self.render_runtime_options_sheet(cx))
+                })
+                .when_some(overlay, |root, overlay| {
+                    root.child(self.render_mobile_overlay(overlay, cx))
+                })
+                .when_some(attachment_preview, |root, preview| {
+                    root.child(self.render_attachment_preview(preview, cx))
+                })
+                .when_some(attachment_preview_loading, |root, label| {
+                    root.child(self.render_attachment_preview_loading(&label, cx))
+                }),
+            cx.listener(Self::drawer_pan),
+        )
     }
 
     fn render_attachment_preview(
@@ -13426,7 +13438,7 @@ impl MobileApp {
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
-                                        window.hide_soft_keyboard();
+                                        crate::platform::hide_keyboard();
                                         this.dismiss_overlay(Some(window), cx);
                                     }),
                                 ),

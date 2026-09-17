@@ -520,7 +520,7 @@ impl AssetSource for MobileAssets {
             "icons/rotate-ccw.svg" => {
                 Some(include_bytes!("../../desktop/assets/icons/rotate-ccw.svg"))
             }
-            "icons/undo.svg" => Some(include_bytes!("../../../vendor/zed/assets/icons/undo.svg")),
+            "icons/undo.svg" => Some(include_bytes!("../assets/icons/undo.svg")),
             "icons/chevrons-down-up.svg" => Some(include_bytes!(
                 "../../desktop/assets/icons/chevrons-down-up.svg"
             )),

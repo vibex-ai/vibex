@@ -30,6 +30,26 @@ targets:
       - sdk: Security.framework
       - sdk: Network.framework
       - sdk: UserNotifications.framework
+      # gpui-pre-mobile's package modules declare these frameworks with
+      # `#[link(name = ...)]`, so the binary has to link them even though Vibex
+      # only uses the platform layer.
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AppTrackingTransparency.framework
+      - sdk: Contacts.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreLocation.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreMotion.framework
+      - sdk: EventKit.framework
+      - sdk: LocalAuthentication.framework
+      - sdk: Photos.framework
+      - sdk: PhotosUI.framework
+      - sdk: Speech.framework
+      - sdk: StoreKit.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: WebKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile
@@ -43,6 +63,21 @@ targets:
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Discover Vibex desktops available for pairing on your local network.
         INFOPLIST_KEY_NSBonjourServices: ["_vibex._tcp"]
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # Usage strings for the gpui-pre-mobile package modules that are linked
+        # in but not part of any Vibex flow yet. They keep App Review from
+        # rejecting a binary that references the frameworks.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: Record audio when a paired Vibex session requests it.
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Attach images from your library to a Vibex session.
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: Save images shared by a Vibex session to your library.
+        INFOPLIST_KEY_NSContactsUsageDescription: Share a contact when a paired Vibex session requests one.
+        INFOPLIST_KEY_NSCalendarsUsageDescription: Share a calendar event when a paired Vibex session requests one.
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: Connect to nearby Vibex devices over Bluetooth.
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Dictate prompts to a Vibex session.
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Tag a Vibex session with your current location.
+        INFOPLIST_KEY_NSMotionUsageDescription: Read device motion for gesture input.
+        INFOPLIST_KEY_NSUserTrackingUsageDescription: Measure Vibex feature usage across apps and websites.
+        INFOPLIST_KEY_NSFaceIDUsageDescription: Unlock paired Vibex credentials with Face ID.
+        INFOPLIST_KEY_NSAppleMusicUsageDescription: Attach media from your library to a Vibex session.
         CLANG_ENABLE_OBJC_ARC: YES
         # The XCFramework supplies the header and its sole VibexFFI module map
         # through Xcode's generated target include directory.

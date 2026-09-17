@@ -297,7 +297,7 @@ fn main() {
         None
     };
 
-    let application = gpui_platform::application();
+    let application = vibex_desktop::platform::application();
     // On macOS a Dock click on the app icon reaches the running process as a
     // platform reopen request. The workbench owns that window, so the request
     // has to restore it instead of being dropped on the floor.

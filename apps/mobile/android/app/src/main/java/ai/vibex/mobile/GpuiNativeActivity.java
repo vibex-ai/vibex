@@ -1,7 +1,6 @@
 package ai.vibex.mobile;
 
 import android.Manifest;
-import android.app.NativeActivity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -10,7 +9,6 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.net.Uri;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
@@ -18,15 +16,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.Settings;
-import android.text.Editable;
-import android.text.InputType;
-import android.text.TextWatcher;
-import android.view.View;
-import android.view.ViewGroup;
-import android.view.inputmethod.EditorInfo;
-import android.view.inputmethod.InputMethodManager;
-import android.widget.EditText;
-import android.widget.FrameLayout;
 
 import androidx.core.view.WindowCompat;
 
@@ -38,8 +27,17 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
-/** NativeActivity host that supplies Android's IME with a real InputConnection. */
-public final class GpuiNativeActivity extends NativeActivity {
+/**
+ * Vibex's Android host.
+ *
+ * Extends the vendored {@code dev.gpui.mobile.GpuiInputActivity}: gpui-pre-mobile
+ * calls {@code gpuiShowKeyboard}/{@code gpuiHideKeyboard}/{@code
+ * gpuiResetComposition} on the running activity and ships the matching
+ * {@code InputConnection} bridge, so the IME host must stay that exact class.
+ * Everything Vibex-specific — notifications, LAN discovery, the foreground
+ * service, lifecycle reporting — lives here.
+ */
+public final class GpuiNativeActivity extends dev.gpui.mobile.GpuiInputActivity {
     private static final int LOCAL_NETWORK_PERMISSION_REQUEST = 4102;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4103;
     private static final String AGENT_NOTIFICATION_CHANNEL = "agent_activity";
@@ -55,14 +53,12 @@ public final class GpuiNativeActivity extends NativeActivity {
         System.loadLibrary("vibex_mobile");
     }
 
-    private GpuiEditText textInput;
     private NsdManager nsdManager;
     private NsdManager.DiscoveryListener lanDiscoveryListener;
     private final Map<String, NsdManager.ResolveListener> pendingResolutions = new HashMap<>();
 
-    private static native void nativeReplaceText(int start, int before, String replacement);
-    private static native void nativeSetSelection(int start, int end);
     private static native void nativeOnLanDiscoveryEvent(String payload);
+    private static native void nativeOnAppLifecycle(boolean foreground);
     private static native void nativeOnNotificationActivated(
             String notificationId, String opaqueLocator);
 
@@ -70,14 +66,10 @@ public final class GpuiNativeActivity extends NativeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Keep the GPUI content rectangle below Android system bars. GPUI then
-        // publishes the same geometry through Window::insets() as iOS does.
+        // Keep the GPUI content rectangle below Android system bars; the
+        // platform republishes that geometry as the window's safe-area insets.
         WindowCompat.setDecorFitsSystemWindows(getWindow(), true);
 
-        textInput = new GpuiEditText(this);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
-        ViewGroup content = findViewById(android.R.id.content);
-        content.addView(textInput, params);
         createAgentNotificationChannel();
         handleNotificationIntent(getIntent());
     }
@@ -197,30 +189,16 @@ public final class GpuiNativeActivity extends NativeActivity {
         }
     }
 
-    /** Called from the GPUI thread; all View work is transferred to Android's UI thread. */
-    public void showGpuiKeyboard(String text, int selectionStart, int selectionEnd) {
-        runOnUiThread(() -> {
-            textInput.syncDocument(text, selectionStart, selectionEnd);
-            textInput.requestFocus();
-            InputMethodManager manager =
-                    (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-            manager.restartInput(textInput);
-            textInput.post(() -> manager.showSoftInput(textInput, InputMethodManager.SHOW_IMPLICIT));
-        });
+    @Override
+    protected void onResume() {
+        super.onResume();
+        nativeOnAppLifecycle(true);
     }
 
-    /** Keeps programmatic GPUI edits and cursor moves visible to the active IME. */
-    public void syncGpuiText(String text, int selectionStart, int selectionEnd) {
-        runOnUiThread(() -> textInput.syncDocument(text, selectionStart, selectionEnd));
-    }
-
-    public void hideGpuiKeyboard() {
-        runOnUiThread(() -> {
-            InputMethodManager manager =
-                    (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-            manager.hideSoftInputFromWindow(textInput.getWindowToken(), 0);
-            textInput.clearFocus();
-        });
+    @Override
+    protected void onPause() {
+        nativeOnAppLifecycle(false);
+        super.onPause();
     }
 
     public void launchPairingQrScanner() {
@@ -388,64 +366,5 @@ public final class GpuiNativeActivity extends NativeActivity {
         }
         InetAddress address = service.getHost();
         return address == null ? "" : address.getHostAddress();
-    }
-
-    private static final class GpuiEditText extends EditText {
-        private boolean synchronizing;
-
-        GpuiEditText(Context context) {
-            super(context);
-            setSingleLine(true);
-            setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-            setImeOptions(EditorInfo.IME_ACTION_NONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
-            setBackground(null);
-            setTextColor(Color.TRANSPARENT);
-            setHintTextColor(Color.TRANSPARENT);
-            setCursorVisible(false);
-            setPadding(0, 0, 0, 0);
-            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-            addTextChangedListener(new TextWatcher() {
-                @Override
-                public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
-
-                @Override
-                public void onTextChanged(CharSequence text, int start, int before, int count) {
-                    if (!synchronizing && hasFocus()) {
-                        nativeReplaceText(
-                                start,
-                                before,
-                                text.subSequence(start, start + count).toString());
-                    }
-                }
-
-                @Override
-                public void afterTextChanged(Editable text) {}
-            });
-        }
-
-        void syncDocument(String text, int selectionStart, int selectionEnd) {
-            synchronizing = true;
-            try {
-                if (!getText().toString().equals(text)) {
-                    setText(text);
-                }
-                int length = getText().length();
-                int start = Math.max(0, Math.min(selectionStart, length));
-                int end = Math.max(0, Math.min(selectionEnd, length));
-                if (getSelectionStart() != start || getSelectionEnd() != end) {
-                    setSelection(start, end);
-                }
-            } finally {
-                synchronizing = false;
-            }
-        }
-
-        @Override
-        protected void onSelectionChanged(int start, int end) {
-            super.onSelectionChanged(start, end);
-            if (!synchronizing && hasFocus() && start >= 0 && end >= 0) {
-                nativeSetSelection(start, end);
-            }
-        }
     }
 }

@@ -76,13 +76,14 @@ drop approval/error states.
 ## Native Platform Boundary
 
 `apps/mobile` is a Rust crate with `cdylib`, `staticlib`, and `rlib` outputs.
-It calls `gpui_platform::application()` and links the platform implementations
-from the `vendor/zed` submodule:
+It builds its platform through `apps/mobile/src/platform.rs`, which wraps the
+pinned `gpui-pre-mobile` platform crate:
 
-- Android enters through `android_main`, initializes `gpui_android`, and is
-  packaged as a NativeActivity Gradle application.
-- iOS exports `vibex_mobile_main`; `gpui_ios` owns the UIKit application loop,
-  and a small Objective-C host supplies the executable entry point.
+- Android enters through `android_main`, initializes the `gpui-pre-mobile`
+  platform, and is packaged as a NativeActivity Gradle application.
+- iOS exports `vibex_mobile_register_app` and `vibex_mobile_set_lifecycle`; the
+  Objective-C host in `apps/mobile/ios/Vibex/main.m` enters `UIApplicationMain`,
+  registers the root view, drives frames, and forwards lifecycle phases.
 
 The checked-in project definitions live under `apps/mobile/android` and
 `apps/mobile/ios`. Generated libraries, XCFramework contents, Xcode projects,

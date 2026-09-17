@@ -15772,8 +15772,8 @@ mod tests {
     #[test]
     fn relative_directory_path_chain_builds_each_ancestor() {
         assert_eq!(
-            relative_directory_path_chain("vendor/zed/crates"),
-            ["vendor", "vendor/zed", "vendor/zed/crates"]
+            relative_directory_path_chain("crates/vibex-ui/theme"),
+            ["crates", "crates/vibex-ui", "crates/vibex-ui/theme"]
         );
     }
 

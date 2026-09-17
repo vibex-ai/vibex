@@ -21,21 +21,38 @@ const INTER_LATIN_EXT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../node_modules/.pnpm/@fontsource-variable+inter@5.2.8/node_modules/@fontsource-variable/inter/files/inter-latin-ext-wght-normal.woff2"
 ));
-const IBM_PLEX_SANS_REGULAR: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-const IBM_PLEX_SANS_ITALIC: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
-const IBM_PLEX_SANS_SEMIBOLD: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
-const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-const LILEX_REGULAR: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Regular.ttf");
-const LILEX_ITALIC: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Italic.ttf");
-const LILEX_BOLD: &[u8] = include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Bold.ttf");
-const LILEX_BOLD_ITALIC: &[u8] =
-    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-BoldItalic.ttf");
+pub(crate) const IBM_PLEX_SANS_REGULAR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+));
+pub(crate) const IBM_PLEX_SANS_ITALIC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"
+));
+pub(crate) const IBM_PLEX_SANS_SEMIBOLD: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"
+));
+pub(crate) const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf"
+));
+pub(crate) const LILEX_REGULAR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/lilex/Lilex-Regular.ttf"
+));
+pub(crate) const LILEX_ITALIC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/lilex/Lilex-Italic.ttf"
+));
+pub(crate) const LILEX_BOLD: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/lilex/Lilex-Bold.ttf"
+));
+pub(crate) const LILEX_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/lilex/Lilex-BoldItalic.ttf"
+));
 const WQY_MICROHEI: &[u8] =
     include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
 const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[

@@ -10,7 +10,7 @@ Primary evidence:
 - [Architecture Baseline](../guides/architecture-baseline.md)
 - `apps/desktop`
 - `apps/mobile`
-- `vendor/zed/crates/gpui_ios` and `vendor/zed/crates/gpui_android`
+- `apps/mobile/src/platform.rs` and the pinned `gpui-pre-mobile` platform crate
 
 ## Required Reading Order
 

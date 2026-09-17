@@ -1,8 +1,24 @@
 # Vibex Mobile
 
-`vibex-mobile` is the native GPUI client for iOS and Android. It links the
-mobile platform implementations from `vendor/zed`, connects to the
-authoritative desktop runtime, and renders Vibex Agent sessions as a GUI.
+`vibex-mobile` is the native GPUI client for iOS and Android. It runs on the
+published `gpui-pre` family with `gpui-pre-mobile` supplying the Android and iOS
+platform layer, connects to the authoritative desktop runtime, and renders Vibex
+Agent sessions as a GUI.
+
+## Platform layer
+
+- `gpui-pre` / `gpui-pre-platform` come from crates.io; the Android and iOS
+  hosts are built on `gpui-pre-mobile`, pinned by git revision in
+  `apps/mobile/Cargo.toml`.
+- `apps/mobile/src/platform.rs` is the single place that knows how to construct
+  the platform and read window insets or drive the software keyboard, because
+  `gpui-pre-mobile` reports those outside `PlatformWindow`.
+- Android's IME host is the vendored `dev.gpui.mobile.GpuiInputActivity`
+  (`apps/mobile/android/app/src/main/java/dev/gpui/mobile/`); the class name and
+  package are part of the JNI contract and must not change.
+- iOS runs from `apps/mobile/ios/Vibex/main.m`, which enters `UIApplicationMain`,
+  registers the root view, and forwards the frame clock and app lifecycle to
+  `gpui-pre-mobile`.
 
 ## Android
 

@@ -262,15 +262,6 @@ pub struct AppearanceUiState {
     pub code_font: FontSetting,
     pub reduced_motion: bool,
     pub high_contrast: bool,
-    /// Frosted-glass floating surfaces (dialogs, popovers): a blurred
-    /// snapshot of the content behind the card shows through a thinned
-    /// surface tint. Defaults off; renderers that cannot blur degrade
-    /// gracefully to the regular opaque treatment.
-    #[serde(default)]
-    pub glass_surfaces: bool,
-    /// Blur sigma in logical pixels for glass surfaces.
-    #[serde(default = "default_glass_blur_radius")]
-    pub glass_blur_radius: u16,
 }
 
 /// Local outbound network proxy preference for the desktop runtime.
@@ -307,8 +298,6 @@ impl Default for AppearanceUiState {
             code_font: FontSetting::code_default(),
             reduced_motion: false,
             high_contrast: false,
-            glass_surfaces: false,
-            glass_blur_radius: default_glass_blur_radius(),
         }
     }
 }
@@ -936,10 +925,6 @@ impl Default for DesktopUiStateV1 {
 
 const fn default_window_scale_percent() -> u16 {
     100
-}
-
-fn default_glass_blur_radius() -> u16 {
-    24
 }
 
 impl DesktopUiStateV1 {

@@ -1,5 +1,0 @@
-[submodule "vendor/zed"]
-	path = vendor/zed
-	url = https://github.com/vibex-ai/zed.git
-	branch = main
-	shallow = true

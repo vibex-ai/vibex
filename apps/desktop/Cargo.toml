@@ -17,6 +17,7 @@ gpui_tokio.workspace = true
 gpui-component.workspace = true
 gpui-fps.workspace = true
 gpui-kit-assets.workspace = true
+anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 qrcode.workspace = true
 resvg.workspace = true
@@ -30,6 +31,8 @@ similar = "3.1.1"
 tray-icon.workspace = true
 base64.workspace = true
 chrono = "0.4.45"
+futures-channel.workspace = true
+smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
@@ -49,6 +52,7 @@ vibex-markdown = { path = "../../crates/vibex-markdown" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.5" }
 gtk = { version = "0.18" }
 tray-icon = { workspace = true, features = ["gtk"] }
 

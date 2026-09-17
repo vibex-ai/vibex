@@ -201,7 +201,7 @@ AGPL-3.0-or-later. Two product clients share one GPUI design system:
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| Native mobile | `apps/mobile` | Rust + GPUI with `gpui_ios` / `gpui_android` from `vendor/zed` |
+| Native mobile | `apps/mobile` | Rust + GPUI with `gpui-pre-mobile` (Android/iOS platform layer) |
 
 Layout: `apps/` (desktop, mobile, relay-server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,

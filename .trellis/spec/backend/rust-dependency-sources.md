@@ -2,86 +2,71 @@
 
 Vibex consumes third-party Rust projects from their upstream Cargo sources. The
 repository does not maintain copied, patched, or shimmed third-party source trees
-beyond the one reviewed GPUI fork submodule.
+beyond two reviewed exceptions: the small first-party `gpui-tokio` bridge and the
+vendored Android IME host.
 
-## Scenario: Forked Zed Submodule With Git-Pinned gpui-kit
+## Scenario: Published gpui-pre With A Git-Pinned gpui-kit Family
 
 ### 1. Scope / Trigger
 
-- Trigger: moving the `vendor/zed` submodule pointer, changing `Cargo.lock`,
-  changing a third-party license decision, or bumping the pinned gpui-kit family.
-- The GPUI ecosystem uses two source controls: the Zed fork is a pinned Git
-  submodule that republishes the `gpui-pre-*` family, while the gpui-kit crates
-  (`gpui-component`, `gpui-fps`, `gpui-kit-assets`) are pinned to a gpui-kit Git
-  revision so unreleased component work is usable without waiting for crates.io.
+- Trigger: changing `Cargo.lock`, bumping the `gpui-pre` family, bumping the
+  pinned gpui-kit family, bumping `gpui-pre-mobile`, or changing a third-party
+  license decision.
+- GPUI arrives from three sources: the published `gpui-pre` family on crates.io
+  (zed snapshots), the gpui-kit crates pinned to a Git revision, and
+  `gpui-pre-mobile` pinned to a Git revision for the Android/iOS platform layer.
+  Glue with no published equivalent lives in this workspace.
 
 ### 2. Signatures
 
-```ini
-# .gitmodules
-[submodule "vendor/zed"]
-    path = vendor/zed
-    url = https://github.com/vibex-ai/zed.git
-    branch = main
-    shallow = true
-```
-
 ```toml
 # Cargo.toml
-[workspace]
-exclude = ["vendor/zed"]
-
 [workspace.dependencies]
-gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
-gpui_platform = { package = "gpui-pre-platform", path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
+gpui = { package = "gpui-pre", version = "=0.3.5" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
 gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
 gpui-fps = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
+```
 
-[patch.crates-io]
-gpui-pre = { path = "vendor/zed/crates/gpui" }
-gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
-gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
-gpui-pre-platform = { path = "vendor/zed/crates/gpui_platform" }
+```toml
+# apps/mobile/Cargo.toml
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "<pinned-gpui-mobile-rev>" }
 ```
 
 ```text
-vendor/zed/crates/gpui/Cargo.toml                  name = "gpui-pre", version = "0.3.5"
-vendor/zed/crates/gpui_platform/Cargo.toml         name = "gpui-pre-platform", version = "0.3.5",
-                                                   [lib] name = "gpui_platform"
-git submodule update --init --recursive          initialize the pinned Zed tree
-Cargo.lock                                       one Vibex workspace lockfile
-cargo metadata --locked --format-version 1       resolved source identity
-pnpm check:licenses                              SPDX, asset, SBOM, and notice gate
-pnpm check:rust                                  locked fmt/check/clippy/test gate
+crates/gpui-tokio/                    first-party copy of zed's gpui_tokio (no published crate)
+apps/mobile/src/platform.rs           the only place that builds the mobile Platform
+apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java
+                                      vendored IME host; package and class names are the JNI contract
+Cargo.lock                            one Vibex workspace lockfile
+cargo metadata --locked --format-version 1
+pnpm check:licenses                   SPDX, asset, SBOM, and notice gate
+pnpm check:rust                       locked fmt/check/clippy/test gate
+pnpm check:mobile-native              native mobile crate and project contract
 ```
 
 ### 3. Contracts
 
-- `vendor/zed` is the only approved vendor entry. It is a Git submodule, not a
-  copied or directly edited source tree, and its committed gitlink is the exact Zed
-  revision used by the build and the SBOM.
-- The submodule URL is `https://github.com/vibex-ai/zed.git`. The tracked branch is
-  `main`, but ordinary builds use the committed gitlink; they never select remote
-  `main` automatically.
-- Exclude `vendor/zed` from the Vibex workspace. Without the exclusion, Cargo makes
-  Zed crates inherit Vibex's `[workspace.dependencies]` and manifest loading fails.
-- The workspace `gpui` alias maps `gpui-pre` to the submodule copy so first-party
-  code compiles against exactly one GPUI. The `[patch.crates-io]` block redirects
-  the whole `gpui-pre-*` family (gpui, gpui_macros, sum_tree) — which registry
-  gpui-component consumes — back to the same submodule.
-- All Zed-family packages in Cargo metadata must resolve from the one submodule
-  tree. No package may remain on either the official Zed Git source or a separate
-  Git fetch of the fork.
-- gpui-component and gpui-kit-assets come from crates.io at the versions pinned by
-  the root `Cargo.lock`; do not fork, vendor, or patch them without an explicit
-  approved source-policy change.
-- Reproducibility is the combination of the committed Zed gitlink and root
-  `Cargo.lock`. A Zed update reviews and commits the submodule pointer, lockfile,
-  and regenerated license outputs together.
-- Every CI checkout that builds, checks, or packages must enable recursive
-  submodule checkout.
+- The `gpui-pre` family resolves from crates.io at the exact `=0.3.5` pins. Do not
+  reintroduce a `[patch.crates-io]` block that redirects it to a local fork, and do
+  not rename a fork to satisfy the version constraint.
+- `gpui-pre-mobile` resolves from its pinned Git revision; the pin moves only with
+  a reviewed dependency-source change, never as a floating branch.
+- `crates/gpui-tokio` is the only first-party copy of upstream Rust code. It is a
+  verbatim copy of zed's Apache-2.0 `gpui_tokio` with re-pointed dependency
+  coordinates, kept because no `gpui-pre-tokio` package exists. Keep it verbatim;
+  changes belong upstream.
+- The vendored Android IME host is the only copied third-party source tree. Its
+  Java package (`dev.gpui.mobile`) and class names are referenced by
+  `#[no_mangle]` JNI exports, so renaming or relocating it breaks the keyboard.
+- The gpui-kit family is pinned to a Git revision so unreleased component work is
+  usable without waiting for crates.io. Do not vendor or patch it locally.
+- Reproducibility is the combination of the crates.io pins, the two Git revision
+  pins, and the root `Cargo.lock`. A bump reviews and commits the lockfile and the
+  regenerated license outputs together.
 - No other tracked `vendor/` tree, Git submodule, local third-party path patch,
   compatibility shim, or copied upstream source is approved.
 - Use crates.io packages unmodified unless the user explicitly approves a new
@@ -95,39 +80,39 @@ pnpm check:rust                                  locked fmt/check/clippy/test ga
 
 | Condition | Required result |
 | --- | --- |
-| `vendor/zed` is absent, uninitialized, not a gitlink, or points at another URL | `cargo metadata --locked` fails and builds stop. |
-| A direct GPUI dependency does not use its exact `vendor/zed` path | `cargo metadata` fails to resolve. |
-| The `[patch.crates-io]` block omits a `gpui-pre-*` member | Registry gpui-component drags in a second GPUI from crates.io; review the lockfile diff before committing. |
-| Cargo metadata contains an official or fork Zed Git package | Inspect `cargo metadata` output and reject the escaped packages manually. |
-| `proc-macro-error2` re-enters the graph, or another future-incompatible package appears | `pnpm check:rust` fails until the graph or reviewed allowlist is corrected. |
+| A `[patch.crates-io]` entry redirects `gpui-pre*` to a path | Reject the change: the tree must not carry a renamed GPUI fork. |
+| `cargo metadata` resolves two `gpui-pre` versions | Reject: every GPUI consumer must share one version. |
+| `apps/mobile` resolves a `vendor/zed` path dependency | `pnpm check:mobile-native` fails. |
+| The vendored `GpuiInputActivity` package or class name changes | `pnpm check:mobile-native` fails; the JNI export would no longer match. |
 | An unapproved or missing SPDX selection enters the graph | `pnpm check:licenses` fails; do not silently broaden the policy. |
+| A font or icon asset moves between trees | Update the policy `assetInputs`/`fontInputs` count and tree hash in the same change. |
 | Generated SBOM, notices, or baseline inventory drift | Regenerate the owning artifact and rerun its verification command. |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: fetch and review a fork commit, check out that exact revision inside
-  `vendor/zed`, review the gitlink and `Cargo.lock` diffs, regenerate licenses,
-  then run `pnpm check:rust` and `pnpm check:licenses`.
-- Base: ordinary development initializes the submodule once and uses `--locked`;
-  neither the fork revision nor gpui-component version moves automatically.
-- Base: a non-GPUI dependency changes the root lock without moving the gitlink;
-  no submodule review is needed.
-- Bad: run `git submodule update --remote` and commit the result without reviewing
-  the fork diff, resolved graph, and licenses.
-- Bad: remove the `[patch.crates-io]` block and let registry gpui-component pull a
-  second GPUI from crates.io.
-- Bad: copy Zed files into `vendor/zed`, vendor gpui-component, or patch a
-  warning-producing crates.io package locally.
+- Good: bump `gpui-pre` to a published version, regenerate `Cargo.lock`, review the
+  resolved graph, regenerate licenses, then run `pnpm check:rust`,
+  `pnpm check:mobile-native`, and `pnpm check:licenses`.
+- Base: ordinary development uses `--locked`; neither the crates.io pins nor the
+  Git revision pins move automatically.
+- Base: a non-GPUI dependency changes the root lock without moving any pin; no
+  source-policy review is needed.
+- Bad: fork zed again and publish it under the `gpui-pre` name so the version
+  constraint is satisfied.
+- Bad: move a font or icon out of a third-party checkout without registering the
+  new provenance entry.
+- Bad: patch a warning-producing crates.io package locally.
 
 ### 6. Tests Required
 
-- `git submodule status --recursive` reports the initialized reviewed revision.
-- `cargo metadata --locked --format-version 1` resolves successfully and every
-  Zed-family manifest path is under `vendor/zed`.
-- `pnpm check:rust` accepts an empty reviewed future-incompatibility allowlist
-  and rejects every unlisted package or stale exception.
-- `pnpm check:licenses` verifies path-package provenance, the fork revision in the
-  SBOM, the full Cargo graph, assets, notices, and intended AGPL/GPL selections.
+- `cargo metadata --locked --format-version 1` resolves successfully with exactly
+  one `gpui-pre` version in the graph.
+- `pnpm check:mobile-native` verifies the mobile manifest pins, the platform
+  facade, and the vendored IME host.
+- `pnpm check:rust` accepts an empty reviewed future-incompatibility allowlist and
+  rejects every unlisted package or stale exception.
+- `pnpm check:licenses` verifies asset/font provenance, the SBOM, the full Cargo
+  graph, notices, and the intended AGPL/GPL selections.
 - Run repository-level `pnpm check` before committing a dependency-source migration.
 
 ### 7. Wrong vs Correct
@@ -135,21 +120,17 @@ pnpm check:rust                                  locked fmt/check/clippy/test ga
 #### Wrong
 
 ```toml
-gpui = { git = "https://github.com/vibex-ai/zed.git", branch = "main" }
+gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
 gpui-component = { path = "vendor/gpui-component/crates/ui" }
 ```
 
-This fetches branch state through Cargo and bypasses the reviewed submodule gitlink.
+This reintroduces a renamed GPUI fork and a vendored component tree.
 
 #### Correct
 
 ```toml
-gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
-
-[patch.crates-io]
-gpui-pre = { path = "vendor/zed/crates/gpui" }
-gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
-gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
+gpui = { package = "gpui-pre", version = "=0.3.5" }
+gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
 ```
 
 ## Scenario: Redistributed Native Runtime With A Bounded Package Transform

@@ -665,150 +665,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:android-activity@0.6.1:c19b7c6f923b580a",
-      "name": "android-activity",
-      "version": "0.6.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/android-activity@0.6.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-mobile/android-activity"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:android-properties@0.2.2:c19b7c6f923b580a",
-      "name": "android-properties",
-      "version": "0.2.2",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ],
-      "purl": "pkg:cargo/android-properties@0.2.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/miklelappo/android-properties"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
-      "name": "android_log-sys",
-      "version": "0.3.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/android_log-sys@0.3.2",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-mobile/android_log-sys-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:android_logger@0.15.1:c19b7c6f923b580a",
-      "name": "android_logger",
-      "version": "0.15.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/android_logger@0.15.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-mobile/android_logger-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:android_system_properties@0.1.5:c19b7c6f923b580a",
       "name": "android_system_properties",
       "version": "0.1.5",
@@ -4661,42 +4517,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-      "name": "collections",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/collections@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/collections"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:color_quant@1.1.0:c19b7c6f923b580a",
       "name": "color_quant",
       "version": "1.1.0",
@@ -6713,42 +6533,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9",
-      "name": "derive_refineable",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/derive_refineable@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/refineable/derive_refineable"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:digest@0.10.7:c19b7c6f923b580a",
       "name": "digest",
       "version": "0.10.7",
@@ -6821,6 +6605,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:dirs@5.0.1:c19b7c6f923b580a",
+      "name": "dirs",
+      "version": "5.0.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/dirs@5.0.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/soc/dirs-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:dirs@6.0.0:c19b7c6f923b580a",
       "name": "dirs",
       "version": "6.0.0",
@@ -6852,6 +6672,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/soc/dirs-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:dirs-sys@0.4.1:c19b7c6f923b580a",
+      "name": "dirs-sys",
+      "version": "0.4.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/dirs-sys@0.4.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dirs-dev/dirs-sys-rs"
         }
       ]
     },
@@ -7788,42 +7644,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/enumn"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:env_filter@0.1.4:c19b7c6f923b580a",
-      "name": "env_filter",
-      "version": "0.1.4",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/env_filter@0.1.4",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-cli/env_logger"
         }
       ]
     },
@@ -9449,15 +9269,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures@0.3.34:c19b7c6f923b580a",
       "name": "futures",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures@0.3.32",
+      "purl": "pkg:cargo/futures@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9485,15 +9305,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
       "name": "futures-channel",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-channel@0.3.32",
+      "purl": "pkg:cargo/futures-channel@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9557,15 +9377,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-core@0.3.34:c19b7c6f923b580a",
       "name": "futures-core",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-core@0.3.32",
+      "purl": "pkg:cargo/futures-core@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9593,15 +9413,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-executor@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-executor@0.3.34:c19b7c6f923b580a",
       "name": "futures-executor",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-executor@0.3.32",
+      "purl": "pkg:cargo/futures-executor@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9629,15 +9449,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-io@0.3.34:c19b7c6f923b580a",
       "name": "futures-io",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-io@0.3.32",
+      "purl": "pkg:cargo/futures-io@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9701,15 +9521,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-macro@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-macro@0.3.34:c19b7c6f923b580a",
       "name": "futures-macro",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-macro@0.3.32",
+      "purl": "pkg:cargo/futures-macro@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9737,15 +9557,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
       "name": "futures-sink",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-sink@0.3.32",
+      "purl": "pkg:cargo/futures-sink@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9773,15 +9593,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-task@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-task@0.3.34:c19b7c6f923b580a",
       "name": "futures-task",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-task@0.3.32",
+      "purl": "pkg:cargo/futures-task@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -9809,15 +9629,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+      "bom-ref": "cargo:futures-util@0.3.34:c19b7c6f923b580a",
       "name": "futures-util",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/futures-util@0.3.32",
+      "purl": "pkg:cargo/futures-util@0.3.34",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -10817,7 +10637,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-base@0.6.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-base@0.6.1:4871d8d8ce4b9c18",
       "name": "gpui-base",
       "version": "0.6.1",
       "licenses": [
@@ -10829,7 +10649,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
         },
         {
           "name": "vibex:selected-license",
@@ -10853,7 +10673,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component@0.6.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component@0.6.1:4871d8d8ce4b9c18",
       "name": "gpui-component",
       "version": "0.6.1",
       "licenses": [
@@ -10865,7 +10685,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
         },
         {
           "name": "vibex:selected-license",
@@ -10889,7 +10709,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-component-macros@0.6.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-component-macros@0.6.1:4871d8d8ce4b9c18",
       "name": "gpui-component-macros",
       "version": "0.6.1",
       "licenses": [
@@ -10901,7 +10721,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
         },
         {
           "name": "vibex:selected-license",
@@ -10918,14 +10738,50 @@
       ],
       "externalReferences": [
         {
-          "type": "distribution",
-          "url": "https://crates.io/crates/gpui-component-macros/0.6.1"
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-kit-assets@0.6.1:c19b7c6f923b580a",
+      "bom-ref": "cargo:gpui-fps@0.6.1:4871d8d8ce4b9c18",
+      "name": "gpui-fps",
+      "version": "0.6.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-fps@0.6.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/longbridge/gpui-kit/tree/main/crates/fps"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-kit-assets@0.6.1:4871d8d8ce4b9c18",
       "name": "gpui-kit-assets",
       "version": "0.6.1",
       "licenses": [
@@ -10937,7 +10793,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
+          "value": "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
         },
         {
           "name": "vibex:selected-license",
@@ -10961,19 +10817,19 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+      "bom-ref": "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
       "name": "gpui-pre",
-      "version": "0.3.1",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre@0.3.1",
+      "purl": "pkg:cargo/gpui-pre@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -10991,25 +10847,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-macros@0.3.1:68a634b806535a7e",
-      "name": "gpui-pre-macros",
-      "version": "0.3.1",
+      "bom-ref": "cargo:gpui-pre-apple@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-apple",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-macros@0.3.1",
+      "purl": "pkg:cargo/gpui-pre-apple@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_macros"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11027,7 +10883,367 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-collections",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-collections@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-derive-refineable@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-derive-refineable",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-derive-refineable@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-http-client@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-http-client",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-http-client@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-linux@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-linux",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-linux@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-macos@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-macos",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-macos@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-macros@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-macros",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-macros@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-media@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-media",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-media@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-perf@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-perf",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-perf@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-platform@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-platform",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-platform@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-refineable@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-refineable",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-refineable@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
@@ -11069,19 +11285,91 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui-pre-sum-tree@0.3.1:4be25d71ea23994e",
+      "bom-ref": "cargo:gpui-pre-scheduler@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-scheduler",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-scheduler@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-shared-string@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-shared-string",
+      "version": "0.3.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/gpui-pre-shared-string@0.3.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:gpui-pre-sum-tree@0.3.5:c19b7c6f923b580a",
       "name": "gpui-pre-sum-tree",
-      "version": "0.3.1",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui-pre-sum-tree@0.3.1",
+      "purl": "pkg:cargo/gpui-pre-sum-tree@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/sum_tree"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11099,25 +11387,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_android@0.1.0:3738e49034b3d570",
-      "name": "gpui_android",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-util",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_android@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-util@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_android"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11135,25 +11423,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_apple@0.1.0:fc0854a0c0901261",
-      "name": "gpui_apple",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-util-macros@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-util-macros",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_apple@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-util-macros@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_apple"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11171,25 +11459,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
-      "name": "gpui_ios",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-web@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-web",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_ios@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-web@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_ios"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11207,25 +11495,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
-      "name": "gpui_linux",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-wgpu@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-wgpu",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_linux@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-wgpu@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_linux"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11243,25 +11531,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_macos@0.1.0:b1880b4155df1643",
-      "name": "gpui_macos",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-windows@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-windows",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_macos@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-windows@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_macos"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11279,25 +11567,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
-      "name": "gpui_platform",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-zlog@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-zlog",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_platform@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-zlog@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_platform"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11315,25 +11603,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
-      "name": "gpui_shared_string",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-ztracing@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-ztracing",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_shared_string@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-ztracing@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_shared_string"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11351,25 +11639,25 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
-      "name": "gpui_tokio",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-pre-ztracing-macro@0.3.5:c19b7c6f923b580a",
+      "name": "gpui-pre-ztracing-macro",
+      "version": "0.3.5",
       "licenses": [
         {
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/gpui_tokio@0.1.0",
+      "purl": "pkg:cargo/gpui-pre-ztracing-macro@0.3.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_tokio"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -11387,29 +11675,29 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/zed-industries/zed"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-      "name": "gpui_util",
-      "version": "0.1.0",
+      "bom-ref": "cargo:gpui-tokio@0.1.0-rc.3:a9a8ee941163297c",
+      "name": "gpui-tokio",
+      "version": "0.1.0-rc.3",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "expression": "AGPL-3.0-or-later"
         }
       ],
-      "purl": "pkg:cargo/gpui_util@0.1.0",
+      "purl": "pkg:cargo/gpui-tokio@0.1.0-rc.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_util"
+          "value": "path:crates/gpui-tokio"
         },
         {
           "name": "vibex:selected-license",
-          "value": "Apache-2.0"
+          "value": "AGPL-3.0-or-later"
         },
         {
           "name": "vibex:license-policy-status",
@@ -11423,115 +11711,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui_web@0.1.0:831621201e4c1b95",
-      "name": "gpui_web",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui_web@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_web"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-      "name": "gpui_wgpu",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui_wgpu@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_wgpu"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c",
-      "name": "gpui_windows",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/gpui_windows@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/gpui_windows"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
+          "url": "https://github.com/vibex-ai/vibex"
         }
       ]
     },
@@ -12041,6 +12221,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:hdrhistogram@7.6.0:c19b7c6f923b580a",
+      "name": "hdrhistogram",
+      "version": "7.6.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/hdrhistogram@7.6.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/HdrHistogram/HdrHistogram_rust.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:heapless@0.9.3:c19b7c6f923b580a",
       "name": "heapless",
       "version": "0.9.3",
@@ -12504,42 +12720,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/hyperium/http-body"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:http_client@0.1.0:a2ee54afcd668cac",
-      "name": "http_client",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/http_client@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/http_client"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -16325,42 +16505,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:media@0.1.0:fff3ea2cd108b5c9",
-      "name": "media",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/media@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/media"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:memchr@2.8.2:c19b7c6f923b580a",
       "name": "memchr",
       "version": "2.8.2",
@@ -16860,78 +17004,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/gfx-rs/wgpu"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:ndk@0.9.0:c19b7c6f923b580a",
-      "name": "ndk",
-      "version": "0.9.0",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/ndk@0.9.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-mobile/ndk"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
-      "name": "ndk-context",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/ndk-context@0.1.1",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "registry+https://github.com/rust-lang/crates.io-index"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "MIT"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-windowing/android-ndk-rs"
         }
       ]
     },
@@ -18701,6 +18773,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:objc2-io-kit@0.3.2:c19b7c6f923b580a",
+      "name": "objc2-io-kit",
+      "version": "0.3.2",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/objc2-io-kit@0.3.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Zlib"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/madsmtm/objc2"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:objc2-io-surface@0.3.2:c19b7c6f923b580a",
       "name": "objc2-io-surface",
       "version": "0.3.2",
@@ -18854,6 +18962,42 @@
         }
       ],
       "purl": "pkg:cargo/objc2-quartz-core@0.3.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Zlib"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/madsmtm/objc2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
+      "name": "objc2-screen-capture-kit",
+      "version": "0.3.2",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/objc2-screen-capture-kit@0.3.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -19776,42 +19920,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/servo/rust-url/"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:perf@0.1.0:bccd121581a434b4",
-      "name": "perf",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/perf@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/tooling/perf"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -21257,19 +21365,19 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:proptest@1.10.0:54cab8b0ad0094d4",
+      "bom-ref": "cargo:proptest@1.11.0:c19b7c6f923b580a",
       "name": "proptest",
-      "version": "1.10.0",
+      "version": "1.11.0",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/proptest@1.10.0",
+      "purl": "pkg:cargo/proptest@1.11.0",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -21293,7 +21401,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:proptest-macro@0.5.0:54cab8b0ad0094d4",
+      "bom-ref": "cargo:proptest-macro@0.5.0:c19b7c6f923b580a",
       "name": "proptest-macro",
       "version": "0.5.0",
       "licenses": [
@@ -21305,7 +21413,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -22733,6 +22841,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:redox_users@0.4.6:c19b7c6f923b580a",
+      "name": "redox_users",
+      "version": "0.4.6",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/redox_users@0.4.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://gitlab.redox-os.org/redox-os/users"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:redox_users@0.5.2:c19b7c6f923b580a",
       "name": "redox_users",
       "version": "0.5.2",
@@ -22836,42 +22980,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/ref-cast"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:refineable@0.1.0:3b1a0b83dab40436",
-      "name": "refineable",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/refineable@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/refineable"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -24420,42 +24528,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/steffengy/schannel-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:scheduler@0.1.0:702e91d7065ee89a",
-      "name": "scheduler",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/scheduler@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/scheduler"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -27701,6 +27773,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:syn@3.0.6:c19b7c6f923b580a",
+      "name": "syn",
+      "version": "3.0.6",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/syn@3.0.6",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:sync_wrapper@1.0.2:c19b7c6f923b580a",
       "name": "sync_wrapper",
       "version": "1.0.2",
@@ -27818,6 +27926,42 @@
         }
       ],
       "purl": "pkg:cargo/sysinfo@0.31.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/GuillaumeGomez/sysinfo"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:sysinfo@0.37.2:c19b7c6f923b580a",
+      "name": "sysinfo",
+      "version": "0.37.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/sysinfo@0.37.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -31517,15 +31661,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:unicode-properties@0.1.4:c19b7c6f923b580a",
+      "bom-ref": "cargo:unicode-properties@0.1.3:c19b7c6f923b580a",
       "name": "unicode-properties",
-      "version": "0.1.4",
+      "version": "0.1.3",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/unicode-properties@0.1.4",
+      "purl": "pkg:cargo/unicode-properties@0.1.3",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -32088,42 +32232,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/hsivonen/utf8_iter"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:util_macros@0.1.0:68d96308134eb097",
-      "name": "util_macros",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/util_macros@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/util_macros"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -33821,7 +33929,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:wasm_thread@0.3.3:fc854d297f87f5cd",
+      "bom-ref": "cargo:wasm_thread@0.3.3:c19b7c6f923b580a",
       "name": "wasm_thread",
       "version": "0.3.3",
       "licenses": [
@@ -33833,7 +33941,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -35981,6 +36089,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:windows-sys@0.48.0:c19b7c6f923b580a",
+      "name": "windows-sys",
+      "version": "0.48.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows-sys@0.48.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:windows-sys@0.52.0:c19b7c6f923b580a",
       "name": "windows-sys",
       "version": "0.52.0",
@@ -36098,6 +36242,42 @@
         }
       ],
       "purl": "pkg:cargo/windows-sys@0.61.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:windows-targets@0.48.5:c19b7c6f923b580a",
+      "name": "windows-targets",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows-targets@0.48.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -36305,6 +36485,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:windows_aarch64_gnullvm@0.48.5:c19b7c6f923b580a",
+      "name": "windows_aarch64_gnullvm",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_aarch64_gnullvm@0.48.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:windows_aarch64_gnullvm@0.52.6:c19b7c6f923b580a",
       "name": "windows_aarch64_gnullvm",
       "version": "0.52.6",
@@ -36377,6 +36593,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:windows_aarch64_msvc@0.48.5:c19b7c6f923b580a",
+      "name": "windows_aarch64_msvc",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_aarch64_msvc@0.48.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:windows_aarch64_msvc@0.52.6:c19b7c6f923b580a",
       "name": "windows_aarch64_msvc",
       "version": "0.52.6",
@@ -36422,6 +36674,42 @@
         }
       ],
       "purl": "pkg:cargo/windows_aarch64_msvc@0.53.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:windows_i686_gnu@0.48.5:c19b7c6f923b580a",
+      "name": "windows_i686_gnu",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_i686_gnu@0.48.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -36593,6 +36881,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:windows_i686_msvc@0.48.5:c19b7c6f923b580a",
+      "name": "windows_i686_msvc",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_i686_msvc@0.48.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:windows_i686_msvc@0.52.6:c19b7c6f923b580a",
       "name": "windows_i686_msvc",
       "version": "0.52.6",
@@ -36638,6 +36962,42 @@
         }
       ],
       "purl": "pkg:cargo/windows_i686_msvc@0.53.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:windows_x86_64_gnu@0.48.5:c19b7c6f923b580a",
+      "name": "windows_x86_64_gnu",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_x86_64_gnu@0.48.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -36737,6 +37097,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:windows_x86_64_gnullvm@0.48.5:c19b7c6f923b580a",
+      "name": "windows_x86_64_gnullvm",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_x86_64_gnullvm@0.48.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:windows_x86_64_gnullvm@0.52.6:c19b7c6f923b580a",
       "name": "windows_x86_64_gnullvm",
       "version": "0.52.6",
@@ -36782,6 +37178,42 @@
         }
       ],
       "purl": "pkg:cargo/windows_x86_64_gnullvm@0.53.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:windows_x86_64_msvc@0.48.5:c19b7c6f923b580a",
+      "name": "windows_x86_64_msvc",
+      "version": "0.48.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/windows_x86_64_msvc@0.48.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -37529,7 +37961,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:xim-ctext@0.3.0:ef61c9718ec401eb",
+      "bom-ref": "cargo:xim-ctext@0.3.0:c19b7c6f923b580a",
       "name": "xim-ctext",
       "version": "0.3.0",
       "licenses": [
@@ -37541,7 +37973,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/xim-rs.git?rev=16f35a2c881b815a2b6cdfd6687988e84f8447d8#16f35a2c881b815a2b6cdfd6687988e84f8447d8"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -37565,19 +37997,19 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:xim-parser@0.2.1:ef61c9718ec401eb",
+      "bom-ref": "cargo:xim-parser@0.2.2:c19b7c6f923b580a",
       "name": "xim-parser",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "licenses": [
         {
           "expression": "MIT"
         }
       ],
-      "purl": "pkg:cargo/xim-parser@0.2.1",
+      "purl": "pkg:cargo/xim-parser@0.2.2",
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/xim-rs.git?rev=16f35a2c881b815a2b6cdfd6687988e84f8447d8#16f35a2c881b815a2b6cdfd6687988e84f8447d8"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -38393,7 +38825,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:zed-font-kit@0.14.1-zed:22dd8bee4964c984",
+      "bom-ref": "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a",
       "name": "zed-font-kit",
       "version": "0.14.1-zed",
       "licenses": [
@@ -38405,7 +38837,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f28166665e8fd2f53ff6d268a14955c82269"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -38429,7 +38861,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:zed-scap@0.0.8-zed:7248204075bc570b",
+      "bom-ref": "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a",
       "name": "zed-scap",
       "version": "0.0.8-zed",
       "licenses": [
@@ -38441,7 +38873,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/scap?rev=4afea48c3b002197176fb19cd0f9b180dd36eaac#4afea48c3b002197176fb19cd0f9b180dd36eaac"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -38465,7 +38897,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:zed-xim@0.4.0-zed:ef61c9718ec401eb",
+      "bom-ref": "cargo:zed-xim@0.4.0-zed:c19b7c6f923b580a",
       "name": "zed-xim",
       "version": "0.4.0-zed",
       "licenses": [
@@ -38477,7 +38909,7 @@
       "properties": [
         {
           "name": "vibex:cargo-source",
-          "value": "git+https://github.com/zed-industries/xim-rs.git?rev=16f35a2c881b815a2b6cdfd6687988e84f8447d8#16f35a2c881b815a2b6cdfd6687988e84f8447d8"
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
         },
         {
           "name": "vibex:selected-license",
@@ -38933,42 +39365,6 @@
     },
     {
       "type": "library",
-      "bom-ref": "cargo:zlog@0.1.0:79e142a907c245ed",
-      "name": "zlog",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/zlog@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/zlog"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "bom-ref": "cargo:zmij@1.0.21:c19b7c6f923b580a",
       "name": "zmij",
       "version": "1.0.21",
@@ -39108,78 +39504,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/gyscos/zstd-rs"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:ztracing@0.1.0:2ef71bbe95310c4b",
-      "name": "ztracing",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/ztracing@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/ztracing"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa",
-      "name": "ztracing_macro",
-      "version": "0.1.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/ztracing_macro@0.1.0",
-      "properties": [
-        {
-          "name": "vibex:cargo-source",
-          "value": "path:vendor/zed/crates/ztracing_macro"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "Apache-2.0"
-        },
-        {
-          "name": "vibex:license-policy-status",
-          "value": "approved"
-        },
-        {
-          "name": "vibex:license-evidence",
-          "value": "cargo-manifest"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/zed.git#f748b84d68b2d1191aa653de8f470e8c9f39f943"
         }
       ]
     },
@@ -39663,7 +39987,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
+      "bom-ref": "asset:vibex-desktop-application-icons:6d723c8f201e9676",
       "name": "Vibex desktop application and tray icons",
       "version": "0.1.0-rc.3",
       "licenses": [
@@ -39674,7 +39998,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "9ae646c05c9fa1f745ad2cb98aa0479021e216248e597b1678c205b99343eb44"
+          "content": "6d723c8f201e9676810e87bbe3c071f6e9490c6638289651dda6ce99afde2592"
         }
       ],
       "externalReferences": [
@@ -39694,7 +40018,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "10"
+          "value": "15"
         },
         {
           "name": "vibex:selected-license",
@@ -39786,7 +40110,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-mobile-native-icons:4ef261305bc4ba1c",
+      "bom-ref": "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
       "name": "Vibex native mobile Lucide controls",
       "version": "0.1.0-rc.3",
       "licenses": [
@@ -39797,7 +40121,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "4ef261305bc4ba1ce560b10053b1ffe6fdb9637af3523117afaec8168832b14d"
+          "content": "4af6d4773e1b878b72eee77d09eb644c5f80d12313dcf749a873d2859e71d57b"
         }
       ],
       "externalReferences": [
@@ -39817,7 +40141,7 @@
         },
         {
           "name": "vibex:file-count",
-          "value": "34"
+          "value": "35"
         },
         {
           "name": "vibex:selected-license",
@@ -39829,7 +40153,7 @@
       "type": "file",
       "bom-ref": "font:vibex-mobile-ibm-plex-sans:73c85a21223a7956",
       "name": "IBM Plex Sans mobile interface fonts",
-      "version": "vendor/zed@49d9758",
+      "version": "zed@49d9758",
       "licenses": [
         {
           "expression": "OFL-1.1"
@@ -39855,6 +40179,88 @@
         {
           "name": "vibex:asset-root",
           "value": "apps/mobile/assets/fonts/ibm-plex-sans"
+        },
+        {
+          "name": "vibex:file-count",
+          "value": "5"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "OFL-1.1"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
+      "name": "IBM Plex Sans desktop interface fonts",
+      "version": "zed@49d9758",
+      "licenses": [
+        {
+          "expression": "OFL-1.1"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "550b0b7d6dee90b44ce68f78727b51c66216c9f0f0b2cf5ca0617b8e2876d784"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans"
+        }
+      ],
+      "properties": [
+        {
+          "name": "vibex:input-kind",
+          "value": "font"
+        },
+        {
+          "name": "vibex:asset-root",
+          "value": "apps/desktop/assets/fonts/ibm-plex-sans"
+        },
+        {
+          "name": "vibex:file-count",
+          "value": "5"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "OFL-1.1"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "font:vibex-desktop-lilex:8e69f85c04197d91",
+      "name": "Lilex desktop code fonts",
+      "version": "zed@49d9758",
+      "licenses": [
+        {
+          "expression": "OFL-1.1"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8e69f85c04197d912e78f4748a1eb1e75ac5cbdcc79caaf298e298eaebf8f7b1"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/lilex"
+        }
+      ],
+      "properties": [
+        {
+          "name": "vibex:input-kind",
+          "value": "font"
+        },
+        {
+          "name": "vibex:asset-root",
+          "value": "apps/desktop/assets/fonts/lilex"
         },
         {
           "name": "vibex:file-count",
@@ -40127,7 +40533,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
+      "ref": "asset:vibex-desktop-application-icons:6d723c8f201e9676",
       "dependsOn": []
     },
     {
@@ -40143,7 +40549,7 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-mobile-native-icons:4ef261305bc4ba1c",
+      "ref": "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
       "dependsOn": []
     },
     {
@@ -40192,7 +40598,7 @@
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
         "cargo:atspi@0.29.0:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:zbus@5.13.2:c19b7c6f923b580a"
       ]
@@ -40302,38 +40708,6 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:android-activity@0.6.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:android-properties@0.2.2:c19b7c6f923b580a",
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:cc@1.2.65:c19b7c6f923b580a",
-        "cargo:jni@0.22.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
-        "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
-        "cargo:ndk@0.9.0:c19b7c6f923b580a",
-        "cargo:num_enum@0.7.6:c19b7c6f923b580a",
-        "cargo:thiserror@2.0.18:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:android-properties@0.2.2:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
-      "ref": "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
-      "ref": "cargo:android_logger@0.15.1:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:android_log-sys@0.3.2:c19b7c6f923b580a",
-        "cargo:env_filter@0.1.4:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:android_system_properties@0.1.5:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a"
@@ -40405,8 +40779,8 @@
       "ref": "cargo:ashpd@0.13.12:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:enumflags2@0.7.12:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:getrandom@0.4.3:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:serde_repr@0.1.20:c19b7c6f923b580a",
@@ -40451,7 +40825,7 @@
       "dependsOn": [
         "cargo:event-listener-strategy@0.5.4:c19b7c6f923b580a",
         "cargo:event-listener@5.4.1:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
       ]
     },
@@ -40460,7 +40834,7 @@
       "dependsOn": [
         "cargo:concurrent-queue@2.5.0:c19b7c6f923b580a",
         "cargo:event-listener-strategy@0.5.4:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
       ]
     },
@@ -40469,7 +40843,7 @@
       "dependsOn": [
         "cargo:compression-codecs@0.4.38:c19b7c6f923b580a",
         "cargo:compression-core@0.4.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
       ]
     },
@@ -40498,7 +40872,7 @@
         "cargo:autocfg@1.5.1:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
         "cargo:concurrent-queue@2.5.0:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:parking@2.2.1:c19b7c6f923b580a",
         "cargo:polling@3.11.0:c19b7c6f923b580a",
@@ -40553,8 +40927,8 @@
         "cargo:async-lock@3.4.2:c19b7c6f923b580a",
         "cargo:atomic-waker@1.1.2:c19b7c6f923b580a",
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
         "cargo:rustix@1.1.4:c19b7c6f923b580a",
         "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a",
         "cargo:slab@0.4.12:c19b7c6f923b580a",
@@ -40684,7 +41058,7 @@
       "ref": "cargo:axum-core@0.5.6:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:http-body-util@0.1.3:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
@@ -40722,7 +41096,7 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:form_urlencoded@1.2.2:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:http-body-util@0.1.3:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
@@ -40870,7 +41244,7 @@
       "dependsOn": [
         "cargo:async-channel@2.5.0:c19b7c6f923b580a",
         "cargo:async-task@4.7.1:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:piper@0.2.5:c19b7c6f923b580a"
       ]
@@ -40906,7 +41280,7 @@
         "cargo:dynify@0.1.2:c19b7c6f923b580a",
         "cargo:fast-float2@0.2.3:c19b7c6f923b580a",
         "cargo:float16@0.1.5:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
         "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:hashbrown@0.16.1:c19b7c6f923b580a",
@@ -41255,14 +41629,6 @@
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:termcolor@1.4.1:c19b7c6f923b580a",
         "cargo:unicode-width@0.2.2:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-      "dependsOn": [
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-        "cargo:indexmap@2.14.0:c19b7c6f923b580a",
-        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a"
       ]
     },
     {
@@ -41682,14 +42048,6 @@
       ]
     },
     {
-      "ref": "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9",
-      "dependsOn": [
-        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
-        "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:digest@0.10.7:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:block-buffer@0.10.4:c19b7c6f923b580a",
@@ -41706,12 +42064,27 @@
       ]
     },
     {
+      "ref": "cargo:dirs-sys@0.4.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:option-ext@0.2.0:c19b7c6f923b580a",
+        "cargo:redox_users@0.4.6:c19b7c6f923b580a",
+        "cargo:windows-sys@0.48.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:dirs-sys@0.5.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a",
         "cargo:option-ext@0.2.0:c19b7c6f923b580a",
         "cargo:redox_users@0.5.2:c19b7c6f923b580a",
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:dirs@5.0.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:dirs-sys@0.4.1:c19b7c6f923b580a"
       ]
     },
     {
@@ -41880,13 +42253,6 @@
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:env_filter@0.1.4:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:regex@1.12.4:c19b7c6f923b580a"
       ]
     },
     {
@@ -42063,8 +42429,8 @@
       "ref": "cargo:flume@0.12.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:fastrand@2.4.1:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
         "cargo:spin@0.9.9:c19b7c6f923b580a"
       ]
     },
@@ -42168,88 +42534,88 @@
       ]
     },
     {
-      "ref": "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a"
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a"
       ]
     },
     {
       "ref": "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:fixedbitset@0.5.7:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:pin-project@1.1.13:c19b7c6f923b580a",
         "cargo:smallvec@1.15.2:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-core@0.3.34:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
-      "ref": "cargo:futures-executor@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-executor@0.3.34:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-task@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a"
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-task@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-io@0.3.34:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
       "ref": "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:fastrand@2.4.1:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
         "cargo:parking@2.2.1:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:futures-macro@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-macro@0.3.34:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
-      "ref": "cargo:futures-task@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-task@0.3.34:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
-      "ref": "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures-util@0.3.34:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-macro@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-task@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-macro@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-task@0.3.34:c19b7c6f923b580a",
         "cargo:memchr@2.8.2:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:slab@0.4.12:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:futures@0.3.32:c19b7c6f923b580a",
+      "ref": "cargo:futures@0.3.34:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-executor@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-task@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a"
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-executor@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-task@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a"
       ]
     },
     {
@@ -42372,10 +42738,10 @@
     {
       "ref": "cargo:gio@0.18.4:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib@0.18.5:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
@@ -42415,11 +42781,11 @@
       "ref": "cargo:glib@0.18.5:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-executor@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-task@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-executor@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-task@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:gio-sys@0.18.1:c19b7c6f923b580a",
         "cargo:glib-macros@0.18.5:c19b7c6f923b580a",
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
@@ -42502,16 +42868,18 @@
       ]
     },
     {
-      "ref": "cargo:gpui-base@0.6.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-base@0.6.1:4871d8d8ce4b9c18",
       "dependsOn": [
         "cargo:aho-corasick@1.1.4:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:ashpd@0.13.12:c19b7c6f923b580a",
         "cargo:async-channel@2.5.0:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.1:68a634b806535a7e",
-        "cargo:gpui-pre-sum-tree@0.3.1:4be25d71ea23994e",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+        "cargo:data-url@0.3.2:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-macros@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:instant@0.1.13:c19b7c6f923b580a",
         "cargo:lsp-types@0.97.0:c19b7c6f923b580a",
@@ -42530,11 +42898,12 @@
         "cargo:smol@2.0.2:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
         "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
-        "cargo:web-time@1.1.0:c19b7c6f923b580a"
+        "cargo:web-time@1.1.0:c19b7c6f923b580a",
+        "cargo:windows@0.58.0:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-component-macros@0.6.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component-macros@0.6.1:4871d8d8ce4b9c18",
       "dependsOn": [
         "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -42543,18 +42912,18 @@
       ]
     },
     {
-      "ref": "cargo:gpui-component@0.6.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-component@0.6.1:4871d8d8ce4b9c18",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
         "cargo:enum-iterator@2.3.0:c19b7c6f923b580a",
-        "cargo:gpui-base@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-component-macros@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.1:68a634b806535a7e",
-        "cargo:gpui-pre-sum-tree@0.3.1:4be25d71ea23994e",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+        "cargo:gpui-base@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-component-macros@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-kit-assets@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-pre-macros@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
         "cargo:instant@0.1.13:c19b7c6f923b580a",
         "cargo:itertools@0.13.0:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
@@ -42609,12 +42978,27 @@
       ]
     },
     {
-      "ref": "cargo:gpui-kit-assets@0.6.1:c19b7c6f923b580a",
+      "ref": "cargo:gpui-fps@0.6.1:4871d8d8ce4b9c18",
+      "dependsOn": [
+        "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-io-kit@0.3.2:c19b7c6f923b580a",
+        "cargo:sysinfo@0.37.2:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:wayland-client@0.31.14:c19b7c6f923b580a",
+        "cargo:web-time@1.1.0:c19b7c6f923b580a",
+        "cargo:windows@0.58.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-kit-assets@0.6.1:4871d8d8ce4b9c18",
       "dependsOn": [
         "asset:gpui-kit-lucide-icons:efafb5ab9a148d12",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:gpui-pre-reqwest@0.12.15:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rust-embed@8.12.0:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
@@ -42622,12 +43006,195 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-macros@0.3.1:68a634b806535a7e",
+      "ref": "cargo:gpui-pre-apple@0.3.5:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:heck@0.5.0:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:block@0.1.6:c19b7c6f923b580a",
+        "cargo:cbindgen@0.28.0:c19b7c6f923b580a",
+        "cargo:cocoa@0.26.0:c19b7c6f923b580a",
+        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
+        "cargo:core-video@0.5.2:c19b7c6f923b580a",
+        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
+        "cargo:etagere@0.2.15:c19b7c6f923b580a",
+        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:metal@0.33.0:c19b7c6f923b580a",
+        "cargo:objc2@0.6.4:c19b7c6f923b580a",
+        "cargo:objc@0.2.7:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:indexmap@2.14.0:c19b7c6f923b580a",
+        "cargo:rustc-hash@2.1.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-derive-refineable@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-http-client@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-compression@0.4.42:c19b7c6f923b580a",
+        "cargo:bytes@1.12.0:c19b7c6f923b580a",
+        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:http-body@1.0.1:c19b7c6f923b580a",
+        "cargo:http@1.4.2:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:serde_urlencoded@0.7.1:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-linux@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
+        "cargo:accesskit_unix@0.22.1:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:as-raw-xcb-connection@1.0.1:c19b7c6f923b580a",
+        "cargo:ashpd@0.13.12:c19b7c6f923b580a",
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
+        "cargo:calloop-wayland-source@0.4.1:c19b7c6f923b580a",
+        "cargo:calloop@0.14.4:c19b7c6f923b580a",
+        "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:notify-rust@4.18.0:c19b7c6f923b580a",
+        "cargo:oo7@0.6.0:c19b7c6f923b580a",
+        "cargo:open@5.3.6:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:smol@2.0.2:c19b7c6f923b580a",
+        "cargo:strum@0.28.0:c19b7c6f923b580a",
+        "cargo:url@2.5.8:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:wayland-backend@0.3.15:c19b7c6f923b580a",
+        "cargo:wayland-client@0.31.14:c19b7c6f923b580a",
+        "cargo:wayland-cursor@0.31.14:c19b7c6f923b580a",
+        "cargo:wayland-protocols-plasma@0.3.12:c19b7c6f923b580a",
+        "cargo:wayland-protocols-wlr@0.3.12:c19b7c6f923b580a",
+        "cargo:wayland-protocols@0.32.13:c19b7c6f923b580a",
+        "cargo:x11-clipboard@0.9.3:c19b7c6f923b580a",
+        "cargo:x11rb@0.13.2:c19b7c6f923b580a",
+        "cargo:xkbcommon@0.8.0:c19b7c6f923b580a",
+        "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a",
+        "cargo:zed-xim@0.4.0-zed:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-macos@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
+        "cargo:accesskit_macos@0.26.3:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:async-task@4.7.1:c19b7c6f923b580a",
+        "cargo:block2@0.6.2:c19b7c6f923b580a",
+        "cargo:block@0.1.6:c19b7c6f923b580a",
+        "cargo:cocoa@0.26.0:c19b7c6f923b580a",
+        "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
+        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
+        "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
+        "cargo:core-text@21.0.0:c19b7c6f923b580a",
+        "cargo:ctor@1.0.13:c19b7c6f923b580a",
+        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
+        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-apple@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-media@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:mach2@0.5.0:c19b7c6f923b580a",
+        "cargo:metal@0.33.0:c19b7c6f923b580a",
+        "cargo:objc2-app-kit@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-user-notifications@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2@0.6.4:c19b7c6f923b580a",
+        "cargo:objc@0.2.7:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:pathfinder_geometry@0.5.1:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:semver@1.0.28:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:strum@0.28.0:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-macros@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:heck@0.5.0:c19b7c6f923b580a",
+        "cargo:proc-macro-crate@3.5.0:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-media@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:bindgen@0.72.1:c19b7c6f923b580a",
+        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
+        "cargo:core-video@0.5.2:c19b7c6f923b580a",
+        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
+        "cargo:metal@0.33.0:c19b7c6f923b580a",
+        "cargo:objc@0.2.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-perf@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-platform@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
+        "cargo:gpui-pre-linux@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-macos@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-web@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-windows@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-refineable@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-derive-refineable@0.3.5:c19b7c6f923b580a"
       ]
     },
     {
@@ -42636,8 +43203,8 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:encoding_rs@0.8.35:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:h2@0.4.15:c19b7c6f923b580a",
         "cargo:http-body-util@0.1.3:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
@@ -42678,17 +43245,153 @@
       ]
     },
     {
-      "ref": "cargo:gpui-pre-sum-tree@0.3.1:4be25d71ea23994e",
+      "ref": "cargo:gpui-pre-scheduler@0.3.5:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:heapless@0.9.3:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:rayon@1.12.0:c19b7c6f923b580a",
-        "cargo:tracing@0.1.44:c19b7c6f923b580a",
-        "cargo:ztracing@0.1.0:2ef71bbe95310c4b"
+        "cargo:async-task@4.7.1:c19b7c6f923b580a",
+        "cargo:backtrace@0.3.76:c19b7c6f923b580a",
+        "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:flume@0.12.0:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:rand@0.9.4:c19b7c6f923b580a",
+        "cargo:wasm_thread@0.3.3:c19b7c6f923b580a",
+        "cargo:web-time@1.1.0:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+      "ref": "cargo:gpui-pre-shared-string@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:schemars@1.2.1:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:smol_str@0.3.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-sum-tree@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-ztracing@0.3.5:c19b7c6f923b580a",
+        "cargo:heapless@0.9.3:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:rayon@1.12.0:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-util-macros@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-perf@0.3.5:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:which@8.0.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-web@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:js-sys@0.3.102:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:unicode-properties@0.1.3:c19b7c6f923b580a",
+        "cargo:unicode-script@0.5.8:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
+        "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
+        "cargo:wasm_thread@0.3.3:c19b7c6f923b580a",
+        "cargo:web-sys@0.3.102:c19b7c6f923b580a",
+        "cargo:web-time@1.1.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-wgpu@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
+        "cargo:cosmic-text@0.19.0:c19b7c6f923b580a",
+        "cargo:etagere@0.2.15:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:profiling@1.0.18:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:swash@0.2.9:c19b7c6f923b580a",
+        "cargo:unicode-bidi@0.3.18:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:web-sys@0.3.102:c19b7c6f923b580a",
+        "cargo:wgpu@29.0.4:c19b7c6f923b580a",
+        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-windows@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
+        "cargo:accesskit_windows@0.34.0:c19b7c6f923b580a",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:dunce@1.0.5:c19b7c6f923b580a",
+        "cargo:etagere@0.2.15:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:image@0.25.10:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:rand@0.9.4:c19b7c6f923b580a",
+        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
+        "cargo:windows-core@0.62.2:c19b7c6f923b580a",
+        "cargo:windows-numerics@0.3.1:c19b7c6f923b580a",
+        "cargo:windows-registry@0.6.1:c19b7c6f923b580a",
+        "cargo:windows@0.62.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-zlog@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:chrono@0.4.45:c19b7c6f923b580a",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:log@0.4.33:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre-ztracing-macro@0.3.5:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:gpui-pre-ztracing@0.3.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:gpui-pre-zlog@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-ztracing-macro@0.3.5:c19b7c6f923b580a",
+        "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:accesskit@0.24.1:c19b7c6f923b580a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
@@ -42698,21 +43401,26 @@
         "cargo:bindgen@0.72.1:c19b7c6f923b580a",
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
         "cargo:core-video@0.5.2:c19b7c6f923b580a",
         "cargo:ctor@1.0.13:c19b7c6f923b580a",
         "cargo:derive_more@2.1.1:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
         "cargo:etagere@0.2.15:c19b7c6f923b580a",
         "cargo:futures-concurrency@7.7.1:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:getrandom@0.3.4:c19b7c6f923b580a",
-        "cargo:gpui-pre-macros@0.3.1:68a634b806535a7e",
-        "cargo:gpui-pre-sum-tree@0.3.1:4be25d71ea23994e",
-        "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
+        "cargo:gpui-pre-collections@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-http-client@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-macros@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-refineable@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-scheduler@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-shared-string@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-sum-tree@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util-macros@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-ztracing@0.3.5:c19b7c6f923b580a",
+        "cargo:hdrhistogram@7.6.0:c19b7c6f923b580a",
         "cargo:heapless@0.9.3:c19b7c6f923b580a",
-        "cargo:http_client@0.1.0:a2ee54afcd668cac",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:inventory@0.3.24:c19b7c6f923b580a",
         "cargo:itertools@0.14.0:c19b7c6f923b580a",
@@ -42725,13 +43433,11 @@
         "cargo:pollster@0.4.0:c19b7c6f923b580a",
         "cargo:postage@0.5.0:c19b7c6f923b580a",
         "cargo:profiling@1.0.18:c19b7c6f923b580a",
-        "cargo:proptest@1.10.0:54cab8b0ad0094d4",
+        "cargo:proptest@1.11.0:c19b7c6f923b580a",
         "cargo:rand@0.9.4:c19b7c6f923b580a",
         "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:refineable@0.1.0:3b1a0b83dab40436",
         "cargo:regex@1.12.4:c19b7c6f923b580a",
         "cargo:resvg@0.46.0:c19b7c6f923b580a",
-        "cargo:scheduler@0.1.0:702e91d7065ee89a",
         "cargo:schemars@1.2.1:c19b7c6f923b580a",
         "cargo:seahash@4.1.0:c19b7c6f923b580a",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
@@ -42746,266 +43452,21 @@
         "cargo:ttf-parser@0.25.1:c19b7c6f923b580a",
         "cargo:url@2.5.8:c19b7c6f923b580a",
         "cargo:usvg@0.46.0:c19b7c6f923b580a",
-        "cargo:util_macros@0.1.0:68d96308134eb097",
         "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:waker-fn@1.2.0:c19b7c6f923b580a",
         "cargo:web-time@1.1.0:c19b7c6f923b580a",
         "cargo:windows@0.62.2:c19b7c6f923b580a",
-        "cargo:zed-font-kit@0.14.1-zed:22dd8bee4964c984",
-        "cargo:zed-scap@0.0.8-zed:7248204075bc570b",
-        "cargo:ztracing@0.1.0:2ef71bbe95310c4b"
+        "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a",
+        "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:gpui_android@0.1.0:3738e49034b3d570",
-      "dependsOn": [
-        "cargo:android-activity@0.6.1:c19b7c6f923b580a",
-        "cargo:android_logger@0.15.1:c19b7c6f923b580a",
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-        "cargo:jni@0.22.4:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:wgpu@29.0.4:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_apple@0.1.0:fc0854a0c0901261",
+      "ref": "cargo:gpui-tokio@0.1.0-rc.3:a9a8ee941163297c",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:block@0.1.6:c19b7c6f923b580a",
-        "cargo:cbindgen@0.28.0:c19b7c6f923b580a",
-        "cargo:cocoa@0.26.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:core-video@0.5.2:c19b7c6f923b580a",
-        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
-        "cargo:etagere@0.2.15:c19b7c6f923b580a",
-        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:image@0.25.10:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:metal@0.33.0:c19b7c6f923b580a",
-        "cargo:objc@0.2.7:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:async-task@4.7.1:c19b7c6f923b580a",
-        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:objc@0.2.7:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
-      "dependsOn": [
-        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
-        "cargo:accesskit_unix@0.22.1:c19b7c6f923b580a",
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:as-raw-xcb-connection@1.0.1:c19b7c6f923b580a",
-        "cargo:ashpd@0.13.12:c19b7c6f923b580a",
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
-        "cargo:calloop-wayland-source@0.4.1:c19b7c6f923b580a",
-        "cargo:calloop@0.14.4:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:filedescriptor@0.8.3:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-        "cargo:http_client@0.1.0:a2ee54afcd668cac",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:notify-rust@4.18.0:c19b7c6f923b580a",
-        "cargo:oo7@0.6.0:c19b7c6f923b580a",
-        "cargo:open@5.3.6:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-        "cargo:smol@2.0.2:c19b7c6f923b580a",
-        "cargo:strum@0.28.0:c19b7c6f923b580a",
-        "cargo:url@2.5.8:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:wayland-backend@0.3.15:c19b7c6f923b580a",
-        "cargo:wayland-client@0.31.14:c19b7c6f923b580a",
-        "cargo:wayland-cursor@0.31.14:c19b7c6f923b580a",
-        "cargo:wayland-protocols-plasma@0.3.12:c19b7c6f923b580a",
-        "cargo:wayland-protocols-wlr@0.3.12:c19b7c6f923b580a",
-        "cargo:wayland-protocols@0.32.13:c19b7c6f923b580a",
-        "cargo:x11-clipboard@0.9.3:c19b7c6f923b580a",
-        "cargo:x11rb@0.13.2:c19b7c6f923b580a",
-        "cargo:xkbcommon@0.8.0:c19b7c6f923b580a",
-        "cargo:zed-scap@0.0.8-zed:7248204075bc570b",
-        "cargo:zed-xim@0.4.0-zed:ef61c9718ec401eb"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_macos@0.1.0:b1880b4155df1643",
-      "dependsOn": [
-        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
-        "cargo:accesskit_macos@0.26.3:c19b7c6f923b580a",
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:async-task@4.7.1:c19b7c6f923b580a",
-        "cargo:block2@0.6.2:c19b7c6f923b580a",
-        "cargo:block@0.1.6:c19b7c6f923b580a",
-        "cargo:cocoa@0.26.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:core-foundation-sys@0.8.7:c19b7c6f923b580a",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
-        "cargo:core-text@21.0.0:c19b7c6f923b580a",
-        "cargo:ctor@1.0.13:c19b7c6f923b580a",
-        "cargo:dispatch2@0.3.1:c19b7c6f923b580a",
-        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_apple@0.1.0:fc0854a0c0901261",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-        "cargo:image@0.25.10:c19b7c6f923b580a",
-        "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:libc@0.2.189:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:mach2@0.5.0:c19b7c6f923b580a",
-        "cargo:media@0.1.0:fff3ea2cd108b5c9",
-        "cargo:metal@0.33.0:c19b7c6f923b580a",
-        "cargo:objc2-app-kit@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2-user-notifications@0.3.2:c19b7c6f923b580a",
-        "cargo:objc2@0.6.4:c19b7c6f923b580a",
-        "cargo:objc@0.2.7:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:pathfinder_geometry@0.5.1:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:semver@1.0.28:c19b7c6f923b580a",
-        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-        "cargo:strum@0.28.0:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:zed-font-kit@0.14.1-zed:22dd8bee4964c984"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
-      "dependsOn": [
-        "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_android@0.1.0:3738e49034b3d570",
-        "cargo:gpui_ios@0.1.0:a624b9346de27f9a",
-        "cargo:gpui_linux@0.1.0:5277bbb1e9f77bc3",
-        "cargo:gpui_macos@0.1.0:b1880b4155df1643",
-        "cargo:gpui_web@0.1.0:831621201e4c1b95",
-        "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_shared_string@0.1.0:65e4be665b28764c",
-      "dependsOn": [
-        "cargo:schemars@1.2.1:c19b7c6f923b580a",
-        "cargo:serde@1.0.228:c19b7c6f923b580a",
-        "cargo:smol_str@0.3.6:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
+        "cargo:gpui-pre-util@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:which@8.0.6:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_web@0.1.0:831621201e4c1b95",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:console_error_panic_hook@0.1.7:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-        "cargo:http_client@0.1.0:a2ee54afcd668cac",
-        "cargo:js-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:scheduler@0.1.0:702e91d7065ee89a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
-        "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
-        "cargo:wasm_thread@0.3.3:fc854d297f87f5cd",
-        "cargo:web-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:web-time@1.1.0:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_wgpu@0.1.0:694946df1c2f93ee",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:cosmic-text@0.19.0:c19b7c6f923b580a",
-        "cargo:etagere@0.2.15:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-        "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:profiling@1.0.18:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-        "cargo:swash@0.2.9:c19b7c6f923b580a",
-        "cargo:unicode-bidi@0.3.18:c19b7c6f923b580a",
-        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
-        "cargo:web-sys@0.3.102:c19b7c6f923b580a",
-        "cargo:wgpu@29.0.4:c19b7c6f923b580a",
-        "cargo:zed-font-kit@0.14.1-zed:22dd8bee4964c984"
-      ]
-    },
-    {
-      "ref": "cargo:gpui_windows@0.1.0:3b463fd5ef335d4c",
-      "dependsOn": [
-        "cargo:accesskit@0.24.1:c19b7c6f923b580a",
-        "cargo:accesskit_windows@0.34.0:c19b7c6f923b580a",
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:dunce@1.0.5:c19b7c6f923b580a",
-        "cargo:etagere@0.2.15:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_util@0.1.0:b9f3001c16e3909e",
-        "cargo:image@0.25.10:c19b7c6f923b580a",
-        "cargo:itertools@0.14.0:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:rand@0.9.4:c19b7c6f923b580a",
-        "cargo:raw-window-handle@0.6.2:c19b7c6f923b580a",
-        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
-        "cargo:uuid@1.23.3:c19b7c6f923b580a",
-        "cargo:windows-core@0.62.2:c19b7c6f923b580a",
-        "cargo:windows-numerics@0.3.1:c19b7c6f923b580a",
-        "cargo:windows-registry@0.6.1:c19b7c6f923b580a",
-        "cargo:windows@0.62.2:c19b7c6f923b580a"
       ]
     },
     {
@@ -43046,7 +43507,7 @@
         "cargo:atk@0.18.2:c19b7c6f923b580a",
         "cargo:cairo-rs@0.18.5:c19b7c6f923b580a",
         "cargo:field-offset@0.3.6:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
         "cargo:gdk-pixbuf@0.18.5:c19b7c6f923b580a",
         "cargo:gdk@0.18.2:c19b7c6f923b580a",
         "cargo:gio@0.18.4:c19b7c6f923b580a",
@@ -43064,8 +43525,8 @@
         "cargo:atomic-waker@1.1.2:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:fnv@1.0.7:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
         "cargo:indexmap@2.14.0:c19b7c6f923b580a",
         "cargo:slab@0.4.12:c19b7c6f923b580a",
@@ -43132,6 +43593,13 @@
       ]
     },
     {
+      "ref": "cargo:hdrhistogram@7.6.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:byteorder@1.5.0:c19b7c6f923b580a",
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:heapless@0.9.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:hash32@0.3.1:c19b7c6f923b580a",
@@ -43191,7 +43659,7 @@
       "ref": "cargo:http-body-util@0.1.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
@@ -43209,24 +43677,6 @@
       "dependsOn": [
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:itoa@1.0.18:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:http_client@0.1.0:a2ee54afcd668cac",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:async-compression@0.4.42:c19b7c6f923b580a",
-        "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:http-body@1.0.1:c19b7c6f923b580a",
-        "cargo:http@1.4.2:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:serde@1.0.228:c19b7c6f923b580a",
-        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
-        "cargo:serde_urlencoded@0.7.1:c19b7c6f923b580a",
-        "cargo:url@2.5.8:c19b7c6f923b580a"
       ]
     },
     {
@@ -43261,8 +43711,8 @@
       "dependsOn": [
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
         "cargo:hyper@1.10.1:c19b7c6f923b580a",
@@ -43283,8 +43733,8 @@
       "dependsOn": [
         "cargo:atomic-waker@1.1.2:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:h2@0.4.15:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
@@ -43649,7 +44099,7 @@
       "ref": "cargo:js-sys@0.3.102:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a"
       ]
     },
@@ -44012,18 +44462,6 @@
       ]
     },
     {
-      "ref": "cargo:media@0.1.0:fff3ea2cd108b5c9",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:bindgen@0.72.1:c19b7c6f923b580a",
-        "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
-        "cargo:core-video@0.5.2:c19b7c6f923b580a",
-        "cargo:foreign-types@0.5.0:c19b7c6f923b580a",
-        "cargo:metal@0.33.0:c19b7c6f923b580a",
-        "cargo:objc@0.2.7:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:memchr@2.8.2:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -44150,24 +44588,9 @@
       ]
     },
     {
-      "ref": "cargo:ndk-context@0.1.1:c19b7c6f923b580a",
-      "dependsOn": []
-    },
-    {
       "ref": "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:jni-sys@0.3.1:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:ndk@0.9.0:c19b7c6f923b580a",
-      "dependsOn": [
-        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
-        "cargo:jni-sys@0.3.1:c19b7c6f923b580a",
-        "cargo:log@0.4.33:c19b7c6f923b580a",
-        "cargo:ndk-sys@0.6.0+11769913:c19b7c6f923b580a",
-        "cargo:num_enum@0.7.6:c19b7c6f923b580a",
-        "cargo:thiserror@1.0.69:c19b7c6f923b580a"
       ]
     },
     {
@@ -44532,6 +44955,13 @@
       ]
     },
     {
+      "ref": "cargo:objc2-io-kit@0.3.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:objc2-io-surface@0.3.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
@@ -44574,6 +45004,15 @@
         "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2-metal@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2@0.6.4:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:objc2-screen-capture-kit@0.3.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:block2@0.6.2:c19b7c6f923b580a",
+        "cargo:objc2-core-graphics@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-foundation@0.3.2:c19b7c6f923b580a",
         "cargo:objc2@0.6.4:c19b7c6f923b580a"
       ]
     },
@@ -44649,7 +45088,7 @@
         "cargo:digest@0.10.7:c19b7c6f923b580a",
         "cargo:endi@1.1.1:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:getrandom@0.4.3:c19b7c6f923b580a",
         "cargo:hkdf@0.12.4:c19b7c6f923b580a",
         "cargo:hmac@0.12.1:c19b7c6f923b580a",
@@ -44695,7 +45134,7 @@
     {
       "ref": "cargo:ordered-stream@0.2.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a"
       ]
     },
@@ -44794,14 +45233,6 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:perf@0.1.0:bccd121581a434b4",
-      "dependsOn": [
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:serde@1.0.228:c19b7c6f923b580a",
-        "cargo:serde_json@1.0.150:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:phf@0.11.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:phf_shared@0.11.3:c19b7c6f923b580a"
@@ -44885,7 +45316,7 @@
       "dependsOn": [
         "cargo:atomic-waker@1.1.2:c19b7c6f923b580a",
         "cargo:fastrand@2.4.1:c19b7c6f923b580a",
-        "cargo:futures-io@0.3.32:c19b7c6f923b580a"
+        "cargo:futures-io@0.3.34:c19b7c6f923b580a"
       ]
     },
     {
@@ -44971,7 +45402,7 @@
       "dependsOn": [
         "cargo:atomic@0.5.3:c19b7c6f923b580a",
         "cargo:crossbeam-queue@0.3.13:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
         "cargo:pin-project@1.1.13:c19b7c6f923b580a",
@@ -45068,7 +45499,7 @@
       ]
     },
     {
-      "ref": "cargo:proptest-macro@0.5.0:54cab8b0ad0094d4",
+      "ref": "cargo:proptest-macro@0.5.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:convert_case@0.11.0:c19b7c6f923b580a",
         "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
@@ -45077,13 +45508,13 @@
       ]
     },
     {
-      "ref": "cargo:proptest@1.10.0:54cab8b0ad0094d4",
+      "ref": "cargo:proptest@1.11.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bit-set@0.8.0:c19b7c6f923b580a",
         "cargo:bit-vec@0.8.0:c19b7c6f923b580a",
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:num-traits@0.2.19:c19b7c6f923b580a",
-        "cargo:proptest-macro@0.5.0:54cab8b0ad0094d4",
+        "cargo:proptest-macro@0.5.0:c19b7c6f923b580a",
         "cargo:rand@0.9.4:c19b7c6f923b580a",
         "cargo:rand_chacha@0.9.0:c19b7c6f923b580a",
         "cargo:rand_xorshift@0.4.0:c19b7c6f923b580a",
@@ -45394,6 +45825,14 @@
       ]
     },
     {
+      "ref": "cargo:redox_users@0.4.6:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:getrandom@0.2.17:c19b7c6f923b580a",
+        "cargo:libredox@0.1.17:c19b7c6f923b580a",
+        "cargo:thiserror@1.0.69:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:redox_users@0.5.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:getrandom@0.2.17:c19b7c6f923b580a",
@@ -45413,12 +45852,6 @@
       "ref": "cargo:ref-cast@1.0.25:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:ref-cast-impl@1.0.25:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:refineable@0.1.0:3b1a0b83dab40436",
-      "dependsOn": [
-        "cargo:derive_refineable@0.1.0:4ff7da202d7ebfc9"
       ]
     },
     {
@@ -45459,9 +45892,9 @@
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
         "cargo:encoding_rs@0.8.35:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:h2@0.4.15:c19b7c6f923b580a",
         "cargo:http-body-util@0.1.3:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
@@ -45793,7 +46226,7 @@
         "cargo:ttf-parser@0.25.1:c19b7c6f923b580a",
         "cargo:unicode-bidi-mirroring@0.4.0:c19b7c6f923b580a",
         "cargo:unicode-ccc@0.4.0:c19b7c6f923b580a",
-        "cargo:unicode-properties@0.1.4:c19b7c6f923b580a",
+        "cargo:unicode-properties@0.1.3:c19b7c6f923b580a",
         "cargo:unicode-script@0.5.8:c19b7c6f923b580a"
       ]
     },
@@ -45815,20 +46248,6 @@
       "ref": "cargo:schannel@0.1.29:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:windows-sys@0.61.2:c19b7c6f923b580a"
-      ]
-    },
-    {
-      "ref": "cargo:scheduler@0.1.0:702e91d7065ee89a",
-      "dependsOn": [
-        "cargo:async-task@4.7.1:c19b7c6f923b580a",
-        "cargo:backtrace@0.3.76:c19b7c6f923b580a",
-        "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:flume@0.12.0:c19b7c6f923b580a",
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
-        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
-        "cargo:rand@0.9.4:c19b7c6f923b580a",
-        "cargo:wasm_thread@0.3.3:fc854d297f87f5cd",
-        "cargo:web-time@1.1.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -45894,7 +46313,7 @@
       "dependsOn": [
         "cargo:aes@0.8.4:c19b7c6f923b580a",
         "cargo:cbc@0.1.2:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:generic-array@0.14.7:c19b7c6f923b580a",
         "cargo:hkdf@0.12.4:c19b7c6f923b580a",
         "cargo:num@0.4.3:c19b7c6f923b580a",
@@ -46460,9 +46879,17 @@
       ]
     },
     {
+      "ref": "cargo:syn@3.0.6:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:unicode-ident@1.0.24:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:sync_wrapper@1.0.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a"
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a"
       ]
     },
     {
@@ -46488,6 +46915,17 @@
         "cargo:ntapi@0.4.3:c19b7c6f923b580a",
         "cargo:rayon@1.12.0:c19b7c6f923b580a",
         "cargo:windows@0.57.0:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:sysinfo@0.37.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:memchr@2.8.2:c19b7c6f923b580a",
+        "cargo:ntapi@0.4.3:c19b7c6f923b580a",
+        "cargo:objc2-core-foundation@0.3.2:c19b7c6f923b580a",
+        "cargo:objc2-io-kit@0.3.2:c19b7c6f923b580a",
+        "cargo:windows@0.61.3:c19b7c6f923b580a"
       ]
     },
     {
@@ -46729,7 +47167,7 @@
       "ref": "cargo:tokio-socks@0.5.3:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:either@1.16.0:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:thiserror@1.0.69:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
       ]
@@ -46737,7 +47175,7 @@
     {
       "ref": "cargo:tokio-tungstenite@0.28.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:rustls-native-certs@0.8.4:c19b7c6f923b580a",
         "cargo:rustls-pki-types@1.14.1:c19b7c6f923b580a",
@@ -46750,7 +47188,7 @@
     {
       "ref": "cargo:tokio-tungstenite@0.29.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tungstenite@0.29.0:c19b7c6f923b580a"
@@ -46760,8 +47198,8 @@
       "ref": "cargo:tokio-util@0.7.18:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a"
       ]
@@ -46867,7 +47305,7 @@
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:bytes@1.12.0:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:http-body@1.0.1:c19b7c6f923b580a",
         "cargo:http@1.4.2:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
@@ -46888,8 +47326,8 @@
     {
       "ref": "cargo:tower@0.5.3:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:pin-project-lite@0.2.17:c19b7c6f923b580a",
         "cargo:sync_wrapper@1.0.2:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
@@ -47246,7 +47684,7 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:unicode-properties@0.1.4:c19b7c6f923b580a",
+      "ref": "cargo:unicode-properties@0.1.3:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -47359,14 +47797,6 @@
     {
       "ref": "cargo:utf8_iter@1.0.4:c19b7c6f923b580a",
       "dependsOn": []
-    },
-    {
-      "ref": "cargo:util_macros@0.1.0:68d96308134eb097",
-      "dependsOn": [
-        "cargo:perf@0.1.0:bccd121581a434b4",
-        "cargo:quote@1.0.46:c19b7c6f923b580a",
-        "cargo:syn@2.0.118:c19b7c6f923b580a"
-      ]
     },
     {
       "ref": "cargo:uuid@1.23.3:c19b7c6f923b580a",
@@ -47484,7 +47914,7 @@
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:ed25519-dalek@2.2.0:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:quick-xml@0.41.0:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:semver@1.0.28:c19b7c6f923b580a",
@@ -47594,7 +48024,7 @@
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:flate2@1.1.9:c19b7c6f923b580a",
         "cargo:fs2@0.4.3:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:mdns-sd@0.21.0:c19b7c6f923b580a",
         "cargo:reqwest@0.13.4:c19b7c6f923b580a",
         "cargo:rusqlite@0.37.0:c19b7c6f923b580a",
@@ -47630,16 +48060,20 @@
     {
       "ref": "cargo:vibex-desktop@0.1.0-rc.3:8be20e5fa4f9b6f0",
       "dependsOn": [
-        "asset:vibex-desktop-application-icons:9ae646c05c9fa1f7",
+        "asset:vibex-desktop-application-icons:6d723c8f201e9676",
         "asset:vibex-desktop-reviewed-icons:f23fe8f66fd05797",
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
         "cargo:embed-resource@3.0.9:c19b7c6f923b580a",
-        "cargo:gpui-component@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-kit-assets@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
-        "cargo:gpui_platform@0.1.0:d84003249f53c9d3",
-        "cargo:gpui_tokio@0.1.0:d0725b3477647b75",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:gpui-component@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-fps@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-kit-assets@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-pre-platform@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre-wgpu@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
+        "cargo:gpui-tokio@0.1.0-rc.3:a9a8ee941163297c",
         "cargo:gtk@0.18.2:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:pdfium-render@0.9.3:c19b7c6f923b580a",
@@ -47650,7 +48084,9 @@
         "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:similar@3.1.1:c19b7c6f923b580a",
+        "cargo:smallvec@1.15.2:c19b7c6f923b580a",
         "cargo:sys-locale@0.3.2:c19b7c6f923b580a",
+        "cargo:sysinfo@0.37.2:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
         "cargo:tray-icon@0.24.2:c19b7c6f923b580a",
@@ -47668,6 +48104,8 @@
         "cargo:vibex-remote-client@0.1.0-rc.3:fbf177affd133cad",
         "cargo:vibex-terminal@0.1.0-rc.3:73363de7836b4dd0",
         "cargo:vibex-ui@0.1.0-rc.3:5b03b27578a01810",
+        "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
+        "font:vibex-desktop-lilex:8e69f85c04197d91",
         "installer:cargo-packager:9aa0f5056c419100",
         "installer:nsis-application-id:1c2772b0edfb0f96",
         "installer:nsis-tauri-utils:0eed48313a7f904d",
@@ -47718,8 +48156,8 @@
       "ref": "cargo:vibex-markdown@0.1.0-rc.3:d874bdc43e124bf4",
       "dependsOn": [
         "cargo:base64@0.22.1:c19b7c6f923b580a",
-        "cargo:gpui-component@0.6.1:c19b7c6f923b580a",
-        "cargo:gpui-pre@0.3.1:639af286d43bf32b",
+        "cargo:gpui-component@0.6.1:4871d8d8ce4b9c18",
+        "cargo:gpui-pre@0.3.5:c19b7c6f923b580a",
         "cargo:html5ever@0.27.0:c19b7c6f923b580a",
         "cargo:image@0.25.10:c19b7c6f923b580a",
         "cargo:markup5ever_rcdom@0.3.0:c19b7c6f923b580a",
@@ -47754,8 +48192,8 @@
       "ref": "cargo:vibex-remote-client@0.1.0-rc.3:fbf177affd133cad",
       "dependsOn": [
         "cargo:base64@0.22.1:c19b7c6f923b580a",
-        "cargo:futures-channel@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-channel@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:hkdf@0.12.4:c19b7c6f923b580a",
         "cargo:hmac@0.12.1:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
@@ -47786,7 +48224,7 @@
         "cargo:axum-server@0.8.0:c19b7c6f923b580a",
         "cargo:axum@0.8.9:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:hkdf@0.12.4:c19b7c6f923b580a",
         "cargo:hmac@0.12.1:c19b7c6f923b580a",
         "cargo:rand_core@0.6.4:c19b7c6f923b580a",
@@ -47835,8 +48273,9 @@
       "dependsOn": [
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
         "asset:vibex-mobile-brand-marks:84a77e160e305979",
-        "asset:vibex-mobile-native-icons:4ef261305bc4ba1c",
+        "asset:vibex-mobile-native-icons:4af6d4773e1b878b",
         "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
         "cargo:vibex-backend@0.1.0-rc.3:14559522eff35735",
         "cargo:vibex-core@0.1.0-rc.3:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.0-rc.3:3eccb8226f5ee757",
@@ -47946,7 +48385,7 @@
     {
       "ref": "cargo:wasm-streams@0.4.2:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
@@ -47956,7 +48395,7 @@
     {
       "ref": "cargo:wasm-streams@0.5.0:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:wasm-bindgen-futures@0.4.75:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
@@ -47964,9 +48403,9 @@
       ]
     },
     {
-      "ref": "cargo:wasm_thread@0.3.3:fc854d297f87f5cd",
+      "ref": "cargo:wasm_thread@0.3.3:c19b7c6f923b580a",
       "dependsOn": [
-        "cargo:futures@0.3.32:c19b7c6f923b580a",
+        "cargo:futures@0.3.34:c19b7c6f923b580a",
         "cargo:js-sys@0.3.102:c19b7c6f923b580a",
         "cargo:wasm-bindgen@0.2.125:c19b7c6f923b580a",
         "cargo:web-sys@0.3.102:c19b7c6f923b580a"
@@ -48462,6 +48901,12 @@
       ]
     },
     {
+      "ref": "cargo:windows-sys@0.48.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:windows-targets@0.48.5:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:windows-sys@0.52.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:windows-targets@0.52.6:c19b7c6f923b580a"
@@ -48483,6 +48928,18 @@
       "ref": "cargo:windows-sys@0.61.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:windows-link@0.2.1:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:windows-targets@0.48.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:windows_aarch64_gnullvm@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_aarch64_msvc@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_i686_gnu@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_i686_msvc@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_x86_64_gnu@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_x86_64_gnullvm@0.48.5:c19b7c6f923b580a",
+        "cargo:windows_x86_64_msvc@0.48.5:c19b7c6f923b580a"
       ]
     },
     {
@@ -48564,6 +49021,10 @@
       ]
     },
     {
+      "ref": "cargo:windows_aarch64_gnullvm@0.48.5:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:windows_aarch64_gnullvm@0.52.6:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -48572,11 +49033,19 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:windows_aarch64_msvc@0.48.5:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:windows_aarch64_msvc@0.52.6:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
       "ref": "cargo:windows_aarch64_msvc@0.53.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:windows_i686_gnu@0.48.5:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -48596,11 +49065,19 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:windows_i686_msvc@0.48.5:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:windows_i686_msvc@0.52.6:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
       "ref": "cargo:windows_i686_msvc@0.53.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:windows_x86_64_gnu@0.48.5:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -48612,11 +49089,19 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:windows_x86_64_gnullvm@0.48.5:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:windows_x86_64_gnullvm@0.52.6:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
       "ref": "cargo:windows_x86_64_gnullvm@0.53.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
+      "ref": "cargo:windows_x86_64_msvc@0.48.5:c19b7c6f923b580a",
       "dependsOn": []
     },
     {
@@ -48751,13 +49236,13 @@
       ]
     },
     {
-      "ref": "cargo:xim-ctext@0.3.0:ef61c9718ec401eb",
+      "ref": "cargo:xim-ctext@0.3.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:encoding_rs@0.8.35:c19b7c6f923b580a"
       ]
     },
     {
-      "ref": "cargo:xim-parser@0.2.1:ef61c9718ec401eb",
+      "ref": "cargo:xim-parser@0.2.2:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a"
       ]
@@ -48877,9 +49362,9 @@
         "cargo:async-trait@0.1.89:c19b7c6f923b580a",
         "cargo:enumflags2@0.7.12:c19b7c6f923b580a",
         "cargo:event-listener@5.4.1:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-sink@0.3.32:c19b7c6f923b580a",
-        "cargo:futures-util@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-sink@0.3.34:c19b7c6f923b580a",
+        "cargo:futures-util@0.3.34:c19b7c6f923b580a",
         "cargo:hex@0.4.3:c19b7c6f923b580a",
         "cargo:nix@0.29.0:c19b7c6f923b580a",
         "cargo:ordered-stream@0.2.0:c19b7c6f923b580a",
@@ -48911,7 +49396,7 @@
         "cargo:blocking@1.6.2:c19b7c6f923b580a",
         "cargo:enumflags2@0.7.12:c19b7c6f923b580a",
         "cargo:event-listener@5.4.1:c19b7c6f923b580a",
-        "cargo:futures-core@0.3.32:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
         "cargo:futures-lite@2.6.1:c19b7c6f923b580a",
         "cargo:hex@0.4.3:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a",
@@ -48977,14 +49462,14 @@
       ]
     },
     {
-      "ref": "cargo:zed-font-kit@0.14.1-zed:22dd8bee4964c984",
+      "ref": "cargo:zed-font-kit@0.14.1-zed:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bitflags@2.13.0:c19b7c6f923b580a",
         "cargo:byteorder@1.5.0:c19b7c6f923b580a",
         "cargo:core-foundation@0.10.1:c19b7c6f923b580a",
         "cargo:core-graphics@0.24.0:c19b7c6f923b580a",
         "cargo:core-text@21.0.0:c19b7c6f923b580a",
-        "cargo:dirs@6.0.0:c19b7c6f923b580a",
+        "cargo:dirs@5.0.1:c19b7c6f923b580a",
         "cargo:dwrote@0.11.5:c19b7c6f923b580a",
         "cargo:float-ord@0.3.2:c19b7c6f923b580a",
         "cargo:freetype-sys@0.20.1:c19b7c6f923b580a",
@@ -48999,7 +49484,7 @@
       ]
     },
     {
-      "ref": "cargo:zed-scap@0.0.8-zed:7248204075bc570b",
+      "ref": "cargo:zed-scap@0.0.8-zed:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:cocoa@0.25.0:c19b7c6f923b580a",
@@ -49018,14 +49503,14 @@
       ]
     },
     {
-      "ref": "cargo:zed-xim@0.4.0-zed:ef61c9718ec401eb",
+      "ref": "cargo:zed-xim@0.4.0-zed:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:ahash@0.8.12:c19b7c6f923b580a",
         "cargo:hashbrown@0.14.5:c19b7c6f923b580a",
         "cargo:log@0.4.33:c19b7c6f923b580a",
         "cargo:x11rb@0.13.2:c19b7c6f923b580a",
-        "cargo:xim-ctext@0.3.0:ef61c9718ec401eb",
-        "cargo:xim-parser@0.2.1:ef61c9718ec401eb"
+        "cargo:xim-ctext@0.3.0:c19b7c6f923b580a",
+        "cargo:xim-parser@0.2.2:c19b7c6f923b580a"
       ]
     },
     {
@@ -49116,15 +49601,6 @@
       "dependsOn": []
     },
     {
-      "ref": "cargo:zlog@0.1.0:79e142a907c245ed",
-      "dependsOn": [
-        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
-        "cargo:chrono@0.4.45:c19b7c6f923b580a",
-        "cargo:collections@0.1.0:7d3dd2996f7d7d18",
-        "cargo:log@0.4.33:c19b7c6f923b580a"
-      ]
-    },
-    {
       "ref": "cargo:zmij@1.0.21:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -49146,19 +49622,6 @@
       "dependsOn": [
         "cargo:zstd-safe@7.2.4:c19b7c6f923b580a"
       ]
-    },
-    {
-      "ref": "cargo:ztracing@0.1.0:2ef71bbe95310c4b",
-      "dependsOn": [
-        "cargo:tracing-subscriber@0.3.23:c19b7c6f923b580a",
-        "cargo:tracing@0.1.44:c19b7c6f923b580a",
-        "cargo:zlog@0.1.0:79e142a907c245ed",
-        "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa"
-      ]
-    },
-    {
-      "ref": "cargo:ztracing_macro@0.1.0:3d0ef0a5a6381faa",
-      "dependsOn": []
     },
     {
       "ref": "cargo:zune-core@0.4.12:c19b7c6f923b580a",
@@ -49245,6 +49708,14 @@
         "cargo:syn@2.0.118:c19b7c6f923b580a",
         "cargo:winnow@1.0.3:c19b7c6f923b580a"
       ]
+    },
+    {
+      "ref": "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
+      "dependsOn": []
+    },
+    {
+      "ref": "font:vibex-desktop-lilex:8e69f85c04197d91",
+      "dependsOn": []
     },
     {
       "ref": "font:vibex-mobile-ibm-plex-sans:73c85a21223a7956",

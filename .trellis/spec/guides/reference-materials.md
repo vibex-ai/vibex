@@ -38,7 +38,7 @@ guide wins on signatures and error handling.
 | Backend capability traits | `crates/vibex-backend/src` |
 | Shared UI, tokens, shells | `crates/vibex-ui/src`, `crates/vibex-ui/theme/tokens.json` |
 | Desktop presentation | `apps/desktop/src` |
-| Native mobile client | `apps/mobile` and `vendor/zed` mobile platform crates |
+| Native mobile client | `apps/mobile` and the pinned `gpui-pre-mobile` platform crate |
 | Projections (timeline, preview, diff) | `crates/desktop-model/src` |
 | Git and managed worktrees | `crates/git/src`, [Quality Guidelines](../backend/quality-guidelines.md) |
 | Filesystem service | `crates/fs/src` |

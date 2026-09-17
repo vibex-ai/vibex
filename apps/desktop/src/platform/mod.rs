@@ -11,7 +11,25 @@ use std::{borrow::Cow, collections::BTreeSet};
 use gpui::App;
 use vibex_core::{VibexError, VibexResult};
 
+#[cfg(target_os = "linux")]
+pub mod bounded_text;
+
 pub const DESKTOP_UI_STATE_FILE: &str = "desktop-ui-state.json";
+
+/// The GPUI application entry point for the desktop shell.
+///
+/// Linux gets a platform wrapper that keeps the process font database bounded
+/// (see [`bounded_text`]); every other platform uses the stock one.
+pub fn application() -> gpui::Application {
+    #[cfg(target_os = "linux")]
+    {
+        gpui::Application::with_platform(bounded_text::platform())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        gpui_platform::application()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageUsage {

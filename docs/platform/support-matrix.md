@@ -12,8 +12,8 @@ platform-specific checks.
 | Linux desktop | Primary native development target and full local workbench | `pnpm dev:desktop`, `pnpm package:preview` | Release claims require package, input, and rollback evidence for the exact source and lockfile. |
 | macOS desktop | Native build target | `cargo check -p vibex-desktop --locked` | Packaging, signing, and physical UI claims require macOS evidence. |
 | Windows desktop | Native build target | `cargo check -p vibex-desktop --locked` | Packaging, signing, install, and physical UI claims require Windows evidence. |
-| Android | Native GPUI client using `gpui_android` and NativeActivity | `pnpm build:mobile:android` | Each rebuilt APK needs source-bound device or emulator validation before a release claim. |
-| iOS | Native GPUI client using `gpui_ios` and UIKit | `pnpm build:mobile:ios` on macOS | Simulator/device, signing, and distribution validation remain separate release evidence. |
+| Android | Native GPUI client using `gpui-pre-mobile` and NativeActivity | `pnpm build:mobile:android` | Each rebuilt APK needs source-bound device or emulator validation before a release claim. |
+| iOS | Native GPUI client using `gpui-pre-mobile` and UIKit | `pnpm build:mobile:ios` on macOS | Simulator/device, signing, and distribution validation remain separate release evidence. |
 | Relay server | Optional user-self-hosted encrypted transport | `pnpm smoke:relay:local` | Relay is transport only; deployment, TLS, NAT, and device proof are operator-owned. |
 
 Desktop is the only authoritative runtime. Mobile is a remote client through the

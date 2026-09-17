@@ -5,7 +5,12 @@
 extern "C" {
 #endif
 
-void vibex_mobile_main(void);
+// Registers the GPUI root-view callback; call before `gpui_ios_run_demo()`.
+void vibex_mobile_register_app(void);
+
+// Reports an app lifecycle transition: 1 for foreground, 0 for background.
+void vibex_mobile_set_lifecycle(int foreground);
+
 void vibex_ios_initialize_notifications(void);
 void vibex_mobile_notification_activated(
     const char *notification_id,

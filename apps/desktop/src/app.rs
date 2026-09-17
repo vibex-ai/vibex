@@ -155,7 +155,6 @@ use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
 use crate::directory_picker::{DirectoryBrowseTarget, DirectoryPickHandler, DirectoryPickerDialog};
-use crate::glass;
 use crate::gpui_ext::button_with_aria_label;
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
@@ -25785,20 +25784,6 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn set_glass_surfaces(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.ui_state.appearance.glass_surfaces = enabled;
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
-        self.queue_ui_state();
-        cx.notify();
-    }
-
-    fn set_glass_blur_radius(&mut self, radius: u16, window: &mut Window, cx: &mut Context<Self>) {
-        self.ui_state.appearance.glass_blur_radius = radius;
-        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
-        self.queue_ui_state();
-        cx.notify();
-    }
-
     fn set_sidebar_hierarchy_mode(&mut self, mode: SidebarHierarchyMode, cx: &mut Context<Self>) {
         self.ui_state.sidebar.hierarchy_mode = mode;
         self.queue_ui_state();
@@ -32073,7 +32058,7 @@ impl VibexWorkbench {
             .overflow_x_hidden()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .rounded(px(8.0))
-            .bg(glass::glass_tint(popover_color, cx))
+            .bg(popover_color)
             .text_color(popover_foreground)
             .shadow(vec![
                 gpui::BoxShadow::new(px(0.0), px(0.0), popover_foreground.opacity(0.10))
@@ -32141,22 +32126,17 @@ impl VibexWorkbench {
             ));
         let project_menu_content = if self.ui_state.appearance.reduced_motion {
             if project_menu_open {
-                glass::frosted(8.0, project_menu_panel).into_any_element()
+                project_menu_panel.into_any_element()
             } else {
                 project_menu_panel.opacity(0.0).into_any_element()
             }
         } else if project_menu_open {
-            // The close path fades out WITHOUT frost: a blur region cannot
-            // fade with the content, so it would linger over the workspace.
-            glass::frosted(
-                8.0,
-                Transition::new(NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION)
-                    .ease(motion::MENU_IN.curve.easing())
-                    .slide_y(px(-8.0), px(0.0))
-                    .fade(0.0, 1.0)
-                    .apply(project_menu_panel, "new-session-project-menu-open"),
-            )
-            .into_any_element()
+            Transition::new(NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION)
+                .ease(motion::MENU_IN.curve.easing())
+                .slide_y(px(-8.0), px(0.0))
+                .fade(0.0, 1.0)
+                .apply(project_menu_panel, "new-session-project-menu-open")
+                .into_any_element()
         } else {
             Transition::new(NEW_SESSION_PROJECT_MENU_TRANSITION_DURATION)
                 .ease(motion::MENU_IN.curve.easing())
@@ -32615,7 +32595,7 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .border_1()
             .border_color(border_color)
-            .bg(glass::glass_tint(popover_color, cx))
+            .bg(popover_color)
             .p_2()
             .text_color(popover_foreground)
             .shadow_lg()
@@ -32693,7 +32673,7 @@ impl VibexWorkbench {
                 cx.notify();
             }))
             .trigger(mode_trigger)
-            .child(glass::frosted(8.0, mode_panel))
+            .child(mode_panel)
             .into_any_element();
         let workspace_controls = v_flex().w_full().min_w_0().mt_2().gap(px(6.0)).child(
             h_flex()
@@ -50053,20 +50033,6 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_glass_surfaces(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self
-            .workbench
-            .update(cx, |this, cx| this.set_glass_surfaces(enabled, window, cx));
-        cx.notify();
-    }
-
-    fn set_glass_blur_radius(&mut self, radius: u16, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.workbench.update(cx, |this, cx| {
-            this.set_glass_blur_radius(radius, window, cx)
-        });
-        cx.notify();
-    }
-
     fn set_sidebar_hierarchy(&mut self, mode: SidebarHierarchyMode, cx: &mut Context<Self>) {
         let _ = self
             .workbench
@@ -51134,72 +51100,6 @@ impl FoundationSettings {
                 ),
             ]
             .into_iter()
-            // Windows' DirectX renderer cannot snapshot the framebuffer,
-            // so frosted glass has no effect there and the controls would
-            // be dead ends; keep them to platforms with backdrop blur.
-            .chain({
-                // Windows' DirectX renderer cannot snapshot the framebuffer,
-                // so frosted glass has no effect there and the controls would
-                // be dead ends; keep them to platforms with backdrop blur.
-                if glass::platform_supports_backdrop_blur() {
-                    vec![
-                        setting_row(
-                            locale::text("Frosted glass", "磨砂玻璃", "磨砂玻璃"),
-                            locale::text(
-                                "Blur the content behind dialogs and floating menus.",
-                                "让对话框和浮出菜单背后的内容呈现模糊玻璃效果。",
-                                "讓對話框和浮出選單背後的內容呈現模糊玻璃效果。",
-                            ),
-                            Switch::new("glass-surfaces")
-                                .small()
-                                .checked(appearance.glass_surfaces)
-                                .on_click(cx.listener(|this, enabled, window, cx| {
-                                    this.set_glass_surfaces(*enabled, window, cx)
-                                })),
-                            stacked,
-                            cx,
-                        ),
-                        setting_row(
-                            locale::text("Glass blur strength", "玻璃模糊强度", "玻璃模糊強度"),
-                            locale::text(
-                                "Blur radius for frosted glass surfaces.",
-                                "磨砂玻璃表面的模糊半径。",
-                                "磨砂玻璃表面的模糊半徑。",
-                            ),
-                            settings_number_stepper(
-                                "glass-blur-radius",
-                                appearance.glass_blur_radius,
-                                Some("px"),
-                                4,
-                                64,
-                                cx.listener(|this, _, window, cx| {
-                                    let current = this.appearance(cx).glass_blur_radius;
-                                    this.set_glass_blur_radius(
-                                        current.saturating_sub(4).max(4),
-                                        window,
-                                        cx,
-                                    )
-                                }),
-                                cx.listener(|this, _, window, cx| {
-                                    let current = this.appearance(cx).glass_blur_radius;
-                                    this.set_glass_blur_radius(
-                                        current.saturating_add(4).min(64),
-                                        window,
-                                        cx,
-                                    )
-                                }),
-                                locale::text("Decrease blur", "减小模糊", "減小模糊"),
-                                locale::text("Increase blur", "增大模糊", "增大模糊"),
-                                cx,
-                            ),
-                            stacked,
-                            cx,
-                        ),
-                    ]
-                } else {
-                    Vec::new()
-                }
-            })
             .collect(),
             cx,
         )

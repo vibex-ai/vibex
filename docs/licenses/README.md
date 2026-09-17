@@ -19,7 +19,7 @@ The committed outputs are:
   license, and evidence inventory.
 
 The two Zed packages whose manifests omit `license` are not silently accepted. Their
-Apache-2.0 classification is tied to the reviewed `vendor/zed` submodule revision
+Apache-2.0 classification is tied to the published `gpui-pre-*` release
 and the SHA-256 of the package-local `LICENSE-APACHE` file. The
 gpui-component Lucide icon bundle is audited from the locked upstream Cargo package
 and tied to a file count and aggregate tree hash. The reused Vibex application/tray

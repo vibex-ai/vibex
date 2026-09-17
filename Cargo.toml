@@ -19,6 +19,7 @@ members = [
   "crates/db",
   "crates/fs",
   "crates/git",
+  "crates/gpui-tokio",
   "crates/relay",
   "crates/remote",
   "crates/terminal",
@@ -28,7 +29,6 @@ members = [
   "crates/vibex-ui",
   "crates/vibex-terminal-ui",
 ]
-exclude = ["vendor/zed"]
 resolver = "3"
 
 [workspace.package]
@@ -39,11 +39,13 @@ repository = "https://github.com/vibex-ai/vibex"
 
 [workspace.dependencies]
 alacritty_terminal = "0.26"
+anyhow = "1"
 async-trait = "0.1"
 command-group = { version = "5.0.1", features = ["with-tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = { version = "1", features = ["serde"] }
+smallvec = "1"
 sha2 = "0.10"
 sys-locale = "0.3.2"
 sysinfo = "0.37"
@@ -76,9 +78,9 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
-gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
-gpui_platform = { package = "gpui-pre-platform", path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
-gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
+gpui = { package = "gpui-pre", version = "=0.3.5" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
 gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
 gpui-fps = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
 gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "fb26e617da3add2ce2ac92a2ccc1a64bc8343135" }
@@ -112,15 +114,6 @@ webpki-root-certs = "1"
 ropey = "=2.0.0-beta.1"
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "precomputed-tables", "static_secrets", "zeroize"] }
 zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-
-[patch.crates-io]
-# The gpui-kit family is pinned to gpui-kit main; redirect the whole gpui-pre-*
-# family it consumes to the vendored vibex-ai/zed fork so the tree has ONE gpui.
-# The fork publishes this family as gpui-pre 0.3.5 (upstream zed@d89e9c2).
-gpui-pre = { path = "vendor/zed/crates/gpui" }
-gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
-gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
-gpui-pre-platform = { path = "vendor/zed/crates/gpui_platform" }
 
 [profile.dev]
 incremental = true

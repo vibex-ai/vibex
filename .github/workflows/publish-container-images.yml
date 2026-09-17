@@ -102,10 +102,6 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # The workspace patches gpui-pre to the vendor/zed submodule, so the
-          # build context is incomplete without it.
-          submodules: recursive
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:

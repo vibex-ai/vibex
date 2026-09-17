@@ -37,9 +37,9 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "apps/mobile/ios/Vibex/QRScanner.swift",
     "apps/mobile/ios/Headers/vibex_mobile.h",
     "apps/mobile/ios/Headers/module.modulemap",
-    "vendor/zed/crates/gpui_android/src/ime.rs",
-    "vendor/zed/crates/gpui_android/src/platform.rs",
-    "vendor/zed/crates/gpui_android/src/window.rs"
+    "apps/mobile/src/platform.rs",
+    "apps/mobile/src/scroll_capture.rs",
+    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java"
   ]) {
     assert(exists(path), `native_mobile_file_missing:${path}`);
   }
@@ -53,16 +53,14 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   const storage = read("apps/mobile/src/storage.rs");
   const remoteManifest = read("crates/vibex-remote-client/Cargo.toml");
   const remoteTransport = read("crates/vibex-remote-client/src/transport.rs");
-  const gpuiWindow = read("vendor/zed/crates/gpui/src/window.rs");
+  const platform = read("apps/mobile/src/platform.rs");
   const android = read("apps/mobile/android/app/src/main/AndroidManifest.xml");
   const androidSettings = read("apps/mobile/android/settings.gradle");
   const androidBuild = read("apps/mobile/android/app/build.gradle");
   const androidActivity = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java");
   const androidScanner = read("apps/mobile/android/app/src/main/java/ai/vibex/mobile/PairingQrScannerActivity.java");
   const androidStyles = read("apps/mobile/android/app/src/main/res/values/styles.xml");
-  const androidIme = read("vendor/zed/crates/gpui_android/src/ime.rs");
-  const androidPlatform = read("vendor/zed/crates/gpui_android/src/platform.rs");
-  const androidWindow = read("vendor/zed/crates/gpui_android/src/window.rs");
+  const gpuiMobileActivity = read("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java");
   const iosMain = read("apps/mobile/ios/Vibex/main.m");
   const iosProject = read("apps/mobile/ios/project.yml");
   const iosScanner = read("apps/mobile/ios/Vibex/QRScanner.swift");
@@ -72,7 +70,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(workspace.includes('"apps/mobile"'), "native_mobile_workspace_member_missing");
   assert(!workspace.includes('"apps/mobile-wasm"'), "legacy_mobile_workspace_member_present");
   assert(manifest.includes('crate-type = ["cdylib", "staticlib", "rlib"]'), "native_mobile_crate_types_invalid");
-  assert(manifest.includes('../../vendor/zed/crates/gpui_android'), "vibex_zed_android_backend_missing");
+  assert(manifest.includes('gpui-mobile = { package = "gpui-pre-mobile"'), "mobile_gpui_pre_mobile_dependency_missing");
+  assert(manifest.includes("longbridge/gpui-mobile"), "mobile_gpui_pre_mobile_source_missing");
+  assert(manifest.includes('rev = "4e4668d316325b04c9c051e7d0609f876eb5b1fe"'), "mobile_gpui_pre_mobile_revision_missing");
+  assert(!manifest.includes("vendor/zed"), "mobile_vendor_zed_dependency_present");
   assert(manifest.includes('rustls-platform-verifier = "0.7"'), "android_tls_platform_verifier_dependency_missing");
   assert(workspace.includes('webpki-root-certs = "1"'), "android_webpki_root_workspace_dependency_missing");
   assert(remoteManifest.includes("webpki-root-certs.workspace = true"), "android_webpki_root_dependency_missing");
@@ -96,19 +97,23 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     !remoteTransport.includes("danger_accept_invalid_certs"),
     "android_remote_tls_verification_disabled"
   );
-  assert(entry.includes("gpui_platform::android_init(android_app)"), "android_gpui_init_missing");
+  assert(
+    entry.includes("gpui_mobile::android::jni::init_platform(&android_app)"),
+    "android_gpui_platform_init_missing"
+  );
+  assert(platform.includes("gpui_mobile::android::init_logger()"), "android_gpui_logger_missing");
   assert(entry.includes("rustls_platform_verifier::android::init_with_env"), "android_tls_platform_verifier_init_missing");
   assert(entry.includes('"getApplicationContext"'), "android_tls_application_context_missing");
   assert(
-    entry.indexOf("initialize_android_tls(&android_app)") < entry.indexOf("gpui_platform::android_init(android_app)"),
+    entry.indexOf("initialize_android_tls(&android_app)") < entry.indexOf("Application::with_platform"),
     "android_tls_platform_verifier_init_order_invalid"
   );
   assert(entry.includes("scanner::initialize_android(&android_app)"), "android_qr_scanner_init_missing");
   assert(
-    entry.includes("gpui_platform::application()") ||
-      entry.includes("gpui::Application::with_platform(platform)"),
+    entry.includes("gpui::Application::with_platform(platform)"),
     "native_gpui_application_missing"
   );
+  assert(entry.includes("platform::current_platform(false)"), "native_mobile_platform_facade_missing");
   assert(entry.includes('target_os = "ios"'), "ios_rust_entry_missing");
   assert(entry.includes("assets::load_fonts(cx)"), "native_mobile_font_loading_missing");
   // Text entry used to be a hand-rolled field that focused itself and asked for
@@ -118,19 +123,28 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // is not quietly lost along with the field that used to provide it.
   assert(app.includes("Textarea::new(&self.composer_input)"), "native_composer_kit_input_missing");
   assert(entry.includes("gpui_component::init(cx)"), "native_component_init_missing");
-  assert(gpuiWindow.includes("show_soft_keyboard"), "native_text_input_keyboard_missing");
+  assert(platform.includes("gpui_mobile::show_keyboard()"), "native_text_input_keyboard_missing");
+  assert(platform.includes("gpui_mobile::hide_keyboard()"), "native_text_input_keyboard_hide_missing");
 
   assert(android.includes('android:name=".GpuiNativeActivity"'), "android_gpui_activity_missing");
   assert(android.includes('android:value="vibex_mobile"'), "android_native_library_name_invalid");
   assert(android.includes('android:windowSoftInputMode="adjustResize"'), "android_keyboard_resize_missing");
   assert(!android.includes('android:hasCode="false"'), "android_java_host_disabled");
   assert(!android.includes("WebView"), "android_webview_host_present");
-  assert(androidActivity.includes("extends NativeActivity"), "android_native_activity_base_missing");
+  assert(
+    androidActivity.includes("extends dev.gpui.mobile.GpuiInputActivity"),
+    "android_gpui_ime_activity_base_missing"
+  );
   assert(androidActivity.includes('System.loadLibrary("vibex_mobile")'), "android_gpui_native_library_classloader_load_missing");
-  assert(androidActivity.includes("extends EditText"), "android_ime_editor_missing");
-  assert(androidActivity.includes("showGpuiKeyboard"), "android_ime_show_bridge_missing");
-  assert(androidActivity.includes("nativeReplaceText"), "android_ime_replace_callback_missing");
-  assert(androidActivity.includes("nativeSetSelection"), "android_ime_selection_callback_missing");
+  assert(gpuiMobileActivity.includes("extends EditText"), "android_ime_editor_missing");
+  assert(gpuiMobileActivity.includes("public void gpuiShowKeyboard"), "android_ime_show_bridge_missing");
+  assert(gpuiMobileActivity.includes("public void gpuiHideKeyboard"), "android_ime_hide_bridge_missing");
+  assert(gpuiMobileActivity.includes("gpuiResetComposition"), "android_ime_reset_bridge_missing");
+  assert(gpuiMobileActivity.includes("InputConnectionWrapper"), "android_ime_connection_bridge_missing");
+  assert(gpuiMobileActivity.includes("private static native void nativeIme"), "android_ime_jni_callback_missing");
+  assert(androidActivity.includes("nativeOnAppLifecycle"), "android_lifecycle_bridge_missing");
+  assert(androidActivity.includes("protected void onResume()"), "android_lifecycle_resume_missing");
+  assert(androidActivity.includes("protected void onPause()"), "android_lifecycle_pause_missing");
   assert(androidActivity.includes("launchPairingQrScanner"), "android_qr_scanner_launch_bridge_missing");
   assert(android.includes("android.permission.CAMERA"), "android_camera_permission_missing");
   assert(android.includes("PairingQrScannerActivity"), "android_qr_scanner_activity_missing");
@@ -155,16 +169,20 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     androidBuild.includes("implementation 'rustls:rustls-platform-verifier:latest.release'"),
     "android_tls_verifier_aar_dependency_missing"
   );
-  assert(androidIme.includes("VecDeque<ImeEvent>"), "android_ime_event_queue_missing");
-  assert(androidIme.includes("nativeReplaceText"), "android_ime_jni_replace_missing");
-  assert(androidIme.includes("nativeSetSelection"), "android_ime_jni_selection_missing");
-  assert(androidWindow.includes("update_java_editor"), "android_ime_editor_sync_missing");
-  assert(androidWindow.includes("apply_pending_ime_events"), "android_ime_event_drain_missing");
-  assert(androidPlatform.includes("Mutex<Option<AndroidApp>>"), "android_reentrant_activity_handle_missing");
-  assert(androidPlatform.includes("clear_events()"), "android_stale_ime_event_cleanup_missing");
+  assert(entry.includes("Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle"), "android_lifecycle_jni_export_missing");
 
-  assert(iosMain.includes("vibex_mobile_main();"), "ios_rust_entry_call_missing");
-  assert(!iosMain.includes("UIApplicationMain"), "ios_host_double_enters_ui_application");
+  assert(iosMain.includes("vibex_mobile_register_app();"), "ios_rust_entry_call_missing");
+  assert(iosMain.includes("    gpui_ios_run_demo();"), "ios_gpui_run_loop_missing");
+  assert(iosMain.includes("gpui_ios_get_window()"), "ios_gpui_window_lookup_missing");
+  assert(iosMain.includes("gpui_ios_request_frame"), "ios_gpui_frame_driver_missing");
+  assert(iosMain.includes("gpui_ios_set_frame_waker"), "ios_gpui_frame_waker_missing");
+  assert(iosMain.includes("vibex_mobile_set_lifecycle"), "ios_lifecycle_bridge_missing");
+  assert(
+    iosMain.includes("return UIApplicationMain(argc, argv"),
+    "ios_host_must_enter_ui_application"
+  );
+  assert(entry.includes("vibex_mobile_register_app"), "ios_register_app_export_missing");
+  assert(entry.includes("vibex_mobile_set_lifecycle"), "ios_lifecycle_export_missing");
   assert(iosProject.includes("VibexFFI.xcframework"), "ios_xcframework_missing");
   assert(!iosProject.includes("HEADER_SEARCH_PATHS"), "ios_header_search_root_exposes_module_map");
   for (const iosSource of [iosMain, read("apps/mobile/ios/Vibex/LanDiscovery.m"), read("apps/mobile/ios/Vibex/Notifications.m")]) {
@@ -204,7 +222,8 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     "DRAWER_VERTICAL_CANCEL_RATIO",
     // Touch pans reach the app as scroll events, so the drawer swipe must ride the
     // platform touch stream; mouse-move listeners only ever describe a tap.
-    "capture_scroll_wheel(cx.listener(Self::drawer_pan))",
+    "crate::scroll_capture::capture_scroll_wheel(",
+    "cx.listener(Self::drawer_pan)",
     "TouchPhase::Started"
   ]) {
     assert(app.includes(marker), `native_agent_gui_contract_missing:${marker}`);
@@ -213,8 +232,10 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   assert(pairing.includes('url.scheme() != "vibex"'), "mobile_pairing_entry_validation_missing");
   assert(pairing.includes('"/self_hosted_relay"'), "mobile_pairing_transport_selection_missing");
   assert(storage.includes("reject_invalid"), "invalid_mobile_credential_cleanup_missing");
-  assert(gpuiWindow.includes("pub fn insets(&self) -> WindowInsets"), "gpui_mobile_insets_api_missing");
-  assert(gpuiWindow.includes("on_insets_changed"), "gpui_mobile_insets_refresh_missing");
+  assert(platform.includes("pub fn insets(window: &Window) -> WindowInsets"), "gpui_mobile_insets_api_missing");
+  assert(platform.includes("safe_area_insets"), "gpui_mobile_safe_area_missing");
+  assert(platform.includes("keyboard_height"), "gpui_mobile_keyboard_height_missing");
+  assert(platform.includes("impl WindowInsetsExt for Window"), "gpui_mobile_insets_trait_missing");
   for (const marker of [
     "claim_pairing_offer",
     "claim_pairing_offer_via_relay",
@@ -241,7 +262,8 @@ function runSelfTest() {
     ["apps/mobile/src/storage.rs", source("apps/mobile/src/storage.rs")],
     ["crates/vibex-remote-client/Cargo.toml", source("crates/vibex-remote-client/Cargo.toml")],
     ["crates/vibex-remote-client/src/transport.rs", source("crates/vibex-remote-client/src/transport.rs")],
-    ["vendor/zed/crates/gpui/src/window.rs", source("vendor/zed/crates/gpui/src/window.rs")],
+    ["apps/mobile/src/platform.rs", source("apps/mobile/src/platform.rs")],
+    ["apps/mobile/src/scroll_capture.rs", source("apps/mobile/src/scroll_capture.rs")],
     ["apps/mobile/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf", "font"],
     ["apps/mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc", "font"],
     ["apps/mobile/android/app/src/main/AndroidManifest.xml", source("apps/mobile/android/app/src/main/AndroidManifest.xml")],
@@ -257,9 +279,7 @@ function runSelfTest() {
     ["apps/mobile/ios/Vibex/QRScanner.swift", source("apps/mobile/ios/Vibex/QRScanner.swift")],
     ["apps/mobile/ios/Headers/vibex_mobile.h", source("apps/mobile/ios/Headers/vibex_mobile.h")],
     ["apps/mobile/ios/Headers/module.modulemap", source("apps/mobile/ios/Headers/module.modulemap")],
-    ["vendor/zed/crates/gpui_android/src/ime.rs", source("vendor/zed/crates/gpui_android/src/ime.rs")],
-    ["vendor/zed/crates/gpui_android/src/platform.rs", source("vendor/zed/crates/gpui_android/src/platform.rs")],
-    ["vendor/zed/crates/gpui_android/src/window.rs", source("vendor/zed/crates/gpui_android/src/window.rs")]
+    ["apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java", source("apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java")]
   ]);
 
   function expectRejected(path, from, to, code) {
@@ -290,9 +310,33 @@ function runSelfTest() {
   );
   expectRejected(
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",
-    "extends NativeActivity",
-    "extends Activity",
+    "extends dev.gpui.mobile.GpuiInputActivity",
+    "extends android.app.Activity",
     "native_mobile_checker_self_test_accepted_non_native_activity_host"
+  );
+  expectRejected(
+    "apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java",
+    "private static native void nativeIme",
+    "private static native void nativeMissing",
+    "native_mobile_checker_self_test_accepted_missing_ime_bridge"
+  );
+  expectRejected(
+    "apps/mobile/Cargo.toml",
+    'gpui-mobile = { package = "gpui-pre-mobile"',
+    'gpui-mobile = { package = "gpui-pre-missing"',
+    "native_mobile_checker_self_test_accepted_missing_gpui_mobile_dependency"
+  );
+  expectRejected(
+    "apps/mobile/src/lib.rs",
+    "Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle",
+    "Java_ai_vibex_mobile_GpuiNativeActivity_nativeMissingLifecycle",
+    "native_mobile_checker_self_test_accepted_missing_android_lifecycle_bridge"
+  );
+  expectRejected(
+    "apps/mobile/ios/Vibex/main.m",
+    "    vibex_mobile_register_app();\n    gpui_ios_run_demo();",
+    "    vibex_mobile_register_app();\n    gpui_ios_missing_demo();",
+    "native_mobile_checker_self_test_accepted_missing_ios_run_loop"
   );
   expectRejected(
     "apps/mobile/android/app/src/main/java/ai/vibex/mobile/GpuiNativeActivity.java",

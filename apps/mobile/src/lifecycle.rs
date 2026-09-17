@@ -12,6 +12,10 @@ pub enum MobileLifecycleEvent {
 
 static APP_BACKGROUNDED: AtomicBool = AtomicBool::new(false);
 
+/// Set once the host has installed its bridge, so a burst of phases from a
+/// recreated activity cannot be replayed through a stale transition.
+static TRACKER: OnceLock<Mutex<bool>> = OnceLock::new();
+
 fn event_sender() -> &'static Mutex<Option<UnboundedSender<MobileLifecycleEvent>>> {
     static SENDER: OnceLock<Mutex<Option<UnboundedSender<MobileLifecycleEvent>>>> = OnceLock::new();
     SENDER.get_or_init(|| Mutex::new(None))
@@ -53,13 +57,20 @@ fn transition(backgrounded: &mut bool, phase: AppLifecyclePhase) -> Option<Mobil
     }
 }
 
-pub fn attach(platform: &dyn gpui::Platform) {
-    let mut backgrounded = is_backgrounded();
-    platform.on_app_lifecycle(Box::new(move |phase| {
-        if let Some(event) = transition(&mut backgrounded, phase) {
-            enqueue(event);
-        }
-    }));
+/// Records a phase reported by the host and publishes the resulting event.
+///
+/// `gpui-pre-mobile` implements no `Platform::on_app_lifecycle`, so the mobile
+/// hosts are the source: the iOS host calls
+/// `vibex_mobile_set_lifecycle`, and the Android activity calls the
+/// `nativeOnAppLifecycle` JNI entry point.
+pub fn notify(phase: AppLifecyclePhase) {
+    let backgrounded = TRACKER.get_or_init(|| Mutex::new(is_backgrounded()));
+    let Ok(mut backgrounded) = backgrounded.lock() else {
+        return;
+    };
+    if let Some(event) = transition(&mut backgrounded, phase) {
+        enqueue(event);
+    }
 }
 
 pub fn subscribe() -> UnboundedReceiver<MobileLifecycleEvent> {

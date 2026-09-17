@@ -12,8 +12,10 @@ mod locale;
 mod markdown;
 mod notifications;
 mod pairing;
+mod platform;
 mod power;
 mod scanner;
+mod scroll_capture;
 mod selection_menu;
 mod sidebar;
 mod storage;
@@ -22,55 +24,55 @@ mod workbench;
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Bounds, WindowBackgroundAppearance, WindowBounds, WindowOptions};
+use gpui::{App, AppContext as _, WindowBackgroundAppearance, WindowOptions};
 
 pub use pairing::{MobileCredentialBundle, MobileRemoteRouteBundle};
 
-fn run(data_dir: PathBuf) {
-    let platform = gpui_platform::current_platform(false);
+/// Builds the shared state and opens the root window.
+///
+/// Runs inside the application callback on both targets: on Android once the
+/// native surface exists, on iOS once UIKit has finished launching. Everything
+/// before the window — Tokio, the kit, the bundled fonts — has to happen here
+/// because the GPUI context only exists at this point.
+fn open_root_window(data_dir: PathBuf, cx: &mut App) {
     let tokio_handle = background_connection::tokio_handle();
-    lifecycle::attach(platform.as_ref());
-    gpui::Application::with_platform(platform)
-        .with_assets(assets::MobileAssets)
-        .run(move |cx: &mut App| {
-            gpui_tokio::init_from_handle(cx, tokio_handle.clone());
-            // gpui-kit registers the global theme and the overlay state every
-            // component reads, so it has to be initialized before the first
-            // window opens.
-            gpui_component::init(cx);
-            app::bind_keys(cx);
-            // Resolve the native platform's preferred language before the
-            // first window is created so the initial pairing screen is never
-            // rendered with a stale English fallback.
-            let _ = locale::current();
-            assets::load_fonts(cx).expect("failed to load bundled mobile fonts");
-            // Point the kit theme at the shared vibex tokens before the first
-            // paint, so no component is ever drawn from the framework palette.
-            theme::apply_component_theme(None, cx);
+    gpui_tokio::init_from_handle(cx, tokio_handle.clone());
+    // gpui-kit registers the global theme and the overlay state every
+    // component reads, so it has to be initialized before the first
+    // window opens.
+    gpui_component::init(cx);
+    app::bind_keys(cx);
+    // Resolve the native platform's preferred language before the
+    // first window is created so the initial pairing screen is never
+    // rendered with a stale English fallback.
+    let _ = locale::current();
+    assets::load_fonts(cx).expect("failed to load bundled mobile fonts");
+    // Point the kit theme at the shared vibex tokens before the first
+    // paint, so no component is ever drawn from the framework palette.
+    theme::apply_component_theme(None, cx);
 
-            let bounds = Bounds::centered(None, gpui::size(gpui::px(390.0), gpui::px(844.0)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_background: WindowBackgroundAppearance::Opaque,
-                    focus: true,
-                    show: true,
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
-                    // `Root` owns the overlay layers (sheets, dialogs,
-                    // notifications, menus) and restores focus after one
-                    // closes. Phone windows are fullscreen, so no border.
-                    cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
-                },
-            )
-            .expect("failed to open Vibex mobile window");
-        });
+    cx.open_window(
+        WindowOptions {
+            // Mobile windows are fullscreen; the platform owns their geometry.
+            window_bounds: None,
+            window_background: WindowBackgroundAppearance::Opaque,
+            focus: true,
+            show: true,
+            ..Default::default()
+        },
+        move |window, cx| {
+            let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
+            // `Root` owns the overlay layers (sheets, dialogs,
+            // notifications, menus) and restores focus after one
+            // closes. Phone windows are fullscreen, so no border.
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+        },
+    )
+    .expect("failed to open Vibex mobile window");
 }
 
 #[cfg(target_os = "android")]
-fn initialize_android_tls(android_app: &gpui_android::AndroidApp) {
+fn initialize_android_tls(android_app: &android_activity::AndroidApp) {
     use jni::{JavaVM, objects::JObject, refs::Global, signature::RuntimeMethodSignature};
 
     let vm = unsafe { JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
@@ -94,28 +96,84 @@ fn initialize_android_tls(android_app: &gpui_android::AndroidApp) {
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub fn android_main(android_app: gpui_android::AndroidApp) {
+pub fn android_main(android_app: android_activity::AndroidApp) {
     let data_dir = android_app
         .internal_data_path()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    // Logging and the panic hook come first so every later failure is visible
+    // in logcat instead of vanishing with the native thread.
+    platform::install_diagnostics();
+    gpui_mobile::android::jni::init_platform(&android_app);
     initialize_android_tls(&android_app);
     background_connection::initialize_android(&android_app);
     discovery::initialize_android(&android_app);
     notifications::initialize_android(&android_app);
     power::initialize_android(&android_app);
     scanner::initialize_android(&android_app);
-    gpui_platform::android_init(android_app);
-    run(data_dir);
+
+    // `Application::run` blocks by driving the Android event loop, and defers
+    // the callback until the activity has a native surface.
+    let platform = platform::current_platform(false);
+    gpui::Application::with_platform(platform)
+        .with_assets(assets::MobileAssets)
+        .run(move |cx: &mut App| open_root_window(data_dir, cx));
 }
 
-/// Called by the tiny Objective-C host. `gpui_ios` enters UIApplicationMain.
+/// Reports an application lifecycle transition from the Android host.
+///
+/// Called from `GpuiNativeActivity.onResume` / `onPause`, which are the only
+/// places that see Android's process lifecycle. `gpui-pre-mobile` implements no
+/// `Platform::on_app_lifecycle`, so this bridge is what feeds
+/// [`background_connection`]'s suspend/resume handling.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLifecycle(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    foreground: jni::sys::jboolean,
+) {
+    let phase = if foreground {
+        gpui::AppLifecyclePhase::Active
+    } else {
+        gpui::AppLifecyclePhase::Background
+    };
+    platform::notify_lifecycle(phase);
+}
+
+/// Registers the iOS root-view callback.
+///
+/// The UIKit host calls this from `application:didFinishLaunchingWithOptions:`
+/// before `gpui_ios_run_demo()`, which invokes the callback once GPUI's run
+/// loop starts.
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)]
-pub extern "C" fn vibex_mobile_main() {
+pub extern "C" fn vibex_mobile_register_app() {
+    platform::install_diagnostics();
     let data_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Library/Application Support/Vibex");
-    run(data_dir);
+    gpui_mobile::ios::ffi::set_app_callback(Box::new(move |cx: &mut App| {
+        open_root_window(data_dir, cx);
+    }));
+}
+
+/// Reports an application lifecycle transition from the UIKit host.
+///
+/// `phase` is `1` when the app becomes foreground and `0` when it enters the
+/// background. `gpui-pre-mobile` has no `Platform::on_app_lifecycle`
+/// implementation, so the host bridge is the only source for these events.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn vibex_mobile_set_lifecycle(phase: i32) {
+    let phase = if phase == 0 {
+        gpui::AppLifecyclePhase::Background
+    } else {
+        gpui::AppLifecyclePhase::Active
+    };
+    platform::notify_lifecycle(phase);
 }
