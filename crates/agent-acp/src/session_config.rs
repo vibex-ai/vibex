@@ -1509,6 +1509,111 @@ pub(crate) fn runtime_features_from_options(
     }))
 }
 
+/// Category cursor-agent gives every model parameter that is not reasoning
+/// depth.
+const CURSOR_MODEL_PARAMETER_CATEGORY: &str = "model_config";
+
+/// Parameter ids cursor-agent can use for the reasoning-depth scale, in
+/// preference order. `thinking` is last because it is normally a boolean
+/// toggle; the value-vocabulary check keeps it out of the scale unless the
+/// model really exposes levels.
+const CURSOR_REASONING_PARAMETER_IDS: &[&str] = &[
+    "effort",
+    "reasoning",
+    CANONICAL_REASONING_EFFORT,
+    "thinking_level",
+    "thought_level",
+    "thinking",
+];
+
+/// The `thought_level` parameters cursor-agent publishes once the client
+/// advertises `_meta.parameterizedModelPicker`.
+fn is_thought_level_parameter(option: &ProviderSessionConfigOption) -> bool {
+    let category = option
+        .category
+        .as_deref()
+        .map(normalize_identifier)
+        .unwrap_or_default();
+    if category == "thought_level" {
+        return true;
+    }
+    matches!(
+        normalize_identifier(&option.id).as_str(),
+        "thinking"
+            | "reasoning"
+            | "effort"
+            | "thinking_level"
+            | "thought_level"
+            | CANONICAL_REASONING_EFFORT
+    )
+}
+
+/// Whether the option advertises real depth levels rather than a boolean
+/// on/off switch (`thinking`) or an unrelated parameter that merely shares a
+/// thought-level id.
+fn is_reasoning_effort_scale(option: &ProviderSessionConfigOption) -> bool {
+    option.values.iter().any(|value| {
+        REASONING_EFFORT_MODE_VALUES.contains(&normalize_identifier(&value.value).as_str())
+    })
+}
+
+/// Adapts cursor-agent's parameterized model picker to Vibex's canonical
+/// session config shape.
+///
+/// With `_meta.parameterizedModelPicker` the CLI stops freezing every
+/// parameter combination into one model id and instead publishes one config
+/// option per model parameter: reasoning parameters (`effort`, `reasoning`,
+/// `thinking`) in the `thought_level` category and everything else (`fast`,
+/// `context`, ...) in `model_config`. Vibex models reasoning depth as exactly
+/// one dimension, so this function:
+///
+/// - promotes the depth scale to the canonical `reasoning_effort` category so
+///   the planner can set it live (the raw option id still goes on the wire);
+/// - demotes every other thought-level parameter to a plain Session option,
+///   where a boolean `thinking` toggle belongs, instead of letting the
+///   structural filter swallow it.
+///
+/// The rewrite is a no-op for the legacy "variants" shape and for every other
+/// agent, so an older CLI that ignores the capability keeps working.
+pub(crate) fn normalize_parameterized_model_options(
+    agent_id: &AgentId,
+    options: &mut [ProviderSessionConfigOption],
+) {
+    if !crate::dialect::agent_supports_parameterized_model_picker(agent_id.as_str()) {
+        return;
+    }
+    let primary = CURSOR_REASONING_PARAMETER_IDS.iter().find_map(|id| {
+        options.iter().position(|option| {
+            normalize_identifier(&option.id) == *id
+                && is_thought_level_parameter(option)
+                && is_reasoning_effort_scale(option)
+        })
+    });
+    for (index, option) in options.iter_mut().enumerate() {
+        if !is_thought_level_parameter(option) {
+            continue;
+        }
+        option.category = Some(if Some(index) == primary {
+            CANONICAL_REASONING_EFFORT.to_string()
+        } else {
+            CURSOR_MODEL_PARAMETER_CATEGORY.to_string()
+        });
+    }
+}
+
+/// Model name behind a legacy cursor variant id.
+///
+/// Before the parameterized picker, cursor-agent identified a model by its
+/// frozen parameter combination (`claude-opus-5[thinking=true,context=300k]`).
+/// A binding persisted under that shape still pins the bracketed form, which
+/// the parameterized picker rejects, so the runtime collapses it to the model
+/// it named.
+pub(crate) fn legacy_variant_model_name(model_id: &str) -> Option<&str> {
+    let (name, parameters) = model_id.split_once('[')?;
+    let name = name.trim();
+    (!name.is_empty() && parameters.ends_with(']')).then_some(name)
+}
+
 fn is_structural_catalog_option(option: &ProviderSessionConfigOption, id: &str) -> bool {
     const STRUCTURAL_KEYS: [&str; 6] = [
         CANONICAL_MODEL,
@@ -1916,6 +2021,214 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn parameterized_cursor_options() -> Vec<ProviderSessionConfigOption> {
+        vec![
+            catalog_option(
+                "model",
+                Some("model"),
+                ProviderSessionConfigOptionKind::Select,
+                "claude-opus-5",
+                &[("claude-opus-5", "claude-opus-5")],
+            ),
+            catalog_option(
+                "mode",
+                Some("mode"),
+                ProviderSessionConfigOptionKind::Select,
+                "agent",
+                &[("agent", "Agent"), ("plan", "Plan")],
+            ),
+            catalog_option(
+                "thinking",
+                Some("thought_level"),
+                ProviderSessionConfigOptionKind::Select,
+                "true",
+                &[("false", "Off"), ("true", "On")],
+            ),
+            catalog_option(
+                "effort",
+                Some("thought_level"),
+                ProviderSessionConfigOptionKind::Select,
+                "high",
+                &[
+                    ("low", "Low"),
+                    ("medium", "Medium"),
+                    ("high", "High"),
+                    ("xhigh", "XHigh"),
+                ],
+            ),
+            catalog_option(
+                "context",
+                Some("model_config"),
+                ProviderSessionConfigOptionKind::Select,
+                "300k",
+                &[("200k", "200k"), ("300k", "300k")],
+            ),
+            catalog_option(
+                "fast",
+                Some("model_config"),
+                ProviderSessionConfigOptionKind::Select,
+                "false",
+                &[("false", "Off"), ("true", "On")],
+            ),
+        ]
+    }
+
+    fn cursor() -> AgentId {
+        AgentId::parse("cursor").unwrap()
+    }
+
+    #[test]
+    fn parameterized_cursor_options_promote_the_depth_scale_and_keep_the_rest() {
+        let mut options = parameterized_cursor_options();
+        normalize_parameterized_model_options(&cursor(), &mut options);
+
+        let by_id = |id: &str| options.iter().find(|option| option.id == id).unwrap();
+        assert_eq!(
+            by_id("effort").category.as_deref(),
+            Some(CANONICAL_REASONING_EFFORT)
+        );
+        for id in ["thinking", "context", "fast"] {
+            assert_eq!(
+                by_id(id).category.as_deref(),
+                Some(CURSOR_MODEL_PARAMETER_CATEGORY),
+                "{id} must stay a Session option"
+            );
+        }
+        assert_eq!(by_id("model").category.as_deref(), Some("model"));
+
+        let planner = SessionConfigPlanner::new(
+            "adapter=cursor@1",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            options.clone(),
+        );
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        let depth = planner.option_for_key(&reasoning_key).unwrap().unwrap();
+        assert_eq!(depth.id, "effort");
+        assert_eq!(
+            planner
+                .option_for_key(&CanonicalSessionConfigKey::parse("thinking").unwrap())
+                .unwrap()
+                .unwrap()
+                .id,
+            "thinking"
+        );
+
+        let features = runtime_features_from_options(&options);
+        let feature_ids = features
+            .iter()
+            .map(|feature| feature.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(feature_ids, vec!["context", "fast", "thinking"]);
+
+        let efforts = crate::runtime::extract_probe_reasoning_efforts(
+            &serde_json::json!({ "configOptions": options }),
+        );
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"],
+            "the boolean thinking toggle must not leak into the depth scale"
+        );
+    }
+
+    #[test]
+    fn parameterized_cursor_reasoning_parameter_becomes_the_depth_scale() {
+        let mut options = vec![
+            catalog_option(
+                "model",
+                Some("model"),
+                ProviderSessionConfigOptionKind::Select,
+                "gpt-5.6-sol",
+                &[("gpt-5.6-sol", "gpt-5.6-sol")],
+            ),
+            catalog_option(
+                "reasoning",
+                Some("thought_level"),
+                ProviderSessionConfigOptionKind::Select,
+                "medium",
+                &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
+            ),
+            catalog_option(
+                "fast",
+                Some("model_config"),
+                ProviderSessionConfigOptionKind::Select,
+                "false",
+                &[("false", "Off"), ("true", "On")],
+            ),
+        ];
+        normalize_parameterized_model_options(&cursor(), &mut options);
+
+        let planner = SessionConfigPlanner::new(
+            "adapter=cursor@1",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            options,
+        );
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        assert_eq!(
+            planner.option_for_key(&reasoning_key).unwrap().unwrap().id,
+            "reasoning"
+        );
+    }
+
+    #[test]
+    fn parameterized_cursor_boolean_thinking_stays_a_session_option() {
+        let mut options = vec![catalog_option(
+            "thinking",
+            Some("thought_level"),
+            ProviderSessionConfigOptionKind::Select,
+            "true",
+            &[("false", "Off"), ("true", "On")],
+        )];
+        normalize_parameterized_model_options(&cursor(), &mut options);
+        assert_eq!(
+            options[0].category.as_deref(),
+            Some(CURSOR_MODEL_PARAMETER_CATEGORY)
+        );
+
+        let planner = SessionConfigPlanner::new(
+            "adapter=cursor@1",
+            1,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            options.clone(),
+        );
+        let reasoning_key = CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap();
+        assert!(planner.option_for_key(&reasoning_key).unwrap().is_none());
+        assert_eq!(
+            runtime_features_from_options(&options)
+                .iter()
+                .map(|feature| feature.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thinking"]
+        );
+    }
+
+    #[test]
+    fn parameterized_option_normalization_leaves_other_agents_untouched() {
+        let original = parameterized_cursor_options();
+        let mut options = original.clone();
+        normalize_parameterized_model_options(&AgentId::parse("grok").unwrap(), &mut options);
+        assert_eq!(options, original);
+    }
+
+    #[test]
+    fn legacy_variant_model_names_collapse_to_the_bare_model() {
+        assert_eq!(
+            legacy_variant_model_name("claude-opus-5[thinking=true,context=300k]"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(legacy_variant_model_name("default[]"), Some("default"));
+        assert_eq!(legacy_variant_model_name("claude-opus-5"), None);
+        assert_eq!(legacy_variant_model_name("[]"), None);
+        assert_eq!(legacy_variant_model_name("claude-opus-5[broken"), None);
     }
 
     #[test]

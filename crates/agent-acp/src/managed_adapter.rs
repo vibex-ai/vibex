@@ -534,7 +534,7 @@ async fn probe_initialize(
             "jsonrpc": "2.0",
             "id": 1,
             "method": AcpOperation::Initialize.method(),
-            "params": build_initialize_params(false, false, false, false, false),
+            "params": build_initialize_params(false, false, false, false, false, false),
         });
         let line = serde_json::to_vec(&request).map_err(|error| {
             VibexError::validation(

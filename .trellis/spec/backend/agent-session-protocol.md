@@ -395,6 +395,34 @@ succeeded). Only `effort` is safe to treat as a built-in alias;
 `thinking_level`/`thought_level` stay alias-gated because some dialects
 advertise them as standalone option ids.
 
+### Cursor ACP compatibility note
+
+`cursor-agent acp` keeps its model picker in a legacy "variants" mode by
+default: one config option (`model`) whose values are frozen parameter
+combinations such as `claude-opus-5[thinking=true,context=300k,fast=false]`.
+Only when `initialize.clientCapabilities._meta.parameterizedModelPicker` is
+`true` does it publish one config option per model parameter instead — the
+reasoning parameters (`effort`, `reasoning`, `thinking`) with category
+`thought_level` and the rest (`fast`, `context`, ...) with category
+`model_config`. Cursor reads the reserved `_meta` key, not the plain `meta`
+extension key the rest of the initialize payload uses, and live sessions and
+runtime probes must advertise the same capability or the catalog would list a
+model shape the session cannot accept.
+
+Vibex keeps reasoning depth as exactly one canonical dimension, so the
+discovered option set is normalized for this dialect: the depth scale
+(`effort`/`reasoning`, selected by id preference plus an effort-vocabulary
+check on its values) is promoted to the canonical `reasoning_effort` category
+so the planner can set it live with the raw parameter id, while every other
+thought-level parameter is demoted to a plain Session option. A boolean
+`thinking` toggle therefore surfaces under Session options instead of being
+swallowed by the structural filter or leaking `true`/`false` into the depth
+scale. Because the picker switches model ids from variant strings to bare
+model names, a binding persisted under the old shape is collapsed to its model
+name during attachment rebuild — but only when live discovery proves the
+picker is parameterized, so an older CLI that ignores the capability keeps its
+bracketed ids resolvable.
+
 ## Scenario: Claude ACP Extension And Transcript Compensation
 
 ### 1. Scope / Trigger

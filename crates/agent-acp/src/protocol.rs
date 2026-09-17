@@ -23,7 +23,9 @@
 //!    not the spec's `_meta`). The stable
 //!    [`agent_client_protocol_schema::v1::ClientCapabilities`] surface cannot
 //!    represent them, so [`build_initialize_params`] serializes the typed base
-//!    and then splices these extension keys back in.
+//!    and then splices these extension keys back in. Agents whose dialect
+//!    advertises `parameterized_model_picker` additionally receive the
+//!    reserved `_meta.parameterizedModelPicker` capability.
 //! 2. `session/new.mcpServers` and `session/load.mcpServers` are serialized by
 //!    the runtime through the official
 //!    [`agent_client_protocol_schema::v1::McpServer`] types and spliced into
@@ -716,6 +718,7 @@ pub(crate) fn build_initialize_params(
     terminal_tools: bool,
     terminal_auth: bool,
     mcp_servers: bool,
+    parameterized_model_picker: bool,
 ) -> Value {
     let mut fs = FileSystemCapabilities::new();
     fs.read_text_file = read_text_file;
@@ -753,6 +756,15 @@ pub(crate) fn build_initialize_params(
                 "mcpServers": mcp_servers
             }),
         );
+        if parameterized_model_picker {
+            // Cursor reads the spec's reserved `_meta` (not the plain `meta`
+            // extension above) to decide whether each model parameter becomes
+            // its own config option instead of a frozen variant id.
+            capabilities.insert(
+                "_meta".to_string(),
+                json!({ "parameterizedModelPicker": true }),
+            );
+        }
     }
     params
 }
@@ -920,7 +932,7 @@ mod tests {
     // §25.1: standard request serialization matches the frozen wire shapes.
     #[test]
     fn typed_initialize_params_match_frozen_wire_shape() {
-        let params = build_initialize_params(true, true, false, true, true);
+        let params = build_initialize_params(true, true, false, true, true, false);
         assert_eq!(
             params,
             json!({
@@ -943,6 +955,23 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// Cursor reads the spec's reserved `_meta`, so the capability must not be
+    /// folded into the plain `meta` extension key above.
+    #[test]
+    fn parameterized_model_picker_is_advertised_through_the_reserved_meta_key() {
+        let capabilities =
+            &build_initialize_params(true, true, false, false, false, true)["clientCapabilities"];
+        assert_eq!(
+            capabilities["_meta"],
+            json!({ "parameterizedModelPicker": true })
+        );
+        assert_eq!(capabilities["meta"]["mcpServers"], json!(false));
+
+        let without =
+            &build_initialize_params(true, true, false, false, false, false)["clientCapabilities"];
+        assert!(without.get("_meta").is_none());
     }
 
     #[test]

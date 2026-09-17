@@ -21,6 +21,7 @@
 //! | `event_enricher` | `AcpRuntimeClient::effective_adapter_identity` |
 //! | `host_request_dialects` | inbound request dispatch |
 //! | `restore_policy` | `AcpRuntimeClient::restore_policy_for_agent` |
+//! | `parameterized_model_picker` | `initialize` client capabilities |
 //!
 //! A descriptor always wins over a profile: managed adapters are exact-version
 //! contracts, profiles are best-effort family knowledge.
@@ -138,6 +139,12 @@ pub struct AgentDialectProfile {
     pub event_enricher: AgentEventEnricherKind,
     pub host_request_dialects: &'static [AgentHostRequestDialect],
     pub restore_policy: RestorePolicy,
+    /// The agent's ACP server publishes every model parameter (`fast`,
+    /// `thinking`, `effort`, `context`, ...) as its own config option once the
+    /// client advertises `clientCapabilities._meta.parameterizedModelPicker`.
+    /// Without the capability the agent collapses each model into a single
+    /// pre-parameterized variant id.
+    pub parameterized_model_picker: bool,
     /// Why this agent deviates from the generic path. Recorded for
     /// diagnostics and to keep the table auditable.
     pub rationale: &'static str,
@@ -155,6 +162,7 @@ impl AgentDialectProfile {
             event_enricher: AgentEventEnricherKind::Passthrough,
             host_request_dialects: &[],
             restore_policy: RestorePolicy::ResumeThenLoadThenNew,
+            parameterized_model_picker: false,
             rationale: "generic ACP behavior only; capability comes from runtime probing",
         }
     }
@@ -195,6 +203,11 @@ impl AgentDialectProfile {
         dialects: &'static [AgentHostRequestDialect],
     ) -> Self {
         self.host_request_dialects = dialects;
+        self
+    }
+
+    const fn with_parameterized_model_picker(mut self) -> Self {
+        self.parameterized_model_picker = true;
         self
     }
 
@@ -252,11 +265,19 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
         ]),
     // cursor-agent reads `~/.cursor/mcp.json`, shared with the IDE. A stale
     // `CURSOR_API_KEY` makes the CLI validate that key instead of falling back
-    // to the browser login credential.
+    // to the browser login credential. Its ACP server also keeps the model
+    // picker in a legacy "variants" mode (one frozen id per parameter
+    // combination, e.g. `claude-opus-5[thinking=true,context=300k]`) unless the
+    // client opts into `_meta.parameterizedModelPicker`, which is the only
+    // shape that exposes `fast` and the other per-model parameters.
     AgentDialectProfile::generic("cursor")
-        .profiled("native MCP config shared with the IDE; API-key env beats the browser login")
+        .profiled(
+            "native MCP config shared with the IDE; API-key env beats the browser login; \
+             parameterized model picker exposes per-model parameters",
+        )
         .with_credential_scrub(&["CURSOR_API_KEY", "CURSOR_API_BASE_URL"])
-        .with_mcp_delivery(McpWireDelivery::NativeConfig),
+        .with_mcp_delivery(McpWireDelivery::NativeConfig)
+        .with_parameterized_model_picker(),
     // pi-acp accepts `mcpServers` and drops it: it never forwards MCP to the
     // inner `pi --mode rpc` process, and pi has no native MCP either.
     // Workspace trust gates config/skill loading only, never execution.
@@ -327,6 +348,13 @@ pub fn agent_dialect_profiles() -> &'static [AgentDialectProfile] {
     AGENT_DIALECT_PROFILES
 }
 
+/// Whether `initialize` must advertise the parameterized model picker for this
+/// agent. The capability changes the config-option shape the agent returns, so
+/// live sessions and probes must agree on it.
+pub fn agent_supports_parameterized_model_picker(agent_id: &str) -> bool {
+    agent_dialect_profile(agent_id).parameterized_model_picker
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +392,17 @@ mod tests {
                 known.contains(profile.agent_id),
                 "{} has a dialect profile but is not a selectable agent",
                 profile.agent_id
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_parameterized_picker_agents_advertise_the_capability() {
+        assert!(agent_supports_parameterized_model_picker("cursor"));
+        for agent_id in ["claude", "codex", "grok", "gemini", "not-a-real-agent"] {
+            assert!(
+                !agent_supports_parameterized_model_picker(agent_id),
+                "{agent_id} must not receive the Cursor picker capability"
             );
         }
     }

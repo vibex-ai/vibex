@@ -544,7 +544,7 @@ impl AcpRuntimeClient {
             let initialize = process
                 .request(
                     AcpOperation::Initialize.method(),
-                    build_initialize_params(false, false, false, false, false),
+                    build_initialize_params(false, false, false, false, false, false),
                     timeout_duration.min(ACP_PROBE_TIMEOUT),
                 )
                 .await?;

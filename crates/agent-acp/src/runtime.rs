@@ -144,7 +144,8 @@ use crate::session_attachment_registry::{
 };
 use crate::session_config::{
     CanonicalSessionConfigKey, SessionConfigFieldKind, SessionConfigFieldRequest,
-    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner, normalize_identifier,
+    SessionConfigOperationEvidence, SessionConfigPlan, SessionConfigPlanner,
+    legacy_variant_model_name, normalize_identifier, normalize_parameterized_model_options,
     validate_effort_value, validate_mode_value, validate_model_value,
 };
 use crate::session_restore::{
@@ -560,6 +561,7 @@ fn build_initialize_params(
     terminal_tools: bool,
     terminal_auth: bool,
     mcp_servers: bool,
+    parameterized_model_picker: bool,
 ) -> Value {
     // Typed construction lives in protocol.rs (P2-01); the wire shape is
     // frozen and covered by protocol.rs unit tests.
@@ -569,6 +571,28 @@ fn build_initialize_params(
         terminal_tools,
         terminal_auth,
         mcp_servers,
+        parameterized_model_picker,
+    )
+}
+
+/// Initialize params for one agent, including the dialect capabilities that
+/// change the config-option shape it returns. Live sessions and probes must
+/// agree, or the catalog would advertise a shape the session cannot accept.
+fn build_agent_initialize_params(
+    agent_id: &AgentId,
+    read_text_file: bool,
+    write_text_file: bool,
+    terminal_tools: bool,
+    terminal_auth: bool,
+    mcp_servers: bool,
+) -> Value {
+    build_initialize_params(
+        read_text_file,
+        write_text_file,
+        terminal_tools,
+        terminal_auth,
+        mcp_servers,
+        crate::dialect::agent_supports_parameterized_model_picker(agent_id.as_str()),
     )
 }
 
@@ -3880,8 +3904,9 @@ impl AcpSessionAttachment {
         if config_options_array(update).is_none() {
             return;
         }
-        let options = extract_config_options(update);
+        let mut options = extract_config_options(update);
         let process = self.process();
+        normalize_parameterized_model_options(&process.agent_id, &mut options);
         let profile_id = process.auth_source.provider_profile_id().cloned();
         let generation = self.activation_generation();
         let mut runtime_snapshot = None;
@@ -12498,7 +12523,8 @@ impl AcpRuntimeClient {
         let result = process
             .request(
                 AcpOperation::Initialize.method(),
-                build_initialize_params(
+                build_agent_initialize_params(
+                    &process.agent_id,
                     true,
                     true,
                     process.terminal_tools_enabled,
@@ -14559,6 +14585,34 @@ pub(crate) fn validate_restore_response(
     Ok(())
 }
 
+/// Collapses a persisted legacy cursor variant id (`claude-opus-5[...]`) to
+/// the bare model name the parameterized picker accepts.
+///
+/// Applied only once the live discovery proves the picker is parameterized
+/// (every discovered model is a bare name). An older CLI that ignores the
+/// capability keeps advertising bracketed ids, and rewriting those would make
+/// them unresolvable.
+fn collapse_legacy_parameterized_model_ids(
+    agent_id: &AgentId,
+    discovery: &ProviderSessionConfigState,
+    runtime_state: &mut SessionRuntimeConfigState,
+) {
+    if !crate::dialect::agent_supports_parameterized_model_picker(agent_id.as_str())
+        || discovery.models.is_empty()
+        || discovery
+            .models
+            .iter()
+            .any(|model| legacy_variant_model_name(&model.value).is_some())
+    {
+        return;
+    }
+    runtime_state.preferred_model = runtime_state.preferred_model.take().map(|model| {
+        legacy_variant_model_name(&model)
+            .map(ToString::to_string)
+            .unwrap_or(model)
+    });
+}
+
 fn apply_session_state_to_attachment(
     state: &mut AcpAttachmentShared,
     agent_id: &AgentId,
@@ -14794,6 +14848,7 @@ impl AcpRuntimeClient {
             runtime_state.preferred_mode = None;
             runtime_state.effective_mode = None;
         }
+        collapse_legacy_parameterized_model_ids(&process.agent_id, &discovery, &mut runtime_state);
 
         // A new generation starts from the values explicitly reported by the
         // Agent. Never carry an old effective value as if it were confirmed.
@@ -16583,7 +16638,14 @@ async fn launch_agent_auth_process(
     let initialize = match process
         .request(
             AcpOperation::Initialize.method(),
-            build_initialize_params(false, false, false, process.terminal_auth_enabled, false),
+            build_agent_initialize_params(
+                &process.agent_id,
+                false,
+                false,
+                false,
+                process.terminal_auth_enabled,
+                false,
+            ),
             ACP_PROBE_TIMEOUT,
         )
         .await
@@ -16768,7 +16830,7 @@ async fn probe_runtime_session_configs_with_config(
         let initialize = process
             .request(
                 AcpOperation::Initialize.method(),
-                build_initialize_params(false, false, false, false, false),
+                build_agent_initialize_params(agent_id, false, false, false, false, false),
                 ACP_PROBE_TIMEOUT,
             )
             .await?;
@@ -16909,7 +16971,7 @@ async fn probe_copilot_runtime_session_once(
         let initialize = process
             .request(
                 AcpOperation::Initialize.method(),
-                build_initialize_params(false, false, false, false, false),
+                build_initialize_params(false, false, false, false, false, false),
                 ACP_PROBE_TIMEOUT,
             )
             .await?;
@@ -17060,11 +17122,25 @@ async fn runtime_session_probe_from_response(
             .map(|response| extract_config_values(mode_candidates(response)))
             .unwrap_or_else(|| extract_config_values(mode_candidates(session)))
     };
-    let mut reasoning_efforts = model_response_ref
+    let mut options = model_response_ref
         .filter(|response| response_has_config_options(response))
         .or(model_config_update.as_ref())
-        .map(extract_probe_reasoning_efforts)
-        .unwrap_or_else(|| extract_probe_reasoning_efforts(session));
+        .map(extract_config_options)
+        .unwrap_or_else(|| extract_config_options(session));
+    normalize_parameterized_model_options(&process.agent_id, &mut options);
+    let mut reasoning_efforts =
+        if crate::dialect::agent_supports_parameterized_model_picker(process.agent_id.as_str()) {
+            // The parameterized picker publishes reasoning depth as a model
+            // parameter. Read it from the normalized option set so a demoted
+            // boolean `thinking` toggle cannot leak into the depth scale.
+            extract_probe_reasoning_efforts(&json!({ "configOptions": &options }))
+        } else {
+            model_response_ref
+                .filter(|response| response_has_config_options(response))
+                .or(model_config_update.as_ref())
+                .map(extract_probe_reasoning_efforts)
+                .unwrap_or_else(|| extract_probe_reasoning_efforts(session))
+        };
     if reasoning_efforts.is_empty() {
         reasoning_efforts =
             extract_initialize_reasoning_efforts(initialize, runtime_target_model.as_deref());
@@ -17072,11 +17148,6 @@ async fn runtime_session_probe_from_response(
     if process.agent_id.as_str() == "antigravity" {
         reasoning_efforts = antigravity_reasoning_efforts();
     }
-    let options = model_response_ref
-        .filter(|response| response_has_config_options(response))
-        .or(model_config_update.as_ref())
-        .map(extract_config_options)
-        .unwrap_or_else(|| extract_config_options(session));
     Ok(AcpRuntimeSessionProbe {
         models: target_model
             .map(|model| vec![model.to_string()])
@@ -19350,7 +19421,10 @@ fn extract_provider_session_config_state(
     let modes = agent_id
         .map(|agent_id| extract_modes_for_agent(response, agent_id))
         .unwrap_or_else(|| extract_config_values(mode_candidates(response)));
-    let options = extract_config_options(response);
+    let mut options = extract_config_options(response);
+    if let Some(agent_id) = agent_id {
+        normalize_parameterized_model_options(agent_id, &mut options);
+    }
     let current_model = extract_current_model_id(response)
         .map(|value| ProviderSessionConfigValue { value, label: None });
     let current_mode = match agent_id {
@@ -20653,6 +20727,87 @@ mod tests {
         assert_eq!(projection.product_id("unmapped"), "unmapped");
     }
 
+    fn discovery_with_models(models: &[&str]) -> ProviderSessionConfigState {
+        ProviderSessionConfigState {
+            provider_kind: ProviderKind::Acp,
+            provider_profile_id: None,
+            native_session_id: Some("native-session".to_string()),
+            current_model: None,
+            models: models
+                .iter()
+                .map(|model| ProviderSessionConfigValue {
+                    value: (*model).to_string(),
+                    label: None,
+                })
+                .collect(),
+            current_mode: None,
+            modes: Vec::new(),
+            options: Vec::new(),
+            source: "test".to_string(),
+            updated_at_ms: 0,
+            metadata: Vec::new(),
+        }
+    }
+
+    fn legacy_cursor_binding() -> SessionRuntimeConfigState {
+        SessionRuntimeConfigState {
+            preferred_model: Some("claude-opus-5[thinking=true,context=300k]".to_string()),
+            ..SessionRuntimeConfigState::default()
+        }
+    }
+
+    #[test]
+    fn legacy_cursor_variant_bindings_collapse_only_under_parameterized_discovery() {
+        let cursor = AgentId::parse("cursor").unwrap();
+
+        let mut parameterized = legacy_cursor_binding();
+        collapse_legacy_parameterized_model_ids(
+            &cursor,
+            &discovery_with_models(&["claude-opus-5", "gpt-5.6-sol"]),
+            &mut parameterized,
+        );
+        assert_eq!(
+            parameterized.preferred_model.as_deref(),
+            Some("claude-opus-5")
+        );
+
+        // An older CLI that ignores the capability still advertises variants;
+        // rewriting those would make the stored selection unresolvable.
+        let mut variants = legacy_cursor_binding();
+        collapse_legacy_parameterized_model_ids(
+            &cursor,
+            &discovery_with_models(&["claude-opus-5[thinking=true,context=300k]"]),
+            &mut variants,
+        );
+        assert_eq!(
+            variants.preferred_model.as_deref(),
+            Some("claude-opus-5[thinking=true,context=300k]")
+        );
+
+        // No discovery evidence: leave the persisted value alone.
+        let mut undiscovered = legacy_cursor_binding();
+        collapse_legacy_parameterized_model_ids(
+            &cursor,
+            &discovery_with_models(&[]),
+            &mut undiscovered,
+        );
+        assert_eq!(
+            undiscovered.preferred_model.as_deref(),
+            Some("claude-opus-5[thinking=true,context=300k]")
+        );
+
+        let mut other_agent = legacy_cursor_binding();
+        collapse_legacy_parameterized_model_ids(
+            &AgentId::parse("grok").unwrap(),
+            &discovery_with_models(&["grok-4.6"]),
+            &mut other_agent,
+        );
+        assert_eq!(
+            other_agent.preferred_model.as_deref(),
+            Some("claude-opus-5[thinking=true,context=300k]")
+        );
+    }
+
     #[test]
     fn events_runtime_snapshot_uses_exact_enricher_or_passthrough() {
         let snapshot = ToolCallSnapshot {
@@ -20737,7 +20892,7 @@ mod tests {
     #[test]
     fn initialize_params_keep_phase_one_capabilities() {
         assert_eq!(
-            build_initialize_params(true, true, false, false, false),
+            build_initialize_params(true, true, false, false, false, false),
             json!({
                 "protocolVersion": ACP_PROTOCOL_VERSION,
                 "clientCapabilities": {
@@ -20764,15 +20919,17 @@ mod tests {
             })
         );
         assert_eq!(
-            build_initialize_params(false, false, false, false, false)["clientCapabilities"]["fs"],
+            build_initialize_params(false, false, false, false, false, false)["clientCapabilities"]
+                ["fs"],
             json!({ "readTextFile": false, "writeTextFile": false })
         );
         assert_eq!(
-            build_initialize_params(true, true, true, true, false)["clientCapabilities"]["terminal"],
+            build_initialize_params(true, true, true, true, false, false)["clientCapabilities"]["terminal"],
             json!(true)
         );
         assert_eq!(
-            build_initialize_params(true, true, true, true, false)["clientCapabilities"]["auth"]["terminal"],
+            build_initialize_params(true, true, true, true, false, false)["clientCapabilities"]["auth"]
+                ["terminal"],
             json!(true)
         );
     }

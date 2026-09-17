@@ -117,7 +117,7 @@ impl AcpBridgeContractRunner {
         let (initialize_call, initialize_duration) = connection
             .timed_request(
                 AcpOperation::Initialize,
-                build_initialize_params(false, false, false, false, false),
+                build_initialize_params(false, false, false, false, false, false),
                 self.request_timeout,
             )
             .await;
