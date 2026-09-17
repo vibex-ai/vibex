@@ -1,6 +1,6 @@
 # Vibex v0.1.0-rc.4 Release Notes
 
-- Released: 2026-09-17 · Range: `v0.1.0-rc.3...v0.1.0-rc.4` · 32 commits
+- Released: 2026-09-17 · Range: `v0.1.0-rc.3...v0.1.0-rc.4` · 43 commits
 
 ---
 
@@ -8,78 +8,88 @@
 
 ### Highlights
 
-- **GPUI now comes from crates.io** — the 95 MB `vendor/zed` submodule and its `[patch.crates-io]` block are gone: `gpui` and `gpui_platform` resolve from the published `gpui-pre` 0.3.5 family, `gpui-pre-mobile` is pinned by revision for the Android/iOS platform layer, `crates/gpui-tokio` carries Zed's Apache-2.0 `gpui_tokio` bridge, Linux keeps a bounded font database through a platform delegation wrapper, and frosted glass retires with the fork-only scene primitives it depended on (`6ffcf7c`, `825bb97`, `9ecc107`).
-- **One runtime manager on both clients** — desktop and mobile gain a single place to browse, add, switch, rename and remove runtimes. `remote-runtimes.json` (v2) keeps every grant beside `activeRuntimeId`, mobile hosts move to `vibex-native-mobile-hosts.v2`, switching parks the embedded runtime instead of shutting it down so local terminals and Agent turns survive the round trip, and a failed switch leaves the workbench exactly where it was (`3e72051`).
-- **A runtime says which machine it is** — `RemoteServerKind` (desktop / headless / unknown) travels with the runtime's self-description from `/api/v2/info` and the v2 handshake, so an operator can tell a paired Vibex desktop from a standalone `vibex-server` before driving it. The field is additive on the wire, and a peer that predates it keeps the generic label instead of being guessed at (`a33e67c`).
-- **Ten light and dark palettes, chosen independently** — the appearance setting stops being a single light/dark switch: the token source is keyed by theme id and ships Vibex, Catppuccin, Gruvbox, Solarized, GitHub, Tokyo Night, and Nord variants, any light palette pairs with any dark one, and a themes directory under the app home extends the catalog. Every curated theme clears 4.5:1 for body and muted text, and a user theme re-derives each unpinned foreground against the surface it is painted on (`04d582d`).
-- **The window chrome follows the platform** — the title bar becomes a 38px overlay that carries no fill or bottom border of its own, so the sidebar tone, workbench surface, and panel seams run to the window edge behind it, and the right rail paints one shared surface token. Which caption buttons exist is now one decision, `resolve_window_controls`: macOS keeps its AppKit traffic lights, Windows keeps the system hit areas that Snap Layouts needs, and Linux draws buttons only for a client-decorated window and then follows GTK's `gtk-decoration-layout` (`5a2f015`, `a72bf55`, `4035d0e`, `dd87a6f`, `18c8628`).
-- **A silent ACP turn now fails instead of answering nothing** — an Adapter that swallows an internal provider failure and still returns `end_turn` with no `session/update` at all (Kimi Code 1.50.0 on a rejected API key) used to persist an empty final message that rendered as a vanished answer with no error and a completed submission. Completion now reports `acp_turn_without_output` with a recovery hint, while a pending permission or elicitation, a user-requested stop, and any recognized `session/update` still keep a legitimate turn intact (`dcd01d8`).
-- **Session search stops rebuilding itself** — opening search rebuilt the index for every session and re-ran the whole scan on every frame the dialog stayed open, which showed up as a drop from ~58 fps to 6-8 on a live session. `AgentManager` now remembers the paths this process verified, a paged timeline read keeps one connection instead of opening one per page, projection moves to the blocking pool, and the dialog keeps its index across a close so a reopen is a no-op (`95d0a8a`).
+- **Ten built-in themes, with light and dark chosen separately** — Appearance is no longer a single light/dark switch. Vibex now ships ten ready-made palettes — five light (Vibex, Catppuccin Latte, Gruvbox, Solarized, and GitHub) and five dark (Vibex, Catppuccin Mocha, Gruvbox, Tokyo Night, and Nord) — any light theme can be paired with any dark one, and you can add your own theme file to the themes folder in the Vibex home directory. Every built-in theme keeps body and secondary text at a contrast ratio of at least 4.5:1, and a custom theme adjusts any colour you do not set yourself to the background it is actually drawn on (`04d582d`).
+- **The window frame now follows your system** — The title bar floats over the app instead of owning a strip of its own, so the sidebar and the panels run all the way to the top edge and the right-hand rail reads as one surface. The buttons in the title bar match the platform you are on: macOS keeps its traffic lights, Windows keeps the areas Snap Layouts needs, and Linux follows your desktop's own button layout. Buttons the window cannot perform are no longer drawn, and pressing one never starts a window drag (`5a2f015`, `a72bf55`, `4035d0e`, `dd87a6f`, `18c8628`).
+- **One place to manage every runtime** — Desktop and mobile now share a single Runtime Manager for browsing, adding, switching, renaming, and removing runtimes. Switching away no longer shuts down the built-in runtime, so local terminals and running Agent turns survive the round trip; a wrong address changes nothing and the failure reason is kept with that runtime. The list also tells you whether a runtime is another Vibex desktop or a headless server (one with no window of its own) before you connect (`3e72051`, `a33e67c`).
+- **A rebuilt Agent, provider, and model picker** — Choosing a model in the composer is now one floating menu that behaves like the rest of the app: an Agent tab strip, a starred-models view, a star on every row, the default reasoning level marked, and search that puts the closest matches and your favourites first. The panel keeps the same height while you type or switch Agent, so it no longer jumps around under your pointer, and the search box is wider (`973e015`, `6a6380a`).
+- **An Agent that fails silently now tells you** — An Agent connection could hide an internal failure (a rejected API key, for example) and end the turn with nothing at all: the answer vanished, no error appeared, and the message still counted as sent. That now ends the turn with an error and a suggestion for what to try, while a real stop, a permission prompt, or any actual activity still completes normally (`dcd01d8`).
+- **Search no longer drags the app down** — Opening session search used to rebuild its index for every session and repeat the whole scan on every frame, which dropped a busy session from about 58 fps to 6-8. The index is now built once and kept warm, the scan runs in the background, and reopening the dialog is instant (`95d0a8a`).
+- **Terminals stay smooth** — The terminal rebuilt every single cell as its own object on every repaint — which happens on each line of output and each cursor blink — so even an idle terminal could stall the window twice a second. It now draws the whole grid in one pass: the same frame that took about 242 ms in a debug build takes about 3 ms (`eabe83b`).
+- **Android builds install as updates, at a normal size** — Every Android package carried the same internal version number, so a new APK could not replace an older install on any channel that checks versions. The number is now derived from the release version, so `0.1.0-rc.4` sorts after `0.1.0-rc.3`, and a version that cannot be encoded fails the build instead of silently reusing the old number. Release builds also stop picking up libraries left behind by earlier debug builds: an APK that had grown to 429 MB is back to about 73 MB (`cb9809f`, `8de5d4e`).
+- **No more bundled editor source** — Vibex used to carry a 95 MB copy of the Zed editor's source tree to build its interface toolkit. That copy is gone: the toolkit now comes from ordinary published packages, which makes the checkout much smaller and the build easier to reproduce. The one visible consequence is that the frosted-glass effect, which depended on that copy, has been retired (`6ffcf7c`, `825bb97`, `9ecc107`).
 
 ### New Features
 
 **Runtime & remote**
 
-- Give both clients one runtime manager to browse, add, switch, rename and remove runtimes, with the list and detail stage sharing one anchored panel so management never stacks overlays (`3e72051`)
-- Keep the embedded runtime alive across a switch (L1 keep-alive), connect before swapping so a wrong address changes nothing, and record the failure reason per runtime (`3e72051`)
-- Tell a desktop-hosted runtime from a headless `vibex-server` through `RemoteServerKind`, carried on the credential and the phone's per-runtime metadata so it is known at pairing time and refreshed on every connect (`a33e67c`)
+- Browse, add, switch, rename, and remove runtimes from one window on both desktop and mobile, with the list and the details of the selected runtime in one panel instead of stacked dialogs (`3e72051`)
+- Keep the built-in runtime running while you are switched away, connect first so a bad address changes nothing, and keep the failure reason with each runtime (`3e72051`)
+- See whether a runtime is a Vibex desktop or a headless server, known from the moment you pair and refreshed on every connection (`a33e67c`)
 
-**Theme & design system**
+**Themes & appearance**
 
-- Ship a curated catalog of ten light and dark palettes with independent selection per appearance, and let users extend it with theme files that name only the roles they want to change (`04d582d`)
-- Derive hover and selection washes from the active theme's own background, so a warm or tinted palette no longer receives neutral grey chrome (`04d582d`)
-- Paint every right-rail panel — files, Git, and the child Agent timeline — with one `right-rail-surface` token so the rail reads as a single pane (`18c8628`)
+- Pick from ten built-in light and dark palettes and mix them freely, and extend the list with a theme file that names only the colours you want to change (`04d582d`)
+- Hover and selection colours now come from the theme's own background, so warm or tinted themes no longer get neutral grey highlights (`04d582d`)
+- The right rail — files, Git, and child-Agent timelines — now paints as a single surface (`18c8628`)
 
 **Desktop**
 
-- Float the window chrome above the shell as a 38px overlay, and reserve `TITLE_BAR_HEIGHT` in every column that must not underlap it (`5a2f015`)
-- Resolve caption buttons per platform, honour GTK's `gtk-decoration-layout`, drop buttons the window cannot perform, and render each cluster outside the drag region so a caption press never starts a window move (`a72bf55`)
-- Slide the usage range switch as a travelling thumb and soften control borders (`37e8029`)
-- Group the usage cross-filters behind the range control and name each trigger's applied value, with a `+N` suffix for further selections (`2a03753`)
-- Rework the model provider editor: Enter saves instead of closing the dialog, every control writes into the draft, and errors report under the field that produced them (`69489d7`)
-- Host the MCP and Skills native-export card on their own pages, so a resource family can be written into an Agent's configuration without opening the unreachable Advanced page (`f7c3129`)
-- Add a Developer settings section whose switch overlays the gpui-fps HUD (`a80f3fd`), let the HUD be dragged and persist its placement as `developer.fpsMonitorPlacement` (`b2aa073`), and record its samples as diagnostics data in `diagnostics/fps-monitor.jsonl` (`8a30d6a`)
+- The title bar floats above the app as a 38-pixel overlay, and every column leaves room for it so nothing hides underneath (`5a2f015`)
+- Title-bar buttons follow the platform's own rules, respect the GTK decoration layout on Linux, hide actions the window cannot perform, and never start a window drag when pressed (`a72bf55`)
+- The Usage range switch now slides, and control outlines are softer (`37e8029`)
+- Usage filters are grouped after the range switch, and each one shows the value it applies — with `+N` for further selections — instead of a count you have to open the menu to understand (`2a03753`)
+- The model provider editor saves with Enter instead of closing, every field writes into the draft, and errors appear under the field that caused them (`69489d7`)
+- Export MCP and Skills configuration to an Agent from their own pages, without going through the Advanced page that the main navigation cannot reach (`f7c3129`)
+- A Developer settings section turns the FPS overlay on and off (`a80f3fd`), the overlay can be dragged and remembers where you put it (`b2aa073`), and its samples can be recorded as diagnostics (`8a30d6a`)
+- The composer's Agent, provider, and model picker is now a proper floating menu with an Agent tab strip, a starred-models view, star toggles on each row, the default reasoning level marked, and open/close animation (`973e015`)
+- Search in that picker ranks prefix matches first, then partial matches, then provider names, keeps starred models on top, remembers and reorders favourites, locks the Agent row while a switch is in flight, and returns focus to the composer when it closes (`973e015`)
 
 **Agent & ACP**
 
-- Upgrade the zcode adapter from 0.17.2 to 0.37.1 (`d88327f`)
-- Declare zcode's usage contract as per-turn, show the adapter's readable `toolCall.content` and affected `toolCall.locations` in the approval dialog, and pin the interpreter with `ZCODE_ACP_RUNTIME=node` (`d88327f`)
+- The zcode adapter is updated from 0.17.2 to 0.37.1 (`d88327f`)
+- Approval prompts for zcode now show the readable description of the tool call and the files it will touch, and the adapter always runs on Node (`d88327f`)
 
 ### Fixes
 
 **Desktop**
 
-- Bundle every icon the workbench asks for: thirty-four registered paths were missing and two pointed at the wrong directory, so those surfaces drew a gap where an icon should be (`2b37048`)
-- Show the runtime button's icon and keep its panel open, instead of letting the popover and the trigger's `on_click` toggle against each other (`de067b9`)
-- Answer the sidebar-organization bridge for the embedded authority specifically, so a paired client never receives the displayed remote runtime's tree (`444226b`)
-- Release a settled streaming shrink of the timeline extent, so a collapsed card or merged process row no longer leaves a blank band the viewport parks on (`3e59958`)
-- Honour the macOS Dock icon grid with `icon-macos-*.png` renditions and route a Dock reopen request through `SystemTray::restore` (`a5af0ee`)
-- Order the provider connection fields before its models, matching the order they are filled in when a Provider is created (`232e8b6`)
-- Give the usage toolbar and chart-header controls the standard `small` frame instead of the cramped xsmall one (`c98f0f4`)
+- Restore the icons that were silently missing: thirty-four icon paths drew nothing — thirty-two were never registered (sidebar project logos, file and folder actions, file-type icons, and the drag handle) and two pointed at the wrong folder (`2b37048`)
+- The runtime button now shows its icon, and its panel stays open when you click it (`de067b9`)
+- A paired phone always receives its own sidebar layout, instead of the layout of the remote runtime the desktop happens to be showing (`444226b`)
+- Collapsing a card or merging process rows no longer leaves a blank strip under the last row that the view stays parked on (`3e59958`)
+- The macOS Dock icon now matches the size of its neighbours, and clicking the Dock icon reopens the window (`a5af0ee`)
+- In the provider editor, connection fields come before models, in the order you fill them in (`232e8b6`)
+- The Usage toolbar and chart headers use the standard small control size instead of a cramped one (`c98f0f4`)
+- The provider and model menu keeps one height for a given window size, so it no longer resizes while you type or switch Agent; the list scrolls inside it and the search box gets the width back (`6a6380a`)
+- Switching sessions no longer nudges the conversation: the timeline keeps its measured row heights and remembers which turn you were reading, so a reader who scrolled up stays exactly where they were (`5785cdb`)
+- Unselected session rows in the sidebar are easier to read and now match the project and workspace rows (`fff3271`)
 
 **Agent & ACP**
 
-- Fail a completely silent ACP turn instead of persisting an empty answer, with `needs_input`, user-cancelled, and activity-only turns exempted (`dcd01d8`)
-- Lock Cline's base URL to `api.openai.com` through an Agent-owned `FixedEndpoint` control, and preview the pinned origin in the projection plan (`4285157`)
+- A completely silent turn now fails instead of saving an empty answer; turns that are waiting for input, stopped by you, or doing real work are unaffected (`dcd01d8`)
+- Cline's address is fixed to `api.openai.com`: the Agent owns that endpoint and ignores whatever address a profile carries, and the preview shows the address it will actually call (`4285157`)
 
 **Mobile & build**
 
-- Pass the NDK API level when building Android: `cargo ndk` defaults to platform 21 while `gpui-pre-mobile` links `libnativewindow.so`, which the NDK only ships from API 26, so the link step failed for `build:mobile:android`, `package:mobile:android`, and the tagged release workflow (`50a03f9`)
+- Android builds now pass the NDK API level, so the Android build, package, and tagged-release steps no longer fail while linking the app (`50a03f9`)
+- Android version numbers are derived from the release version, so a new build installs over an older one; a version that cannot be encoded, or a prerelease number past 99, fails the build (`cb9809f`)
+- Release builds clear out libraries left behind by earlier debug builds, so a release APK no longer ships debug libraries (`8de5d4e`)
+- Swiping a drawer open no longer scrolls the page it reveals, and the flick that follows the swipe no longer carries into the drawer's list (`2609443`)
+- Tapping a field that already has focus brings the keyboard back after you dismissed it, on both Android and iOS; tapping a button next to a field does not open the keyboard, and the tap does nothing while the keyboard is already up (`fe7f843`)
 
 ### Performance
 
-- Keep the session search index warm across dialog closes, scan it in a debounced background task instead of in `render`, and match ASCII and case-less text in place (`95d0a8a`)
+- Session search keeps its index between openings, scans in the background instead of while drawing, and matches text in place (`95d0a8a`)
+- The terminal draws its whole grid as one element and handles pointer input with a single listener (`eabe83b`)
 
-### Internal, Build & Docs
+### Under the hood
 
-- Replace the `vendor/zed` fork with published `gpui-pre` 0.3.5: remove the submodule, `.gitmodules`, and the submodule-aware license plumbing, add `crates/gpui-tokio` for the unpublished Apache-2.0 `gpui_tokio` bridge, move the IBM Plex Sans and Lilex faces and the mobile undo icon out of the submodule, and rebuild the mobile platform facade, IME host, and iOS entry point on `gpui-pre-mobile` (`6ffcf7c`)
-- Track zed `d89e9c2` and pin the gpui-kit family to `gpui-kit` main `fb26e617` with a fourth `[patch.crates-io]` entry (`825bb97`), then bump the pin for `ImageSource::evict` (`9ecc107`)
-- Record the git-pinned gpui-kit dependency source in spec, including the upstream-merge requirement before the revision moves past the gpui-pre version the fork reports (`e1d56bc`)
-- Update `check-mobile-native.mjs` to assert the new dependency sources, platform facade, and IME host instead of fork internals; update `check-licenses.mjs` and `source-identities.mjs` for the new dependency graph, `generate-tokens.mjs` for the theme catalog, and `check-release.mjs` and `package-desktop-release.mjs` for the macOS icon grid (`6ffcf7c`, `04d582d`, `a5af0ee`)
-- Regenerate the SBOM, third-party notices, and license policy, and record the relocated font and icon provenance (`6ffcf7c`, `a5af0ee`)
-- Refresh the release packaging matrix, platform support matrix, UI-boundary architecture note, and the license gate README (`6ffcf7c`, `a5af0ee`)
-- Update the frontend, usage-statistics, agent-session-protocol, and architecture-baseline specs for the chrome, toolbar, empty-turn, and dependency-source contracts (`2a03753`, `dcd01d8`, `e1d56bc`)
-- Fix the workspace clippy gate: `CaptureScrollWheel`'s listener field is now a named `CaptureScrollWheelListener` alias, so `clippy::type_complexity` no longer fails `pnpm check:rust` and the CI job that runs `pnpm check` (`45709c8`)
+- Vibex no longer vendors the Zed source tree: the interface toolkit comes from published packages, the small unpublished bridge it needed now lives in this repository, the bundled fonts and mobile icons moved out of the old copy, and the mobile platform layer, keyboard handling, and iOS entry point were rebuilt on the published package (`6ffcf7c`)
+- The interface toolkit family is pinned to a specific revision, with a note in the specs about when that pin may move (`825bb97`, `9ecc107`, `e1d56bc`)
+- The build and licence checks were updated for the new dependencies and assets, the list of bundled software (SBOM), third-party notices, and licence policy were regenerated, and the release packaging, platform support, UI boundary, and licence documents were refreshed (`6ffcf7c`, `04d582d`, `a5af0ee`)
+- The project's specs were updated for the window chrome, the Usage toolbar, silent Agent turns, the dependency source, and terminal drawing (`2a03753`, `dcd01d8`, `e1d56bc`, `eabe83b`)
+- A code-quality check that failed on the mobile scroll listener no longer breaks the Rust quality gate or CI (`45709c8`)
+- Version numbers were bumped to `0.1.0-rc.4` across the workspace and the packaging inputs (`4dd6ce6`)
 
 ---
 
@@ -87,75 +97,85 @@
 
 ### 亮点
 
-- **GPUI 改为从 crates.io 获取** — 95 MB 的 `vendor/zed` 子模块及其 `[patch.crates-io]` 块已移除：`gpui` 与 `gpui_platform` 解析自已发布的 `gpui-pre` 0.3.5 家族，Android/iOS 平台层所用的 `gpui-pre-mobile` 按 revision 固定；Zed 那 100 行 Apache-2.0 的 `gpui_tokio` 桥接没有已发布包，改由新增的 `crates/gpui-tokio` 承载；Linux 通过平台委托包装层保留有界字体库；毛玻璃效果随其依赖的 fork 专属场景原语一并下线（`6ffcf7c`、`825bb97`、`9ecc107`）。
-- **两个客户端共用一套运行时管理器** — 桌面端与移动端各自有了浏览、添加、切换、重命名与删除运行时的唯一入口。`remote-runtimes.json`（v2）把每份授权与 `activeRuntimeId` 存在一起，移动端主机存储迁移到 `vibex-native-mobile-hosts.v2`；切换时改为挂起内嵌运行时而非销毁，本地终端与 Agent 回合得以跨往返存活；切换失败则工作台原地不动（`3e72051`）。
-- **运行时会说明自己是哪台机器** — `RemoteServerKind`（desktop / headless / unknown）随运行时自描述经 `/api/v2/info` 与 v2 握手传递，运维在驱动之前即可分辨配对的是 Vibex 桌面端还是独立的 `vibex-server`。该字段在线路上是纯增量，早于该字段的对方仍显示通用标签而不会被猜测（`a33e67c`）。
-- **十套明暗配色，明暗独立选择** — 外观设置不再是单一明暗开关：token 源改按主题 id 索引，内置 Vibex、Catppuccin、Gruvbox、Solarized、GitHub、Tokyo Night 与 Nord 变体，任意浅色可与任意深色搭配；应用 home 下的 themes 目录可扩展目录。所有精选主题的正文与次要文字对比度均达到 4.5:1，用户主题会针对实际绘制的表面重新推导每个未固定的前景色（`04d582d`）。
-- **窗口外框跟随平台** — 标题栏改为 38px 浮层，自身不再绘制填充与下边线，侧栏色调、工作台表面与面板接缝因此一直延伸到窗口边缘，右栏统一使用同一个表面 token。标题按钮的有无现在由唯一决策 `resolve_window_controls` 决定：macOS 保留 AppKit 交通灯，Windows 保留 Snap Layouts 所需的系统命中区，Linux 仅在客户端装饰窗口上绘制按钮并遵循 GTK 的 `gtk-decoration-layout`（`5a2f015`、`a72bf55`、`4035d0e`、`dd87a6f`、`18c8628`）。
-- **静默的 ACP 回合现在会失败，而不是答非所问** — 适配器吞掉内部 provider 失败却仍以 `end_turn` 返回、且完全没有任何 `session/update` 时（Kimi Code 1.50.0 在 API key 被拒时即如此），过去会持久化一条空的最终消息，表现为回答凭空消失、没有报错、提交却记为完成。现在完成阶段会报 `acp_turn_without_output` 并给出恢复提示；而待处理的权限或 elicitation、用户主动停止、以及任何可识别的 `session/update` 仍会让正常回合保持完好（`dcd01d8`）。
-- **会话搜索不再反复重建** — 过去每次打开搜索都会为所有会话重建索引，并在对话框打开的每一帧重跑整轮扫描，在活跃会话上表现为从约 58 fps 掉到 6-8。现在 `AgentManager` 记住本进程已验证的路径，分页时间线读取复用同一个连接而非每页新开，投影移至阻塞线程池，对话框关闭时保留索引，重开即为空操作（`95d0a8a`）。
+- **内置十套主题，明暗可以分开选** — 外观不再只是一个「浅色／深色」开关。Vibex 现在自带十套配色：五套浅色（Vibex、Catppuccin Latte、Gruvbox、Solarized、GitHub）和五套深色（Vibex、Catppuccin Mocha、Gruvbox、Tokyo Night、Nord）；任意浅色都能和任意深色搭配，你也可以在 Vibex 主目录的 themes 文件夹里放自己的主题文件来扩充。所有内置主题的正文与次要文字对比度都不低于 4.5:1；自定义主题里没有指定的颜色，会自动按它实际所在的背景调整（`04d582d`）。
+- **窗口边框跟随你的系统** — 标题栏改为浮在界面之上，不再单独占一条，因此侧栏和各个面板一直延伸到窗口顶边，右侧栏看起来也是完整的一块。标题栏按钮与你所在的平台一致：macOS 保留红黄绿交通灯，Windows 保留贴靠布局需要的区域，Linux 跟随你桌面自己的按钮布局。窗口做不到的按钮不再显示，按按钮也不会误触发拖动窗口（`5a2f015`、`a72bf55`、`4035d0e`、`dd87a6f`、`18c8628`）。
+- **所有运行时集中在一处管理** — 桌面端和手机端现在共用同一个运行时管理器，用来浏览、添加、切换、重命名和删除运行时。切走时不再关掉内置运行时，本地终端和正在跑的 Agent 回合都能保留；地址填错什么都不会变，失败原因会记在对应的运行时上。列表还会在连接之前就告诉你，对方是另一台 Vibex 桌面端还是无界面的服务器（`3e72051`、`a33e67c`）。
+- **重做的 Agent／服务商／模型选择器** — 在输入框里选模型现在是一个和全局一致的浮动菜单：顶部是 Agent 标签条，有「已加星」视图，每行都有星标，默认推理档位有标记，搜索会把最贴近的结果和你收藏的模型排在前面。输入或切换 Agent 时面板高度保持不变，不会在鼠标底下跳来跳去，搜索框也更宽了（`973e015`、`6a6380a`）。
+- **Agent 静默失败时现在会告诉你** — 某些 Agent 适配器会把内部错误（比如 API key 被拒）吞掉，然后什么都不回就结束回合：回答凭空消失、没有任何报错，消息却算作已发送。现在这种情况会以错误结束，并提示可以怎么处理；而真正的停止、权限确认或确实有内容产生的回合不受影响（`dcd01d8`）。
+- **搜索不再拖慢整个应用** — 以前打开会话搜索会为每个会话重建索引，而且对话框开着的时候每一帧都重跑一遍，繁忙会话会从约 58 fps 掉到 6-8。现在索引只建一次并保持可用，扫描放到后台，再次打开对话框是瞬间完成的（`95d0a8a`）。
+- **终端保持流畅** — 终端以前每次重绘都要把每个单元格重新构造成一个对象，而输出每一行、光标每闪一次都会重绘，所以连空闲终端都可能每秒卡住窗口两次。现在整个网格一次画完：同一帧在 debug 构建下从约 242 ms 降到约 3 ms（`eabe83b`）。
+- **Android 安装包可以正常升级，体积也恢复正常** — 以前每个 Android 安装包的内部版本号都一样，凡是会检查版本的渠道，新 APK 都装不上旧版本。现在版本号由发布版本推导，`0.1.0-rc.4` 排在 `0.1.0-rc.3` 之后；无法编码的版本会让构建直接失败，而不是悄悄沿用旧号。发布构建也不再带上早先 debug 构建遗留的库：曾涨到 429 MB 的安装包回到约 73 MB（`cb9809f`、`8de5d4e`）。
+- **不再内置编辑器源码** — Vibex 过去为了构建界面工具包，要带上一份 95 MB 的 Zed 编辑器源码。这份副本已经移除，工具包改为使用正常发布的软件包，代码检出小了很多，构建也更容易复现。唯一看得见的变化是：依赖这份副本的毛玻璃效果已随之下线（`6ffcf7c`、`825bb97`、`9ecc107`）。
 
 ### 新功能
 
 **运行时与远程**
 
-- 为两个客户端提供统一的运行时管理器，用于浏览、添加、切换、重命名与删除运行时；列表与详情阶段共用同一个锚定面板，管理操作不再堆叠浮层（`3e72051`）
-- 切换时保留内嵌运行时（L1 keep-alive）；先连接成功再切换，地址错误则工作台保持不变；每个运行时单独记录失败原因（`3e72051`）
-- 通过 `RemoteServerKind` 区分桌面端承载的运行时与无头 `vibex-server`，该信息随凭据与手机端各运行时元数据保存，配对时即已知并在每次连接时刷新（`a33e67c`）
+- 桌面端和手机端都能在同一个窗口里浏览、添加、切换、重命名和删除运行时；列表与所选运行时的详情放在同一个面板里，不再层层叠叠弹窗（`3e72051`）
+- 切走时保持内置运行时继续运行；先连接成功再切换，地址错误则一切照旧；每个运行时单独记录失败原因（`3e72051`）
+- 一眼看出某个运行时是 Vibex 桌面端还是无界面服务器，配对时即已知，并在每次连接时刷新（`a33e67c`）
 
-**主题与设计系统**
+**主题与外观**
 
-- 内置十套明暗配色目录，明暗两种外观各自独立选择；用户可用只声明想改角色的主题文件扩展目录（`04d582d`）
-- 悬停与选中底色改为从当前主题自身背景推导，暖色或带色调的配色不再收到中性灰控件底色（`04d582d`）
-- 右栏所有面板（文件、Git、子 Agent 时间线）统一绘制 `right-rail-surface` token，整栏读作同一块面板（`18c8628`）
+- 十套内置明暗配色任选，明暗可自由搭配；也可以只写想改的颜色，用自己的主题文件扩充（`04d582d`）
+- 悬停和选中颜色改为取自主题自身的背景，暖色或带色调的主题不再配到中性灰的高亮（`04d582d`）
+- 右侧栏（文件、Git、子 Agent 时间线）现在整体画成一块（`18c8628`）
 
 **桌面端**
 
-- 窗口外框以 38px 浮层浮在工作台之上，所有不应被其压住的列都预留 `TITLE_BAR_HEIGHT`（`5a2f015`）
-- 标题按钮按平台解析，遵循 GTK 的 `gtk-decoration-layout`，剔除窗口无法执行的按钮；左右按钮组绘制在拖拽区之外，按标题按钮不会触发窗口移动（`a72bf55`）
-- 用量范围开关改为滑动滑块，并柔化控件描边（`37e8029`）
-- 用量交叉筛选器归为一组排在范围控件之后，每个触发器直接显示已应用的值，多选时追加 `+N`（`2a03753`）
-- 重做模型 Provider 编辑器：回车改为保存而非关闭对话框，所有控件直接写入草稿，错误显示在产生它的字段下方（`69489d7`）
-- MCP 与 Skills 的原生导出卡片移到各自页面，无需进入从主导航无法到达的 Advanced 页即可把资源族写入 Agent 配置（`f7c3129`）
-- 新增开发者设置分区，开关即可叠加 gpui-fps HUD（`a80f3fd`）；HUD 可拖动并把位置持久化为 `developer.fpsMonitorPlacement`（`b2aa073`）；其采样作为诊断数据记录到 `diagnostics/fps-monitor.jsonl`（`8a30d6a`）
+- 标题栏以 38 像素浮层浮在界面上方，每一列都为它留出空间，内容不会被压住（`5a2f015`）
+- 标题栏按钮遵循各平台自己的规则，在 Linux 上遵循 GTK 的装饰布局，窗口做不到的操作不再显示，按下按钮也不会误触发拖动窗口（`a72bf55`）
+- 用量页的范围开关改为滑动切换，控件描边更柔和（`37e8029`）
+- 用量页的筛选器归到范围开关之后成组排列，每个直接显示它筛选的值（多选时显示 `+N`），不用再打开菜单才知道筛了什么（`2a03753`）
+- 模型服务商编辑器改为回车保存而不关闭对话框，所有字段都会写入草稿，错误显示在出问题的字段下方（`69489d7`）
+- MCP 与 Skills 的配置导出移到各自页面，不必再绕进主导航到不了的 Advanced 页（`f7c3129`）
+- 新增开发者设置分区，可开关帧率浮层（`a80f3fd`）；浮层可拖动并记住位置（`b2aa073`）；采样可作为诊断数据记录（`8a30d6a`）
+- 输入框的 Agent／服务商／模型选择器改为真正的浮动菜单：Agent 标签条、「已加星」视图、每行的星标开关、标出默认推理档位，并带打开／关闭动画（`973e015`）
+- 选择器搜索先按开头匹配、再按包含匹配、最后按服务商排序，已加星模型置顶；收藏可保存并重排列表；切换进行中锁定 Agent 行；关闭后焦点回到输入框（`973e015`）
 
 **Agent 与 ACP**
 
-- zcode 适配器由 0.17.2 升级到 0.37.1（`d88327f`）
-- 将 zcode 的用量契约声明为按回合；审批对话框优先显示适配器可读的 `toolCall.content` 并列出受影响的 `toolCall.locations`；以 `ZCODE_ACP_RUNTIME=node` 固定解释器（`d88327f`）
+- zcode 适配器从 0.17.2 升级到 0.37.1（`d88327f`）
+- zcode 的审批提示现在会显示工具调用的可读说明和将要改动的文件，适配器固定使用 Node 运行（`d88327f`）
 
 ### 修复
 
 **桌面端**
 
-- 补齐工作台请求的全部图标：34 个路径未注册、2 个指向了错误目录，导致相应位置只画出空白（`2b37048`）
-- 显示运行时按钮的图标并保持其面板常开，不再让 popover 与触发器的 `on_click` 互相切换（`de067b9`）
-- 侧栏组织桥接改为专门应答内嵌权威端，配对客户端不会再收到当前显示的远程运行时的树（`444226b`）
-- 流式行已稳定的收缩会释放时间线高度，折叠卡片或合并的流程行不再留下视口停驻的空白带（`3e59958`）
-- 以 `icon-macos-*.png` 适配 macOS Dock 图标网格，并让 Dock 重新打开请求走 `SystemTray::restore`（`a5af0ee`）
-- Provider 编辑器中连接字段排在模型之前，与创建 Provider 时的填写顺序一致（`232e8b6`）
-- 用量工具栏与图表标题控件改用标准 `small` 尺寸，替换局促的 xsmall（`c98f0f4`）
+- 补齐此前悄悄缺失的图标：共 34 个图标路径画不出东西，其中 32 个从未注册（侧栏项目图标、文件与文件夹操作、文件类型图标、拖动手柄），另有 2 个指向了错误的目录（`2b37048`）
+- 运行时按钮现在会显示自己的图标，点击后其面板保持打开（`de067b9`）
+- 配对的手机会始终拿到自己的侧栏布局，而不是桌面端当时正在显示的远程运行时的布局（`444226b`）
+- 折叠卡片或合并流程行之后，最后一行下方不再留下一条空白带、让视图停在那里（`3e59958`）
+- macOS 的 Dock 图标大小现在与旁边的图标一致，点击 Dock 图标也能重新打开窗口（`a5af0ee`）
+- 服务商编辑器里连接字段排在模型之前，与你填写时的顺序一致（`232e8b6`）
+- 用量页工具栏和图表标题改用标准的小尺寸控件，不再局促（`c98f0f4`）
+- 服务商与模型菜单在同一窗口尺寸下保持固定高度，输入或切换 Agent 时不再改变大小；列表在内部滚动，搜索框也拿回了宽度（`6a6380a`）
+- 切换会话不再让对话跳动：时间线保留已测量的行高，并记住你正在看的那一轮，向上翻看的读者会停在原处（`5785cdb`）
+- 侧栏未选中会话行更易读，与项目和 workspace 行保持一致（`fff3271`）
 
 **Agent 与 ACP**
 
-- 完全静默的 ACP 回合改为失败，不再持久化空回答；待输入、用户取消与仅有活动的回合除外（`dcd01d8`）
-- 通过 Agent 自有的 `FixedEndpoint` 控件把 Cline 的 base URL 锁定为 `api.openai.com`，并在投影计划中预览该固定地址（`4285157`）
+- 完全没有输出的回合现在会失败，不再保存一条空回答；等待输入、被你停止或确实有内容产生的回合不受影响（`dcd01d8`）
+- Cline 的地址固定为 `api.openai.com`：该端点由 Agent 自己掌握，配置里填的地址不再起作用，预览中会显示它实际调用的地址（`4285157`）
 
 **移动端与构建**
 
-- Android 构建传入 NDK API 级别：`cargo ndk` 默认 platform 21，而 `gpui-pre-mobile` 链接 `libnativewindow.so`（NDK 自 API 26 起才提供），导致 `build:mobile:android`、`package:mobile:android` 与打标签的发布工作流均在链接阶段失败（`50a03f9`）
+- Android 构建现在会传入 NDK API 级别，构建、打包和打标签发布流程不再在链接环节报错（`50a03f9`）
+- Android 版本号由发布版本推导，新构建可以覆盖安装旧版本；无法编码的版本、或预发布序号超过 99 时构建直接失败（`cb9809f`）
+- 发布构建会先清掉早先 debug 构建遗留的库，安装包不再夹带 debug 库（`8de5d4e`）
+- 滑开抽屉不再顺带滚动它展开的页面，滑动之后手指带起的惯性也不会传到抽屉列表里（`2609443`）
+- 键盘收起后，点击仍然聚焦的输入框可以重新唤出键盘（Android 与 iOS 均如此）；点击输入框旁边的按钮不会弹出键盘，键盘已经在屏幕上时点击也不会重复唤起（`fe7f843`）
 
 ### 性能
 
-- 会话搜索索引在对话框关闭后保持温热，改由去抖的后台任务扫描而非在 `render` 中执行，并对 ASCII 与无大小写文本就地匹配（`95d0a8a`）
+- 会话搜索在对话框关闭后保留索引，扫描放在后台而不是绘制时进行，文本就地匹配（`95d0a8a`）
+- 终端把整个网格作为一个元素绘制，指针输入也收敛为单个监听器（`eabe83b`）
 
-### 内部、构建与文档
+### 底层改动
 
-- 以已发布的 `gpui-pre` 0.3.5 取代 `vendor/zed` fork：移除子模块、`.gitmodules` 与依赖子模块的许可证管线；新增 `crates/gpui-tokio` 承载未发布的 Apache-2.0 `gpui_tokio` 桥接；IBM Plex Sans、Lilex 字体与移动端撤销图标迁出子模块；移动端平台门面、输入法宿主与 iOS 入口重建于 `gpui-pre-mobile` 之上（`6ffcf7c`）
-- 跟踪 zed `d89e9c2`，并以第四个 `[patch.crates-io]` 条目把 gpui-kit 家族固定到 `gpui-kit` main `fb26e617`（`825bb97`），随后为 `ImageSource::evict` 更新固定点（`9ecc107`）
-- 在 spec 中记录 git 固定的 gpui-kit 依赖来源，并写明在该修订越过 fork 所报告的 gpui-pre 版本之前必须先完成上游合并（`e1d56bc`）
-- `check-mobile-native.mjs` 改为断言新的依赖来源、平台门面与输入法宿主，不再检查 fork 内部；`check-licenses.mjs` 与 `source-identities.mjs` 适配新的依赖图，`generate-tokens.mjs` 适配主题目录，`check-release.mjs` 与 `package-desktop-release.mjs` 适配 macOS 图标网格（`6ffcf7c`、`04d582d`、`a5af0ee`）
-- 重新生成 SBOM、第三方声明与许可证策略，并记录迁移后的字体与图标来源（`6ffcf7c`、`a5af0ee`）
-- 更新发布打包矩阵、平台支持矩阵、UI 边界架构说明与许可证门禁 README（`6ffcf7c`、`a5af0ee`）
-- 更新前端、用量统计、Agent 会话协议与架构基线 spec，以记录外框、工具栏、空回合与依赖来源契约（`2a03753`、`dcd01d8`、`e1d56bc`）
-- 修复工作区 clippy 门禁：`CaptureScrollWheel` 的监听器字段改为具名 `CaptureScrollWheelListener` 别名，`clippy::type_complexity` 不再让 `pnpm check:rust` 及运行 `pnpm check` 的 CI 任务失败（`45709c8`）
+- 不再内置 Zed 源码：界面工具包改用已发布的软件包，其中一小段未发布的桥接代码移入本仓库；随包字体和移动端图标迁出旧副本；移动端平台层、键盘处理和 iOS 入口都重建在已发布的软件包之上（`6ffcf7c`）
+- 界面工具包系列固定到某个具体修订，并在项目文档（spec）中写明该固定点何时可以前移（`825bb97`、`9ecc107`、`e1d56bc`）
+- 构建与许可证检查适配了新的依赖和资源，重新生成软件物料清单（SBOM）、第三方声明与许可证策略，并更新发布打包、平台支持、UI 边界与许可证文档（`6ffcf7c`、`04d582d`、`a5af0ee`）
+- 项目文档（spec）更新了窗口边框、用量工具栏、静默 Agent 回合、依赖来源与终端绘制相关内容（`2a03753`、`dcd01d8`、`e1d56bc`、`eabe83b`）
+- 移动端滚动监听器的一处代码检查失败不再影响 Rust 质量门禁和 CI（`45709c8`）
+- 工作区与打包输入的版本号统一升到 `0.1.0-rc.4`（`4dd6ce6`）
