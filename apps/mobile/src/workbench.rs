@@ -1637,6 +1637,10 @@ impl MobileWorkbench {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // A drawer swipe is a horizontal pan; without this the
+                    // pan (and the fling that follows it) would be applied to
+                    // the vertical offset and the tree would scroll itself.
+                    .restrict_scroll_to_axis()
                     .when(!query_present, |body| {
                         body.children(
                             rows.into_iter()
@@ -2201,6 +2205,7 @@ impl MobileWorkbench {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .when(changes_active, |body| {
                         let row_count = self.git.state.model.change_tree_row_count();
                         body.when(row_count == 0, |body| {
@@ -2517,6 +2522,7 @@ impl MobileWorkbench {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .when(loading, |body| {
                         body.child(empty_label(locale::common("Loading")))
                     })
@@ -3169,6 +3175,7 @@ impl MobileWorkbench {
                         .flex_shrink_0()
                         .min_h(px(36.0))
                         .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
                         .flex()
                         .items_center()
                         .gap_1()
@@ -3290,6 +3297,7 @@ impl MobileWorkbench {
                             .min_h(px(theme::TOUCH_TARGET))
                             .px_2()
                             .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                             .flex()
                             .items_center()
                             .gap_1()

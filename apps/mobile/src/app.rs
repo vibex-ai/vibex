@@ -70,6 +70,7 @@ use crate::storage::{
 };
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme};
+use gpui_component::StyledExt as _;
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 
@@ -781,6 +782,13 @@ pub struct MobileApp {
     /// Timestamp of the last drawer pan event, feeding the release-velocity
     /// estimate that separates deliberate swipes from slow drags.
     drawer_pan_last_at: Option<Instant>,
+    /// Whether the drawer owns the momentum that follows the pan it claimed.
+    ///
+    /// The platform keeps emitting fling scroll events after the finger lifts.
+    /// A drawer snap is a programmatic animation, so that momentum has no
+    /// owner: left unclaimed it scrolls whichever list the drawer just
+    /// revealed — a leftward swipe always drags a vertical list up.
+    drawer_fling_owned: bool,
     expanded_process: BTreeMap<String, bool>,
     expanded_timeline_rows: BTreeSet<String>,
     collapsed_timeline_rows: BTreeSet<String>,
@@ -1056,6 +1064,7 @@ impl MobileApp {
             drawer_animation_id: 0,
             drawer_snap_task: None,
             drawer_pan_last_at: None,
+            drawer_fling_owned: false,
             expanded_process: BTreeMap::new(),
             expanded_timeline_rows: BTreeSet::new(),
             collapsed_timeline_rows: BTreeSet::new(),
@@ -5394,6 +5403,7 @@ impl MobileApp {
         self.drawer_gesture = None;
         self.drawer_snap = None;
         self.drawer_snap_task = None;
+        self.drawer_fling_owned = false;
         Self::remove_back_screens(&mut self.back_stack, |screen| {
             matches!(
                 screen,
@@ -5787,6 +5797,8 @@ impl MobileApp {
         match drawer_pan_input(event) {
             DrawerPanInput::Started { delta_x, delta_y } => {
                 self.drawer_gesture = None;
+                // The new touch owns whatever momentum follows it.
+                self.drawer_fling_owned = false;
                 self.drawer_pan_last_at = Some(now);
                 if self.drawer_snap.is_some()
                     || self.session_action.is_some()
@@ -5807,7 +5819,16 @@ impl MobileApp {
                 self.advance_drawer_pan(delta_x, delta_y, now, window, cx);
             }
             DrawerPanInput::Moved { delta_x, delta_y } => {
+                if self.drawer_fling_owned {
+                    // Momentum from the swipe the drawer already claimed.
+                    cx.stop_propagation();
+                    return;
+                }
                 self.advance_drawer_pan(delta_x, delta_y, now, window, cx)
+            }
+            DrawerPanInput::Ended if self.drawer_fling_owned => {
+                self.drawer_fling_owned = false;
+                cx.stop_propagation();
             }
             DrawerPanInput::Ended => self.finish_drawer_pan(false, window, cx),
             DrawerPanInput::Cancelled => self.finish_drawer_pan(true, window, cx),
@@ -5834,6 +5855,10 @@ impl MobileApp {
         if was_dragging || was_partial {
             cx.stop_propagation();
         }
+        // A claimed swipe keeps the fling that follows it: the drawer snaps on
+        // its own animation, and the momentum would otherwise scroll the page
+        // the swipe just revealed.
+        self.drawer_fling_owned = was_dragging;
         self.start_drawer_snap(target, Some(window), cx);
     }
 
@@ -7813,6 +7838,7 @@ impl MobileApp {
                     .id("runtime-agent-strip")
                     .h(px(RUNTIME_SHEET_AGENT_STRIP_HEIGHT))
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
                     .track_scroll(&self.runtime_agent_strip_scroll)
                     .flex()
                     .items_center()
@@ -8128,6 +8154,7 @@ impl MobileApp {
             .flex_shrink_0()
             .h(px(RUNTIME_SHEET_MODEL_LIST_HEIGHT))
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .border_b_1()
             .border_color(theme::border_subtle())
             .pb_1()
@@ -8169,6 +8196,7 @@ impl MobileApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .pb_2();
         let Some(draft) = draft else {
             return list.into_any_element();
@@ -10947,6 +10975,7 @@ impl MobileApp {
                     .id("elicitation-fields")
                     .min_h_0()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -12708,6 +12737,12 @@ impl MobileApp {
                                     ),
                                 )
                                 .track_scroll(&self.drawer_scroll)
+                                // `UniformList` only exposes the axis switch
+                                // through its style refinement.
+                                .refine_style(&gpui::StyleRefinement {
+                                    restrict_scroll_to_axis: Some(true),
+                                    ..Default::default()
+                                })
                                 .on_scroll_wheel(cx.listener(Self::sidebar_list_pan))
                                 .size_full()
                                 .py(px(2.0)),
@@ -12893,6 +12928,7 @@ impl MobileApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
             .px(px(theme::SPACING_LG))
             .py(px(theme::SPACING_MD));
@@ -13574,6 +13610,7 @@ impl MobileApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
@@ -14059,6 +14096,7 @@ impl MobileApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
@@ -14616,6 +14654,7 @@ impl MobileApp {
                     .min_h_0()
                     .track_scroll(&self.settings_scroll)
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .on_scroll_wheel(cx.listener(Self::consume_drawer_scroll))
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_MD))
@@ -17929,6 +17968,84 @@ mod tests {
         }
     }
 
+    /// Two vertical lists, one of them restricted to the gesture's axis.
+    ///
+    /// A drawer swipe is a horizontal pan, and gpui folds a horizontal delta
+    /// into a vertical container's offset unless the container opts out — which
+    /// is how a swipe used to drag the list the drawer just revealed upwards.
+    struct AxisRestrictedScrollProbe {
+        plain: ScrollHandle,
+        restricted: ScrollHandle,
+    }
+
+    impl Render for AxisRestrictedScrollProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .w(px(320.0))
+                .h(px(240.0))
+                .child(
+                    div()
+                        .id("plain-scroll-probe")
+                        .flex_1()
+                        .h_full()
+                        .track_scroll(&self.plain)
+                        .overflow_y_scroll()
+                        .child(div().h(px(600.0)).flex_none()),
+                )
+                .child(
+                    div()
+                        .id("restricted-scroll-probe")
+                        .flex_1()
+                        .h_full()
+                        .track_scroll(&self.restricted)
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .child(div().h(px(600.0)).flex_none()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_horizontal_pan_only_scrolls_a_list_that_restricts_its_axis(cx: &mut TestAppContext) {
+        let plain = ScrollHandle::new();
+        let restricted = ScrollHandle::new();
+        let observed_plain = plain.clone();
+        let observed_restricted = restricted.clone();
+        let (_, cx) = cx.add_window_view(|_, _| AxisRestrictedScrollProbe { plain, restricted });
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // One leftward pan, the direction that opens the workbench drawer.
+        for (x, position) in [
+            (80.0, point(px(80.0), px(120.0))),
+            (240.0, point(px(240.0), px(120.0))),
+        ] {
+            let _ = x;
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(-60.0), px(0.0))),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            observed_plain.offset().y,
+            px(-60.0),
+            "the probe has to show the gpui behaviour it guards against"
+        );
+        assert_eq!(
+            observed_restricted.offset().y,
+            px(0.0),
+            "a horizontal swipe must not scroll a vertical list"
+        );
+    }
+
     #[test]
     fn drawer_pan_waits_until_the_gesture_clears_the_threshold() {
         assert_eq!(
@@ -18180,6 +18297,124 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(200));
         cx.run_until_parked();
         assert_eq!(app.read_with(cx, |app, _| app.drawer_offset), 1.0);
+    }
+
+    /// A claimed drawer swipe keeps the fling that follows it.
+    ///
+    /// The momentum arrives as pans with no gesture of their own, so without
+    /// the drawer remembering that it owns them they scroll whatever the swipe
+    /// just revealed — a leftward swipe always dragged that list upwards.
+    #[gpui::test]
+    fn a_claimed_drawer_swipe_owns_the_fling_that_follows_it(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let position = point(px(300.0), px(200.0));
+        for (delta, touch_phase) in [
+            (px(-24.0), TouchPhase::Started),
+            (px(-120.0), TouchPhase::Moved),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(delta, px(0.0))),
+                modifiers: Default::default(),
+                touch_phase,
+            });
+        }
+        assert!(app.read_with(cx, |app, _| {
+            matches!(
+                app.drawer_gesture,
+                Some(DrawerGesture::Dragging {
+                    page: DrawerPage::Workbench,
+                    ..
+                })
+            )
+        }));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        cx.run_until_parked();
+        let snapped_offset = app.read_with(cx, |app, _| app.drawer_offset);
+        assert!(
+            app.read_with(cx, |app, _| app.drawer_fling_owned),
+            "the drawer has to own the fling of the swipe it claimed"
+        );
+
+        // The momentum that follows the release is the drawer's, so it neither
+        // moves the page nor outlives its own terminal event.
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(-90.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.drawer_offset),
+            snapped_offset
+        );
+        assert!(app.read_with(cx, |app, _| app.drawer_fling_owned));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        assert!(!app.read_with(cx, |app, _| app.drawer_fling_owned));
+    }
+
+    /// A pan the drawer turns down is a list scroll, and its fling is the
+    /// list's: the drawer must not swallow the momentum that keeps it moving.
+    #[gpui::test]
+    fn a_scroll_pan_leaves_its_fling_to_the_list(cx: &mut TestAppContext) {
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let position = point(px(300.0), px(200.0));
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(4.0), px(-40.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        assert!(app.read_with(cx, |app, _| app.drawer_gesture.is_none()));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Ended,
+        });
+        cx.run_until_parked();
+        assert!(!app.read_with(cx, |app, _| app.drawer_fling_owned));
     }
 
     #[test]
