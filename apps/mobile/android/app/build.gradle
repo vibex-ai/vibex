@@ -2,6 +2,30 @@ plugins {
     id 'com.android.application'
 }
 
+// The release tag is the source of truth for the version, so the Android
+// versionCode is derived from the version name rather than kept as a literal
+// that has to be remembered. Android orders installs by this integer alone, so
+// a prerelease has to sort below the release it leads up to: preview < rc <
+// final, with the sequence number separating successive prereleases.
+def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.0-rc.4'
+
+def vibexVersionCode = {
+    def matcher = (vibexVersionName =~ /^(\d+)\.(\d+)\.(\d+)(?:-(preview|rc)\.(\d+))?$/)
+    if (!matcher.matches()) {
+        throw new GradleException("cannot derive an Android versionCode from '${vibexVersionName}'")
+    }
+    def major = matcher[0][1] as int
+    def minor = matcher[0][2] as int
+    def patch = matcher[0][3] as int
+    def channel = matcher[0][4]
+    def sequence = matcher[0][5] ? (matcher[0][5] as int) : 0
+    if (sequence > 99) {
+        throw new GradleException("prerelease sequence ${sequence} in '${vibexVersionName}' overflows the versionCode")
+    }
+    def preRank = channel == null ? 999 : (channel == 'rc' ? 500 : 100) + sequence
+    return major * 10000000 + minor * 100000 + patch * 1000 + preRank
+}()
+
 android {
     namespace 'ai.vibex.mobile'
     compileSdk 35
@@ -10,8 +34,8 @@ android {
         applicationId 'ai.vibex.mobile'
         minSdk 28
         targetSdk 35
-        versionCode 1
-        versionName project.findProperty('vibexVersion') ?: '0.1.0-rc.4'
+        versionCode vibexVersionCode
+        versionName vibexVersionName
 
         ndk {
             abiFilters 'arm64-v8a', 'x86_64'
