@@ -689,6 +689,73 @@ Wrong: soak tick -> print newline -> scroll viewport -> require fullRepaints <= 
 Correct: erase/home stable row + unique counter -> wait for incremental parser/frame update
 ```
 
+## Scenario: GPUI Terminal Grid Painting
+
+### 1. Scope / Trigger
+
+- Trigger: the terminal surface's grid rendering, its repaint cost, or its pointer
+  mapping changes.
+- Ownership boundary: `TerminalFrameCache` owns the cells, `TerminalSurface` owns
+  the element tree and the pointer state.
+
+### 2. Signatures
+
+```text
+shape_terminal_grid(&Entity<TerminalSurface>, &mut Window, &mut App) -> TerminalGridLayout
+paint_terminal_grid(Bounds<Pixels>, &TerminalGridLayout, &Entity<TerminalSurface>, &mut Window, &mut App)
+cell_at_position(Point<Pixels>) -> Option<TerminalGridPoint>
+column_for_offset(&[usize], usize) -> usize
+```
+
+### 3. Contracts
+
+- The grid is exactly one GPUI element. Cells are never one element each: a
+  20 x 100 grid built as per-cell divs with formatted ids and three mouse listeners
+  each cost about 240 ms per draw in a debug build, and every terminal notify
+  (16 ms output poll, 500 ms cursor blink) paid it again for the whole window.
+- Prepaint shapes one `ShapedLine` per row and records each column's byte offset;
+  paint draws backgrounds, glyphs, decorations, and the cursor by hand.
+- Paint each glyph at its cell origin plus the shaped offset inside that cell. The
+  mono font advance is not the cell width (8.0 px at a 13 px code font against a
+  measured 7.8 px advance), so painting a whole shaped row at the font's own
+  advance drifts the columns.
+- Blank, spacer, and hidden cells stay out of the shaped text; the byte-offset
+  table keeps every glyph mapped to its own column.
+- Pointer handlers live on the grid container, not on cells. The `on_prepaint`
+  bounds are the container's content box, which is already the cell origin: do not
+  add or subtract padding when converting a pointer position into a cell.
+- A block cursor inverts its cell's colors; beam, underline, and hollow-block
+  cursors are quads. Selection and underline/strikethrough runs stay per-cell data
+  and merge into one quad per run.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Terminal open and idle, output poll, or cursor blink | Grid painting stays inside the frame budget. |
+| Pointer inside a cell | That cell, never its neighbour, receives selection or mouse reporting. |
+| Pointer outside the cell area | Ignored; no clamped selection. |
+| Shaped row omits blank cells | Glyph-to-column mapping is unchanged. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: one element per grid, one shaped line per row, glyphs snapped to cell origins.
+- Bad: per-cell divs with `format!("terminal-cell-{row}-{column}")` ids and mouse
+  listeners, or painting a shaped row at the font's own advance.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-desktop --lib terminal_surface::` covers glyph-to-column
+  mapping, painted background/decoration/cursor geometry, and pointer-to-cell
+  mapping including drag selection.
+
+### 7. Wrong vs Correct
+
+```text
+Wrong: (0..rows).map(|row| h_flex().children((0..columns).map(render_cell)))
+Correct: one canvas -> shape rows in prepaint -> paint quads and glyphs per cell
+```
+
 ## Scenario: GPUI PDF Surface With Bounded Background Rendering
 
 ### 1. Scope / Trigger
