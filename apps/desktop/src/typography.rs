@@ -15,7 +15,6 @@ pub const MENU_ROW: f32 = 12.5;
 pub const MENU_SUBLINE: f32 = 11.0;
 pub const MENU_HEADING: f32 = 10.0;
 pub const MENU_BODY: f32 = 13.0;
-pub const MENU_KBD: f32 = 10.0;
 
 /// `size` in logical pixels expressed as rems against the default 16px root.
 pub fn ui_rems(size: f32) -> Rems {
@@ -42,11 +41,6 @@ pub fn menu_body() -> Rems {
     ui_rems(MENU_BODY)
 }
 
-/// A keyboard-shortcut chip.
-pub fn menu_kbd() -> Rems {
-    ui_rems(MENU_KBD)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +63,5 @@ mod tests {
         for pair in ladder.windows(2) {
             assert!(pair[0] > pair[1], "ladder must descend: {pair:?}");
         }
-        assert_eq!(MENU_KBD, MENU_HEADING);
     }
 }

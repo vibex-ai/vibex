@@ -502,19 +502,11 @@ const NEW_SESSION_RUNTIME_MENU_MIN_HEIGHT: f32 = 104.0;
 const RUNTIME_MENU_VIEWPORT_MARGIN: f32 = 12.0;
 const RUNTIME_MENU_TRIGGER_GAP: f32 = 4.0;
 const COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT: f32 = 30.0;
-// Chrome above the scroll body: the 40px Agent row and the 40px search row
-// (each carrying its own bottom hairline) plus the 37px footer (1px hairline,
-// 6px padding, 24px button, 6px padding). The card itself is flush, so every
-// pane carries its own padding.
-const COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT: f32 = 119.0;
-const COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT: f32 = 119.0;
+/// One model row in the provider/model list.
 const COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT: f32 = 30.0;
-const COMPOSER_RUNTIME_MODEL_ROW_HEIGHT: f32 = 48.0;
 const COMPOSER_RUNTIME_AGENT_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_RUNTIME_SEARCH_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_RUNTIME_GROUP_HEADING_HEIGHT: f32 = 32.0;
-/// The authentication page's back row: a 32px button over a 9px divider.
-const COMPOSER_RUNTIME_AUTH_BACK_ROW_HEIGHT: f32 = 41.0;
 /// Square Agent logo chip in the provider/model Agent row.
 const COMPOSER_RUNTIME_AGENT_CHIP_SIZE: f32 = 32.0;
 /// Floating-card rounding for the provider/model popovers.
@@ -963,33 +955,6 @@ fn reveal_composer_cursor_after_layout(input: Entity<TextareaState>, window: &mu
 
 fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
     viewport_width <= NEW_SESSION_COMPACT_SELECTOR_MAX_WIDTH
-}
-
-/// Height of a provider/model menu for a given content height.
-///
-/// The caller measures its own content — one heading per group plus one row
-/// per model — because the two are different heights. Counting rows alone
-/// (a heading charged at the row height) over-reserved 2px per group.
-fn composer_runtime_menu_height(
-    view: ComposerRuntimeMenuView,
-    content_height: f32,
-    max_height: f32,
-) -> f32 {
-    let (chrome_height, min_content_height) = match view {
-        ComposerRuntimeMenuView::AuthSource => (
-            COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT,
-            COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT,
-        ),
-        ComposerRuntimeMenuView::Authentication => (
-            COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT,
-            COMPOSER_RUNTIME_MODEL_ROW_HEIGHT,
-        ),
-        ComposerRuntimeMenuView::Model => (
-            COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT,
-            COMPOSER_RUNTIME_MODEL_ROW_HEIGHT,
-        ),
-    };
-    (chrome_height + content_height.max(min_content_height)).min(max_height)
 }
 
 fn composer_runtime_menu_placement(
@@ -21600,37 +21565,6 @@ impl VibexWorkbench {
         self.agent_action_pending
     }
 
-    /// Content height of the provider/model list for the current query and
-    /// scope, so the popover can size itself before the list renders.
-    fn runtime_provider_menu_content_height(
-        &self,
-        catalog: &SessionRuntimeOptionCatalog,
-        agent_id: &AgentId,
-        search: &Entity<InputState>,
-        preferred: Option<&SessionRuntimeSelection>,
-        cx: &App,
-    ) -> f32 {
-        let favorites_view = self.runtime_provider_favorites_view;
-        let agent_ids = if favorites_view {
-            self.runtime_agent_choices()
-                .into_iter()
-                .map(|agent| agent.id)
-                .collect::<Vec<_>>()
-        } else {
-            vec![agent_id.clone()]
-        };
-        let groups = runtime_provider_groups_for_query(
-            catalog,
-            &agent_ids,
-            search.read(cx).value().as_ref(),
-            favorites_view,
-            &self.ui_state.composer.favorite_runtime_models,
-            preferred,
-            &self.ui_state.composer.runtime_selections_by_model,
-        );
-        runtime_provider_groups_content_height(&groups)
-    }
-
     /// Scope the provider/model layer to starred models across every Agent, or
     /// back to the selected Agent's providers.
     fn toggle_runtime_provider_favorites_view(&mut self, cx: &mut Context<Self>) {
@@ -21660,44 +21594,6 @@ impl VibexWorkbench {
         self.runtime_provider_scroll_to_selection = true;
         self.queue_ui_state();
         cx.notify();
-    }
-
-    /// Jump-pick the Nth visible model row (⌘1…⌘9). The index spans every
-    /// visible group, matching the ⌘N chips the rows advertise.
-    fn jump_runtime_provider_model(
-        &mut self,
-        index: usize,
-        context: &RuntimeProviderNavContext,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let favorites_view = self.runtime_provider_favorites_view;
-        let favorites = self.ui_state.composer.favorite_runtime_models.clone();
-        let agent_ids = if favorites_view {
-            self.runtime_agent_choices()
-                .into_iter()
-                .map(|agent| agent.id)
-                .collect::<Vec<_>>()
-        } else {
-            vec![context.agent_id.clone()]
-        };
-        let groups = runtime_provider_groups_for_query(
-            &context.catalog,
-            &agent_ids,
-            context.search.read(cx).value().as_ref(),
-            favorites_view,
-            &favorites,
-            context.preferred.as_ref(),
-            &self.ui_state.composer.runtime_selections_by_model,
-        );
-        let Some(choice) = runtime_provider_group_choices(&groups).get(index).cloned() else {
-            return;
-        };
-        if context.new_session {
-            self.choose_new_session_runtime(choice.selection, window, cx);
-        } else {
-            self.choose_runtime_selection(choice.selection, window, cx);
-        }
     }
 
     /// Hand focus back to the composer once the picker leaves.
@@ -31567,9 +31463,6 @@ impl VibexWorkbench {
         let selected_shadows = runtime_menu_selected_shadows(cx);
         let hairline = runtime_menu_hairline(cx);
         let mut visible_groups = Vec::new();
-        // The ⌘N chips advertise a jump that spans every visible row, so the
-        // index has to run across groups rather than restart at each heading.
-        let mut flat_index = 0usize;
 
         for group in &groups {
             let heading_key = format!(
@@ -31650,8 +31543,6 @@ impl VibexWorkbench {
             }
 
             let rows = group.choices.iter().cloned().map(|choice| {
-                let index = flat_index;
-                flat_index += 1;
                 let is_selected = selected.is_some_and(|selected| {
                     choice.selection.agent_id == selected.agent_id
                         && choice.selection.auth_source == selected.auth_source
@@ -31740,9 +31631,6 @@ impl VibexWorkbench {
                     .when(is_selected, |this| {
                         this.child(Icon::new(IconName::Check).size(px(14.0)))
                     })
-                    .when(index < 9, |this| {
-                        this.child(runtime_menu_kbd_chip(format!("⌘{}", index + 1), cx))
-                    })
                     .child(runtime_menu_star_toggle(
                         row_id.clone(),
                         is_favorite,
@@ -31797,8 +31685,8 @@ impl VibexWorkbench {
                     .h(px(COMPOSER_RUNTIME_SEARCH_ROW_HEIGHT))
                     .flex_none()
                     .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
+                    .pl(px(4.0))
+                    .pr(px(8.0))
                     .border_b_1()
                     .border_color(hairline)
                     .child({
@@ -31868,30 +31756,6 @@ impl VibexWorkbench {
                                     )
                                 })
                             })
-                            // ⌘1…⌘9 jump-picks the Nth visible row. `Input`
-                            // claims no digit chords, so an unhandled key-down
-                            // on the focused field bubbles here.
-                            .on_key_down({
-                                let nav_context = nav_context.clone();
-                                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                                    if !event.keystroke.modifiers.platform {
-                                        return;
-                                    }
-                                    let Ok(digit) = event.keystroke.key.parse::<usize>() else {
-                                        return;
-                                    };
-                                    if !(1..=9).contains(&digit) {
-                                        return;
-                                    }
-                                    this.jump_runtime_provider_model(
-                                        digit - 1,
-                                        &nav_context,
-                                        window,
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                })
-                            })
                             // The popover focuses its own panel when it opens, so the search
                             // field has to claim focus once the provider/model layer is on
                             // screen; without it neither typing nor arrow keys reach here.
@@ -31911,6 +31775,7 @@ impl VibexWorkbench {
                             })
                             .child(
                                 Input::new(&search)
+                                    .small()
                                     .w_full()
                                     .appearance(false)
                                     .text_size(type_scale::menu_body())
@@ -32073,47 +31938,17 @@ impl VibexWorkbench {
             _ => Vec::new(),
         };
         let menu_view = self.new_session_runtime_menu_view;
-        let menu_content_height = match menu_view {
-            ComposerRuntimeMenuView::Model => {
-                COMPOSER_RUNTIME_MODEL_ROW_HEIGHT * model_choices.len().max(1) as f32
-            }
-            ComposerRuntimeMenuView::Authentication => {
-                COMPOSER_RUNTIME_AUTH_BACK_ROW_HEIGHT
-                    + self
-                        .runtime_authentication_menu
-                        .as_ref()
-                        .and_then(|state| state.catalog.as_ref())
-                        .map(|catalog| {
-                            COMPOSER_RUNTIME_MODEL_ROW_HEIGHT * catalog.methods.len().max(1) as f32
-                        })
-                        .unwrap_or(COMPOSER_RUNTIME_MODEL_ROW_HEIGHT)
-            }
-            ComposerRuntimeMenuView::AuthSource => catalog
-                .as_ref()
-                .zip(agent_id.as_ref())
-                .map(|(catalog, agent_id)| {
-                    self.runtime_provider_menu_content_height(
-                        catalog,
-                        agent_id,
-                        &self.new_session_runtime_search,
-                        preferred_model_selection.as_ref(),
-                        cx,
-                    )
-                })
-                .unwrap_or(0.0),
-        };
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
         let viewport_height = self.last_visibility.layout.viewport_height as f32;
-        let desired_menu_height = composer_runtime_menu_height(
-            menu_view,
-            menu_content_height,
-            COMPOSER_RUNTIME_MENU_MAX_HEIGHT,
-        );
+        // Fixed height: the panel must not resize while the user types or
+        // switches Agent, so it always asks for the full cap and lets the
+        // list scroll inside. `composer_runtime_menu_placement` still clamps
+        // to the space actually available around the trigger.
         let menu_placement = composer_runtime_menu_placement(
             self.new_session_composer_geometry.runtime_trigger_bounds,
             viewport_height,
-            desired_menu_height,
+            NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
             NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
         );
         let trigger_bounds_entity = cx.weak_entity();
@@ -34756,38 +34591,14 @@ impl VibexWorkbench {
         );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
+        // See the new-session twin: one fixed height per viewport, so
+        // switching Agent or typing a query never resizes the panel.
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
             .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
-        let menu_view = self.composer_runtime_menu_view;
-        let menu_content_height = match menu_view {
-            ComposerRuntimeMenuView::AuthSource => self.runtime_provider_menu_content_height(
-                &catalog,
-                &menu_agent_id,
-                &self.composer_runtime_search,
-                preferred_model_selection.as_ref(),
-                cx,
-            ),
-            ComposerRuntimeMenuView::Authentication => {
-                COMPOSER_RUNTIME_AUTH_BACK_ROW_HEIGHT
-                    + self
-                        .runtime_authentication_menu
-                        .as_ref()
-                        .and_then(|state| state.catalog.as_ref())
-                        .map(|catalog| {
-                            COMPOSER_RUNTIME_MODEL_ROW_HEIGHT * catalog.methods.len().max(1) as f32
-                        })
-                        .unwrap_or(COMPOSER_RUNTIME_MODEL_ROW_HEIGHT)
-            }
-            ComposerRuntimeMenuView::Model => {
-                COMPOSER_RUNTIME_MODEL_ROW_HEIGHT * model_choices.len().max(1) as f32
-            }
-        };
-        let menu_height =
-            composer_runtime_menu_height(menu_view, menu_content_height, menu_max_height);
         let menu_placement = composer_runtime_menu_placement(
             self.composer_geometry.runtime_trigger_bounds,
             self.last_visibility.layout.viewport_height as f32,
-            menu_height,
+            menu_max_height,
             menu_max_height,
         );
         let separator = || {
@@ -47695,8 +47506,8 @@ fn runtime_model_search_rank(normalized_query: &str, label: &str, provider: &str
 /// One provider group in the provider/model layer: a heading plus the models
 /// it advertises, already filtered and ordered.
 ///
-/// Rendering and keyboard navigation walk the same groups, so the ⌘N chips,
-/// arrow keys and Enter can never disagree with what is on screen.
+/// Rendering and keyboard navigation walk the same groups, so the arrow keys
+/// and Enter can never disagree with what is on screen.
 struct RuntimeProviderGroup {
     agent_id: AgentId,
     source: RuntimeAuthSourceSummary,
@@ -47795,19 +47606,6 @@ fn runtime_provider_groups_for_query(
         }
     }
     groups
-}
-
-/// Content height of the grouped list: one heading per group plus one row per
-/// model. The two are different heights, so the caller measures rather than
-/// counts.
-fn runtime_provider_groups_content_height(groups: &[RuntimeProviderGroup]) -> f32 {
-    groups
-        .iter()
-        .map(|group| {
-            COMPOSER_RUNTIME_GROUP_HEADING_HEIGHT
-                + COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT * group.choices.len() as f32
-        })
-        .sum()
 }
 
 /// Flatten the groups into the order the keyboard cursor walks.
@@ -47926,21 +47724,6 @@ fn runtime_default_reasoning_effort(choices: &[RuntimeCascadeChoice]) -> Option<
         }
     }
     choices.first().map(|choice| choice.value.clone())
-}
-
-/// The ⌘N jump hint trailing a model row.
-fn runtime_menu_kbd_chip(label: String, cx: &App) -> AnyElement {
-    div()
-        .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(5.0))
-        .bg(cx.theme().foreground.opacity(0.05))
-        .text_size(type_scale::menu_kbd())
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_color(cx.theme().muted_foreground.opacity(0.6))
-        .child(SharedString::from(label))
-        .into_any_element()
 }
 
 /// The star toggle trailing a model row.
@@ -63006,37 +62789,34 @@ mod tests {
     }
 
     #[test]
-    fn composer_runtime_menu_reserves_agent_row_search_and_model_rows_before_scrolling() {
-        // Content is measured, not counted: one heading per group plus one row
-        // per model, and the two heights differ. An empty list still reserves
-        // one row so the chrome never collapses onto itself.
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 0.0, 448.0),
-            COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT + COMPOSER_RUNTIME_AGENT_PROFILE_ROW_HEIGHT
-        );
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::AuthSource, 92.0, 448.0),
-            COMPOSER_RUNTIME_PROFILE_MENU_CHROME_HEIGHT + 92.0
-        );
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 0.0, 448.0),
-            COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT + COMPOSER_RUNTIME_MODEL_ROW_HEIGHT
-        );
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 48.0, 448.0),
-            COMPOSER_RUNTIME_MODEL_MENU_CHROME_HEIGHT + 48.0
-        );
-        assert_eq!(
-            composer_runtime_menu_height(ComposerRuntimeMenuView::Model, 960.0, 448.0),
-            448.0
-        );
-    }
+    fn runtime_menu_height_does_not_follow_its_content() {
+        // Switching Agent or typing a query must never resize the panel, so
+        // both cascades ask for the full cap and let the list scroll inside.
+        let source = include_str!("app.rs");
+        let new_session = source
+            .split_once("    fn render_new_session_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_panel("))
+            .map(|(body, _)| body)
+            .expect("new-session runtime cascade should remain inspectable");
+        let composer = source
+            .split_once("    fn render_composer_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .map(|(body, _)| body)
+            .expect("current-session runtime cascade should remain inspectable");
 
-    #[test]
-    fn provider_menu_content_height_charges_headings_and_rows_separately() {
-        // A group is a 32px heading plus 30px per model — charging the heading
-        // at the row height over-reserved 2px per group.
-        assert_eq!(runtime_provider_groups_content_height(&[]), 0.0);
+        assert!(
+            !new_session.contains("menu_content_height")
+                && !composer.contains("menu_content_height"),
+            "the popover height must not be derived from the filtered content"
+        );
+        assert!(
+            new_session.contains("NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,\n            NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,"),
+            "the new-session popover must ask for its full cap up front"
+        );
+        assert!(
+            composer.contains("menu_max_height,\n            menu_max_height,"),
+            "the composer popover must ask for its full cap up front"
+        );
     }
 
     #[test]
@@ -63537,7 +63317,10 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(runtime_provider_groups_content_height(&groups), 0.0);
+        assert!(
+            groups.is_empty(),
+            "a provider profile with no models contributes no group"
+        );
         assert!(
             runtime_model_choices(&catalog, &agent.id, &auth_sources[0].source, None, &[])
                 .is_empty()
@@ -63594,7 +63377,11 @@ mod tests {
             .expect("current-session runtime cascade should remain inspectable");
         let provider_groups = source
             .split_once("fn runtime_provider_groups_for_query(")
-            .and_then(|(_, tail)| tail.split_once("\n/// Content height of the grouped list"))
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n/// Flatten the groups into the order the keyboard cursor walks.",
+                )
+            })
             .map(|(body, _)| body)
             .expect("provider group projection should remain inspectable");
         let agent_chip = source
