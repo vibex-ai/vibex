@@ -17,7 +17,7 @@ The Relay must not decrypt, authorize, store, or log Vibex business payloads.
 The image is published for every release, so the common path is a pull:
 
 ```bash
-export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.3
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.4
 docker compose -f deploy/relay/docker-compose.yml pull relay-server
 docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health

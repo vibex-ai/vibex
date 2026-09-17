@@ -144,7 +144,7 @@
     {
       "id": "vibex-desktop-reviewed-icons",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
-      "version": "0.1.0-rc.3",
+      "version": "0.1.0-rc.4",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/icons",
       "extensions": [
@@ -215,7 +215,7 @@
     {
       "id": "vibex-desktop-application-icons",
       "name": "Vibex desktop application and tray icons",
-      "version": "0.1.0-rc.3",
+      "version": "0.1.0-rc.4",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/app-icons",
       "extensions": [
@@ -231,7 +231,7 @@
     {
       "id": "vibex-mobile-brand-marks",
       "name": "Vibex native mobile brand mark",
-      "version": "0.1.0-rc.3",
+      "version": "0.1.0-rc.4",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/brand",
       "extensions": [
@@ -245,7 +245,7 @@
     {
       "id": "vibex-mobile-application-icons",
       "name": "Vibex native mobile application icons",
-      "version": "0.1.0-rc.3",
+      "version": "0.1.0-rc.4",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
       "extensions": [
@@ -260,7 +260,7 @@
     {
       "id": "vibex-mobile-native-icons",
       "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.0-rc.3",
+      "version": "0.1.0-rc.4",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/icons",
       "extensions": [
