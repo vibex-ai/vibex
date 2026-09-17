@@ -1,6 +1,6 @@
 # Vibex v0.1.0-rc.4 Release Notes
 
-- Released: 2026-09-17 · Range: `v0.1.0-rc.3...v0.1.0-rc.4` · 43 commits
+- Released: 2026-09-17 · Range: `v0.1.0-rc.3...v0.1.0-rc.4` · 45 commits
 
 ---
 
@@ -48,6 +48,8 @@
 
 - The zcode adapter is updated from 0.17.2 to 0.37.1 (`d88327f`)
 - Approval prompts for zcode now show the readable description of the tool call and the files it will touch, and the adapter always runs on Node (`d88327f`)
+- Cursor now publishes one option per model parameter instead of freezing every combination into its own model id, so models are listed by name and `fast`, `context`, and reasoning depth are chosen as options on the model you picked (`8ab812f`)
+- Reasoning depth stays settable during a session, a boolean thinking toggle appears under Session options instead of being read as a depth level, and a model saved under an old variant id (`claude-opus-5[thinking=true,context=300k]`) collapses to its model name once the CLI proves it uses the new shape (`8ab812f`)
 
 ### Fixes
 
@@ -87,8 +89,9 @@
 - Vibex no longer vendors the Zed source tree: the interface toolkit comes from published packages, the small unpublished bridge it needed now lives in this repository, the bundled fonts and mobile icons moved out of the old copy, and the mobile platform layer, keyboard handling, and iOS entry point were rebuilt on the published package (`6ffcf7c`)
 - The interface toolkit family is pinned to a specific revision, with a note in the specs about when that pin may move (`825bb97`, `9ecc107`, `e1d56bc`)
 - The build and licence checks were updated for the new dependencies and assets, the list of bundled software (SBOM), third-party notices, and licence policy were regenerated, and the release packaging, platform support, UI boundary, and licence documents were refreshed (`6ffcf7c`, `04d582d`, `a5af0ee`)
-- The project's specs were updated for the window chrome, the Usage toolbar, silent Agent turns, the dependency source, and terminal drawing (`2a03753`, `dcd01d8`, `e1d56bc`, `eabe83b`)
+- The project's specs were updated for the window chrome, the Usage toolbar, silent Agent turns, the dependency source, terminal drawing, and Cursor's parameterized model picker (`2a03753`, `dcd01d8`, `e1d56bc`, `eabe83b`, `8ab812f`)
 - A code-quality check that failed on the mobile scroll listener no longer breaks the Rust quality gate or CI (`45709c8`)
+- The Android release job no longer dies before it builds anything: the SDK setup action still asked for the legacy `tools` package, which Google no longer publishes, and it is now pinned to the version that dropped it (`b870998`)
 - Version numbers were bumped to `0.1.0-rc.4` across the workspace and the packaging inputs (`4dd6ce6`)
 
 ---
@@ -137,6 +140,8 @@
 
 - zcode 适配器从 0.17.2 升级到 0.37.1（`d88327f`）
 - zcode 的审批提示现在会显示工具调用的可读说明和将要改动的文件，适配器固定使用 Node 运行（`d88327f`）
+- Cursor 现在按模型参数逐个发布选项，不再把每种参数组合冻结成单独的模型 id：模型按名称列出，`fast`、`context` 和推理深度作为所选模型上的选项来设置（`8ab812f`）
+- 推理深度在会话中仍可随时调整；布尔型的 thinking 开关归入会话选项，不再被当成一个深度档位；用旧变体 id 保存的模型（`claude-opus-5[thinking=true,context=300k]`）在确认 CLI 已使用新形态后，会自动收敛为模型名（`8ab812f`）
 
 ### 修复
 
@@ -176,6 +181,7 @@
 - 不再内置 Zed 源码：界面工具包改用已发布的软件包，其中一小段未发布的桥接代码移入本仓库；随包字体和移动端图标迁出旧副本；移动端平台层、键盘处理和 iOS 入口都重建在已发布的软件包之上（`6ffcf7c`）
 - 界面工具包系列固定到某个具体修订，并在项目文档（spec）中写明该固定点何时可以前移（`825bb97`、`9ecc107`、`e1d56bc`）
 - 构建与许可证检查适配了新的依赖和资源，重新生成软件物料清单（SBOM）、第三方声明与许可证策略，并更新发布打包、平台支持、UI 边界与许可证文档（`6ffcf7c`、`04d582d`、`a5af0ee`）
-- 项目文档（spec）更新了窗口边框、用量工具栏、静默 Agent 回合、依赖来源与终端绘制相关内容（`2a03753`、`dcd01d8`、`e1d56bc`、`eabe83b`）
+- 项目文档（spec）更新了窗口边框、用量工具栏、静默 Agent 回合、依赖来源、终端绘制与 Cursor 参数化模型选择器相关内容（`2a03753`、`dcd01d8`、`e1d56bc`、`eabe83b`、`8ab812f`）
 - 移动端滚动监听器的一处代码检查失败不再影响 Rust 质量门禁和 CI（`45709c8`）
+- Android 发布任务不再在构建开始前就中断：SDK 初始化动作仍在请求 Google 已停止发布的旧 `tools` 包，现已固定到去掉该包的版本（`b870998`）
 - 工作区与打包输入的版本号统一升到 `0.1.0-rc.4`（`4dd6ce6`）
