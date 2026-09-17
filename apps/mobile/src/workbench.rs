@@ -1485,6 +1485,7 @@ impl MobileWorkbench {
                     .border_color(theme::border_default())
                     .bg(theme::bg_card())
                     .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
                     .child(textarea_element(self.file_editor_input.as_ref())),
             )
             .child(
@@ -1591,6 +1592,10 @@ impl MobileWorkbench {
                                 div()
                                     .min_w_0()
                                     .flex_1()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        crate::app::resume_keyboard_on_tap,
+                                    )
                                     .child(input_element(self.file_search_input.as_ref())),
                             )
                             .when(search_loading, |bar| {
@@ -2078,9 +2083,16 @@ impl MobileWorkbench {
                                         .text_color(theme::text_muted()),
                                 )
                                 .child(
-                                    div().min_w_0().flex_1().child(input_element(
-                                        self.git_history_query_input.as_ref(),
-                                    )),
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            crate::app::resume_keyboard_on_tap,
+                                        )
+                                        .child(input_element(
+                                            self.git_history_query_input.as_ref(),
+                                        )),
                                 )
                                 .when(
                                     !input_value(&self.git_history_query_input, cx)
@@ -3657,6 +3669,7 @@ fn input_shell(input: Option<&Entity<InputState>>) -> gpui::Div {
         .border_color(theme::border_default())
         .bg(theme::bg_card())
         .px_1()
+        .on_mouse_down(MouseButton::Left, crate::app::resume_keyboard_on_tap)
         .child(input_element(input))
 }
 

@@ -144,6 +144,30 @@ pub unsafe extern "C" fn Java_ai_vibex_mobile_GpuiNativeActivity_nativeOnAppLife
     platform::notify_lifecycle(phase);
 }
 
+/// Reports the software keyboard's visibility from the Android host.
+///
+/// `gpui-pre-mobile` drives the IME from focus changes alone, so nothing on the
+/// Rust side learns that the user dismissed the keyboard while an input kept
+/// GPUI focus. The vendored activity reports the real state so a tap on that
+/// input can ask for the keyboard again.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeKeyboardVisible<'caller>(
+    mut unowned_env: jni::EnvUnowned<'caller>,
+    _class: jni::objects::JClass<'caller>,
+    visible: jni::sys::jboolean,
+) {
+    unowned_env
+        .with_env(|_| -> jni::errors::Result<()> {
+            platform::set_keyboard_visible(visible);
+            Ok(())
+        })
+        .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// Registers the iOS root-view callback.
 ///
 /// The UIKit host calls this from `application:didFinishLaunchingWithOptions:`

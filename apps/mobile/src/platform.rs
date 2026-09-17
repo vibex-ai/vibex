@@ -23,6 +23,7 @@
 //!   over JNI, both landing in [`notify_lifecycle`].
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Edges, Pixels, Platform, Window, px};
 
@@ -134,6 +135,41 @@ pub fn hide_keyboard() {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         gpui_mobile::hide_keyboard();
+    }
+}
+
+/// The keyboard's visibility as last reported by the platform.
+///
+/// Android's host activity reports it from the layout change the IME causes;
+/// iOS derives it from the keyboard height `gpui-pre-mobile` tracks itself.
+static KEYBOARD_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Records the software keyboard's visibility (Android host callback).
+pub fn set_keyboard_visible(visible: bool) {
+    KEYBOARD_VISIBLE.store(visible, Ordering::Release);
+}
+
+/// Whether the software keyboard is on screen.
+pub fn keyboard_visible() -> bool {
+    #[cfg(target_os = "ios")]
+    {
+        gpui_mobile::keyboard_height() > 0.0
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        KEYBOARD_VISIBLE.load(Ordering::Acquire)
+    }
+}
+
+/// Re-requests the software keyboard for a tap on a text field.
+///
+/// The platform shows and hides the IME from focus changes alone, so an input
+/// that keeps GPUI focus while the user dismisses the keyboard never asks for
+/// it again — the tap has to, or the field stays focused with no way back to
+/// typing but tapping elsewhere first.
+pub fn resume_keyboard() {
+    if !keyboard_visible() {
+        show_keyboard();
     }
 }
 

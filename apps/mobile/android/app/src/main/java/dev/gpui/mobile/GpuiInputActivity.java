@@ -8,12 +8,14 @@ package dev.gpui.mobile;
 
 import android.app.NativeActivity;
 import android.content.pm.PackageManager;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.Selection;
 import android.text.TextWatcher;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
@@ -22,9 +24,23 @@ import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+
 /** NativeActivity with a UI-thread InputConnection for multistage IMEs. */
 public class GpuiInputActivity extends NativeActivity {
     private InputProxy input;
+
+    /**
+     * The software keyboard's last reported visibility.
+     *
+     * Vibex addition: `gpui-pre-mobile` drives the IME from focus changes alone,
+     * so nothing on the Rust side learns that the user dismissed the keyboard
+     * while an input kept GPUI focus — and a tap on that input never asks for
+     * the keyboard again. Reporting the real visibility lets the app re-request
+     * it. See {@code platform::keyboard_visible}.
+     */
+    private boolean imeVisible;
 
     @Override protected void onCreate(Bundle state) {
         // NativeActivity's dlopen alone does not register JNI native methods.
@@ -36,7 +52,28 @@ public class GpuiInputActivity extends NativeActivity {
             throw new IllegalStateException(error);
         }
         super.onCreate(state);
+        getWindow().getDecorView().getViewTreeObserver()
+                .addOnGlobalLayoutListener(this::reportImeVisibility);
     }
+
+    /** Vibex addition: report a layout change that is the software keyboard. */
+    private void reportImeVisibility() {
+        View decor = getWindow().getDecorView();
+        Rect visibleFrame = new Rect();
+        decor.getWindowVisibleDisplayFrame(visibleFrame);
+        WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(decor);
+        boolean imeInsets = insets != null && insets.isVisible(WindowInsetsCompat.Type.ime());
+        // With `adjustResize` the window shrinks instead of the content being
+        // panned, so the keyboard is the difference between the frame the
+        // window reports and the display area it still occupies.
+        int heightDiff = decor.getRootView().getHeight() - visibleFrame.bottom;
+        boolean visible = imeInsets || heightDiff > getResources().getDisplayMetrics().density * 100f;
+        if (visible == imeVisible) return;
+        imeVisible = visible;
+        nativeKeyboardVisible(visible);
+    }
+
+    private static native void nativeKeyboardVisible(boolean visible);
 
     public void gpuiShowKeyboard(int keyboardType, long session) {
         runOnUiThread(() -> {

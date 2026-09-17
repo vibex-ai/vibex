@@ -6159,6 +6159,7 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
+                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                     .child(Input::new(&self.pairing_server_url_input).appearance(false)),
             )
             .child(
@@ -6166,6 +6167,7 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
+                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                     .child(Input::new(&self.pairing_code_input).appearance(false)),
             )
             .child(
@@ -6212,6 +6214,7 @@ impl MobileApp {
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
+                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                     .child(Input::new(&self.pairing_link_input).appearance(false)),
             )
             .child(
@@ -7281,6 +7284,7 @@ impl MobileApp {
                             .px_3()
                             .flex()
                             .items_center()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(Input::new(&self.sidebar_name_input).appearance(false)),
                     )
                     .child(
@@ -7410,6 +7414,7 @@ impl MobileApp {
                                 .border_color(theme::border_default())
                                 .bg(theme::bg_primary())
                                 .px_1()
+                                .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                                 .child(Input::new(&self.session_action_input).appearance(false)),
                         )
                     })
@@ -7549,6 +7554,7 @@ impl MobileApp {
                                 .border_color(theme::border_default())
                                 .bg(theme::bg_primary())
                                 .px_1()
+                                .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                                 .child(Input::new(&self.session_action_input).appearance(false)),
                         )
                     })
@@ -7977,6 +7983,7 @@ impl MobileApp {
                     div()
                         .flex_1()
                         .min_w_0()
+                        .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                         .child(Input::new(&input).appearance(false)),
                 )
             })
@@ -10804,6 +10811,7 @@ impl MobileApp {
                             .border_1()
                             .border_color(theme::border_default())
                             .bg(theme::bg_card_dim())
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(input)
                             .into_any_element()
                     })
@@ -11139,24 +11147,28 @@ impl MobileApp {
                     .items_end()
                     .pl(px(theme::SPACING_XS))
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.composer_input)
-                                .appearance(false)
-                                // The long press hook is the only signal the
-                                // platform gives for "the user selected this
-                                // word": open the touch toolbar instead of the
-                                // kit's keyboard-oriented menu, which would
-                                // take focus and collapse the keyboard.
-                                .context_menu({
-                                    let menu = self.selection_menu.downgrade();
-                                    move |items, _window, cx| {
-                                        if let Some(menu) = menu.upgrade() {
-                                            menu.update(cx, |menu, cx| menu.open(cx));
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(
+                                Textarea::new(&self.composer_input)
+                                    .appearance(false)
+                                    // The long press hook is the only signal the
+                                    // platform gives for "the user selected this
+                                    // word": open the touch toolbar instead of the
+                                    // kit's keyboard-oriented menu, which would
+                                    // take focus and collapse the keyboard.
+                                    .context_menu({
+                                        let menu = self.selection_menu.downgrade();
+                                        move |items, _window, cx| {
+                                            if let Some(menu) = menu.upgrade() {
+                                                menu.update(cx, |menu, cx| menu.open(cx));
+                                            }
+                                            items
                                         }
-                                        items
-                                    }
-                                }),
-                        ),
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -12549,9 +12561,17 @@ impl MobileApp {
                                         .flex_shrink_0()
                                         .text_color(theme::sidebar_text_muted()),
                                 )
-                                .child(div().flex_1().min_w_0().h_full().child(
-                                    Input::new(&self.sidebar_search_input).appearance(false),
-                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                                        .child(
+                                            Input::new(&self.sidebar_search_input)
+                                                .appearance(false),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .id("mobile-drawer-search-close")
@@ -13450,6 +13470,7 @@ impl MobileApp {
                             .px_3()
                             .flex()
                             .items_center()
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(Input::new(&self.host_name_input).appearance(false)),
                     )
                     .child(
@@ -14245,6 +14266,7 @@ impl MobileApp {
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
                             .px(px(2.0))
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(Input::new(&self.new_session_title_input).appearance(false)),
                     )
                     .child(
@@ -14256,6 +14278,7 @@ impl MobileApp {
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
                             .px(px(2.0))
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(Input::new(&self.new_session_prompt_input).appearance(false)),
                     )
                     .child(
@@ -14328,6 +14351,7 @@ impl MobileApp {
                             .border_1()
                             .border_color(theme::border_default())
                             .bg(theme::bg_card())
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
                             .child(Input::new(&self.new_project_input).appearance(false)),
                     )
                     .when_some(self.new_project_error.as_ref(), |body, error| {
@@ -15057,6 +15081,17 @@ impl MobileApp {
             MobileOverlay::NewSession => self.render_new_session(cx),
         }
     }
+}
+
+/// A tap on a text field's frame: ask for the keyboard the user dismissed.
+///
+/// The platform drives the IME from focus changes alone, so a field that keeps
+/// GPUI focus after the keyboard is dismissed never asks for it again — the tap
+/// has to, or the only way back to typing is tapping somewhere else first.
+/// Only a field's own frame carries this, never a row that also holds buttons,
+/// so a tap on a button never opens the keyboard.
+pub(crate) fn resume_keyboard_on_tap(_: &gpui::MouseDownEvent, _: &mut Window, _: &mut App) {
+    crate::platform::resume_keyboard();
 }
 
 /// A placeholder mouse event for reusing mouse-up listeners from the back-key
@@ -16458,6 +16493,7 @@ fn runtime_feature_input(input: &Entity<InputState>) -> gpui::Div {
         .border_color(theme::border_default())
         .bg(theme::bg_card())
         .px_1()
+        .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
         .child(Input::new(input).appearance(false))
 }
 
@@ -18870,6 +18906,64 @@ mod tests {
 
         assert!(observed_drawer_scroll.offset().y < px(0.0));
         assert_eq!(observed_timeline_scroll.offset().y, px(0.0));
+    }
+
+    /// The name of the function whose body contains `index`, if any.
+    fn enclosing_function_name(source: &str, index: usize) -> Option<&str> {
+        let head = &source[..index];
+        let (_, tail) = head.rsplit_once("\nfn ")?;
+        tail.split(['(', '<', ' ']).next()
+    }
+
+    /// Every text field the phone renders has to ask for the keyboard on a tap.
+    ///
+    /// The platform shows the IME on focus changes alone, so a field that keeps
+    /// focus after the user dismisses the keyboard never asks for it again; the
+    /// tap has to. The kit's `Input`/`Textarea` expose no event hook, so the
+    /// field's own frame carries it — never a row that also holds buttons, or a
+    /// tap on a button would open the keyboard.
+    #[test]
+    fn every_text_field_asks_for_the_keyboard_on_a_tap() {
+        for (name, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("workbench.rs", include_str!("workbench.rs")),
+        ] {
+            // The test module quotes the very patterns this test looks for.
+            let source = source
+                .split("\nmod tests {")
+                .next()
+                .expect("the module has production code");
+            for field in ["Input::new(", "Textarea::new("] {
+                for (index, _) in source.match_indices(field) {
+                    // `MarkdownInput::new` only looks like a kit field.
+                    if source[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|previous| previous.is_alphanumeric() || previous == '_')
+                    {
+                        continue;
+                    }
+                    // The shared renderers return the kit component itself; the
+                    // frames that call them carry the hook.
+                    if matches!(
+                        enclosing_function_name(source, index),
+                        Some("input_element" | "textarea_element")
+                    ) {
+                        continue;
+                    }
+                    let start = source[..index]
+                        .char_indices()
+                        .rev()
+                        .nth(600)
+                        .map_or(0, |(offset, _)| offset);
+                    let frame = &source[start..index];
+                    assert!(
+                        frame.contains("resume_keyboard_on_tap"),
+                        "{name}: the field at byte {index} has no keyboard tap hook"
+                    );
+                }
+            }
+        }
     }
 
     /// A long press on the composer has to reach the touch toolbar instead of
