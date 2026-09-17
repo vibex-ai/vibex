@@ -256,8 +256,18 @@ in process history. Do not resize the virtual row from character counts or
 Markdown syntax in the newer source.
 
 While the same streaming row remains active, intrinsic measurements may grow but
-must not shrink the turn: incomplete Markdown syntax can temporarily reparse into
-a shorter document and otherwise make bottom-follow bounce in both directions.
+must not shrink the turn on the first shorter observation: incomplete Markdown
+syntax can temporarily reparse into a shorter document and otherwise make
+bottom-follow bounce in both directions. A turn is one virtual row, so a held
+extent that never releases renders as an empty band under the last row, and
+bottom-follow parks the viewport on that band. A repeatable smaller measurement
+is therefore real content reduction — a collapsed card, merged process rows, or
+activity folded into one summary line — and must replace the held extent once it
+has settled: the same height confirmed by at least two paints and held for a
+settle window longer than the streaming Markdown refresh throttle. Restart that
+window whenever the measured height changes, so a still growing document keeps
+the extent its streaming content already earned and no reparse wobble becomes a
+scroll jump.
 A text-only event that changes presentation structure, such as commentary moving
 to the conclusion or the final message reconciling the stream, keeps the current
 virtual extent for that frame but invalidates the old intrinsic measurement. Once
@@ -269,9 +279,15 @@ scrolls against that measured extent once.
 // then contracts to the old prepaint measurement and visibly bounces.
 virtual_height += estimate_height(delta);
 
+// Wrong: holding the largest extent forever leaves permanent slack under the
+// last row, because a turn is one virtual row and bottom-follow scrolls to the
+// extent bottom.
+measured_height = previous_measured_height.max(measured_height); // no release
+
 // Correct: source update -> background parse -> intrinsic measurement -> scroll.
 estimated_heights.insert(turn_id, (signature, current_virtual_height));
 measured_height = previous_measured_height.max(measured_height); // same streaming row only
+measured_height = settle_streaming_shrink(measured_height, candidate, now); // settled shrink wins
 ```
 
 The same ownership rule applies inside `MarkdownVirtualFlow`. A long streaming
@@ -309,6 +325,11 @@ virtual row-size vector. Cover both conclusion and process-history Agent text,
 the non-shrinking same-row measurement rule, and the text-only structural
 transition path that bypasses estimated height. Non-text structured events
 continue to use the full invalidation contract above.
+Cover the shrink release too: a one-frame shorter measurement keeps the held
+extent, a document that keeps changing never settles one, a confirmed and
+settled shorter measurement reclaims the extent, the settle window only applies
+while the preserve policy owns the turn, and a queued candidate is dropped by
+every measurement invalidation path.
 For long Markdown, also assert that an append-only document update preserves
 the measured prefix and continuing tail, that repeated streaming measurements
 are monotonic, and that the final non-streaming measurement can converge

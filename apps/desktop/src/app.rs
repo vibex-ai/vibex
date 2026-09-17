@@ -429,6 +429,13 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::fr
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
+/// Settle window before a repeatable smaller intrinsic measurement may replace
+/// a streaming turn's held extent. Incomplete Markdown reparses shorter for far
+/// less than this window, while a real content reduction stays put.
+const AGENT_TIMELINE_STREAMING_SHRINK_SETTLE: Duration = Duration::from_millis(250);
+/// Confirming paints required before a settled shrink is accepted.
+const AGENT_TIMELINE_STREAMING_SHRINK_CONFIRMATIONS: u8 = 2;
+const AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX: f32 = 1.0;
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
 const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -3776,6 +3783,16 @@ fn stable_streaming_timeline_height(
     }
 }
 
+fn streaming_extent_is_preserved(
+    preserve_streaming_extent: bool,
+    previous_layout_signature: Option<u64>,
+    current_layout_signature: Option<u64>,
+) -> bool {
+    preserve_streaming_extent
+        && current_layout_signature.is_some()
+        && previous_layout_signature == current_layout_signature
+}
+
 fn stable_streaming_timeline_height_for_layout(
     previous_height: Option<f32>,
     measured_height: f32,
@@ -3783,10 +3800,89 @@ fn stable_streaming_timeline_height_for_layout(
     previous_layout_signature: Option<u64>,
     current_layout_signature: Option<u64>,
 ) -> f32 {
-    let preserve_streaming_extent = preserve_streaming_extent
-        && current_layout_signature.is_some()
-        && previous_layout_signature == current_layout_signature;
-    stable_streaming_timeline_height(previous_height, measured_height, preserve_streaming_extent)
+    stable_streaming_timeline_height(
+        previous_height,
+        measured_height,
+        streaming_extent_is_preserved(
+            preserve_streaming_extent,
+            previous_layout_signature,
+            current_layout_signature,
+        ),
+    )
+}
+
+/// A repeatable smaller intrinsic measurement observed while the streaming
+/// preserve policy still owns a turn's virtual extent.
+///
+/// The policy holds the previous extent on the first observation because
+/// incomplete Markdown can reparse into a shorter document for a frame or two.
+/// A candidate that keeps repeating while the turn reshapes nothing, however,
+/// is real content reduction - a collapsed card, merged process rows, or
+/// activity grouped into one summary line. Holding that back forever is what
+/// leaves a blank band under the last row, so a settled candidate replaces the
+/// held extent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StreamingShrinkCandidate {
+    height: f32,
+    observed_at: Instant,
+    confirmations: u8,
+}
+
+impl StreamingShrinkCandidate {
+    /// Fold one smaller measurement into the candidate. A different height
+    /// restarts the window: a still growing document is not settling.
+    fn observe(previous: Option<Self>, measured_height: f32, now: Instant) -> Self {
+        match previous.filter(|candidate| {
+            (candidate.height - measured_height).abs() < AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX
+        }) {
+            Some(previous) => Self {
+                height: measured_height,
+                observed_at: previous.observed_at,
+                confirmations: previous.confirmations.saturating_add(1),
+            },
+            None => Self {
+                height: measured_height,
+                observed_at: now,
+                confirmations: 1,
+            },
+        }
+    }
+
+    fn is_settled(&self, now: Instant) -> bool {
+        self.confirmations >= AGENT_TIMELINE_STREAMING_SHRINK_CONFIRMATIONS
+            && now.saturating_duration_since(self.observed_at)
+                >= AGENT_TIMELINE_STREAMING_SHRINK_SETTLE
+    }
+}
+
+/// Resolve a measurement taken while the preserve policy holds a turn's extent.
+///
+/// Returns the extent to keep plus the shrink candidate that survives the
+/// frame: an unsettled candidate keeps the held extent and stays queued so the
+/// next paint can confirm it; a settled one releases the extent to the freshly
+/// measured content so bottom-follow can reclaim the freed space.
+fn settle_streaming_timeline_shrink(
+    previous_height: Option<f32>,
+    raw_measured_height: f32,
+    stable_height: f32,
+    preserve_streaming_extent: bool,
+    candidate: Option<StreamingShrinkCandidate>,
+    now: Instant,
+) -> (f32, Option<StreamingShrinkCandidate>) {
+    let is_shrinking = preserve_streaming_extent
+        && previous_height.is_some_and(|previous| {
+            raw_measured_height < previous - AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX
+        });
+    if !is_shrinking {
+        return (stable_height, None);
+    }
+
+    let candidate = StreamingShrinkCandidate::observe(candidate, raw_measured_height, now);
+    if candidate.is_settled(now) {
+        (raw_measured_height, None)
+    } else {
+        (stable_height, Some(candidate))
+    }
 }
 
 fn timeline_layout_width_changed(previous: Option<f32>, current: Option<f32>) -> bool {
@@ -5016,6 +5112,7 @@ pub struct VibexWorkbench {
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
+    timeline_streaming_shrink_candidates: BTreeMap<String, StreamingShrinkCandidate>,
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_layout_width: Option<f32>,
@@ -5847,6 +5944,7 @@ impl VibexWorkbench {
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_measured_turn_heights: BTreeMap::new(),
             timeline_measured_turn_layout_signatures: BTreeMap::new(),
+            timeline_streaming_shrink_candidates: BTreeMap::new(),
             timeline_pending_turn_heights: BTreeMap::new(),
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_layout_width: None,
@@ -11827,6 +11925,9 @@ impl VibexWorkbench {
             ),
         };
         entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
+        // Shrink candidates are transient paint bookkeeping, not view state: a
+        // restored extent must earn its next reclaim from fresh measurements.
+        self.timeline_streaming_shrink_candidates.clear();
         self.timeline_markdown_sources.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -11912,6 +12013,9 @@ impl VibexWorkbench {
         self.timeline_measured_turn_layout_signatures =
             entry.timeline_measured_turn_layout_signatures;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
+        // A restored extent re-earns any reclaim from the first paints of the
+        // switched-to session instead of carrying paint bookkeeping across.
+        self.timeline_streaming_shrink_candidates.clear();
         self.timeline_markdown_sources.clear();
         self.timeline_reasoning_summaries.clear();
         self.timeline_tool_card_projections.clear();
@@ -14047,6 +14151,8 @@ impl VibexWorkbench {
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         self.timeline_measured_turn_layout_signatures
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
+        self.timeline_streaming_shrink_candidates
+            .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         self.timeline_estimated_turn_heights
             .retain(|turn_id, _| active_turn_ids.contains(turn_id.as_str()));
         let content_width = session_content_max_width(self.ui_state.session.content_width)
@@ -14071,6 +14177,7 @@ impl VibexWorkbench {
     fn invalidate_timeline_layout_measurements(&mut self) {
         self.timeline_measured_turn_heights.clear();
         self.timeline_measured_turn_layout_signatures.clear();
+        self.timeline_streaming_shrink_candidates.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
@@ -14256,6 +14363,7 @@ impl VibexWorkbench {
         self.timeline_item_index.get_mut().invalidate();
         self.timeline_measured_turn_heights.clear();
         self.timeline_measured_turn_layout_signatures.clear();
+        self.timeline_streaming_shrink_candidates.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         // The row table is derived from the measurements just cleared. Drop it
@@ -14280,6 +14388,7 @@ impl VibexWorkbench {
         self.timeline_measured_turn_heights.remove(turn_id);
         self.timeline_measured_turn_layout_signatures
             .remove(turn_id);
+        self.timeline_streaming_shrink_candidates.remove(turn_id);
         self.timeline_pending_turn_heights
             .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
     }
@@ -14560,13 +14669,38 @@ impl VibexWorkbench {
                     .and_then(|turn| streaming_timeline_row_body_len(turn, state))
                     .is_some_and(|body_len| body_len == state.body_len)
         });
-        let measured_height = stable_streaming_timeline_height_for_layout(
+        let extent_preserved = streaming_extent_is_preserved(
+            preserve_streaming_extent,
+            previous_layout_signature,
+            layout_signature,
+        );
+        let stable_height = stable_streaming_timeline_height_for_layout(
             previous_height,
             measured_height,
             preserve_streaming_extent,
             previous_layout_signature,
             layout_signature,
         );
+        // A streaming turn must not follow every shorter Markdown reparse, but a
+        // repeatable smaller measurement is real content reduction. Accept the
+        // settled one so the held extent cannot leave permanent slack - the
+        // blank band bottom-follow would otherwise park the viewport on.
+        let (measured_height, shrink_candidate) = settle_streaming_timeline_shrink(
+            previous_height,
+            measured_height,
+            stable_height,
+            extent_preserved,
+            self.timeline_streaming_shrink_candidates
+                .get(&turn_id)
+                .copied(),
+            Instant::now(),
+        );
+        if let Some(candidate) = shrink_candidate {
+            self.timeline_streaming_shrink_candidates
+                .insert(turn_id.clone(), candidate);
+        } else {
+            self.timeline_streaming_shrink_candidates.remove(&turn_id);
+        }
         if let Some(layout_signature) = layout_signature {
             self.timeline_measured_turn_layout_signatures
                 .insert(turn_id.clone(), layout_signature);
@@ -14580,11 +14714,20 @@ impl VibexWorkbench {
         // the correction whenever the slot disagrees, otherwise a switched-to
         // session would keep an empty band under its last row until an
         // unrelated event invalidated the turn again.
+        //
+        // A confirmed shrink candidate also needs frames: the settle window has
+        // to elapse before its smaller extent is accepted. Unconfirmed ones do
+        // not ask for a repaint, so an oscillating measurement cannot spin the
+        // workbench on its own.
+        let shrink_awaiting_settle = shrink_candidate.is_some_and(|candidate| {
+            candidate.confirmations >= AGENT_TIMELINE_STREAMING_SHRINK_CONFIRMATIONS
+        });
         if previous_height.is_some_and(|current| (current - measured_height).abs() < 1.0)
             && self
                 .timeline_row_sizes
                 .get(turn_index)
                 .is_some_and(|row_size| (f32::from(row_size.height) - measured_height).abs() < 1.0)
+            && !shrink_awaiting_settle
         {
             return;
         }
@@ -59191,6 +59334,159 @@ mod tests {
             stable_streaming_timeline_height_for_layout(Some(220.0), 180.0, true, None, Some(7),),
             180.0
         );
+    }
+
+    #[test]
+    fn transient_streaming_reparse_shrink_keeps_the_held_extent() {
+        let now = Instant::now();
+        // First shorter parse: hold the extent and queue the candidate.
+        let (height, candidate) =
+            settle_streaming_timeline_shrink(Some(220.0), 180.0, 220.0, true, None, now);
+        assert_eq!(height, 220.0);
+        let candidate = candidate.expect("an unsettled shrink stays queued");
+        assert_eq!(candidate.confirmations, 1);
+        assert!(!candidate.is_settled(now));
+
+        // The parse catches up on the next paint: the candidate is dropped
+        // instead of reclaiming the extent for a one-frame wobble.
+        let (height, candidate) = settle_streaming_timeline_shrink(
+            Some(220.0),
+            220.0,
+            220.0,
+            true,
+            Some(candidate),
+            now + Duration::from_millis(16),
+        );
+        assert_eq!(height, 220.0);
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn still_growing_streaming_content_never_settles_a_shrink() {
+        let mut now = Instant::now();
+        let mut candidate = None;
+        // Each paint sees a different shorter document, so the window restarts
+        // and the turn keeps the extent its streaming content already earned.
+        for measured in [180.0, 196.0, 205.0, 212.0] {
+            let (height, next) = settle_streaming_timeline_shrink(
+                Some(220.0),
+                measured,
+                220.0,
+                true,
+                candidate,
+                now,
+            );
+            assert_eq!(height, 220.0);
+            candidate = Some(next.expect("a changing shrink never settles"));
+            now += Duration::from_millis(200);
+        }
+        assert_eq!(candidate.expect("candidate").confirmations, 1);
+    }
+
+    #[test]
+    fn settled_streaming_shrink_reclaims_the_turn_extent() {
+        let now = Instant::now();
+        let observed = StreamingShrinkCandidate::observe(None, 180.0, now);
+        let confirmed = StreamingShrinkCandidate::observe(
+            Some(observed),
+            180.0,
+            now + Duration::from_millis(120),
+        );
+        assert_eq!(confirmed.confirmations, 2);
+        // Repeat paints inside the settle window still hold the extent.
+        assert!(!confirmed.is_settled(now + Duration::from_millis(120)));
+        let (height, candidate) = settle_streaming_timeline_shrink(
+            Some(220.0),
+            180.0,
+            220.0,
+            true,
+            Some(confirmed),
+            now + Duration::from_millis(120),
+        );
+        assert_eq!(height, 220.0);
+        assert!(candidate.is_some());
+
+        // A settled candidate is real content reduction: reclaim it so
+        // bottom-follow cannot park the viewport on stale slack.
+        let (height, candidate) = settle_streaming_timeline_shrink(
+            Some(220.0),
+            180.0,
+            220.0,
+            true,
+            Some(confirmed),
+            now + AGENT_TIMELINE_STREAMING_SHRINK_SETTLE,
+        );
+        assert_eq!(height, 180.0);
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn streaming_shrink_settling_needs_the_preserve_policy_and_an_extent() {
+        let now = Instant::now();
+        let queued = StreamingShrinkCandidate {
+            height: 180.0,
+            observed_at: now - AGENT_TIMELINE_STREAMING_SHRINK_SETTLE,
+            confirmations: 8,
+        };
+
+        // A released preserve policy already owns the measured height.
+        let (height, candidate) =
+            settle_streaming_timeline_shrink(Some(220.0), 180.0, 180.0, false, Some(queued), now);
+        assert_eq!(height, 180.0);
+        assert!(candidate.is_none());
+
+        // Nothing is held before the first measurement of the turn.
+        let (height, candidate) =
+            settle_streaming_timeline_shrink(None, 180.0, 180.0, true, Some(queued), now);
+        assert_eq!(height, 180.0);
+        assert!(candidate.is_none());
+
+        // Growth keeps the larger extent and drops any shrink candidate.
+        let (height, candidate) =
+            settle_streaming_timeline_shrink(Some(220.0), 260.0, 260.0, true, Some(queued), now);
+        assert_eq!(height, 260.0);
+        assert!(candidate.is_none());
+
+        // A sub-pixel difference is measurement noise, not a shrink.
+        let (height, candidate) =
+            settle_streaming_timeline_shrink(Some(220.0), 219.4, 220.0, true, Some(queued), now);
+        assert_eq!(height, 220.0);
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn streaming_shrink_reclaim_stays_wired_into_the_measurement_path() {
+        let source = include_str!("app.rs");
+        let recorder = source
+            .split_once("    fn record_timeline_turn_height(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Apply every height observed during the prior prepaint")
+            })
+            .map(|(body, _)| body)
+            .expect("timeline height recorder should remain inspectable");
+        assert!(recorder.contains("settle_streaming_timeline_shrink("));
+        assert!(recorder.contains("self.timeline_streaming_shrink_candidates"));
+        // A confirmed candidate must not be swallowed by the convergence
+        // return: the settle window still needs its frames.
+        assert!(recorder.contains("&& !shrink_awaiting_settle"));
+
+        let invalidation = source
+            .split_once("    fn invalidate_timeline_turn_measurement(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Height estimation walks every row body")
+            })
+            .map(|(body, _)| body)
+            .expect("timeline turn invalidation should remain inspectable");
+        assert!(
+            invalidation.contains("self.timeline_streaming_shrink_candidates.remove(turn_id);")
+        );
+
+        let layout_invalidation = source
+            .split_once("    fn invalidate_timeline_layout_measurements(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_timeline_layout_width("))
+            .map(|(body, _)| body)
+            .expect("timeline layout invalidation should remain inspectable");
+        assert!(layout_invalidation.contains("self.timeline_streaming_shrink_candidates.clear();"));
     }
 
     #[test]
