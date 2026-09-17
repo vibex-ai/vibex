@@ -4,14 +4,16 @@ Vibex consumes third-party Rust projects from their upstream Cargo sources. The
 repository does not maintain copied, patched, or shimmed third-party source trees
 beyond the one reviewed GPUI fork submodule.
 
-## Scenario: Forked Zed Submodule With Registry gpui-component
+## Scenario: Forked Zed Submodule With Git-Pinned gpui-kit
 
 ### 1. Scope / Trigger
 
 - Trigger: moving the `vendor/zed` submodule pointer, changing `Cargo.lock`,
-  changing a third-party license decision, or bumping the gpui-component family.
+  changing a third-party license decision, or bumping the pinned gpui-kit family.
 - The GPUI ecosystem uses two source controls: the Zed fork is a pinned Git
-  submodule, while gpui-component 0.6 ships from crates.io.
+  submodule that republishes the `gpui-pre-*` family, while the gpui-kit crates
+  (`gpui-component`, `gpui-fps`, `gpui-kit-assets`) are pinned to a gpui-kit Git
+  revision so unreleased component work is usable without waiting for crates.io.
 
 ### 2. Signatures
 
@@ -31,18 +33,23 @@ exclude = ["vendor/zed"]
 
 [workspace.dependencies]
 gpui = { package = "gpui-pre", path = "vendor/zed/crates/gpui" }
-gpui_platform = { path = "vendor/zed/crates/gpui_platform" }
+gpui_platform = { package = "gpui-pre-platform", path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { path = "vendor/zed/crates/gpui_tokio" }
-gpui-component = "0.6.0"
-gpui-kit-assets = "0.6.0"
+gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
+gpui-fps = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
 
 [patch.crates-io]
 gpui-pre = { path = "vendor/zed/crates/gpui" }
 gpui-pre-macros = { path = "vendor/zed/crates/gpui_macros" }
 gpui-pre-sum-tree = { path = "vendor/zed/crates/sum_tree" }
+gpui-pre-platform = { path = "vendor/zed/crates/gpui_platform" }
 ```
 
 ```text
+vendor/zed/crates/gpui/Cargo.toml                  name = "gpui-pre", version = "0.3.5"
+vendor/zed/crates/gpui_platform/Cargo.toml         name = "gpui-pre-platform", version = "0.3.5",
+                                                   [lib] name = "gpui_platform"
 git submodule update --init --recursive          initialize the pinned Zed tree
 Cargo.lock                                       one Vibex workspace lockfile
 cargo metadata --locked --format-version 1       resolved source identity
