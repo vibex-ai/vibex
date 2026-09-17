@@ -457,6 +457,17 @@ vibex-foundation: runtime-stopped
 - `DesktopRuntime` owns the process/home lock. A second shell must fail while the
   workbench is live, and the same external lock probe must succeed only after awaited
   shutdown and process exit. Cleanup that is merely spawned and abandoned is invalid.
+- A macOS Dock click on the app icon is a platform reopen request, not a new launch:
+  GPUI exposes it as `Application::on_reopen`, and only the application entry point
+  can register it. `apps/desktop/src/main.rs` registers `system_tray::handle_reopen`,
+  which restores the window through the same `SystemTray::restore` path as the menu
+  bar "Open Vibex" item. Without that registration the click is dropped while the
+  menu bar entry keeps working, which reads as a dead Dock icon. When Vibex could not
+  install a menu bar entry it quits with its last window, so the handler stays a
+  guarded no-op instead of restoring a window nobody can close.
+- The packaged macOS bundle carries the `icon-macos-*.png` icon-grid renditions
+  instead of the full-bleed Linux/Windows artwork, because macOS draws an app icon
+  exactly as provided. See the release packaging matrix for the grid contract.
 - The preview shell uses the isolated preview app id/home; it must not acquire a
   user's ordinary desktop state or an existing production home.
 - The preview shell stays provider-free: managed ACP adapter installation must not

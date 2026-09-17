@@ -222,10 +222,11 @@
         ".ico",
         ".png"
       ],
-      "expectedFileCount": 10,
-      "treeSha256": "9ae646c05c9fa1f745ad2cb98aa0479021e216248e597b1678c205b99343eb44",
+      "expectedFileCount": 15,
+      "treeSha256": "6d723c8f201e9676810e87bbe3c071f6e9490c6638289651dda6ce99afde2592",
       "licenseExpression": "AGPL-3.0-or-later",
-      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons"
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons",
+      "licenseEvidence": "First-party Vibex artwork. The icon-macos-*.png renditions derive from the same Vibex app icon as icon.png and only place that artwork on the macOS app icon grid: an 824x824 body on a 1024x1024 canvas with the platform corner radius, which the packaged macOS bundle needs because macOS draws an app icon exactly as provided."
     },
     {
       "id": "vibex-mobile-brand-marks",

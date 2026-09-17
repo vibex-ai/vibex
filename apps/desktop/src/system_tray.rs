@@ -248,6 +248,18 @@ pub(crate) fn handle_window_close(window: &mut Window, cx: &mut App) -> bool {
     cx.update_global::<SystemTray, _>(|tray, cx| tray.close_visible_window(window, cx))
 }
 
+/// Restores the workbench window for a platform reopen request, which is the
+/// surface a macOS Dock click on the app icon reaches and the same one the menu
+/// bar "Open Vibex" item offers. The tray global is absent when Vibex could not
+/// install a menu bar entry; that run quits with its last window, so it has
+/// nothing to restore.
+pub fn handle_reopen(cx: &mut App) {
+    if !cx.has_global::<SystemTray>() {
+        return;
+    }
+    cx.update_global::<SystemTray, _>(|tray, cx| tray.restore(cx));
+}
+
 pub(crate) fn update_locale(locale: ResolvedLocale, cx: &mut App) {
     if cx.has_global::<SystemTray>() {
         cx.update_global::<SystemTray, _>(|tray, _| tray.update_locale(locale));
@@ -360,6 +372,36 @@ mod tests {
         assert_eq!(icon.dimensions(), (128, 128));
         assert_eq!(*icon.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
         assert!(icon.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]));
+    }
+
+    /// A Dock click on macOS arrives as a platform reopen request, and GPUI only
+    /// exposes that handler on the application, so the entry point owns the
+    /// registration while the tray owns the restore path.
+    #[test]
+    fn the_entry_point_registers_the_reopen_handler_for_the_tray() {
+        let entry_point = include_str!("main.rs");
+        assert!(
+            entry_point.contains("application.on_reopen(system_tray::handle_reopen);"),
+            "the desktop entry point must register the tray reopen handler"
+        );
+
+        let source = include_str!("system_tray.rs");
+        let reopen = source
+            .split_once("pub fn handle_reopen(")
+            .and_then(|(_, tail)| tail.split_once("\npub(crate) fn update_locale("))
+            .map(|(body, _)| body)
+            .expect("the tray reopen handler should remain inspectable");
+        assert!(
+            reopen.contains("tray.restore(cx)"),
+            "the reopen handler must restore the window through the tray's restore path"
+        );
+    }
+
+    /// Vibex quits with its last window when it could not install a menu bar
+    /// entry, so a reopen request has nothing to restore.
+    #[gpui::test]
+    fn reopen_without_a_tray_global_is_ignored(cx: &mut gpui::TestAppContext) {
+        cx.update(handle_reopen);
     }
 
     #[test]

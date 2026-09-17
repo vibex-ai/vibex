@@ -277,12 +277,30 @@ function validatePackaging() {
     desktopReleaseScript.includes("withIcons(config, MACOS_ICON_INPUTS)"),
     "macOS release packaging must select a supported ICNS input set"
   );
-  for (const icon of ["icon-16.png", "icon-32.png", "icon-48.png", "icon-128.png", "icon-256.png"]) {
+  // macOS draws an app icon exactly as provided, so the bundle must carry the
+  // icon-grid renditions (824x824 body on a 1024x1024 canvas) instead of the
+  // full-bleed Linux/Windows artwork, which renders about a quarter larger than
+  // neighbouring Dock icons.
+  for (const icon of [
+    "icon-macos-16.png",
+    "icon-macos-32.png",
+    "icon-macos-48.png",
+    "icon-macos-128.png",
+    "icon-macos-256.png"
+  ]) {
     assert(
       desktopReleaseScript.includes(`assets/app-icons/${icon}`),
       `macOS release packaging is missing ${icon}`
     );
+    assert(
+      existsSync(path(`apps/desktop/assets/app-icons/${icon}`)),
+      `macOS release packaging references a missing icon: ${icon}`
+    );
   }
+  assert(
+    !desktopReleaseScript.includes("assets/app-icons/icon-16.png"),
+    "macOS release packaging must not fall back to the full-bleed icon renditions"
+  );
   assert(
     desktopReleaseScript.includes("--formats"),
     "desktop release packager must select an explicit platform format"

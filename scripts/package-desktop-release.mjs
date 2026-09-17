@@ -28,12 +28,18 @@ const TARGET_TRIPLES = {
   "windows-aarch64": "aarch64-pc-windows-msvc"
 };
 // Keep macOS input dimensions within cargo-packager's supported ICNS types.
+//
+// macOS draws an app icon exactly as the bundle provides it, so these are the
+// icon-grid renditions, not the full-bleed Linux/Windows artwork: an 824x824
+// body inside a 1024x1024 canvas (100 px transparent margin on every side) with
+// the platform corner radius of 185.4 px. A full-bleed rendition renders about
+// a quarter larger than neighbouring Dock icons.
 const MACOS_ICON_INPUTS = [
-  "assets/app-icons/icon-16.png",
-  "assets/app-icons/icon-32.png",
-  "assets/app-icons/icon-48.png",
-  "assets/app-icons/icon-128.png",
-  "assets/app-icons/icon-256.png"
+  "assets/app-icons/icon-macos-16.png",
+  "assets/app-icons/icon-macos-32.png",
+  "assets/app-icons/icon-macos-48.png",
+  "assets/app-icons/icon-macos-128.png",
+  "assets/app-icons/icon-macos-256.png"
 ];
 
 function fail(message) {

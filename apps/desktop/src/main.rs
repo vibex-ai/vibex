@@ -11,7 +11,7 @@ use vibex_agent::run_delegation_mcp_stdio;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, terminal_surface, theme,
+    first_frame_probe, system_tray, terminal_surface, theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -297,7 +297,12 @@ fn main() {
         None
     };
 
-    gpui_platform::application()
+    let application = gpui_platform::application();
+    // On macOS a Dock click on the app icon reaches the running process as a
+    // platform reopen request. The workbench owns that window, so the request
+    // has to restore it instead of being dropped on the floor.
+    application.on_reopen(system_tray::handle_reopen);
+    application
         .with_assets(assets::VibexAssets)
         .run(move |cx: &mut App| {
             gpui_tokio::init(cx);

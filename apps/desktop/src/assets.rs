@@ -2237,6 +2237,153 @@ mod tests {
         assert!(icon.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]));
     }
 
+    /// The renditions the macOS bundle carries. macOS draws an app icon exactly
+    /// as provided, so these place the same artwork on the platform icon grid:
+    /// an 824x824 body centred on a 1024x1024 canvas. The full-bleed
+    /// `icon-*.png` renditions stay in use for Linux, Windows, and the tray,
+    /// where the window manager owns the icon shape.
+    const MACOS_APP_ICONS: &[(u32, &[u8])] = &[
+        (
+            16,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/app-icons/icon-macos-16.png"
+            )),
+        ),
+        (
+            32,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/app-icons/icon-macos-32.png"
+            )),
+        ),
+        (
+            48,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/app-icons/icon-macos-48.png"
+            )),
+        ),
+        (
+            128,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/app-icons/icon-macos-128.png"
+            )),
+        ),
+        (
+            256,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/app-icons/icon-macos-256.png"
+            )),
+        ),
+    ];
+    const MACOS_ICON_BODY_RATIO: f32 = 824.0 / 1024.0;
+
+    fn macos_app_icon(size: u32) -> image::RgbaImage {
+        let (_, bytes) = MACOS_APP_ICONS
+            .iter()
+            .copied()
+            .find(|(icon_size, _)| *icon_size == size)
+            .expect("macOS app icon size should be bundled");
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .expect("bundled macOS app icon should decode")
+            .into_rgba8()
+    }
+
+    fn bounds_matching(
+        icon: &image::RgbaImage,
+        matches: impl Fn(&image::Rgba<u8>) -> bool,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let mut bounds: Option<(u32, u32, u32, u32)> = None;
+        for (x, y, pixel) in icon.enumerate_pixels() {
+            if !matches(pixel) {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                None => (x, y, x, y),
+            });
+        }
+        bounds
+    }
+
+    /// The icon body as a viewer sees it: the platform grid leaves a transparent
+    /// margin, so the edge is where the artwork reaches half opacity.
+    fn icon_body(icon: &image::RgbaImage) -> (u32, u32, u32, u32) {
+        bounds_matching(icon, |pixel| pixel.0[3] >= 128)
+            .expect("macOS app icon body should not be empty")
+    }
+
+    fn icon_mark(icon: &image::RgbaImage) -> (u32, u32, u32, u32) {
+        bounds_matching(icon, |pixel| {
+            pixel.0[3] >= 128 && pixel.0[0] > 200 && pixel.0[1] > 200 && pixel.0[2] > 200
+        })
+        .expect("macOS app icon should carry the Vibex mark")
+    }
+
+    #[test]
+    fn macos_app_icons_place_the_artwork_on_the_platform_icon_grid() {
+        for (size, _) in MACOS_APP_ICONS {
+            let icon = macos_app_icon(*size);
+            assert_eq!(icon.dimensions(), (*size, *size));
+            for corner in [
+                (0, 0),
+                (*size - 1, 0),
+                (0, *size - 1),
+                (*size - 1, *size - 1),
+            ] {
+                assert_eq!(
+                    *icon.get_pixel(corner.0, corner.1),
+                    image::Rgba([0, 0, 0, 0]),
+                    "the {size}px macOS app icon must keep its grid margin transparent"
+                );
+            }
+
+            let (x0, y0, x1, y1) = icon_body(&icon);
+            let measured = (x1 - x0 + 1).max(y1 - y0 + 1) as f32;
+            let expected = *size as f32 * MACOS_ICON_BODY_RATIO;
+            assert!(
+                (measured - expected).abs() <= 1.5,
+                "the {size}px macOS app icon draws a {measured}px body; the icon grid expects {expected}px"
+            );
+            let (left, top) = (x0, y0);
+            let (right, bottom) = (*size - 1 - x1, *size - 1 - y1);
+            assert!(
+                left.abs_diff(right) <= 1 && top.abs_diff(bottom) <= 1,
+                "the {size}px macOS app icon is off the grid centre: {left}/{right}px horizontal and {top}/{bottom}px vertical margins"
+            );
+        }
+
+        // Grid geometry alone would still accept a stale copy of the artwork, so
+        // the largest rendition has to carry the same mark as the master icon.
+        let rendered = macos_app_icon(256);
+        let (x0, y0, x1, y1) = icon_body(&rendered);
+        let body = (x1 - x0 + 1).max(y1 - y0 + 1);
+        let (mark_x0, mark_y0, mark_x1, mark_y1) = icon_mark(&rendered);
+        let rendered_mark = [
+            (mark_x0 - x0) as f32 / body as f32,
+            (mark_y0 - y0) as f32 / body as f32,
+            (mark_x1 - x0) as f32 / body as f32,
+            (mark_y1 - y0) as f32 / body as f32,
+        ];
+        let (mark_x0, mark_y0, mark_x1, mark_y1) =
+            icon_mark(&window_icon().expect("bundled window icon should decode"));
+        let master_mark = [
+            mark_x0 as f32 / 256.0,
+            mark_y0 as f32 / 256.0,
+            mark_x1 as f32 / 256.0,
+            mark_y1 as f32 / 256.0,
+        ];
+        for (edge, master_edge) in rendered_mark.iter().zip(master_mark.iter()) {
+            assert!(
+                (edge - master_edge).abs() <= 0.02,
+                "the macOS app icon mark {rendered_mark:?} drifted from the master icon mark {master_mark:?}"
+            );
+        }
+    }
+
     #[test]
     fn multicolor_agent_brands_use_polychrome_image_elements() {
         for identity in [

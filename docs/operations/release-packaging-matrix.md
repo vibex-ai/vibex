@@ -44,6 +44,20 @@ embeds the other product's assets.
 - The Linux aarch64 deb, macOS, and Windows packages carry no embedded PDFium
   runtime: distribution approval is scoped to linux-x86_64.
 
+## macOS App Icon Rules
+
+- macOS draws an app icon exactly as the bundle provides it: it neither pads nor
+  masks the artwork. The macOS ICNS inputs are therefore the `icon-macos-*.png`
+  grid renditions — an 824x824 body centred on a 1024x1024 canvas with the
+  platform corner radius — while Linux, Windows, and the tray keep the
+  full-bleed `icon-*.png` renditions, whose shape their window manager owns.
+- A full-bleed rendition in the macOS bundle renders roughly a quarter larger
+  than neighbouring Dock icons, so `pnpm check:release` rejects a macOS icon set
+  that falls back to the full-bleed files.
+- Regenerating the `icon-macos-*.png` renditions from a new master icon is part
+  of the artwork change, not a packaging step: the checked-in files are reviewed
+  and audited like every other reviewed asset input.
+
 ## Mobile Packaging Rules
 
 - `apps/mobile` contains the source-owned Android and iOS project definitions.
