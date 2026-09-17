@@ -13,6 +13,8 @@ use gpui::{
     HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ScrollWheelEvent, Window,
 };
 
+type CaptureScrollWheelListener = Rc<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
+
 /// Wraps `child` and reports scroll-wheel events in the capture phase.
 ///
 /// The event is only reported while the wrapped element is under the pointer,
@@ -21,7 +23,7 @@ use gpui::{
 pub struct CaptureScrollWheel {
     id: ElementId,
     child: AnyElement,
-    listener: Rc<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>,
+    listener: CaptureScrollWheelListener,
 }
 
 /// Wraps `child` with a capture-phase scroll-wheel listener.
