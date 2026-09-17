@@ -447,6 +447,12 @@ const SESSION_SEARCH_DIALOG_MAX_HEIGHT: f32 = 620.0;
 const SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
 const SESSION_SEARCH_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
+/// A keystroke waits this long before the result scan starts, so typing a word
+/// schedules one scan instead of one per character.
+const SESSION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+/// Indexing lands one session at a time; a longer delay coalesces the rescans
+/// of an open dialog into the growth of the index rather than its every step.
+const SESSION_SEARCH_INDEX_SCAN_DEBOUNCE: Duration = Duration::from_millis(250);
 const COMPOSER_INLINE_ATTACHMENT_PREFIX: &str = "attachment_";
 const COMPOSER_INLINE_ATTACHMENT_MARKER_RESERVE: &str = "..........";
 const COMPOSER_INLINE_ATTACHMENT_SUFFIX: &str = "_vbx";
@@ -4212,6 +4218,74 @@ fn session_search_documents(items: &[TimelineItem]) -> Vec<SessionSearchDocument
     documents
 }
 
+/// Scans one query over a snapshot of the search index.
+///
+/// Pure, so the dialog can run it off the UI thread: the walk covers every
+/// indexed document, and doing it in `render` meant paying it once per frame.
+/// `sessions` arrives already ordered by recency, and `query` is already
+/// normalized by [`normalized_session_search_query`].
+fn session_search_scan(
+    query: &str,
+    sessions: &[SessionSearchScanSession],
+) -> Vec<SessionSearchResult> {
+    let mut results = Vec::new();
+    for session in sessions {
+        if query.is_empty() {
+            results.push(SessionSearchResult {
+                session_id: session.session_id.clone(),
+                agent_id: session.agent_id.clone(),
+                session_title: session.session_title.clone(),
+                project_name: session.project_name.clone(),
+                last_message_at_ms: session.last_message_at_ms,
+                excerpt: None,
+                target: None,
+            });
+            continue;
+        }
+        if !session_search_match_ranges(&session.session_title, query).is_empty() {
+            results.push(SessionSearchResult {
+                session_id: session.session_id.clone(),
+                agent_id: session.agent_id.clone(),
+                session_title: session.session_title.clone(),
+                project_name: session.project_name.clone(),
+                last_message_at_ms: session.last_message_at_ms,
+                excerpt: None,
+                target: None,
+            });
+            if results.len() >= SESSION_SEARCH_RESULT_LIMIT {
+                return results;
+            }
+        }
+        for document in session.documents.iter().rev() {
+            let Some(excerpt) = session_search_excerpt(&document.text, query) else {
+                continue;
+            };
+            results.push(SessionSearchResult {
+                session_id: session.session_id.clone(),
+                agent_id: session.agent_id.clone(),
+                session_title: session.session_title.clone(),
+                project_name: session.project_name.clone(),
+                last_message_at_ms: if document.timestamp_ms > 0 {
+                    document.timestamp_ms
+                } else {
+                    session.last_message_at_ms
+                },
+                excerpt: Some(excerpt),
+                target: Some(SessionSearchTarget {
+                    session_id: session.session_id.clone(),
+                    turn_id: document.turn_id.clone(),
+                    item_id: document.item_id.clone(),
+                    first_sequence: document.first_sequence,
+                }),
+            });
+            if results.len() >= SESSION_SEARCH_RESULT_LIMIT {
+                return results;
+            }
+        }
+    }
+    results
+}
+
 fn session_search_row_text(row: &TimelineRow) -> String {
     let title = row.title.trim();
     let body = row.body.trim();
@@ -4245,6 +4319,66 @@ fn session_search_match_ranges_with_limit(
         return Vec::new();
     }
 
+    // Case folding only moves offsets for cased characters, and most indexed
+    // text is either ASCII or has no case at all (CJK). Searching in place
+    // avoids copying the whole document plus a per-character offset map for
+    // every document a scan touches.
+    if text.is_ascii() && folded_query.is_ascii() {
+        return ascii_case_insensitive_match_ranges(text, folded_query.as_bytes(), limit);
+    }
+    if !text.chars().any(char::is_uppercase) {
+        return merge_session_search_ranges(
+            text.match_indices(&folded_query)
+                .take(limit)
+                .map(|(start, matched)| start..start + matched.len()),
+        );
+    }
+
+    session_search_folded_match_ranges(text, &folded_query, limit)
+}
+
+/// Byte ranges of the first `limit` case-insensitive occurrences of an ASCII
+/// `folded_query` in an ASCII `text`.
+fn ascii_case_insensitive_match_ranges(
+    text: &str,
+    folded_query: &[u8],
+    limit: usize,
+) -> Vec<Range<usize>> {
+    let haystack = text.as_bytes();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut index = 0;
+    while ranges.len() < limit && index + folded_query.len() <= haystack.len() {
+        if haystack[index..index + folded_query.len()].eq_ignore_ascii_case(folded_query) {
+            ranges.push(index..index + folded_query.len());
+            index += folded_query.len();
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn merge_session_search_ranges(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for next in ranges {
+        if let Some(last) = merged.last_mut()
+            && last.end >= next.start
+        {
+            last.end = last.end.max(next.end);
+        } else {
+            merged.push(next);
+        }
+    }
+    merged
+}
+
+/// Folds the whole document before searching, for text where case folding can
+/// change offsets. Only mixed-case non-ASCII documents reach this path.
+fn session_search_folded_match_ranges(
+    text: &str,
+    folded_query: &str,
+    limit: usize,
+) -> Vec<Range<usize>> {
     let mut folded_text = String::new();
     let mut character_ranges = Vec::new();
     for (original_start, character) in text.char_indices() {
@@ -4257,7 +4391,7 @@ fn session_search_match_ranges_with_limit(
     }
 
     let mut ranges: Vec<Range<usize>> = Vec::new();
-    for (folded_start, _) in folded_text.match_indices(&folded_query).take(limit) {
+    for (folded_start, _) in folded_text.match_indices(folded_query).take(limit) {
         let folded_end = folded_start + folded_query.len();
         let first_character =
             character_ranges.partition_point(|(folded, _)| folded.end <= folded_start);
@@ -4283,8 +4417,21 @@ fn session_search_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     session_search_match_ranges_with_limit(text, query, usize::MAX)
 }
 
+/// Collapses whitespace runs without the intermediate word vector that
+/// `split_whitespace().collect::<Vec<_>>().join(" ")` builds per document.
+fn compact_session_search_text(text: &str) -> String {
+    let mut compact = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !compact.is_empty() {
+            compact.push(' ');
+        }
+        compact.push_str(word);
+    }
+    compact
+}
+
 fn session_search_excerpt(text: &str, normalized_query: &str) -> Option<String> {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact_session_search_text(text);
     if compact.is_empty() {
         return None;
     }
@@ -4864,7 +5011,20 @@ struct SessionSearchDocument {
 struct SessionSearchIndexEntry {
     session_id: VibexSessionId,
     session_updated_at_ms: i64,
-    documents: Vec<SessionSearchDocument>,
+    /// Shared with the scan snapshots so handing the index to a background
+    /// thread clones a pointer instead of the session's full text.
+    documents: Arc<Vec<SessionSearchDocument>>,
+}
+
+/// One session's slice of the search index, resolved on the UI thread and
+/// cheap to clone, so the result scan can run off it.
+struct SessionSearchScanSession {
+    session_id: VibexSessionId,
+    agent_id: AgentId,
+    session_title: String,
+    project_name: String,
+    last_message_at_ms: i64,
+    documents: Arc<Vec<SessionSearchDocument>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5006,6 +5166,17 @@ pub struct VibexWorkbench {
     session_search_index: BTreeMap<String, SessionSearchIndexEntry>,
     session_search_index_loading: bool,
     session_search_generation: u64,
+    /// Results of the last scan, valid for `session_search_results_query`.
+    ///
+    /// The scan walks every indexed document, so it must not run in `render`:
+    /// a query with few matches took over 200 ms per frame there. A keystroke
+    /// schedules one scan instead, and `render` only reads this cache.
+    session_search_results: Rc<Vec<SessionSearchResult>>,
+    /// The query `session_search_results` was scanned for; `None` means the
+    /// cache is cold and the next read has to recompute it.
+    session_search_results_query: Option<String>,
+    session_search_scan_generation: u64,
+    session_search_scan_task: Option<Task<()>>,
     pending_session_search_jump: Option<SessionSearchTarget>,
     session_search_highlight_item_id: Option<String>,
     session_search_highlight_query: Option<String>,
@@ -5456,6 +5627,7 @@ impl VibexWorkbench {
                     InputEvent::Change => {
                         this.session_search_selected_index = 0;
                         this.session_search_scroll = VirtualListScrollHandle::new();
+                        this.schedule_session_search_scan(SESSION_SEARCH_DEBOUNCE, cx);
                         cx.notify();
                     }
                     InputEvent::PressEnter { shift: false, .. } => {
@@ -5841,6 +6013,10 @@ impl VibexWorkbench {
             session_search_index: BTreeMap::new(),
             session_search_index_loading: false,
             session_search_generation: 0,
+            session_search_results: Rc::new(Vec::new()),
+            session_search_results_query: None,
+            session_search_scan_generation: 0,
+            session_search_scan_task: None,
             pending_session_search_jump: None,
             session_search_highlight_item_id: None,
             session_search_highlight_query: None,
@@ -23336,6 +23512,10 @@ impl VibexWorkbench {
             input.set_value("", window, cx);
             input.focus(window, cx);
         });
+        // Opening shows the recent list, which only needs the sessions.
+        self.ensure_session_search_results(cx);
+        // The index survives closing the dialog; this refreshes the sessions
+        // that changed since it was built and is a no-op otherwise.
         self.refresh_session_search_index(cx);
         cx.notify();
     }
@@ -23348,7 +23528,13 @@ impl VibexWorkbench {
         self.session_search_generation = self.session_search_generation.saturating_add(1);
         self.session_search_index_task = None;
         self.session_search_index_loading = false;
-        self.session_search_index.clear();
+        // The index itself stays warm: rebuilding it reads every session's
+        // full timeline, which is far more expensive than keeping the
+        // documents around until the next open refreshes what changed.
+        self.session_search_scan_generation = self.session_search_scan_generation.wrapping_add(1);
+        self.session_search_scan_task = None;
+        self.session_search_results = Rc::new(Vec::new());
+        self.session_search_results_query = None;
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -23402,10 +23588,19 @@ impl VibexWorkbench {
                 else {
                     continue;
                 };
+                // Projecting a whole session into search documents is pure CPU
+                // over everything it contains. It runs on the blocking pool so
+                // it does not hold one of the two shared Tokio workers that
+                // every other async caller in the workbench depends on.
+                let Ok(documents) =
+                    tokio::task::spawn_blocking(move || session_search_documents(&items)).await
+                else {
+                    continue;
+                };
                 let signal = SessionSearchIndexSignal::Indexed(SessionSearchIndexEntry {
                     session_id: session.id,
                     session_updated_at_ms: session.updated_at_ms,
-                    documents: session_search_documents(&items),
+                    documents: Arc::new(documents),
                 });
                 if signal_tx.send(signal).is_err() {
                     return;
@@ -23425,6 +23620,20 @@ impl VibexWorkbench {
                             SessionSearchIndexSignal::Indexed(entry) => {
                                 this.session_search_index
                                     .insert(entry.session_id.as_str().to_string(), entry);
+                                // An open dialog is searching a growing index;
+                                // rescan so it sees the sessions that just
+                                // landed without waiting for the whole pass.
+                                if this.session_search_open
+                                    && !normalized_session_search_query(
+                                        this.session_search.read(cx).value().as_ref(),
+                                    )
+                                    .is_empty()
+                                {
+                                    this.schedule_session_search_scan(
+                                        SESSION_SEARCH_INDEX_SCAN_DEBOUNCE,
+                                        cx,
+                                    );
+                                }
                             }
                             SessionSearchIndexSignal::Finished => {
                                 this.session_search_index_loading = false;
@@ -23442,94 +23651,118 @@ impl VibexWorkbench {
         ));
     }
 
-    fn session_search_results(&self, cx: &App) -> Vec<SessionSearchResult> {
-        let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
+    /// Resolves everything the result scan reads against the workbench.
+    ///
+    /// This is the only part that has to stay on the UI thread; the scan
+    /// itself is [`session_search_scan`] over the returned snapshot.
+    fn session_search_scan_sessions(&self) -> Vec<SessionSearchScanSession> {
         let mut sessions = self.sessions.iter().collect::<Vec<_>>();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_message_at_ms));
-        let mut results = Vec::new();
-        for session in sessions {
-            let selected = self.selected_session_id.as_ref() == Some(&session.id);
-            let selected_runtime = selected.then(|| self.selected_runtime_selection());
-            let selected_desired_agent_id = selected_runtime
-                .as_ref()
-                .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
-            let cached_desired_agent_id = self
-                .agent_session_view_cache
-                .get(session.id.as_str())
-                .and_then(|entry| entry.runtime_selection.as_ref())
-                .map(|state| &state.desired.agent_id);
-            let agent_id = sidebar_session_agent_id(
-                &session.agent_id,
-                selected_desired_agent_id,
-                cached_desired_agent_id,
-            );
-            let project_name = self
-                .workspaces
-                .iter()
-                .find(|(_, workspace)| workspace.id == session.workspace_id)
-                .map(|(project, _)| project.name.clone())
-                .unwrap_or_else(|| workspace_display_name(&session.workspace_root));
-            if query.is_empty() {
-                results.push(SessionSearchResult {
+        sessions
+            .into_iter()
+            .map(|session| {
+                let selected = self.selected_session_id.as_ref() == Some(&session.id);
+                let selected_runtime = selected.then(|| self.selected_runtime_selection());
+                let selected_desired_agent_id = selected_runtime
+                    .as_ref()
+                    .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
+                let cached_desired_agent_id = self
+                    .agent_session_view_cache
+                    .get(session.id.as_str())
+                    .and_then(|entry| entry.runtime_selection.as_ref())
+                    .map(|state| &state.desired.agent_id);
+                let agent_id = sidebar_session_agent_id(
+                    &session.agent_id,
+                    selected_desired_agent_id,
+                    cached_desired_agent_id,
+                );
+                let project_name = self
+                    .workspaces
+                    .iter()
+                    .find(|(_, workspace)| workspace.id == session.workspace_id)
+                    .map(|(project, _)| project.name.clone())
+                    .unwrap_or_else(|| workspace_display_name(&session.workspace_root));
+                SessionSearchScanSession {
                     session_id: session.id.clone(),
                     agent_id,
                     session_title: session.title.clone(),
                     project_name,
                     last_message_at_ms: session.last_message_at_ms,
-                    excerpt: None,
-                    target: None,
-                });
-                continue;
-            }
-            if !session_search_match_ranges(&session.title, &query).is_empty() {
-                results.push(SessionSearchResult {
-                    session_id: session.id.clone(),
-                    agent_id: agent_id.clone(),
-                    session_title: session.title.clone(),
-                    project_name: project_name.clone(),
-                    last_message_at_ms: session.last_message_at_ms,
-                    excerpt: None,
-                    target: None,
-                });
-                if results.len() >= SESSION_SEARCH_RESULT_LIMIT {
-                    return results;
+                    documents: self
+                        .session_search_index
+                        .get(session.id.as_str())
+                        .map(|entry| entry.documents.clone())
+                        .unwrap_or_default(),
                 }
-            }
-            let Some(entry) = self.session_search_index.get(session.id.as_str()) else {
-                continue;
-            };
-            for document in entry.documents.iter().rev() {
-                let Some(excerpt) = session_search_excerpt(&document.text, &query) else {
-                    continue;
-                };
-                results.push(SessionSearchResult {
-                    session_id: session.id.clone(),
-                    agent_id: agent_id.clone(),
-                    session_title: session.title.clone(),
-                    project_name: project_name.clone(),
-                    last_message_at_ms: if document.timestamp_ms > 0 {
-                        document.timestamp_ms
-                    } else {
-                        session.last_message_at_ms
-                    },
-                    excerpt: Some(excerpt),
-                    target: Some(SessionSearchTarget {
-                        session_id: session.id.clone(),
-                        turn_id: document.turn_id.clone(),
-                        item_id: document.item_id.clone(),
-                        first_sequence: document.first_sequence,
-                    }),
-                });
-                if results.len() >= SESSION_SEARCH_RESULT_LIMIT {
-                    return results;
-                }
-            }
+            })
+            .collect()
+    }
+
+    /// The scan for the dialog's current query, recomputed on the UI thread
+    /// when a scheduled scan has not landed yet.
+    fn ensure_session_search_results(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Rc<Vec<SessionSearchResult>> {
+        let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
+        if self.session_search_results_query.as_deref() != Some(query.as_str()) {
+            let sessions = self.session_search_scan_sessions();
+            self.session_search_results = Rc::new(session_search_scan(&query, &sessions));
+            self.session_search_results_query = Some(query);
+            // A pending scan would only recompute what this call just did.
+            self.session_search_scan_generation =
+                self.session_search_scan_generation.wrapping_add(1);
+            self.session_search_scan_task = None;
         }
-        results
+        self.session_search_results.clone()
+    }
+
+    /// Recomputes the dialog's result list away from the UI thread.
+    fn schedule_session_search_scan(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        self.session_search_scan_generation = self.session_search_scan_generation.wrapping_add(1);
+        let generation = self.session_search_scan_generation;
+        self.session_search_scan_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                if !delay.is_zero() {
+                    cx.background_executor().timer(delay).await;
+                }
+                let request = entity
+                    .update(cx, |this, cx| {
+                        if this.session_search_scan_generation != generation {
+                            return None;
+                        }
+                        Some((
+                            normalized_session_search_query(
+                                this.session_search.read(cx).value().as_ref(),
+                            ),
+                            this.session_search_scan_sessions(),
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((query, sessions)) = request else {
+                    return;
+                };
+                let scanned_query = query.clone();
+                let results = cx
+                    .background_executor()
+                    .spawn(async move { session_search_scan(&scanned_query, &sessions) })
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    if this.session_search_scan_generation != generation {
+                        return;
+                    }
+                    this.session_search_results = Rc::new(results);
+                    this.session_search_results_query = Some(query);
+                    this.session_search_scan_task = None;
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     fn move_session_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let result_count = self.session_search_results(cx).len();
+        let result_count = self.ensure_session_search_results(cx).len();
         if result_count == 0 {
             self.session_search_selected_index = 0;
             return;
@@ -23549,7 +23782,7 @@ impl VibexWorkbench {
 
     fn activate_session_search_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(result) = self
-            .session_search_results(cx)
+            .ensure_session_search_results(cx)
             .get(self.session_search_selected_index)
             .cloned()
         else {
@@ -42531,7 +42764,9 @@ impl VibexWorkbench {
         let locale = self.resolved_locale();
         let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
         let query_empty = query.is_empty();
-        let results = Rc::new(self.session_search_results(cx));
+        // The scan is cached; a keystroke schedules one instead of paying it
+        // on every frame the dialog stays open.
+        let results = self.session_search_results.clone();
         if results.is_empty() {
             self.session_search_selected_index = 0;
         } else {
@@ -55194,6 +55429,35 @@ mod tests {
     }
 
     #[test]
+    fn session_search_match_ranges_search_in_place_when_folding_cannot_move_offsets() {
+        // ASCII documents are matched case-insensitively without folding a
+        // copy of the text.
+        let text = "Read the README, then read the docs";
+        let matches = session_search_match_ranges(text, "read")
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>();
+        assert_eq!(matches, ["Read", "READ", "read"]);
+
+        let limited = session_search_match_ranges_with_limit(text, "read", 2);
+        assert_eq!(limited.len(), 2);
+
+        // Case-less documents fold to themselves, so they match in place too.
+        let text = "会话搜索索引: 搜索会话和消息内容";
+        let matches = session_search_match_ranges(text, "搜索")
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>();
+        assert_eq!(matches, ["搜索", "搜索"]);
+    }
+
+    #[test]
+    fn compact_session_search_text_collapses_whitespace_without_a_word_vector() {
+        assert_eq!(compact_session_search_text("  a\n\n b\tc  "), "a b c");
+        assert_eq!(compact_session_search_text("   "), "");
+    }
+
+    #[test]
     fn session_search_documents_keep_timeline_jump_identity() {
         let session_id = VibexSessionId::parse("session_search").unwrap();
         let user_item_id = TimelineItemId::new();
@@ -66384,7 +66648,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_session_search_releases_the_full_text_index() {
+    fn closing_session_search_keeps_the_full_text_index_warm() {
         let source = include_str!("app.rs");
         let close = source
             .split_once("    fn close_session_search(")
@@ -66394,7 +66658,42 @@ mod tests {
 
         assert!(close.contains("self.session_search_generation"));
         assert!(close.contains("self.session_search_index_task = None;"));
-        assert!(close.contains("self.session_search_index.clear();"));
+        // Building the index reads every session's full timeline — tens of
+        // seconds of CPU for a large history — so closing the dialog releases
+        // the in-flight work but not the documents.
+        assert!(!close.contains("self.session_search_index.clear();"));
+        assert!(close.contains("self.session_search_scan_task = None;"));
+    }
+
+    #[test]
+    fn reopening_session_search_refreshes_only_changed_sessions() {
+        let source = include_str!("app.rs");
+        let refresh = source
+            .split_once("    fn refresh_session_search_index(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_search_scan_sessions("))
+            .map(|(body, _)| body)
+            .expect("session search index refresh should remain inspectable");
+
+        assert!(refresh.contains("entry.session_updated_at_ms != session.updated_at_ms"));
+        assert!(refresh.contains("if stale_sessions.is_empty()"));
+        // The index build must not hold one of the shared Tokio workers while
+        // it projects a session into documents.
+        assert!(refresh.contains("tokio::task::spawn_blocking"));
+    }
+
+    #[test]
+    fn session_search_overlay_renders_the_cached_scan() {
+        let source = include_str!("app.rs");
+        let overlay = source
+            .split_once("    fn render_session_search_overlay(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_docked_panel_animation("))
+            .map(|(body, _)| body)
+            .expect("session search overlay should remain inspectable");
+
+        // The scan walks every indexed document, so running it in `render`
+        // pinned the workbench at single-digit fps while the dialog was open.
+        assert!(!overlay.contains("session_search_results(cx)"));
+        assert!(overlay.contains("self.session_search_results.clone()"));
     }
 
     struct ReasoningFirstLineProbe {

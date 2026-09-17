@@ -86,6 +86,14 @@ pub struct AgentManager {
     delegation_tool: OnceLock<AgentDelegationToolConfig>,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    /// One read connection shared by the paged timeline reads.
+    ///
+    /// Every page used to open its own connection, and a full-history read —
+    /// the session-search index walks every session — paid that thousands of
+    /// times. SQLite connections are `Send` but not `Sync`, so the mutex is
+    /// what makes the reuse safe; it is only ever held for the synchronous
+    /// query, never across an await.
+    timeline_reader: StdMutex<Option<DbConnection>>,
     context_bridge: ContextBridgeService,
 }
 
@@ -199,11 +207,39 @@ impl AgentTurnDisplayPolicy {
     };
 }
 
+/// Databases whose schema this process has already migrated.
+///
+/// Migrations are a startup concern — `AgentManager::new` applies them before
+/// the manager serves a request, and only a newer binary can add more — but
+/// every storage operation opens through [`AgentManager::open_migrated`].
+/// Re-checking the schema there cost a write transaction plus the version
+/// bookkeeping on every call; a single session-search index pass paid it 4,473
+/// times and spent most of its time doing so. Remembering the paths this
+/// process has verified keeps the guarantee at startup cost.
+fn verified_schema_paths() -> &'static StdMutex<HashSet<PathBuf>> {
+    static VERIFIED_SCHEMA_PATHS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
+    VERIFIED_SCHEMA_PATHS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn schema_is_verified(db_path: &Path) -> bool {
+    verified_schema_paths()
+        .lock()
+        .map(|paths| paths.contains(db_path))
+        .unwrap_or(false)
+}
+
+fn mark_schema_verified(db_path: &Path) {
+    if let Ok(mut paths) = verified_schema_paths().lock() {
+        paths.insert(db_path.to_path_buf());
+    }
+}
+
 impl AgentManager {
     pub fn new(db_path: impl Into<PathBuf>) -> VibexResult<Self> {
         let db_path = db_path.into();
         let mut conn = open_database(&db_path)?;
         apply_migrations(&mut conn)?;
+        mark_schema_verified(&db_path);
         let context_bridge = ContextBridgeService::new(db_path.clone())?;
         let (live_events, _) = broadcast::channel(512);
         let (session_events, _) = broadcast::channel(256);
@@ -222,6 +258,7 @@ impl AgentManager {
             delegation_tool: OnceLock::new(),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
+            timeline_reader: StdMutex::new(None),
             context_bridge,
         };
         manager.recover_interrupted_sessions(&mut conn)?;
@@ -1579,13 +1616,38 @@ impl AgentManager {
     }
 
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
-        let conn = self.open_migrated()?;
-        TimelineRepository::fetch_after(
-            &conn,
-            &request.session_id,
-            request.after_sequence,
-            request.limit,
-        )
+        self.fetch_timeline_page(&request.session_id, request.after_sequence, request.limit)
+    }
+
+    /// Fetches one timeline page over the shared read connection.
+    ///
+    /// The session-search index reads whole histories page by page, so this
+    /// path opens the database once instead of once per page.
+    fn fetch_timeline_page(
+        &self,
+        session_id: &VibexSessionId,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> VibexResult<TimelinePage> {
+        let mut reader = self
+            .timeline_reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reader.is_none() {
+            *reader = Some(self.open_migrated()?);
+        }
+        let conn = reader
+            .as_ref()
+            .expect("the timeline reader was opened just above");
+        match TimelineRepository::fetch_after(conn, session_id, after_sequence, limit) {
+            Ok(page) => Ok(page),
+            Err(error) => {
+                // A connection that cannot serve this read is not worth
+                // keeping; the next call starts from a fresh one.
+                *reader = None;
+                Err(error)
+            }
+        }
     }
 
     /// Scans every registered local Agent history source concurrently. The
@@ -3771,7 +3833,10 @@ impl AgentManager {
 
     pub(crate) fn open_migrated(&self) -> VibexResult<DbConnection> {
         let mut conn = open_database(&self.db_path)?;
-        apply_migrations(&mut conn)?;
+        if !schema_is_verified(&self.db_path) {
+            apply_migrations(&mut conn)?;
+            mark_schema_verified(&self.db_path);
+        }
         Ok(conn)
     }
 
