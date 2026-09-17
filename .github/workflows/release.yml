@@ -262,7 +262,12 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      # v4.0.2 drops the deprecated `tools` package from its default package
+      # set: Google no longer serves it, so the action used to die on
+      # "Failed to find package 'tools'" before any build step ran.
+      - uses: android-actions/setup-android@7731365548f3f81c15d4c49c8f1d29101e02cdcf # v4.0.2
+        with:
+          packages: platform-tools
       - name: Verify native mobile contract
         run: node scripts/check-mobile-native.mjs
       - name: Install Android SDK and NDK
