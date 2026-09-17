@@ -38,10 +38,17 @@ command -v cargo-ndk >/dev/null || {
   exit 1
 }
 
+# cargo-ndk writes only the libraries it just built, so anything an earlier
+# build left behind - a debug build's unstripped .so, or an ABI this profile no
+# longer targets - is still packaged into the APK. The directory is generated
+# and gitignored, so clear it rather than merging into it.
+JNI_LIBS_DIR=apps/mobile/android/app/src/main/jniLibs
+rm -rf "$JNI_LIBS_DIR"
+
 cargo ndk \
   "${NDK_TARGET_ARGS[@]}" \
   --platform "$ANDROID_API" \
-  -o apps/mobile/android/app/src/main/jniLibs \
+  -o "$JNI_LIBS_DIR" \
   build -p vibex-mobile --lib "${RUST_FLAGS[@]}"
 
 cd apps/mobile/android
