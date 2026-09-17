@@ -2,6 +2,7 @@ use serde::Serialize;
 
 pub mod actions;
 pub mod app;
+pub mod appearance_theme;
 pub mod assets;
 pub mod code_workbench;
 pub mod directory_picker;

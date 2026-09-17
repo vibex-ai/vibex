@@ -7,8 +7,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE = "crates/vibex-ui/theme/tokens.json";
 const OUTPUT = "crates/vibex-ui/src/generated_tokens.rs";
-const SCHEMA_VERSION = "vibex-design-tokens.v1";
+const SCHEMA_VERSION = "vibex-design-tokens.v2";
 const PRODUCT_VISUAL_SOURCE = "apps/desktop";
+const THEME_MODES = ["light", "dark"];
 const FORBIDDEN_SOURCE_REFERENCES = [
   "apps/web",
   "apps/mobile-wasm",
@@ -153,6 +154,53 @@ function validateSyntaxHighlight(value, label) {
   return highlight;
 }
 
+function parseThemes(value) {
+  const raw = object(value, "themes");
+  const ids = Object.keys(raw);
+  if (!ids.length) fail("themes must contain at least one theme");
+
+  const themes = {};
+  const counts = { light: 0, dark: 0 };
+  let referenceNames = null;
+
+  for (const id of ids) {
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) fail(`themes.${id} is not a valid theme id`);
+    const entry = object(raw[id], `themes.${id}`);
+    exactKeys(entry, ["name", "mode", "semanticColors", "syntaxHighlight"], `themes.${id}`);
+    if (typeof entry.name !== "string" || !entry.name.trim()) {
+      fail(`themes.${id}.name must be a non-empty string`);
+    }
+    if (!THEME_MODES.includes(entry.mode)) {
+      fail(`themes.${id}.mode must be one of ${THEME_MODES.join(", ")}`);
+    }
+    counts[entry.mode] += 1;
+
+    const semanticColors = semanticTokens(entry.semanticColors, `themes.${id}.semanticColors`);
+    const names = semanticColors.map((token) => token.name);
+    if (referenceNames === null) {
+      referenceNames = names;
+    } else if (JSON.stringify(names) !== JSON.stringify(referenceNames)) {
+      fail(`themes.${id} semantic color names or order differ from themes.${ids[0]}`);
+    }
+
+    themes[id] = {
+      id,
+      name: entry.name.trim(),
+      mode: entry.mode,
+      semanticColors,
+      syntaxHighlight: validateSyntaxHighlight(
+        entry.syntaxHighlight,
+        `themes.${id}.syntaxHighlight`
+      )
+    };
+  }
+
+  for (const mode of THEME_MODES) {
+    if (!counts[mode]) fail(`themes must contain at least one ${mode} theme`);
+  }
+  return { themes, ids, counts };
+}
+
 function parseSource(raw) {
   let source;
   try {
@@ -171,6 +219,7 @@ function parseSource(raw) {
       "spacingPx",
       "bordersPx",
       "shadows",
+      "defaultTheme",
       "themes"
     ],
     "token source"
@@ -231,24 +280,20 @@ function parseSource(raw) {
   exactKeys(source.shadows, ["enabled"], "shadows");
   if (typeof source.shadows.enabled !== "boolean") fail("shadows.enabled must be boolean");
 
-  exactKeys(source.themes, ["light", "dark"], "themes");
-  const themes = {};
-  for (const mode of ["light", "dark"]) {
-    exactKeys(source.themes[mode], ["semanticColors", "syntaxHighlight"], `themes.${mode}`);
-    themes[mode] = {
-      semanticColors: semanticTokens(source.themes[mode].semanticColors, `themes.${mode}.semanticColors`),
-      syntaxHighlight: validateSyntaxHighlight(
-        source.themes[mode].syntaxHighlight,
-        `themes.${mode}.syntaxHighlight`
-      )
-    };
+  const { themes, ids, counts } = parseThemes(source.themes);
+
+  exactKeys(source.defaultTheme, THEME_MODES, "defaultTheme");
+  for (const mode of THEME_MODES) {
+    const id = source.defaultTheme[mode];
+    if (typeof id !== "string" || !themes[id]) {
+      fail(`defaultTheme.${mode} must name a theme in themes`);
+    }
+    if (themes[id].mode !== mode) {
+      fail(`defaultTheme.${mode} must name a ${mode} theme`);
+    }
   }
-  const lightNames = themes.light.semanticColors.map((token) => token.name);
-  const darkNames = themes.dark.semanticColors.map((token) => token.name);
-  if (JSON.stringify(lightNames) !== JSON.stringify(darkNames)) {
-    fail("light and dark semantic color names or order differ");
-  }
-  return { source, themes };
+
+  return { source, themes, ids, counts };
 }
 
 function rustFloat(value) {
@@ -274,8 +319,12 @@ function tokenRows(tokens) {
     .join("\n");
 }
 
+function themeConstSuffix(id) {
+  return id.toUpperCase().replace(/-/g, "_");
+}
+
 function generate(raw) {
-  const { source, themes } = parseSource(raw);
+  const { source, themes, ids, counts } = parseSource(raw);
   const hash = createHash("sha256").update(raw).digest("hex");
   const code = source.typography.code;
   const lines = [
@@ -310,6 +359,31 @@ function generate(raw) {
     "    pub focus_px: f32,",
     "}",
     "",
+    "/// Which appearance a theme variant is authored for.",
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]",
+    "pub enum GpuiThemeMode {",
+    "    Light,",
+    "    Dark,",
+    "}",
+    "",
+    "impl GpuiThemeMode {",
+    "    pub const ALL: [Self; 2] = [Self::Light, Self::Dark];",
+    "",
+    "    pub fn is_dark(self) -> bool {",
+    "        matches!(self, Self::Dark)",
+    "    }",
+    "}",
+    "",
+    "/// One completely resolved theme variant from the shared token source.",
+    "#[derive(Debug, Clone, Copy, PartialEq)]",
+    "pub struct GpuiThemeDefinition {",
+    "    pub id: &'static str,",
+    "    pub name: &'static str,",
+    "    pub mode: GpuiThemeMode,",
+    "    pub tokens: &'static [GpuiColorToken],",
+    "    pub highlight_json: &'static str,",
+    "}",
+    "",
     `pub const TOKEN_SCHEMA_VERSION: &str = ${rustString(source.schemaVersion)};`,
     `pub const TOKEN_PRODUCT_VISUAL_SOURCE: &str = ${rustString(source.productVisualSource)};`,
     `pub const TOKEN_SOURCE_PATH: &str = ${rustString(SOURCE)};`,
@@ -337,17 +411,40 @@ function generate(raw) {
     "};",
     `pub const SHADOWS_ENABLED: bool = ${source.shadows.enabled};`,
     "",
-    `pub const LIGHT_HIGHLIGHT_THEME_JSON: &str = ${rustRawString(JSON.stringify(themes.light.syntaxHighlight))};`,
-    `pub const DARK_HIGHLIGHT_THEME_JSON: &str = ${rustRawString(JSON.stringify(themes.dark.syntaxHighlight))};`,
-    "",
-    "pub const LIGHT_TOKENS: &[GpuiColorToken] = &[",
-    tokenRows(themes.light.semanticColors),
-    "];",
-    "",
-    "pub const DARK_TOKENS: &[GpuiColorToken] = &[",
-    tokenRows(themes.dark.semanticColors),
-    "];"
+    `pub const DEFAULT_LIGHT_THEME_ID: &str = ${rustString(source.defaultTheme.light)};`,
+    `pub const DEFAULT_DARK_THEME_ID: &str = ${rustString(source.defaultTheme.dark)};`,
+    ""
   ];
+
+  for (const id of ids) {
+    const theme = themes[id];
+    const suffix = themeConstSuffix(id);
+    lines.push(`const THEME_${suffix}_TOKENS: &[GpuiColorToken] = &[`);
+    lines.push(tokenRows(theme.semanticColors));
+    lines.push("];");
+    lines.push(
+      `const THEME_${suffix}_HIGHLIGHT_JSON: &str = ${rustRawString(
+        JSON.stringify(theme.syntaxHighlight)
+      )};`
+    );
+    lines.push("");
+  }
+
+  lines.push("/// Every theme variant from the shared token source, in authoring order.");
+  lines.push("pub const THEMES: &[GpuiThemeDefinition] = &[");
+  for (const id of ids) {
+    const theme = themes[id];
+    const suffix = themeConstSuffix(id);
+    lines.push("    GpuiThemeDefinition {");
+    lines.push(`        id: ${rustString(id)},`);
+    lines.push(`        name: ${rustString(theme.name)},`);
+    lines.push(`        mode: GpuiThemeMode::${theme.mode === "dark" ? "Dark" : "Light"},`);
+    lines.push(`        tokens: THEME_${suffix}_TOKENS,`);
+    lines.push(`        highlight_json: THEME_${suffix}_HIGHLIGHT_JSON,`);
+    lines.push("    },");
+  }
+  lines.push("];");
+
   const unformatted = `${lines.join("\n")}\n`;
   const formatted = spawnSync("rustfmt", ["--edition", "2024"], {
     input: unformatted,
@@ -359,23 +456,34 @@ function generate(raw) {
   return {
     content: formatted.stdout,
     hash,
-    lightCount: themes.light.semanticColors.length,
-    darkCount: themes.dark.semanticColors.length
+    themeCount: ids.length,
+    lightCount: counts.light,
+    darkCount: counts.dark,
+    tokenCount: themes[ids[0]].semanticColors.length
   };
 }
 
 function selfTest(raw) {
   const mutations = [
-    ["schema drift", (copy) => (copy.schemaVersion = "vibex-design-tokens.v0")],
+    ["schema drift", (copy) => (copy.schemaVersion = "vibex-design-tokens.v1")],
     [
       "legacy source reference",
       (copy) => (copy.typography.code.fallbackStack = "apps/desktop/src/styles.css")
     ],
-    ["theme name drift", (copy) => delete copy.themes.dark.semanticColors.background],
+    ["theme token drift", (copy) => delete copy.themes["vibex-dark"].semanticColors.background],
     [
       "invalid syntax weight",
-      (copy) => (copy.themes.light.syntaxHighlight.syntax.title.font_weight = 650)
-    ]
+      (copy) => (copy.themes["vibex-light"].syntaxHighlight.syntax.title.font_weight = 650)
+    ],
+    ["unknown default theme", (copy) => (copy.defaultTheme.dark = "missing-theme")],
+    ["default theme mode mismatch", (copy) => (copy.defaultTheme.light = "vibex-dark")],
+    ["missing theme name", (copy) => delete copy.themes.nord.name],
+    ["invalid theme mode", (copy) => (copy.themes.nord.mode = "sepia")],
+    ["token order drift", (copy) => {
+      const colors = copy.themes.nord.semanticColors;
+      const reordered = Object.fromEntries(Object.entries(colors).reverse());
+      copy.themes.nord.semanticColors = reordered;
+    }]
   ];
   for (const [label, mutate] of mutations) {
     const copy = JSON.parse(raw);
@@ -411,6 +519,8 @@ if (process.argv.includes("--self-test")) {
     fail(`${OUTPUT} is stale; run node scripts/generate-tokens.mjs --write`);
   }
   console.log(
-    `GPUI tokens verified: ${generated.lightCount} light, ${generated.darkCount} dark, ${generated.hash}`
+    `GPUI tokens verified: ${generated.themeCount} themes ` +
+      `(${generated.lightCount} light, ${generated.darkCount} dark), ` +
+      `${generated.tokenCount} tokens each, ${generated.hash}`
   );
 }

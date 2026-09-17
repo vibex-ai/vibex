@@ -2,15 +2,18 @@
 //!
 //! The palette resolves from the shared desktop token source
 //! (`crates/vibex-ui` generated tokens) at render time through an appearance
-//! mode, so the phone reads as the same product as the desktop shell in both
-//! dark and light. Views must go through these accessors instead of
-//! hardcoding colors.
+//! mode and the user's light/dark theme selection, so the phone reads as the
+//! same product as the desktop shell in every palette. Views must go through
+//! these accessors instead of hardcoding colors.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use gpui::{App, Hsla, Rgba, Window, hsla, px, rgb};
 use gpui_component::{Theme, ThemeMode as ComponentThemeMode};
-use vibex_ui::{DARK_TOKENS, GpuiColorToken, LIGHT_TOKENS};
+use vibex_desktop_model::ThemeSelection;
+use vibex_ui::{
+    GpuiThemeDefinition, GpuiThemeMode, default_theme, semantic_token, theme_at, theme_index,
+};
 
 // ---------------------------------------------------------------------------
 // Appearance mode
@@ -120,15 +123,65 @@ pub fn follows_system() -> bool {
 // Shared token resolution
 // ---------------------------------------------------------------------------
 
+/// The palette the client is painting with, per appearance.
+///
+/// Mirrors the desktop shell's paint-time resolution: colors are read
+/// imperatively through [`semantic_color`], which has no `App` handle to
+/// consult, so the active catalog position is cached here. `UNSET` resolves to
+/// the catalog default, which is what a cold read before any selection lands
+/// on.
+const UNSET: usize = usize::MAX;
+
+static ACTIVE_LIGHT: AtomicUsize = AtomicUsize::new(UNSET);
+static ACTIVE_DARK: AtomicUsize = AtomicUsize::new(UNSET);
+
+fn mode_slot(mode: GpuiThemeMode) -> &'static AtomicUsize {
+    match mode {
+        GpuiThemeMode::Light => &ACTIVE_LIGHT,
+        GpuiThemeMode::Dark => &ACTIVE_DARK,
+    }
+}
+
+fn model_mode(dark: bool) -> GpuiThemeMode {
+    if dark {
+        GpuiThemeMode::Dark
+    } else {
+        GpuiThemeMode::Light
+    }
+}
+
+/// The theme variant the client is painting with for `mode`.
+pub fn active_theme(mode: GpuiThemeMode) -> &'static GpuiThemeDefinition {
+    let index = mode_slot(mode).load(Ordering::Relaxed);
+    if index == UNSET {
+        return default_theme(mode);
+    }
+    theme_at(index).unwrap_or_else(|| default_theme(mode))
+}
+
+/// Point the paint-time palette at `selection`.
+///
+/// The phone mirrors the desktop's selection so both surfaces name the same
+/// palettes; an id the catalog does not know falls back to the default for
+/// that appearance instead of failing the frame.
+pub fn set_theme_selection(selection: &ThemeSelection) {
+    for mode in GpuiThemeMode::ALL {
+        let requested = match mode {
+            GpuiThemeMode::Light => selection.light(),
+            GpuiThemeMode::Dark => selection.dark(),
+        };
+        let index = requested
+            .and_then(|id| theme_index(id, mode))
+            .unwrap_or(UNSET);
+        mode_slot(mode).store(index, Ordering::Relaxed);
+    }
+}
+
 /// One step above the desktop lookup helper: a missing token is a build-time
 /// contract with `tokens.json`, so a typo surfaces as a panic at first paint
 /// instead of a silent wrong color.
 pub fn semantic_color(name: &str, dark: bool) -> Hsla {
-    let tokens: &[GpuiColorToken] = if dark { DARK_TOKENS } else { LIGHT_TOKENS };
-    let token = tokens
-        .iter()
-        .copied()
-        .find(|token| token.name == name)
+    let token = semantic_token(active_theme(model_mode(dark)), name)
         .unwrap_or_else(|| panic!("missing generated GPUI semantic token: {name}"));
     Hsla {
         a: token.alpha,

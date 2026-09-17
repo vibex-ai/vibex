@@ -683,13 +683,13 @@ information.
 
 ## Styling
 
-- Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across desktop and native mobile GPUI.
+- Use semantic tokens from `crates/vibex-ui/theme/tokens.json` across desktop and native mobile GPUI. See [Themes](#themes) before adding or changing a palette or a role.
 - Every panel integrated in the right rail — files, Git, and the child Agent
   timeline — paints the shared `right-rail-surface` token as its base, and the
   section washes inside it layer that same token rather than `sidebar` or
   `background`. A rail panel that paints another surface token reads as a
   different pane from its neighbours.
-- Preserve dark mode as a first-class path.
+- Preserve dark mode as a first-class path, and keep every curated theme in both appearances equally readable.
 - Use shared GPUI/gpui-component primitives; legacy React may keep shadcn/Radix until cutover.
 - GPUI delete, remove, clear, and destructive close actions must use the shared
   `icons/vibex/trash-2.svg` glyph. Do not use `IconName::Delete`: the locked
@@ -724,6 +724,43 @@ information.
   inside the dialog.
 - Do not default to flat, generic layouts when implementing new screens. Follow the
   current GPUI Desktop workbench and its domain-component language.
+
+### Themes
+
+`crates/vibex-ui/theme/tokens.json` is keyed by theme id. Each entry carries a
+display name, the appearance it is authored for (`light` or `dark`), the full
+semantic role map, and a syntax highlight block. `defaultTheme` names the
+product default for each appearance. The file is the only place a built-in
+palette is authored; `scripts/generate-tokens.mjs` validates it, converts OKLCH
+to sRGB, and emits `crates/vibex-ui/src/generated_tokens.rs`.
+
+- **A theme variant belongs to exactly one appearance.** A light palette is not
+  a valid dark selection; resolvers reject the mismatch and fall back to the
+  appearance's default rather than painting unreadable text.
+- **Light and dark selections are independent.** Persisted state stores one
+  theme id per appearance, so any light palette can pair with any dark one.
+  Never collapse them into a single "current theme" setting.
+- **All themes carry the same role set.** A new role must be added to every
+  theme in `tokens.json`; the generator rejects a file whose themes disagree on
+  role names or order. Add the role to the default themes first, then to the
+  curated ones.
+- **Resolve colors through the active theme, never a fixed pair.** Use
+  `cx.theme()` for component surfaces and `theme::semantic_color(name, is_dark)`
+  where no context is available. A missing role panics by design: it is a
+  build-time contract between the token source and the call site.
+- **Derived tones follow the theme.** Washes, scrims, and mixed plates must be
+  computed from the active theme's own background or foreground so a warm or
+  tinted palette does not receive neutral grey chrome.
+- **Contrast is a gate, not a preference.** Body and muted text must clear
+  4.5:1 against the surface they are painted on, in every theme.
+
+Users can add their own palettes by dropping a theme file into the `themes`
+directory under the app home. A file names only the roles it changes;
+compilation starts from the built-in default for the entry's appearance and
+re-derives every unpinned `*-foreground` against the surface it is painted on.
+A malformed entry is reported and skipped without hiding its valid siblings,
+and a user theme may shadow a built-in id. `crates/vibex-ui/theme/example-theme-file.json`
+is the copy-pasteable reference and is kept compiling by a test.
 
 ## Accessibility
 

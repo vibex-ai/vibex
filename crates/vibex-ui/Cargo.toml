@@ -8,13 +8,13 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 vibex-core = { path = "../core" }
 vibex-desktop-model = { path = "../desktop-model" }
 vibex-backend = { path = "../vibex-backend" }
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
 vibex-git = { path = "../git" }

@@ -140,7 +140,7 @@ use vibex_markdown::{
     parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_ui::{
-    AgentFileGitController, ElicitationFormDraft, ManagementWorkflowCapabilities,
+    AgentFileGitController, ElicitationFormDraft, GpuiThemeMode, ManagementWorkflowCapabilities,
     ManagementWorkflowController, ShellKind, TerminalWorkflowCapabilities,
     TerminalWorkflowController,
 };
@@ -150,6 +150,8 @@ use crate::actions::{
     OpenSettings, RedoImageEdit, RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview,
     ToggleRightRail, ToggleSidebar, UndoImageEdit,
 };
+
+use crate::appearance_theme;
 use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
@@ -5441,6 +5443,9 @@ impl VibexWorkbench {
         });
         let (config, mut ui_state, ui_writer, persistence_note) = match config {
             Ok(config) => {
+                // Before the persisted selection is applied, so a saved user
+                // theme resolves on the first frame.
+                theme::install_user_themes(&config.home_dir);
                 let store = UiStateStore::new(ui_state_path(&config.home_dir));
                 match store.load_read_only() {
                     Ok(load) => {
@@ -25428,6 +25433,25 @@ impl VibexWorkbench {
 
     fn set_theme(&mut self, mode: ModelThemeMode, window: &mut Window, cx: &mut Context<Self>) {
         self.ui_state.appearance.theme = mode;
+        theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    /// Change one appearance's palette, leaving the other appearance's choice
+    /// intact — the two slots are independent by design.
+    fn set_theme_variant(
+        &mut self,
+        mode: GpuiThemeMode,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = &mut self.ui_state.appearance.theme_selection;
+        match mode {
+            GpuiThemeMode::Light => selection.select_light(id),
+            GpuiThemeMode::Dark => selection.select_dark(id),
+        }
         theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         self.queue_ui_state();
         cx.notify();
@@ -49913,6 +49937,19 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_theme_variant(
+        &mut self,
+        mode: GpuiThemeMode,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_theme_variant(mode, id, window, cx));
+        cx.notify();
+    }
+
     fn set_locale(&mut self, mode: LocaleMode, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self
             .workbench
@@ -50942,6 +50979,32 @@ impl FoundationSettings {
             Some(strings.choose_interface_font),
             cx,
         );
+        let light_theme_picker = appearance_theme::theme_picker(
+            "light-theme-picker",
+            GpuiThemeMode::Light,
+            &appearance.theme_selection,
+            {
+                let this = cx.entity().downgrade();
+                move |id, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.set_theme_variant(GpuiThemeMode::Light, id, window, cx)
+                    });
+                }
+            },
+        );
+        let dark_theme_picker = appearance_theme::theme_picker(
+            "dark-theme-picker",
+            GpuiThemeMode::Dark,
+            &appearance.theme_selection,
+            {
+                let this = cx.entity().downgrade();
+                move |id, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.set_theme_variant(GpuiThemeMode::Dark, id, window, cx)
+                    });
+                }
+            },
+        );
         let code_font_select = settings_select(
             &self.code_fonts,
             Some(px(240.0)),
@@ -50957,6 +51020,28 @@ impl FoundationSettings {
                     strings.theme,
                     strings.theme_description,
                     theme_control,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.light_theme,
+                    appearance_theme::selected_theme_description(
+                        &appearance.theme_selection,
+                        GpuiThemeMode::Light,
+                        strings.system_default,
+                    ),
+                    light_theme_picker,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    strings.dark_theme,
+                    appearance_theme::selected_theme_description(
+                        &appearance.theme_selection,
+                        GpuiThemeMode::Dark,
+                        strings.system_default,
+                    ),
+                    dark_theme_picker,
                     stacked,
                     cx,
                 ),

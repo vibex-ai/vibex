@@ -1,15 +1,16 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{App, Hsla, Window, px};
 use gpui_component::{
     Theme, ThemeMode as ComponentThemeMode,
     highlighter::{HighlightTheme, HighlightThemeStyle},
 };
-use vibex_desktop_model::{AppearanceUiState, ThemeMode};
+use vibex_desktop_model::{AppearanceUiState, ThemeMode, ThemeSelection};
 use vibex_markdown::apply_code_font_weight;
 use vibex_ui::{
-    CODE_TYPOGRAPHY, DARK_HIGHLIGHT_THEME_JSON, DARK_TOKENS, GpuiColorToken, INTERFACE_TYPOGRAPHY,
-    LIGHT_HIGHLIGHT_THEME_JSON, LIGHT_TOKENS, RADII, SHADOWS_ENABLED,
+    CODE_TYPOGRAPHY, GpuiColorToken, GpuiThemeDefinition, GpuiThemeMode, INTERFACE_TYPOGRAPHY,
+    RADII, SHADOWS_ENABLED, default_theme, semantic_token as catalog_token, theme_index,
 };
 
 use crate::motion::mix;
@@ -18,6 +19,69 @@ pub use vibex_ui::{
     TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
 };
 
+/// The palette the renderer is currently painting with, per appearance.
+///
+/// Colors are read imperatively at paint time through [`semantic_color`],
+/// which has no `App` handle to consult, so the active catalog position is
+/// mirrored here whenever the selection changes. `UNSET` resolves to the
+/// catalog default, which is what the very first frame and any unit test that
+/// never installs a theme see.
+const UNSET: usize = usize::MAX;
+
+static ACTIVE_LIGHT: AtomicUsize = AtomicUsize::new(UNSET);
+static ACTIVE_DARK: AtomicUsize = AtomicUsize::new(UNSET);
+
+fn mode_slot(mode: GpuiThemeMode) -> &'static AtomicUsize {
+    match mode {
+        GpuiThemeMode::Light => &ACTIVE_LIGHT,
+        GpuiThemeMode::Dark => &ACTIVE_DARK,
+    }
+}
+
+fn model_mode(dark: bool) -> GpuiThemeMode {
+    if dark {
+        GpuiThemeMode::Dark
+    } else {
+        GpuiThemeMode::Light
+    }
+}
+
+/// The theme variant the renderer is painting with for `mode`.
+pub fn active_theme(mode: GpuiThemeMode) -> &'static GpuiThemeDefinition {
+    let index = mode_slot(mode).load(Ordering::Relaxed);
+    if index == UNSET {
+        return default_theme(mode);
+    }
+    vibex_ui::theme_at(index).unwrap_or_else(|| default_theme(mode))
+}
+
+/// The catalog position a selection resolves to for `mode`, or [`UNSET`].
+///
+/// Pure, so the mapping is testable without mutating the process-wide slots
+/// that other tests read.
+fn selection_index(selection: &ThemeSelection, mode: GpuiThemeMode) -> usize {
+    let requested = match mode {
+        GpuiThemeMode::Light => selection.light(),
+        GpuiThemeMode::Dark => selection.dark(),
+    };
+    // A stale or cross-appearance id resolves to the default here rather than
+    // being stored, so `active_theme` never has to correct it.
+    requested
+        .and_then(|id| theme_index(id, mode))
+        .unwrap_or(UNSET)
+}
+
+/// Point the paint-time palette at `selection`.
+///
+/// Called by [`apply_appearance`] before it reads any token, so the whole
+/// palette — including the colors the gpui-component theme is built from — is
+/// resolved against the same variant.
+pub fn set_active_selection(selection: &ThemeSelection) {
+    for mode in GpuiThemeMode::ALL {
+        mode_slot(mode).store(selection_index(selection, mode), Ordering::Relaxed);
+    }
+}
+
 fn shared_code_font_family() -> &'static str {
     match CODE_TYPOGRAPHY.family {
         "platform_monospace" => crate::platform::default_code_font_family(),
@@ -25,25 +89,56 @@ fn shared_code_font_family() -> &'static str {
     }
 }
 
-fn shared_highlight_theme(is_dark: bool) -> Arc<HighlightTheme> {
-    let (name, appearance, source) = if is_dark {
-        (
-            "Vibex Dark",
-            ComponentThemeMode::Dark,
-            DARK_HIGHLIGHT_THEME_JSON,
-        )
-    } else {
-        (
-            "Vibex Light",
-            ComponentThemeMode::Light,
-            LIGHT_HIGHLIGHT_THEME_JSON,
-        )
-    };
-    let style = serde_json::from_str::<HighlightThemeStyle>(source)
-        .expect("shared GPUI syntax highlight tokens must be valid");
+/// Load user theme files from `home` into the shared catalog.
+///
+/// Called once at startup, before the persisted selection is applied, so a
+/// saved custom theme resolves on the first frame. A file that does not
+/// compile is reported and skipped — it never keeps the app from starting, and
+/// never hides the themes in its valid siblings.
+pub fn install_user_themes(home: &std::path::Path) {
+    let directory = vibex_ui::theme_directory(home);
+    let (themes, errors) = vibex_ui::load_directory(&directory);
+    for (path, error) in &errors {
+        tracing::warn!(
+            code = error.stable_code(),
+            path = %path.display(),
+            "user theme skipped: {error}"
+        );
+    }
+    if themes.is_empty() {
+        return;
+    }
+    let count = themes.len();
+    match vibex_ui::install_custom_themes(themes) {
+        Ok(()) => tracing::info!(
+            count,
+            directory = %directory.display(),
+            "user themes installed"
+        ),
+        Err(error) => tracing::warn!("user themes were not installed: {error}"),
+    }
+}
+
+fn shared_highlight_theme(mode: GpuiThemeMode) -> Arc<HighlightTheme> {
+    let definition = active_theme(mode);
+    // A user theme's highlight block is validated structurally when its file
+    // loads, but only the highlighter can reject a style it cannot use. Fall
+    // back to the appearance's built-in block rather than failing the frame.
+    let style = serde_json::from_str::<HighlightThemeStyle>(definition.highlight_json)
+        .or_else(|error| {
+            tracing::warn!(
+                theme = definition.id,
+                "syntax highlight block rejected, using the built-in one: {error}"
+            );
+            serde_json::from_str::<HighlightThemeStyle>(default_theme(mode).highlight_json)
+        })
+        .expect("built-in syntax highlight tokens must be valid");
     Arc::new(HighlightTheme {
-        name: name.to_string(),
-        appearance,
+        name: definition.name.to_string(),
+        appearance: match mode {
+            GpuiThemeMode::Light => ComponentThemeMode::Light,
+            GpuiThemeMode::Dark => ComponentThemeMode::Dark,
+        },
         style,
     })
 }
@@ -76,13 +171,20 @@ fn apply_semantic_highlight_colors(theme: &mut Theme, is_dark: bool) {
 /// State-wash tone shared by hover, active, and selected fills. Quoted in
 /// dark-mode terms: dark paints a soft-white wash, light the tone-flipped
 /// soft-black — the same alpha family the dark tuning established.
+///
+/// The wash is a scrim, not a palette color: its *lightness* is fixed at the
+/// pole that reads as "raised" for the appearance, while hue and a damped
+/// chroma follow the active theme's background so a warm or tinted palette
+/// gets a wash in its own family instead of a neutral grey one.
 fn state_wash(is_dark: bool, alpha: f32) -> Hsla {
-    if is_dark {
-        gpui::hsla(0.0, 0.0, 0.92, alpha)
-    } else {
-        gpui::hsla(0.0, 0.0, 0.10, alpha)
-    }
+    let background = semantic_color("background", is_dark);
+    let pole = if is_dark { 0.92 } else { 0.10 };
+    gpui::hsla(background.h, background.s * WASH_CHROMA_SCALE, pole, alpha)
 }
+
+/// How much of the background's chroma survives into a wash. Enough to keep
+/// the wash in the theme's family, low enough that it never reads as a color.
+const WASH_CHROMA_SCALE: f32 = 0.35;
 
 /// Hover wash for interactive rows, buttons, and tabs (theme-independent —
 /// callers blending it per-frame through `motion::hover_blend` need a value,
@@ -102,6 +204,10 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         ThemeMode::Dark => Theme::change(ComponentThemeMode::Dark, window, cx),
         ThemeMode::System => Theme::sync_system_appearance(window, cx),
     }
+    // Install the selection before any token is read: everything below — the
+    // highlight theme, the component colors, the washes — resolves against the
+    // variant this points at, and so does every paint after it.
+    set_active_selection(&appearance.theme_selection);
     // Keep gpui's global animation flag in step with the user preference: the
     // vendored gpui snaps every `with_animation` element (modal slides, menu
     // fades, entrance lifts) to its end state and schedules no frames while it
@@ -132,7 +238,7 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     theme.radius_lg = px(RADII.large_px);
     theme.shadow = SHADOWS_ENABLED;
     let is_dark = theme.is_dark();
-    theme.highlight_theme = shared_highlight_theme(is_dark);
+    theme.highlight_theme = shared_highlight_theme(model_mode(is_dark));
     apply_semantic_popover_colors(theme, is_dark);
     apply_semantic_highlight_colors(theme, is_dark);
     // Full semantic mapping — every interactive surface resolves from the
@@ -226,7 +332,15 @@ pub fn scaled_font_size(size: u16, window_scale_percent: u16) -> gpui::Pixels {
 }
 
 pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {
-    let token = semantic_token(name, dark)
+    semantic_color_for(active_theme(model_mode(dark)), name)
+}
+
+/// Read a semantic token from one specific theme.
+///
+/// Used by previews that must paint a palette other than the active one —
+/// theme pickers above all, which show every candidate at once.
+pub fn semantic_color_for(theme: &GpuiThemeDefinition, name: &str) -> Hsla {
+    let token = catalog_token(theme, name)
         .unwrap_or_else(|| panic!("missing generated GPUI semantic token: {name}"));
     Hsla {
         a: token.alpha,
@@ -234,9 +348,9 @@ pub(crate) fn semantic_color(name: &str, dark: bool) -> Hsla {
     }
 }
 
+/// Read a semantic token from the palette currently active for `dark`.
 pub fn semantic_token(name: &str, dark: bool) -> Option<GpuiColorToken> {
-    let tokens = if dark { DARK_TOKENS } else { LIGHT_TOKENS };
-    tokens.iter().copied().find(|token| token.name == name)
+    catalog_token(active_theme(model_mode(dark)), name)
 }
 
 #[cfg(test)]
@@ -253,16 +367,66 @@ mod tests {
     #[test]
     fn generated_tokens_keep_shared_source_identity_and_core_semantics() {
         assert_eq!(TOKEN_SOURCE_SHA256.len(), 64);
-        assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v1");
+        assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v2");
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
-        assert_eq!(semantic_token("background", false).unwrap().hex, "#ffffff");
-        assert_eq!(semantic_token("foreground", true).unwrap().hex, "#e5e5e5");
-        assert_eq!(semantic_token("border", true).unwrap().alpha, 0.1);
-        assert!(semantic_token("warning-foreground", false).is_some());
-        assert!(semantic_token("warning-foreground", true).is_some());
-        assert!(LIGHT_TOKENS.len() >= 40);
-        assert_eq!(LIGHT_TOKENS.len(), DARK_TOKENS.len());
+
+        // Assert against the catalog defaults directly rather than through the
+        // process-wide active slot, so the expectations cannot depend on test
+        // ordering.
+        let light = default_theme(GpuiThemeMode::Light);
+        let dark = default_theme(GpuiThemeMode::Dark);
+        assert_eq!(catalog_token(light, "background").unwrap().hex, "#ffffff");
+        assert_eq!(catalog_token(dark, "foreground").unwrap().hex, "#e5e5e5");
+        assert_eq!(catalog_token(dark, "border").unwrap().alpha, 0.1);
+        for theme in [light, dark] {
+            assert!(catalog_token(theme, "warning-foreground").is_some());
+            assert!(theme.tokens.len() >= 40);
+        }
+    }
+
+    #[test]
+    fn an_unset_slot_paints_the_catalog_default() {
+        for mode in GpuiThemeMode::ALL {
+            assert_eq!(active_theme(mode).id, default_theme(mode).id);
+        }
+    }
+
+    #[test]
+    fn selection_resolves_each_appearance_slot_independently() {
+        let mut selection = ThemeSelection::default();
+        assert_eq!(selection_index(&selection, GpuiThemeMode::Light), UNSET);
+        assert_eq!(selection_index(&selection, GpuiThemeMode::Dark), UNSET);
+
+        selection.select_light("gruvbox-light");
+        selection.select_dark("nord");
+
+        // Resolve through the catalog so the assertion does not depend on
+        // catalog ordering.
+        let light_index = vibex_ui::theme_index("gruvbox-light", GpuiThemeMode::Light);
+        let dark_index = vibex_ui::theme_index("nord", GpuiThemeMode::Dark);
+        assert_eq!(
+            selection_index(&selection, GpuiThemeMode::Light),
+            light_index.unwrap()
+        );
+        assert_eq!(
+            selection_index(&selection, GpuiThemeMode::Dark),
+            dark_index.unwrap()
+        );
+
+        // Changing one slot leaves the other alone.
+        selection.select_light("solarized-light");
+        assert_eq!(
+            selection_index(&selection, GpuiThemeMode::Dark),
+            dark_index.unwrap()
+        );
+
+        // A stale id, or one authored for the other appearance, falls back to
+        // the default instead of adopting a mismatched palette.
+        selection.select_light("removed-theme");
+        selection.select_dark("vibex-light");
+        assert_eq!(selection_index(&selection, GpuiThemeMode::Light), UNSET);
+        assert_eq!(selection_index(&selection, GpuiThemeMode::Dark), UNSET);
     }
 
     #[test]
@@ -280,11 +444,11 @@ mod tests {
     #[test]
     fn shared_highlight_tokens_preserve_the_locked_component_defaults() {
         assert_eq!(
-            shared_highlight_theme(false).style,
+            shared_highlight_theme(GpuiThemeMode::Light).style,
             HighlightTheme::default_light().style
         );
         assert_eq!(
-            shared_highlight_theme(true).style,
+            shared_highlight_theme(GpuiThemeMode::Dark).style,
             HighlightTheme::default_dark().style
         );
     }

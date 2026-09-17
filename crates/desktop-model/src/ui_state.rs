@@ -11,6 +11,7 @@ use vibex_core::{AgentId, SessionRuntimeSelection};
 
 use crate::{
     AgentSortStrategy, NewSessionLocation, SidebarHierarchyMode, SidebarOrganizationState,
+    ThemeSelection,
 };
 
 pub const DESKTOP_UI_STATE_SCHEMA_VERSION: u32 = 1;
@@ -262,6 +263,11 @@ pub struct AppearanceUiState {
     pub code_font: FontSetting,
     pub reduced_motion: bool,
     pub high_contrast: bool,
+    /// Independently selected light and dark palettes. An absent slot resolves
+    /// to the catalog default for that appearance, so state written before
+    /// theme selection existed keeps loading unchanged.
+    #[serde(default)]
+    pub theme_selection: ThemeSelection,
 }
 
 /// Local outbound network proxy preference for the desktop runtime.
@@ -298,6 +304,7 @@ impl Default for AppearanceUiState {
             code_font: FontSetting::code_default(),
             reduced_motion: false,
             high_contrast: false,
+            theme_selection: ThemeSelection::default(),
         }
     }
 }
@@ -2527,6 +2534,43 @@ mod tests {
         let error = store.load_or_default(1).unwrap_err();
         assert!(matches!(error, UiStateError::UnsupportedVersion(99)));
         assert!(path.exists());
+    }
+
+    /// State written before theme selection existed must keep loading, and must
+    /// land on "no explicit choice" rather than on a bogus theme id.
+    #[test]
+    fn theme_selection_defaults_when_state_predates_it() {
+        let migrated =
+            decode_and_migrate(br#"{"theme":"dark","activeTab":"files","sidebarWidth":320}"#)
+                .unwrap();
+        assert_eq!(
+            migrated.appearance.theme_selection,
+            ThemeSelection::default()
+        );
+        assert_eq!(migrated.appearance.theme_selection.light(), None);
+        assert_eq!(migrated.appearance.theme_selection.dark(), None);
+    }
+
+    #[test]
+    fn theme_selection_survives_a_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-ui-state.json");
+        let store = UiStateStore::new(&path);
+
+        let mut state = DesktopUiStateV1::default();
+        state
+            .appearance
+            .theme_selection
+            .select_light("gruvbox-light");
+        state.appearance.theme_selection.select_dark("nord");
+        store.save(&state).unwrap();
+
+        let loaded = store.load_or_default(2_000).unwrap();
+        assert_eq!(
+            loaded.state.appearance.theme_selection.light(),
+            Some("gruvbox-light")
+        );
+        assert_eq!(loaded.state.appearance.theme_selection.dark(), Some("nord"));
     }
 
     #[test]

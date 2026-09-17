@@ -11,6 +11,8 @@ pub mod locale;
 pub mod management;
 pub mod shell;
 pub mod terminal;
+pub mod theme_catalog;
+pub mod theme_files;
 pub mod workflow;
 
 pub use agent::*;
@@ -23,6 +25,8 @@ pub use git::*;
 pub use management::*;
 pub use shell::*;
 pub use terminal::*;
+pub use theme_catalog::*;
+pub use theme_files::*;
 pub use workflow::*;
 
 /// Canonical structured source used to generate the shared Rust token constants.
@@ -34,14 +38,19 @@ mod tests {
 
     #[test]
     fn token_source_is_platform_neutral_and_complete() {
-        assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v1");
+        assert_eq!(TOKEN_SCHEMA_VERSION, "vibex-design-tokens.v2");
         assert_eq!(TOKEN_PRODUCT_VISUAL_SOURCE, "apps/desktop");
         assert_eq!(TOKEN_SOURCE_PATH, "crates/vibex-ui/theme/tokens.json");
         assert_eq!(TOKEN_SOURCE_SHA256.len(), 64);
-        assert_eq!(LIGHT_TOKENS.len(), DARK_TOKENS.len());
-        assert!(LIGHT_TOKENS.len() >= 40);
-        assert!(!LIGHT_HIGHLIGHT_THEME_JSON.is_empty());
-        assert!(!DARK_HIGHLIGHT_THEME_JSON.is_empty());
+        assert!(THEMES.len() >= 2);
+        for theme in THEMES {
+            assert!(theme.tokens.len() >= 40, "{} is incomplete", theme.id);
+            assert!(
+                !theme.highlight_json.is_empty(),
+                "{} has no syntax",
+                theme.id
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "vibex-theme-file.v1",
+  "name": "Example themes",
+  "author": "you",
+  "themes": [
+    {
+      "id": "example-midnight",
+      "name": "Example Midnight",
+      "mode": "dark",
+      "semanticColors": {
+        "background": "#0b0d16",
+        "card": "#141827",
+        "popover": "#141827",
+        "sidebar": "#080a12",
+        "muted": "#1d2233",
+        "foreground": "#e4e7f2",
+        "muted-foreground": "#9aa1bd",
+        "border": "#ffffff / 14%",
+        "input": "#ffffff / 18%",
+        "ring": "#7c8cff",
+        "sidebar-primary": "#7c8cff",
+        "destructive": "#ff6b81",
+        "warning": "#f5c26b"
+      }
+    },
+    {
+      "id": "example-paper",
+      "name": "Example Paper",
+      "mode": "light",
+      "semanticColors": {
+        "background": "#fbfaf7",
+        "card": "#ffffff",
+        "popover": "#ffffff",
+        "sidebar": "#f2efe9",
+        "muted": "#eae6de",
+        "foreground": "#23211c",
+        "muted-foreground": "#5f5a50",
+        "border": "#000000 / 12%",
+        "ring": "#8a5a2b",
+        "sidebar-primary": "#8a5a2b",
+        "destructive": "#b3261e",
+        "warning": "#8a6100"
+      }
+    }
+  ]
+}
