@@ -19,6 +19,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
     Sizable as _,
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyDescription, EmptyHeader},
     h_flex,
     input::{Input, InputEvent, InputState},
     tab::{Tab, TabBar},
@@ -1695,12 +1696,11 @@ impl TerminalSurface {
 
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(tab) = self.active_tab.and_then(|index| self.tabs.get(index)) else {
-            return v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .text_color(cx.theme().muted_foreground)
-                .child("Terminal is unavailable")
+            return Empty::new()
+                .header(
+                    EmptyHeader::new()
+                        .description(EmptyDescription::new().child("Terminal is unavailable")),
+                )
                 .into_any_element();
         };
         let resize_entity = cx.weak_entity();

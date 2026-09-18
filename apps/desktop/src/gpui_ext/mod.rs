@@ -1,8 +1,8 @@
 use gpui::{
-    App, InteractiveElement, Interactivity, IntoElement, RenderOnce, SharedString,
-    StatefulInteractiveElement, Window, WindowAppearance,
+    App, BorderStyle, InteractiveElement, Interactivity, IntoElement, RenderOnce, SharedString,
+    StatefulInteractiveElement, Styled as _, Window, WindowAppearance,
 };
-use gpui_component::button::Button;
+use gpui_component::{button::Button, empty::Empty};
 
 #[derive(IntoElement)]
 struct AccessibleButton(Button);
@@ -30,4 +30,12 @@ pub fn is_dark_system_appearance(cx: &App) -> bool {
         cx.window_appearance(),
         WindowAppearance::Dark | WindowAppearance::VibrantDark
     )
+}
+
+/// [`Empty`] paints a dashed border as soon as a border width is set. Vibex's
+/// empty-state cards have always used a solid hairline, so keep that look while
+/// the component owns the rest of the layout.
+pub fn solid_empty_border(mut empty: Empty) -> Empty {
+    empty.style().border_style = Some(BorderStyle::Solid);
+    empty
 }

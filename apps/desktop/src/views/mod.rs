@@ -2,7 +2,9 @@ use gpui::{
     AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
+    empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle},
+    h_flex, v_flex,
 };
 
 use crate::locale::Strings;
@@ -26,21 +28,15 @@ pub fn session_sidebar(strings: Strings, cx: &App) -> AnyElement {
                 .child(div().text_sm().font_semibold().child(strings.sessions)),
         )
         .child(
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_4()
-                .text_center()
-                .child(div().text_sm().font_medium().child(strings.no_workspace))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(strings.open_workspace),
-                ),
+            Empty::new().gap_2().px_4().header(
+                EmptyHeader::new()
+                    .title(EmptyTitle::new().child(strings.no_workspace))
+                    .description(
+                        EmptyDescription::new()
+                            .text_xs()
+                            .child(strings.open_workspace),
+                    ),
+            ),
         )
         .into_any_element()
 }
@@ -69,22 +65,17 @@ pub fn central_workbench(strings: Strings, runtime_ready: bool, cx: &App) -> Any
                 .child(runtime_badge(strings, runtime_ready, cx)),
         )
         .child(
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .p_6()
-                .child(div().text_lg().font_semibold().child(strings.no_workspace))
-                .child(
-                    div()
-                        .max_w(px(440.0))
-                        .text_center()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(strings.open_workspace),
-                ),
+            Empty::new().gap_3().p_6().header(
+                EmptyHeader::new()
+                    .max_w(px(440.0))
+                    .title(
+                        EmptyTitle::new()
+                            .text_lg()
+                            .font_semibold()
+                            .child(strings.no_workspace),
+                    )
+                    .description(EmptyDescription::new().child(strings.open_workspace)),
+            ),
         )
         .child(
             h_flex()
@@ -152,20 +143,9 @@ fn placeholder_panel(
                 .child(div().text_sm().font_semibold().child(title)),
         )
         .child(
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
+            Empty::new()
                 .px_4()
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_center()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(empty),
-                ),
+                .header(EmptyHeader::new().description(EmptyDescription::new().child(empty))),
         )
         .into_any_element()
 }

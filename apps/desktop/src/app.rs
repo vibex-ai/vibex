@@ -39,6 +39,9 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
     dialog::{DialogAction, DialogClose, DialogFooter},
+    empty::{
+        Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
+    },
     h_flex,
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
@@ -162,7 +165,7 @@ use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
 use crate::directory_picker::{DirectoryBrowseTarget, DirectoryPickHandler, DirectoryPickerDialog};
-use crate::gpui_ext::button_with_aria_label;
+use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
     apply_mosaic, apply_rectangle, apply_text,
@@ -8244,31 +8247,29 @@ impl VibexWorkbench {
 
         if remotes.is_empty() {
             rows.push(
-                v_flex()
-                    .w_full()
+                EmptyState::new()
+                    .flex_none()
+                    .items_start()
+                    .text_left()
                     .gap_1()
                     .px_2()
                     .py_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .child(locale::text(
+                    .header(
+                        EmptyHeader::new()
+                            .items_start()
+                            .max_w_full()
+                            .title(EmptyTitle::new().child(locale::text(
                                 "No remote runtimes yet",
                                 "还没有远程运行时",
                                 "還沒有遠端執行階段",
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .whitespace_normal()
-                            .child(locale::text(
-                                "Run vibex-server on a host and pair with it to drive that machine from here.",
-                                "在服务器上运行 vibex-server 并与之配对，就能从这里驱动那台机器。",
-                                "在伺服器上執行 vibex-server 並與之配對，就能從這裡驅動那台機器。",
-                            )),
+                            )))
+                            .description(
+                                EmptyDescription::new().text_xs().child(locale::text(
+                                    "Run vibex-server on a host and pair with it to drive that machine from here.",
+                                    "在服务器上运行 vibex-server 并与之配对，就能从这里驱动那台机器。",
+                                    "在伺服器上執行 vibex-server 並與之配對，就能從這裡驅動那台機器。",
+                                )),
+                            ),
                     )
                     .into_any_element(),
             );
@@ -28269,15 +28270,26 @@ impl VibexWorkbench {
                             .py_3()
                             .when(group_elements.is_empty(), |this| {
                                 this.child(
-                                    div()
-                                        .rounded(px(8.0))
-                                        .border_1()
-                                        .border_color(cx.theme().sidebar_border.opacity(0.70))
-                                        .bg(cx.theme().background.opacity(0.30))
-                                        .p_3()
-                                        .text_sm()
-                                        .text_color(cx.theme().sidebar_foreground.opacity(0.55))
-                                        .child(strings.sidebar_no_matching_sessions),
+                                    solid_empty_border(
+                                        EmptyState::new()
+                                            .flex_none()
+                                            .items_start()
+                                            .text_left()
+                                            .rounded(px(8.0))
+                                            .border_1()
+                                            .border_color(cx.theme().sidebar_border.opacity(0.70))
+                                            .bg(cx.theme().background.opacity(0.30))
+                                            .p_3(),
+                                    )
+                                    .header(
+                                        EmptyHeader::new().items_start().max_w_full().description(
+                                            EmptyDescription::new()
+                                                .text_color(
+                                                    cx.theme().sidebar_foreground.opacity(0.55),
+                                                )
+                                                .child(strings.sidebar_no_matching_sessions),
+                                        ),
+                                    ),
                                 )
                             })
                             .children(group_elements)
@@ -35011,29 +35023,25 @@ impl VibexWorkbench {
                 this.child(if self.agent_loading {
                     skeleton_conversation(content_max_width, strings, cx)
                 } else {
-                    v_flex()
+                    EmptyState::new()
                         .size_full()
-                        .items_center()
-                        .justify_center()
                         .gap_2()
-                        .p_6()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_semibold()
-                                .child(if selected.is_some() {
-                                    strings.agent_start_conversation
-                                } else {
-                                    strings.agent_select_session
-                                }),
-                        )
-                        .child(
-                            div()
+                        .header(
+                            EmptyHeader::new()
                                 .max_w(px(460.0))
-                                .text_center()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(strings.agent_timeline_description),
+                                .title(
+                                    EmptyTitle::new().text_lg().font_semibold().child(
+                                        if selected.is_some() {
+                                            strings.agent_start_conversation
+                                        } else {
+                                            strings.agent_select_session
+                                        },
+                                    ),
+                                )
+                                .description(
+                                    EmptyDescription::new()
+                                        .child(strings.agent_timeline_description),
+                                ),
                         )
                         .into_any_element()
                 })
@@ -36369,37 +36377,40 @@ impl VibexWorkbench {
                             })
                             .when(selected_terminal.is_none(), |surface| {
                                 surface.child(
-                                    v_flex()
+                                    EmptyState::new()
                                         .size_full()
-                                        .items_center()
-                                        .justify_center()
                                         .gap_2()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(locale::text(
-                                            "No Composer terminal",
-                                            "暂无编辑器终端",
-                                            "暫無編輯器終端機",
+                                        .header(EmptyHeader::new().description(
+                                            EmptyDescription::new().child(locale::text(
+                                                "No Composer terminal",
+                                                "暂无编辑器终端",
+                                                "暫無編輯器終端機",
+                                            )),
                                         ))
-                                        .child(
-                                            Button::new("create-first-composer-terminal")
-                                                .small()
-                                                .primary()
-                                                .icon(IconName::Plus)
-                                                .label(locale::text(
-                                                    "New terminal",
-                                                    "新建终端",
-                                                    "新增終端機",
-                                                ))
-                                                .disabled(
-                                                    self.agent_action_pending
-                                                        || self.selected_session_id.is_none(),
-                                                )
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.create_composer_terminal(
-                                                        window.window_handle(),
-                                                        cx,
+                                        .content(
+                                            EmptyContent::new().child(
+                                                Button::new("create-first-composer-terminal")
+                                                    .small()
+                                                    .primary()
+                                                    .icon(IconName::Plus)
+                                                    .label(locale::text(
+                                                        "New terminal",
+                                                        "新建终端",
+                                                        "新增終端機",
+                                                    ))
+                                                    .disabled(
+                                                        self.agent_action_pending
+                                                            || self.selected_session_id.is_none(),
                                                     )
-                                                })),
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.create_composer_terminal(
+                                                                window.window_handle(),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            ),
                                         ),
                                 )
                             }),
@@ -38445,13 +38456,15 @@ impl VibexWorkbench {
         {
             self.render_child_agent_full_timeline(session_id, snapshot, window, cx)
         } else {
-            div()
-                .w_full()
-                .min_w_0()
+            EmptyState::new()
+                .flex_none()
+                .items_start()
+                .text_left()
+                .px_0()
                 .py_4()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Open a child Agent from the timeline")
+                .header(EmptyHeader::new().items_start().max_w_full().description(
+                    EmptyDescription::new().child("Open a child Agent from the timeline"),
+                ))
                 .into_any_element()
         };
         v_flex()
@@ -44368,16 +44381,19 @@ impl VibexWorkbench {
         let result_list = if results.is_empty() && self.session_search_index_loading {
             skeleton_session_search(cx)
         } else if results.is_empty() {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
+            EmptyState::new()
                 .gap_2()
-                .p_6()
-                .text_color(cx.theme().muted_foreground)
-                .child(Icon::new(IconName::Search).size(px(24.0)))
-                .child(div().text_sm().child(strings.session_search_no_results))
+                .header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .mb_0()
+                                .child(Icon::new(IconName::Search).size(px(24.0))),
+                        )
+                        .description(
+                            EmptyDescription::new().child(strings.session_search_no_results),
+                        ),
+                )
                 .into_any_element()
         } else {
             v_virtual_list(

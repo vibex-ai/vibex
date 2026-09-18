@@ -24,6 +24,10 @@ use gpui_component::{
     checkbox::Checkbox,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
+    empty::{
+        Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia,
+        EmptyMediaVariant, EmptyTitle,
+    },
     form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -68,7 +72,7 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
-use crate::gpui_ext::button_with_aria_label;
+use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::remote_access_pairing::open_remote_access_pairing;
@@ -10438,36 +10442,36 @@ impl ManagementCenter {
             ));
         } else if visible.is_empty() {
             body = body.child(
-                v_flex()
-                    .w_full()
-                    .items_center()
+                EmptyState::new()
+                    .flex_none()
                     .gap_2()
                     .p_4()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
+                    .header(
+                        EmptyHeader::new().description(EmptyDescription::new().text_xs().child(
+                            management_locale_text(
                                 "No model matches this search.",
                                 "没有匹配该搜索的模型。",
                                 "沒有符合這個搜尋的模型。",
-                            )),
+                            ),
+                        )),
                     )
-                    .child(
-                        Button::new("provider-candidates-clear-search")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .label(management_locale_text(
-                                "Clear search",
-                                "清除搜索",
-                                "清除搜尋",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.profile_model_search
-                                    .update(cx, |state, cx| state.set_value("", window, cx));
-                                cx.notify();
-                            })),
+                    .content(
+                        EmptyContent::new().child(
+                            Button::new("provider-candidates-clear-search")
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .label(management_locale_text(
+                                    "Clear search",
+                                    "清除搜索",
+                                    "清除搜尋",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.profile_model_search
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    cx.notify();
+                                })),
+                        ),
                     ),
             );
         } else {
@@ -13575,52 +13579,53 @@ impl ManagementCenter {
 
         let installation = self.render_agent_installation_card(&selected_agent, window, cx);
         let provider_configuration = if profiles.is_empty() {
-            v_flex()
-                .w_full()
+            EmptyState::new()
+                .flex_none()
                 .min_h(px(180.0))
-                .items_center()
-                .justify_center()
                 .gap_3()
                 .py_4()
-                .child(div().text_sm().font_medium().child(copy.no_profiles))
-                .child(
-                    div()
+                .header(
+                    EmptyHeader::new()
                         .max_w(px(420.0))
-                        .text_xs()
-                        .text_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(copy.no_profiles_description),
-                )
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(
-                            Button::new("provider-empty-add-configuration")
-                                .small()
-                                .primary()
-                                .icon(IconName::Plus)
-                                .label(copy.add_configuration)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_profile_creator(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("provider-empty-import-existing")
-                                .small()
-                                .secondary()
-                                .icon(Icon::default().path("icons/vibex/import.svg"))
-                                .label(copy.import_configuration)
-                                .loading(native_importing)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let agent_id = this.selected_agent_id.clone();
-                                    this.preview_native_import(true, agent_id, cx)
-                                })),
+                        .title(EmptyTitle::new().child(copy.no_profiles))
+                        .description(
+                            EmptyDescription::new()
+                                .text_xs()
+                                .child(copy.no_profiles_description),
                         ),
+                )
+                .content(
+                    EmptyContent::new().child(
+                        h_flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                Button::new("provider-empty-add-configuration")
+                                    .small()
+                                    .primary()
+                                    .icon(IconName::Plus)
+                                    .label(copy.add_configuration)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_profile_creator(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("provider-empty-import-existing")
+                                    .small()
+                                    .secondary()
+                                    .icon(Icon::default().path("icons/vibex/import.svg"))
+                                    .label(copy.import_configuration)
+                                    .loading(native_importing)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let agent_id = this.selected_agent_id.clone();
+                                        this.preview_native_import(true, agent_id, cx)
+                                    })),
+                            ),
+                    ),
                 )
                 .into_any_element()
         } else {
@@ -17733,19 +17738,21 @@ impl Render for ManagementImportDialog {
             );
         } else if candidates.is_empty() {
             rows = rows.child(
-                div()
-                    .w_full()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_4()
-                    .text_sm()
-                    .font_medium()
-                    .child(management_locale_text(
+                solid_empty_border(
+                    EmptyState::new()
+                        .flex_none()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_4(),
+                )
+                .header(EmptyHeader::new().title(EmptyTitle::new().child(
+                    management_locale_text(
                         "No import candidates",
                         "没有可导入的候选项",
                         "沒有可匯入的候選項",
-                    )),
+                    ),
+                ))),
             );
         }
         if !discovering {
@@ -19867,24 +19874,81 @@ fn management_provider_placeholders(cx: &App) -> Vec<AnyElement> {
         .collect()
 }
 
+/// Icon, title, and description of the compact management empty state.
+fn compact_empty_state_header(
+    title: &'static str,
+    description: &'static str,
+    cx: &App,
+) -> EmptyHeader {
+    EmptyHeader::new()
+        .media(
+            EmptyMedia::new()
+                .with_variant(EmptyMediaVariant::Icon)
+                .mb_0()
+                .size(px(28.0))
+                .rounded(px(7.0))
+                .bg(cx.theme().muted.opacity(0.45))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(px(15.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
+        .title(EmptyTitle::new().child(title))
+        .description(
+            EmptyDescription::new()
+                .max_w(px(280.0))
+                .text_xs()
+                .child(description),
+        )
+}
+
+/// Icon, title, and description of the full-detail management empty state.
+fn detail_empty_state_header(
+    title: &'static str,
+    description: &'static str,
+    cx: &App,
+) -> EmptyHeader {
+    EmptyHeader::new()
+        .media(
+            EmptyMedia::new()
+                .with_variant(EmptyMediaVariant::Icon)
+                .mb_0()
+                .size(px(40.0))
+                .rounded(px(10.0))
+                .bg(cx.theme().muted.opacity(0.45))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .size(px(20.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+        )
+        .title(EmptyTitle::new().font_semibold().child(title))
+        .description(
+            EmptyDescription::new()
+                .max_w(px(360.0))
+                .text_xs()
+                .child(description),
+        )
+}
+
 fn compact_empty_state(
     title: &'static str,
     description: &'static str,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    v_flex()
-        .w_full()
-        .items_center()
-        .justify_center()
-        .gap_1p5()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.70))
-        .bg(cx.theme().background.opacity(0.60))
-        .p_3()
-        .text_center()
-        .child(compact_empty_state_content(title, description, cx))
-        .into_any_element()
+    solid_empty_border(
+        EmptyState::new()
+            .flex_none()
+            .gap_1p5()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().background.opacity(0.60))
+            .p_3(),
+    )
+    .header(compact_empty_state_header(title, description, cx))
+    .into_any_element()
 }
 
 /// The same empty state without its own box, for a region that already has a
@@ -19897,49 +19961,11 @@ fn bare_empty_state(
     description: &'static str,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    v_flex()
-        .w_full()
+    EmptyState::new()
         .min_h_0()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .p_3()
-        .text_center()
-        .child(compact_empty_state_content(title, description, cx))
-        .into_any_element()
-}
-
-fn compact_empty_state_content(
-    title: &'static str,
-    description: &'static str,
-    cx: &mut Context<ManagementCenter>,
-) -> AnyElement {
-    v_flex()
-        .items_center()
-        .justify_center()
         .gap_1p5()
-        .text_center()
-        .child(
-            h_flex()
-                .size(px(28.0))
-                .items_center()
-                .justify_center()
-                .rounded(px(7.0))
-                .bg(cx.theme().muted.opacity(0.45))
-                .child(
-                    Icon::new(IconName::Inbox)
-                        .size(px(15.0))
-                        .text_color(cx.theme().muted_foreground),
-                ),
-        )
-        .child(div().text_sm().font_medium().child(title))
-        .child(
-            div()
-                .max_w(px(280.0))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(description),
-        )
+        .p_3()
+        .header(compact_empty_state_header(title, description, cx))
         .into_any_element()
 }
 
@@ -19948,39 +19974,17 @@ fn detail_empty_state(
     description: &'static str,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    v_flex()
-        .w_full()
-        .min_h(px(220.0))
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(cx.theme().border)
-        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.55))
-        .text_center()
-        .child(
-            h_flex()
-                .size(px(40.0))
-                .items_center()
-                .justify_center()
-                .rounded(px(10.0))
-                .bg(cx.theme().muted.opacity(0.45))
-                .child(
-                    Icon::new(IconName::Inbox)
-                        .size(px(20.0))
-                        .text_color(cx.theme().muted_foreground),
-                ),
-        )
-        .child(div().text_sm().font_semibold().child(title))
-        .child(
-            div()
-                .max_w(px(360.0))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(description),
-        )
-        .into_any_element()
+    solid_empty_border(
+        EmptyState::new()
+            .gap_2()
+            .min_h(px(220.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.55)),
+    )
+    .header(detail_empty_state_header(title, description, cx))
+    .into_any_element()
 }
 
 fn management_profile_count(count: usize) -> String {
@@ -20897,22 +20901,21 @@ fn empty_state(
     description: &'static str,
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
-    v_flex()
-        .w_full()
-        .items_center()
-        .gap_1()
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded_sm()
-        .p_4()
-        .child(div().text_sm().font_semibold().child(title))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(description),
-        )
-        .into_any_element()
+    solid_empty_border(
+        EmptyState::new()
+            .flex_none()
+            .gap_1()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_sm()
+            .p_4(),
+    )
+    .header(
+        EmptyHeader::new()
+            .title(EmptyTitle::new().font_semibold().child(title))
+            .description(EmptyDescription::new().text_xs().child(description)),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]

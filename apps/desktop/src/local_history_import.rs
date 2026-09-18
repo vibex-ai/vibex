@@ -16,6 +16,7 @@ use gpui_component::{
     StyledExt as _, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     input::{Input, InputEvent, InputState},
     popover::Popover,
@@ -1342,31 +1343,27 @@ impl Render for LocalHistoryImportDialog {
                 .scan
                 .as_ref()
                 .is_none_or(|scan| scan.folders.is_empty());
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
+            Empty::new()
                 .gap_2()
                 .p_8()
-                .child(scan_state_icon(
-                    IconName::FolderOpen,
-                    cx.theme().muted_foreground,
-                    cx,
-                ))
-                .child(div().text_sm().font_medium().child(if empty {
-                    strings.empty
-                } else {
-                    strings.no_matches
-                }))
-                .when(empty, |view| {
-                    view.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(strings.empty_hint),
-                    )
-                })
+                .header(
+                    EmptyHeader::new()
+                        .media(EmptyMedia::new().mb_0().child(scan_state_icon(
+                            IconName::FolderOpen,
+                            cx.theme().muted_foreground,
+                            cx,
+                        )))
+                        .title(EmptyTitle::new().child(if empty {
+                            strings.empty
+                        } else {
+                            strings.no_matches
+                        }))
+                        .when(empty, |header| {
+                            header.description(
+                                EmptyDescription::new().text_xs().child(strings.empty_hint),
+                            )
+                        }),
+                )
                 .into_any_element()
         } else {
             let rows = folders

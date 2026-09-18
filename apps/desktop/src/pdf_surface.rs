@@ -15,6 +15,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Selectable as _, Sizable as _,
     StyledExt as _,
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle},
     h_flex,
     scroll::ScrollableElement as _,
     status_bar::StatusBar,
@@ -983,7 +984,7 @@ impl PdfSurface {
                 .child(self.render_page_list(cx))
                 .child(self.render_document(cx))
                 .into_any_element(),
-            PdfSurfacePhase::Loading => centered_state(
+            PdfSurfacePhase::Loading => loading_state(
                 "Loading PDF…",
                 "Reading metadata and rendering the visible page off the GPUI foreground thread.",
                 cx,
@@ -1031,15 +1032,13 @@ impl PdfSurface {
                         ),
                 )
                 .into_any_element(),
-            PdfSurfacePhase::Closed => centered_state(
+            PdfSurfacePhase::Closed => empty_state(
                 "PDF closed",
                 "Decoded pages and document metadata were released.",
-                cx,
             ),
-            PdfSurfacePhase::Empty => centered_state(
+            PdfSurfacePhase::Empty => empty_state(
                 "Open a PDF document",
                 "Vibex renders visible pages through the bounded native PDFium controller.",
-                cx,
             ),
         }
     }
@@ -1121,7 +1120,24 @@ impl Render for PdfSurface {
     }
 }
 
-fn centered_state(
+/// Centered placeholder for a surface with no document to show.
+///
+/// The header keeps the surface's wider 560px measure instead of the
+/// component's 24rem default, because the copy explains the PDF pipeline.
+fn empty_state(title: &'static str, description: &'static str) -> AnyElement {
+    Empty::new()
+        .gap_2()
+        .header(
+            EmptyHeader::new()
+                .max_w(px(560.0))
+                .title(EmptyTitle::new().text_lg().font_semibold().child(title))
+                .description(EmptyDescription::new().child(description)),
+        )
+        .into_any_element()
+}
+
+/// Centered placeholder while the document is still being read.
+fn loading_state(
     title: &'static str,
     description: &'static str,
     cx: &mut Context<PdfSurface>,

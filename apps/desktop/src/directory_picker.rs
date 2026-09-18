@@ -17,6 +17,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant},
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
@@ -680,39 +681,33 @@ impl gpui::Render for DirectoryPickerDialog {
                 )
                 .into_any_element()
         } else if rows.is_empty() {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
+            Empty::new()
                 .gap_2()
-                .child(
-                    div()
-                        .size(px(44.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(12.0))
-                        .bg(muted_bg.opacity(0.4))
-                        .child(
-                            Icon::new(IconName::FolderOpen)
-                                .size(px(20.0))
-                                .text_color(muted),
-                        ),
+                .header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .mb_0()
+                                .size(px(44.0))
+                                .rounded(px(12.0))
+                                .bg(muted_bg.opacity(0.4))
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .size(px(20.0))
+                                        .text_color(muted),
+                                ),
+                        )
+                        .description(EmptyDescription::new().text_color(muted).child(
+                            if query.is_empty() {
+                                strings.empty
+                            } else {
+                                strings.no_matches
+                            },
+                        )),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(if query.is_empty() {
-                            strings.empty
-                        } else {
-                            strings.no_matches
-                        }),
-                )
-                .when(query_is_path, |view| {
-                    view.child(
+                .content(EmptyContent::new().when(query_is_path, |content| {
+                    content.child(
                         Button::new("directory-picker-go-path")
                             .small()
                             .outline()
@@ -721,7 +716,7 @@ impl gpui::Render for DirectoryPickerDialog {
                                 this.descend_into_query(window, cx);
                             })),
                     )
-                })
+                }))
                 .into_any_element()
         } else {
             let entries = rows;

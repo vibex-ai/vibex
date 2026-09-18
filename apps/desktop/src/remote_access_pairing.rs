@@ -10,6 +10,7 @@ use gpui_component::{
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::DialogButtonProps,
+    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     input::{Input, InputEvent, InputState},
     notification::Notification,
@@ -2242,26 +2243,28 @@ impl RemoteAccessPairing {
                 )
                 .into_any_element();
         }
-        v_flex()
-            .w_full()
-            .items_center()
+        Empty::new()
             .gap_3()
             .py(px(48.0))
-            .child(div().text_sm().font_medium().child(locale::text(
-                "Pairing has ended",
-                "配对已结束",
-                "配對已結束",
-            )))
-            .child(
-                Button::new("pairing-ended-back")
-                    .small()
-                    .outline()
-                    .label(locale::text("Back", "返回", "返回"))
-                    .on_click(move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.dispatch_action(RemoteAccessAction::ShowSetup, cx)
-                        });
-                    }),
+            .header(
+                EmptyHeader::new().title(EmptyTitle::new().child(locale::text(
+                    "Pairing has ended",
+                    "配对已结束",
+                    "配對已結束",
+                ))),
+            )
+            .content(
+                EmptyContent::new().child(
+                    Button::new("pairing-ended-back")
+                        .small()
+                        .outline()
+                        .label(locale::text("Back", "返回", "返回"))
+                        .on_click(move |_, _, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.dispatch_action(RemoteAccessAction::ShowSetup, cx)
+                            });
+                        }),
+                ),
             )
             .into_any_element()
     }
@@ -2639,28 +2642,27 @@ impl RemoteAccessPairing {
 
         if window.pending_requests.is_empty() {
             column = column.child(
-                v_flex()
-                    .w_full()
-                    .items_center()
+                Empty::new()
+                    .flex_none()
                     .gap_2()
                     .rounded(px(8.0))
                     .bg(cx.theme().background.opacity(0.5))
                     .px_3()
                     .py(px(28.0))
-                    .child(
-                        Icon::new(IconName::Eye)
-                            .size(px(20.0))
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(locale::text(
+                    .header(
+                        EmptyHeader::new()
+                            .media(
+                                EmptyMedia::new().mb_0().child(
+                                    Icon::new(IconName::Eye)
+                                        .size(px(20.0))
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                            )
+                            .description(EmptyDescription::new().text_xs().child(locale::text(
                                 "Waiting for a nearby device",
                                 "正在等待附近设备",
                                 "正在等待附近裝置",
-                            )),
+                            ))),
                     ),
             );
         }

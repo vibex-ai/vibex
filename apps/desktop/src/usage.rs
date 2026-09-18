@@ -12,6 +12,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
     Sizable as _, Size, StyledExt as _,
     button::{Button, ButtonGroup, ButtonVariants as _},
+    empty::{Empty as EmptyState, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
@@ -1199,20 +1200,19 @@ impl Render for UsageView {
                     .children(status)
                     .child(self.render_toolbar(window, cx))
                     .child(
-                        v_flex()
-                            .h(px(200.0))
-                            .w_full()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(Icon::new(IconName::Inbox).size(px(22.0)))
-                            .child(locale::text(
-                                "Usage is recorded from the time this feature is enabled",
-                                "用量从启用此功能后开始记录",
-                                "用量從啟用此功能後開始記錄",
-                            )),
+                        EmptyState::new().flex_none().h(px(200.0)).gap_2().header(
+                            EmptyHeader::new()
+                                .media(
+                                    EmptyMedia::new()
+                                        .mb_0()
+                                        .child(Icon::new(IconName::Inbox).size(px(22.0))),
+                                )
+                                .description(EmptyDescription::new().child(locale::text(
+                                    "Usage is recorded from the time this feature is enabled",
+                                    "用量从启用此功能后开始记录",
+                                    "用量從啟用此功能後開始記錄",
+                                ))),
+                        ),
                     )
                     .into_any_element(),
                 UsageContentState::Unavailable => v_flex()
@@ -2322,20 +2322,19 @@ impl TableDelegate for UsageTableDelegate {
     fn render_empty(
         &mut self,
         _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
+        _cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        h_flex()
+        EmptyState::new()
+            .flex_none()
             .h(px(96.0))
-            .w_full()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(locale::text(
-                "No usage facts match these filters",
-                "没有符合筛选条件的用量记录",
-                "沒有符合篩選條件的用量記錄",
-            ))
+            .p_4()
+            .header(
+                EmptyHeader::new().description(EmptyDescription::new().child(locale::text(
+                    "No usage facts match these filters",
+                    "没有符合筛选条件的用量记录",
+                    "沒有符合篩選條件的用量記錄",
+                ))),
+            )
     }
 
     fn render_td(
@@ -2571,16 +2570,12 @@ fn summary_columns(viewport_width: f32) -> u16 {
     }
 }
 
-fn centered_message(message: &'static str, cx: &mut Context<UsageView>) -> AnyElement {
-    div()
+fn centered_message(message: &'static str, _cx: &mut Context<UsageView>) -> AnyElement {
+    EmptyState::new()
+        .flex_none()
         .h(px(180.0))
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_sm()
-        .text_color(cx.theme().muted_foreground)
-        .child(message)
+        .p_4()
+        .header(EmptyHeader::new().description(EmptyDescription::new().child(message)))
         .into_any_element()
 }
 

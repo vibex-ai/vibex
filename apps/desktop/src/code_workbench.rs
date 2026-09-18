@@ -26,6 +26,9 @@ use gpui_component::{
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
+    empty::{
+        Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
+    },
     h_flex,
     input::{
         Editor, EditorState, Input, InputEvent, InputState, Position, Textarea, TextareaState,
@@ -81,6 +84,7 @@ use vibex_terminal::TerminalManager;
 
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
+use crate::gpui_ext::solid_empty_border;
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -5970,20 +5974,14 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    fn render_empty(&self, message: impl Into<SharedString>, cx: &Context<Self>) -> AnyElement {
-        v_flex()
+    fn render_empty(&self, message: impl Into<SharedString>, _cx: &Context<Self>) -> AnyElement {
+        EmptyState::new()
             .size_full()
-            .items_center()
-            .justify_center()
             .gap_2()
-            .px_4()
-            .text_center()
-            .child(Icon::new(IconName::Inbox))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(message.into()),
+            .header(
+                EmptyHeader::new()
+                    .media(EmptyMedia::new().mb_0().child(Icon::new(IconName::Inbox)))
+                    .description(EmptyDescription::new().child(message.into())),
             )
             .into_any_element()
     }
@@ -6398,37 +6396,27 @@ impl CodeWorkbench {
                     .overflow_hidden()
                     .child(match active {
                         Some(tab_id) => self.render_tab_content(&tab_id, window, cx),
-                        None => v_flex()
+                        None => EmptyState::new()
                             .size_full()
-                            .items_center()
-                            .justify_center()
                             .p_4()
-                            .text_center()
-                            .child(
-                                v_flex()
+                            .header(
+                                EmptyHeader::new()
                                     .max_w(px(320.0))
-                                    .items_center()
-                                    .gap_3()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        div()
+                                    .media(
+                                        EmptyMedia::new()
+                                            .mb_0()
                                             .size(px(48.0))
-                                            .items_center()
-                                            .justify_center()
                                             .rounded_full()
                                             .border_1()
                                             .border_color(cx.theme().border)
                                             .bg(cx.theme().background)
-                                            .text_color(cx.theme().foreground)
                                             .child(
                                                 Icon::new(IconName::PanelLeftOpen).size(px(20.0)),
                                             ),
                                     )
-                                    .child(
-                                        div()
+                                    .title(
+                                        EmptyTitle::new()
                                             .text_size(px(16.0))
-                                            .font_medium()
                                             .text_color(cx.theme().foreground)
                                             .child(locale::text(
                                                 "No preview tabs",
@@ -6436,44 +6424,48 @@ impl CodeWorkbench {
                                                 "暫無預覽標籤",
                                             )),
                                     )
-                                    .child(div().line_height(gpui::relative(1.5)).child(locale::text(
-                                        "Open a file or terminal here while keeping the Agent visible.",
-                                        "在这里打开文件或终端，同时保留 Agent 对话。",
-                                        "在這裡開啟檔案或終端機，同時保留 Agent 對話。",
-                                    )))
-                                    .child(
-                                        h_flex()
-                                            .flex_wrap()
-                                            .justify_center()
-                                            .gap_2()
-                                            .child(
-                                                Button::new(format!(
-                                                    "preview-empty-new-terminal:{pane_id}"
-                                                ))
-                                                .outline()
-                                                .icon(IconName::SquareTerminal)
-                                                .label(locale::text(
-                                                    "New terminal",
-                                                    "新建终端",
-                                                    "新增終端",
-                                                ))
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = empty_terminal_entity.update(
-                                                        cx,
-                                                        |this, cx| {
-                                                            this.request_new_preview_terminal(
-                                                                window.window_handle(),
-                                                                Some(
-                                                                    empty_terminal_pane_id.clone(),
-                                                                ),
-                                                                None,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    );
-                                                }),
-                                            ),
+                                    .description(
+                                        EmptyDescription::new()
+                                            .line_height(gpui::relative(1.5))
+                                            .child(locale::text(
+                                                "Open a file or terminal here while keeping the Agent visible.",
+                                                "在这里打开文件或终端，同时保留 Agent 对话。",
+                                                "在這裡開啟檔案或終端機，同時保留 Agent 對話。",
+                                            )),
                                     ),
+                            )
+                            .content(
+                                EmptyContent::new().child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(format!(
+                                                "preview-empty-new-terminal:{pane_id}"
+                                            ))
+                                            .outline()
+                                            .icon(IconName::SquareTerminal)
+                                            .label(locale::text(
+                                                "New terminal",
+                                                "新建终端",
+                                                "新增終端",
+                                            ))
+                                            .on_click(move |_, window, cx| {
+                                                let _ = empty_terminal_entity.update(
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.request_new_preview_terminal(
+                                                            window.window_handle(),
+                                                            Some(empty_terminal_pane_id.clone()),
+                                                            None,
+                                                            cx,
+                                                        )
+                                                    },
+                                                );
+                                            }),
+                                        ),
+                                ),
                             )
                             .into_any_element(),
                     })
@@ -7886,17 +7878,16 @@ impl CodeWorkbench {
         let list = if !has_files {
             self.render_empty(locale::text("No diff", "没有差异", "沒有差異"), cx)
         } else if count == 0 {
-            v_flex()
+            EmptyState::new()
                 .size_full()
-                .items_center()
-                .justify_center()
                 .p_4()
-                .text_center()
-                .child(div().text_sm().child(locale::text(
-                    "No content changes in this file.",
-                    "此文件没有内容变更。",
-                    "此檔案沒有內容變更。",
-                )))
+                .header(
+                    EmptyHeader::new().description(EmptyDescription::new().child(locale::text(
+                        "No content changes in this file.",
+                        "此文件没有内容变更。",
+                        "此檔案沒有內容變更。",
+                    ))),
+                )
                 .into_any_element()
         } else {
             let list_state = self
@@ -13840,21 +13831,14 @@ fn skeleton_git_history(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn rail_empty(message: impl Into<SharedString>, cx: &Context<CodeRightRail>) -> AnyElement {
-    v_flex()
-        .flex_1()
-        .min_h_0()
-        .items_center()
-        .justify_center()
+fn rail_empty(message: impl Into<SharedString>, _cx: &Context<CodeRightRail>) -> AnyElement {
+    EmptyState::new()
         .gap_2()
         .p_4()
-        .text_center()
-        .child(Icon::new(IconName::Inbox))
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(message.into()),
+        .header(
+            EmptyHeader::new()
+                .media(EmptyMedia::new().mb_0().child(Icon::new(IconName::Inbox)))
+                .description(EmptyDescription::new().child(message.into())),
         )
         .into_any_element()
 }
@@ -13873,26 +13857,28 @@ fn rail_empty_card(
         .justify_center()
         .p_4()
         .child(
-            v_flex()
-                .w_full()
-                .min_w_0()
-                .max_w(px(384.0))
-                .gap_1p5()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().background)
-                .px_6()
-                .py_6()
-                .text_center()
-                .child(div().font_semibold().child(title.into()))
-                .child(
-                    div()
-                        .text_sm()
-                        .line_height(gpui::relative(1.5))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description.into()),
-                ),
+            solid_empty_border(
+                EmptyState::new()
+                    .flex_none()
+                    .max_w(px(384.0))
+                    .gap_1p5()
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .px_6()
+                    .py_6(),
+            )
+            .header(
+                EmptyHeader::new()
+                    .max_w_full()
+                    .title(EmptyTitle::new().font_semibold().child(title.into()))
+                    .description(
+                        EmptyDescription::new()
+                            .line_height(gpui::relative(1.5))
+                            .child(description.into()),
+                    ),
+            ),
         )
         .into_any_element()
 }

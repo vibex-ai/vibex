@@ -72,6 +72,7 @@ use crate::storage::{
 use crate::workbench::{MobileWorkbench, WorkbenchSurface};
 use crate::{locale, markdown, notifications, power, scanner, theme};
 use gpui_component::StyledExt as _;
+use gpui_component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
 use gpui_component::shimmer::ShimmerText;
@@ -6717,41 +6718,48 @@ impl MobileApp {
                                 })
                                 .when(!timeline_loading && turns.is_empty(), |timeline| {
                                     timeline.child(
-                                        div()
-                                            .py_8()
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
+                                        Empty::new()
+                                            .flex_none()
                                             .gap_3()
-                                            .text_size(px(theme::FONT_BODY))
-                                            .text_color(theme::text_muted())
-                                            .text_center()
-                                            .child(locale::common("No messages yet"))
-                                            .when(no_selected_session, |empty| {
-                                                empty.child(
-                                                    div()
-                                                        .id("create-first-session")
-                                                        .h(px(theme::TOUCH_TARGET))
-                                                        .px_4()
-                                                        .rounded(px(theme::RADIUS_CONTROL))
-                                                        .border_1()
-                                                        .border_color(theme::border_default())
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .text_color(theme::text_secondary())
-                                                        .when(can_create_session, |button| {
-                                                            button.cursor_pointer().on_mouse_up(
-                                                                MouseButton::Left,
-                                                                cx.listener(Self::create_session),
-                                                            )
-                                                        })
-                                                        .when(!can_create_session, |button| {
-                                                            button.opacity(0.55)
-                                                        })
-                                                        .child(locale::common("New session")),
-                                                )
-                                            }),
+                                            .py_8()
+                                            .header(
+                                                EmptyHeader::new().max_w_full().description(
+                                                    EmptyDescription::new()
+                                                        .text_size(px(theme::FONT_BODY))
+                                                        .text_color(theme::text_muted())
+                                                        .child(locale::common("No messages yet")),
+                                                ),
+                                            )
+                                            .content(EmptyContent::new().when(
+                                                no_selected_session,
+                                                |content| {
+                                                    content.text_size(px(theme::FONT_BODY)).child(
+                                                        div()
+                                                            .id("create-first-session")
+                                                            .h(px(theme::TOUCH_TARGET))
+                                                            .px_4()
+                                                            .rounded(px(theme::RADIUS_CONTROL))
+                                                            .border_1()
+                                                            .border_color(theme::border_default())
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .text_color(theme::text_secondary())
+                                                            .when(can_create_session, |button| {
+                                                                button.cursor_pointer().on_mouse_up(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        Self::create_session,
+                                                                    ),
+                                                                )
+                                                            })
+                                                            .when(!can_create_session, |button| {
+                                                                button.opacity(0.55)
+                                                            })
+                                                            .child(locale::common("New session")),
+                                                    )
+                                                },
+                                            )),
                                     )
                                 })
                                 .when(!turns.is_empty(), |timeline| {
@@ -13022,33 +13030,33 @@ impl MobileApp {
     }
 
     fn render_hosts_empty(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        div()
-            .w_full()
+        Empty::new()
+            .flex_none()
+            .gap(px(theme::SPACING_SM))
             .rounded(px(theme::RADIUS_CARD))
             .border_1()
             .border_color(theme::border_subtle())
             .bg(theme::bg_card_dim())
             .p(px(theme::SPACING_LG))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(theme::SPACING_SM))
-            .child(
-                div()
-                    .text_size(px(theme::FONT_BODY))
-                    .text_color(theme::text_primary())
-                    .child(locale::common("No runtimes yet")),
+            .header(
+                EmptyHeader::new()
+                    .max_w_full()
+                    .title(
+                        EmptyTitle::new()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_primary())
+                            .child(locale::common("No runtimes yet")),
+                    )
+                    .description(
+                        EmptyDescription::new()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted())
+                            .child(locale::common(
+                                "Open pairing on the desktop or server, then scan the QR code with the camera.",
+                            )),
+                    ),
             )
-            .child(
-                div()
-                    .text_size(px(theme::FONT_CAPTION))
-                    .text_color(theme::text_muted())
-                    .text_center()
-                    .child(locale::common(
-                        "Open pairing on the desktop or server, then scan the QR code with the camera.",
-                    )),
-            )
-            .child(
+            .content(EmptyContent::new().child(
                 runtime_sheet_action_button(
                     "mobile-hosts-empty-add",
                     locale::common("Add runtime"),
@@ -13058,39 +13066,42 @@ impl MobileApp {
                 .cursor_pointer()
                 .active(|style| style.bg(theme::row_pressed_bg()))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
-            )
+            ))
             .into_any_element()
     }
 
     /// The runtime the phone is on, with the live state the transport reports.
     fn render_active_host_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(host) = self.active_host_entry() else {
-            return div()
-                .w_full()
+            return Empty::new()
+                .flex_none()
+                .items_start()
+                .text_left()
+                .gap(px(theme::SPACING_SM))
                 .rounded(px(theme::RADIUS_CARD))
                 .border_1()
                 .border_color(theme::border_subtle())
                 .bg(theme::bg_card_dim())
                 .p(px(theme::SPACING_MD))
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap(px(theme::SPACING_SM))
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_BODY))
-                        .text_color(theme::text_secondary())
-                        .child(locale::common("No runtime connected")),
+                .header(
+                    EmptyHeader::new().items_start().max_w_full().title(
+                        EmptyTitle::new()
+                            .text_size(px(theme::FONT_BODY))
+                            .text_color(theme::text_secondary())
+                            .child(locale::common("No runtime connected")),
+                    ),
                 )
-                .child(
-                    runtime_sheet_action_button(
-                        "mobile-hosts-connect",
-                        locale::common("Add runtime"),
-                        false,
-                    )
-                    .cursor_pointer()
-                    .active(|style| style.bg(theme::row_pressed_bg()))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
+                .content(
+                    EmptyContent::new().items_start().child(
+                        runtime_sheet_action_button(
+                            "mobile-hosts-connect",
+                            locale::common("Add runtime"),
+                            false,
+                        )
+                        .cursor_pointer()
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::begin_pairing_host)),
+                    ),
                 )
                 .into_any_element();
         };
