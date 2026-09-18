@@ -52442,14 +52442,28 @@ impl FoundationSettings {
     ) {
         let entity = cx.weak_entity();
         let action_label = shortcut_action_label(&action);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(current.clone())
-                    .placeholder("cmd-shift-p")
-            });
+        self.operation_note = None;
+        // Keep the input entity outside the dialog builder. Dialog builders are
+        // evaluated again whenever the workbench repaints, so creating the input
+        // in the builder would replace its focus handle and reset the text while
+        // the user types, which made shortcuts impossible to edit.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(current.clone())
+                .placeholder("cmd-shift-p")
+        });
+        let input_for_focus = input.clone();
+        let input_selection_end = current.len();
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let apply = entity.clone();
             let action_for_apply = action.clone();
+            let input_for_apply = input.clone();
+            // A rejected chord keeps the dialog open, so the reason has to be
+            // visible inside the dialog rather than only on the page behind it.
+            let rejection = entity
+                .read_with(cx, |settings, _| settings.operation_note.clone())
+                .ok()
+                .flatten();
             dialog
                 .title(format!(
                     "{}: {}",
@@ -52457,7 +52471,19 @@ impl FoundationSettings {
                     action_label
                 ))
                 .w(px(420.0))
-                .child(Input::new(&input).w_full())
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(Input::new(&input).w_full())
+                        .when_some(rejection, |this, note| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(locale::localize_ui_message(&note)),
+                            )
+                        }),
+                )
                 .footer(
                     DialogFooter::new()
                         .child(
@@ -52476,13 +52502,22 @@ impl FoundationSettings {
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    let value = input.read(cx).value().to_string();
+                    let value = input_for_apply.read(cx).value().to_string();
                     apply
                         .update(cx, |settings, cx| {
                             settings.set_shortcut(action_for_apply.clone(), value, cx)
                         })
                         .unwrap_or(false)
                 })
+        });
+        // The dialog's focus trap claims focus while it mounts. Request input
+        // focus after that first frame so keyboard events reach the text field,
+        // and select the current chord so typing replaces it.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| {
+                input.set_selected_range(0..input_selection_end, cx);
+                input.focus(window, cx);
+            });
         });
     }
 
@@ -66180,6 +66215,43 @@ mod tests {
         assert!(
             page.contains("open_shortcut_dialog("),
             "clicking the keycap should still open the edit dialog"
+        );
+    }
+
+    #[test]
+    fn shortcut_dialog_keeps_one_input_entity_across_dialog_repaints() {
+        let source = include_str!("app.rs");
+        let dialog = source
+            .split_once("    fn open_shortcut_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("the shortcut dialog should remain inspectable");
+
+        let input_creation = dialog
+            .find("let input = cx.new(")
+            .expect("the shortcut input should be created once");
+        let dialog_open = dialog
+            .find("window.open_dialog(cx")
+            .expect("the shortcut dialog should open after its input exists");
+        assert!(
+            input_creation < dialog_open,
+            "the input entity must be created outside the dialog builder"
+        );
+        assert!(
+            !dialog[dialog_open..].contains("cx.new("),
+            "the dialog builder must not replace the input entity on every repaint"
+        );
+        assert!(
+            dialog.contains("window.on_next_frame(move |window, cx|"),
+            "the input should take focus after the dialog's focus trap mounts"
+        );
+        assert!(
+            dialog.contains("input.set_selected_range(0..input_selection_end, cx)"),
+            "the current chord should be selected so typing replaces it"
+        );
+        assert!(
+            dialog.contains("settings.operation_note.clone()"),
+            "a rejected chord should be reported inside the dialog"
         );
     }
 
