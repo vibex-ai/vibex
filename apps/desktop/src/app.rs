@@ -42491,6 +42491,12 @@ impl VibexWorkbench {
                                             .min_w_0()
                                             .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                             .flex_1()
+                                            // The expanded composer is a fullscreen input:
+                                            // the slot stretches and the textarea fills it,
+                                            // instead of stopping at the auto-grow row cap.
+                                            .when(self.composer_expanded, |this| {
+                                                this.self_stretch()
+                                            })
                                             .on_prepaint(move |bounds, _, cx| {
                                                 let _ =
                                                     input_geometry_entity.update(cx, |this, cx| {
@@ -42622,7 +42628,10 @@ impl VibexWorkbench {
                                             ))
                                             .child(
                                                 Textarea::new(&self.composer_input)
-                                                    .appearance(false),
+                                                    .appearance(false)
+                                                    .when(self.composer_expanded, |this| {
+                                                        this.h_full()
+                                                    }),
                                             ),
                                     )
                                     .child(
@@ -56623,6 +56632,109 @@ mod tests {
         }
     }
 
+    /// Mirrors the active composer's height chain (workbench → composer root →
+    /// surface → input row → input slot → textarea) so the fullscreen input's
+    /// editable height can be measured without booting the whole workbench.
+    struct ComposerFullscreenLayoutProbe {
+        input: Entity<TextareaState>,
+        expanded: bool,
+        surface_height: Rc<Cell<f32>>,
+        input_row_height: Rc<Cell<f32>>,
+        input_slot_height: Rc<Cell<f32>>,
+    }
+
+    impl Render for ComposerFullscreenLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let expanded = self.expanded;
+            let surface_height = self.surface_height.clone();
+            let input_row_height = self.input_row_height.clone();
+            let input_slot_height = self.input_slot_height.clone();
+            v_flex()
+                .id("agent-workbench")
+                .size_full()
+                .min_h_0()
+                .min_w_0()
+                .justify_end()
+                .overflow_hidden()
+                .child(
+                    v_flex()
+                        .id("agent-composer")
+                        .relative()
+                        .w_full()
+                        .min_w_0()
+                        .flex_none()
+                        .when(expanded, |this| this.flex_1().min_h_0())
+                        .gap_2()
+                        .items_center()
+                        .px_4()
+                        .py_2()
+                        .when(expanded, |this| this.pt_4())
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .min_w_0()
+                                .when(expanded, |this| this.flex_1().min_h_0())
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .min_h(px(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT))
+                                        .when(expanded, |this| this.flex_1().min_h(px(240.0)))
+                                        .rounded(px(COMPOSER_SURFACE_RADIUS))
+                                        .border_1()
+                                        .on_prepaint(move |bounds, _, _| {
+                                            surface_height.set(f32::from(bounds.size.height));
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                                .flex_1()
+                                                .items_start()
+                                                .gap_2()
+                                                .px_3()
+                                                .pt_3()
+                                                .pb_1()
+                                                .on_prepaint(move |bounds, _, _| {
+                                                    input_row_height
+                                                        .set(f32::from(bounds.size.height));
+                                                })
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .min_h(px(
+                                                            ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT,
+                                                        ))
+                                                        .flex_1()
+                                                        .when(expanded, |this| this.self_stretch())
+                                                        .on_prepaint(move |bounds, _, _| {
+                                                            input_slot_height
+                                                                .set(f32::from(bounds.size.height));
+                                                        })
+                                                        .child(
+                                                            Textarea::new(&self.input)
+                                                                .appearance(false)
+                                                                .when(expanded, |this| {
+                                                                    this.h_full()
+                                                                }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    v_flex()
+                                                        .flex_none()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .child(div().size(px(30.0))),
+                                                ),
+                                        )
+                                        .child(h_flex().w_full().h(px(52.0)).flex_none()),
+                                ),
+                        ),
+                )
+        }
+    }
+
     impl Render for ComposerBottomAnchorProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let root_bottom = self.root_bottom.clone();
@@ -62142,6 +62254,93 @@ mod tests {
             .expect("composer feature controls should be rendered");
         assert!(composer_effort < composer_mode);
         assert!(composer_mode < composer_feature);
+    }
+
+    /// The fullscreen composer is an input box, not just a taller surface: the
+    /// whole box stays editable. The textarea used to keep the `auto_grow(2, 8)`
+    /// row cap after expanding, so a long draft stayed clipped to roughly eight
+    /// rows while the rest of the surface was dead space.
+    #[gpui::test]
+    fn expanded_composer_keeps_the_whole_surface_editable(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        const DRAFT_LINES: usize = 20;
+        let mut measured = Vec::new();
+        for expanded in [false, true] {
+            let surface_height = Rc::new(Cell::new(0.0));
+            let input_row_height = Rc::new(Cell::new(0.0));
+            let input_slot_height = Rc::new(Cell::new(0.0));
+            let input_slot = Rc::new(RefCell::new(None));
+            let (_, cx) = cx.add_window_view(|window, cx| {
+                let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
+                *input_slot.borrow_mut() = Some(input.clone());
+                ComposerFullscreenLayoutProbe {
+                    input,
+                    expanded,
+                    surface_height: surface_height.clone(),
+                    input_row_height: input_row_height.clone(),
+                    input_slot_height: input_slot_height.clone(),
+                }
+            });
+            let input = input_slot
+                .borrow()
+                .clone()
+                .expect("composer probe should own its textarea state");
+            cx.update(|window, cx| {
+                input.update(cx, |input, cx| {
+                    input.replace(
+                        (0..DRAFT_LINES)
+                            .map(|line| format!("draft line {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        window,
+                        cx,
+                    );
+                });
+                for _ in 0..2 {
+                    window.simulate_next_frame(cx);
+                    let _ = window.draw(cx);
+                }
+            });
+            let visible_rows = input.read_with(cx, |input, _| input.visible_row_range());
+            let visible_rows = visible_rows
+                .map(|rows| rows.len())
+                .expect("the composer textarea should report its laid-out rows");
+            measured.push((
+                surface_height.get(),
+                input_row_height.get(),
+                input_slot_height.get(),
+                visible_rows,
+            ));
+        }
+
+        let (collapsed_surface, _, collapsed_slot, collapsed_rows) = measured[0];
+        let (expanded_surface, _, expanded_slot, expanded_rows) = measured[1];
+        assert!(
+            expanded_surface > collapsed_surface * 3.0,
+            "the expanded composer should fill the workbench: collapsed {collapsed_surface}, expanded {expanded_surface}"
+        );
+        assert!(
+            collapsed_rows < DRAFT_LINES,
+            "the collapsed composer keeps its auto-grow row cap: {collapsed_rows} of {DRAFT_LINES} rows"
+        );
+        assert!(
+            expanded_rows >= DRAFT_LINES,
+            "the expanded composer should lay out every draft row: {expanded_rows} of {DRAFT_LINES} rows"
+        );
+        assert!(
+            expanded_slot > collapsed_slot * 3.0,
+            "the input slot should grow with the fullscreen surface: collapsed {collapsed_slot}, expanded {expanded_slot}"
+        );
+
+        let composer = include_str!("app.rs")
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        // The probe only proves the height chain works; the composer itself has
+        // to opt into it, so guard the two expanded-only hooks in its source.
+        assert!(composer.contains("this.self_stretch()"));
+        assert!(composer.contains("this.h_full()"));
     }
 
     #[gpui::test]
