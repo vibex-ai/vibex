@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use chrono::{Datelike as _, NaiveDate};
 use gpui::{
-    AnimationExt as _, AnyElement, App, BorderStyle, Bounds, Context, Edges, ElementId, Entity,
-    Hsla, InteractiveElement as _, IntoElement, Pixels, Render, SharedString, Styled as _, Task,
-    WeakEntity, Window, canvas, div, point, prelude::*, px, quad, size, transparent_black,
+    AnimationExt as _, AnyElement, App, Bounds, Context, Edges, ElementId, Entity, Hsla,
+    InteractiveElement as _, IntoElement, Pixels, Render, SharedString, Styled as _, Task,
+    WeakEntity, Window, div, point, prelude::*, px, size, transparent_black,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
@@ -28,10 +28,16 @@ use vibex_core::{
     ProviderProfileId, VibexSessionId,
 };
 
-use crate::{gpui_ext::button_with_aria_label, locale, motion, theme};
+use crate::{
+    gpui_ext::button_with_aria_label,
+    locale, motion, theme,
+    usage_charts::{
+        ModelChart, ModelChartCategory, ModelChartDay, TrendChart, TrendChartBucket,
+        TrendChartSeries,
+    },
+};
 
 const USAGE_CHART_HEIGHT: f32 = 176.0;
-const USAGE_CHART_AXIS_WIDTH: f32 = 48.0;
 const USAGE_HEATMAP_CELL_SIZE: f32 = 12.0;
 const USAGE_HEATMAP_GAP: f32 = 3.0;
 const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
@@ -1462,224 +1468,46 @@ fn usage_trend_series(cx: &Context<UsageView>) -> [UsageTrendSeries; 4] {
     ]
 }
 
-fn nice_axis_upper(value: u64, minimum: u64) -> u64 {
-    if value == 0 {
-        return minimum;
-    }
-    let raw_step = value as f64 / 4.0;
-    let magnitude = 10_f64.powf(raw_step.log10().floor());
-    let normalized = raw_step / magnitude;
-    let nice = if normalized <= 1.0 {
-        1.0
-    } else if normalized <= 2.0 {
-        2.0
-    } else if normalized <= 2.5 {
-        2.5
-    } else if normalized <= 5.0 {
-        5.0
-    } else {
-        10.0
-    };
-    ((nice * magnitude * 4.0).ceil() as u64).max(minimum)
-}
-
-fn axis_ticks(maximum: u64) -> [u64; 5] {
-    let step = maximum / 4;
-    [
-        maximum,
-        step.saturating_mul(3),
-        step.saturating_mul(2),
-        step,
-        0,
-    ]
-}
-
-fn format_token_axis_k(value: u64) -> String {
-    if value.is_multiple_of(1_000) {
-        format!("{}K", value / 1_000)
-    } else {
-        let formatted = format!("{:.2}", value as f64 / 1_000.0);
-        format!("{}K", formatted.trim_end_matches('0').trim_end_matches('.'))
-    }
-}
-
-fn render_trend_axis(maximum: u64, width: f32, cx: &mut Context<UsageView>) -> AnyElement {
-    let mut axis = v_flex()
-        .h(px(USAGE_CHART_HEIGHT))
-        .w(px(width))
-        .flex_none()
-        .justify_between()
-        .text_size(px(10.0))
-        .text_color(cx.theme().muted_foreground);
-    for tick in axis_ticks(maximum) {
-        axis = axis.child(
-            div()
-                .w_full()
-                .pr_2()
-                .text_right()
-                .child(format_token_axis_k(tick)),
-        );
-    }
-    axis.into_any_element()
-}
-
-fn stacked_bucket_total(aggregate: &AgentUsageAggregate, metrics: &[AgentUsageTrendMetric]) -> u64 {
-    metrics.iter().fold(0_u64, |total, metric| {
-        total.saturating_add(trend_value(aggregate, *metric).unwrap_or(0))
-    })
-}
-
-fn paint_chart_rect(
-    window: &mut Window,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-    color: Hsla,
-) {
-    window.paint_quad(quad(
-        Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom))),
-        px(1.0),
-        color,
-        Edges::default(),
-        transparent_black(),
-        BorderStyle::default(),
-    ));
-}
-
 fn render_stacked_trend(
     statistics: &AgentUsageStatistics,
     enabled_metrics: &[AgentUsageTrendMetric],
     cx: &mut Context<UsageView>,
 ) -> AnyElement {
-    let bar_data = usage_trend_series(cx)
+    let series = usage_trend_series(cx)
         .into_iter()
         .filter(|series| enabled_metrics.contains(&series.metric))
-        .map(|series| {
-            (
-                series.color,
-                statistics
-                    .trend_buckets
+        .collect::<Vec<_>>();
+    let has_metrics = !series.is_empty();
+    let buckets = statistics
+        .trend_buckets
+        .iter()
+        .map(|bucket| {
+            TrendChartBucket::new(
+                bucket.label.clone(),
+                series
                     .iter()
-                    .map(|bucket| trend_value(&bucket.aggregate, series.metric))
-                    .collect::<Vec<_>>(),
+                    .map(|series| trend_value(&bucket.aggregate, series.metric))
+                    .collect(),
             )
         })
         .collect::<Vec<_>>();
-    let stack_maximum = statistics
-        .trend_buckets
-        .iter()
-        .map(|bucket| stacked_bucket_total(&bucket.aggregate, enabled_metrics))
-        .max()
-        .unwrap_or(0);
-    let token_axis_maximum = nice_axis_upper(stack_maximum, 1_000);
-    let has_values = bar_data
-        .iter()
-        .flat_map(|(_, values)| values.iter().flatten())
-        .any(|value| *value > 0);
-    let has_metrics = !bar_data.is_empty();
-    let bucket_count = statistics.trend_buckets.len();
+    let has_values = buckets.iter().any(|bucket| bucket.has_reported_value());
+    let chart = TrendChart::new(
+        buckets,
+        series
+            .into_iter()
+            .map(|series| TrendChartSeries::new(series.label, series.color))
+            .collect(),
+    );
 
-    let mut grid = v_flex().absolute().inset_0().justify_between();
-    for _ in 0..5 {
-        grid = grid.child(
-            div()
-                .w_full()
-                .border_t_1()
-                .border_color(cx.theme().border.opacity(0.42)),
-        );
-    }
-    let mut hitboxes = h_flex().absolute().inset_0();
-    for (index, bucket) in statistics.trend_buckets.iter().enumerate() {
-        let tooltip_title = bucket.label.clone();
-        let tooltip_rows = trend_bucket_tooltip_rows(&bucket.aggregate, enabled_metrics);
-        hitboxes = hitboxes.child(
-            div()
-                .id(SharedString::from(format!("usage-trend-bucket-{index}")))
-                .h_full()
-                .min_w(px(2.0))
-                .flex_1()
-                .tooltip(move |window, cx| {
-                    let title = tooltip_title.clone();
-                    let rows = tooltip_rows.clone();
-                    Tooltip::element(move |_, cx| {
-                        let mut content = v_flex()
-                            .min_w(px(190.0))
-                            .gap_1()
-                            .text_xs()
-                            .child(div().font_medium().child(title.clone()));
-                        for (label, value) in rows.iter() {
-                            content = content.child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .gap_4()
-                                    .child(
-                                        div()
-                                            .text_color(cx.theme().popover_foreground.opacity(0.72))
-                                            .child(*label),
-                                    )
-                                    .child(div().font_medium().child(value.clone())),
-                            );
-                        }
-                        content
-                    })
-                    .build(window, cx)
-                }),
-        );
-    }
-    let plot = div()
+    // The chart owns its own axis, grid, and tooltip; the card only stacks the
+    // empty-state message over it.
+    div()
         .relative()
-        .h(px(USAGE_CHART_HEIGHT))
+        .w_full()
         .min_w_0()
-        .flex_1()
-        .overflow_hidden()
-        .border_b_1()
-        .border_color(cx.theme().border.opacity(0.55))
-        .child(grid)
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let width = f32::from(bounds.size.width).max(1.0);
-                    let height = f32::from(bounds.size.height).max(1.0);
-                    let bucket_count = bucket_count.max(1);
-                    let bucket_width = width / bucket_count as f32;
-                    let bar_width = (bucket_width * 0.64).clamp(2.0, 32.0);
-                    let origin_x = f32::from(bounds.origin.x);
-                    let origin_y = f32::from(bounds.origin.y);
-                    for index in 0..bucket_count {
-                        let center = origin_x + bucket_width * (index as f32 + 0.5);
-                        let mut bottom = origin_y + height - 2.0;
-                        for (color, values) in &bar_data {
-                            let Some(value) = values.get(index).copied().flatten() else {
-                                continue;
-                            };
-                            if value == 0 {
-                                continue;
-                            }
-                            let segment_height = (value.min(token_axis_maximum) as f64
-                                / token_axis_maximum.max(1) as f64
-                                * f64::from((height - 4.0).max(1.0)))
-                                as f32;
-                            let top = bottom - segment_height;
-                            paint_chart_rect(
-                                window,
-                                center - bar_width / 2.0,
-                                top,
-                                center + bar_width / 2.0,
-                                bottom,
-                                *color,
-                            );
-                            bottom = top;
-                        }
-                    }
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
-        .child(hitboxes)
+        .h(px(USAGE_CHART_HEIGHT))
+        .child(chart)
         .when(!has_values, |this| {
             this.child(
                 div()
@@ -1704,77 +1532,8 @@ fn render_stacked_trend(
                         )
                     }),
             )
-        });
-
-    v_flex()
-        .w_full()
-        .gap_2()
-        .child(
-            h_flex()
-                .w_full()
-                .child(render_trend_axis(
-                    token_axis_maximum,
-                    USAGE_CHART_AXIS_WIDTH,
-                    cx,
-                ))
-                .child(plot),
-        )
-        .child(
-            h_flex()
-                .w_full()
-                .child(div().w(px(USAGE_CHART_AXIS_WIDTH)).flex_none())
-                .child(render_trend_labels(statistics, cx)),
-        )
-        .into_any_element()
-}
-
-fn trend_bucket_tooltip_rows(
-    aggregate: &AgentUsageAggregate,
-    enabled_metrics: &[AgentUsageTrendMetric],
-) -> Vec<(&'static str, String)> {
-    let display = |value: Option<u64>| {
-        value
-            .map(format_full_number)
-            .unwrap_or_else(|| locale::text("Unknown", "未知", "未知").to_string())
-    };
-    enabled_metrics
-        .iter()
-        .map(|metric| {
-            let label = match metric {
-                AgentUsageTrendMetric::Requests => locale::text("Requests", "请求", "請求"),
-                AgentUsageTrendMetric::TotalTokens => locale::text("Total", "总量", "總量"),
-                AgentUsageTrendMetric::InputTokens => locale::text("Input", "输入", "輸入"),
-                AgentUsageTrendMetric::OutputTokens => locale::text("Output", "输出", "輸出"),
-                AgentUsageTrendMetric::CachedTokens => locale::text("Cache", "缓存", "快取"),
-            };
-            (label, display(trend_value(aggregate, *metric)))
         })
-        .collect()
-}
-
-fn render_trend_labels(
-    statistics: &AgentUsageStatistics,
-    cx: &mut Context<UsageView>,
-) -> AnyElement {
-    let count = statistics.trend_buckets.len();
-    let mut labels = h_flex().w_full();
-    for (index, bucket) in statistics.trend_buckets.iter().enumerate() {
-        let visible = count <= 8 || index == 0 || index + 1 == count || index % 6 == 0;
-        labels = labels.child(
-            div()
-                .min_w(px(2.0))
-                .flex_1()
-                .text_center()
-                .text_size(px(10.0))
-                .text_color(cx.theme().muted_foreground)
-                .child(if visible {
-                    bucket.label.clone()
-                } else {
-                    String::new()
-                }),
-        );
-    }
-    labels.into_any_element()
+        .into_any_element()
 }
 
 fn usage_heatmap_entries(annual: &AgentUsageAnnualProjection) -> Vec<UsageHeatmapEntry> {
@@ -2157,20 +1916,6 @@ fn model_day_value(
     }
 }
 
-fn render_percentage_axis(cx: &mut Context<UsageView>) -> AnyElement {
-    v_flex()
-        .h(px(USAGE_CHART_HEIGHT))
-        .w(px(38.0))
-        .flex_none()
-        .justify_between()
-        .text_size(px(10.0))
-        .text_color(cx.theme().muted_foreground)
-        .children(
-            ["100%", "50%", "0%"].map(|label| div().w_full().text_right().pr_2().child(label)),
-        )
-        .into_any_element()
-}
-
 fn render_model_usage(
     annual: Option<&AgentUsageAnnualProjection>,
     metric: UsageModelMetric,
@@ -2192,176 +1937,39 @@ fn render_model_usage(
         .filter(|category| !category.other)
         .map(|category| category.id.clone())
         .collect::<BTreeSet<_>>();
-    let day_values = annual
+    let mut previous_month = None;
+    let days = annual
         .days
         .iter()
         .map(|day| {
-            let values = categories
-                .iter()
-                .map(|category| model_day_value(day, category, metric, &visible_model_ids))
-                .collect::<Vec<_>>();
-            (day.label.clone(), values)
+            let month = NaiveDate::parse_from_str(&day.label, "%Y-%m-%d")
+                .ok()
+                .map(|date| date.month());
+            // Only the first day of each month carries a label, so the band
+            // axis reads as a calendar instead of a date smear.
+            let month_label = (month.is_some() && month != previous_month)
+                .then(|| SharedString::from(month.map(month_label).unwrap_or_default()));
+            if month.is_some() {
+                previous_month = month;
+            }
+            ModelChartDay::new(
+                day.label.clone(),
+                month_label,
+                categories
+                    .iter()
+                    .map(|category| model_day_value(day, category, metric, &visible_model_ids))
+                    .collect(),
+            )
         })
         .collect::<Vec<_>>();
-    let mut grid = v_flex().absolute().inset_0().justify_between();
-    for _ in 0..3 {
-        grid = grid.child(
-            div()
-                .w_full()
-                .border_t_1()
-                .border_color(cx.theme().border.opacity(0.42)),
-        );
-    }
-    let mut hitboxes = h_flex().absolute().inset_0();
-    for (index, (label, values)) in day_values.iter().enumerate() {
-        let title = label.clone();
-        let denominator = values
+    let chart = ModelChart::new(
+        days,
+        categories
             .iter()
-            .flatten()
-            .fold(0_u64, |sum, value| sum.saturating_add(*value));
-        let rows = categories
-            .iter()
-            .zip(values.iter())
-            .map(|(category, value)| {
-                (
-                    category.label.clone(),
-                    value.map_or_else(
-                        || locale::text("Unknown", "未知", "未知").to_string(),
-                        |value| {
-                            let percentage = if denominator == 0 {
-                                0.0
-                            } else {
-                                value as f64 / denominator as f64 * 100.0
-                            };
-                            format!("{} · {percentage:.1}%", format_full_number(value))
-                        },
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        hitboxes = hitboxes.child(
-            div()
-                .id(SharedString::from(format!("usage-model-day-{index}")))
-                .h_full()
-                .min_w(px(1.0))
-                .flex_1()
-                .tooltip(move |window, cx| {
-                    let title = title.clone();
-                    let rows = rows.clone();
-                    Tooltip::element(move |_, cx| {
-                        let mut content = v_flex()
-                            .min_w(px(190.0))
-                            .gap_1()
-                            .text_xs()
-                            .child(div().font_medium().child(title.clone()));
-                        for (label, value) in &rows {
-                            content = content.child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .text_color(cx.theme().popover_foreground.opacity(0.72))
-                                            .child(label.clone()),
-                                    )
-                                    .child(div().font_medium().child(value.clone())),
-                            );
-                        }
-                        content.child(
-                            div()
-                                .text_color(cx.theme().popover_foreground.opacity(0.62))
-                                .child(model_metric_label(metric)),
-                        )
-                    })
-                    .build(window, cx)
-                }),
-        );
-    }
-    let chart_data = day_values
-        .iter()
-        .map(|(_, values)| values.clone())
-        .collect::<Vec<_>>();
-    let colors = categories
-        .iter()
-        .map(|category| category.color)
-        .collect::<Vec<_>>();
-    let plot = div()
-        .relative()
-        .h(px(USAGE_CHART_HEIGHT))
-        .min_w_0()
-        .flex_1()
-        .overflow_hidden()
-        .child(grid)
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let width = f32::from(bounds.size.width).max(1.0);
-                    let height = f32::from(bounds.size.height).max(1.0);
-                    let count = chart_data.len().max(1);
-                    let day_width = width / count as f32;
-                    let bar_width = (day_width * 0.82).clamp(1.0, 8.0);
-                    let origin_x = f32::from(bounds.origin.x);
-                    let origin_y = f32::from(bounds.origin.y);
-                    for (index, values) in chart_data.iter().enumerate() {
-                        let total = values
-                            .iter()
-                            .flatten()
-                            .fold(0_u64, |sum, value| sum.saturating_add(*value));
-                        if total == 0 {
-                            continue;
-                        }
-                        let center = origin_x + day_width * (index as f32 + 0.5);
-                        let mut bottom = origin_y + height;
-                        for (value, color) in values.iter().zip(colors.iter()) {
-                            let Some(value) = value else { continue };
-                            if *value == 0 {
-                                continue;
-                            }
-                            let segment_height =
-                                (*value as f64 / total as f64 * height as f64) as f32;
-                            let top = bottom - segment_height;
-                            paint_chart_rect(
-                                window,
-                                center - bar_width / 2.0,
-                                top,
-                                center + bar_width / 2.0,
-                                bottom,
-                                *color,
-                            );
-                            bottom = top;
-                        }
-                    }
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
-        .child(hitboxes);
-    let mut month_labels = h_flex().w_full().gap_0();
-    let mut previous_month = None;
-    for (label, _) in &day_values {
-        let month = NaiveDate::parse_from_str(label, "%Y-%m-%d")
-            .ok()
-            .map(|date| date.month());
-        let visible = month.is_some() && month != previous_month;
-        if visible {
-            previous_month = month;
-        }
-        month_labels = month_labels.child(
-            div()
-                .min_w(px(1.0))
-                .flex_1()
-                .text_size(px(10.0))
-                .text_color(cx.theme().muted_foreground)
-                .child(if visible {
-                    month.map(month_label).unwrap_or_default()
-                } else {
-                    String::new()
-                }),
-        );
-    }
+            .map(|category| ModelChartCategory::new(category.label.clone(), category.color))
+            .collect(),
+        model_metric_label(metric),
+    );
     let mut legend = h_flex().w_full().flex_wrap().items_center().gap_2();
     for category in &categories {
         legend = legend.child(
@@ -2372,6 +1980,8 @@ fn render_model_usage(
                 .child(div().text_xs().child(category.label.clone())),
         );
     }
+    // The chart owns its percentage axis, month labels, and tooltip; the card
+    // only keeps the horizontal scroll and the category legend around it.
     v_flex()
         .w_full()
         .gap_2()
@@ -2381,21 +1991,11 @@ fn render_model_usage(
                 .w_full()
                 .overflow_x_scroll()
                 .child(
-                    v_flex()
+                    div()
+                        .relative()
                         .min_w(px(USAGE_MODEL_CHART_MIN_WIDTH))
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .child(render_percentage_axis(cx))
-                                .child(plot),
-                        )
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .child(div().w(px(38.0)).flex_none())
-                                .child(month_labels),
-                        ),
+                        .h(px(USAGE_CHART_HEIGHT))
+                        .child(chart),
                 ),
         )
         .child(legend)
@@ -3055,7 +2655,7 @@ fn format_compact_number(value: u64) -> String {
     }
 }
 
-fn format_full_number(value: u64) -> String {
+pub(crate) fn format_full_number(value: u64) -> String {
     let digits = value.to_string();
     let mut output = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
@@ -3483,17 +3083,6 @@ mod tests {
         assert!(detail.contains('2'));
         assert!(detail.contains('3'));
         assert!(detail.contains("input + output"));
-    }
-
-    #[test]
-    fn trend_axis_uses_a_stable_token_scale() {
-        assert_eq!(nice_axis_upper(0, 1_000), 1_000);
-        assert_eq!(nice_axis_upper(86_700, 1_000), 100_000);
-        assert_eq!(axis_ticks(100_000), [100_000, 75_000, 50_000, 25_000, 0]);
-        assert_eq!(format_token_axis_k(25_000), "25K");
-        assert_eq!(format_token_axis_k(1_500), "1.5K");
-        assert_eq!(format_token_axis_k(750), "0.75K");
-        assert_eq!(format_token_axis_k(250), "0.25K");
     }
 
     #[test]

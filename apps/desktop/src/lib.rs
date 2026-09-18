@@ -30,6 +30,7 @@ pub mod testing;
 pub mod theme;
 pub mod typography;
 pub mod usage;
+mod usage_charts;
 pub mod views;
 
 pub const DEFAULT_WIDTH: u32 = 1200;
