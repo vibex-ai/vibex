@@ -321,6 +321,12 @@ Render Agent activity through provider-neutral cards:
 Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
+A user message delivered by a queued action marks itself inside the bubble: the
+delivery logo leads the message's first line in its own column, colored by
+delivery (steer green, interrupted resend yellow), with the delivery label in
+its tooltip. Do not tint the bubble border or paint a separate chip above the
+bubble; the glyph shape, its hue, and the tooltip together carry the meaning.
+
 Delegation and Team cards should show parent/child session links, role or slot,
 current state, pending permission ownership, and latest result summary without
 requiring components to read provider-native child-turn payloads.

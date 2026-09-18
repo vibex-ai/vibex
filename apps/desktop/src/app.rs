@@ -39143,11 +39143,6 @@ impl VibexWorkbench {
                 })
                 .unwrap_or_default()
         };
-        let delivery_accent = match delivery {
-            UserMessageDelivery::Prompt => None,
-            UserMessageDelivery::Steer => Some(cx.theme().primary),
-            UserMessageDelivery::Resend => Some(cx.theme().warning),
-        };
         let attachments = if attachments.is_empty() {
             self.optimistic_user_message_attachments_for_row(row)
                 .unwrap_or(attachments)
@@ -39175,6 +39170,14 @@ impl VibexWorkbench {
                 search_query.as_deref(),
                 cx,
             )
+        };
+        // The delivery logo leads the message's first line inside the bubble.
+        // Edit mode swaps the bubble for the inline editor, which carries no
+        // delivery marker.
+        let delivery_marker = if editing {
+            None
+        } else {
+            render_user_message_delivery_marker(&row.id, delivery, cx)
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
         let edit_text = row.body.clone();
@@ -39206,17 +39209,12 @@ impl VibexWorkbench {
                     .w(relative(0.78))
                     .items_end()
                     .gap_1()
-                    .when(!editing, |this| {
-                        this.when_some(delivery_accent, |this, accent| {
-                            this.child(render_user_message_delivery_hint(&row.id, delivery, accent))
-                        })
-                    })
                     .child(render_user_message_bubble(
                         inline_content,
+                        delivery_marker,
                         cx.theme().muted,
                         cx.theme().foreground,
                         editing,
-                        delivery_accent,
                     ))
                     .when(!editing, |this| {
                         this.child(
@@ -39330,10 +39328,10 @@ impl VibexWorkbench {
                     .gap_1()
                     .child(render_user_message_bubble(
                         inline_content,
+                        None,
                         cx.theme().muted,
                         cx.theme().foreground,
                         false,
-                        None,
                     )),
             )
             .into_any_element()
@@ -55910,17 +55908,19 @@ fn user_message_inline_document(
     (Arc::new(document), Arc::new(attachment_actions))
 }
 
-/// The hint a user message wears when a queued action delivered it.
+/// The logo a user message wears when a queued action delivered it.
 ///
-/// The chip names the delivery and the bubble edge repeats its accent, so a
-/// steered message and an interrupted resend stay distinguishable without
-/// relying on color alone.
-fn render_user_message_delivery_hint(
+/// The logo leads the message's first line inside the bubble and carries the
+/// delivery accent itself — steer is green, an interrupted resend is yellow —
+/// so the two deliveries stay distinguishable by glyph and by hue without
+/// tinting the bubble edge. The delivery label lives in the logo's tooltip,
+/// which also names the marker for assistive technology.
+fn render_user_message_delivery_marker(
     row_id: &str,
     delivery: UserMessageDelivery,
-    accent: gpui::Hsla,
-) -> AnyElement {
-    let (icon_path, label) = match delivery {
+    cx: &App,
+) -> Option<AnyElement> {
+    let (icon_path, label, accent) = match delivery {
         UserMessageDelivery::Steer => (
             "icons/vibex/corner-down-right.svg",
             locale::text(
@@ -55928,6 +55928,7 @@ fn render_user_message_delivery_hint(
                 "已引导运行中的回合",
                 "已引導執行中的回合",
             ),
+            cx.theme().success,
         ),
         UserMessageDelivery::Resend => (
             "icons/vibex/rotate-ccw.svg",
@@ -55936,34 +55937,39 @@ fn render_user_message_delivery_hint(
                 "已打断上一轮并重新发送",
                 "已打斷上一輪並重新傳送",
             ),
+            cx.theme().warning,
         ),
-        UserMessageDelivery::Prompt => return div().into_any_element(),
+        UserMessageDelivery::Prompt => return None,
     };
-    h_flex()
-        .id(SharedString::from(format!(
-            "user-message-delivery:{row_id}"
-        )))
-        .items_center()
-        .gap_1()
-        .rounded_full()
-        .border_1()
-        .border_color(accent.opacity(0.35))
-        .bg(accent.opacity(0.10))
-        .px_2()
-        .py(px(2.0))
-        .text_xs()
-        .text_color(accent)
-        .child(Icon::default().path(icon_path).size(px(12.0)))
-        .child(label)
-        .into_any_element()
+    let label = SharedString::from(label);
+    Some(
+        div()
+            .id(SharedString::from(format!(
+                "user-message-delivery:{row_id}"
+            )))
+            .flex_shrink_0()
+            // Optical centering on the message's first line box: the markdown
+            // body sets a 22px line height, so a 14px glyph drops (22 - 14) / 2
+            // below the line top instead of sitting on it.
+            .mt(px(4.0))
+            .aria_label(label.clone())
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(
+                Icon::default()
+                    .path(icon_path)
+                    .size(px(14.0))
+                    .text_color(accent),
+            )
+            .into_any_element(),
+    )
 }
 
 fn render_user_message_bubble(
     body: AnyElement,
+    delivery_marker: Option<AnyElement>,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
     fill_width: bool,
-    accent: Option<gpui::Hsla>,
 ) -> gpui_component::bubble::Bubble {
     // Codex-parity: compact rounded-xl pill rendered by the library Bubble.
     // The 78% width contract stays on the definite-width row wrapper; the
@@ -55972,6 +55978,18 @@ fn render_user_message_bubble(
     // no intrinsic width, so edit mode must fill the wrapper on both the
     // Bubble and its visible BubbleContent surface or the hug collapses the
     // pill.
+    //
+    // A queued delivery's logo leads the first line inside the pill. It owns a
+    // fixed column so wrapped lines align to the text, not under the glyph.
+    let body = match delivery_marker {
+        Some(marker) => h_flex()
+            .items_start()
+            .gap_1()
+            .child(marker)
+            .child(div().min_w_0().flex_shrink(1.0).child(body))
+            .into_any_element(),
+        None => body,
+    };
     Bubble::new()
         .alignment(MessageAlignment::End)
         .flex_shrink(1.0)
@@ -55988,9 +56006,6 @@ fn render_user_message_bubble(
                 .line_height(relative(1.5))
                 .shadow_sm()
                 .when(fill_width, |this| this.w_full())
-                .when_some(accent, |this, accent| {
-                    this.border_1().border_color(accent.opacity(0.45))
-                })
                 .child(body),
         )
 }
@@ -57820,10 +57835,10 @@ mod tests {
                                     None,
                                 )
                                 .into_any_element(),
+                                None,
                                 theme::semantic_color("muted", true),
                                 theme::semantic_color("foreground", true),
                                 false,
-                                None,
                             )),
                     )
                     // The hidden hover actions still participate in the row's intrinsic width.
@@ -57861,10 +57876,10 @@ mod tests {
                                     .child(div().w(px(60.0)).h(px(24.0))),
                             )
                             .into_any_element(),
+                        None,
                         theme::semantic_color("muted", true),
                         theme::semantic_color("foreground", true),
                         true,
-                        None,
                     )),
             )
         }
@@ -68811,59 +68826,115 @@ mod tests {
         );
     }
 
-    /// Renders the delivery hint alone so the test can measure what a user
-    /// message row actually paints for each delivery.
-    struct UserMessageDeliveryHintProbe {
+    /// Renders a delivered user message through the real bubble so the test can
+    /// measure what a user message row paints, and where the delivery logo
+    /// lands relative to the message's first line.
+    struct UserMessageDeliveryMarkerProbe {
         delivery: Rc<Cell<UserMessageDelivery>>,
-        measured_height: Rc<Cell<f32>>,
+        /// Left edge, top edge, and height of the logo's column.
+        measured_marker: Rc<Cell<(f32, f32, f32)>>,
+        /// Left edge, top edge, and height of the message text.
+        measured_body: Rc<Cell<(f32, f32, f32)>>,
     }
 
-    impl Render for UserMessageDeliveryHintProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let measured_height = self.measured_height.clone();
-            h_flex().w(px(320.0)).child(
-                div()
-                    .on_prepaint(move |bounds, _, _| {
-                        measured_height.set(f32::from(bounds.size.height));
-                    })
-                    .child(render_user_message_delivery_hint(
-                        "delivery-probe",
-                        self.delivery.get(),
-                        theme::semantic_color("primary", true),
-                    )),
-            )
+    impl Render for UserMessageDeliveryMarkerProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let measured_marker = self.measured_marker.clone();
+            let measured_body = self.measured_body.clone();
+            let marker =
+                render_user_message_delivery_marker("delivery-probe", self.delivery.get(), cx).map(
+                    |marker| {
+                        // The wrapper hugs the logo, so its bounds report where
+                        // the logo actually paints inside the bubble.
+                        div()
+                            .on_prepaint(move |bounds, _, _| {
+                                measured_marker.set((
+                                    f32::from(bounds.origin.x),
+                                    f32::from(bounds.origin.y),
+                                    f32::from(bounds.size.height),
+                                ));
+                            })
+                            .child(marker)
+                            .into_any_element()
+                    },
+                );
+            let body = div()
+                .on_prepaint(move |bounds, _, _| {
+                    measured_body.set((
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.height),
+                    ));
+                })
+                .child(render_user_message_text_segment(
+                    "user-message-delivery-probe",
+                    "hi".to_string(),
+                    None,
+                ));
+            h_flex().w(px(320.0)).child(render_user_message_bubble(
+                body.into_any_element(),
+                marker,
+                theme::semantic_color("muted", true),
+                theme::semantic_color("foreground", true),
+                false,
+            ))
         }
     }
 
     #[gpui::test]
-    fn user_message_delivery_hint_paints_only_for_queued_deliveries(cx: &mut TestAppContext) {
+    fn user_message_delivery_marker_leads_the_first_line_for_queued_deliveries(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(gpui_component::init);
         let delivery = Rc::new(Cell::new(UserMessageDelivery::Prompt));
-        let measured_height = Rc::new(Cell::new(0.0));
-        let (_, cx) = cx.add_window_view(|_, _| UserMessageDeliveryHintProbe {
+        let measured_marker = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let measured_body = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageDeliveryMarkerProbe {
             delivery: delivery.clone(),
-            measured_height: measured_height.clone(),
+            measured_marker: measured_marker.clone(),
+            measured_body: measured_body.clone(),
         });
 
-        for (case, paints_chip) in [
+        for (case, paints_marker) in [
             (UserMessageDelivery::Prompt, false),
             (UserMessageDelivery::Steer, true),
             (UserMessageDelivery::Resend, true),
         ] {
             delivery.set(case);
+            measured_marker.set((0.0, 0.0, 0.0));
             cx.run_until_parked();
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
             });
-            let height = measured_height.get();
-            if paints_chip {
-                assert!(
-                    height > 0.0,
-                    "{case:?} should paint a delivery chip, measured {height}"
+            let (marker_left, marker_top, marker_height) = measured_marker.get();
+            let (body_left, body_top, body_height) = measured_body.get();
+            if !paints_marker {
+                assert_eq!(
+                    marker_height, 0.0,
+                    "an ordinary prompt should not paint a delivery logo"
                 );
-            } else {
-                assert_eq!(height, 0.0, "an ordinary prompt should not paint a chip");
+                continue;
             }
+            assert!(
+                marker_left < body_left,
+                "{case:?} logo should lead the message text: {marker_left} vs {body_left}"
+            );
+            assert!(
+                (marker_top - body_top).abs() <= 0.5,
+                "{case:?} logo column should start on the first line: {marker_top} vs {body_top}"
+            );
+            // The column is the 4px leading inset plus the 14px glyph, so the
+            // glyph center lands on the center of the 22px first line box.
+            assert!(
+                (marker_height - 18.0).abs() <= 0.5,
+                "{case:?} logo column should inset half the line leading: {marker_height}"
+            );
+            let glyph_center = marker_top + marker_height - 7.0;
+            let line_center = body_top + body_height / 2.0;
+            assert!(
+                (glyph_center - line_center).abs() <= 1.0,
+                "{case:?} logo should center on the first line: {glyph_center} vs {line_center}"
+            );
         }
     }
 
@@ -68924,6 +68995,34 @@ mod tests {
         assert!(helper.contains(".max_w_full()"));
         assert!(helper.contains(".rounded(px(12.0))"));
         assert!(!helper.contains(".overflow_y_scrollbar()"));
+        // A queued delivery is marked by the logo leading the bubble's first
+        // line, never by a chip above it or a tinted bubble edge.
+        assert!(row.contains("render_user_message_delivery_marker"));
+        assert!(!row.contains("render_user_message_delivery_hint"));
+        assert!(!row.contains(".border_color("));
+        assert!(helper.contains("delivery_marker"));
+        assert!(!helper.contains("border_1"));
+        assert!(!helper.contains("border_color"));
+    }
+
+    #[test]
+    fn user_message_delivery_marker_colors_the_logo_by_delivery() {
+        let source = include_str!("app.rs");
+        let marker = source
+            .split_once("fn render_user_message_delivery_marker(")
+            .and_then(|(_, tail)| tail.split_once("\nfn render_user_message_bubble("))
+            .map(|(body, _)| body)
+            .expect("delivery marker helper should remain inspectable");
+
+        // The two deliveries stay distinguishable by glyph, by hue, and by the
+        // tooltip that carries the label the old chip printed.
+        assert!(marker.contains("icons/vibex/corner-down-right.svg"));
+        assert!(marker.contains("icons/vibex/rotate-ccw.svg"));
+        assert!(marker.contains("cx.theme().success"));
+        assert!(marker.contains("cx.theme().warning"));
+        assert!(marker.contains("Tooltip::new"));
+        assert!(marker.contains(".aria_label("));
+        assert!(marker.contains(".text_color(accent)"));
     }
 
     #[test]
