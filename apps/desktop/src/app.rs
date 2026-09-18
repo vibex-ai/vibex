@@ -4627,17 +4627,44 @@ fn composer_queue_session_blocks_dispatch(
     local_turn_pending || session_blocks
 }
 
+/// Whether an auto-dispatched queued message must wait for the latest turn to
+/// settle.
+///
+/// `cached_turn_status` is the completion probe for the session's current
+/// revision:
+/// - `None` means the outcome has not been observed yet. Auto-send waits rather
+///   than guessing, so a session that stopped abnormally can never auto-send.
+/// - `Some(None)` means the session has no conversational turn to continue.
+/// - `Some(Some(ended_normally))` is the probe's answer.
+///
+/// Explicit actions (`ForceNext`, `AfterInterrupt`) bypass the wait because the
+/// user asked for that message to go out.
 fn composer_queue_waits_for_continuation(
     behavior: ComposerQueueDispatchBehavior,
     session_state: Option<AgentSessionState>,
-    latest_turn_ended_normally: Option<bool>,
+    cached_turn_status: Option<Option<bool>>,
 ) -> bool {
-    matches!(
+    if !matches!(
         behavior,
         ComposerQueueDispatchBehavior::Automatic | ComposerQueueDispatchBehavior::AfterCompletion
-    ) && session_state.is_some_and(|state| {
-        agent_session_turn_requires_continuation(state, latest_turn_ended_normally)
-    })
+    ) {
+        return false;
+    }
+    let Some(state) = session_state else {
+        return false;
+    };
+    if !matches!(state, AgentSessionState::Idle | AgentSessionState::Error) {
+        return false;
+    }
+    match cached_turn_status {
+        // This session revision has not been probed yet. Wait for the probe
+        // instead of risking an auto-send after an abnormal stop.
+        None => true,
+        // The probe found no conversational turn, so there is nothing to wait for.
+        Some(None) => false,
+        // Only a confirmed normal completion may auto-send.
+        Some(Some(ended_normally)) => !ended_normally,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9807,6 +9834,10 @@ impl VibexWorkbench {
             return;
         };
         if session.updated_at_ms != session_updated_at_ms {
+            // The probe answered for a revision that was superseded while it
+            // ran. Let a paused auto-send queue re-evaluate so it can probe the
+            // current revision instead of waiting forever.
+            self.mark_paused_composer_queue_for_recheck(session_id);
             return;
         }
         self.auto_continue_turn_statuses.insert(
@@ -9824,6 +9855,27 @@ impl VibexWorkbench {
             self.auto_continue_probe_tasks.remove(session_id.as_str());
         }
         self.sync_auto_continue_for_session(session_id, cx);
+        // A freshly observed turn outcome can release an auto-send queue that
+        // paused on an unobserved revision. Re-evaluate on the next frame, where
+        // the dispatch path can honor the settled answer.
+        self.mark_paused_composer_queue_for_recheck(session_id);
+    }
+
+    /// Flags a paused auto-send queue for a dispatch re-evaluation on the next
+    /// frame. The dispatch path re-reads the completion probe, so a settled
+    /// normal completion advances the queue while an abnormal stop stays paused.
+    fn mark_paused_composer_queue_for_recheck(&mut self, session_id: &VibexSessionId) {
+        if self
+            .composer_queue_paused_session_ids
+            .contains(session_id.as_str())
+            && self
+                .composer_queue
+                .iter()
+                .any(|message| message.session_id == *session_id)
+        {
+            self.composer_queue_ready_after_continuation_session_ids
+                .insert(session_id.as_str().to_string());
+        }
     }
 
     fn probe_auto_continue_turn_status(
@@ -16593,15 +16645,13 @@ impl VibexWorkbench {
             .iter()
             .find(|session| session.id == session_id);
         let session_state = session.map(|session| session.state);
-        let latest_turn_ended_normally = session
-            .and_then(|session| {
-                self.cached_auto_continue_turn_status(&session_id, session.updated_at_ms)
-            })
-            .and_then(|status| status.ended_normally);
+        let cached_turn_status = session.and_then(|session| {
+            self.cached_auto_continue_turn_status(&session_id, session.updated_at_ms)
+        });
         let waits_for_continuation = composer_queue_waits_for_continuation(
             behavior,
             session_state,
-            latest_turn_ended_normally,
+            cached_turn_status.map(|status| status.ended_normally),
         );
         if composer_queue_session_blocks_dispatch(
             behavior,
@@ -16618,6 +16668,12 @@ impl VibexWorkbench {
             if waits_for_continuation {
                 self.composer_queue_paused_session_ids
                     .insert(session_id.as_str().to_string());
+                // An unobserved revision is not proof of a normal completion:
+                // probe it so a later frame can release the queue once the
+                // latest turn is known.
+                if cached_turn_status.is_none() {
+                    self.probe_composer_queue_turn_status(&session_id, cx);
+                }
             }
             cx.notify();
             return;
@@ -16832,6 +16888,32 @@ impl VibexWorkbench {
         .detach();
     }
 
+    /// Probes the latest turn outcome when the composer queue is waiting on an
+    /// unobserved session revision. The probe caches the answer and marks the
+    /// paused queue for re-evaluation on the next frame, so a normal completion
+    /// still advances the queue without user action.
+    fn probe_composer_queue_turn_status(
+        &mut self,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_updated_at_ms) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| session.updated_at_ms)
+        else {
+            return;
+        };
+        if self
+            .cached_auto_continue_turn_status(session_id, session_updated_at_ms)
+            .is_some()
+        {
+            return;
+        }
+        self.probe_auto_continue_turn_status(session_id.clone(), session_updated_at_ms, cx);
+    }
+
     fn maybe_dispatch_next_composer_queue_message(
         &mut self,
         session_id: &VibexSessionId,
@@ -16844,15 +16926,13 @@ impl VibexWorkbench {
             .iter()
             .find(|session| &session.id == session_id);
         let session_state = session.map(|session| session.state);
-        let latest_turn_ended_normally = session
-            .and_then(|session| {
-                self.cached_auto_continue_turn_status(session_id, session.updated_at_ms)
-            })
-            .and_then(|status| status.ended_normally);
+        let cached_turn_status = session.and_then(|session| {
+            self.cached_auto_continue_turn_status(session_id, session.updated_at_ms)
+        });
         let waits_for_continuation = composer_queue_waits_for_continuation(
             behavior,
             session_state,
-            latest_turn_ended_normally,
+            cached_turn_status.map(|status| status.ended_normally),
         );
         if !composer_queue_dispatch_enabled(
             &self.composer_queue_manual_session_ids,
@@ -16872,6 +16952,12 @@ impl VibexWorkbench {
             if waits_for_continuation {
                 self.composer_queue_paused_session_ids
                     .insert(session_id.as_str().to_string());
+                // An unobserved revision is not proof of a normal completion:
+                // probe it so a later frame can release the queue once the
+                // latest turn is known.
+                if cached_turn_status.is_none() {
+                    self.probe_composer_queue_turn_status(session_id, cx);
+                }
             }
             return;
         }
@@ -63486,24 +63572,49 @@ mod tests {
 
     #[test]
     fn automatic_composer_queue_waits_for_an_incomplete_turn_continuation() {
+        // An unobserved revision never auto-sends: it could be an abnormal stop.
+        assert!(composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Idle),
+            None,
+        ));
         assert!(composer_queue_waits_for_continuation(
             ComposerQueueDispatchBehavior::Automatic,
             Some(AgentSessionState::Error),
             None,
         ));
+        // A probed abnormal stop keeps the queue paused.
         assert!(composer_queue_waits_for_continuation(
             ComposerQueueDispatchBehavior::Automatic,
             Some(AgentSessionState::Idle),
-            Some(false),
+            Some(Some(false)),
+        ));
+        // A probed normal completion releases it.
+        assert!(!composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Idle),
+            Some(Some(true)),
         ));
         assert!(!composer_queue_waits_for_continuation(
             ComposerQueueDispatchBehavior::Automatic,
             Some(AgentSessionState::Error),
-            Some(true),
+            Some(Some(true)),
         ));
+        // A probe that found no conversational turn has nothing to wait for.
+        assert!(!composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::Automatic,
+            Some(AgentSessionState::Idle),
+            Some(None),
+        ));
+        // Explicit actions bypass the wait.
         assert!(!composer_queue_waits_for_continuation(
             ComposerQueueDispatchBehavior::ForceNext,
             Some(AgentSessionState::Error),
+            None,
+        ));
+        assert!(!composer_queue_waits_for_continuation(
+            ComposerQueueDispatchBehavior::AfterInterrupt,
+            Some(AgentSessionState::Idle),
             None,
         ));
     }
