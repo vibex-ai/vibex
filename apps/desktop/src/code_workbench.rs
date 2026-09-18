@@ -8264,25 +8264,16 @@ impl CodeWorkbench {
                                     .px_2()
                                     .border_r_1()
                                     .border_color(cx.theme().border.opacity(0.30))
-                                    .child(skeleton::skeleton_bar(
-                                        row_height * 0.45,
-                                        0.55,
-                                        cx,
-                                    )),
+                                    .child(skeleton::skeleton_bar(row_height * 0.45, 0.55, cx)),
                             )
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .items_center()
-                                    .px_3()
-                                    .child(skeleton::skeleton_bar(
-                                        row_height * 0.45,
-                                        DIFF_PREVIEW_LOADING_WIDTHS
-                                            [row % DIFF_PREVIEW_LOADING_WIDTHS.len()],
-                                        cx,
-                                    )),
-                            )
+                            .child(h_flex().min_w_0().flex_1().items_center().px_3().child(
+                                skeleton::skeleton_bar(
+                                    row_height * 0.45,
+                                    DIFF_PREVIEW_LOADING_WIDTHS
+                                        [row % DIFF_PREVIEW_LOADING_WIDTHS.len()],
+                                    cx,
+                                ),
+                            ))
                     })),
             )
             .into_any_element()

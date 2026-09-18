@@ -45,7 +45,8 @@ const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
 const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
 /// One toolbar control: the range shell's segment plus its inset and hairline.
-const USAGE_TOOLBAR_CONTROL_HEIGHT: f32 = USAGE_RANGE_SEGMENT_HEIGHT + USAGE_RANGE_INSET * 2.0 + 2.0;
+const USAGE_TOOLBAR_CONTROL_HEIGHT: f32 =
+    USAGE_RANGE_SEGMENT_HEIGHT + USAGE_RANGE_INSET * 2.0 + 2.0;
 /// One summary tile: `py_3` + a 20px label row + `gap_2` + the `text_xl` value
 /// line at `relative(1.2)` + `py_3`. The loading placeholder uses the same
 /// figure so the grid does not resize when the numbers land.
@@ -1105,131 +1106,130 @@ impl Render for UsageView {
             self.loading,
             self.error.is_some(),
         );
-        let content = match state {
-            UsageContentState::Ready => {
-                let statistics = statistics.expect("ready usage state requires statistics");
-                v_flex()
-                    .w_full()
-                    .gap_4()
-                    .children(status)
-                    .child(self.render_toolbar(window, cx))
-                    .child(self.render_summary(&statistics.totals, viewport_width, cx))
-                    .child(self.render_trend(&statistics, cx))
-                    .child(self.render_dimensions(window, cx))
-                    .into_any_element()
-            }
-            UsageContentState::Loading => {
-                // Stand in for the ready layout with its own containers — the
-                // same toolbar slot, summary grid, and two cards — so the
-                // statistics land where their placeholders stood instead of
-                // reflowing the page. This is a first load only: once
-                // `statistics` is set the state is `Ready`, so a range, filter,
-                // or sort change keeps the previous numbers on screen.
-                v_flex()
-                    .w_full()
-                    .gap_4()
-                    .children(status)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(skeleton::skeleton_bar(
-                                USAGE_TOOLBAR_CONTROL_HEIGHT,
-                                0.22,
-                                cx,
-                            ))
-                            .child(skeleton::skeleton_bar(
-                                USAGE_TOOLBAR_CONTROL_HEIGHT,
-                                0.46,
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .grid()
-                            .grid_cols(summary_columns(viewport_width))
-                            .w_full()
-                            .gap_3()
-                            .children((0..USAGE_SUMMARY_METRIC_COUNT).map(|_| {
-                                skeleton::skeleton_bar(USAGE_SUMMARY_TILE_HEIGHT, 1.0, cx)
-                            })),
-                    )
-                    .child(
-                        usage_card(cx)
-                            .gap_3()
-                            .px_4()
-                            .py_3()
-                            .child(skeleton::skeleton_bar(24.0, 0.34, cx))
-                            .child(skeleton::skeleton_bar(USAGE_CHART_HEIGHT, 1.0, cx)),
-                    )
-                    .child(
-                        usage_card(cx)
-                            .overflow_hidden()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .px_2()
-                                    .py(px(6.0))
-                                    .border_b_1()
-                                    .border_color(cx.theme().border.opacity(0.55))
-                                    .child(skeleton::skeleton_bar(28.0, 0.38, cx)),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .children((0..USAGE_LOADING_TABLE_ROWS).map(|_| {
+        let content =
+            match state {
+                UsageContentState::Ready => {
+                    let statistics = statistics.expect("ready usage state requires statistics");
+                    v_flex()
+                        .w_full()
+                        .gap_4()
+                        .children(status)
+                        .child(self.render_toolbar(window, cx))
+                        .child(self.render_summary(&statistics.totals, viewport_width, cx))
+                        .child(self.render_trend(&statistics, cx))
+                        .child(self.render_dimensions(window, cx))
+                        .into_any_element()
+                }
+                UsageContentState::Loading => {
+                    // Stand in for the ready layout with its own containers — the
+                    // same toolbar slot, summary grid, and two cards — so the
+                    // statistics land where their placeholders stood instead of
+                    // reflowing the page. This is a first load only: once
+                    // `statistics` is set the state is `Ready`, so a range, filter,
+                    // or sort change keeps the previous numbers on screen.
+                    v_flex()
+                        .w_full()
+                        .gap_4()
+                        .children(status)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(skeleton::skeleton_bar(
+                                    USAGE_TOOLBAR_CONTROL_HEIGHT,
+                                    0.22,
+                                    cx,
+                                ))
+                                .child(skeleton::skeleton_bar(
+                                    USAGE_TOOLBAR_CONTROL_HEIGHT,
+                                    0.46,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .grid()
+                                .grid_cols(summary_columns(viewport_width))
+                                .w_full()
+                                .gap_3()
+                                .children((0..USAGE_SUMMARY_METRIC_COUNT).map(|_| {
+                                    skeleton::skeleton_bar(USAGE_SUMMARY_TILE_HEIGHT, 1.0, cx)
+                                })),
+                        )
+                        .child(
+                            usage_card(cx)
+                                .gap_3()
+                                .px_4()
+                                .py_3()
+                                .child(skeleton::skeleton_bar(24.0, 0.34, cx))
+                                .child(skeleton::skeleton_bar(USAGE_CHART_HEIGHT, 1.0, cx)),
+                        )
+                        .child(
+                            usage_card(cx)
+                                .overflow_hidden()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap(px(2.0))
+                                        .px_2()
+                                        .py(px(6.0))
+                                        .border_b_1()
+                                        .border_color(cx.theme().border.opacity(0.55))
+                                        .child(skeleton::skeleton_bar(28.0, 0.38, cx)),
+                                )
+                                .child(v_flex().w_full().children(
+                                    (0..USAGE_LOADING_TABLE_ROWS).map(|_| {
                                         h_flex()
                                             .w_full()
                                             .h(px(USAGE_TABLE_ROW_HEIGHT))
                                             .items_center()
                                             .px_3()
                                             .child(skeleton::skeleton_bar(12.0, 0.42, cx))
-                                    })),
-                            )
+                                    }),
+                                )),
+                        )
+                        .into_any_element()
+                }
+                UsageContentState::Empty => v_flex()
+                    .w_full()
+                    .gap_4()
+                    .children(status)
+                    .child(self.render_toolbar(window, cx))
+                    .child(
+                        v_flex()
+                            .h(px(200.0))
+                            .w_full()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Icon::new(IconName::Inbox).size(px(22.0)))
+                            .child(locale::text(
+                                "Usage is recorded from the time this feature is enabled",
+                                "用量从启用此功能后开始记录",
+                                "用量從啟用此功能後開始記錄",
+                            )),
                     )
-                    .into_any_element()
-            }
-            UsageContentState::Empty => v_flex()
-                .w_full()
-                .gap_4()
-                .children(status)
-                .child(self.render_toolbar(window, cx))
-                .child(
-                    v_flex()
-                        .h(px(200.0))
-                        .w_full()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(Icon::new(IconName::Inbox).size(px(22.0)))
-                        .child(locale::text(
-                            "Usage is recorded from the time this feature is enabled",
-                            "用量从启用此功能后开始记录",
-                            "用量從啟用此功能後開始記錄",
-                        )),
-                )
-                .into_any_element(),
-            UsageContentState::Unavailable => v_flex()
-                .w_full()
-                .gap_4()
-                .children(status)
-                .child(self.render_toolbar(window, cx))
-                .child(centered_message(
-                    locale::text(
-                        "Usage data is not available",
-                        "用量数据当前不可用",
-                        "用量資料目前不可用",
-                    ),
-                    cx,
-                ))
-                .into_any_element(),
-        };
+                    .into_any_element(),
+                UsageContentState::Unavailable => v_flex()
+                    .w_full()
+                    .gap_4()
+                    .children(status)
+                    .child(self.render_toolbar(window, cx))
+                    .child(centered_message(
+                        locale::text(
+                            "Usage data is not available",
+                            "用量数据当前不可用",
+                            "用量資料目前不可用",
+                        ),
+                        cx,
+                    ))
+                    .into_any_element(),
+            };
         v_flex()
             .id("usage-view")
             .size_full()

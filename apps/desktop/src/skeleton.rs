@@ -48,14 +48,20 @@ mod tests {
             "self.loading && self.snapshot.skills.is_empty()",
             "self.loading && !self.details_ready",
         ] {
-            assert!(management.contains(gate), "{gate} must gate its placeholder");
+            assert!(
+                management.contains(gate),
+                "{gate} must gate its placeholder"
+            );
         }
         for placeholder in [
             "management_agent_card_placeholders(cx)",
             "management_resource_placeholders(cx)",
             "management_provider_placeholders(cx)",
         ] {
-            assert!(management.contains(placeholder), "{placeholder} is unreachable");
+            assert!(
+                management.contains(placeholder),
+                "{placeholder} is unreachable"
+            );
         }
 
         let code_workbench = include_str!("code_workbench.rs");

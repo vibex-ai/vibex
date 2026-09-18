@@ -4366,7 +4366,11 @@ fn skeleton_session_search(cx: &App) -> AnyElement {
                         .flex_1()
                         .gap_2()
                         .child(skeleton::skeleton_bar(12.0, TITLES[row % TITLES.len()], cx))
-                        .child(skeleton::skeleton_bar(10.0, DETAILS[row % DETAILS.len()], cx)),
+                        .child(skeleton::skeleton_bar(
+                            10.0,
+                            DETAILS[row % DETAILS.len()],
+                            cx,
+                        )),
                 )
         }))
         .into_any_element()
@@ -4380,17 +4384,10 @@ fn skeleton_session_search(cx: &App) -> AnyElement {
 /// cached turns and clears the flag instead. Turn heights are measured and
 /// virtualized, so the placeholder approximates a short conversation rather
 /// than predicting it — it must never write into the row-size table.
-fn skeleton_conversation(
-    content_max_width: Option<f32>,
-    strings: Strings,
-    cx: &App,
-) -> AnyElement {
+fn skeleton_conversation(content_max_width: Option<f32>, strings: Strings, cx: &App) -> AnyElement {
     /// Per turn: the User bubble's width, then the Agent answer's line widths,
     /// as fractions of the content column. A zero ends the answer.
-    const TURNS: [(f32, [f32; 3]); 2] = [
-        (0.42, [0.94, 0.86, 0.52]),
-        (0.56, [0.90, 0.72, 0.0]),
-    ];
+    const TURNS: [(f32, [f32; 3]); 2] = [(0.42, [0.94, 0.86, 0.52]), (0.56, [0.90, 0.72, 0.0])];
     let mut column = v_flex().w_full().min_w_0().gap_8();
     for (bubble_width, answer_widths) in TURNS {
         column = column
@@ -4405,17 +4402,12 @@ fn skeleton_conversation(
                 ),
             )
             .child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_start()
-                    .gap_2()
-                    .children(
-                        answer_widths
-                            .into_iter()
-                            .filter(|width| *width > 0.0)
-                            .map(|width| skeleton::skeleton_bar(12.0, width, cx)),
-                    ),
+                v_flex().w_full().min_w_0().items_start().gap_2().children(
+                    answer_widths
+                        .into_iter()
+                        .filter(|width| *width > 0.0)
+                        .map(|width| skeleton::skeleton_bar(12.0, width, cx)),
+                ),
             );
     }
     v_flex()

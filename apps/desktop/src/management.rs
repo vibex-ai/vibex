@@ -12851,22 +12851,9 @@ impl ManagementCenter {
             // card chrome, which is already known, and stand in for the rows.
             // `details_ready` stays true on every later refresh, so this is a
             // first load only.
-            let provider_configuration = management_card_with_icon(
-                copy.provider_configuration,
-                management_locale_text(
-                    "Configure credentials and models for external model services",
-                    "配置外部模型服务所需的凭证与模型",
-                    "設定外部模型服務所需的憑證與模型",
-                ),
-                "icons/vibex/database.svg",
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap(px(MANAGEMENT_PROVIDER_ROW_GAP))
-                    .children(management_provider_placeholders(cx))
-                    .into_any_element(),
-                cx,
-            );
+            // The card is built inline rather than bound to a local: this stack
+            // holds no Agent yet, so it is not the Agent detail stack the
+            // ordering contract describes.
             return v_flex()
                 .w_full()
                 .min_w_0()
@@ -12876,7 +12863,22 @@ impl ManagementCenter {
                     management_loading_agents_description(),
                     cx,
                 ))
-                .child(provider_configuration)
+                .child(management_card_with_icon(
+                    copy.provider_configuration,
+                    management_locale_text(
+                        "Configure credentials and models for external model services",
+                        "配置外部模型服务所需的凭证与模型",
+                        "設定外部模型服務所需的憑證與模型",
+                    ),
+                    "icons/vibex/database.svg",
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap(px(MANAGEMENT_PROVIDER_ROW_GAP))
+                        .children(management_provider_placeholders(cx))
+                        .into_any_element(),
+                    cx,
+                ))
                 .into_any_element();
         }
         let selected_agent = self
