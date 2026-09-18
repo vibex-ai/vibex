@@ -10948,6 +10948,46 @@ impl VibexWorkbench {
         self.queue_ui_state();
     }
 
+    fn sidebar_activation_session(
+        &self,
+        project_id: &ProjectId,
+        workspace: Option<&WorkspaceRecord>,
+    ) -> Option<VibexSessionId> {
+        sidebar_group_activation_session(
+            &self.sessions,
+            self.selected_session_id.as_ref(),
+            project_id,
+            workspace,
+        )
+    }
+
+    /// Moves the workbench focus for a clicked sidebar project or workspace row.
+    ///
+    /// The center timeline, the right rail, and the file/git panels all read the
+    /// selected Session's Workspace, so the row must switch the Session before
+    /// any Workspace focus can move. The one exception is the New Session home:
+    /// with no Session on screen the Workspace itself is the context the next
+    /// Session will be created in, so the row may activate it directly.
+    fn activate_sidebar_group(
+        &mut self,
+        session_id: Option<VibexSessionId>,
+        workspace: WorkspaceRecord,
+        cx: &mut Context<Self>,
+    ) {
+        match session_id {
+            Some(session_id) => {
+                if self.selected_session_id.as_ref() != Some(&session_id) {
+                    self.select_session(session_id, cx);
+                }
+            }
+            None if self.selected_session_id.is_none() => self.activate_workspace(workspace, cx),
+            // No Session to switch to and one is already on screen: leave the
+            // Workspace focus alone rather than desynchronizing the right rail
+            // from the Session in the center.
+            None => {}
+        }
+    }
+
     pub(crate) fn focus_worktree_operation_target(
         &mut self,
         workspace_id: vibex_core::WorkspaceId,
@@ -11229,7 +11269,8 @@ impl VibexWorkbench {
         workspace: WorkspaceRecord,
         cx: &mut Context<Self>,
     ) {
-        self.activate_workspace(workspace, cx);
+        let session_id = self.sidebar_activation_session(&project_id, None);
+        self.activate_sidebar_group(session_id, workspace, cx);
         let project_id = project_id.as_str().to_string();
         if !self.sidebar_state.collapsed_ids.remove(&project_id) {
             self.sidebar_state.collapsed_ids.insert(project_id);
@@ -11264,7 +11305,8 @@ impl VibexWorkbench {
             .sidebar
             .collapsed_workspace_ids
             .contains(&workspace_id);
-        self.activate_workspace(workspace, cx);
+        let session_id = self.sidebar_activation_session(&project_id, Some(&workspace));
+        self.activate_sidebar_group(session_id, workspace, cx);
         if was_collapsed {
             for (_, candidate) in &self.workspaces {
                 if candidate.project_id == project_id {
@@ -46567,6 +46609,49 @@ fn sidebar_project_is_active(
     !session_selected && selected_workspace_id == Some(workspace_id)
 }
 
+/// Resolves the Session a sidebar project or workspace row click should open.
+///
+/// The Session already on screen wins while it belongs to the clicked scope, so
+/// a second click on the same group only toggles it instead of jumping to
+/// another Session. Otherwise the scope's most recently active Session is used,
+/// matching the recency stream the sidebar displays. Deleted Sessions are never
+/// activated, and a workspace scope also matches Sessions that still point at an
+/// aliased workspace row with the same root and mode.
+fn sidebar_group_activation_session(
+    sessions: &[AgentSession],
+    selected_session_id: Option<&VibexSessionId>,
+    project_id: &ProjectId,
+    workspace: Option<&WorkspaceRecord>,
+) -> Option<VibexSessionId> {
+    let in_scope = |session: &AgentSession| {
+        session.deleted_at_ms.is_none()
+            && &session.project_id == project_id
+            && workspace.is_none_or(|workspace| {
+                session.workspace_id == workspace.id
+                    || (session.workspace_root == workspace.root_path
+                        && session.workspace_mode == workspace.mode)
+            })
+    };
+    if let Some(selected) = selected_session_id
+        && let Some(session) = sessions
+            .iter()
+            .find(|session| &session.id == selected && in_scope(session))
+    {
+        return Some(session.id.clone());
+    }
+    sessions
+        .iter()
+        .filter(|session| in_scope(session))
+        .max_by(|left, right| {
+            left.last_message_at_ms
+                .cmp(&right.last_message_at_ms)
+                .then_with(|| left.updated_at_ms.cmp(&right.updated_at_ms))
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| right.id.as_str().cmp(left.id.as_str()))
+        })
+        .map(|session| session.id.clone())
+}
+
 fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
     h_flex()
         .h(px(28.0))
@@ -59235,6 +59320,120 @@ mod tests {
         ));
     }
 
+    fn sidebar_activation_session_fixture(
+        project_id: &ProjectId,
+        workspace: &WorkspaceRecord,
+        last_message_at_ms: i64,
+    ) -> AgentSession {
+        AgentSession {
+            id: VibexSessionId::new(),
+            title: "Sidebar activation".into(),
+            project_id: project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: last_message_at_ms,
+            updated_at_ms: last_message_at_ms,
+            last_message_at_ms,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn sidebar_group_click_opens_a_session_instead_of_moving_the_workspace_focus() {
+        let project = ProjectId::new();
+        let other_project = ProjectId::new();
+        let checkout = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            project_id: project.clone(),
+            root_path: "/repo".into(),
+            mode: WorkspaceMode::CurrentCheckout,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let worktree = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            project_id: project.clone(),
+            root_path: "/repo-worktree".into(),
+            mode: WorkspaceMode::VibexWorktree,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+        let checkout_session = sidebar_activation_session_fixture(&project, &checkout, 10);
+        let worktree_session = sidebar_activation_session_fixture(&project, &worktree, 20);
+        let foreign_session = sidebar_activation_session_fixture(&other_project, &checkout, 30);
+        let sessions = vec![
+            checkout_session.clone(),
+            worktree_session.clone(),
+            foreign_session.clone(),
+        ];
+
+        // No Session on screen: the project row opens the most recently active
+        // Session across every workspace the project owns.
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, None, &project, None),
+            Some(worktree_session.id.clone())
+        );
+        // A Session already on screen keeps its place while it belongs to the
+        // clicked project, even when a sibling is more recent.
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, Some(&checkout_session.id), &project, None),
+            Some(checkout_session.id.clone())
+        );
+        // A Session from another project never wins over the clicked scope.
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, Some(&foreign_session.id), &project, None),
+            Some(worktree_session.id.clone())
+        );
+        // A workspace scope only resolves Sessions living in that workspace.
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, None, &project, Some(&checkout)),
+            Some(checkout_session.id.clone())
+        );
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, None, &project, Some(&worktree)),
+            Some(worktree_session.id.clone())
+        );
+        // A workspace with no Sessions leaves the focus untouched.
+        let empty_workspace = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            project_id: project.clone(),
+            root_path: "/repo-empty".into(),
+            mode: WorkspaceMode::VibexWorktree,
+            created_at_ms: 3,
+            updated_at_ms: 3,
+        };
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, None, &project, Some(&empty_workspace)),
+            None
+        );
+        // A deleted Session is never reopened.
+        let mut deleted_session = worktree_session.clone();
+        deleted_session.deleted_at_ms = Some(1);
+        assert_eq!(
+            sidebar_group_activation_session(
+                &[checkout_session.clone(), deleted_session],
+                None,
+                &project,
+                None
+            ),
+            Some(checkout_session.id.clone())
+        );
+        // Aliased workspace rows resolve by root and mode.
+        let alias = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            ..worktree.clone()
+        };
+        assert_eq!(
+            sidebar_group_activation_session(&sessions, None, &project, Some(&alias)),
+            Some(worktree_session.id.clone())
+        );
+    }
+
     #[test]
     fn selected_session_background_increases_contrast_in_both_themes() {
         let light_accent = theme::semantic_color("sidebar-accent", false);
@@ -59292,6 +59491,45 @@ mod tests {
         assert!(project.contains("workspace.agent_summary.total"));
         assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
+    }
+
+    #[test]
+    fn sidebar_group_rows_switch_sessions_instead_of_moving_the_workspace_focus() {
+        let source = include_str!("app.rs");
+        let group_activation = source
+            .split_once("    fn activate_sidebar_group(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    pub(crate) fn focus_worktree_operation_target(")
+            })
+            .map(|(body, _)| body)
+            .expect("sidebar group activation should remain inspectable");
+        assert!(group_activation.contains("self.select_session(session_id, cx);"));
+        assert!(group_activation.contains(
+            "None if self.selected_session_id.is_none() => self.activate_workspace(workspace, cx)"
+        ));
+
+        let project_toggle = source
+            .split_once("    fn activate_and_toggle_project(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_sidebar_project("))
+            .map(|(body, _)| body)
+            .expect("project toggle should remain inspectable");
+        assert!(project_toggle.contains("self.sidebar_activation_session(&project_id, None)"));
+        assert!(project_toggle.contains("self.activate_sidebar_group(session_id, workspace, cx);"));
+        assert!(!project_toggle.contains("self.activate_workspace("));
+
+        let workspace_toggle = source
+            .split_once("    fn activate_and_toggle_sidebar_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_sidebar_organization_drop_target("))
+            .map(|(body, _)| body)
+            .expect("workspace toggle should remain inspectable");
+        assert!(
+            workspace_toggle
+                .contains("self.sidebar_activation_session(&project_id, Some(&workspace))")
+        );
+        assert!(
+            workspace_toggle.contains("self.activate_sidebar_group(session_id, workspace, cx);")
+        );
+        assert!(!workspace_toggle.contains("self.activate_workspace("));
     }
 
     #[test]
@@ -65069,7 +65307,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the provider search reset should remain inspectable");
         assert!(
-            reset.contains("composer_runtime_search") && reset.contains("new_session_runtime_search"),
+            reset.contains("composer_runtime_search")
+                && reset.contains("new_session_runtime_search"),
             "the composer and the new-session home share one popover shape, so both fields reset"
         );
         assert!(
