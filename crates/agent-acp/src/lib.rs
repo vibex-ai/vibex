@@ -155,6 +155,7 @@ pub use spawn_config::{
 };
 
 const OPENCODE_PRESET_ID: &str = "opencode";
+const DEEPSEEK_HARNESS_AGENT_ID: &str = "deepseek-harness";
 const DEFAULT_OPENCODE_SMOKE_PROMPT: &str =
     "Reply with a one-line ACP smoke marker and do not edit files.";
 const OPENCODE_ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -287,6 +288,46 @@ const OPENCODE_ACP_PROVIDER_COMMANDS: &[OpenCodeAcpSlashCommand] = &[
     },
 ];
 
+/// DeepSeek Harness's command surface for the pre-session composer.
+///
+/// The bridge announces its live catalog through
+/// `available_commands_update` once a session exists; until then there is no
+/// runtime to ask, so the new-session composer would otherwise offer nothing.
+/// This pinned list mirrors the bridge's adapter built-ins (`/status`,
+/// `/model`) plus the harness command registry it mounts (`/compact`,
+/// `/goal`, `/permission`, `/plan`, `/feedback`), the same way Codex and
+/// OpenCode keep a static catalog before their first session.
+const DEEPSEEK_HARNESS_ACP_PROVIDER_COMMANDS: &[DeepSeekHarnessAcpSlashCommand] = &[
+    DeepSeekHarnessAcpSlashCommand {
+        name: "status",
+        description: "Show adapter, model, mode, and token status.",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "model",
+        description: "Select the model for this conversation.",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "compact",
+        description: "Compact older conversation history.",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "goal",
+        description: "Set or view the goal for a long-running task.",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "permission",
+        description: "Switch the permission preset (sandbox mode and approval policy).",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "plan",
+        description: "Enter or leave plan mode.",
+    },
+    DeepSeekHarnessAcpSlashCommand {
+        name: "feedback",
+        description: "Record feedback about this session.",
+    },
+];
+
 #[derive(Debug, Clone, Copy)]
 struct CodexAcpSlashCommand {
     name: &'static str,
@@ -298,6 +339,12 @@ struct OpenCodeAcpSlashCommand {
     name: &'static str,
     label: &'static str,
     insertion_text: &'static str,
+    description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeepSeekHarnessAcpSlashCommand {
+    name: &'static str,
     description: &'static str,
 }
 
@@ -2487,6 +2534,19 @@ impl AgentProvider for AcpAgentProvider {
             });
         }
 
+        if self.request_supports_deepseek_harness_commands(&request) {
+            return Ok(AgentCommandDiscoverResponse {
+                entries: DEEPSEEK_HARNESS_ACP_PROVIDER_COMMANDS
+                    .iter()
+                    .map(|command| deepseek_harness_acp_command_entry(command, ProviderKind::Acp))
+                    .collect(),
+                diagnostics: vec![ProviderBindingMetadata {
+                    key: "catalogSource".to_string(),
+                    value: "deepseek-harness-static".to_string(),
+                }],
+            });
+        }
+
         if !self.request_supports_opencode_commands(&request) {
             return Ok(AgentCommandDiscoverResponse {
                 entries: Vec::new(),
@@ -2611,10 +2671,32 @@ impl AcpAgentProvider {
         self.acp_config_for_profile(profile_id)
             .is_some_and(|config| acp_config_supports_codex_commands(&config))
     }
+
+    fn request_supports_deepseek_harness_commands(
+        &self,
+        request: &AgentCommandDiscoverRequest,
+    ) -> bool {
+        if request.agent_id.as_ref().map(vibex_core::AgentId::as_str)
+            != Some(DEEPSEEK_HARNESS_AGENT_ID)
+        {
+            return false;
+        }
+
+        let Some(profile_id) = request.provider_profile_id.as_ref() else {
+            return self.config_service.is_none();
+        };
+        self.acp_config_for_profile(profile_id)
+            .is_some_and(|config| acp_config_supports_deepseek_harness_commands(&config))
+    }
 }
 
 fn acp_config_supports_codex_commands(config: &AcpProviderConfig) -> bool {
     acp_config_has_feature(config, &["slash_commands"]) && acp_runtime_looks_like_codex(config)
+}
+
+fn acp_config_supports_deepseek_harness_commands(config: &AcpProviderConfig) -> bool {
+    acp_config_has_feature(config, &["slash_commands"])
+        && acp_runtime_looks_like_deepseek_harness(config)
 }
 
 fn acp_config_supports_opencode_commands(config: &AcpProviderConfig) -> bool {
@@ -2661,6 +2743,17 @@ fn acp_runtime_looks_like_codex(config: &AcpProviderConfig) -> bool {
     std::iter::once(config.command.as_str())
         .chain(config.args.iter().map(String::as_str))
         .any(|value| normalize_acp_feature_token(value).contains(&adapter_token))
+}
+
+/// Whether the configured command is the DeepSeek Harness ACP bridge.
+///
+/// The bridge ships under the `deepseek-harness` npm name and is launched
+/// either through `npx @openma/deepseek-harness-acp@…` or through a managed
+/// install whose path carries the same name, so both spellings resolve here.
+fn acp_runtime_looks_like_deepseek_harness(config: &AcpProviderConfig) -> bool {
+    std::iter::once(config.command.as_str())
+        .chain(config.args.iter().map(String::as_str))
+        .any(|value| normalize_acp_feature_token(value).contains("deepseek_harness"))
 }
 
 fn acp_config_has_feature(config: &AcpProviderConfig, aliases: &[&str]) -> bool {
@@ -2770,6 +2863,32 @@ fn opencode_acp_command_entry(
                 value: OPENCODE_PRESET_ID.to_string(),
             },
         ],
+    }
+}
+
+fn deepseek_harness_acp_command_entry(
+    command: &DeepSeekHarnessAcpSlashCommand,
+    provider_kind: ProviderKind,
+) -> AgentCommandEntry {
+    AgentCommandEntry {
+        id: format!("provider:acp:deepseek-harness:{}", command.name),
+        trigger: AgentCommandTrigger::Slash,
+        source_kind: AgentCommandSourceKind::Provider,
+        label: format!("/{}", command.name),
+        description: Some(command.description.to_string()),
+        insertion_text: format!("/{} ", command.name),
+        command_name: Some(command.name.to_string()),
+        provider_kind: Some(provider_kind),
+        prompt_id: None,
+        skill_id: None,
+        reference_path: None,
+        selection_behavior: AgentCommandSelectionBehavior::Insert,
+        execution_behavior: AgentCommandExecutionBehavior::ProviderCommand,
+        destructive: false,
+        metadata: vec![ProviderBindingMetadata {
+            key: "catalogSource".to_string(),
+            value: "deepseek-harness-static".to_string(),
+        }],
     }
 }
 
@@ -3928,6 +4047,115 @@ mod tests {
         assert!(response.entries.is_empty());
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.key == "catalogSource" && diagnostic.value == "unsupported-acp-profile"
+        }));
+
+        cleanup_db(db_path);
+    }
+
+    #[test]
+    fn detects_the_deepseek_harness_bridge_in_both_launch_spellings() {
+        let mut config = AcpProviderConfig {
+            command: "npx".to_string(),
+            args: vec![
+                "-y".to_string(),
+                "@openma/deepseek-harness-acp@0.4.32".to_string(),
+            ],
+            env: Vec::new(),
+            cwd_template: Some("{workspaceRoot}".to_string()),
+            process_strategy: vibex_core::AcpProcessStrategy::default(),
+            terminal_tools: false,
+            terminal_auth: false,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: vec!["slash_commands".to_string()],
+            disabled_tools: Vec::new(),
+        };
+        assert!(acp_config_supports_deepseek_harness_commands(&config));
+
+        config.command = "/usr/bin/node".to_string();
+        config.args = vec![
+            "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.32-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
+        ];
+        assert!(acp_config_supports_deepseek_harness_commands(&config));
+
+        // The pinned catalog is gated on the profile still advertising slash
+        // commands, exactly like the Codex and OpenCode catalogs.
+        config.features.clear();
+        assert!(!acp_config_supports_deepseek_harness_commands(&config));
+    }
+
+    #[tokio::test]
+    async fn discovers_deepseek_harness_commands_before_a_session_exists() {
+        let db_path = temp_db_path("commands-deepseek-harness-profile");
+        let service = ProviderConfigService::new(db_path.clone());
+        let profile = service
+            .create_acp_profile(AcpProviderProfileCreateRequest {
+                agent_id: Some(vibex_core::AgentId::parse("deepseek-harness").unwrap()),
+                display_name: "DeepSeek Harness ACP".to_string(),
+                account_alias: None,
+                preset_id: None,
+                config: Some(AcpProviderConfig {
+                    command: "/usr/bin/node".to_string(),
+                    args: vec![
+                        "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.32-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
+                    ],
+                    env: Vec::new(),
+                    cwd_template: Some("{workspaceRoot}".to_string()),
+                    process_strategy: vibex_core::AcpProcessStrategy::default(),
+                    terminal_tools: false,
+                    terminal_auth: false,
+                    models: Vec::new(),
+                    modes: Vec::new(),
+                    features: vec!["slash_commands".to_string()],
+                    disabled_tools: Vec::new(),
+                }),
+            })
+            .unwrap();
+        let provider = AcpAgentProvider::with_config_service(
+            Arc::new(FixtureAcpClient::new(
+                AcpSession::default(),
+                Ok(AcpTurn {
+                    events: Vec::new(),
+                    binding_update: None,
+                    completed: true,
+                }),
+            )),
+            service,
+        );
+
+        let response = provider
+            .discover_commands(AgentCommandDiscoverRequest {
+                agent_id: Some(profile.agent_id.clone()),
+                provider_profile_id: Some(profile.id.clone()),
+                session_id: None,
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(response.entries.iter().any(|entry| {
+            entry.source_kind == AgentCommandSourceKind::Provider
+                && entry.label == "/status"
+                && entry.command_name.as_deref() == Some("status")
+        }));
+        for expected in [
+            "/model",
+            "/compact",
+            "/goal",
+            "/permission",
+            "/plan",
+            "/feedback",
+        ] {
+            assert!(
+                response.entries.iter().any(|entry| entry.label == expected),
+                "pre-session DeepSeek Harness catalog is missing {expected}"
+            );
+        }
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "catalogSource" && diagnostic.value == "deepseek-harness-static"
         }));
 
         cleanup_db(db_path);
