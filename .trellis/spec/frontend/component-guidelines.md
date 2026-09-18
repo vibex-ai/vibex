@@ -207,7 +207,55 @@ window.on_next_frame(move |window, cx| {
 
 A dialog that can reject its input must surface the reason inside the dialog.
 Notes rendered on the page behind a modal are occluded, so a rejected value
-looks like an unresponsive control.
+looks like an unresponsive control. The exception is a rejection raised while the
+dialog is still open for a correction that is not tied to a field: route it
+through the notification layer, which stacks above every dialog.
+
+### Light Hints
+
+Transient feedback that answers an action the user just took — a link copied, a
+device paired, storage cleared, a setting rejected — is a light hint and must be
+shown through the kit's `Notification` on the notification layer
+(`window.push_notification`). Do not hand-roll a banner, strip, or colored box in
+the page for it.
+
+The reasons are the ones the kit component already solves: the notification layer
+stacks above sheets and dialogs, it auto-hides, it is click-dismissable, and a
+hint pushed with the same `.id::<T>()` replaces the previous one instead of
+stacking duplicates. A page banner has none of that and needs the page to
+remember to clear it on the next action.
+
+```rust
+struct GitMutationNotification;
+
+Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+window.push_notification(
+    Notification::success(message)
+        .id::<GitMutationNotification>()
+        .autohide(true)
+        .on_click(|_, _, _| {}),
+    cx,
+);
+```
+
+Rules that keep the pattern consistent:
+
+- Set `Theme::global_mut(cx).notification.placement = Anchor::TopCenter` before
+  pushing, and give each hint family its own private zero-sized id type so
+  unrelated hints do not replace each other.
+- Pick the type from the meaning, not the page: `success` for a completed action,
+  `error` for one that failed, `info` for a neutral result, `warning` for one the
+  user should look at. Do not paint a failure with a success tone.
+- Present the hint from `render` when the producer has no `Window` (an async
+  callback or a background task). Keep the pending hint on the owner entity, take
+  it in the presenter, and push it inside `window.defer` so the push never
+  re-enters the update that produced it.
+- Keep a message that is still true on screen as state instead of a hint:
+  connection status with a retry affordance, loading and progress lines, and
+  persistent error banners with a recovery action are not light hints.
+- Keep a validation message inside the dialog or field that rejected the value;
+  the notification layer is for results, not for pointing at the control that
+  needs correcting.
 
 ### GPUI Post-Mutation Scroll Timing
 

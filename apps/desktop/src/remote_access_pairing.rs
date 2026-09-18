@@ -1,17 +1,18 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, KeyDownEvent, Render,
+    Anchor, AnyElement, App, ClipboardItem, Context, Entity, IntoElement, KeyDownEvent, Render,
     RenderImage, Role, SharedString, Subscription, Task, WeakEntity, Window, div, img, prelude::*,
     px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _, Theme,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
     spinner::Spinner,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -329,8 +330,46 @@ struct PairingViewState {
     active_zero_config_window: Option<RemoteLanPairingWindowSnapshot>,
     pending: Option<RemoteAccessMutation>,
     error_code: Option<String>,
-    notice: Option<&'static str>,
+    notice: Option<RemoteAccessNotice>,
 }
+
+/// One light hint the Remote Access page has to show.
+///
+/// The hint is an answer to something the user just did — a pairing link copied,
+/// a device paired, a pairing stopped — so it is announced on the notification
+/// layer instead of occupying a banner in the page until the next action clears
+/// it. The tone is kept because a failed clipboard write is not a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteAccessNotice {
+    message: &'static str,
+    tone: RemoteAccessNoticeTone,
+}
+
+impl RemoteAccessNotice {
+    fn success(message: &'static str) -> Self {
+        Self {
+            message,
+            tone: RemoteAccessNoticeTone::Success,
+        }
+    }
+
+    fn error(message: &'static str) -> Self {
+        Self {
+            message,
+            tone: RemoteAccessNoticeTone::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAccessNoticeTone {
+    Success,
+    Error,
+}
+
+/// Names the Remote Access hint on the notification layer, so a newer hint
+/// replaces the one still on screen instead of stacking behind it.
+struct RemoteAccessNoticeNotification;
 
 impl Default for PairingViewState {
     fn default() -> Self {
@@ -661,11 +700,11 @@ impl RemoteAccessPairing {
                             this.clear_offer();
                             this.clear_lan_window();
                             this.clear_zero_config_window();
-                            this.state.notice = Some(locale::text(
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
                                 "Remote access disabled",
                                 "远程访问已停用",
                                 "遠端存取已停用",
-                            ));
+                            )));
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::OfferCreated(response))) => {
                             if let Err(error) = this.state.install_offer(response) {
@@ -681,11 +720,11 @@ impl RemoteAccessPairing {
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::OfferCanceled)) => {
                             this.clear_offer();
-                            this.state.notice = Some(locale::text(
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
                                 "Pairing offer canceled",
                                 "配对请求已取消",
                                 "配對請求已取消",
-                            ));
+                            )));
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::LanWindow(snapshot))) => {
                             this.state.selected_entry = RemoteAccessEntry::Direct;
@@ -694,11 +733,11 @@ impl RemoteAccessPairing {
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::LanCanceled)) => {
                             this.clear_lan_window();
-                            this.state.notice = Some(locale::text(
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
                                 "Nearby pairing stopped",
                                 "附近配对已停止",
                                 "附近配對已停止",
-                            ));
+                            )));
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::ZeroConfigWindow(snapshot))) => {
                             this.state.selected_entry = RemoteAccessEntry::LocalNetwork;
@@ -707,11 +746,11 @@ impl RemoteAccessPairing {
                         }
                         Ok(Ok(RemoteAccessMutationOutcome::ZeroConfigCanceled)) => {
                             this.clear_zero_config_window();
-                            this.state.notice = Some(locale::text(
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
                                 "Local pairing stopped",
                                 "局域网配对已停止",
                                 "區域網路配對已停止",
-                            ));
+                            )));
                         }
                         Ok(Err(error)) => this.state.error_code = Some(error.code),
                         Err(_) => {
@@ -1058,9 +1097,17 @@ impl RemoteAccessPairing {
             .and_then(|item| item.text())
             .is_some_and(|clipboard| clipboard == value);
         self.state.notice = Some(if verified {
-            locale::text("Pairing link copied", "配对链接已复制", "配對連結已複製")
+            RemoteAccessNotice::success(locale::text(
+                "Pairing link copied",
+                "配对链接已复制",
+                "配對連結已複製",
+            ))
         } else {
-            locale::text("Clipboard write failed", "无法写入剪贴板", "無法寫入剪貼簿")
+            RemoteAccessNotice::error(locale::text(
+                "Clipboard write failed",
+                "无法写入剪贴板",
+                "無法寫入剪貼簿",
+            ))
         });
         cx.notify();
     }
@@ -1098,10 +1145,8 @@ impl RemoteAccessPairing {
                                 }
                                 offer.apply_status(outcome.summary, unix_timestamp_ms());
                                 if offer.summary.claimed_device_id.is_some() {
-                                    this.state.notice = Some(locale::text(
-                                        "Device paired",
-                                        "设备已配对",
-                                        "裝置已配對",
+                                    this.state.notice = Some(RemoteAccessNotice::success(
+                                        locale::text("Device paired", "设备已配对", "裝置已配對"),
                                     ));
                                 }
                                 continue_polling = !offer.is_terminal(unix_timestamp_ms());
@@ -1170,13 +1215,17 @@ impl RemoteAccessPairing {
                                 });
                             this.clear_lan_window();
                             this.state.notice = Some(if had_approved_request {
-                                locale::text("Device paired", "设备已配对", "裝置已配對")
+                                RemoteAccessNotice::success(locale::text(
+                                    "Device paired",
+                                    "设备已配对",
+                                    "裝置已配對",
+                                ))
                             } else {
-                                locale::text(
+                                RemoteAccessNotice::success(locale::text(
                                     "Nearby pairing ended",
                                     "附近配对已结束",
                                     "附近配對已結束",
-                                )
+                                ))
                             });
                         }
                         Ok(Err(error)) => {
@@ -1239,13 +1288,17 @@ impl RemoteAccessPairing {
                             })
                             .detach();
                             this.state.notice = Some(if had_approved_request {
-                                locale::text("Device paired", "设备已配对", "裝置已配對")
+                                RemoteAccessNotice::success(locale::text(
+                                    "Device paired",
+                                    "设备已配对",
+                                    "裝置已配對",
+                                ))
                             } else {
-                                locale::text(
+                                RemoteAccessNotice::success(locale::text(
                                     "Local pairing ended",
                                     "局域网配对已结束",
                                     "區域網路配對已結束",
-                                )
+                                ))
                             });
                         }
                         Ok(Err(error)) => {
@@ -2883,6 +2936,32 @@ impl RemoteAccessPairing {
             })
             .into_any_element()
     }
+
+    /// Announces the pending light hint on the notification layer.
+    ///
+    /// The hint answers an action the user just took, so it is shown through the
+    /// kit's `Notification` rather than a page banner: the banner sat in the
+    /// layout until the next action happened to clear it, and it pushed the
+    /// connection list down while it was there.
+    fn present_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.state.notice.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            let notification = match notice.tone {
+                RemoteAccessNoticeTone::Success => Notification::success(notice.message),
+                RemoteAccessNoticeTone::Error => Notification::error(notice.message),
+            };
+            window.push_notification(
+                notification
+                    .id::<RemoteAccessNoticeNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
 }
 
 #[cfg(feature = "e2e-test-support")]
@@ -2996,10 +3075,10 @@ impl Render for RemoteAccessPairingE2eDriver {
 }
 
 impl Render for RemoteAccessPairing {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.present_notice(window, cx);
         let page = self.state.page;
         let error = self.state.error_code.as_deref().map(remote_error_label);
-        let notice = self.state.notice;
         let _safe_snapshot = self.state.safe_snapshot();
         let is_dark = cx.theme().is_dark();
         let popover = theme::semantic_color("popover", is_dark);
@@ -3026,14 +3105,6 @@ impl Render for RemoteAccessPairing {
                         IconName::TriangleAlert,
                         cx.theme().danger,
                         error,
-                        cx,
-                    ));
-                }
-                if let Some(notice) = notice {
-                    column = column.child(self.render_status_banner(
-                        IconName::CircleCheck,
-                        cx.theme().success,
-                        notice,
                         cx,
                     ));
                 }
@@ -3081,14 +3152,6 @@ impl Render for RemoteAccessPairing {
                         IconName::TriangleAlert,
                         cx.theme().danger,
                         error,
-                        cx,
-                    ));
-                }
-                if let Some(notice) = notice {
-                    column = column.child(self.render_status_banner(
-                        IconName::CircleCheck,
-                        cx.theme().success,
-                        notice,
                         cx,
                     ));
                 }
@@ -3683,6 +3746,34 @@ mod tests {
             gateway_running: true,
             gateway_bound_addr: None,
         }
+    }
+
+    #[test]
+    fn pairing_hints_use_top_light_notifications_instead_of_a_page_banner() {
+        let source = include_str!("remote_access_pairing.rs");
+        let presenter = source
+            .split_once("    fn present_notice(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("pairing notice presenter should remain inspectable");
+        assert!(presenter.contains("self.state.notice.take()"));
+        assert!(presenter.contains("Notification::success(notice.message)"));
+        assert!(presenter.contains("Notification::error(notice.message)"));
+        assert!(presenter.contains(".id::<RemoteAccessNoticeNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        let render = source
+            .split_once("impl Render for RemoteAccessPairing {")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("pairing renderer should remain inspectable");
+        assert!(render.contains("self.present_notice(window, cx);"));
+        // The page keeps the actionable error banner; the light hint is the
+        // layer's job now.
+        assert!(!render.contains("IconName::CircleCheck"));
+        assert!(render.contains("IconName::TriangleAlert"));
     }
 
     #[test]

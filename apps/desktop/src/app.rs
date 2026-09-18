@@ -270,6 +270,44 @@ struct AmbiguousMessageSubmissionNotification;
 
 struct PersistenceNotification;
 
+struct SettingsOperationNotification;
+
+/// The tone a settings operation result is announced with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsOperationTone {
+    Success,
+    Error,
+}
+
+/// One settings operation result, announced as a light hint on the notification
+/// layer.
+///
+/// The result answers something the user just asked for — an update check that
+/// stopped, a proxy that was rejected, storage that was cleared — so it belongs
+/// on the notification layer rather than in a page banner that the next
+/// operation would have to remember to clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsOperationNotice {
+    tone: SettingsOperationTone,
+    message: String,
+}
+
+impl SettingsOperationNotice {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            tone: SettingsOperationTone::Success,
+            message: message.into(),
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            tone: SettingsOperationTone::Error,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseChannel {
     Preview,
@@ -1627,6 +1665,40 @@ impl VibexWorkbench {
             window.push_notification(
                 Notification::info(locale::localize_ui_message(&note))
                     .id::<PersistenceNotification>()
+                    .autohide(true)
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+    }
+
+    /// Queues a settings operation result for the notification layer.
+    ///
+    /// The settings page is a dialog, so a banner inside it competes with the
+    /// controls it sits above; the result of an action is a light hint and rides
+    /// the same top-centered layer as the workbench's other feedback.
+    fn queue_settings_operation_notice(
+        &mut self,
+        notice: SettingsOperationNotice,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_operation_notice = Some(notice);
+        cx.notify();
+    }
+
+    fn present_settings_operation_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.settings_operation_notice.take() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            let notification = match notice.tone {
+                SettingsOperationTone::Success => Notification::success(notice.message),
+                SettingsOperationTone::Error => Notification::error(notice.message),
+            };
+            window.push_notification(
+                notification
+                    .id::<SettingsOperationNotification>()
                     .autohide(true)
                     .on_click(|_, _, _| {}),
                 cx,
@@ -5356,6 +5428,7 @@ pub struct VibexWorkbench {
     ui_state: DesktopUiStateV1,
     ui_writer: Option<ThrottledUiStateWriter>,
     persistence_note: Option<String>,
+    settings_operation_notice: Option<SettingsOperationNotice>,
     appearance_reload_pending: bool,
     sidebar_overlay_open: bool,
     sidebar_hover_preview_open: bool,
@@ -6249,6 +6322,7 @@ impl VibexWorkbench {
             ui_state,
             ui_writer,
             persistence_note,
+            settings_operation_notice: None,
             appearance_reload_pending: false,
             sidebar_overlay_open: false,
             sidebar_hover_preview_open: false,
@@ -7269,7 +7343,6 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        self.set_settings_operation_note(None, cx);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             runtime.app_update().check(CheckReason::Manual).await
         });
@@ -7279,8 +7352,10 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.set_settings_operation_note(
-                            Some(format!("Update check task stopped unexpectedly: {error}")),
+                        this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "Update check task stopped unexpectedly: {error}"
+                            )),
                             cx,
                         );
                     }
@@ -7294,7 +7369,6 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        self.set_settings_operation_note(None, cx);
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().download().await });
         self.update_action_task = Some(cx.spawn(
@@ -7303,8 +7377,8 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.set_settings_operation_note(
-                            Some(format!(
+                        this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
                                 "Update download task stopped unexpectedly: {error}"
                             )),
                             cx,
@@ -7320,7 +7394,6 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        self.set_settings_operation_note(None, cx);
         let runner =
             gpui_tokio::Tokio::spawn(cx, async move { runtime.app_update().install().await });
         self.update_action_task = Some(cx.spawn(
@@ -7329,8 +7402,10 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     this.update_action_task = None;
                     if let Err(error) = outcome {
-                        this.set_settings_operation_note(
-                            Some(format!("Update install task stopped unexpectedly: {error}")),
+                        this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "Update install task stopped unexpectedly: {error}"
+                            )),
                             cx,
                         );
                     }
@@ -7347,11 +7422,10 @@ impl VibexWorkbench {
         match runtime.app_update().restart() {
             Ok(()) => cx.quit(),
             Err(error) => {
-                self.set_settings_operation_note(
-                    Some(format!("{}: {}", error.code, error.message)),
+                self.queue_settings_operation_notice(
+                    SettingsOperationNotice::error(format!("{}: {}", error.code, error.message)),
                     cx,
                 );
-                cx.notify();
             }
         }
     }
@@ -26881,10 +26955,12 @@ impl VibexWorkbench {
             Ok(normalized) => {
                 self.ui_state.network_proxy = normalized;
                 self.queue_ui_state();
-                self.set_settings_operation_note(None, cx);
             }
             Err(error) => {
-                self.set_settings_operation_note(Some(localize_network_proxy_error(&error)), cx);
+                self.queue_settings_operation_notice(
+                    SettingsOperationNotice::error(localize_network_proxy_error(&error)),
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -26899,25 +26975,15 @@ impl VibexWorkbench {
             Ok(normalized) => {
                 self.ui_state.network_proxy = normalized;
                 self.queue_ui_state();
-                self.set_settings_operation_note(None, cx);
             }
             Err(error) => {
-                self.set_settings_operation_note(Some(localize_network_proxy_error(&error)), cx);
+                self.queue_settings_operation_notice(
+                    SettingsOperationNotice::error(localize_network_proxy_error(&error)),
+                    cx,
+                );
             }
         }
         cx.notify();
-    }
-
-    fn set_settings_operation_note(&mut self, note: Option<String>, cx: &mut Context<Self>) {
-        // Settings callbacks can be running inside FoundationSettings::update. Defer the
-        // sibling entity update until the current GPUI update finishes to avoid re-entrancy.
-        let settings_view = self.settings_view.clone();
-        cx.defer(move |cx| {
-            settings_view.update(cx, |settings, cx| {
-                settings.operation_note = note;
-                cx.notify();
-            });
-        });
     }
 
     fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
@@ -27007,12 +27073,10 @@ impl VibexWorkbench {
             .unwrap_or("com.vibex.desktop");
         let launch_at_login = snapshot.desktop_behavior.launch_at_login;
         if let Err(error) = set_launch_at_login(launch_at_login, application_id) {
-            self.set_settings_operation_note(
-                Some(format!("{}: {}", error.code, error.message)),
+            self.queue_settings_operation_notice(
+                SettingsOperationNotice::error(format!("{}: {}", error.code, error.message)),
                 cx,
             );
-        } else {
-            self.set_settings_operation_note(None, cx);
         }
 
         let auto_continue_default_project_ids = snapshot.session.auto_continue_project_ids.clone();
@@ -27045,7 +27109,10 @@ impl VibexWorkbench {
             match vibex_desktop_runtime::network_proxy::configure(&snapshot.network_proxy) {
                 Ok(settings) => settings,
                 Err(error) => {
-                    self.set_settings_operation_note(Some(locale::localize_ui_message(&error)), cx);
+                    self.queue_settings_operation_notice(
+                        SettingsOperationNotice::error(locale::localize_ui_message(&error)),
+                        cx,
+                    );
                     NetworkProxyUiState::default()
                 }
             };
@@ -27126,7 +27193,7 @@ impl VibexWorkbench {
             if !window.has_active_dialog(cx) {
                 self.settings_open = false;
                 self.settings_view.update(cx, |settings, cx| {
-                    settings.operation_note = None;
+                    settings.shortcut_note = None;
                     cx.notify();
                 });
             }
@@ -27143,7 +27210,7 @@ impl VibexWorkbench {
         self.settings_snapshot = Some(self.ui_state.clone());
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::General;
-            settings.operation_note = None;
+            settings.shortcut_note = None;
             settings.search_selected_index = 0;
             settings
                 .search
@@ -27202,7 +27269,7 @@ impl VibexWorkbench {
                         this.settings_open = false;
                         this.settings_snapshot = None;
                         this.settings_view.update(cx, |settings, cx| {
-                            settings.operation_note = None;
+                            settings.shortcut_note = None;
                             cx.notify();
                         });
                         cx.notify();
@@ -27219,7 +27286,7 @@ impl VibexWorkbench {
         }
         self.settings_view.update(cx, |settings, cx| {
             settings.active_section = SettingsSection::About;
-            settings.operation_note = None;
+            settings.shortcut_note = None;
             cx.notify();
         });
         cx.notify();
@@ -51421,7 +51488,12 @@ struct FoundationSettings {
     storage_usage_state: SettingsStorageUsageState,
     storage_usage_task: Option<Task<()>>,
     storage_cleanup_task: Option<Task<()>>,
-    operation_note: Option<String>,
+    /// Why the shortcut dialog rejected the chord the user typed.
+    ///
+    /// The dialog keeps itself open on a rejection and renders this inside
+    /// itself, so the reason is visible where the input is. Every other settings
+    /// result is a light hint and rides the workbench's notification layer.
+    shortcut_note: Option<String>,
     active_section: SettingsSection,
 }
 
@@ -51623,7 +51695,7 @@ impl FoundationSettings {
                 storage_usage_state: SettingsStorageUsageState::Unloaded,
                 storage_usage_task: None,
                 storage_cleanup_task: None,
-                operation_note: None,
+                shortcut_note: None,
                 active_section: SettingsSection::General,
             }
         })
@@ -51717,6 +51789,23 @@ impl FoundationSettings {
         });
     }
 
+    /// Announces a settings operation result through the workbench's
+    /// notification layer.
+    ///
+    /// The settings page keeps `shortcut_note` for the shortcut dialog, which
+    /// rejects its input and shows the reason inside itself; every other result
+    /// is a light hint, so it rides the top-centered notification layer instead
+    /// of a banner the page would have to remember to clear.
+    fn notify_settings_operation(
+        &mut self,
+        notice: SettingsOperationNotice,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |workbench, cx| {
+            workbench.queue_settings_operation_notice(notice, cx)
+        });
+    }
+
     fn clear_storage_data(&mut self, kind: StorageCleanupKind, cx: &mut Context<Self>) {
         if self.storage_cleanup_task.is_some() {
             return;
@@ -51727,19 +51816,17 @@ impl FoundationSettings {
             .ok()
             .flatten()
         else {
-            self.operation_note = Some(
-                locale::text(
+            self.notify_settings_operation(
+                SettingsOperationNotice::error(locale::text(
                     "The local runtime is not ready.",
                     "本地运行时尚未就绪。",
                     "本機執行階段尚未就緒。",
-                )
-                .to_string(),
+                )),
+                cx,
             );
-            cx.notify();
             return;
         };
 
-        self.operation_note = None;
         self.storage_usage_state = SettingsStorageUsageState::Loading;
         let runner = gpui_tokio::Tokio::spawn(cx, async move { runtime.clear_storage(kind).await });
         self.storage_cleanup_task = Some(cx.spawn(async move |entity, cx| {
@@ -51748,7 +51835,10 @@ impl FoundationSettings {
                 this.storage_cleanup_task = None;
                 match outcome {
                     Ok(Ok(report)) => {
-                        this.operation_note = Some(storage_cleanup_success(kind, report));
+                        this.notify_settings_operation(
+                            SettingsOperationNotice::success(storage_cleanup_success(kind, report)),
+                            cx,
+                        );
                         this.storage_usage_state = SettingsStorageUsageState::Unloaded;
                         this.start_storage_usage_probe(cx);
                         let _ = this.workbench.update(cx, |workbench, cx| match kind {
@@ -51780,12 +51870,23 @@ impl FoundationSettings {
                     }
                     Ok(Err(error)) => {
                         this.storage_usage_state = SettingsStorageUsageState::Unloaded;
-                        this.operation_note = Some(format!("{}: {}", error.code, error.message));
+                        this.notify_settings_operation(
+                            SettingsOperationNotice::error(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            )),
+                            cx,
+                        );
                         this.start_storage_usage_probe(cx);
                     }
                     Err(error) => {
                         this.storage_usage_state = SettingsStorageUsageState::Unloaded;
-                        this.operation_note = Some(format!("storage cleanup task failed: {error}"));
+                        this.notify_settings_operation(
+                            SettingsOperationNotice::error(format!(
+                                "storage cleanup task failed: {error}"
+                            )),
+                            cx,
+                        );
                         this.start_storage_usage_probe(cx);
                     }
                 }
@@ -52354,7 +52455,7 @@ impl FoundationSettings {
     }
 
     fn set_launch_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let note = self
+        let error = self
             .workbench
             .update(cx, |this, cx| {
                 let application_id = this
@@ -52362,7 +52463,7 @@ impl FoundationSettings {
                     .as_ref()
                     .map(|config| config.application_id.as_str())
                     .unwrap_or("com.vibex.desktop");
-                let note = match set_launch_at_login(enabled, application_id) {
+                let error = match set_launch_at_login(enabled, application_id) {
                     Ok(()) => {
                         this.ui_state.desktop_behavior.launch_at_login = enabled;
                         this.queue_ui_state();
@@ -52371,11 +52472,13 @@ impl FoundationSettings {
                     Err(error) => Some(format!("{}: {}", error.code, error.message)),
                 };
                 cx.notify();
-                note
+                error
             })
             .ok()
             .flatten();
-        self.operation_note = note;
+        if let Some(error) = error {
+            self.notify_settings_operation(SettingsOperationNotice::error(error), cx);
+        }
         cx.notify();
     }
 
@@ -52537,7 +52640,7 @@ impl FoundationSettings {
                 valid
             })
             .unwrap_or(false);
-        self.operation_note = (!applied).then(|| {
+        self.shortcut_note = (!applied).then(|| {
             locale::text(
                 "Shortcut is invalid or already in use",
                 "快捷键无效或已被占用",
@@ -52648,19 +52751,22 @@ impl FoundationSettings {
                     if value.is_empty() || std::path::Path::new(&value).is_file() {
                         let _ = apply.update(cx, |settings, cx| {
                             settings.set_terminal_shell(value, cx);
-                            settings.operation_note = None;
                             cx.notify();
                         });
                         true
                     } else {
+                        // The dialog stays open, so the reason has to be visible
+                        // over it: the notification layer sits above every
+                        // dialog, while a note on the page behind would be
+                        // occluded by the dialog that rejected the value.
                         let _ = apply.update(cx, |settings, cx| {
-                            settings.operation_note = Some(
-                                locale::text(
+                            settings.notify_settings_operation(
+                                SettingsOperationNotice::error(locale::text(
                                     "Shell path does not exist",
                                     "Shell 路径不存在",
                                     "Shell 路徑不存在",
-                                )
-                                .to_string(),
+                                )),
+                                cx,
                             );
                             cx.notify();
                         });
@@ -52679,7 +52785,7 @@ impl FoundationSettings {
     ) {
         let entity = cx.weak_entity();
         let action_label = shortcut_action_label(&action);
-        self.operation_note = None;
+        self.shortcut_note = None;
         // Keep the input entity outside the dialog builder. Dialog builders are
         // evaluated again whenever the workbench repaints, so creating the input
         // in the builder would replace its focus handle and reset the text while
@@ -52698,7 +52804,7 @@ impl FoundationSettings {
             // A rejected chord keeps the dialog open, so the reason has to be
             // visible inside the dialog rather than only on the page behind it.
             let rejection = entity
-                .read_with(cx, |settings, _| settings.operation_note.clone())
+                .read_with(cx, |settings, _| settings.shortcut_note.clone())
                 .ok()
                 .flatten();
             dialog
@@ -54806,22 +54912,6 @@ impl Render for FoundationSettings {
             .relative()
             .w_full()
             .min_w_0()
-            .when_some(self.operation_note.clone(), |this, note| {
-                this.child(
-                    div()
-                        .mb_4()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(6.0))
-                        .bg(theme::semantic_color("warning", cx.theme().is_dark()).opacity(0.12))
-                        .text_xs()
-                        .text_color(theme::semantic_color(
-                            "warning-foreground",
-                            cx.theme().is_dark(),
-                        ))
-                        .child(locale::localize_ui_message(&note)),
-                )
-            })
             .child(page)
             .when(has_changes, |this| {
                 this.child(
@@ -55090,6 +55180,7 @@ impl Render for VibexWorkbench {
             window.request_animation_frame();
         }
         self.present_persistence_note(window, cx);
+        self.present_settings_operation_notice(window, cx);
         if self.initial_new_session_setup_pending {
             self.initial_new_session_setup_pending = false;
             let workbench = cx.weak_entity();
@@ -63835,6 +63926,49 @@ mod tests {
     }
 
     #[test]
+    fn settings_operation_results_use_top_light_notifications_instead_of_a_page_banner() {
+        let source = include_str!("app.rs");
+        let presenter = source
+            .split_once("    fn present_settings_operation_notice(")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("settings operation presenter should remain inspectable");
+        assert!(presenter.contains("self.settings_operation_notice.take()"));
+        assert!(presenter.contains("Notification::success(notice.message)"));
+        assert!(presenter.contains("Notification::error(notice.message)"));
+        assert!(presenter.contains(".id::<SettingsOperationNotification>()"));
+        assert!(presenter.contains(".autohide(true)"));
+        assert!(presenter.contains(".on_click(|_, _, _| {})"));
+        assert!(presenter.contains("Anchor::TopCenter"));
+
+        let render = source
+            .split_once("impl Render for FoundationSettings")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl Render for VibexWorkbench"))
+            .map(|(body, _)| body)
+            .expect("settings renderer should remain inspectable");
+        assert!(!render.contains(".when_some(self.shortcut_note.clone()"));
+
+        let workbench_render = source
+            .split_once("impl Render for VibexWorkbench")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\npub fn bind_foundation_keys"))
+            .map(|(body, _)| body)
+            .expect("workbench renderer should remain inspectable");
+        assert!(workbench_render.contains("self.present_settings_operation_notice(window, cx);"));
+    }
+
+    #[test]
+    fn the_shortcut_dialog_keeps_its_rejection_inside_itself() {
+        let source = include_str!("app.rs");
+        let dialog = source
+            .split_once("    fn open_shortcut_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("shortcut dialog should remain inspectable");
+        assert!(dialog.contains("settings.shortcut_note.clone()"));
+        assert!(dialog.contains("locale::localize_ui_message(&note)"));
+    }
+
+    #[test]
     fn runtime_preparation_does_not_render_a_status_banner() {
         assert!(!runtime_status_banner_is_visible(
             SessionRuntimeSelectionStatus::Ready
@@ -66572,7 +66706,7 @@ mod tests {
             "the current chord should be selected so typing replaces it"
         );
         assert!(
-            dialog.contains("settings.operation_note.clone()"),
+            dialog.contains("settings.shortcut_note.clone()"),
             "a rejected chord should be reported inside the dialog"
         );
     }
