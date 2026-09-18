@@ -197,6 +197,10 @@ function validatePackaging() {
     releaseWorkflow.includes("manifest_arch"),
     "publish workflow updater manifest does not normalize artifact architectures"
   );
+  assert(
+    releaseWorkflow.includes("for attempt in 1 2 3") && releaseWorkflow.includes("gh release delete"),
+    "publish workflow lost its recovery from a rolled-back release upload"
+  );
   for (const required of [
     "platform: linux",
     "platform: macos",

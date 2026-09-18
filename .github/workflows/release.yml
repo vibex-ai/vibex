@@ -462,8 +462,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
           release_flags=(--verify-tag --generate-notes --title "Vibex ${{ needs.release-meta.outputs.version }}")
           if [[ "${{ needs.release-meta.outputs.channel }}" != "stable" ]]; then
             release_flags+=(--prerelease)
           fi
-          gh release create "${GITHUB_REF_NAME}" target/publish/* "${release_flags[@]}"
+          # `gh release create` stages the release as a draft and uploads the
+          # assets concurrently, retrying each one on transport errors and 5xx
+          # responses. That retry reuses the asset name without deleting the
+          # interrupted upload first, so it comes back as
+          # "HTTP 422 ReleaseAsset.name already exists"; gh then rolls the draft
+          # back and the release is gone. Retry the whole publish from a clean
+          # slate instead of the individual upload.
+          for attempt in 1 2 3; do
+            if gh release create "${tag}" target/publish/* "${release_flags[@]}"; then
+              exit 0
+            fi
+            echo "publish attempt ${attempt} failed" >&2
+            if (( attempt == 3 )); then
+              exit 1
+            fi
+            gh release delete "${tag}" --yes >/dev/null 2>&1 || true
+            sleep $(( attempt * 15 ))
+          done
