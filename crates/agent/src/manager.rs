@@ -27,7 +27,8 @@ use vibex_core::{
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
     RuntimeLeaseRole, RuntimeModelSelection, SendAgentMessageRequest, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
+    SessionRuntimeSelectionStatus, SteerAgentMessageRequest, SteerAgentMessageResult,
+    SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
     TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
     TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
     VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
@@ -47,8 +48,8 @@ use vibex_db::{
 use crate::adapter::{
     AgentProvider, AgentUsageTelemetryEvent, ProviderElicitationResolution, ProviderEvent,
     ProviderPermissionResolution, ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport,
-    ProviderRuntimeResources, ProviderRuntimeSkill, ProviderSessionHandle,
-    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    ProviderRuntimeResources, ProviderRuntimeSkill, ProviderSessionHandle, ProviderSteerOutcome,
+    ProviderSteerRequest, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
 };
 use crate::context_bridge::{ContextBridgeService, PreparedContextBridge};
 use crate::delegation::{AGENT_DELEGATION_MCP_SERVER_ID, session_capability_token};
@@ -3275,6 +3276,100 @@ impl AgentManager {
             })
             .await?;
         SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle)
+    }
+
+    /// Whether the session's current activation advertised native steering.
+    ///
+    /// A session whose runtime has not materialized yet has no activation to
+    /// interrogate, so the query reports `false` instead of failing.
+    pub async fn native_steering_supported(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> VibexResult<bool> {
+        let conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        let (_, binding, _, route_key) = match self.durable_session_execution(&conn, &session) {
+            Ok(execution) => execution,
+            Err(_) => return Ok(false),
+        };
+        drop(conn);
+        let provider = self.runtime(&route_key)?;
+        Ok(provider.native_steering_supported(&binding).await)
+    }
+
+    /// Injects a message into the turn that is already running through the
+    /// provider's native steering path.
+    ///
+    /// This never claims a new turn: the appended user item belongs to the turn
+    /// already in flight. A session that is no longer running, or a provider
+    /// that reports `PromptRequired`, returns that outcome so the caller can
+    /// fall back to an ordinary submission.
+    pub async fn steer_message(
+        &self,
+        request: SteerAgentMessageRequest,
+    ) -> VibexResult<SteerAgentMessageResult> {
+        let conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        if !matches!(
+            session.state,
+            AgentSessionState::Running | AgentSessionState::NeedsInput
+        ) {
+            return Ok(SteerAgentMessageResult {
+                outcome: SteerMessageOutcome::PromptRequired,
+                items: Vec::new(),
+            });
+        }
+        let (selection, binding, _, route_key) = self.durable_session_execution(&conn, &session)?;
+        drop(conn);
+        let provider = self.runtime(&route_key)?;
+        if !provider.native_steering_supported(&binding).await {
+            return Err(VibexError::capability(
+                "provider_steering_unsupported",
+                "this provider profile does not support native steering",
+            ));
+        }
+        let capabilities = provider.capabilities_for_profile(selection.provider_profile_id());
+        let outcome = provider
+            .steer_turn(
+                ProviderSessionHandle {
+                    binding: binding.clone(),
+                    capabilities,
+                },
+                ProviderSteerRequest {
+                    session_id: session.id.clone(),
+                    text: request.text.clone(),
+                    attachments: request.attachments.clone(),
+                    binding,
+                },
+            )
+            .await?;
+        if outcome == ProviderSteerOutcome::PromptRequired {
+            return Ok(SteerAgentMessageResult {
+                outcome: SteerMessageOutcome::PromptRequired,
+                items: Vec::new(),
+            });
+        }
+        let mut conn = self.open_migrated()?;
+        let item = self.append_timeline_item(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: request.text.clone(),
+                attachments: request.attachments.clone(),
+            }),
+            request.correlation_id.as_ref(),
+            None,
+            TimelineRedactionState::None,
+        )?;
+        Ok(SteerAgentMessageResult {
+            outcome: SteerMessageOutcome::Injected,
+            items: vec![item],
+        })
     }
 
     pub async fn archive_session(&self, session_id: &VibexSessionId) -> VibexResult<()> {
@@ -7889,6 +7984,43 @@ mod tests {
         );
 
         drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn steer_message_reports_prompt_required_when_session_is_not_running() {
+        let db_path = temp_db_path("steer-message-idle");
+        let workspace_root = temp_workspace_path("steer-message-idle");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "steer idle",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("claude").unwrap(),
+            AgentSessionState::Idle,
+        );
+        drop(conn);
+
+        let result = manager
+            .steer_message(SteerAgentMessageRequest {
+                session_id: session.id.clone(),
+                text: "focus on the failing test".to_string(),
+                attachments: Vec::new(),
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, SteerMessageOutcome::PromptRequired);
+        assert!(result.items.is_empty());
+
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
     }

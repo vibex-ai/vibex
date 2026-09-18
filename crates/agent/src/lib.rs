@@ -22,9 +22,10 @@ pub use adapter::{
     AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderElicitationResolution,
     ProviderEvent, ProviderPermissionResolution, ProviderRuntimeMcpServer,
     ProviderRuntimeMcpTransport, ProviderRuntimeResources, ProviderRuntimeSkill,
-    ProviderSessionHandle, ProviderTurnAttachment, ProviderTurnExecutionIdentity,
-    ProviderTurnRequest, ProviderTurnResult, legacy_provider_runtime_binding_id,
-    materialize_provider_attachments, validate_legacy_provider_turn_execution_identity,
+    ProviderSessionHandle, ProviderSteerOutcome, ProviderSteerRequest, ProviderTurnAttachment,
+    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    legacy_provider_runtime_binding_id, materialize_provider_attachments,
+    validate_legacy_provider_turn_execution_identity,
 };
 pub use automation::{AutomationGraphRunner, DEFAULT_AUTOMATION_STALE_AFTER_MS};
 pub use context_bridge::{CONTEXT_BRIDGE_VERSION, ContextBridgeService, PreparedContextBridge};

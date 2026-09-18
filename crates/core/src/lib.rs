@@ -51,6 +51,7 @@ pub use agent::{
     MAX_AGENT_SESSION_TITLE_CHARS, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState,
     ProviderCapabilitiesResponse, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SteerAgentMessageRequest, SteerAgentMessageResult, SteerMessageOutcome,
     agent_session_turn_requires_continuation, normalize_agent_session_title,
 };
 pub use agent_auth::{

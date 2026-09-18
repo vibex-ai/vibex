@@ -95,12 +95,12 @@ use vibex_core::{
     RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
     SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
     SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalSession,
-    TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent,
-    TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource, UserMessagePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest, SteerMessageOutcome,
+    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
+    TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
+    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
+    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -5389,6 +5389,12 @@ pub struct VibexWorkbench {
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
     composer_queue_steering_session_ids: BTreeSet<String>,
+    /// Sessions whose live Agent runtime advertised native steering. The queue
+    /// exposes the native steer action only for these sessions.
+    native_steering_supported_session_ids: BTreeSet<String>,
+    /// Last runtime activation generation probed for native steering, so a
+    /// runtime switch re-probes once instead of on every selection event.
+    native_steering_probed_generations: BTreeMap<String, i64>,
     composer_queue_editing_id: Option<u64>,
     composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
     composer_queue_edit_geometry: ComposerGeometry,
@@ -6234,6 +6240,8 @@ impl VibexWorkbench {
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
             composer_queue_steering_session_ids: BTreeSet::new(),
+            native_steering_supported_session_ids: BTreeSet::new(),
+            native_steering_probed_generations: BTreeMap::new(),
             composer_queue_editing_id: None,
             composer_queue_edit_attachments: Vec::new(),
             composer_queue_edit_geometry: ComposerGeometry::default(),
@@ -12774,7 +12782,60 @@ impl VibexWorkbench {
             false
         };
         self.reconcile_optimistic_runtime_selection(session_id, &state, cx);
+        if state.status == SessionRuntimeSelectionStatus::Ready {
+            self.maybe_probe_native_steering(session_id, state.activation_generation, cx);
+        }
         changed
+    }
+
+    /// Probes the session's live runtime for native steering support once per
+    /// activation generation. The queue uses the cached answer to decide
+    /// whether to expose the native steer action.
+    fn maybe_probe_native_steering(
+        &mut self,
+        session_id: &VibexSessionId,
+        activation_generation: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let session_key = session_id.as_str().to_string();
+        if self
+            .native_steering_probed_generations
+            .get(&session_key)
+            .is_some_and(|probed| *probed == activation_generation)
+        {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.native_steering_probed_generations
+            .insert(session_key.clone(), activation_generation);
+        let probe_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .native_steering_supported(probe_session_id)
+                .await
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let supported = matches!(outcome, Ok(Ok(true)));
+                    let changed = if supported {
+                        this.native_steering_supported_session_ids
+                            .insert(session_key.clone())
+                    } else {
+                        this.native_steering_supported_session_ids
+                            .remove(&session_key)
+                    };
+                    if changed {
+                        cx.notify();
+                    }
+                });
+            },
+        )
+        .detach();
     }
 
     fn reconcile_optimistic_runtime_selection(
@@ -19768,6 +19829,102 @@ impl VibexWorkbench {
                 });
             },
         ));
+    }
+
+    /// Sends a queued message into the running turn through the Agent's native
+    /// steering path. Falls back to the universal interrupt + resend path when
+    /// the turn ended first or the native request fails.
+    fn native_steer_composer_queue_message(
+        &mut self,
+        message_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.move_composer_queue_message_to_front(message_id) else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            self.steer_composer_queue_message(message_id, window, cx);
+            return;
+        };
+        let Some(message) = self
+            .composer_queue
+            .iter()
+            .find(|message| message.id == message_id)
+            .cloned()
+        else {
+            return;
+        };
+        if !self.agent_session_is_active(&session_id) {
+            self.steer_composer_queue_message(message_id, window, cx);
+            return;
+        }
+        self.composer_queue_paused_session_ids
+            .remove(session_id.as_str());
+        let after_sequence = if self.timeline.session_id.as_ref() == Some(&session_id) {
+            self.timeline.authoritative_end_sequence.unwrap_or(0)
+        } else {
+            self.agent_session_view_cache
+                .get(session_id.as_str())
+                .and_then(|entry| entry.timeline.authoritative_end_sequence)
+                .unwrap_or(0)
+        };
+        self.install_optimistic_user_message(OptimisticUserMessage {
+            session_id: session_id.clone(),
+            item_id: TimelineItemId::new(),
+            after_sequence,
+            submitted_at_ms: unix_timestamp_ms(),
+            text: message.text.clone(),
+            attachments: message.attachments.clone(),
+        });
+        self.agent_action_pending = true;
+        self.agent_error = None;
+        let generation = self.session_generation;
+        let request = SteerAgentMessageRequest {
+            session_id: session_id.clone(),
+            text: message.text.clone(),
+            attachments: message.attachments.clone(),
+            correlation_id: None,
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .steer_message(MutationRequest::new(request))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.agent_action_task = Some(cx.spawn_in(
+            window,
+            async move |entity: WeakEntity<Self>, cx| {
+                let outcome = runner.await;
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    this.agent_action_pending = false;
+                    if this.session_generation != generation
+                        || this.selected_session_id.as_ref() != Some(&session_id)
+                    {
+                        cx.notify();
+                        return;
+                    }
+                    let injected = matches!(
+                        &outcome,
+                        Ok(Ok(result)) if result.outcome == SteerMessageOutcome::Injected
+                    );
+                    if injected {
+                        this.composer_queue.retain(|queued| queued.id != message_id);
+                        this.set_session_turn_pending(&session_id, true);
+                        this.reconcile_sidebar_state();
+                        this.publish_sidebar_invalidation();
+                        cx.notify();
+                        return;
+                    }
+                    // `PromptRequired` and transport failures keep the
+                    // universal cancel + resend fallback, which owns idle
+                    // dispatch and pause state.
+                    this.steer_composer_queue_message(message_id, window, cx);
+                });
+            },
+        ));
+        cx.notify();
     }
 
     fn continue_session(&mut self, cx: &mut Context<Self>) {
@@ -41607,6 +41764,12 @@ impl VibexWorkbench {
         let auto_send =
             composer_queue_auto_send_enabled(&self.composer_queue_manual_session_ids, &session_id);
         let editing_id = self.composer_queue_editing_id;
+        // Native steering is offered only when the live Agent runtime proved
+        // the capability and a turn is actually running to steer into.
+        let native_steering_available = self
+            .native_steering_supported_session_ids
+            .contains(session_id.as_str())
+            && self.agent_session_is_active(&session_id);
         let resume_session_id = paused.then(|| session_id.clone());
         let mode_session_id = session_id.clone();
         let clear_session_id = session_id.clone();
@@ -41886,6 +42049,29 @@ impl VibexWorkbench {
                                     }
                                 }),
                         )
+                    })
+                    .when(native_steering_available, |this| {
+                        this.child(button_with_aria_label(
+                            Button::new(format!("native-steer-composer-queue-{message_id}"))
+                                .xsmall()
+                                .ghost()
+                                .compact()
+                                .h(px(26.0))
+                                .px_2()
+                                .rounded(px(7.0))
+                                .icon(sidebar_icon("icons/vibex/corner-down-right.svg"))
+                                .label(locale::text("Steer", "引导", "引導"))
+                                .tooltip(locale::text(
+                                    "Steer the running turn",
+                                    "引导当前运行",
+                                    "引導目前執行",
+                                ))
+                                .disabled(self.agent_action_pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.native_steer_composer_queue_message(message_id, window, cx)
+                                })),
+                            locale::text("Steer the running turn", "引导当前运行", "引導目前執行"),
+                        ))
                     })
                     .child(button_with_aria_label(
                         Button::new(format!("send-composer-queue-{message_id}"))
@@ -62997,6 +63183,9 @@ mod tests {
         assert!(!queue.contains("message_count"));
         assert!(!queue.contains(".label(locale::text(\"Resume\""));
         assert!(queue.contains("send-composer-queue"));
+        assert!(queue.contains("native-steer-composer-queue"));
+        assert!(queue.contains("native_steering_available"));
+        assert!(queue.contains("native_steer_composer_queue_message"));
         assert!(queue.contains("edit-composer-queue"));
         assert!(queue.contains("delete-composer-queue"));
         assert!(queue.contains("begin_composer_queue_edit"));
@@ -63042,6 +63231,27 @@ mod tests {
         assert!(interrupt.contains("turn_was_locally_pending"));
         assert!(interrupt.contains("composer_queue_steering_session_ids"));
         assert!(interrupt.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+    }
+
+    #[test]
+    fn native_steer_queue_action_falls_back_to_interrupt_and_resend() {
+        let source = include_str!("app.rs");
+        let handler = source
+            .split_once("    fn native_steer_composer_queue_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn continue_session("))
+            .map(|(body, _)| body)
+            .expect("native steer handler should remain inspectable");
+        assert!(handler.contains("SteerAgentMessageRequest"));
+        assert!(handler.contains("SteerMessageOutcome::Injected"));
+        assert!(handler.contains("this.steer_composer_queue_message(message_id, window, cx)"));
+        assert!(handler.contains("install_optimistic_user_message"));
+
+        // The affordance is gated on the probed runtime capability, never on a
+        // hard-coded agent id.
+        assert!(source.contains("native_steering_supported_session_ids"));
+        assert!(source.contains("native_steering_probed_generations"));
+        assert!(source.contains("fn maybe_probe_native_steering("));
+        assert!(source.contains("native_steering_supported("));
     }
 
     #[test]

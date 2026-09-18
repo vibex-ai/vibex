@@ -395,6 +395,17 @@ succeeded). Only `effort` is safe to treat as a built-in alias;
 `thinking_level`/`thought_level` stay alias-gated because some dialects
 advertise them as standalone option ids.
 
+Native steering is a 0.4.32 extension: the initialize result advertises
+`_meta.steering.supported: true`, and `_session/steering` injects a user message
+into the turn that is already running. Vibex records that advertisement as
+`AcpOperation::SessionSteering` in the per-activation operation evidence and
+sends the extension only when `supported_for` accepts the current compatibility
+identity and activation generation. A `{outcome: "promptRequired"}` response
+means the turn ended before injection; the caller then falls back to interrupt +
+resend, which remains the universal path for every Agent that does not advertise
+the capability. The manager never claims a new turn for an injected message: it
+appends the user timeline item against the turn already in flight.
+
 ### Cursor ACP compatibility note
 
 `cursor-agent acp` keeps its model picker in a legacy "variants" mode by

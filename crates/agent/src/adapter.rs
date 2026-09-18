@@ -425,6 +425,24 @@ pub struct ProviderTurnResult {
     pub completed: bool,
 }
 
+/// Request for injecting a user message into the turn that is already running.
+#[derive(Debug, Clone)]
+pub struct ProviderSteerRequest {
+    pub session_id: VibexSessionId,
+    pub text: String,
+    pub attachments: Vec<MessageAttachment>,
+    pub binding: ProviderBinding,
+}
+
+/// Outcome reported by a provider's native steering attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSteerOutcome {
+    /// The message joined the running turn.
+    Injected,
+    /// The turn ended before injection; the caller must submit normally.
+    PromptRequired,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderPermissionResolution {
     pub session_id: VibexSessionId,
@@ -613,6 +631,26 @@ pub trait AgentProvider: Send + Sync {
             "interrupt_unsupported",
             "this provider does not support interrupt",
         ))
+    }
+
+    /// Injects a user message into the turn that is already running. Providers
+    /// without native steering keep the capability error default; callers fall
+    /// back to interrupt + resend.
+    async fn steer_turn(
+        &self,
+        _handle: ProviderSessionHandle,
+        _request: ProviderSteerRequest,
+    ) -> VibexResult<ProviderSteerOutcome> {
+        Err(VibexError::capability(
+            "provider_steering_unsupported",
+            "this provider does not support native steering",
+        ))
+    }
+
+    /// Whether the live activation behind `binding` advertised native
+    /// steering support. Static providers answer `false`.
+    async fn native_steering_supported(&self, _binding: &ProviderBinding) -> bool {
+        false
     }
 
     async fn resolve_permission(&self, _request: ProviderPermissionResolution) -> VibexResult<()> {

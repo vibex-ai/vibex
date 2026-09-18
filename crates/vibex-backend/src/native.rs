@@ -69,9 +69,9 @@ use vibex_core::{
     SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
     SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
     SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus, TerminalWriteRequest,
-    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
+    SkillValidateRequest, SkillValidationResult, SteerAgentMessageRequest, SteerAgentMessageResult,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
+    TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventReceiver, DesktopEventStream, DesktopRuntime,
@@ -346,6 +346,36 @@ impl AgentBackend for NativeBackend {
                 .interrupt(&request.payload)
                 .await?;
             Ok(true)
+        })
+    }
+
+    fn native_steering_supported(&self, session_id: VibexSessionId) -> BackendFuture<'_, bool> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .native_steering_supported(&session_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn steer_message(
+        &self,
+        request: MutationRequest<SteerAgentMessageRequest>,
+    ) -> BackendFuture<'_, SteerAgentMessageResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .steer_message(request.payload)
+                .await
+                .map_err(Into::into)
         })
     }
 

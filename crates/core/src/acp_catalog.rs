@@ -140,12 +140,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        "0.4.15",
+        "0.4.32",
         "https://github.com/vibex-ai/deepseek-harness-acp",
         &[
             "npx",
             "-y",
-            "@openma/deepseek-harness-acp@0.4.15",
+            "@openma/deepseek-harness-acp@0.4.32",
         ],
     ),
     AcpAgentCatalogEntry::new(
@@ -399,10 +399,10 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
-        assert_eq!(deepseek.version, "0.4.15");
+        assert_eq!(deepseek.version, "0.4.32");
         assert_eq!(
             deepseek.command,
-            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.15"]
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.32"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }

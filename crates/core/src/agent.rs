@@ -399,6 +399,57 @@ impl fmt::Debug for SendAgentMessageRequest {
     }
 }
 
+/// Sends a message into the Agent turn that is already running instead of
+/// starting a new turn.
+///
+/// Only providers that advertise native steering support accept this request;
+/// every other provider keeps the unsupported default. Callers must fall back
+/// to interrupt + resend when the request is rejected or when the turn ends
+/// before the message can be injected.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerAgentMessageRequest {
+    pub session_id: VibexSessionId,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    pub correlation_id: Option<CorrelationId>,
+}
+
+impl fmt::Debug for SteerAgentMessageRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SteerAgentMessageRequest")
+            .field("session_id", &self.session_id)
+            .field("has_text", &!self.text.is_empty())
+            .field("attachment_count", &self.attachments.len())
+            .field("correlation_id", &self.correlation_id)
+            .finish()
+    }
+}
+
+/// How a native steering attempt resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerMessageOutcome {
+    /// The message joined the running turn.
+    Injected,
+    /// The turn ended before injection; the caller must submit an ordinary
+    /// message instead.
+    PromptRequired,
+}
+
+/// Product-safe projection of a native steering attempt.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerAgentMessageResult {
+    pub outcome: SteerMessageOutcome,
+    /// Timeline items appended for the injected user message. Always empty for
+    /// [`SteerMessageOutcome::PromptRequired`].
+    #[serde(default)]
+    pub items: Vec<TimelineItem>,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMessageSubmissionRequest {

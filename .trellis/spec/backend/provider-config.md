@@ -3921,7 +3921,7 @@ ResolvedAgentProviderProjection {
 
 - The 17 descriptors accept their researched catalog versions and later
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
-  `>=0.1.23`, DeepSeek Harness ACP `>=0.4.15`, Dirac `>=0.4.1`, Factory Droid
+  `>=0.1.23`, DeepSeek Harness ACP `>=0.4.32`, Dirac `>=0.4.1`, Factory Droid
   `>=0.153.1`, Goose `>=1.33.1`,
   Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
   `>=7.2.40`, Kimi `>=1.49.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,

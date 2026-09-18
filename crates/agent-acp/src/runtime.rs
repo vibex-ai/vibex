@@ -156,8 +156,9 @@ use crate::spawn_config::{ProcessSpawnConfigSnapshot, secret_reference_version};
 use crate::{
     AcpClient, AcpCreateSessionRequest, AcpElicitationResolution, AcpEvent,
     AcpPermissionResolution, AcpRuntimeCommand, AcpRuntimeSessionProbe, AcpSendTurnRequest,
-    AcpSession, AcpTurn, bounded_session_content, infer_permission_risk_category, looks_sensitive,
-    plan_codex_fork, redact_summary, redacted_args, redacted_args_summary,
+    AcpSession, AcpSteerOutcome, AcpSteerTurnRequest, AcpTurn, bounded_session_content,
+    infer_permission_risk_category, looks_sensitive, plan_codex_fork, redact_summary,
+    redacted_args, redacted_args_summary,
 };
 use crate::{
     AgentEventInput, AgentEventInputSource, ClaudeBackgroundWorkRegistry, ClaudeTranscriptEvent,
@@ -12667,6 +12668,26 @@ impl AcpRuntimeClient {
                 },
             );
         }
+        if result
+            .pointer("/_meta/steering/supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // The bridge advertises native steering as an initialize-result
+            // extension. Record it per activation so only an agent that proved
+            // the capability can receive `_session/steering`.
+            operation_evidence.insert(
+                AcpOperation::SessionSteering,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::ExtensionCodec,
+                    stability: AcpOperationStability::AdapterExtension,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: 0,
+                },
+            );
+        }
         if let Some(descriptor) = self.compatibility_registry.for_agent(&process.agent_id)
             && descriptor.expected_compatibility_identity().to_string()
                 == process.compatibility_identity
@@ -17930,6 +17951,66 @@ impl AcpClient for AcpRuntimeClient {
                     protocol::build_session_cancel_params(&current.native_session_id),
                 )
             })?
+    }
+
+    async fn steer_turn(&self, request: AcpSteerTurnRequest) -> VibexResult<AcpSteerOutcome> {
+        let Some(attachment) = self.current_attachment(&request.session_id) else {
+            return Err(VibexError::conflict(
+                "acp_steering_no_active_turn",
+                "ACP session has no live attachment to steer",
+            ));
+        };
+        let generation = attachment.fence().activation_generation as i64;
+        let payload = attachment.payload();
+        let process = payload.process();
+        let evidence = process
+            .operation_evidence(generation)
+            .get(&AcpOperation::SessionSteering)
+            .cloned();
+        let Some(evidence) = evidence else {
+            return Err(VibexError::capability(
+                "acp_steering_unsupported",
+                "ACP agent did not advertise native steering support",
+            ));
+        };
+        if !evidence.supported_for(&process.compatibility_identity, generation) {
+            return Err(VibexError::capability(
+                "acp_steering_unsupported",
+                "ACP native steering is not negotiated for this activation",
+            ));
+        }
+        let prompt = runtime_prompt_content(&request.text, &request.attachments);
+        let params =
+            protocol::build_session_steering_params(&attachment.fence().native_session_id, prompt);
+        let response = process
+            .request(
+                AcpOperation::SessionSteering.method(),
+                params,
+                self.prompt_timeout,
+            )
+            .await?;
+        match response.get("outcome").and_then(Value::as_str) {
+            Some("injected") => Ok(AcpSteerOutcome::Injected),
+            Some("promptRequired") => Ok(AcpSteerOutcome::PromptRequired),
+            _ => Err(VibexError::process(
+                "acp_steering_response_invalid",
+                "ACP steering response did not report a recognized outcome",
+            )),
+        }
+    }
+
+    async fn native_steering_supported(&self, binding: &ProviderBinding) -> bool {
+        let Some(attachment) = self.current_attachment(&binding.session_id) else {
+            return false;
+        };
+        let generation = attachment.fence().activation_generation as i64;
+        let process = attachment.payload().process();
+        process
+            .operation_evidence(generation)
+            .get(&AcpOperation::SessionSteering)
+            .is_some_and(|evidence| {
+                evidence.supported_for(&process.compatibility_identity, generation)
+            })
     }
 
     async fn close_session(&self, binding: &ProviderBinding) -> VibexResult<()> {
@@ -23842,6 +23923,7 @@ fs_paths = {}
 restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_fork = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_FORK") == "true"
+advertise_steering = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_STEERING") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
 authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_LOGIN_HANG") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
@@ -23914,6 +23996,8 @@ for line in sys.stdin:
             "agentCapabilities": capabilities,
             "agentInfo": {"name": "mock-acp", "version": "1.0.0"},
         }
+        if advertise_steering:
+            result["_meta"] = {"steering": {"supported": True}}
         if advertise_auth:
             result["authMethods"] = [
                 {
@@ -24094,6 +24178,11 @@ for line in sys.stdin:
                     },
                 },
             })
+    elif method == "_session/steering":
+        if control_value("steering_mode", "promptRequired") == "injected":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "injected"}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
     elif method == "session/set_model":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         model_id = msg.get("params", {}).get("modelId", model_1)
@@ -25234,6 +25323,35 @@ for line in sys.stdin:
                 value: Some("true".to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock fork capability".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        /// Adds the mock steering-capability env before any process spawn, so
+        /// the next initialize advertises `_meta.steering.supported`.
+        fn set_advertise_steering(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            if config
+                .env
+                .iter()
+                .any(|entry| entry.key == "VIBEX_MOCK_ACP_ADVERTISE_STEERING")
+            {
+                return;
+            }
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_ADVERTISE_STEERING".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock steering capability".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -32866,6 +32984,94 @@ for line in sys.stdin:
             }
         }
         assert!(followup_text.contains("permission cancelled"));
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_advertises_and_answers_native_steering() {
+        let Some(fixture) = MockAcpFixture::create("native-steering") else {
+            return;
+        };
+        fixture.set_advertise_steering();
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        assert!(client.native_steering_supported(&binding).await);
+
+        // The default mock turn state reports the typed fallback outcome.
+        let outcome = client
+            .steer_turn(AcpSteerTurnRequest {
+                session_id: session_id.clone(),
+                text: "focus on the failing test".to_string(),
+                attachments: Vec::new(),
+                binding: binding.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcpSteerOutcome::PromptRequired);
+
+        // An injected acknowledgement is parsed from the agent response.
+        fixture.set_control_value("steering_mode", "injected");
+        let outcome = client
+            .steer_turn(AcpSteerTurnRequest {
+                session_id: session_id.clone(),
+                text: "focus on the failing test".to_string(),
+                attachments: Vec::new(),
+                binding: binding.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcpSteerOutcome::Injected);
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_steering_is_rejected_when_the_agent_did_not_advertise_it() {
+        let Some(fixture) = MockAcpFixture::create("native-steering-unsupported") else {
+            return;
+        };
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        assert!(!client.native_steering_supported(&binding).await);
+        let error = client
+            .steer_turn(AcpSteerTurnRequest {
+                session_id: session_id.clone(),
+                text: "focus".to_string(),
+                attachments: Vec::new(),
+                binding: binding.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "acp_steering_unsupported");
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();

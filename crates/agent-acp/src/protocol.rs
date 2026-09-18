@@ -77,6 +77,9 @@ pub enum AcpOperation {
     SessionNew,
     SessionPrompt,
     SessionCancel,
+    /// Adapter extension `_session/steering`: injects a user message into the
+    /// turn that is already running instead of starting a new turn.
+    SessionSteering,
     SessionLoad,
     SessionList,
     SessionSetMode,
@@ -110,6 +113,7 @@ impl AcpOperation {
             Self::SessionNew => "session/new",
             Self::SessionPrompt => "session/prompt",
             Self::SessionCancel => "session/cancel",
+            Self::SessionSteering => "_session/steering",
             Self::SessionLoad => "session/load",
             Self::SessionList => "session/list",
             Self::SessionSetMode => "session/set_mode",
@@ -141,6 +145,7 @@ impl AcpOperation {
             "session/new" => Self::SessionNew,
             "session/prompt" => Self::SessionPrompt,
             "session/cancel" => Self::SessionCancel,
+            "_session/steering" => Self::SessionSteering,
             "session/load" => Self::SessionLoad,
             "session/list" => Self::SessionList,
             "session/set_mode" => Self::SessionSetMode,
@@ -278,6 +283,13 @@ pub fn baseline_operation_matrix() -> Vec<AcpOperationSupport> {
         // actual encoding choice is negotiated (P3-02/P3-03).
         support(Op::SessionFork, St::VersionedUnstable, Enc::VersionedRaw),
         support(Op::ElicitationCreate, St::VersionedUnstable, Enc::Typed),
+        // Adapter-private extension: exact-identity, capability-gated at the
+        // initialize boundary and encoded by a dedicated codec.
+        support(
+            Op::SessionSteering,
+            St::AdapterExtension,
+            Enc::ExtensionCodec,
+        ),
         support(
             Op::SessionSetConfigOption,
             St::VersionedUnstable,
@@ -867,6 +879,23 @@ pub(crate) fn build_session_prompt_params(native_session_id: &str, prompt: Vec<V
     }
 }
 
+/// Build `_session/steering` params.
+///
+/// The bridge accepts the same content-block array as `session/prompt`, plus a
+/// reserved `_meta.steering.idleBehavior`. `promptRequired` asks the agent to
+/// report a finished turn as a typed outcome instead of an error, so the
+/// caller can fall back to an ordinary `session/prompt`.
+pub(crate) fn build_session_steering_params(native_session_id: &str, prompt: Vec<Value>) -> Value {
+    let mut params = build_session_prompt_params(native_session_id, prompt);
+    if let Some(object) = params.as_object_mut() {
+        object.insert(
+            "_meta".to_string(),
+            json!({ "steering": { "idleBehavior": "promptRequired" } }),
+        );
+    }
+    params
+}
+
 /// Build `session/cancel` notification params through the typed schema.
 pub(crate) fn build_session_cancel_params(native_session_id: &str) -> Value {
     let notification = CancelNotification::new(SessionId::new(native_session_id));
@@ -1069,6 +1098,22 @@ mod tests {
         assert_eq!(
             build_session_cancel_params("native-1"),
             json!({ "sessionId": "native-1" })
+        );
+    }
+
+    #[test]
+    fn steering_params_carry_prompt_blocks_and_prompt_required_idle_behavior() {
+        let params = build_session_steering_params(
+            "native-1",
+            vec![json!({ "type": "text", "text": "focus on tests" })],
+        );
+        assert_eq!(
+            params,
+            json!({
+                "sessionId": "native-1",
+                "prompt": [{ "type": "text", "text": "focus on tests" }],
+                "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+            })
         );
     }
 

@@ -16,7 +16,8 @@ use vibex_core::{
     RemoteDeepLinkResolution, RenameAgentSessionRequest, ReplaceUserMessagePayload,
     ResolveElicitationRequest, ResolvePermissionRequest, RuntimeSessionEvent,
     SendAgentMessageRequest, SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
+    SteerAgentMessageRequest, SteerAgentMessageResult, TimelineItem, TimelineLiveEvent,
+    TimelinePage, VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -153,6 +154,28 @@ pub trait AgentBackend: BackendBound {
     ) -> BackendFuture<'_, Vec<TimelineItem>>;
 
     fn interrupt(&self, request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, bool>;
+
+    /// Whether the session's live runtime advertised native steering. Backends
+    /// that cannot interrogate a live activation answer `false`, which keeps
+    /// the native steering affordance hidden instead of failing.
+    fn native_steering_supported(&self, _session_id: VibexSessionId) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Injects a message into the turn that is already running. Backends
+    /// without native steering return a capability error and callers fall back
+    /// to interrupt + resend.
+    fn steer_message(
+        &self,
+        _request: MutationRequest<SteerAgentMessageRequest>,
+    ) -> BackendFuture<'_, SteerAgentMessageResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_steering_unavailable",
+                "Native Agent steering is unavailable on this backend",
+            ))
+        })
+    }
 
     fn resolve_permission(
         &self,

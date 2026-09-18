@@ -22,7 +22,8 @@ use thiserror::Error;
 use vibex_agent::{
     AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderElicitationResolution,
     ProviderEvent, ProviderPermissionResolution, ProviderRuntimeResources, ProviderSessionHandle,
-    ProviderTurnAttachment, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    ProviderSteerOutcome, ProviderSteerRequest, ProviderTurnAttachment,
+    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     materialize_provider_attachments, reject_forbidden_agent_smoke_workspace,
     resolve_agent_smoke_workspace,
 };
@@ -504,6 +505,23 @@ pub trait AcpClient: Send + Sync {
             "acp_interrupt_unsupported",
             "ACP interrupt is not supported by this adapter",
         ))
+    }
+
+    /// Injects a user message into the turn that is already running. Adapters
+    /// without native steering keep the capability error default; callers fall
+    /// back to interrupt + resend.
+    async fn steer_turn(&self, _request: AcpSteerTurnRequest) -> VibexResult<AcpSteerOutcome> {
+        Err(VibexError::capability(
+            "acp_steering_unsupported",
+            "ACP native steering is not supported by this adapter",
+        ))
+    }
+
+    /// Whether the live activation for `binding` advertised native steering
+    /// through the initialize response. A missing or stale attachment answers
+    /// `false`.
+    async fn native_steering_supported(&self, _binding: &ProviderBinding) -> bool {
+        false
     }
 
     async fn close_session(&self, _binding: &ProviderBinding) -> VibexResult<()> {
@@ -1902,6 +1920,40 @@ pub struct AcpSendTurnRequest {
     pub usage_event_sender: Option<tokio::sync::mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
 }
 
+/// Injects a user message into the ACP turn that is already running.
+///
+/// The target session must still have a live prompt in flight; adapters that
+/// did not negotiate `_meta.steering.supported` reject the request instead of
+/// guessing, and callers fall back to interrupt + resend.
+#[derive(Clone)]
+pub struct AcpSteerTurnRequest {
+    pub session_id: vibex_core::VibexSessionId,
+    pub text: String,
+    pub attachments: Vec<ProviderTurnAttachment>,
+    pub binding: ProviderBinding,
+}
+
+impl fmt::Debug for AcpSteerTurnRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcpSteerTurnRequest")
+            .field("session_id", &self.session_id)
+            .field("has_text", &!self.text.is_empty())
+            .field("attachment_count", &self.attachments.len())
+            .field("has_binding", &true)
+            .finish()
+    }
+}
+
+/// Outcome reported by a native steering attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSteerOutcome {
+    /// The message joined the running turn.
+    Injected,
+    /// The turn ended before injection; the caller must submit normally.
+    PromptRequired,
+}
+
 impl fmt::Debug for AcpSendTurnRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2490,6 +2542,32 @@ impl AgentProvider for AcpAgentProvider {
 
     async fn interrupt(&self, handle: ProviderSessionHandle) -> VibexResult<()> {
         self.client.interrupt(&handle.binding).await
+    }
+
+    async fn steer_turn(
+        &self,
+        _handle: ProviderSessionHandle,
+        request: ProviderSteerRequest,
+    ) -> VibexResult<ProviderSteerOutcome> {
+        let attachments =
+            materialize_provider_attachments(&request.session_id, &request.attachments)?;
+        match self
+            .client
+            .steer_turn(AcpSteerTurnRequest {
+                session_id: request.session_id,
+                text: request.text,
+                attachments,
+                binding: request.binding,
+            })
+            .await?
+        {
+            AcpSteerOutcome::Injected => Ok(ProviderSteerOutcome::Injected),
+            AcpSteerOutcome::PromptRequired => Ok(ProviderSteerOutcome::PromptRequired),
+        }
+    }
+
+    async fn native_steering_supported(&self, binding: &ProviderBinding) -> bool {
+        self.client.native_steering_supported(binding).await
     }
 
     async fn close_session(&self, binding: ProviderBinding) -> VibexResult<()> {

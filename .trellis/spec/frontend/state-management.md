@@ -1359,6 +1359,14 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   the initial prompt of a newly created Session: release the new-session action
   lock before advancing the queue, preserve pause behavior after prompt failure
   or a user interrupt, and honor an explicit queued-message steer request.
+- The Composer queue exposes native steering only as a capability-gated extra
+  action. Probe `native_steering_supported(session_id)` once per runtime
+  activation generation, cache the answer per session, and render the steer
+  button only when the live Agent advertised it and a turn is running. Clicking
+  it installs the optimistic user message and calls `steer_message`; an
+  `Injected` outcome removes the queued row, while `PromptRequired` or any
+  transport failure falls back to the universal interrupt + resend path. Never
+  gate the affordance on an Agent id or version string.
 - Auto-continue is a safe local preference persisted in `DesktopUiStateV1`.
   Store project defaults separately from per-session boolean overrides so an
   explicit session disable survives restart even when its project default is
