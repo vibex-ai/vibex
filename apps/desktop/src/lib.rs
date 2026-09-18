@@ -23,6 +23,7 @@ pub mod remote_access_pairing;
 pub mod remote_client;
 pub mod resize_seam;
 pub mod responsive;
+pub mod skeleton;
 pub mod system_tray;
 pub mod terminal_surface;
 pub mod terminal_transport;

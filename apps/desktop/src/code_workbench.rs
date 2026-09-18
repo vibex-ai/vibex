@@ -90,6 +90,7 @@ use crate::platform::{
     open_path_with_default_app, open_path_with_external_tool, reveal_path_in_file_manager,
 };
 use crate::resize_seam;
+use crate::skeleton;
 use crate::terminal_surface::TerminalSurface;
 
 const FILE_ROW_HEIGHT: f32 = 28.0;
@@ -106,10 +107,22 @@ const GIT_HISTORY_DRAWER_CLOSE_THRESHOLD: f32 = 92.0;
 const GIT_HISTORY_DRAWER_DEFAULT_HEIGHT: f32 = 260.0;
 const GIT_HISTORY_DRAWER_KEYBOARD_STEP: f32 = 24.0;
 const GIT_HISTORY_LOAD_MORE_THRESHOLD_PX: f32 = 192.0;
+/// History rows the loading placeholder stands in for. The real count is only
+/// known once the page arrives, so the placeholder fills the rail rather than
+/// guessing it.
+const GIT_HISTORY_LOADING_ROWS: usize = 8;
 const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
 const DIFF_ROW_MIN_HEIGHT: f32 = 22.0;
 const DIFF_LIST_OVERDRAW: f32 = 512.0;
 const DIFF_LINE_VERTICAL_PADDING: f32 = 2.0;
+/// One line-number gutter cell. The loading placeholder reads the same figure,
+/// so the patch does not shift sideways when the document lands.
+const DIFF_GUTTER_WIDTH: f32 = 64.0;
+/// Diff rows the git preview stands in for while its document loads, and the
+/// body length each draws. A patch runs short on hunk boundaries, so the
+/// placeholder cycles a few lengths instead of painting one solid block.
+const DIFF_PREVIEW_LOADING_ROWS: usize = 14;
+const DIFF_PREVIEW_LOADING_WIDTHS: [f32; 6] = [0.70, 0.42, 0.84, 0.58, 0.36, 0.76];
 const FILE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const IMAGE_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LOCAL_IMAGE_LIMIT: usize = 32;
@@ -8191,21 +8204,86 @@ impl CodeWorkbench {
             .into_any_element()
     }
 
-    fn render_git_preview_loading(&self, title: &str, _cx: &Context<Self>) -> AnyElement {
+    fn render_git_preview_loading(&self, title: &str, cx: &Context<Self>) -> AnyElement {
+        // A patch arrives as one document, so the pane holds nothing until it
+        // lands. Keep the header the loaded view draws — the path or commit is
+        // real information — and stand in for the rows on the patch list's own
+        // pitch, so the diff does not resize the pane when it arrives.
+        let row_height = diff_row_height(self.code_font_size);
         v_flex()
             .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .p_6()
-            .text_center()
-            .child(Spinner::new())
+            .min_h_0()
             .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .child(title.to_string()),
+                h_flex()
+                    .min_h(px(48.0))
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted.opacity(0.20))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(title.to_string()),
+                            )
+                            .child(skeleton::skeleton_bar(11.0, 0.30, cx)),
+                    )
+                    .child(skeleton::skeleton_bar(20.0, 0.10, cx)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .children((0..DIFF_PREVIEW_LOADING_ROWS).map(|row| {
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .h(px(row_height))
+                            .flex_none()
+                            .items_center()
+                            .child(
+                                h_flex()
+                                    .w(px(DIFF_GUTTER_WIDTH))
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_end()
+                                    .px_2()
+                                    .border_r_1()
+                                    .border_color(cx.theme().border.opacity(0.30))
+                                    .child(skeleton::skeleton_bar(
+                                        row_height * 0.45,
+                                        0.55,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .items_center()
+                                    .px_3()
+                                    .child(skeleton::skeleton_bar(
+                                        row_height * 0.45,
+                                        DIFF_PREVIEW_LOADING_WIDTHS
+                                            [row % DIFF_PREVIEW_LOADING_WIDTHS.len()],
+                                        cx,
+                                    )),
+                            )
+                    })),
             )
             .into_any_element()
     }
@@ -10245,7 +10323,9 @@ impl CodeRightRail {
                     .track_focus(&self.file_tree_focus)
                     .on_key_down(cx.listener(Self::on_file_tree_key_down))
                     .on_drag_move(cx.listener(Self::auto_scroll_file_tree))
-                    .child(if item_count == 0 && !loading {
+                    .child(if item_count == 0 && loading {
+                        skeleton_file_tree(cx)
+                    } else if item_count == 0 {
                         rail_empty(
                             locale::text(
                                 "No workspace files",
@@ -12679,10 +12759,7 @@ impl CodeRightRail {
 
         let history_list = if history_row_count == 0 {
             if loading {
-                rail_empty(
-                    locale::text("Loading history", "正在加载历史", "正在載入歷史"),
-                    cx,
-                )
+                skeleton_git_history(cx)
             } else {
                 rail_empty_card(
                     locale::text("Recent history", "最近历史", "最近歷史"),
@@ -13693,6 +13770,83 @@ impl Render for CodeWorkbenchFixture {
             .text_color(cx.theme().foreground)
             .child(content)
     }
+}
+
+/// Placeholder rows for the first workspace tree load.
+///
+/// `render_files` gates its empty state on `!loading`, so without this the
+/// loading case falls through to a zero-item `uniform_list` and the rail paints
+/// nothing at all. The rows reuse [`FILE_ROW_HEIGHT`] and [`FILE_TREE_INDENT`]
+/// and walk in and out of two levels, the way a workspace tree does.
+fn skeleton_file_tree(cx: &App) -> AnyElement {
+    /// `(depth, width fraction)` per row.
+    const SHAPE: [(usize, f32); 9] = [
+        (0, 0.60),
+        (1, 0.46),
+        (1, 0.54),
+        (2, 0.38),
+        (1, 0.50),
+        (0, 0.56),
+        (1, 0.42),
+        (0, 0.58),
+        (1, 0.48),
+    ];
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .children(SHAPE.into_iter().map(|(depth, width)| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .h(px(FILE_ROW_HEIGHT))
+                .flex_none()
+                .items_center()
+                .pl(px(FILE_TREE_INDENT * depth as f32 + 6.0))
+                .pr_2()
+                .child(skeleton::skeleton_bar(11.0, width, cx))
+        }))
+        .into_any_element()
+}
+
+/// Placeholder rows for the first Git history load.
+///
+/// The gate stays on an empty list, so a branch, author, or date filter that
+/// keeps the previous rows on screen never reaches this. Each row reuses
+/// [`GIT_HISTORY_ROW_HEIGHT`] and draws the graph lane beside a subject line
+/// and its author/date line.
+fn skeleton_git_history(cx: &App) -> AnyElement {
+    /// Subject length per row, as a fraction of the row body.
+    const SUBJECT_WIDTHS: [f32; 5] = [0.68, 0.52, 0.76, 0.44, 0.62];
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .overflow_hidden()
+        .children((0..GIT_HISTORY_LOADING_ROWS).map(|row| {
+            h_flex()
+                .h(px(GIT_HISTORY_ROW_HEIGHT))
+                .w_full()
+                .flex_none()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .pl_2()
+                .pr_2()
+                .child(skeleton::skeleton_bar(12.0, 0.05, cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        .child(skeleton::skeleton_bar(
+                            11.0,
+                            SUBJECT_WIDTHS[row % SUBJECT_WIDTHS.len()],
+                            cx,
+                        ))
+                        .child(skeleton::skeleton_bar(9.0, 0.26, cx)),
+                )
+        }))
+        .into_any_element()
 }
 
 fn rail_empty(message: impl Into<SharedString>, cx: &Context<CodeRightRail>) -> AnyElement {
@@ -15078,7 +15232,7 @@ fn render_diff_row(
         .border_color(cx.theme().border.opacity(0.30))
         .child(
             div()
-                .w(px(64.0))
+                .w(px(DIFF_GUTTER_WIDTH))
                 .flex_none()
                 .border_r_1()
                 .border_color(cx.theme().border.opacity(0.30))
@@ -15095,7 +15249,7 @@ fn render_diff_row(
         )
         .child(
             div()
-                .w(px(64.0))
+                .w(px(DIFF_GUTTER_WIDTH))
                 .flex_none()
                 .border_r_1()
                 .border_color(cx.theme().border.opacity(0.30))

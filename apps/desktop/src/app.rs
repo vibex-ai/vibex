@@ -182,6 +182,7 @@ use crate::remote_client::{
     RegisteredRuntime,
 };
 use crate::responsive::WorkbenchVisibility;
+use crate::skeleton;
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
 use crate::usage::UsageView;
@@ -460,6 +461,10 @@ const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 6
 const AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX: f32 = 16.0;
 const SESSION_SEARCH_RESULT_LIMIT: usize = 200;
 const SESSION_SEARCH_RESULT_ROW_HEIGHT: f32 = 68.0;
+/// Result rows the indexing placeholder stands in for. The real count is only
+/// known once the index finishes, so the placeholder fills the dialog rather
+/// than guessing it.
+const SESSION_SEARCH_LOADING_ROWS: usize = 6;
 const SESSION_SEARCH_DIALOG_MAX_WIDTH: f32 = 720.0;
 const SESSION_SEARCH_DIALOG_MAX_HEIGHT: f32 = 620.0;
 const SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
@@ -503,6 +508,13 @@ const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
+/// One sign-in method row in the runtime authentication submenu. The loading
+/// placeholder reads the same figure, so the list does not resize under it.
+const RUNTIME_AUTH_METHOD_ROW_HEIGHT: f32 = 48.0;
+/// Method rows the loading placeholder stands in for. The reported count is
+/// only known once both ACP calls return, so the placeholder fills the panel
+/// rather than guessing it.
+const RUNTIME_AUTH_METHOD_LOADING_ROWS: usize = 3;
 const COMPOSER_SUGGESTION_MENU_MAX_HEIGHT: f32 = 360.0;
 const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 72.0;
 const COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT: f32 = 32.0;
@@ -4247,6 +4259,124 @@ fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&Time
     turn.conclusion_row
         .as_ref()
         .filter(|row| !row.body.trim().is_empty())
+}
+
+/// Placeholder rows for the session-search overlay while its index is cold.
+///
+/// The index is built by fetching every stale session's timeline, which takes
+/// seconds on a long history, so without this the body claims "no results" for
+/// a query that is still being indexed. Rows reuse
+/// [`SESSION_SEARCH_RESULT_ROW_HEIGHT`], the pitch of the virtual list that
+/// replaces them. An empty query is answered synchronously from the in-memory
+/// session list, so it never reaches this.
+fn skeleton_session_search(cx: &App) -> AnyElement {
+    /// Title and detail length per row, as fractions of the row body.
+    const TITLES: [f32; 5] = [0.46, 0.62, 0.38, 0.54, 0.44];
+    const DETAILS: [f32; 5] = [0.78, 0.56, 0.84, 0.62, 0.70];
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .overflow_hidden()
+        .children((0..SESSION_SEARCH_LOADING_ROWS).map(|row| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .h(px(SESSION_SEARCH_RESULT_ROW_HEIGHT))
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .child(skeleton::skeleton_bar(16.0, 0.05, cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_2()
+                        .child(skeleton::skeleton_bar(12.0, TITLES[row % TITLES.len()], cx))
+                        .child(skeleton::skeleton_bar(10.0, DETAILS[row % DETAILS.len()], cx)),
+                )
+        }))
+        .into_any_element()
+}
+
+/// Placeholder turns for a cold session open.
+///
+/// `select_session_with_history` clears the timeline and sets `agent_loading`,
+/// so the center pane holds nothing until the authoritative fetch lands. A
+/// cached switch never reaches this: `restore_agent_session_view` renders the
+/// cached turns and clears the flag instead. Turn heights are measured and
+/// virtualized, so the placeholder approximates a short conversation rather
+/// than predicting it — it must never write into the row-size table.
+fn skeleton_conversation(
+    content_max_width: Option<f32>,
+    strings: Strings,
+    cx: &App,
+) -> AnyElement {
+    /// Per turn: the User bubble's width, then the Agent answer's line widths,
+    /// as fractions of the content column. A zero ends the answer.
+    const TURNS: [(f32, [f32; 3]); 2] = [
+        (0.42, [0.94, 0.86, 0.52]),
+        (0.56, [0.90, 0.72, 0.0]),
+    ];
+    let mut column = v_flex().w_full().min_w_0().gap_8();
+    for (bubble_width, answer_widths) in TURNS {
+        column = column
+            .child(
+                v_flex().w_full().min_w_0().items_end().child(
+                    v_flex()
+                        .w(relative(bubble_width))
+                        .min_w_0()
+                        .gap_2()
+                        .child(skeleton::skeleton_bar(12.0, 1.0, cx))
+                        .child(skeleton::skeleton_bar(12.0, 0.66, cx)),
+                ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_2()
+                    .children(
+                        answer_widths
+                            .into_iter()
+                            .filter(|width| *width > 0.0)
+                            .map(|width| skeleton::skeleton_bar(12.0, width, cx)),
+                    ),
+            );
+    }
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .min_w_0()
+        .overflow_hidden()
+        .px_4()
+        .py_4()
+        .gap_3()
+        .child(
+            // The placeholder explains the shape; this line says which wait it
+            // is, and carries the state for assistive technology.
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(Spinner::new().xsmall())
+                .child(strings.agent_loading_session),
+        )
+        .child(
+            h_flex().w_full().min_w_0().justify_center().child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .when_some(content_max_width, |this, max| this.max_w(px(max)))
+                    .child(column),
+            ),
+        )
+        .into_any_element()
 }
 
 fn timeline_streaming_agent_row<'a>(
@@ -31714,7 +31844,7 @@ impl VibexWorkbench {
                     .small()
                     .ghost()
                     .w_full()
-                    .h(px(48.0))
+                    .h(px(RUNTIME_AUTH_METHOD_ROW_HEIGHT))
                     .flex_none()
                     .px_2()
                     .justify_start()
@@ -31824,6 +31954,32 @@ impl VibexWorkbench {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
+                    .when(loading && rows.is_empty(), |this| {
+                        // Two sequential ACP calls report the methods, and the
+                        // rows region is otherwise suppressed while they run,
+                        // leaving the panel blank under its spinner. Stand in on
+                        // the rows' own pitch. `verify` keeps `catalog` under
+                        // `pending`, so only a real load reaches this.
+                        this.children((0..RUNTIME_AUTH_METHOD_LOADING_ROWS).map(|_| {
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .h(px(RUNTIME_AUTH_METHOD_ROW_HEIGHT))
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .child(skeleton::skeleton_bar(15.0, 0.06, cx))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(skeleton::skeleton_bar(12.0, 0.52, cx))
+                                        .child(skeleton::skeleton_bar(10.0, 0.72, cx)),
+                                )
+                        }))
+                    })
                     .when(!loading && rows.is_empty(), |this| {
                         this.child(
                             div()
@@ -34793,7 +34949,9 @@ impl VibexWorkbench {
                 });
             })
             .when(turns.is_empty(), |this| {
-                this.child(
+                this.child(if self.agent_loading {
+                    skeleton_conversation(content_max_width, strings, cx)
+                } else {
                     v_flex()
                         .size_full()
                         .items_center()
@@ -34804,25 +34962,22 @@ impl VibexWorkbench {
                             div()
                                 .text_lg()
                                 .font_semibold()
-                                .child(if self.agent_loading {
-                                    strings.agent_loading_session
-                                } else if selected.is_some() {
+                                .child(if selected.is_some() {
                                     strings.agent_start_conversation
                                 } else {
                                     strings.agent_select_session
                                 }),
                         )
-                        .when(!self.agent_loading, |this| {
-                            this.child(
-                                div()
-                                    .max_w(px(460.0))
-                                    .text_center()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(strings.agent_timeline_description),
-                            )
-                        }),
-                )
+                        .child(
+                            div()
+                                .max_w(px(460.0))
+                                .text_center()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(strings.agent_timeline_description),
+                        )
+                        .into_any_element()
+                })
             })
             .when(!turns.is_empty(), |this| {
                 this.child(
@@ -44151,7 +44306,9 @@ impl VibexWorkbench {
         );
         let rendered_results = results.clone();
         let rendered_query = query.clone();
-        let result_list = if results.is_empty() {
+        let result_list = if results.is_empty() && self.session_search_index_loading {
+            skeleton_session_search(cx)
+        } else if results.is_empty() {
             v_flex()
                 .flex_1()
                 .min_h_0()

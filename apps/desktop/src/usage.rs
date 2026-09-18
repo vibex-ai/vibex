@@ -30,7 +30,7 @@ use vibex_core::{
 
 use crate::{
     gpui_ext::button_with_aria_label,
-    locale, motion, theme,
+    locale, motion, skeleton, theme,
     usage_charts::{
         ModelChart, ModelChartCategory, ModelChartDay, TrendChart, TrendChartBucket,
         TrendChartSeries,
@@ -44,6 +44,19 @@ const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
 const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
 const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
+/// One toolbar control: the range shell's segment plus its inset and hairline.
+const USAGE_TOOLBAR_CONTROL_HEIGHT: f32 = USAGE_RANGE_SEGMENT_HEIGHT + USAGE_RANGE_INSET * 2.0 + 2.0;
+/// One summary tile: `py_3` + a 20px label row + `gap_2` + the `text_xl` value
+/// line at `relative(1.2)` + `py_3`. The loading placeholder uses the same
+/// figure so the grid does not resize when the numbers land.
+const USAGE_SUMMARY_TILE_HEIGHT: f32 = 76.0;
+/// Tiles `render_summary` builds. The placeholder grid must stay on the same
+/// row count or the page reflows when the statistics arrive.
+const USAGE_SUMMARY_METRIC_COUNT: usize = 6;
+/// Rows the placeholder stands in for in the dimension table. The real count is
+/// only known once the statistics arrive, so the placeholder shows a typical
+/// breakdown instead of guessing it.
+const USAGE_LOADING_TABLE_ROWS: usize = 5;
 const USAGE_MODEL_LIMIT: usize = 10;
 const USAGE_OTHER_MODEL_ID: &str = "__vibex_other_models__";
 const USAGE_AGENT_DEFAULT_MODEL_ID: &str = "__vibex_agent_default_model__";
@@ -761,14 +774,8 @@ impl UsageView {
             UsageTrendView::Models => Some(self.render_model_metric_control(cx)),
             UsageTrendView::Heatmap => None,
         };
-        v_flex()
-            .w_full()
-            .min_w_0()
+        usage_card(cx)
             .gap_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
             .px_4()
             .py_3()
             .child(
@@ -932,13 +939,7 @@ impl UsageView {
                     ),
             );
         }
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+        usage_card(cx)
             .overflow_hidden()
             .child(
                 h_flex()
@@ -1078,6 +1079,20 @@ impl UsageView {
     }
 }
 
+/// Card chrome shared by the usage panels and their loading placeholders: the
+/// card plate, a hairline border, and the large radius. Padding and clipping
+/// stay with the caller — the trend card is inset, the dimension card clips its
+/// table.
+fn usage_card(cx: &App) -> gpui::Div {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .rounded_lg()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+}
+
 impl Render for UsageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_width = f32::from(window.viewport_size().width);
@@ -1103,20 +1118,81 @@ impl Render for UsageView {
                     .child(self.render_dimensions(window, cx))
                     .into_any_element()
             }
-            UsageContentState::Loading => div()
-                .h(px(240.0))
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(locale::text(
-                    "Loading usage statistics...",
-                    "正在加载用量统计...",
-                    "正在載入用量統計...",
-                ))
-                .into_any_element(),
+            UsageContentState::Loading => {
+                // Stand in for the ready layout with its own containers — the
+                // same toolbar slot, summary grid, and two cards — so the
+                // statistics land where their placeholders stood instead of
+                // reflowing the page. This is a first load only: once
+                // `statistics` is set the state is `Ready`, so a range, filter,
+                // or sort change keeps the previous numbers on screen.
+                v_flex()
+                    .w_full()
+                    .gap_4()
+                    .children(status)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(skeleton::skeleton_bar(
+                                USAGE_TOOLBAR_CONTROL_HEIGHT,
+                                0.22,
+                                cx,
+                            ))
+                            .child(skeleton::skeleton_bar(
+                                USAGE_TOOLBAR_CONTROL_HEIGHT,
+                                0.46,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .grid()
+                            .grid_cols(summary_columns(viewport_width))
+                            .w_full()
+                            .gap_3()
+                            .children((0..USAGE_SUMMARY_METRIC_COUNT).map(|_| {
+                                skeleton::skeleton_bar(USAGE_SUMMARY_TILE_HEIGHT, 1.0, cx)
+                            })),
+                    )
+                    .child(
+                        usage_card(cx)
+                            .gap_3()
+                            .px_4()
+                            .py_3()
+                            .child(skeleton::skeleton_bar(24.0, 0.34, cx))
+                            .child(skeleton::skeleton_bar(USAGE_CHART_HEIGHT, 1.0, cx)),
+                    )
+                    .child(
+                        usage_card(cx)
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .px_2()
+                                    .py(px(6.0))
+                                    .border_b_1()
+                                    .border_color(cx.theme().border.opacity(0.55))
+                                    .child(skeleton::skeleton_bar(28.0, 0.38, cx)),
+                            )
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .children((0..USAGE_LOADING_TABLE_ROWS).map(|_| {
+                                        h_flex()
+                                            .w_full()
+                                            .h(px(USAGE_TABLE_ROW_HEIGHT))
+                                            .items_center()
+                                            .px_3()
+                                            .child(skeleton::skeleton_bar(12.0, 0.42, cx))
+                                    })),
+                            )
+                    )
+                    .into_any_element()
+            }
             UsageContentState::Empty => v_flex()
                 .w_full()
                 .gap_4()

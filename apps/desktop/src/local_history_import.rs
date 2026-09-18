@@ -34,6 +34,17 @@ use vibex_desktop_runtime::DesktopRuntime;
 use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
 use crate::locale::{self, ResolvedLocale};
+use crate::skeleton;
+
+/// One folder header row, and one session row beneath it. The scan placeholder
+/// reads the same two figures so the dialog does not reflow when the scan lands.
+const LOCAL_HISTORY_FOLDER_HEADER_HEIGHT: f32 = 40.0;
+const LOCAL_HISTORY_SESSION_ROW_HEIGHT: f32 = 36.0;
+/// Folder cards and session rows the scan placeholder stands in for. The real
+/// result is only known once the scan lands, so the placeholder shows a typical
+/// history rather than guessing it.
+const LOCAL_HISTORY_LOADING_FOLDERS: usize = 3;
+const LOCAL_HISTORY_LOADING_SESSIONS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportPhase {
@@ -629,7 +640,7 @@ impl LocalHistoryImportDialog {
             .id(row_id)
             .w_full()
             .min_w_0()
-            .h(px(40.0))
+            .h(px(LOCAL_HISTORY_FOLDER_HEADER_HEIGHT))
             .flex_none()
             .items_center()
             .gap_2()
@@ -742,7 +753,7 @@ impl LocalHistoryImportDialog {
             )))
             .w_full()
             .min_w_0()
-            .h(px(36.0))
+            .h(px(LOCAL_HISTORY_SESSION_ROW_HEIGHT))
             .flex_none()
             .items_center()
             .gap_2()
@@ -1146,24 +1157,59 @@ impl Render for LocalHistoryImportDialog {
         let strings = text(locale);
         match self.phase {
             ImportPhase::Scanning => {
+                // The scan walks every installed Agent's on-disk history and
+                // cannot report how many sessions it will find, so the line
+                // keeps the explanation while the cards below give the result
+                // its shape. `scan_sessions` discards the previous result
+                // (`self.scan = None`), so this is always a first load.
                 return v_flex()
                     .size_full()
-                    .items_center()
-                    .justify_center()
                     .gap_3()
-                    .p_8()
                     .child(
-                        div()
-                            .size(px(44.0))
+                        h_flex()
+                            .w_full()
                             .flex_none()
-                            .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(12.0))
-                            .bg(cx.theme().muted.opacity(0.3))
-                            .child(Spinner::new()),
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Spinner::new().xsmall())
+                            .child(strings.scanning),
                     )
-                    .child(div().text_sm().font_medium().child(strings.scanning));
+                    .children((0..LOCAL_HISTORY_LOADING_FOLDERS).map(|folder| {
+                        let rows = LOCAL_HISTORY_LOADING_SESSIONS.saturating_sub(folder);
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.7))
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .h(px(LOCAL_HISTORY_FOLDER_HEADER_HEIGHT))
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_3()
+                                    .bg(cx.theme().muted.opacity(0.32))
+                                    .child(skeleton::skeleton_bar(12.0, 0.30, cx)),
+                            )
+                            .children((0..rows).map(|_| {
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .h(px(LOCAL_HISTORY_SESSION_ROW_HEIGHT))
+                                    .flex_none()
+                                    .items_center()
+                                    .mx_1()
+                                    .px_2()
+                                    .child(skeleton::skeleton_bar(10.0, 0.45, cx))
+                            }))
+                    }));
             }
             ImportPhase::Error => {
                 return v_flex()

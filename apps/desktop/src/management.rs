@@ -73,6 +73,7 @@ use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::resize_seam;
+use crate::skeleton;
 use crate::terminal_surface::TerminalSurface;
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,
@@ -109,6 +110,15 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+/// Agent cards the loading placeholder stands in for. The catalog arrives with
+/// the aggregated snapshot, so its size is unknown until then; the placeholder
+/// fills the list rather than guessing it.
+const MANAGEMENT_AGENT_LOADING_CARDS: usize = 6;
+/// Resource rows the MCP and Skill sidebars stand in for while the snapshot
+/// loads.
+const MANAGEMENT_RESOURCE_LOADING_ROWS: usize = 4;
+/// Provider rows the detail pane stands in for while the snapshot loads.
+const MANAGEMENT_PROVIDER_LOADING_ROWS: usize = 5;
 const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
@@ -9109,18 +9119,19 @@ impl ManagementCenter {
         });
         let mut agent_rows = v_flex().w_full().gap(px(6.0));
         if agents.is_empty() {
-            let (title, description) = if self.loading && self.snapshot.agents.is_empty() {
-                (
-                    management_loading_agents_title(),
-                    management_loading_agents_description(),
-                )
+            if self.loading && self.snapshot.agents.is_empty() {
+                // The catalog arrives with the aggregated snapshot. Without
+                // this the list shows the same box it uses for "no agents"
+                // while the real answer is still in flight, so loading and
+                // empty are indistinguishable.
+                agent_rows = agent_rows.children(management_agent_card_placeholders(cx));
             } else {
-                (
+                agent_rows = agent_rows.child(compact_empty_state(
                     management_no_matching_agents_title(),
                     management_no_matching_agents_description(),
-                )
-            };
-            agent_rows = agent_rows.child(compact_empty_state(title, description, cx));
+                    cx,
+                ));
+            }
         }
         for agent in agents {
             let id = agent.id.as_str().to_string();
@@ -9685,11 +9696,18 @@ impl ManagementCenter {
                     ),
             );
         if servers.is_empty() {
-            rows = rows.child(compact_empty_state(
-                management_no_mcp_title(),
-                management_no_mcp_description(),
-                cx,
-            ));
+            if self.loading && self.snapshot.mcp_servers.is_empty() {
+                // This list has no loading gate of its own, so without this it
+                // states "No MCP servers" while the snapshot is still in
+                // flight. The empty check keeps a refresh's rows on screen.
+                rows = rows.children(management_resource_placeholders(cx));
+            } else {
+                rows = rows.child(compact_empty_state(
+                    management_no_mcp_title(),
+                    management_no_mcp_description(),
+                    cx,
+                ));
+            }
         }
         for server in servers {
             let id = server.id.as_str().to_string();
@@ -9857,11 +9875,17 @@ impl ManagementCenter {
                     ),
             );
         if skills.is_empty() {
-            rows = rows.child(compact_empty_state(
-                management_no_skills_title(),
-                management_no_skills_description(),
-                cx,
-            ));
+            if self.loading && self.snapshot.skills.is_empty() {
+                // Same as the MCP list: no loading gate of its own, so it would
+                // otherwise claim "No Skills" while the snapshot is in flight.
+                rows = rows.children(management_resource_placeholders(cx));
+            } else {
+                rows = rows.child(compact_empty_state(
+                    management_no_skills_title(),
+                    management_no_skills_description(),
+                    cx,
+                ));
+            }
         }
         for skill in skills {
             let id = skill.id.as_str().to_string();
@@ -12821,11 +12845,39 @@ impl ManagementCenter {
             return self.render_custom_agent_editor(cx);
         }
         if self.loading && !self.details_ready {
-            return detail_empty_state(
-                management_loading_agents_title(),
-                management_loading_agents_description(),
+            // The pane is gated on the aggregated snapshot — the slowest stage
+            // of the management refresh — so it would otherwise show the same
+            // box it uses for "no Agent selected" for the whole wait. Keep the
+            // card chrome, which is already known, and stand in for the rows.
+            // `details_ready` stays true on every later refresh, so this is a
+            // first load only.
+            let provider_configuration = management_card_with_icon(
+                copy.provider_configuration,
+                management_locale_text(
+                    "Configure credentials and models for external model services",
+                    "配置外部模型服务所需的凭证与模型",
+                    "設定外部模型服務所需的憑證與模型",
+                ),
+                "icons/vibex/database.svg",
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(MANAGEMENT_PROVIDER_ROW_GAP))
+                    .children(management_provider_placeholders(cx))
+                    .into_any_element(),
                 cx,
             );
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_4()
+                .child(detail_empty_state(
+                    management_loading_agents_title(),
+                    management_loading_agents_description(),
+                    cx,
+                ))
+                .child(provider_configuration)
+                .into_any_element();
         }
         let selected_agent = self
             .snapshot
@@ -19301,6 +19353,110 @@ fn profile_editor_section(
         )
         .child(content)
         .into_any_element()
+}
+
+/// Placeholder cards for the Agent list while the catalog is still loading.
+///
+/// Each one copies the real row's box model — the 8px radius, the hairline
+/// border, `px_2`/`py_2`, the 28px title row, and `gap_1` — so the cards that
+/// replace them land on the same pitch. The list is gated on
+/// `loading && snapshot.agents.is_empty()`, so a refresh that already has rows
+/// keeps them.
+fn management_agent_card_placeholders(cx: &App) -> Vec<AnyElement> {
+    (0..MANAGEMENT_AGENT_LOADING_CARDS)
+        .map(|_| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .overflow_hidden()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.65))
+                .bg(cx.theme().background.opacity(0.70))
+                .px_2()
+                .py_2()
+                .child(
+                    h_flex()
+                        .h(px(28.0))
+                        .items_center()
+                        .px_1()
+                        .child(skeleton::skeleton_bar(12.0, 0.42, cx)),
+                )
+                .child(skeleton::skeleton_bar(14.0, 0.60, cx))
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// Placeholder rows for the MCP and Skill sidebars while the snapshot loads.
+///
+/// Both lists are full-width select buttons at
+/// [`MANAGEMENT_PROVIDER_ROW_HEIGHT`] with an 8px radius, a hairline border,
+/// and a leading glyph beside a title and a subtitle line, so the rows that
+/// replace these land on the same pitch.
+fn management_resource_placeholders(cx: &App) -> Vec<AnyElement> {
+    (0..MANAGEMENT_RESOURCE_LOADING_ROWS)
+        .map(|_| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .bg(cx.theme().background.opacity(0.70))
+                .px(px(10.0))
+                .py_2()
+                .child(skeleton::skeleton_bar(28.0, 0.09, cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(skeleton::skeleton_bar(12.0, 0.44, cx))
+                        .child(skeleton::skeleton_bar(10.0, 0.30, cx)),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// Placeholder rows for the provider configuration list.
+///
+/// Rows use [`MANAGEMENT_PROVIDER_ROW_HEIGHT`] and
+/// [`MANAGEMENT_PROVIDER_ROW_GAP`], the same pitch the real provider rows are
+/// laid out on, so the list does not resize when the snapshot lands.
+fn management_provider_placeholders(cx: &App) -> Vec<AnyElement> {
+    (0..MANAGEMENT_PROVIDER_LOADING_ROWS)
+        .map(|_| {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .h(px(MANAGEMENT_PROVIDER_ROW_HEIGHT))
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .bg(cx.theme().background.opacity(0.70))
+                .px_3()
+                .child(skeleton::skeleton_bar(18.0, 0.04, cx))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        .child(skeleton::skeleton_bar(12.0, 0.36, cx))
+                        .child(skeleton::skeleton_bar(10.0, 0.52, cx)),
+                )
+                .child(skeleton::skeleton_bar(20.0, 0.08, cx))
+                .into_any_element()
+        })
+        .collect()
 }
 
 fn compact_empty_state(
