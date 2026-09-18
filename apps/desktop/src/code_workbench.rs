@@ -7189,6 +7189,7 @@ impl CodeWorkbench {
                     h_flex()
                         .h(px(38.0))
                         .flex_none()
+                        .items_center()
                         .justify_between()
                         .gap_2()
                         .px_2()
@@ -7200,45 +7201,19 @@ impl CodeWorkbench {
                                 .min_w_0()
                                 .flex_1()
                                 .gap_2()
-                                .child(file_tree_icon_sized(
-                                    file_icon_descriptor(
-                                        Path::new(&path)
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or(path.as_str()),
-                                        FileEntryKind::File,
-                                    )
-                                    .kind,
-                                    false,
-                                    px(15.0),
-                                    cx,
-                                ))
                                 .child(
-                                    v_flex()
+                                    div()
                                         .min_w_0()
                                         .flex_1()
-                                        .gap_0p5()
+                                        .truncate()
+                                        .text_xs()
+                                        .font_medium()
                                         .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .font_medium()
-                                                .child(
-                                                    Path::new(&path)
-                                                        .file_name()
-                                                        .and_then(|name| name.to_str())
-                                                        .unwrap_or(path.as_str())
-                                                        .to_string(),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(path.clone()),
+                                            Path::new(&path)
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or(path.as_str())
+                                                .to_string(),
                                         ),
                                 )
                                 .child(preview_badge(locale::text("Preview", "预览", "預覽"), cx)),
@@ -7248,7 +7223,7 @@ impl CodeWorkbench {
                                 .small()
                                 .ghost()
                                 .compact()
-                                .icon(IconName::Replace)
+                                .icon(Icon::default().path("icons/vibex/pencil.svg"))
                                 .tooltip(locale::text(
                                     "Edit Markdown source",
                                     "编辑 Markdown 源文件",
@@ -7359,6 +7334,7 @@ impl CodeWorkbench {
                     h_flex()
                         .h(px(38.0))
                         .flex_none()
+                        .items_center()
                         .justify_between()
                         .gap_2()
                         .px_2()
@@ -7370,12 +7346,6 @@ impl CodeWorkbench {
                                 .min_w_0()
                                 .flex_1()
                                 .gap_2()
-                                .child(file_tree_icon_sized(
-                                    file_icon_descriptor(&file_name, FileEntryKind::File).kind,
-                                    false,
-                                    px(15.0),
-                                    cx,
-                                ))
                                 .child(
                                     v_flex()
                                         .min_w_0()
