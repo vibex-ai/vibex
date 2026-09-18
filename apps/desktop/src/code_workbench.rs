@@ -10,12 +10,13 @@ use crate::terminal_transport::{
 };
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
-    DragMoveEvent, Entity, FocusHandle, Hsla, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState,
-    MouseButton, MouseDownEvent, Orientation, ParentElement as _, PathBuilder, Render, RenderImage,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    canvas, deferred, div, img, list, point, prelude::*, px, relative, uniform_list,
+    DragMoveEvent, Entity, FocusHandle, Focusable as _, Hsla, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
+    ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, MouseDownEvent, Orientation,
+    ParentElement as _, PathBuilder, Render, RenderImage, Role, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    Task, UniformListScrollHandle, WeakEntity, Window, canvas, deferred, div, img, list, point,
+    prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
@@ -61,15 +62,15 @@ use vibex_core::{
     VibexError, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    BoundedImageCache, ContentPreviewKind, EditorBufferAvailability, EditorBufferRegistry,
-    EditorExternalState, EditorRecoverySnapshot, FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind,
-    FileMutationKind, FileTreeLoadState, FileTreeProjection, GitCommitPatchRow, GitMutationKind,
-    GitPathSelectionState, GitQueryKind, GitSelectionKey, GitTreeRow, GitTreeRowKind,
-    GitWorkbenchMode, GitWorkbenchState, ImageCacheKey, PendingFileMutation,
-    PreviewCloseDisposition, PreviewPane, PreviewSplitNode, PreviewSplitPosition, PreviewState,
-    PreviewTab, PreviewTarget, UnifiedDiffLineKind, WorktreeLifecycleDisplayState,
-    WorktreeLifecycleView, content_preview_kind, content_preview_kind_for_path,
-    file_icon_descriptor, mutation_scope,
+    BoundedImageCache, ContentPreviewKind, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, EditorAutosaveMode,
+    EditorBufferAvailability, EditorBufferRegistry, EditorExternalState, EditorRecoverySnapshot,
+    FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind, FileMutationKind, FileTreeLoadState,
+    FileTreeProjection, GitCommitPatchRow, GitMutationKind, GitPathSelectionState, GitQueryKind,
+    GitSelectionKey, GitTreeRow, GitTreeRowKind, GitWorkbenchMode, GitWorkbenchState,
+    ImageCacheKey, PendingFileMutation, PreviewCloseDisposition, PreviewPane, PreviewSplitNode,
+    PreviewSplitPosition, PreviewState, PreviewTab, PreviewTarget, UnifiedDiffLineKind,
+    WorktreeLifecycleDisplayState, WorktreeLifecycleView, clamp_editor_autosave_delay_ms,
+    content_preview_kind, content_preview_kind_for_path, file_icon_descriptor, mutation_scope,
 };
 use vibex_desktop_runtime::validate_external_open_url;
 use vibex_markdown::{
@@ -312,6 +313,8 @@ pub(crate) struct CodeWorkbenchPersistedState {
     pub recovery: Option<EditorRecoverySnapshot>,
     pub editor_soft_wrap: bool,
     pub editor_show_whitespaces: bool,
+    pub editor_autosave: EditorAutosaveMode,
+    pub editor_autosave_delay_ms: u64,
     pub workspace_id: Option<String>,
     pub selected_file_path: Option<String>,
     pub selected_git_path: Option<String>,
@@ -1052,6 +1055,12 @@ pub struct CodeWorkbench {
     code_font_size: u16,
     editor_soft_wrap: bool,
     editor_show_whitespaces: bool,
+    editor_autosave: EditorAutosaveMode,
+    editor_autosave_delay_ms: u64,
+    autosave_generation: u64,
+    autosave_task: Option<Task<()>>,
+    pending_close_after_save: BTreeSet<String>,
+    window_activation_subscription: Option<Subscription>,
 }
 
 impl gpui::EventEmitter<CodeWorkbenchEvent> for CodeWorkbench {}
@@ -1070,6 +1079,8 @@ impl CodeWorkbench {
         code_font_size: u16,
         editor_soft_wrap: bool,
         editor_show_whitespaces: bool,
+        editor_autosave: EditorAutosaveMode,
+        editor_autosave_delay_ms: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1085,6 +1096,8 @@ impl CodeWorkbench {
             code_font_size,
             editor_soft_wrap,
             editor_show_whitespaces,
+            editor_autosave,
+            editor_autosave_delay_ms,
             window,
             cx,
         )
@@ -1103,6 +1116,8 @@ impl CodeWorkbench {
         code_font_size: u16,
         editor_soft_wrap: bool,
         editor_show_whitespaces: bool,
+        editor_autosave: EditorAutosaveMode,
+        editor_autosave_delay_ms: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1115,7 +1130,7 @@ impl CodeWorkbench {
                 .rows(3)
                 .placeholder(locale::text("Commit message", "提交信息", "提交訊息"))
         });
-        Self {
+        let mut this = Self {
             parent,
             backend: None,
             terminal_transport: None,
@@ -1197,7 +1212,21 @@ impl CodeWorkbench {
             code_font_size,
             editor_soft_wrap,
             editor_show_whitespaces,
-        }
+            editor_autosave,
+            editor_autosave_delay_ms: clamp_editor_autosave_delay_ms(editor_autosave_delay_ms),
+            autosave_generation: 0,
+            autosave_task: None,
+            pending_close_after_save: BTreeSet::new(),
+            window_activation_subscription: None,
+        };
+        this.window_activation_subscription =
+            Some(cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() || !this.editor_autosave.saves_on_focus_change() {
+                    return;
+                }
+                this.autosave_dirty_editors(cx);
+            }));
+        this
     }
 
     pub fn fixture(
@@ -1217,6 +1246,8 @@ impl CodeWorkbench {
             13,
             false,
             false,
+            EditorAutosaveMode::default(),
+            DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
             window,
             cx,
         );
@@ -1612,6 +1643,8 @@ impl CodeWorkbench {
             recovery,
             editor_soft_wrap: self.editor_soft_wrap,
             editor_show_whitespaces: self.editor_show_whitespaces,
+            editor_autosave: self.editor_autosave,
+            editor_autosave_delay_ms: self.editor_autosave_delay_ms,
             workspace_id: self
                 .workspace
                 .as_ref()
@@ -1664,6 +1697,95 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    /// Apply the autosave preference selected in Settings.
+    pub fn set_editor_autosave(
+        &mut self,
+        mode: EditorAutosaveMode,
+        delay_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let delay_ms = clamp_editor_autosave_delay_ms(delay_ms);
+        if self.editor_autosave == mode && self.editor_autosave_delay_ms == delay_ms {
+            return;
+        }
+        self.editor_autosave = mode;
+        self.editor_autosave_delay_ms = delay_ms;
+        if mode.idle_delay_ms(delay_ms).is_none() {
+            // Manual and focus-change modes own no idle timer, so a pending
+            // write scheduled by the previous mode must not fire.
+            self.autosave_generation = self.autosave_generation.wrapping_add(1);
+            self.autosave_task = None;
+        }
+        cx.notify();
+    }
+
+    /// Write a buffer back once editing pauses for the configured delay.
+    fn schedule_editor_autosave(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(delay_ms) = self
+            .editor_autosave
+            .idle_delay_ms(self.editor_autosave_delay_ms)
+        else {
+            return;
+        };
+        self.autosave_generation = self.autosave_generation.wrapping_add(1);
+        let generation = self.autosave_generation;
+        let background = cx.background_executor().clone();
+        self.autosave_task = Some(cx.spawn(async move |entity, cx| {
+            background.timer(Duration::from_millis(delay_ms)).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.autosave_generation != generation {
+                    return;
+                }
+                this.autosave_task = None;
+                this.autosave_editor(path, cx);
+            });
+        }));
+    }
+
+    /// Start an automatic write for one buffer when it still has unsaved edits.
+    fn autosave_editor(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self
+            .editors
+            .buffers
+            .get(&path)
+            .is_some_and(|buffer| buffer.autosave_ready())
+        {
+            return;
+        }
+        self.save_editor(path, cx);
+    }
+
+    /// Write every buffer with unsaved edits, used when focus leaves the window.
+    fn autosave_dirty_editors(&mut self, cx: &mut Context<Self>) {
+        let paths = self
+            .editors
+            .dirty_paths()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.autosave_editor(path, cx);
+        }
+    }
+
+    /// Hand a dirty buffer to the autosave path instead of reporting unsaved
+    /// work, and remember to close its tab once the write lands.
+    fn autosave_before_close(&mut self, path: &str, cx: &mut Context<Self>) -> bool {
+        if !self.editor_autosave.writes_pending_edits()
+            || !self
+                .editors
+                .buffers
+                .get(path)
+                .is_some_and(|buffer| buffer.autosave_ready())
+        {
+            return false;
+        }
+        if !self.save_editor(path.to_string(), cx) {
+            return false;
+        }
+        self.pending_close_after_save.insert(path.to_string());
+        true
+    }
+
     pub fn sync_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_message.update(cx, |input, cx| {
             input.set_placeholder(
@@ -1694,6 +1816,8 @@ impl CodeWorkbench {
         code_font_size: u16,
         editor_soft_wrap: bool,
         editor_show_whitespaces: bool,
+        editor_autosave: EditorAutosaveMode,
+        editor_autosave_delay_ms: u64,
         cx: &mut Context<Self>,
     ) {
         debug_assert!(
@@ -1726,6 +1850,11 @@ impl CodeWorkbench {
         self.code_font_size = code_font_size.clamp(10, 24);
         self.editor_soft_wrap = editor_soft_wrap;
         self.editor_show_whitespaces = editor_show_whitespaces;
+        self.editor_autosave = editor_autosave;
+        self.editor_autosave_delay_ms = clamp_editor_autosave_delay_ms(editor_autosave_delay_ms);
+        self.autosave_generation = self.autosave_generation.wrapping_add(1);
+        self.autosave_task = None;
+        self.pending_close_after_save.clear();
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
         self.sync_terminal_surface_activity(cx);
@@ -3922,11 +4051,21 @@ impl CodeWorkbench {
                 .get_mut(&path)
                 .is_some_and(|buffer| buffer.update_content(value))
             {
+                this.schedule_editor_autosave(path, cx);
                 this.persist_editor_recovery(cx);
                 cx.notify();
             }
         });
         self.editor_subscriptions.push(subscription);
+        let blur_path = path.to_string();
+        let focus_handle = input.read(cx).focus_handle(cx);
+        let blur_subscription = cx.on_blur(&focus_handle, window, move |this, _, cx| {
+            if !this.editor_autosave.saves_on_focus_change() {
+                return;
+            }
+            this.autosave_editor(blur_path.clone(), cx);
+        });
+        self.editor_subscriptions.push(blur_subscription);
         self.editor_bindings.insert(
             path.to_string(),
             EditorBinding {
@@ -4536,15 +4675,17 @@ impl CodeWorkbench {
         cx.notify();
     }
 
-    pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) {
+    /// Start writing an editor buffer back to disk. Returns whether a write was
+    /// actually queued, so autosave can tell a started save from a refused one.
+    pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) -> bool {
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
-            return;
+            return false;
         };
         let Some(ticket) = self.editors.begin_save(&path) else {
             self.error = Some("The editor is not ready to save or has an external conflict".into());
             cx.notify();
-            return;
+            return false;
         };
         let request_id = ticket.request_id;
         let request = ticket.into_request(workspace.id);
@@ -4559,13 +4700,16 @@ impl CodeWorkbench {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.file_tasks.remove(&format!("save:{task_path}"));
+                let close_after_save = this.pending_close_after_save.remove(&task_path);
                 let Some(buffer) = this.editors.buffers.get_mut(&task_path) else {
                     return;
                 };
+                let mut stored = false;
                 match outcome {
                     Ok(Ok(file)) => {
                         buffer.finish_save(request_id, file);
                         this.note = Some(format!("Saved {task_path}"));
+                        stored = true;
                     }
                     Ok(Err(error)) => {
                         buffer.fail_save(request_id, &error.code);
@@ -4579,6 +4723,26 @@ impl CodeWorkbench {
                         this.error = Some(format!("file save task failed: {error}"));
                     }
                 }
+                // An autosave only closes the gap it was scheduled for: edits
+                // made while the write was in flight stay unsaved and either
+                // wait for the next idle window or keep the tab open. A failed
+                // write is never retried on its own — the next edit re-arms it.
+                let still_dirty = this
+                    .editors
+                    .buffers
+                    .get(&task_path)
+                    .is_some_and(|buffer| buffer.dirty);
+                if stored && close_after_save && !still_dirty {
+                    this.close_tab(format!("file:{task_path}"), false, cx);
+                } else if stored
+                    && still_dirty
+                    && this
+                        .editor_autosave
+                        .idle_delay_ms(this.editor_autosave_delay_ms)
+                        .is_some()
+                {
+                    this.schedule_editor_autosave(task_path.clone(), cx);
+                }
                 this.persist(cx);
                 this.persist_editor_recovery(cx);
                 cx.notify();
@@ -4586,6 +4750,7 @@ impl CodeWorkbench {
         });
         self.file_tasks.insert(format!("save:{path}"), task);
         cx.notify();
+        true
     }
 
     pub(crate) fn save_active_editor(&mut self, cx: &mut Context<Self>) {
@@ -4740,7 +4905,15 @@ impl CodeWorkbench {
                 self.error = Some("Unpin the tab before closing it".into())
             }
             PreviewCloseDisposition::Protected => {
-                self.error = Some("Save or discard the dirty editor before closing it".into())
+                // With autosave on, the pending edit is already on its way to
+                // disk: queue the write and close once it lands instead of
+                // asking the user to save work they never meant to keep.
+                let queued = tab_id
+                    .strip_prefix("file:")
+                    .is_some_and(|path| self.autosave_before_close(path, cx));
+                if !queued {
+                    self.error = Some("Save or discard the dirty editor before closing it".into());
+                }
             }
             PreviewCloseDisposition::Missing => {}
         }
@@ -7503,7 +7676,7 @@ impl CodeWorkbench {
                                         .tooltip(locale::text("Save file", "保存文件", "儲存檔案"))
                                         .disabled(!editable || !dirty || pending_save)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.save_editor(save_path.clone(), cx)
+                                            let _ = this.save_editor(save_path.clone(), cx);
                                         })),
                                 ),
                         ),
@@ -16128,6 +16301,106 @@ mod tests {
         });
         let after_relevant = right_rail.read_with(cx, |right_rail, _| right_rail.render_count);
         assert!(after_relevant > after_unrelated);
+    }
+
+    /// The fixture already binds an editor for `README.md`, so typing into that
+    /// input is the real edit path an autosave has to react to.
+    fn fixture_editor_input(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<CodeWorkbench>,
+        Entity<EditorState>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (fixture, cx) = cx.add_window_view(|window, cx| {
+            CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Files, window, cx)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let workbench = fixture.read_with(cx, |fixture, _| fixture.workbench.clone());
+        let input = workbench
+            .read_with(cx, |this, _| {
+                this.editor_bindings
+                    .get("README.md")
+                    .map(|binding| binding.input.clone())
+            })
+            .expect("the files fixture binds the README editor");
+        (workbench, input, cx)
+    }
+
+    fn type_into_editor(input: &Entity<EditorState>, text: &str, cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.insert(text, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn idle_autosave_waits_for_the_configured_delay(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| {
+            this.set_editor_autosave(EditorAutosaveMode::AfterDelay, 500, cx);
+        });
+
+        type_into_editor(&input, "edited", cx);
+        assert!(
+            workbench.read_with(cx, |this, _| this.autosave_task.is_some()),
+            "an edit must arm the idle timer"
+        );
+        assert!(workbench.read_with(cx, |this, _| {
+            this.editors
+                .buffers
+                .get("README.md")
+                .is_some_and(|buffer| buffer.dirty)
+        }));
+
+        // Before the delay elapses the write has not been attempted yet.
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_some()));
+
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert!(
+            workbench.read_with(cx, |this, _| this.autosave_task.is_none()),
+            "the idle timer must retire once it fires"
+        );
+    }
+
+    #[gpui::test]
+    fn manual_and_focus_change_modes_run_no_idle_timer(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+
+        workbench.update(cx, |this, cx| {
+            this.set_editor_autosave(EditorAutosaveMode::Manual, 500, cx);
+        });
+        type_into_editor(&input, "manual", cx);
+        assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_none()));
+
+        workbench.update(cx, |this, cx| {
+            this.set_editor_autosave(EditorAutosaveMode::OnFocusChange, 500, cx);
+        });
+        type_into_editor(&input, "focus", cx);
+        assert!(
+            workbench.read_with(cx, |this, _| this.autosave_task.is_none()),
+            "focus-change mode saves on blur, not on a timer"
+        );
+
+        // Switching back to manual has to cancel a timer armed by the delay mode.
+        workbench.update(cx, |this, cx| {
+            this.set_editor_autosave(EditorAutosaveMode::AfterDelay, 500, cx);
+        });
+        type_into_editor(&input, "delay", cx);
+        assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_some()));
+        workbench.update(cx, |this, cx| {
+            this.set_editor_autosave(EditorAutosaveMode::Manual, 500, cx);
+        });
+        assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_none()));
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_none()));
     }
 
     #[test]

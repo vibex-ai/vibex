@@ -602,6 +602,59 @@ impl SidebarUiState {
     }
 }
 
+/// When the file editor writes an edited buffer back to disk.
+///
+/// The default keeps the desktop honest about durability: edits reach the file
+/// once typing pauses, and an explicit save stays available in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EditorAutosaveMode {
+    /// Only the explicit save action writes the file.
+    Manual,
+    /// Write the file once editing pauses for the configured delay.
+    #[default]
+    AfterDelay,
+    /// Write the file when the editor or the window loses focus.
+    OnFocusChange,
+}
+
+impl EditorAutosaveMode {
+    /// Delay before an idle editor is written back, or `None` when this mode
+    /// does not save on a timer.
+    pub fn idle_delay_ms(self, configured_ms: u64) -> Option<u64> {
+        match self {
+            Self::AfterDelay => Some(clamp_editor_autosave_delay_ms(configured_ms)),
+            Self::Manual | Self::OnFocusChange => None,
+        }
+    }
+
+    /// Whether leaving the editor writes pending edits back.
+    pub fn saves_on_focus_change(self) -> bool {
+        matches!(self, Self::OnFocusChange)
+    }
+
+    /// Whether pending edits are written instead of being reported as unsaved
+    /// work when a tab or the workbench goes away.
+    pub fn writes_pending_edits(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+}
+
+pub const DEFAULT_EDITOR_AUTOSAVE_DELAY_MS: u64 = 1_000;
+pub const MIN_EDITOR_AUTOSAVE_DELAY_MS: u64 = 250;
+pub const MAX_EDITOR_AUTOSAVE_DELAY_MS: u64 = 5_000;
+
+/// Keep a persisted or user-provided autosave delay inside the range the
+/// editor is willing to wait, so a stale or hand-edited value cannot stall
+/// durability or spin the timer.
+pub fn clamp_editor_autosave_delay_ms(milliseconds: u64) -> u64 {
+    milliseconds.clamp(MIN_EDITOR_AUTOSAVE_DELAY_MS, MAX_EDITOR_AUTOSAVE_DELAY_MS)
+}
+
+fn default_editor_autosave_delay_ms() -> u64 {
+    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewUiState {
@@ -616,6 +669,10 @@ pub struct PreviewUiState {
     pub editor_soft_wrap: bool,
     #[serde(default)]
     pub editor_show_whitespaces: bool,
+    #[serde(default)]
+    pub editor_autosave: EditorAutosaveMode,
+    #[serde(default = "default_editor_autosave_delay_ms")]
+    pub editor_autosave_delay_ms: u64,
 }
 
 impl Default for PreviewUiState {
@@ -628,6 +685,8 @@ impl Default for PreviewUiState {
             editor_recovery: crate::EditorRecoverySnapshot::default(),
             editor_soft_wrap: false,
             editor_show_whitespaces: false,
+            editor_autosave: EditorAutosaveMode::default(),
+            editor_autosave_delay_ms: DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
         }
     }
 }
@@ -1031,6 +1090,8 @@ impl DesktopUiStateV1 {
         let mut recovery = crate::EditorBufferRegistry::default();
         recovery.restore_recovery(std::mem::take(&mut self.preview.editor_recovery));
         self.preview.editor_recovery = recovery.recovery_snapshot();
+        self.preview.editor_autosave_delay_ms =
+            clamp_editor_autosave_delay_ms(self.preview.editor_autosave_delay_ms);
         normalize_ids(&mut self.terminal.tab_order, 500);
         self.terminal.selected_terminal_id =
             bounded_optional(self.terminal.selected_terminal_id.take(), 256);
@@ -1777,10 +1838,82 @@ mod tests {
         let preview = legacy.as_object_mut().unwrap();
         preview.remove("editorSoftWrap");
         preview.remove("editorShowWhitespaces");
+        preview.remove("editorAutosave");
+        preview.remove("editorAutosaveDelayMs");
 
         let restored: PreviewUiState = serde_json::from_value(legacy).unwrap();
         assert!(!restored.editor_soft_wrap);
         assert!(!restored.editor_show_whitespaces);
+        assert_eq!(restored.editor_autosave, EditorAutosaveMode::AfterDelay);
+        assert_eq!(
+            restored.editor_autosave_delay_ms,
+            DEFAULT_EDITOR_AUTOSAVE_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn editor_autosave_preferences_round_trip_through_json() {
+        let mut state = PreviewUiState::default();
+        state.editor_autosave = EditorAutosaveMode::OnFocusChange;
+        state.editor_autosave_delay_ms = 2_500;
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            encoded["editorAutosave"],
+            serde_json::json!("onFocusChange")
+        );
+        assert_eq!(encoded["editorAutosaveDelayMs"], serde_json::json!(2_500));
+
+        let restored: PreviewUiState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn editor_autosave_policy_stays_bounded_and_explicit() {
+        assert_eq!(
+            EditorAutosaveMode::default(),
+            EditorAutosaveMode::AfterDelay
+        );
+        assert_eq!(EditorAutosaveMode::Manual.idle_delay_ms(1_000), None);
+        assert_eq!(EditorAutosaveMode::OnFocusChange.idle_delay_ms(1_000), None);
+        assert_eq!(
+            EditorAutosaveMode::AfterDelay.idle_delay_ms(1_000),
+            Some(1_000)
+        );
+        assert_eq!(
+            EditorAutosaveMode::AfterDelay.idle_delay_ms(0),
+            Some(MIN_EDITOR_AUTOSAVE_DELAY_MS)
+        );
+        assert_eq!(
+            EditorAutosaveMode::AfterDelay.idle_delay_ms(u64::MAX),
+            Some(MAX_EDITOR_AUTOSAVE_DELAY_MS)
+        );
+
+        assert!(EditorAutosaveMode::OnFocusChange.saves_on_focus_change());
+        assert!(!EditorAutosaveMode::AfterDelay.saves_on_focus_change());
+        assert!(!EditorAutosaveMode::Manual.saves_on_focus_change());
+
+        assert!(!EditorAutosaveMode::Manual.writes_pending_edits());
+        assert!(EditorAutosaveMode::AfterDelay.writes_pending_edits());
+        assert!(EditorAutosaveMode::OnFocusChange.writes_pending_edits());
+    }
+
+    #[test]
+    fn normalize_clamps_a_hand_edited_autosave_delay() {
+        let mut state = DesktopUiStateV1::default();
+        state.preview.editor_autosave_delay_ms = 1;
+        state.normalize().unwrap();
+        assert_eq!(
+            state.preview.editor_autosave_delay_ms,
+            MIN_EDITOR_AUTOSAVE_DELAY_MS
+        );
+
+        state.preview.editor_autosave_delay_ms = 120_000;
+        state.normalize().unwrap();
+        assert_eq!(
+            state.preview.editor_autosave_delay_ms,
+            MAX_EDITOR_AUTOSAVE_DELAY_MS
+        );
     }
 
     #[test]

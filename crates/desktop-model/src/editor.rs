@@ -131,6 +131,12 @@ impl EditorBufferModel {
             && !matches!(self.external, EditorExternalState::Deleted)
     }
 
+    /// Whether an automatic write can start right now: the buffer holds edits
+    /// the file does not, and no write of it is already in flight.
+    pub fn autosave_ready(&self) -> bool {
+        self.dirty && self.pending_save.is_none() && self.editable()
+    }
+
     pub fn update_content(&mut self, content: impl Into<String>) -> bool {
         if !self.editable() {
             return false;
@@ -565,6 +571,29 @@ mod tests {
             },
             content_revision: revision.into(),
         }
+    }
+
+    #[test]
+    fn autosave_ready_only_for_unsaved_editable_buffers() {
+        let mut buffer = EditorBufferModel::from_read(read("src/lib.rs", "one\n", "r1"));
+        assert!(
+            !buffer.autosave_ready(),
+            "a clean buffer has nothing to write"
+        );
+
+        assert!(buffer.update_content("two\n"));
+        assert!(buffer.autosave_ready());
+
+        let _ticket = buffer.begin_save(3).unwrap();
+        assert!(
+            !buffer.autosave_ready(),
+            "an in-flight write must not be started twice"
+        );
+        assert!(buffer.fail_save(3, "file_write_failed"));
+        assert!(buffer.autosave_ready());
+
+        buffer.availability = EditorBufferAvailability::LargeFileReadOnly;
+        assert!(!buffer.autosave_ready());
     }
 
     #[test]

@@ -108,8 +108,9 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
-    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, FpsMonitorPlacement,
-    GitSelectionKey, GitWorkbenchMode, LocaleMode, MessageSendKey, NavigationHistory,
+    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState,
+    EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey, GitWorkbenchMode, LocaleMode,
+    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
     NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
     NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
     RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
@@ -122,7 +123,7 @@ use vibex_desktop_model::{
     TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
     TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
     WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    complete_string_order, composer_trigger_at, current_agent_plan,
+    clamp_editor_autosave_delay_ms, complete_string_order, composer_trigger_at, current_agent_plan,
     custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
     move_strings_relative, ordered_agent_ids, parse_unified_diff,
     sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
@@ -519,6 +520,9 @@ const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
 const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
 const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 760.0;
+/// One press of the autosave-delay stepper. The delay stays inside the bounds
+/// the editor model clamps to.
+const AUTOSAVE_DELAY_STEP_MS: i64 = 250;
 const SETTINGS_VERTICAL_TABS_MIN_WIDTH: f32 = 768.0;
 const SETTINGS_NAVIGATION_WIDTH: f32 = 256.0;
 const SETTINGS_NAVIGATION_ROW_HEIGHT: f32 = 34.0;
@@ -5994,6 +5998,8 @@ impl VibexWorkbench {
         let restored_selected_terminal_id = ui_state.terminal.selected_terminal_id.clone();
         let restored_editor_soft_wrap = ui_state.preview.editor_soft_wrap;
         let restored_editor_show_whitespaces = ui_state.preview.editor_show_whitespaces;
+        let restored_editor_autosave = ui_state.preview.editor_autosave;
+        let restored_editor_autosave_delay_ms = ui_state.preview.editor_autosave_delay_ms;
         let restored_right_rail_mode =
             right_rail_mode_from_activity_id(ui_state.right_rail.selected_activity_id.as_deref());
         let code_font_family = ui_state
@@ -6016,6 +6022,8 @@ impl VibexWorkbench {
                 code_font_size,
                 restored_editor_soft_wrap,
                 restored_editor_show_whitespaces,
+                restored_editor_autosave,
+                restored_editor_autosave_delay_ms,
                 window,
                 cx,
             );
@@ -7003,6 +7011,8 @@ impl VibexWorkbench {
         let recovery = self.ui_state.preview.editor_recovery.clone();
         let editor_soft_wrap = self.ui_state.preview.editor_soft_wrap;
         let editor_show_whitespaces = self.ui_state.preview.editor_show_whitespaces;
+        let editor_autosave = self.ui_state.preview.editor_autosave;
+        let editor_autosave_delay_ms = self.ui_state.preview.editor_autosave_delay_ms;
         let workspace_id = self.ui_state.workbench.selected_workspace_id.clone();
         let right_rail_mode = right_rail_mode_from_activity_id(
             self.ui_state.right_rail.selected_activity_id.as_deref(),
@@ -7017,6 +7027,8 @@ impl VibexWorkbench {
                 code_font_size,
                 editor_soft_wrap,
                 editor_show_whitespaces,
+                editor_autosave,
+                editor_autosave_delay_ms,
                 cx,
             );
             workbench.right_rail_mode = right_rail_mode;
@@ -24993,6 +25005,8 @@ impl VibexWorkbench {
         }
         self.ui_state.preview.editor_soft_wrap = state.editor_soft_wrap;
         self.ui_state.preview.editor_show_whitespaces = state.editor_show_whitespaces;
+        self.ui_state.preview.editor_autosave = state.editor_autosave;
+        self.ui_state.preview.editor_autosave_delay_ms = state.editor_autosave_delay_ms;
         self.ui_state.workbench.selected_workspace_id = state.workspace_id;
         self.ui_state.workbench.selected_file_path = state.selected_file_path;
         self.ui_state.workbench.selected_git_path = state.selected_git_path;
@@ -26882,6 +26896,8 @@ impl VibexWorkbench {
         let recovery = snapshot.preview.editor_recovery.clone();
         let editor_soft_wrap = snapshot.preview.editor_soft_wrap;
         let editor_show_whitespaces = snapshot.preview.editor_show_whitespaces;
+        let editor_autosave = snapshot.preview.editor_autosave;
+        let editor_autosave_delay_ms = snapshot.preview.editor_autosave_delay_ms;
         let workspace_id = snapshot.workbench.selected_workspace_id.clone();
         let right_rail_mode =
             right_rail_mode_from_activity_id(snapshot.right_rail.selected_activity_id.as_deref());
@@ -26920,6 +26936,8 @@ impl VibexWorkbench {
                 code_font_size,
                 editor_soft_wrap,
                 editor_show_whitespaces,
+                editor_autosave,
+                editor_autosave_delay_ms,
                 cx,
             );
             workbench.right_rail_mode = right_rail_mode;
@@ -50740,6 +50758,35 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             &["reset", "layout", "重置", "重設"],
         ),
         settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Autosave", "自动保存", "自動儲存"),
+            locale::text(
+                "Write edited files without asking. Manual keeps the save shortcut as the only way to store changes.",
+                "自动写回已编辑的文件；选择手动保存时，只有保存快捷键会写入更改。",
+                "自動寫回已編輯的檔案；選擇手動儲存時，只有儲存快速鍵會寫入變更。",
+            ),
+            &[
+                "autosave",
+                "auto save",
+                "save",
+                "editor",
+                "自动保存",
+                "自動儲存",
+                "保存",
+                "儲存",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
+            locale::text("Autosave delay", "自动保存延迟", "自動儲存延遲"),
+            locale::text(
+                "How long typing must pause before the file is written.",
+                "停止输入多久之后将文件写入磁盘。",
+                "停止輸入多久之後將檔案寫入磁碟。",
+            ),
+            &["autosave", "delay", "idle", "延迟", "延遲"],
+        ),
+        settings_search_candidate(
             SettingsSection::Terminal,
             locale::text("Default shell", "默认 Shell", "預設 Shell"),
             locale::text(
@@ -52056,6 +52103,36 @@ impl FoundationSettings {
         let _ = self
             .workbench
             .update(cx, |this, cx| this.set_sidebar_hierarchy_mode(mode, cx));
+        cx.notify();
+    }
+
+    fn set_editor_autosave_mode(&mut self, mode: EditorAutosaveMode, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            let delay_ms = this.ui_state.preview.editor_autosave_delay_ms;
+            this.ui_state.preview.editor_autosave = mode;
+            this.code_workbench.update(cx, |workbench, cx| {
+                workbench.set_editor_autosave(mode, delay_ms, cx);
+            });
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn adjust_editor_autosave_delay(&mut self, delta_ms: i64, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            let current =
+                i64::try_from(this.ui_state.preview.editor_autosave_delay_ms).unwrap_or(i64::MAX);
+            let next = u64::try_from(current.saturating_add(delta_ms).max(0)).unwrap_or(0);
+            let next = clamp_editor_autosave_delay_ms(next);
+            this.ui_state.preview.editor_autosave_delay_ms = next;
+            let mode = this.ui_state.preview.editor_autosave;
+            this.code_workbench.update(cx, |workbench, cx| {
+                workbench.set_editor_autosave(mode, next, cx);
+            });
+            this.queue_ui_state();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -53516,6 +53593,40 @@ impl FoundationSettings {
                 this.ui_state.sidebar.project_location_preferences.len()
             })
             .unwrap_or(0);
+        let autosave = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.preview.editor_autosave)
+            .unwrap_or_default();
+        let autosave_delay_ms = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.preview.editor_autosave_delay_ms)
+            .unwrap_or(DEFAULT_EDITOR_AUTOSAVE_DELAY_MS);
+        let autosave_control = settings_segmented_control(
+            "editor-autosave",
+            vec![
+                settings_segmented_option(
+                    locale::text("Manual", "手动保存", "手動儲存"),
+                    autosave == EditorAutosaveMode::Manual,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_editor_autosave_mode(EditorAutosaveMode::Manual, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("After delay", "延迟保存", "延遲儲存"),
+                    autosave == EditorAutosaveMode::AfterDelay,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_editor_autosave_mode(EditorAutosaveMode::AfterDelay, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("On focus change", "失焦保存", "失焦儲存"),
+                    autosave == EditorAutosaveMode::OnFocusChange,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_editor_autosave_mode(EditorAutosaveMode::OnFocusChange, cx)
+                    }),
+                ),
+            ],
+        );
         let location_control = settings_segmented_control(
             "default-session-location",
             vec![
@@ -53577,6 +53688,42 @@ impl FoundationSettings {
                 });
                 cx.notify();
             }));
+        let autosave_delay_row = (autosave == EditorAutosaveMode::AfterDelay).then(|| {
+            setting_row(
+                locale::text("Autosave delay", "自动保存延迟", "自動儲存延遲"),
+                locale::text(
+                    "How long typing must pause before the file is written.",
+                    "停止输入多久之后将文件写入磁盘。",
+                    "停止輸入多久之後將檔案寫入磁碟。",
+                ),
+                settings_number_stepper(
+                    "editor-autosave-delay",
+                    u16::try_from(autosave_delay_ms).unwrap_or(u16::MAX),
+                    Some("ms"),
+                    u16::try_from(MIN_EDITOR_AUTOSAVE_DELAY_MS).unwrap_or(u16::MAX),
+                    u16::try_from(MAX_EDITOR_AUTOSAVE_DELAY_MS).unwrap_or(u16::MAX),
+                    cx.listener(|this, _, _, cx| {
+                        this.adjust_editor_autosave_delay(-AUTOSAVE_DELAY_STEP_MS, cx)
+                    }),
+                    cx.listener(|this, _, _, cx| {
+                        this.adjust_editor_autosave_delay(AUTOSAVE_DELAY_STEP_MS, cx)
+                    }),
+                    locale::text(
+                        "Decrease autosave delay",
+                        "减少自动保存延迟",
+                        "減少自動儲存延遲",
+                    ),
+                    locale::text(
+                        "Increase autosave delay",
+                        "增加自动保存延迟",
+                        "增加自動儲存延遲",
+                    ),
+                    cx,
+                ),
+                stacked,
+                cx,
+            )
+        });
         settings_page(
             locale::text("Workbench", "工作台", "工作台"),
             locale::text(
@@ -53673,7 +53820,21 @@ impl FoundationSettings {
                     stacked,
                     cx,
                 ),
-            ],
+                setting_row(
+                    locale::text("Autosave", "自动保存", "自動儲存"),
+                    locale::text(
+                        "Write edited files without asking. Manual keeps the save shortcut as the only way to store changes.",
+                        "自动写回已编辑的文件；选择手动保存时，只有保存快捷键会写入更改。",
+                        "自動寫回已編輯的檔案；選擇手動儲存時，只有儲存快速鍵會寫入變更。",
+                    ),
+                    autosave_control,
+                    stacked,
+                    cx,
+                ),
+            ]
+            .into_iter()
+            .chain(autosave_delay_row)
+            .collect(),
             cx,
         )
     }
