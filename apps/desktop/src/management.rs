@@ -103,7 +103,7 @@ const MANAGEMENT_PROVIDER_DRAG_PREVIEW_WIDTH: f32 = 520.0;
 const MANAGEMENT_PROVIDER_REORDER_ANIMATION_MS: u64 = 160;
 const MANAGEMENT_PROVIDER_ROW_ACTION_SIZE: f32 = 40.0;
 const MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const PROVIDER_API_KEY_PLACEHOLDER: &str = "API Key";
+const PROVIDER_API_KEY_PLACEHOLDER: &str = "sk-…";
 const PROVIDER_OPTION_WEBSITE_URL: &str = "ccSwitchWebsiteUrl";
 const PROVIDER_OPTION_CC_SWITCH_DB_PATH: &str = "ccSwitchDbPath";
 const PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID: &str = "ccSwitchProviderId";
@@ -10096,7 +10096,9 @@ impl ManagementCenter {
                 Button::new("provider-candidates-fetch")
                     .xsmall()
                     .outline()
-                    .icon(IconName::Search)
+                    // A refresh glyph, not the search glyph: this asks the
+                    // endpoint for its list instead of filtering one.
+                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
                     .label(if fetching_models {
                         management_locale_text("Fetching...", "获取中...", "取得中...")
                     } else {
@@ -10110,23 +10112,30 @@ impl ManagementCenter {
             );
         }
 
-        let mut controls = h_flex().w_full().min_w_0().items_center().gap_2().child(
-            Checkbox::new("provider-candidates-select-all")
-                .small()
-                .checked(all_selected)
-                .accessibility_label(management_locale_text("Select all", "全选", "全選"))
-                .disabled(pending || visible.is_empty())
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text("Select all", "全选", "全選")),
-                )
-                .on_click(cx.listener(move |this, checked, _, cx| {
-                    this.set_visible_profile_candidates_selected(*checked, cx);
-                })),
-        );
-        if total > 3 {
+        // "Select all" only means something once there is a choice to make, and
+        // the search only earns its row once the list is long enough to scan.
+        let shows_select_all = visible.len() > 1;
+        let shows_search = total > 3;
+        let mut controls = h_flex().w_full().min_w_0().items_center().gap_2();
+        if shows_select_all {
+            controls = controls.child(
+                Checkbox::new("provider-candidates-select-all")
+                    .small()
+                    .checked(all_selected)
+                    .accessibility_label(management_locale_text("Select all", "全选", "全選"))
+                    .disabled(pending)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text("Select all", "全选", "全選")),
+                    )
+                    .on_click(cx.listener(move |this, checked, _, cx| {
+                        this.set_visible_profile_candidates_selected(*checked, cx);
+                    })),
+            );
+        }
+        if shows_search {
             controls = controls.child(
                 div()
                     .min_w_0()
@@ -10208,17 +10217,17 @@ impl ManagementCenter {
                 .pr_1()
         };
 
+        // The pane is a column of the same surface as the form above it, not a
+        // tray: a filled box here would put the rows, the Model editor, and the
+        // pane itself on three different greys.
         let mut pane = v_flex()
             .min_w_0()
             .debug_selector(|| "provider-candidates-pane".to_string())
             .gap_2()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().muted.opacity(0.22))
-            .p_2p5()
             .child(header)
-            .child(controls)
+            .when(shows_select_all || shows_search, |pane| {
+                pane.child(controls)
+            })
             .child(list);
         if bounded {
             // Side by side the two panes split the width; stacked, each one
@@ -10267,8 +10276,12 @@ impl ManagementCenter {
             .rounded(px(6.0))
             .px_2p5()
             .py_1p5()
-            .when(configured, |row| row.bg(cx.theme().primary.opacity(0.08)))
-            .when(!configured, |row| row.bg(cx.theme().muted.opacity(0.18)))
+            // Only a chosen row carries a wash; an unchosen one is plain until
+            // the pointer is over it, so the list does not read as stripes.
+            .when(configured, |row| row.bg(cx.theme().primary.opacity(0.06)))
+            .when(!configured, |row| {
+                row.hover(|row| row.bg(cx.theme().primary.opacity(0.04)))
+            })
             .child(
                 v_flex()
                     .min_w_0()
@@ -10354,14 +10367,19 @@ impl ManagementCenter {
                         "模型設定",
                     )),
             )
-            .child(management_status_badge(
-                if total == 0 {
-                    management_locale_text("No models", "没有模型", "沒有模型").to_string()
-                } else {
-                    management_model_count(total)
-                },
-                cx,
-            ))
+            // The count is an annotation on the caption, not a status worth a
+            // filled badge: a column of Model rows should not open with color.
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if total == 0 {
+                        management_locale_text("No models", "没有模型", "沒有模型").to_string()
+                    } else {
+                        management_model_count(total)
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -10494,11 +10512,6 @@ impl ManagementCenter {
             .min_w_0()
             .debug_selector(|| "provider-chosen-pane".to_string())
             .gap_2()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().muted.opacity(0.22))
-            .p_2p5()
             .child(header)
             .when(total > 3, |pane| {
                 pane.child(
@@ -10527,7 +10540,6 @@ impl ManagementCenter {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let enabled = model.enabled;
-        let expanded = self.profile_model_edit_index == Some(index);
         // The declaration is per Model, so the row states it: otherwise the
         // only way to tell two Models' depths apart is to open each editor.
         let depth = match (
@@ -10570,7 +10582,13 @@ impl ManagementCenter {
                 )
                 .to_string(),
             };
-            let mut parts = vec![model.id.clone(), protocol];
+            // The id leads the second line only when the first one shows a
+            // friendly name; otherwise the id is already the row's identity.
+            let mut parts = Vec::new();
+            if model.display_name.is_some() {
+                parts.push(model.id.clone());
+            }
+            parts.push(protocol);
             if let Some(context_limit) = &context_limit {
                 parts.push(context_limit.clone());
             }
@@ -10593,8 +10611,9 @@ impl ManagementCenter {
             .rounded(px(6.0))
             .px_2p5()
             .py_1p5()
-            .when(expanded, |row| row.bg(cx.theme().primary.opacity(0.08)))
-            .when(!expanded, |row| row.bg(cx.theme().muted.opacity(0.18)))
+            // The open editor below is what marks this row as active; a second
+            // wash here would only compete with it.
+            .hover(|row| row.bg(cx.theme().primary.opacity(0.04)))
             .child(
                 v_flex()
                     .min_w_0()
@@ -10681,14 +10700,17 @@ impl ManagementCenter {
         let reasoning_disabled = self.profile_model_edit_reasoning_disabled;
         let advanced_open = self.profile_model_advanced_open;
 
+        // The editor belongs to the row above it, so it reads as an indented
+        // continuation of that row: an accent on the leading edge and a wash,
+        // not another bordered card inside the pane.
         let mut editor = v_flex()
             .w_full()
             .min_w_0()
             .gap_2p5()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().primary.opacity(0.35))
-            .bg(cx.theme().primary.opacity(0.06))
+            .rounded(px(6.0))
+            .border_l_2()
+            .border_color(cx.theme().primary.opacity(0.55))
+            .bg(cx.theme().primary.opacity(0.05))
             .p_2p5()
             .child(
                 h_flex()
@@ -11038,9 +11060,9 @@ impl ManagementCenter {
                             .danger()
                             .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                             .label(management_locale_text(
-                                "Delete this model",
-                                "删除该模型",
-                                "刪除該模型",
+                                "Remove this model",
+                                "移除该模型",
+                                "移除該模型",
                             ))
                             .disabled(pending)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -11128,40 +11150,72 @@ impl ManagementCenter {
         if surface == ProjectionCredentialSurface::ApiKey {
             let configured = self.profile_secret_configured;
             let clearing = self.profile_secret_clear;
-            let mut header = h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("API Key"),
-                        )
-                        .when(configured && !clearing, |row| {
-                            row.child(Tag::success().xsmall().child(management_locale_text(
-                                "Saved",
-                                "已保存",
-                                "已儲存",
-                            )))
-                        })
-                        .when(clearing, |row| {
-                            row.child(Tag::warning().xsmall().child(management_locale_text(
-                                "Will be cleared",
-                                "保存后清除",
-                                "儲存後清除",
-                            )))
-                        }),
-                );
-            if let Some(state) = auth_state {
+            // The stored-key state is a word beside the label, not a filled
+            // badge: two colored tags on one field spend the dialog's whole
+            // emphasis budget on the least important fact in it.
+            let state = if clearing {
+                Some((
+                    management_locale_text("Will be cleared", "保存后清除", "儲存後清除"),
+                    cx.theme().warning,
+                ))
+            } else if configured {
+                Some((
+                    management_locale_text("Saved", "已保存", "已儲存"),
+                    cx.theme().success,
+                ))
+            } else {
+                None
+            };
+            let mut header =
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("API Key"),
+                            )
+                            .children(state.map(|(label, color)| {
+                                div().text_xs().text_color(color).child(label)
+                            })),
+                    );
+            if let Some(state) =
+                auth_state.filter(|state| projection_auth_state_needs_attention(*state))
+            {
                 header = header.child(projection_auth_state_badge(state, cx));
+            }
+            // Clearing is a command about the stored key, so it lives with the
+            // field's own label instead of at the far end of its help text.
+            if configured {
+                header = header.child(
+                    Button::new("provider-secret-clear")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label(if clearing {
+                            management_locale_text("Keep stored key", "保留密钥", "保留密鑰")
+                        } else {
+                            management_locale_text("Clear", "清除", "清除")
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.profile_secret_clear = !this.profile_secret_clear;
+                            // Clearing is an intent of its own; dropping it again
+                            // leaves the stored Secret exactly as it was.
+                            let clear = this.profile_secret_clear;
+                            this.projection_editor.set_secret_intent(clear, clear);
+                            this.navigation.mark_dirty(ManagementSection::Agents, true);
+                            cx.notify();
+                        })),
+                );
             }
             // The editor never reads the stored Secret back: blank is the
             // "keep it" answer, typing replaces it, and clearing is a command.
@@ -11184,34 +11238,6 @@ impl ManagementCenter {
                     "還沒有儲存密鑰。",
                 )
             };
-            let mut footer = h_flex().w_full().min_w_0().items_center().gap_2().child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .child(management_field_hint(hint, cx)),
-            );
-            if configured {
-                footer = footer.child(
-                    Button::new("provider-secret-clear")
-                        .xsmall()
-                        .ghost()
-                        .compact()
-                        .label(if clearing {
-                            management_locale_text("Keep stored key", "保留密钥", "保留密鑰")
-                        } else {
-                            management_locale_text("Clear", "清除", "清除")
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.profile_secret_clear = !this.profile_secret_clear;
-                            // Clearing is an intent of its own; dropping it again
-                            // leaves the stored Secret exactly as it was.
-                            let clear = this.profile_secret_clear;
-                            this.projection_editor.set_secret_intent(clear, clear);
-                            this.navigation.mark_dirty(ManagementSection::Agents, true);
-                            cx.notify();
-                        })),
-                );
-            }
             return v_flex()
                 .w_full()
                 .gap_1p5()
@@ -11222,7 +11248,7 @@ impl ManagementCenter {
                         .w_full()
                         .mask_toggle(),
                 )
-                .child(footer)
+                .child(management_field_hint(hint, cx))
                 .into_any_element();
         }
 
@@ -11388,14 +11414,19 @@ impl ManagementCenter {
         let mut body = v_flex().w_full().min_h_0().flex_1();
         if wide {
             // The band is bounded so an expanded protocol override cannot eat
-            // the height the two panes need; it scrolls on its own if it does.
+            // the height the two panes need, and it scrolls on its own if it
+            // does. The overflow is the plain one: the scrollbar wrapper sizes
+            // itself to the parent, which would pin the band to its maximum and
+            // leave the panes short of room they should have.
             body = body.child(
                 div()
+                    .id("provider-form-band")
+                    .debug_selector(|| "provider-form-band".to_string())
                     .w_full()
                     .flex_none()
                     .min_h_0()
                     .max_h(px(MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT))
-                    .overflow_y_scrollbar()
+                    .overflow_y_scroll()
                     .pr_1()
                     .child(form_band),
             );
@@ -11445,81 +11476,66 @@ impl ManagementCenter {
                     .w_full()
                     .flex_none()
                     .items_center()
-                    .justify_between()
+                    .justify_end()
                     .gap_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .pt_3()
-                    .child(div().min_w_0().flex_1().when_some(
-                        self.editing_profile_id.clone(),
-                        |row, profile_id| {
-                            let agent_id = selected_agent_id.clone();
-                            row.child(
-                                Button::new("provider-profile-test")
-                                    .small()
-                                    .outline()
-                                    .icon(IconName::Network)
-                                    .label(if testing {
-                                        management_locale_text(
-                                            "Testing...",
-                                            "测试中...",
-                                            "測試中...",
-                                        )
-                                    } else {
-                                        management_locale_text(
-                                            "Test connection",
-                                            "测试连接",
-                                            "測試連線",
-                                        )
-                                    })
-                                    .loading(testing)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.test_provider_profile(
-                                            profile_id.clone(),
-                                            agent_id.clone(),
-                                            cx,
-                                        )
-                                    })),
-                            )
-                        },
-                    ))
+                    // Every command that ends the dialog's work sits together on
+                    // the trailing edge: probe, abandon, commit.
+                    .when_some(self.editing_profile_id.clone(), |row, profile_id| {
+                        let agent_id = selected_agent_id.clone();
+                        row.child(
+                            Button::new("provider-profile-test")
+                                .small()
+                                .outline()
+                                .icon(IconName::Network)
+                                .label(if testing {
+                                    management_locale_text("Testing...", "测试中...", "測試中...")
+                                } else {
+                                    management_locale_text(
+                                        "Test connection",
+                                        "测试连接",
+                                        "測試連線",
+                                    )
+                                })
+                                .loading(testing)
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.test_provider_profile(
+                                        profile_id.clone(),
+                                        agent_id.clone(),
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("provider-profile-close")
-                                    .small()
-                                    .ghost()
-                                    .label(management_locale_text("Cancel", "取消", "取消"))
-                                    .disabled(cancel_disabled)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_profile_editor(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("provider-profile-save")
-                                    .small()
-                                    .primary()
-                                    .label(if updating {
-                                        management_locale_text(
-                                            "Save changes",
-                                            "保存修改",
-                                            "儲存修改",
-                                        )
-                                    } else {
-                                        management_locale_text(
-                                            "Create provider",
-                                            "创建供应商",
-                                            "新增供應商",
-                                        )
-                                    })
-                                    .loading(saving)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
-                            ),
+                        Button::new("provider-profile-close")
+                            .small()
+                            .ghost()
+                            .label(management_locale_text("Cancel", "取消", "取消"))
+                            .disabled(cancel_disabled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_profile_editor(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("provider-profile-save")
+                            .small()
+                            .primary()
+                            .label(if updating {
+                                management_locale_text("Save changes", "保存修改", "儲存修改")
+                            } else {
+                                management_locale_text(
+                                    "Create provider",
+                                    "创建供应商",
+                                    "新增供應商",
+                                )
+                            })
+                            .loading(saving)
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_profile(cx))),
                     ),
             )
             .into_any_element()
@@ -18862,6 +18878,15 @@ fn management_status_badge(label: String, _cx: &App) -> AnyElement {
 ///
 /// The projection reports an enum, and an enum name is not a sentence: it is
 /// translated here so the badge never shows `NotApplicable` to a user.
+/// Whether an authentication state is worth a badge beside a credential field.
+///
+/// A state that says "this is working" is the expected one, so it stays quiet;
+/// only a state the user may have to act on earns the space and the color.
+fn projection_auth_state_needs_attention(state: vibex_core::ProjectionAuthState) -> bool {
+    use vibex_core::ProjectionAuthState as State;
+    matches!(state, State::Missing | State::Unsupported | State::Unknown)
+}
+
 fn projection_auth_state_badge(state: vibex_core::ProjectionAuthState, _cx: &App) -> AnyElement {
     use vibex_core::ProjectionAuthState as State;
     let (label, tag) = match state {
@@ -21195,12 +21220,28 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
         });
+        let band = cx
+            .debug_bounds("provider-form-band")
+            .expect("the wide layout must draw the identity and connection band");
         let picker = cx
             .debug_bounds("provider-candidates-pane")
             .expect("the wide layout must draw the picker");
         let settings = cx
             .debug_bounds("provider-chosen-pane")
             .expect("the wide layout must draw the settings");
+        // The band's height is its content's, not its maximum: a scroll wrapper
+        // that sizes to the parent would pin it to the cap and leave the panes
+        // short of room they should have.
+        assert!(band.size.height > px(0.0));
+        assert!(
+            band.size.height < px(MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT),
+            "the band must not stretch to its maximum"
+        );
+        assert_eq!(
+            picker.origin.y,
+            band.bottom(),
+            "the panes begin where the band ends"
+        );
         assert!(picker.size.width > px(0.0) && picker.size.height > px(0.0));
         assert!(settings.size.width > px(0.0) && settings.size.height > px(0.0));
         assert!(
