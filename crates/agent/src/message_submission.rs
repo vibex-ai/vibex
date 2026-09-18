@@ -1346,8 +1346,8 @@ mod tests {
         AcpAdapterId, AgentId, AgentMessagePayload, AgentSession, AgentSessionSafety,
         AgentSessionState, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, ProviderProfileId, RequestId,
         RuntimeSelectionActionableError, SessionRuntimeSelection, TimelineErrorPayload,
-        TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceMode,
-        unix_timestamp_ms,
+        TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
+        WorkspaceMode, unix_timestamp_ms,
     };
     use vibex_db::{RuntimeSwitchReserveRequest, SessionRepository, WorkspaceRepository};
 
@@ -1563,6 +1563,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: request.text,
                     attachments: request.attachments,
+                    ..Default::default()
                 }),
                 request.correlation_id.as_ref(),
                 None,
@@ -1780,6 +1781,7 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort,
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         }
     }
 
@@ -1791,6 +1793,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "first".to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             (
@@ -1805,6 +1808,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "original".to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             (

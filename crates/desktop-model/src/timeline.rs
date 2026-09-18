@@ -352,6 +352,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "go".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 item(&other, 3, final_message),
@@ -459,6 +460,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "try it".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 item(
@@ -507,6 +509,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "try it".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             provider_error,
@@ -539,6 +542,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "approve".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 item(

@@ -952,6 +952,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: format!("user turn {sequence}"),
                     attachments: Vec::new(),
+                    ..Default::default()
                 })
             } else {
                 TimelinePayload::AgentMessage(AgentMessagePayload {
@@ -1076,6 +1077,7 @@ mod tests {
                         uri: Some("file:///home/private-user/.env".to_string()),
                         inline_text_offset: None,
                     }],
+                    ..Default::default()
                 }),
                 TimelineRedactionState::None,
             ),
@@ -1219,6 +1221,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "same input".to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             TimelineRedactionState::None,
         )];

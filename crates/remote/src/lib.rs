@@ -6820,7 +6820,7 @@ mod tests {
         RuntimeSelectionInteraction, RuntimeSwitchId, SendAgentMessageRequest, SessionConfigValue,
         SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
         SetDesiredAgentSessionRuntimeRequest, TerminalId, TerminalSession, TerminalStatus,
-        TerminalWriteRequest, WorkspaceMode, unix_timestamp_ms,
+        TerminalWriteRequest, UserMessageDelivery, WorkspaceMode, unix_timestamp_ms,
     };
     use vibex_core::{
         ProviderHealthProbeKind, ProviderInjectionPreviewRequest, ProviderOptions,
@@ -9973,6 +9973,7 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         }
     }
 
@@ -9997,6 +9998,7 @@ mod tests {
             vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
                 text: text.to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,

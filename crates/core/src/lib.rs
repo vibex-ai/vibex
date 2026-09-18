@@ -509,8 +509,8 @@ pub use timeline::{
     ReasoningPayload, RetryKind, RetryPhase, SystemNoticeLevel, SystemNoticePayload,
     TimelineErrorPayload, TimelineItem, TimelineItemKind, TimelineLiveEvent, TimelinePage,
     TimelinePayload, TimelineRedactionState, TimelineSource, TodoUpdatePayload, ToolCallPayload,
-    ToolCallStatus, TurnExecutionAttribution, TurnExecutionAttributionView, UserMessagePayload,
-    WebSearchPayload, latest_timeline_turn_ended_normally,
+    ToolCallStatus, TurnExecutionAttribution, TurnExecutionAttributionView, UserMessageDelivery,
+    UserMessagePayload, WebSearchPayload, latest_timeline_turn_ended_normally,
 };
 pub use usage::{
     AgentTurnUsageFact, AgentUsageAggregate, AgentUsageAnnualDay, AgentUsageAnnualProjection,

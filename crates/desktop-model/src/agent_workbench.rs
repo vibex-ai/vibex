@@ -224,6 +224,12 @@ pub struct TimelineConversationTurn {
     pub conclusion_row: Option<TimelineRow>,
     pub runtime_attribution: Option<String>,
     pub complete: bool,
+    /// A later turn already exists in the conversation, so this turn can never
+    /// receive more output. A queued message that was steered into the running
+    /// turn, or one that interrupted it, splits the conversation here: the
+    /// superseded turn keeps its rows but must stop reading as live.
+    #[serde(default)]
+    pub superseded: bool,
     pub failed: bool,
     pub pending_permission: bool,
     pub item_count: usize,
@@ -498,6 +504,13 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
             let runtime_attribution = consistent_row_runtime_attribution(&turn_rows);
             let provider_finished_for_turn =
                 provider_turn_finished && last_turn_index == Some(index);
+            // A turn that a later turn already follows is finished for display
+            // purposes even when it never produced a terminal item: the user
+            // steered a queued message into it, or interrupted it to resend.
+            // Only the last turn can still be live, so anything before it must
+            // stop streaming, stop counting time, and drop its live indicator.
+            let superseded = last_turn_index.is_some_and(|last| index < last);
+            let settled_for_turn = provider_finished_for_turn || superseded;
             let conclusion_item =
                 find_conversation_turn_conclusion(&turn.response_items, provider_finished_for_turn);
             let conclusion_item_id = conclusion_item.map(|item| item.id.to_string());
@@ -510,7 +523,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                 conclusion_row_index.map(|row_index| turn_rows.remove(row_index));
             if let Some(row) = conclusion_row.as_mut() {
                 row.conclusion = true;
-                if provider_finished_for_turn {
+                if settled_for_turn {
                     row.streaming = false;
                 }
             }
@@ -542,6 +555,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                 for row in &mut turn_rows {
                     if row.kind == TimelineRowKind::Reasoning {
                         row.streaming = !complete
+                            && !superseded
                             && row
                                 .item_ids
                                 .iter()
@@ -564,7 +578,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                         .iter()
                         .any(|item_id| final_agent_item_ids.contains(item_id))
             });
-            if provider_finished_for_turn {
+            if settled_for_turn {
                 for row in &mut turn_rows {
                     if row.kind == TimelineRowKind::AgentMessage {
                         row.streaming = false;
@@ -579,7 +593,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                 timeline_process_activity_groups_with_file_operations(&turn_rows);
             let process_activity_groups_with_commands_and_file_operations =
                 timeline_process_activity_groups_with_commands_and_file_operations(&turn_rows);
-            let live_status = (!complete).then_some(live_status).flatten();
+            let live_status = (!complete && !superseded).then_some(live_status).flatten();
             let started_at_ms = turn
                 .user_item
                 .as_ref()
@@ -608,6 +622,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                 conclusion_row,
                 runtime_attribution,
                 complete,
+                superseded,
                 failed: turn.failed,
                 pending_permission: !turn.pending_permission_ids.is_empty(),
                 item_count: usize::from(turn.user_item.is_some()) + turn.response_items.len(),
@@ -640,6 +655,7 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
             conclusion_row: None,
             runtime_attribution: None,
             complete: false,
+            superseded: false,
             failed: false,
             pending_permission: false,
             item_count: 0,
@@ -1993,6 +2009,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "boundary".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2049,6 +2066,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Inspect the workspace".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2127,6 +2145,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Investigate".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2181,6 +2200,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Investigate".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2274,6 +2294,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Think long".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2310,6 +2331,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Explain".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2346,6 +2368,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Inspect".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2367,6 +2390,60 @@ mod tests {
     }
 
     #[test]
+    fn turn_superseded_by_a_later_message_keeps_its_process_without_live_status() {
+        let items = [
+            item(
+                1,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "first".into(),
+                    ..Default::default()
+                }),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Reasoning(ReasoningPayload {
+                    text: "Working on the first request".into(),
+                    is_final: false,
+                }),
+            ),
+            item(
+                3,
+                None,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "steered into the queue".into(),
+                    ..Default::default()
+                }),
+            ),
+        ];
+
+        let turns = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
+
+        assert_eq!(turns.len(), 2);
+        // The later message superseded the first turn, which can never receive
+        // another item. It must stop reading as live even though it has no
+        // terminal response of its own.
+        assert!(turns[0].superseded);
+        assert!(!turns[0].complete);
+        assert!(turns[0].live_status.is_none());
+        assert_eq!(turns[0].ended_at_ms, Some(2));
+        assert!(!turns[1].superseded);
+
+        // The reasoning mode that keeps process rows must keep the work the
+        // superseded turn already did — it is the only record of what the
+        // queued message replaced — but that row must not read as streaming.
+        let timeline_turns = timeline_conversation_turns_with_reasoning_mode(
+            &items,
+            Some(AgentSessionState::Running),
+            false,
+            ReasoningDisplayMode::Timeline,
+        );
+        assert_eq!(timeline_turns[0].process_rows.len(), 1);
+        assert!(!timeline_turns[0].process_rows[0].streaming);
+    }
+
+    #[test]
     fn conversation_turn_projection_keeps_user_and_one_combined_agent_conclusion() {
         let items = [
             item(
@@ -2375,6 +2452,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Who are you?".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2426,6 +2504,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Implement the feature".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2495,6 +2574,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Start something else".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
         ];
@@ -2729,6 +2809,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Implement".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2797,6 +2878,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             system_notice(4),
@@ -2847,6 +2929,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Continue".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2916,6 +2999,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Continue".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2960,6 +3044,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Continue".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -2991,6 +3076,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Continue".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -3023,6 +3109,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Inspect".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -3095,6 +3182,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Inspect".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -3165,6 +3253,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "try".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -3203,6 +3292,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "try".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -3254,6 +3344,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "ship it".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
         )]);
         assert_eq!(rows[0].kind, TimelineRowKind::UserMessage);
@@ -3292,6 +3383,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "run both".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(2, None, permission_request(first_request_id.clone(), 2)),
@@ -3428,6 +3520,7 @@ mod tests {
                         TimelinePayload::UserMessage(UserMessagePayload {
                             text: format!("message {turn_index}"),
                             attachments: Vec::new(),
+                            ..Default::default()
                         }),
                     ),
                     item(

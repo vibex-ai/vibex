@@ -30,10 +30,11 @@ use vibex_core::{
     SessionRuntimeSelectionStatus, SteerAgentMessageRequest, SteerAgentMessageResult,
     SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
     TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState,
-    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessagePayload,
-    VibexError, VibexResult, VibexSessionId, WorkspaceId, agent_id_for_provider_kind,
-    agent_session_turn_requires_continuation, builtin_agent_definitions,
-    latest_timeline_turn_ended_normally, normalize_agent_session_title, unix_timestamp_ms,
+    TimelineSource, TransportKind, TurnExecutionAttribution, UsageExecutionId, UserMessageDelivery,
+    UserMessagePayload, VibexError, VibexResult, VibexSessionId, WorkspaceId,
+    agent_id_for_provider_kind, agent_session_turn_requires_continuation,
+    builtin_agent_definitions, latest_timeline_turn_ended_normally, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthenticationOperationRepository, AgentConfigRepository,
@@ -116,6 +117,9 @@ struct AgentTurnRequest {
     attachments: Vec<MessageAttachment>,
     reasoning_effort: Option<String>,
     correlation_id: Option<vibex_core::CorrelationId>,
+    /// Recorded on the user timeline item this turn opens. Internal prompts
+    /// (commands, continuations) stay ordinary prompts.
+    delivery: UserMessageDelivery,
 }
 
 impl From<SendAgentMessageRequest> for AgentTurnRequest {
@@ -127,6 +131,7 @@ impl From<SendAgentMessageRequest> for AgentTurnRequest {
             attachments: request.attachments,
             reasoning_effort: request.reasoning_effort,
             correlation_id: request.correlation_id,
+            delivery: request.delivery,
         }
     }
 }
@@ -1204,6 +1209,7 @@ impl AgentManager {
             attachments: Vec::new(),
             reasoning_effort: selection.reasoning_effort.clone(),
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         }) {
             Ok(id) => id,
             Err(error) => {
@@ -1924,6 +1930,7 @@ impl AgentManager {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: request.correlation_id,
+                delivery: UserMessageDelivery::Prompt,
             },
             // The continuation prompt is an internal retry instruction. It
             // must stay out of the transcript and must not update the session
@@ -2219,6 +2226,7 @@ impl AgentManager {
             attachments: request.attachments.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
             correlation_id: request.correlation_id.clone(),
+            delivery: UserMessageDelivery::Prompt,
         };
         let command_request = request.clone();
         let items = self
@@ -2300,6 +2308,7 @@ impl AgentManager {
                     attachments: request.attachments,
                     reasoning_effort: request.reasoning_effort,
                     correlation_id: request.correlation_id,
+                    delivery: UserMessageDelivery::Prompt,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -2423,6 +2432,7 @@ impl AgentManager {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: request.text.clone(),
                     attachments: request.attachments.clone(),
+                    delivery: request.delivery,
                 }),
                 request.correlation_id.as_ref(),
                 None,
@@ -3361,6 +3371,7 @@ impl AgentManager {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: request.text.clone(),
                 attachments: request.attachments.clone(),
+                delivery: UserMessageDelivery::Steer,
             }),
             request.correlation_id.as_ref(),
             None,
@@ -5889,6 +5900,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "finish the task".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -5926,6 +5938,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "finish the task".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -6001,6 +6014,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "finish the task".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -6154,6 +6168,7 @@ mod tests {
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery: UserMessageDelivery::Prompt,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -6212,6 +6227,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "earlier user context".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -6450,6 +6466,7 @@ mod tests {
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery: UserMessageDelivery::Prompt,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -6485,6 +6502,7 @@ mod tests {
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery: UserMessageDelivery::Prompt,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -6620,6 +6638,7 @@ mod tests {
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery: UserMessageDelivery::Prompt,
                 },
                 AgentTurnDisplayPolicy::USER_AUTHORED,
                 ContextBridgeTurnBehavior::ConsumePending,
@@ -7206,6 +7225,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "question".to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             item(
@@ -7829,6 +7849,7 @@ mod tests {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .unwrap();
@@ -7959,6 +7980,7 @@ mod tests {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .unwrap();
@@ -8082,6 +8104,7 @@ mod tests {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .unwrap();
@@ -8141,6 +8164,7 @@ mod tests {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             })
             .await
             .unwrap_err();

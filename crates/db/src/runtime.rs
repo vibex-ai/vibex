@@ -4629,6 +4629,7 @@ impl MessageSubmissionRepository {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: request.text,
                     attachments: request.attachments,
+                    ..Default::default()
                 }),
                 None,
                 request.correlation_id.as_ref(),
@@ -6102,6 +6103,7 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
+            delivery: vibex_core::UserMessageDelivery::Prompt,
         }
     }
 
@@ -6278,6 +6280,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "earlier user context".to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -6399,6 +6402,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "current turn".to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -7942,6 +7946,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: request.text.clone(),
                 attachments: request.attachments.clone(),
+                ..Default::default()
             }),
             None,
             None,
@@ -8018,6 +8023,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: request.text,
                 attachments: request.attachments,
+                ..Default::default()
             }),
             None,
             None,
@@ -8070,6 +8076,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: request.text,
                 attachments: request.attachments,
+                ..Default::default()
             }),
             None,
             None,

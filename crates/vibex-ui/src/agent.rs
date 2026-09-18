@@ -1475,7 +1475,8 @@ mod tests {
         PermissionActionDetail, PermissionRequest, PermissionResolution, PermissionResponseKind,
         PermissionResponseOption, PermissionRiskCategory, ProjectId, ProviderProfileId,
         ReasoningPayload, RequestId, SessionRuntimeSelection, TimelineItemId,
-        TimelineRedactionState, TimelineSource, UserMessagePayload, WorkspaceId, WorkspaceMode,
+        TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
+        WorkspaceId, WorkspaceMode,
     };
 
     #[derive(Clone)]
@@ -1754,6 +1755,8 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "go".into(),
                     attachments: Vec::new(),
+
+                    ..Default::default()
                 }),
             ),
             timeline_item(
@@ -1791,6 +1794,8 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "Inspect the change".into(),
                         attachments: Vec::new(),
+
+                        ..Default::default()
                     }),
                 ),
                 timeline_item(
@@ -1839,6 +1844,8 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Inspect the mobile timeline".into(),
                     attachments: Vec::new(),
+
+                    ..Default::default()
                 }),
             )],
         );
@@ -1855,6 +1862,8 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
+
+            delivery: UserMessageDelivery::Prompt,
         });
         controller.begin_send_message(&request).unwrap();
 
@@ -1971,6 +1980,8 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "go".into(),
                     attachments: Vec::new(),
+
+                    ..Default::default()
                 }),
             ),
             timeline_item(
@@ -2525,6 +2536,8 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: Some(CorrelationId::new()),
+
+            delivery: UserMessageDelivery::Prompt,
         });
         let ticket = controller.begin_send_message(&request).unwrap();
         // A same-session authoritative reload advances the view generation but
@@ -2564,6 +2577,8 @@ mod tests {
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
+
+            delivery: UserMessageDelivery::Prompt,
         });
         let ticket = controller.begin_send_message(&request).unwrap();
         let other_session = VibexSessionId::new();

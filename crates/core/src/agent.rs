@@ -13,7 +13,7 @@ use crate::provider::{
     ProviderSessionConfigValue,
 };
 use crate::runtime::{MessageSubmissionStatus, SessionRuntimeSelection};
-use crate::timeline::{MessageAttachment, TimelineItem, TimelinePage};
+use crate::timeline::{MessageAttachment, TimelineItem, TimelinePage, UserMessageDelivery};
 use crate::workspace::WorkspaceMode;
 
 pub const MAX_MESSAGE_IDEMPOTENCY_KEY_LEN: usize = 256;
@@ -367,6 +367,13 @@ pub struct SendAgentMessageRequest {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub correlation_id: Option<CorrelationId>,
+    /// Why this prompt is being sent, recorded on the user timeline item.
+    ///
+    /// The default keeps every ordinary caller on [`UserMessageDelivery::Prompt`];
+    /// only a caller that already interrupted the running turn, such as the
+    /// composer queue's resend action, marks the message as a resend.
+    #[serde(default, skip_serializing_if = "UserMessageDelivery::is_prompt")]
+    pub delivery: UserMessageDelivery,
 }
 
 /// Rewrites the latest user message of a session and re-runs its turn.
@@ -395,6 +402,7 @@ impl fmt::Debug for SendAgentMessageRequest {
             .field("attachment_count", &self.attachments.len())
             .field("reasoning_effort", &self.reasoning_effort)
             .field("correlation_id", &self.correlation_id)
+            .field("delivery", &self.delivery)
             .finish()
     }
 }
@@ -757,6 +765,7 @@ mod tests {
             }],
             reasoning_effort: Some("high".to_string()),
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         };
 
         let json = serde_json::to_value(&request).unwrap();

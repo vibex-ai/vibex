@@ -14664,6 +14664,7 @@ mod tests {
                 attachments: Vec::new(),
                 reasoning_effort: Some("high".to_string()),
                 correlation_id: None,
+                delivery: vibex_core::UserMessageDelivery::Prompt,
             },
         )
         .unwrap();
@@ -17599,6 +17600,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "hello".to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,
@@ -17857,6 +17859,7 @@ mod tests {
                 payload: TimelinePayload::UserMessage(UserMessagePayload {
                     text: "preserve me".to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
                 timestamp_ms: Some(123),
                 correlation_id: None,
@@ -17932,6 +17935,7 @@ mod tests {
                 payload: TimelinePayload::UserMessage(UserMessagePayload {
                     text: "hello".to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
                 timestamp_ms: Some(200),
                 correlation_id: None,
@@ -17988,6 +17992,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "please do a complex task".to_string(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             None,
             None,

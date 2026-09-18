@@ -100,9 +100,10 @@ use vibex_core::{
     SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest, SteerMessageOutcome,
     TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
     TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
-    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
+    TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -3708,6 +3709,7 @@ impl OptimisticUserMessage {
         let payload = TimelinePayload::UserMessage(UserMessagePayload {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            ..Default::default()
         });
         items.push(TimelineItem {
             id: self.item_id.clone(),
@@ -4087,7 +4089,7 @@ fn agent_generation_compaction_count(
     let Some((start_sequence, projected_end_sequence)) = timeline_turn_sequence_range(turn) else {
         return 0;
     };
-    let end_sequence = if turn.complete {
+    let end_sequence = if timeline_turn_finished(turn) {
         projected_end_sequence
     } else {
         timeline_items
@@ -4202,11 +4204,25 @@ fn timeline_session_state_for_render(
     }
 }
 
+/// Whether the turn is over for display.
+///
+/// A superseded turn never receives another item — a queued message was
+/// steered into it or interrupted it — so it must stop counting time and stop
+/// showing the live indicator even though it has no terminal response of its
+/// own.
+fn timeline_turn_finished(turn: &TimelineConversationTurn) -> bool {
+    turn.complete || turn.superseded
+}
+
 fn timeline_turn_process_expanded(
     turn: &TimelineConversationTurn,
     explicit_expansion: Option<bool>,
 ) -> bool {
-    explicit_expansion.unwrap_or(!turn.complete && timeline_turn_conclusion_row(turn).is_none())
+    // A superseded turn keeps its process visible: the work it already did is
+    // the only record of what the queued message replaced.
+    explicit_expansion.unwrap_or(
+        timeline_turn_conclusion_row(turn).is_none() && (!turn.complete || turn.superseded),
+    )
 }
 
 fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&TimelineRow> {
@@ -4664,6 +4680,20 @@ fn composer_queue_waits_for_continuation(
         Some(None) => false,
         // Only a confirmed normal completion may auto-send.
         Some(Some(ended_normally)) => !ended_normally,
+    }
+}
+
+/// How the timeline should record a queued message that is dispatched now.
+///
+/// The queue's resend action cancels the running turn before it delivers the
+/// message, so the user item keeps that history instead of reading as an
+/// ordinary prompt that happened to follow an interrupted turn.
+fn composer_queue_message_delivery(behavior: ComposerQueueDispatchBehavior) -> UserMessageDelivery {
+    match behavior {
+        ComposerQueueDispatchBehavior::AfterInterrupt => UserMessageDelivery::Resend,
+        ComposerQueueDispatchBehavior::Automatic
+        | ComposerQueueDispatchBehavior::ForceNext
+        | ComposerQueueDispatchBehavior::AfterCompletion => UserMessageDelivery::Prompt,
     }
 }
 
@@ -11112,6 +11142,7 @@ impl VibexWorkbench {
                         text: prompt,
                         attachments: Vec::new(),
                         correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
                     })
                     .with_idempotency_key(format!(
                         "worktree-assistance-context:{}",
@@ -12607,7 +12638,7 @@ impl VibexWorkbench {
             .conversation_turns_cache
             .iter()
             .rev()
-            .find(|turn| !turn.complete)
+            .find(|turn| !timeline_turn_finished(turn))
             .cloned()
         else {
             self.agent_generation_stats = None;
@@ -14871,6 +14902,7 @@ impl VibexWorkbench {
             .is_some_and(|(_, summary)| !summary.files.is_empty());
 
         turn.complete.hash(&mut hasher);
+        turn.superseded.hash(&mut hasher);
         turn.failed.hash(&mut hasher);
         turn.pending_permission.hash(&mut hasher);
         process_expanded.hash(&mut hasher);
@@ -14992,6 +15024,7 @@ impl VibexWorkbench {
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         turn.complete.hash(&mut hasher);
+        turn.superseded.hash(&mut hasher);
         process_expansion.hash(&mut hasher);
         self.ui_state
             .session
@@ -16516,6 +16549,7 @@ impl VibexWorkbench {
         &mut self,
         message: ComposerQueueMessage,
         backend: BackendFacade,
+        delivery: UserMessageDelivery,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -16574,6 +16608,7 @@ impl VibexWorkbench {
                     attachments,
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery,
                 }))
                 .await
                 .map(|_| ());
@@ -16640,6 +16675,7 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let session_id = message.session_id.clone();
+        let delivery = composer_queue_message_delivery(behavior);
         let session = self
             .sessions
             .iter()
@@ -16692,7 +16728,7 @@ impl VibexWorkbench {
                 cx.notify();
                 return;
             };
-            self.dispatch_composer_message_remote(message, backend, window, cx);
+            self.dispatch_composer_message_remote(message, backend, delivery, window, cx);
             return;
         };
         let ComposerQueueMessage {
@@ -16791,6 +16827,7 @@ impl VibexWorkbench {
                         attachments,
                         reasoning_effort,
                         correlation_id: None,
+                        delivery,
                     })
                     .await
                     .map(|_| ())
@@ -20757,6 +20794,7 @@ impl VibexWorkbench {
                                 attachments,
                                 reasoning_effort,
                                 correlation_id: None,
+                                delivery: UserMessageDelivery::Prompt,
                             },
                         }))
                         .await
@@ -21809,6 +21847,7 @@ impl VibexWorkbench {
                                 attachments: initial_attachments.clone(),
                                 reasoning_effort: desired_runtime.reasoning_effort.clone(),
                                 correlation_id: None,
+                                delivery: UserMessageDelivery::Prompt,
                             })
                             .with_idempotency_key(format!(
                                 "gpui:new-session:message:{}",
@@ -36887,7 +36926,7 @@ impl VibexWorkbench {
             turn,
             self.timeline_process_expansion.get(&turn.id).copied(),
         );
-        let process_collapsible = turn.complete
+        let process_collapsible = timeline_turn_finished(turn)
             || (timeline_turn_conclusion_row(turn).is_some() && !turn.process_rows.is_empty());
         let process_toggle_id = turn.id.clone();
         let agent_identity = execution_attribution
@@ -36911,7 +36950,7 @@ impl VibexWorkbench {
         };
         let duration = format_compact_duration(
             turn.started_at_ms,
-            timeline_turn_duration_end(turn.complete, turn.ended_at_ms),
+            timeline_turn_duration_end(timeline_turn_finished(turn), turn.ended_at_ms),
         );
         let header_label = format!("{} {duration}", strings.agent_worked_for);
         let mut content = v_flex()
@@ -36944,7 +36983,10 @@ impl VibexWorkbench {
             None
         };
 
-        if !turn.process_rows.is_empty() || turn.conclusion_row.is_some() || !turn.complete {
+        if !turn.process_rows.is_empty()
+            || turn.conclusion_row.is_some()
+            || !timeline_turn_finished(turn)
+        {
             let mut response = v_flex()
                 .w_full()
                 .min_w_0()
@@ -37054,7 +37096,7 @@ impl VibexWorkbench {
                     window,
                     cx,
                 ));
-            } else if !turn.complete
+            } else if !timeline_turn_finished(turn)
                 && !(reasoning_display_mode == ReasoningDisplayMode::Timeline
                     && turn
                         .process_rows
@@ -37440,7 +37482,7 @@ impl VibexWorkbench {
         );
         let duration = format_compact_duration(
             turn.started_at_ms,
-            timeline_turn_duration_end(turn.complete, turn.ended_at_ms),
+            timeline_turn_duration_end(timeline_turn_finished(turn), turn.ended_at_ms),
         );
         let tooltip_label = attribution.agent_label.clone();
         Some(
@@ -38808,8 +38850,9 @@ impl VibexWorkbench {
         if let Some(user_row) = turn.user_row.as_ref() {
             height += self.estimated_timeline_row_height_projected(user_row, false) + 12.0;
         }
-        let has_response =
-            !turn.process_rows.is_empty() || turn.conclusion_row.is_some() || !turn.complete;
+        let has_response = !turn.process_rows.is_empty()
+            || turn.conclusion_row.is_some()
+            || !timeline_turn_finished(turn);
         if has_response {
             // header row + rule
             height += 40.0 + 12.0;
@@ -38819,7 +38862,7 @@ impl VibexWorkbench {
             }
             if let Some(conclusion_row) = timeline_turn_conclusion_row(turn) {
                 height += self.estimated_timeline_row_height_projected(conclusion_row, true) + 12.0;
-            } else if !turn.complete {
+            } else if !timeline_turn_finished(turn) {
                 let timeline_has_live_reasoning = self.ui_state.session.reasoning_display_mode
                     == ReasoningDisplayMode::Timeline
                     && turn
@@ -38991,7 +39034,7 @@ impl VibexWorkbench {
             return self.render_child_agent_user_message_row(row, cx);
         }
         self.sync_timeline_item_index();
-        let attachments = {
+        let (attachments, delivery) = {
             let timeline_item_index = self.timeline_item_index.borrow();
             row.item_ids
                 .iter()
@@ -38999,11 +39042,16 @@ impl VibexWorkbench {
                 .filter_map(|position| self.timeline.items.get(position))
                 .find_map(|item| match &item.payload {
                     vibex_core::TimelinePayload::UserMessage(message) => {
-                        Some(message.attachments.clone())
+                        Some((message.attachments.clone(), message.delivery))
                     }
                     _ => None,
                 })
                 .unwrap_or_default()
+        };
+        let delivery_accent = match delivery {
+            UserMessageDelivery::Prompt => None,
+            UserMessageDelivery::Steer => Some(cx.theme().primary),
+            UserMessageDelivery::Resend => Some(cx.theme().warning),
         };
         let attachments = if attachments.is_empty() {
             self.optimistic_user_message_attachments_for_row(row)
@@ -39063,11 +39111,17 @@ impl VibexWorkbench {
                     .w(relative(0.78))
                     .items_end()
                     .gap_1()
+                    .when(!editing, |this| {
+                        this.when_some(delivery_accent, |this, accent| {
+                            this.child(render_user_message_delivery_hint(&row.id, delivery, accent))
+                        })
+                    })
                     .child(render_user_message_bubble(
                         inline_content,
                         cx.theme().muted,
                         cx.theme().foreground,
                         editing,
+                        delivery_accent,
                     ))
                     .when(!editing, |this| {
                         this.child(
@@ -39184,6 +39238,7 @@ impl VibexWorkbench {
                         cx.theme().muted,
                         cx.theme().foreground,
                         false,
+                        None,
                     )),
             )
             .into_any_element()
@@ -55717,11 +55772,60 @@ fn user_message_inline_document(
     (Arc::new(document), Arc::new(attachment_actions))
 }
 
+/// The hint a user message wears when a queued action delivered it.
+///
+/// The chip names the delivery and the bubble edge repeats its accent, so a
+/// steered message and an interrupted resend stay distinguishable without
+/// relying on color alone.
+fn render_user_message_delivery_hint(
+    row_id: &str,
+    delivery: UserMessageDelivery,
+    accent: gpui::Hsla,
+) -> AnyElement {
+    let (icon_path, label) = match delivery {
+        UserMessageDelivery::Steer => (
+            "icons/vibex/corner-down-right.svg",
+            locale::text(
+                "Steered into the running turn",
+                "已引导运行中的回合",
+                "已引導執行中的回合",
+            ),
+        ),
+        UserMessageDelivery::Resend => (
+            "icons/vibex/rotate-ccw.svg",
+            locale::text(
+                "Interrupted the turn and resent",
+                "已打断上一轮并重新发送",
+                "已打斷上一輪並重新傳送",
+            ),
+        ),
+        UserMessageDelivery::Prompt => return div().into_any_element(),
+    };
+    h_flex()
+        .id(SharedString::from(format!(
+            "user-message-delivery:{row_id}"
+        )))
+        .items_center()
+        .gap_1()
+        .rounded_full()
+        .border_1()
+        .border_color(accent.opacity(0.35))
+        .bg(accent.opacity(0.10))
+        .px_2()
+        .py(px(2.0))
+        .text_xs()
+        .text_color(accent)
+        .child(Icon::default().path(icon_path).size(px(12.0)))
+        .child(label)
+        .into_any_element()
+}
+
 fn render_user_message_bubble(
     body: AnyElement,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
     fill_width: bool,
+    accent: Option<gpui::Hsla>,
 ) -> gpui_component::bubble::Bubble {
     // Codex-parity: compact rounded-xl pill rendered by the library Bubble.
     // The 78% width contract stays on the definite-width row wrapper; the
@@ -55746,6 +55850,9 @@ fn render_user_message_bubble(
                 .line_height(relative(1.5))
                 .shadow_sm()
                 .when(fill_width, |this| this.w_full())
+                .when_some(accent, |this, accent| {
+                    this.border_1().border_color(accent.opacity(0.45))
+                })
                 .child(body),
         )
 }
@@ -56084,6 +56191,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "first question".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             indexed_timeline_item(&session_id, 2, "first answer"),
@@ -56094,6 +56202,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "second question".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             timeline_item_with_payload(
@@ -56155,6 +56264,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "question".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 timeline_item_with_payload(
@@ -56521,6 +56631,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "inspect".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             timeline_item_with_payload(
@@ -56724,6 +56835,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "Implement".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
                 TimelineSource::User,
             ),
@@ -56783,6 +56895,7 @@ mod tests {
             item_count: 0,
             started_at_ms: 0,
             ended_at_ms: complete.then_some(1),
+            superseded: false,
         };
         let turns = [turn("complete", true, false), turn("active", false, true)];
 
@@ -56830,6 +56943,7 @@ mod tests {
             item_count: 1,
             started_at_ms: 1,
             ended_at_ms: Some(1),
+            superseded: false,
         };
 
         assert!(!timeline_turn_process_expanded(&turn, None));
@@ -57280,6 +57394,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "查找这段用户内容".into(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 }),
             ),
             timeline_item(
@@ -57570,6 +57685,7 @@ mod tests {
                                 theme::semantic_color("muted", true),
                                 theme::semantic_color("foreground", true),
                                 false,
+                                None,
                             )),
                     )
                     // The hidden hover actions still participate in the row's intrinsic width.
@@ -57610,6 +57726,7 @@ mod tests {
                         theme::semantic_color("muted", true),
                         theme::semantic_color("foreground", true),
                         true,
+                        None,
                     )),
             )
         }
@@ -61961,6 +62078,7 @@ mod tests {
             item_count: 1,
             started_at_ms: 1,
             ended_at_ms: None,
+            superseded: false,
         };
 
         let timeline_state = StreamingRowStateCache {
@@ -62017,9 +62135,10 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn timeline_turn_execution_attribution("))
             .map(|(body, _)| body)
             .expect("timeline turn renderer should remain inspectable");
-        assert!(
-            turn_renderer.contains("timeline_turn_duration_end(turn.complete, turn.ended_at_ms)")
-        );
+        assert!(turn_renderer.contains(
+            "timeline_turn_duration_end(timeline_turn_finished(turn), turn.ended_at_ms)"
+        ));
+        assert!(turn_renderer.contains("!timeline_turn_finished(turn)"));
     }
 
     #[test]
@@ -62064,6 +62183,7 @@ mod tests {
             item_count: 0,
             started_at_ms: 1_000,
             ended_at_ms: None,
+            superseded: false,
         };
 
         assert_eq!(
@@ -64185,6 +64305,61 @@ mod tests {
         assert!(source.contains("native_steering_probed_generations"));
         assert!(source.contains("fn maybe_probe_native_steering("));
         assert!(source.contains("native_steering_supported("));
+    }
+
+    #[test]
+    fn queued_message_delivery_distinguishes_resend_from_an_ordinary_prompt() {
+        // Only the resend action interrupts the running turn before it
+        // delivers, so only it may claim that history on the timeline.
+        assert_eq!(
+            composer_queue_message_delivery(ComposerQueueDispatchBehavior::AfterInterrupt),
+            UserMessageDelivery::Resend
+        );
+        for behavior in [
+            ComposerQueueDispatchBehavior::Automatic,
+            ComposerQueueDispatchBehavior::ForceNext,
+            ComposerQueueDispatchBehavior::AfterCompletion,
+        ] {
+            assert_eq!(
+                composer_queue_message_delivery(behavior),
+                UserMessageDelivery::Prompt,
+                "{behavior:?} should stay an ordinary prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_turn_stops_counting_time_but_keeps_its_process_expanded() {
+        let turn = TimelineConversationTurn {
+            id: "turn:superseded".into(),
+            user_row: None,
+            process_rows: Vec::new(),
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: None,
+            conclusion_row: None,
+            runtime_attribution: None,
+            complete: false,
+            superseded: true,
+            failed: false,
+            pending_permission: false,
+            item_count: 1,
+            started_at_ms: 1,
+            ended_at_ms: Some(7),
+        };
+
+        // A superseded turn never receives another item, so it is over for
+        // display even though it has no terminal response of its own. It must
+        // stop counting time, and it must keep its process visible because that
+        // work is the only record of what the queued message replaced.
+        assert!(timeline_turn_finished(&turn));
+        assert_eq!(
+            timeline_turn_duration_end(timeline_turn_finished(&turn), turn.ended_at_ms),
+            Some(7)
+        );
+        assert!(timeline_turn_process_expanded(&turn, None));
     }
 
     #[test]
@@ -66822,6 +66997,7 @@ mod tests {
             item_count: 6,
             started_at_ms: 1,
             ended_at_ms: Some(2),
+            superseded: false,
         };
 
         let preview = agent_turn_preview_content(&turn, "#1", "Empty message");
@@ -67046,6 +67222,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "old prompt".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 timeline_item(
@@ -67147,6 +67324,7 @@ mod tests {
                 TimelinePayload::UserMessage(UserMessagePayload {
                     text: "first prompt".into(),
                     attachments: vec![attachment.clone()],
+                    ..Default::default()
                 }),
             )],
         );
@@ -68265,6 +68443,62 @@ mod tests {
         );
     }
 
+    /// Renders the delivery hint alone so the test can measure what a user
+    /// message row actually paints for each delivery.
+    struct UserMessageDeliveryHintProbe {
+        delivery: Rc<Cell<UserMessageDelivery>>,
+        measured_height: Rc<Cell<f32>>,
+    }
+
+    impl Render for UserMessageDeliveryHintProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let measured_height = self.measured_height.clone();
+            h_flex().w(px(320.0)).child(
+                div()
+                    .on_prepaint(move |bounds, _, _| {
+                        measured_height.set(f32::from(bounds.size.height));
+                    })
+                    .child(render_user_message_delivery_hint(
+                        "delivery-probe",
+                        self.delivery.get(),
+                        theme::semantic_color("primary", true),
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn user_message_delivery_hint_paints_only_for_queued_deliveries(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let delivery = Rc::new(Cell::new(UserMessageDelivery::Prompt));
+        let measured_height = Rc::new(Cell::new(0.0));
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageDeliveryHintProbe {
+            delivery: delivery.clone(),
+            measured_height: measured_height.clone(),
+        });
+
+        for (case, paints_chip) in [
+            (UserMessageDelivery::Prompt, false),
+            (UserMessageDelivery::Steer, true),
+            (UserMessageDelivery::Resend, true),
+        ] {
+            delivery.set(case);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let height = measured_height.get();
+            if paints_chip {
+                assert!(
+                    height > 0.0,
+                    "{case:?} should paint a delivery chip, measured {height}"
+                );
+            } else {
+                assert_eq!(height, 0.0, "an ordinary prompt should not paint a chip");
+            }
+        }
+    }
+
     #[gpui::test]
     fn user_message_edit_bubble_keeps_the_timeline_width_contract(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
@@ -68660,6 +68894,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "Update the files".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
         )];
         for (index, operation) in operations.into_iter().enumerate() {

@@ -204,11 +204,46 @@ pub struct MessageAttachment {
     pub inline_text_offset: Option<u32>,
 }
 
+/// How a user message reached the Agent's turn.
+///
+/// The timeline keeps the delivery because it is the only durable evidence of
+/// whether a message opened its own turn, interrupted the running one, or was
+/// injected into it. Readers that predate the field see [`Self::Prompt`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageDelivery {
+    /// An ordinary prompt that claimed its own turn.
+    #[default]
+    Prompt,
+    /// A queued message injected into the turn that was already running.
+    Steer,
+    /// A queued message that interrupted the running turn and claimed a new one.
+    Resend,
+}
+
+impl UserMessageDelivery {
+    pub fn is_prompt(&self) -> bool {
+        *self == Self::Prompt
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessagePayload {
     pub text: String,
     pub attachments: Vec<MessageAttachment>,
+    #[serde(default, skip_serializing_if = "UserMessageDelivery::is_prompt")]
+    pub delivery: UserMessageDelivery,
+}
+
+impl Default for UserMessagePayload {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            attachments: Vec::new(),
+            delivery: UserMessageDelivery::Prompt,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1021,6 +1056,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "finish the task".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
         );
         let commentary = completion_item(
@@ -1106,6 +1142,7 @@ mod tests {
             TimelinePayload::UserMessage(UserMessagePayload {
                 text: "try again".into(),
                 attachments: Vec::new(),
+                ..Default::default()
             }),
         );
         let retry = completion_item(
@@ -1173,6 +1210,7 @@ mod tests {
                     TimelinePayload::UserMessage(UserMessagePayload {
                         text: "try again".into(),
                         attachments: Vec::new(),
+                        ..Default::default()
                     }),
                 ),
                 exhausted,

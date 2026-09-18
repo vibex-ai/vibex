@@ -8,7 +8,7 @@ use vibex_core::{
     AutomationRunStepCreateRequest, AutomationRunStepId, AutomationRunStepListRequest,
     AutomationRunStepStatus, AutomationRunStepUpdateRequest, AutomationRunUpdateRequest,
     CreateAgentSessionRequest, PermissionRequest, PermissionRequestStatus, RedactedDiagnostic,
-    SendAgentMessageRequest, VibexError, VibexResult, unix_timestamp_ms,
+    SendAgentMessageRequest, UserMessageDelivery, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_db::{AutomationGraphRepository, PermissionRepository};
 
@@ -441,6 +441,7 @@ impl<'a> AutomationGraphRunner<'a> {
                 attachments: Vec::new(),
                 reasoning_effort: runtime.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             })
             .await
         {

@@ -32,8 +32,9 @@ use vibex_core::{
     RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
     SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TimelineItem, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessagePayload, VibexSessionId, WorkspaceMode,
-    WorkspaceRecord, agent_session_turn_requires_continuation, unix_timestamp_ms,
+    TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
+    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     NewSessionLocation, ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection,
@@ -298,6 +299,7 @@ impl PendingMobileUserMessage {
         let payload = TimelinePayload::UserMessage(UserMessagePayload {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            ..Default::default()
         });
         items.push(TimelineItem {
             id: self.item_id.clone(),
@@ -3214,6 +3216,7 @@ impl MobileApp {
                             attachments: Vec::new(),
                             reasoning_effort: runtime.reasoning_effort.clone(),
                             correlation_id: None,
+                            delivery: UserMessageDelivery::Prompt,
                         }))
                         .await
                         .map(|_| ()),
@@ -4968,6 +4971,7 @@ impl MobileApp {
             attachments,
             reasoning_effort: runtime.desired.reasoning_effort.clone(),
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         });
         let ticket = match controller.begin_send_message(&request) {
             Ok(ticket) => ticket,
@@ -5423,7 +5427,7 @@ impl MobileApp {
     }
 
     fn timeline_process_expanded(&self, turn: &TimelineConversationTurn) -> bool {
-        if !turn.complete {
+        if !turn.complete || turn.superseded {
             return true;
         }
         self.expanded_process
@@ -8533,7 +8537,9 @@ impl MobileApp {
         let agent_icon = agent_identity.as_deref().map(agent_icon_path);
         let duration = format_compact_duration(
             turn.started_at_ms,
-            turn.complete.then_some(turn.ended_at_ms).flatten(),
+            (turn.complete || turn.superseded)
+                .then_some(turn.ended_at_ms)
+                .flatten(),
         );
         let worked_label = format!(
             "{} {duration}",
@@ -8543,9 +8549,10 @@ impl MobileApp {
             .conclusion_row
             .as_ref()
             .filter(|row| !row.body.trim().is_empty());
-        let process_collapsible = turn.complete;
-        let has_response =
-            !turn.process_rows.is_empty() || conclusion_row.is_some() || !turn.complete;
+        let process_collapsible = turn.complete || turn.superseded;
+        let has_response = !turn.process_rows.is_empty()
+            || conclusion_row.is_some()
+            || !(turn.complete || turn.superseded);
         div()
             .id(format!("timeline-turn:{}", turn.id))
             .w_full()
@@ -8650,7 +8657,7 @@ impl MobileApp {
             )
             .when(
                 conclusion_row.is_none()
-                    && !turn.complete
+                    && !(turn.complete || turn.superseded)
                     && !turn
                         .process_rows
                         .iter()
@@ -9145,7 +9152,9 @@ impl MobileApp {
             timeline_runtime_attribution_parts(turn.runtime_attribution.as_deref());
         let duration = format_compact_duration(
             turn.started_at_ms,
-            turn.complete.then_some(turn.ended_at_ms).flatten(),
+            (turn.complete || turn.superseded)
+                .then_some(turn.ended_at_ms)
+                .flatten(),
         );
         let generation_time = format_generation_time(turn.started_at_ms, turn.ended_at_ms);
         let runtime_value = runtime_label.unwrap_or_default();

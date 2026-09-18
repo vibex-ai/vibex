@@ -19881,7 +19881,9 @@ fn image_content_block(attachment: &ProviderTurnAttachment) -> Option<Value> {
 mod tests {
     use super::*;
     use vibex_agent::AgentProvider;
-    use vibex_core::{AgentAuthenticationOperation, AgentAuthenticationOperationState};
+    use vibex_core::{
+        AgentAuthenticationOperation, AgentAuthenticationOperationState, UserMessageDelivery,
+    };
 
     #[test]
     fn zcode_auto_mode_ignores_transient_concrete_turn_mode() {
@@ -27031,6 +27033,7 @@ for line in sys.stdin:
                 text: text.to_string(),
                 attachments: Vec::new(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             })
             .await
             .unwrap()
@@ -27135,6 +27138,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29136,6 +29140,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29210,6 +29215,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: target_selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29314,6 +29320,7 @@ for line in sys.stdin:
             attachments: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
+            delivery: UserMessageDelivery::Prompt,
         };
 
         let prompt_count = logged_request_count(&fixture.fixture.request_log(), "session/prompt");
@@ -29471,6 +29478,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29537,6 +29545,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: selection_b.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29621,6 +29630,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29670,6 +29680,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -29761,6 +29772,7 @@ for line in sys.stdin:
                 attachments: Vec::new(),
                 reasoning_effort: fixture.selection.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         )
         .await
@@ -35320,6 +35332,7 @@ for line in sys.stdin:
                     attachments: Vec::new(),
                     reasoning_effort: None,
                     correlation_id: None,
+                    delivery: UserMessageDelivery::Prompt,
                 })
                 .await
         });

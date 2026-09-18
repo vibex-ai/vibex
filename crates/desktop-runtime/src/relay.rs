@@ -1447,7 +1447,7 @@ mod tests {
         RemoteAgentSessionListRequest, RemoteAgentSessionListResponse, RemoteAuthProof,
         RemoteClaimPairingCodeRequest, RemoteCreatePairingCodeRequest, RemoteDevicePermissionLevel,
         RemoteEnvelopeStatus, RemoteOperationKind, RemoteResponseEnvelope, RequestId,
-        SendAgentMessageRequest, SessionRuntimeSelection, WorkspaceMode,
+        SendAgentMessageRequest, SessionRuntimeSelection, UserMessageDelivery, WorkspaceMode,
     };
     use vibex_db::{
         RemoteDeviceRepository, SessionRepository, WorkspaceRepository, apply_migrations,
@@ -1652,6 +1652,7 @@ mod tests {
                         attachments: Vec::new(),
                         reasoning_effort: None,
                         correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
                     },
                 },
             ))

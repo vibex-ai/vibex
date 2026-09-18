@@ -679,7 +679,11 @@ fn user_entry_with_attachments(
     let text = bounded_text(&text, MAX_TEXT_CHARS);
     (!text.is_empty() || !attachments.is_empty()).then_some(LocalHistoryTimelineEntry {
         source: TimelineSource::User,
-        payload: TimelinePayload::UserMessage(UserMessagePayload { text, attachments }),
+        payload: TimelinePayload::UserMessage(UserMessagePayload {
+            text,
+            attachments,
+            ..Default::default()
+        }),
         timestamp_ms,
     })
 }

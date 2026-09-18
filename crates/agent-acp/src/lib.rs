@@ -3338,6 +3338,7 @@ pub(crate) fn map_acp_event(
             payload: TimelinePayload::UserMessage(UserMessagePayload {
                 text,
                 attachments: Vec::new(),
+                ..Default::default()
             }),
             provider_correlation_id: None,
             redaction_state: TimelineRedactionState::None,

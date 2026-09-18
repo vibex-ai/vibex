@@ -224,6 +224,34 @@ new non-empty Agent message rows only. Streaming deltas that reconcile into the
 same row count once; reasoning, plans, tools, permissions, and other activity
 rows do not increment the badge.
 
+### Convention: A turn is over for display once a later turn follows it
+
+The projection marks a turn `superseded` when any later turn exists in the
+conversation. A queued message that was steered into the running turn, or one
+that interrupted it to resend, ends the earlier turn's ability to receive
+output even though it never produced a terminal item of its own. Clients must
+treat `superseded` as finished for every liveness decision: no live reasoning
+block, no pending/thinking indicator, no running duration, and no streamed-row
+extension. The turn keeps its rows and its recorded end time — that work is the
+only record of what the queued message replaced — and its process stays
+expanded. Never key these decisions on `!turn.complete` alone; use the shared
+finished-for-display predicate (desktop: `timeline_turn_finished`), which also
+bounds range-based lookups such as the generation compaction count.
+
+### Convention: User-message delivery is durable timeline data
+
+`UserMessageDelivery` on `UserMessagePayload` records how a user message
+reached its turn: an ordinary `prompt`, a queued `steer` injected into the
+running turn, or a `resend` that interrupted the running turn and claimed a new
+one. The desktop composer is the only place that knows a resend happened, so it
+sets the field on `SendAgentMessageRequest`; the Agent manager persists it with
+the user item, and the native steer path marks its own injected item as
+`steer`. Clients render the distinction on the message bubble itself (the
+desktop uses a labelled chip plus an accent edge) so the interrupted turn above
+it is explained without relying on color alone. The field defaults to `prompt`
+and is skipped on the wire when it holds that value, so older readers and older
+records stay valid.
+
 Timeline wheel handling and bottom controls must treat a positive vertical
 `ScrollHandle::max_offset` as the prerequisite for leaving follow mode or
 showing a return-to-bottom affordance. GPUI can apply a wheel delta to the raw

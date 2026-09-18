@@ -2,8 +2,8 @@ use vibex_core::{
     AgentSessionState, CreateAgentSessionRequest, ErrorCategory, RedactedDiagnostic, ScheduledTask,
     ScheduledTaskDailySchedule, ScheduledTaskId, ScheduledTaskIntervalSchedule, ScheduledTaskRun,
     ScheduledTaskRunId, ScheduledTaskRunStatus, ScheduledTaskRunUpdateRequest,
-    ScheduledTaskSchedule, ScheduledTaskStatus, SendAgentMessageRequest, VibexError, VibexResult,
-    VibexSessionId,
+    ScheduledTaskSchedule, ScheduledTaskStatus, SendAgentMessageRequest, UserMessageDelivery,
+    VibexError, VibexResult, VibexSessionId,
 };
 use vibex_db::ScheduledTaskRepository;
 
@@ -247,6 +247,7 @@ impl<'a> ScheduledTaskRunner<'a> {
                 attachments: Vec::new(),
                 reasoning_effort: runtime.reasoning_effort.clone(),
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             })
             .await
         {

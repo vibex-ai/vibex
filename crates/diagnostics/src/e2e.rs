@@ -35,7 +35,8 @@ use vibex_core::{
     ScheduledTaskRunStatus, ScheduledTaskSchedule, SendAgentMessageRequest,
     SessionRuntimeConfigState, SessionRuntimeSelection, SkillCreateRequest, SkillProviderMatrix,
     SkillScopeKind, SkillSourceKind, SkillStatus, TerminalCreateRequest, TerminalWriteRequest,
-    TimelineItemKind, TransportKind, VibexError, VibexResult, WorkspaceMode, unix_timestamp_ms,
+    TimelineItemKind, TransportKind, UserMessageDelivery, VibexError, VibexResult, WorkspaceMode,
+    unix_timestamp_ms,
 };
 use vibex_db::{
     AgentSessionRuntimeRepository, ProviderProfileRepository, ScheduledTaskRepository,
@@ -835,6 +836,7 @@ async fn remote_agent_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> {
                 attachments: Vec::new(),
                 reasoning_effort: None,
                 correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
             },
         }),
     )
