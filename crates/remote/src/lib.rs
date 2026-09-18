@@ -3610,6 +3610,24 @@ async fn dispatch_provider_request(
             )
             .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::GetAgentModelProviderProfileSecret(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            // Reading a stored Secret back is a read, so it is authorized like
+            // one and leaves no audit line: the editor reveals it, the user
+            // asked for it, and nothing about the profile changed.
+            let response =
+                service.get_agent_model_provider_profile_secret_value(request.request)?;
+            serde_json::to_value(
+                vibex_core::RemoteAgentModelProviderProfileSecretGetResponse { response },
+            )
+            .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::UpdateAgentConfig(request) => {
             let auth = authorize_provider_action(
                 runtime,

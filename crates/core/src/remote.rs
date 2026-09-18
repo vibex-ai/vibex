@@ -2167,6 +2167,7 @@ pub enum RemoteProviderOperationKind {
     CreateAgentModelProviderProfile,
     UpdateAgentModelProviderProfile,
     MutateAgentModelProviderProfileSecret,
+    GetAgentModelProviderProfileSecret,
     GetAgentModelProviderDisplayOrder,
     SetAgentModelProviderDisplayOrder,
     TestAgentModelProviderProfile,
@@ -3256,6 +3257,19 @@ pub struct RemoteAgentModelProviderProfileSecretMutationResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileSecretGetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::AgentModelProviderProfileSecretValueRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentModelProviderProfileSecretGetResponse {
+    pub response: AgentModelProviderProfileSecretValueResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteAgentModelProviderProfileCreateRequest {
     pub auth: RemoteAuthProof,
     pub request: AgentModelProviderProfileCreateRequest,
@@ -3418,6 +3432,7 @@ pub enum RemoteProviderRequest {
     CreateAgentModelProviderProfile(RemoteAgentModelProviderProfileCreateRequest),
     UpdateAgentModelProviderProfile(RemoteAgentModelProviderProfileUpdateRequest),
     MutateAgentModelProviderProfileSecret(RemoteAgentModelProviderProfileSecretMutationRequest),
+    GetAgentModelProviderProfileSecret(RemoteAgentModelProviderProfileSecretGetRequest),
     GetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderGetRequest),
     SetAgentModelProviderDisplayOrder(RemoteAgentModelProviderDisplayOrderSetRequest),
     TestAgentModelProviderProfile(RemoteAgentModelProviderProfileTestRequest),
@@ -3581,6 +3596,9 @@ impl RemoteProviderRequest {
             }
             Self::MutateAgentModelProviderProfileSecret(_) => {
                 RemoteProviderOperationKind::MutateAgentModelProviderProfileSecret
+            }
+            Self::GetAgentModelProviderProfileSecret(_) => {
+                RemoteProviderOperationKind::GetAgentModelProviderProfileSecret
             }
             Self::GetAgentModelProviderDisplayOrder(_) => {
                 RemoteProviderOperationKind::GetAgentModelProviderDisplayOrder

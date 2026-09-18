@@ -295,6 +295,8 @@ pub use remote::{
     RemoteAgentModelProviderProfileDeleteResponse,
     RemoteAgentModelProviderProfileFetchModelsRequest,
     RemoteAgentModelProviderProfileFetchModelsResponse,
+    RemoteAgentModelProviderProfileSecretGetRequest,
+    RemoteAgentModelProviderProfileSecretGetResponse,
     RemoteAgentModelProviderProfileSecretMutationRequest,
     RemoteAgentModelProviderProfileSecretMutationResponse,
     RemoteAgentModelProviderProfileTestRequest, RemoteAgentModelProviderProfileTestResponse,

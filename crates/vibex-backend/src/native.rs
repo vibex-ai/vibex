@@ -16,7 +16,7 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
@@ -2153,6 +2153,22 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .update_agent_model_provider_profile_secret_value(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn get_agent_model_provider_profile_secret_value(
+        &self,
+        request: AgentModelProviderProfileSecretValueRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .get_agent_model_provider_profile_secret_value(request)
                 .map_err(Into::into)
         })
     }

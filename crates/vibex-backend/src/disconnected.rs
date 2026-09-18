@@ -8,7 +8,8 @@ use vibex_core::{
     AgentModelProviderDisplayOrderListResponse, AgentModelProviderDisplayOrderSetRequest,
     AgentModelProviderDisplayOrderSetResponse, AgentModelProviderProfileCreateRequest,
     AgentModelProviderProfileDeleteRequest, AgentModelProviderProfileFetchModelsRequest,
-    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileFetchModelsResponse, AgentModelProviderProfileSecretValueRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeOptionProbeRequest,
@@ -1143,6 +1144,13 @@ impl ManagementBackend for DisconnectedBackend {
     fn mutate_agent_model_provider_profile_secret(
         &self,
         _request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
+        disconnected_future!()
+    }
+
+    fn get_agent_model_provider_profile_secret_value(
+        &self,
+        _request: AgentModelProviderProfileSecretValueRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
         disconnected_future!()
     }

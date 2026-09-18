@@ -159,10 +159,13 @@ struct ProfileModelEditorContext {
 
 /// One row of the Model picker.
 ///
-/// A row is the union of what the endpoint advertised and what the draft
-/// already configures, so a Model can be recognised by the endpoint, chosen by
-/// the user, or both. `configured_index` is what makes the checkbox state and
-/// the removal path read from the same list the editor writes.
+/// A row is the union of what the endpoint advertised, what the draft already
+/// configures, and what the user released by unchecking it, so a Model can be
+/// recognised by the endpoint, chosen by the user, released but still restorable,
+/// or any combination of those. `configured_index` is what makes the checkbox
+/// state and the removal path read from the same list the editor writes, and
+/// `released` is what keeps a hand-typed Model's row on screen after it is
+/// unchecked instead of letting it vanish from the list.
 #[derive(Debug, Clone)]
 struct ProfileCandidateRow {
     id: String,
@@ -170,11 +173,21 @@ struct ProfileCandidateRow {
     wire_api: Option<vibex_core::ProviderModelWireApi>,
     capabilities: vibex_core::ProviderModelCapabilities,
     configured_index: Option<usize>,
+    released: bool,
 }
 
 impl ProfileCandidateRow {
     fn is_configured(&self) -> bool {
         self.configured_index.is_some()
+    }
+
+    /// Whether the draft still holds a declaration this row can delete.
+    ///
+    /// A released Model keeps its declaration for a later re-check, so the row
+    /// offers the same delete command as a configured one; a row the draft never
+    /// held has nothing to delete.
+    fn is_declared(&self) -> bool {
+        self.is_configured() || self.released
     }
 
     /// The Model this row would contribute to the draft when it is chosen.
@@ -851,9 +864,16 @@ pub struct ManagementCenter {
     compact_sidebar_resize_drag: Option<ManagementSidebarResizeDragState>,
     profile_editor_open: bool,
     editing_profile_id: Option<String>,
-    /// Whether the stored Secret exists, shown as state. The editor never reads
-    /// the value back: the field opens empty and blank means "keep it".
+    /// Whether the stored Secret exists, shown as state.
     profile_secret_configured: bool,
+    /// The stored Secret the editor read back, if the read succeeded.
+    ///
+    /// The field shows it masked and the eye reveals it. Remembering the loaded
+    /// value is also what lets a save tell "the user left it alone" from "the
+    /// user typed a replacement", so an untouched field never rewrites it.
+    profile_secret_loaded: Option<String>,
+    /// The in-flight read that fills the API key field.
+    profile_secret_task: Option<Task<()>>,
     /// Set only by the explicit Clear command, so an empty field on its own
     /// never deletes a stored Secret.
     profile_secret_clear: bool,
@@ -1588,6 +1608,8 @@ impl ManagementCenter {
             profile_editor_open: false,
             editing_profile_id: None,
             profile_secret_configured: false,
+            profile_secret_loaded: None,
+            profile_secret_task: None,
             profile_secret_clear: false,
             profile_name_error: None,
             profile_submit_error: None,
@@ -4233,6 +4255,7 @@ impl ManagementCenter {
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
         self.profile_secret_configured = false;
+        self.profile_secret_loaded = None;
         self.profile_secret_clear = false;
         self.profile_name_error = None;
         self.profile_submit_error = None;
@@ -4336,10 +4359,15 @@ impl ManagementCenter {
         self.profile_protocol_advanced_open = self.pending_protocol_overrides() > 0;
         self.editing_profile_id = Some(profile.id.clone());
         self.projection_editor.draft_revision = 0;
-        // The stored Secret is never read back into the editor: the field opens
-        // blank, says that a Secret exists, and blank keeps it.
+        // The stored Secret is read back so the field can show it masked and
+        // reveal it on request; until the read lands the field stays blank,
+        // which is the "keep the stored value" answer either way.
         self.profile_secret_configured = profile.secret_configured;
+        self.profile_secret_loaded = None;
         self.profile_secret_clear = false;
+        if profile.secret_configured {
+            self.load_profile_secret(profile.id.clone(), window, cx);
+        }
         self.profile_name_error = None;
         self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
@@ -4357,6 +4385,56 @@ impl ManagementCenter {
         }
     }
 
+    /// Reads the stored Secret back so the API key field can show it.
+    ///
+    /// The field renders it masked and the eye reveals it, so the value is only
+    /// ever legible on the user's own request. The read fills the field only
+    /// while the same Provider is still open and the user has typed nothing, so
+    /// a late answer can never overwrite a replacement; a failed read leaves the
+    /// blank field, which is still the "keep the stored value" answer.
+    fn load_profile_secret(&mut self, profile_id: String, window: &Window, cx: &mut Context<Self>) {
+        let (Ok(provider_profile_id), Some(agent_id), Some(backend)) = (
+            vibex_core::ProviderProfileId::parse(profile_id.clone()),
+            self.selected_agent_id
+                .clone()
+                .and_then(|agent_id| AgentId::parse(agent_id).ok()),
+            self.backend.clone(),
+        ) else {
+            return;
+        };
+        let entity = cx.weak_entity();
+        self.profile_secret_task = Some(cx.spawn_in(window, async move |_, cx| {
+            let outcome = backend
+                .management()
+                .get_agent_model_provider_profile_secret_value(
+                    vibex_core::AgentModelProviderProfileSecretValueRequest {
+                        agent_id,
+                        provider_profile_id,
+                    },
+                )
+                .await;
+            let _ = entity.update_in(cx, |this, window, cx| {
+                if this.editing_profile_id.as_deref() != Some(profile_id.as_str())
+                    || !this.profile_api_key.read(cx).value().is_empty()
+                {
+                    return;
+                }
+                let Ok(response) = outcome else {
+                    return;
+                };
+                let Some(secret) = response.value.filter(|value| !value.trim().is_empty()) else {
+                    return;
+                };
+                this.profile_secret_loaded = Some(secret.clone());
+                this.profile_api_key.update(cx, |state, cx| {
+                    state.set_masked(true, window, cx);
+                    state.set_value(secret, window, cx);
+                });
+                cx.notify();
+            });
+        }));
+    }
+
     fn reset_profile_editor_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.profile_api_key.update(cx, |state, cx| {
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
@@ -4368,6 +4446,7 @@ impl ManagementCenter {
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
         self.profile_secret_configured = false;
+        self.profile_secret_loaded = None;
         self.profile_secret_clear = false;
         self.profile_name_error = None;
         self.projection_editor.set_secret_intent(false, false);
@@ -4582,8 +4661,9 @@ impl ManagementCenter {
     }
 
     /// The picker's rows: what the endpoint advertised, plus every configured
-    /// Model the last answer did not mention, so nothing already saved can
-    /// silently disappear from the list.
+    /// Model the last answer did not mention, plus every Model the user released
+    /// by unchecking it, so nothing already saved or hand-typed can silently
+    /// disappear from the list.
     fn profile_candidate_rows(&self) -> Vec<ProfileCandidateRow> {
         let mut rows: Vec<ProfileCandidateRow> = Vec::new();
         for model in &self.profile_available_models {
@@ -4605,6 +4685,7 @@ impl ManagementCenter {
                     wire_api: model.wire_api,
                     capabilities: model.capabilities.clone(),
                     configured_index: None,
+                    released: false,
                 }),
             }
         }
@@ -4630,6 +4711,33 @@ impl ManagementCenter {
                     wire_api: model.wire_api,
                     capabilities: model.capabilities.clone(),
                     configured_index: Some(index),
+                    released: false,
+                }),
+            }
+        }
+        for model in &self.profile_detached_models {
+            match rows.iter_mut().find(|row| row.id == model.id) {
+                Some(row) => {
+                    // Unchecking keeps the row where it was, unchecked and
+                    // still holding the declaration a re-check restores.
+                    row.released = true;
+                    if !model.capabilities.is_empty() {
+                        row.capabilities = model.capabilities.clone();
+                    }
+                    if row.display_name.is_none() {
+                        row.display_name = model.display_name.clone();
+                    }
+                    if row.wire_api.is_none() {
+                        row.wire_api = model.wire_api;
+                    }
+                }
+                None => rows.push(ProfileCandidateRow {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    wire_api: model.wire_api,
+                    capabilities: model.capabilities.clone(),
+                    configured_index: None,
+                    released: true,
                 }),
             }
         }
@@ -4644,11 +4752,58 @@ impl ManagementCenter {
         }
     }
 
-    fn remove_profile_model(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.detach_profile_model_at(index) {
-            self.navigation.mark_dirty(ManagementSection::Agents, true);
-            cx.notify();
+    /// Removes a Model from the draft entirely, wherever its declaration lives.
+    ///
+    /// Unchecking a row only releases a Model and keeps its declaration for a
+    /// later re-check; the row's delete command is the stronger answer, so it
+    /// drops the declaration too and leaves a catalogue row as the plain,
+    /// unconfigured row it started as.
+    fn delete_profile_model(
+        &mut self,
+        model_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut removed = false;
+        if let Some(index) = self
+            .profile_configured_models
+            .iter()
+            .position(|model| model.id == model_id)
+        {
+            self.profile_configured_models.remove(index);
+            removed = true;
         }
+        if let Some(index) = self
+            .profile_detached_models
+            .iter()
+            .position(|model| model.id == model_id)
+        {
+            self.profile_detached_models.remove(index);
+            removed = true;
+        }
+        if !removed {
+            return;
+        }
+        // The settings pane must not keep editing a Model the draft no longer
+        // holds, so deleting the open one closes it.
+        if self.profile_model_selection.as_deref() == Some(model_id.as_str()) {
+            self.profile_model_selection = None;
+            self.profile_model_edit_wire_api = None;
+            self.profile_model_edit_reasoning_disabled = false;
+            self.profile_model_edit_error = None;
+            self.profile_model_advanced_open = false;
+            for input in [
+                &self.profile_model_edit_id,
+                &self.profile_model_edit_name,
+                &self.profile_model_edit_efforts,
+                &self.profile_model_edit_context_tokens,
+                &self.profile_model_edit_output_tokens,
+            ] {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+        }
+        self.navigation.mark_dirty(ManagementSection::Agents, true);
+        cx.notify();
     }
 
     /// Flips one of the Provider editor's disclosures.
@@ -4906,15 +5061,13 @@ impl ManagementCenter {
 
     /// Selects one answer of the Model's reasoning control.
     ///
-    /// `disabled` is the Model's opt-out; otherwise `declaration` is the
-    /// editable level list the preset fills in. The presets are starting points
-    /// rather than stored inferences, which is why a user can correct one the
-    /// endpoint spells differently.
+    /// `disabled` is the Model's opt-out; the levels themselves are the set the
+    /// chips toggle, and both answers leave the field as the declaration the
+    /// Agent reads.
     fn set_profile_model_reasoning_draft(
         &mut self,
         index: usize,
         disabled: bool,
-        declaration: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4922,6 +5075,31 @@ impl ManagementCenter {
             return;
         }
         self.profile_model_edit_reasoning_disabled = disabled;
+        self.profile_model_edit_efforts
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.apply_profile_model_edit(cx);
+    }
+
+    /// Adds or removes one level of the Model's declared thinking levels.
+    ///
+    /// The chips and the field are two views of one declaration: a chip toggles
+    /// the level it names, the field keeps every wire spelling, and an entry the
+    /// vocabulary does not name stays exactly where the user wrote it.
+    fn toggle_profile_model_reasoning_level(
+        &mut self,
+        index: usize,
+        level: vibex_core::ProviderReasoningEffortLevel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_profile_model_index() != Some(index) {
+            return;
+        }
+        let declaration =
+            toggled_reasoning_levels(&self.profile_model_edit_efforts.read(cx).value(), level);
+        // A declaration is the more specific answer, so choosing levels leaves
+        // the non-reasoning opt-out behind.
+        self.profile_model_edit_reasoning_disabled = false;
         self.profile_model_edit_efforts
             .update(cx, |state, cx| state.set_value(declaration, window, cx));
         self.apply_profile_model_edit(cx);
@@ -5051,6 +5229,10 @@ impl ManagementCenter {
             None => self.profile_base_url.read(cx).value().trim().to_string(),
         };
         let api_key = self.profile_api_key.read(cx).value().trim().to_string();
+        // A value the editor loaded and the user left alone is not a
+        // replacement: writing it back would rewrite the same Secret for no
+        // reason. Only a different value counts as the user's new key.
+        let secret_edited = self.profile_secret_loaded.as_deref() != Some(api_key.as_str());
         let configured_models = normalized_provider_models(&self.profile_configured_models);
         let default_model = configured_models
             .iter()
@@ -5176,7 +5358,7 @@ impl ManagementCenter {
                     .map_err(crate::app::remote_error_into_vibex)?
             };
             let saved_profile_id = profile.id.as_str().to_string();
-            let replaces_secret = !api_key.is_empty();
+            let replaces_secret = !api_key.is_empty() && secret_edited;
             if replaces_secret || secret_clear {
                 backend
                     .management()
@@ -10355,11 +10537,13 @@ impl ManagementCenter {
     }
 
     /// One picker row: the checkbox that decides whether the Provider offers
-    /// the Model, and a body that opens its settings.
+    /// the Model, the body that opens its settings, and the delete command that
+    /// takes it back out of the draft.
     ///
-    /// The two are separate targets rather than one, because checking a Model
-    /// and inspecting it are different intentions and a single hit area would
-    /// have to guess which one a click meant.
+    /// Checking a Model and inspecting it are different intentions, so the
+    /// checkbox answers only itself. The row around it is the settings target,
+    /// which means a click anywhere on the strip opens the Model instead of only
+    /// the width of its name.
     fn render_profile_candidate_row(
         &self,
         row: &ProfileCandidateRow,
@@ -10384,8 +10568,13 @@ impl ManagementCenter {
         let title = row.display_name.clone().unwrap_or_else(|| row.id.clone());
         let toggled = row.clone();
         let selected_id = row.id.clone();
+        let deleted_id = row.id.clone();
+        let row_id = row.id.clone();
         let debug_id = row.id.clone();
         h_flex()
+            .id(SharedString::from(format!(
+                "provider-candidate-row-{row_id}"
+            )))
             .w_full()
             .min_w_0()
             .items_center()
@@ -10417,61 +10606,99 @@ impl ManagementCenter {
                     row.bg(management_surface_wash(cx, MANAGEMENT_PANEL_ROW_HOVER_WASH))
                 })
             })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_profile_model(selected_id.clone(), window, cx);
+            }))
             .child(
-                Checkbox::new(SharedString::from(format!("provider-candidate-{}", row.id)))
-                    .small()
-                    .checked(configured)
-                    .accessibility_label(SharedString::from(title.clone()))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, checked, _, cx| {
-                        this.select_profile_candidate(&toggled, *checked, cx);
-                    })),
-            )
-            .child(
+                // The checkbox keeps its own answer: a click on it checks the
+                // Model instead of also opening its settings.
                 div()
                     .id(SharedString::from(format!(
-                        "provider-candidate-open-{}",
+                        "provider-candidate-check-{}",
                         row.id
                     )))
-                    .min_w_0()
-                    .flex_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_profile_model(selected_id.clone(), window, cx);
-                    }))
+                    .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .w_full()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    // An unoffered Model is a name in the
-                                    // catalogue, not a name in use: it stays
-                                    // legible but visibly secondary until it is
-                                    // checked, which is what makes a long
-                                    // catalogue scannable.
-                                    .text_color(if configured {
-                                        cx.theme().foreground
-                                    } else {
-                                        cx.theme().foreground.opacity(0.75)
-                                    })
-                                    .child(title),
-                            )
-                            .when(!meta.is_empty(), |row| {
-                                row.child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(meta),
-                                )
-                            }),
+                        Checkbox::new(SharedString::from(format!("provider-candidate-{}", row.id)))
+                            .small()
+                            .checked(configured)
+                            .accessibility_label(SharedString::from(title.clone()))
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, checked, _, cx| {
+                                this.select_profile_candidate(&toggled, *checked, cx);
+                            })),
                     ),
             )
+            .child(
+                div().min_w_0().flex_1().child(
+                    v_flex()
+                        .min_w_0()
+                        .w_full()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                // An unoffered Model is a name in the
+                                // catalogue, not a name in use: it stays
+                                // legible but visibly secondary until it is
+                                // checked, which is what makes a long
+                                // catalogue scannable.
+                                .text_color(if configured {
+                                    cx.theme().foreground
+                                } else {
+                                    cx.theme().foreground.opacity(0.75)
+                                })
+                                .child(title),
+                        )
+                        .when(!meta.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(meta),
+                            )
+                        }),
+                ),
+            )
+            .when(row.is_declared(), |row| {
+                row.child(
+                    // The delete command is on the row it deletes, so the Model
+                    // it removes is the Model the pointer is on, and the trash
+                    // keeps its own intention instead of also opening settings.
+                    div()
+                        .id(SharedString::from(format!(
+                            "provider-candidate-delete-wrap-{}",
+                            row_id
+                        )))
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "provider-candidate-delete-{}",
+                                row_id
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .danger()
+                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                            .tooltip(management_locale_text(
+                                "Delete this model",
+                                "删除该模型",
+                                "刪除該模型",
+                            ))
+                            .disabled(pending)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.delete_profile_model(deleted_id.clone(), window, cx)
+                                },
+                            )),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -10834,7 +11061,7 @@ impl ManagementCenter {
                 pending,
                 None,
                 cx.listener(move |this, _, window, cx| {
-                    this.set_profile_model_reasoning_draft(index, disabled, "", window, cx)
+                    this.set_profile_model_reasoning_draft(index, disabled, window, cx)
                 }),
                 cx,
             ));
@@ -10851,51 +11078,28 @@ impl ManagementCenter {
         );
 
         if !reasoning_disabled {
-            let current = self
-                .profile_model_edit_efforts
-                .read(cx)
-                .value()
-                .trim()
-                .to_string();
-            let mut presets = h_flex().w_full().flex_wrap().gap_1p5();
-            for (key, label, declaration) in [
-                ("deepseek", "DeepSeek", "off, low, high, max"),
-                (
-                    "openai",
-                    management_locale_text(
-                        "OpenAI-compatible",
-                        "通用 OpenAI 兼容",
-                        "通用 OpenAI 相容",
-                    ),
-                    "off, low, medium, high",
-                ),
-                (
-                    "anthropic",
-                    "Anthropic Messages",
-                    "off, low, medium, high, max",
-                ),
-            ] {
-                presets = presets.child(management_option_chip(
-                    SharedString::from(format!("provider-model-efforts-preset-{index}-{key}")),
-                    SharedString::from(label),
-                    current == declaration,
+            // The levels are a set the user clicks together, and the field
+            // below stays the place a wire spelling is written, so the chips and
+            // the field are two views of one declaration rather than two
+            // answers to the same question.
+            let declared =
+                reasoning_level_entries(&self.profile_model_edit_efforts.read(cx).value());
+            let mut levels = h_flex().w_full().flex_wrap().gap_1p5();
+            for level in vibex_core::ProviderReasoningEffortLevel::ALL {
+                let selected = declared.iter().any(|entry| entry.level() == Some(level));
+                let name = level.as_str();
+                levels = levels.child(management_option_chip(
+                    SharedString::from(format!("provider-model-efforts-level-{index}-{name}")),
+                    SharedString::from(name),
+                    selected,
                     pending,
-                    // The chip's label is the endpoint family; the tooltip says
-                    // what it writes, because the chip fills the field below
-                    // rather than choosing an abstraction.
-                    Some(SharedString::from(match locale::current_locale() {
-                        ResolvedLocale::En => format!("Write: {declaration}"),
-                        ResolvedLocale::ZhCn => format!("写入：{declaration}"),
-                        ResolvedLocale::ZhTw => format!("寫入：{declaration}"),
+                    Some(SharedString::from(if selected {
+                        management_locale_text("Remove this level", "取消该档位", "取消該檔位")
+                    } else {
+                        management_locale_text("Declare this level", "声明该档位", "宣告該檔位")
                     })),
                     cx.listener(move |this, _, window, cx| {
-                        this.set_profile_model_reasoning_draft(
-                            index,
-                            false,
-                            declaration,
-                            window,
-                            cx,
-                        )
+                        this.toggle_profile_model_reasoning_level(index, level, window, cx)
                     }),
                     cx,
                 ));
@@ -10908,7 +11112,7 @@ impl ManagementCenter {
                         management_locale_text("Thinking levels", "思考档位", "思考檔位"),
                         cx,
                     ))
-                    .child(presets)
+                    .child(levels)
                     .child(management_input_field_with_error(
                         management_locale_text("Declared levels", "档位列表", "檔位清單"),
                         &self.profile_model_edit_efforts,
@@ -10918,9 +11122,9 @@ impl ManagementCenter {
                     ))
                     .child(management_field_hint(
                         management_locale_text(
-                            "Empty follows the Agent default. Write levels separated by commas, or level=wire when the endpoint spells one differently.",
-                            "留空沿用 Agent 默认。多个档位用逗号分隔；端点拼写不同时写成 档位=实际值。",
-                            "留空沿用 Agent 預設。多個檔位用逗號分隔；端點拼寫不同時寫成 檔位=實際值。",
+                            "Click a level to declare it and click it again to take it back. The field takes any other spelling: levels separated by commas, or level=wire when the endpoint spells one differently. Empty follows the Agent default.",
+                            "点击档位即可声明，再次点击取消。也可以在输入框自定义：多个档位用逗号分隔，端点拼写不同时写成 档位=实际值。留空沿用 Agent 默认。",
+                            "點擊檔位即可宣告，再次點擊取消。也可以在輸入框自訂：多個檔位用逗號分隔，端點拼寫不同時寫成 檔位=實際值。留空沿用 Agent 預設。",
                         ),
                         cx,
                     )),
@@ -10952,32 +11156,37 @@ impl ManagementCenter {
                                 .w_full()
                                 .gap_2p5()
                                 .pt_2()
-                                .child(management_input_field_with_error(
+                                .child(management_token_field(
                                     management_locale_text(
                                         "Context window (tokens)",
                                         "上下文窗口（Token）",
                                         "上下文視窗（Token）",
                                     ),
                                     &self.profile_model_edit_context_tokens,
-                                    false,
                                     limits_error.as_deref(),
+                                    &MANAGEMENT_CONTEXT_TOKEN_PRESETS,
+                                    format!("provider-model-context-preset-{index}"),
+                                    pending,
                                     cx,
                                 ))
-                                .child(management_input_field(
+                                .child(management_token_field(
                                     management_locale_text(
                                         "Max output tokens",
                                         "最大输出 Token",
                                         "最大輸出 Token",
                                     ),
                                     &self.profile_model_edit_output_tokens,
-                                    false,
+                                    None,
+                                    &MANAGEMENT_OUTPUT_TOKEN_PRESETS,
+                                    format!("provider-model-output-preset-{index}"),
+                                    pending,
                                     cx,
                                 ))
                                 .child(management_field_hint(
                                     management_locale_text(
-                                        "Empty keeps the Agent's own default. Only Agents that read a declared limit are affected.",
-                                        "留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
-                                        "留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
+                                        "Click a value to declare it and click it again to clear it, or type any other count. Empty keeps the Agent's own default; only Agents that read a declared limit are affected.",
+                                        "点击常用值即可填入，再次点击清除，也可以输入其他数值。留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
+                                        "點擊常用值即可填入，再次點擊清除，也可以輸入其他數值。留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
                                     ),
                                     cx,
                                 )),
@@ -10985,38 +11194,7 @@ impl ManagementCenter {
                 ),
         );
 
-        // The pane has no dismissable editor, so the only trailing command is
-        // the one that takes the Model back out of the Provider. It is set off
-        // by a rule so it cannot be hit while reaching for the last field.
-        editor
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_start()
-                    .gap_2()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        Button::new(SharedString::from(format!("provider-model-delete-{index}")))
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .danger()
-                            .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                            .label(management_locale_text(
-                                "Remove this model",
-                                "移除该模型",
-                                "移除該模型",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_profile_model(index, cx)
-                            })),
-                    ),
-            )
-            .into_any_element()
+        editor.into_any_element()
     }
 
     /// Checks or unchecks every picker row the current search shows.
@@ -11152,24 +11330,42 @@ impl ManagementCenter {
                         } else {
                             management_locale_text("Clear", "清除", "清除")
                         })
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.profile_secret_clear = !this.profile_secret_clear;
                             // Clearing is an intent of its own; dropping it again
-                            // leaves the stored Secret exactly as it was.
+                            // leaves the stored Secret exactly as it was. The
+                            // field follows the intent so it never shows a key
+                            // the save is about to delete.
                             let clear = this.profile_secret_clear;
+                            let restored = (!clear)
+                                .then(|| this.profile_secret_loaded.clone())
+                                .flatten()
+                                .unwrap_or_default();
+                            this.profile_api_key.update(cx, |state, cx| {
+                                state.set_masked(true, window, cx);
+                                state.set_value(restored, window, cx);
+                            });
                             this.projection_editor.set_secret_intent(clear, clear);
                             this.navigation.mark_dirty(ManagementSection::Agents, true);
                             cx.notify();
                         })),
                 );
             }
-            // The editor never reads the stored Secret back: blank is the
-            // "keep it" answer, typing replaces it, and clearing is a command.
+            // A stored key the read brought back is shown masked, and the eye
+            // reveals it; a key the read could not bring back keeps the older
+            // answer, where blank is "keep it". Typing replaces either way, and
+            // clearing is a command.
             let hint = if clearing {
                 management_locale_text(
                     "Saving clears the stored key.",
                     "保存后会清除已保存的密钥。",
                     "儲存後會清除已儲存的密鑰。",
+                )
+            } else if configured && self.profile_secret_loaded.is_some() {
+                management_locale_text(
+                    "A key is stored, hidden behind asterisks. Use the eye to reveal it, or type a new value to replace it.",
+                    "已保存密钥，默认用星号隐藏显示，点击右侧眼睛可显示明文；输入新值即可替换。",
+                    "已儲存密鑰，預設以星號隱藏顯示，點擊右側眼睛可顯示明文；輸入新值即可取代。",
                 )
             } else if configured {
                 management_locale_text(
@@ -19072,6 +19268,216 @@ fn management_choice_group_label(label: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// The context-window sizes the Model editor offers as one click.
+const MANAGEMENT_CONTEXT_TOKEN_PRESETS: [u64; 5] = [128_000, 200_000, 256_000, 512_000, 1_000_000];
+/// The max-output sizes the Model editor offers as one click.
+const MANAGEMENT_OUTPUT_TOKEN_PRESETS: [u64; 6] = [4_000, 8_000, 16_000, 32_000, 64_000, 128_000];
+
+/// The count a quick-value chip is labelled with: `128k`, `1M`, or the number.
+fn management_token_count_label(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// The count a token field currently holds, when it holds one.
+fn current_token_field(state: &Entity<InputState>, cx: &App) -> Option<u64> {
+    state.read(cx).value().trim().parse::<u64>().ok()
+}
+
+/// A token-count field with the quick values the user can click instead.
+///
+/// The chips sit between the label and the input because they are shortcuts to
+/// the value the field holds rather than a second answer: the label names what is
+/// being chosen, the chips are the common counts, and the field stays the place
+/// any other count is typed.
+fn management_token_field(
+    label: impl Into<SharedString>,
+    state: &Entity<InputState>,
+    error: Option<&str>,
+    presets: &'static [u64],
+    id_prefix: String,
+    pending: bool,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let label: SharedString = label.into();
+    let mut input = Input::new(state).small().w_full();
+    if error.is_some() {
+        input = input.border_color(cx.theme().danger);
+    }
+    let current = current_token_field(state, cx);
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(
+            Form::new().child(
+                Field::new().label(label).child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(management_token_preset_row(
+                            &id_prefix, presets, current, pending, state, cx,
+                        ))
+                        .child(input),
+                ),
+            ),
+        )
+        .children(error.map(|message| management_field_error(message.to_string(), cx)))
+        .into_any_element()
+}
+
+/// A row of quick counts for a token field.
+///
+/// Clicking a chip writes its count into the field below, which stays the place
+/// any other count is typed; clicking the chip that is already current clears
+/// the field again, so "not declared" is reachable without the keyboard. The
+/// field is the answer either way — the chip is a shortcut, not a second value.
+fn management_token_preset_row(
+    id_prefix: &str,
+    presets: &[u64],
+    current: Option<u64>,
+    pending: bool,
+    input: &Entity<InputState>,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let mut row = h_flex().w_full().flex_wrap().gap_1p5();
+    for preset in presets {
+        let preset = *preset;
+        let selected = current == Some(preset);
+        let input = input.clone();
+        row = row.child(management_option_chip(
+            SharedString::from(format!("{id_prefix}-{preset}")),
+            SharedString::from(management_token_count_label(preset)),
+            selected,
+            pending,
+            // Only the current chip has something extra to say; the rest are
+            // named by the counts they write.
+            selected.then(|| {
+                SharedString::from(management_locale_text(
+                    "Click again to clear",
+                    "再次点击清除",
+                    "再次點擊清除",
+                ))
+            }),
+            cx.listener(move |this, _, window, cx| {
+                let value = if selected {
+                    String::new()
+                } else {
+                    preset.to_string()
+                };
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+                this.apply_profile_model_edit(cx);
+            }),
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// One entry of the declared-levels field.
+///
+/// The chips read levels out of the field and write them back, so an entry the
+/// vocabulary does not name is kept as the text the user wrote rather than being
+/// dropped by the next click, and a level's wire spelling survives a toggle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReasoningLevelEntry {
+    Level {
+        level: vibex_core::ProviderReasoningEffortLevel,
+        wire: Option<String>,
+    },
+    Raw(String),
+}
+
+impl ReasoningLevelEntry {
+    fn level(&self) -> Option<vibex_core::ProviderReasoningEffortLevel> {
+        self.level_and_wire().map(|(level, _)| level)
+    }
+
+    fn level_and_wire(&self) -> Option<(vibex_core::ProviderReasoningEffortLevel, Option<String>)> {
+        match self {
+            Self::Level { level, wire } => Some((*level, wire.clone())),
+            Self::Raw(_) => None,
+        }
+    }
+
+    /// The entry as the field spells it: `level`, `level=wire`, or the raw text.
+    fn declaration(&self) -> String {
+        match self {
+            Self::Level { level, wire } => match wire {
+                Some(wire) if wire != level.as_str() => format!("{level}={wire}"),
+                _ => level.as_str().to_string(),
+            },
+            Self::Raw(text) => text.clone(),
+        }
+    }
+}
+
+/// Splits the declared-levels field into the entries the chips read.
+fn reasoning_level_entries(text: &str) -> Vec<ReasoningLevelEntry> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (name, wire) = match entry.split_once('=') {
+                Some((name, wire)) => (name.trim(), Some(wire.trim().to_string())),
+                None => (entry, None),
+            };
+            match vibex_core::ProviderReasoningEffortLevel::parse(name) {
+                Some(level) => ReasoningLevelEntry::Level { level, wire },
+                None => ReasoningLevelEntry::Raw(entry.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Adds a level to the declaration, or takes it back out when it is there.
+///
+/// Levels keep escalation order, which is the order the declaration is stored
+/// and shown in, and each keeps the wire spelling it was written with. An entry
+/// the vocabulary does not name keeps its own text and its own place, and an
+/// emptied declaration is the "follow the Agent default" answer.
+fn toggled_reasoning_levels(text: &str, level: vibex_core::ProviderReasoningEffortLevel) -> String {
+    let entries = reasoning_level_entries(text);
+    let mut levels = entries
+        .iter()
+        .filter_map(ReasoningLevelEntry::level_and_wire)
+        .collect::<Vec<_>>();
+    match levels.iter().position(|(current, _)| *current == level) {
+        Some(index) => {
+            levels.remove(index);
+        }
+        None => levels.push((level, None)),
+    }
+    levels.sort_by_key(|(level, _)| *level);
+
+    // The levels take the slots the declared ones held, so raw entries stay
+    // where the user wrote them; a level that was just added has no slot and
+    // lands after them.
+    let mut remaining = levels.into_iter();
+    let mut ordered = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        match entry {
+            ReasoningLevelEntry::Level { .. } => {
+                if let Some((level, wire)) = remaining.next() {
+                    ordered.push(ReasoningLevelEntry::Level { level, wire });
+                }
+            }
+            raw => ordered.push(raw),
+        }
+    }
+    ordered.extend(remaining.map(|(level, wire)| ReasoningLevelEntry::Level { level, wire }));
+    ordered
+        .iter()
+        .map(ReasoningLevelEntry::declaration)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A disclosure header: a quiet caption row that opens the content below it.
 ///
 /// Collapsed by default so a rarely used group does not push the frequent
@@ -20569,7 +20975,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_api_key_editor_never_reads_the_stored_secret_back() {
+    fn provider_api_key_editor_reveals_the_stored_secret_only_on_request() {
         let source = include_str!("management.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -20580,6 +20986,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn close_profile_editor("))
             .map(|(body, _)| body)
             .expect("Provider editor should remain inspectable");
+        let loader = source
+            .split_once("    fn load_profile_secret(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn reset_profile_editor_state("))
+            .map(|(body, _)| body)
+            .expect("Provider secret loader should remain inspectable");
         let credential_control = source
             .split_once("    fn render_projection_credential_control(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_profile_editor_dialog("))
@@ -20591,15 +21002,18 @@ mod tests {
             .map(|(body, _)| body)
             .expect("profile save handler should remain inspectable");
 
-        // The editor states that a Secret exists instead of fetching it: blank
-        // keeps the stored value, typing replaces it, Clear removes it.
+        // The stored Secret is read back so the field can show it, but only
+        // masked: the eye is what reveals it, and a field the user has not
+        // touched is never mistaken for a replacement on save.
         assert!(editor.contains("self.profile_secret_configured = profile.secret_configured;"));
-        assert!(editor.contains("state.set_value(\"\", window, cx);"));
-        assert!(!production.contains("get_agent_model_provider_profile_secret_value"));
+        assert!(editor.contains("self.load_profile_secret(profile.id.clone(), window, cx);"));
+        assert!(loader.contains("get_agent_model_provider_profile_secret_value"));
+        assert!(loader.contains("state.set_masked(true, window, cx);"));
+        assert!(loader.contains("this.profile_secret_loaded = Some(secret.clone());"));
         assert!(!production.contains("PROVIDER_API_KEY_CONFIGURED_PLACEHOLDER"));
         assert!(credential_control.contains(".mask_toggle()"));
         assert!(credential_control.contains("provider-secret-clear"));
-        assert!(save.contains("let replaces_secret = !api_key.is_empty();"));
+        assert!(save.contains("let replaces_secret = !api_key.is_empty() && secret_edited;"));
         assert!(save.contains("clear: secret_clear,"));
     }
 
@@ -20659,6 +21073,7 @@ mod tests {
             wire_api: None,
             capabilities: Default::default(),
             configured_index: None,
+            released: false,
         };
 
         assert!(profile_candidate_matches(&row("gpt-5-codex", None), ""));
@@ -21395,9 +21810,12 @@ mod tests {
             center.select_profile_candidate(&rows[0], false, cx);
             assert!(center.profile_configured_models.is_empty());
             assert_eq!(center.profile_detached_models.len(), 1);
-            assert!(!center.profile_candidate_rows()[0].is_configured());
-
             let rows = center.profile_candidate_rows();
+            assert!(!rows[0].is_configured());
+            // The row stays on screen while its declaration waits for a
+            // re-check, and the trash beside it is what drops the declaration.
+            assert!(rows[0].is_declared());
+
             center.select_profile_candidate(&rows[0], true, cx);
             assert_eq!(center.profile_configured_models.len(), 1);
             assert_eq!(
@@ -21408,6 +21826,159 @@ mod tests {
                 "re-checking a row must restore what the Model declared"
             );
         });
+    }
+
+    #[gpui::test]
+    fn releasing_a_hand_typed_model_keeps_its_row(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, cx| {
+            center.profile_configured_models = vec![test_provider_model("hand-typed", None)];
+
+            let rows = center.profile_candidate_rows();
+            center.select_profile_candidate(&rows[0], false, cx);
+            assert!(center.profile_configured_models.is_empty());
+
+            // The catalogue never advertised it, so the released declaration is
+            // the only thing keeping the row in the list.
+            let rows = center.profile_candidate_rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "hand-typed");
+            assert!(!rows[0].is_configured());
+            assert!(rows[0].is_declared());
+
+            center.select_profile_candidate(&rows[0], true, cx);
+            assert_eq!(center.profile_configured_models.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn deleting_a_model_drops_its_declaration_and_closes_its_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_available_models = vec![test_provider_model("gpt-5", None)];
+                center.profile_configured_models = vec![
+                    test_provider_model("gpt-5", None),
+                    test_provider_model("hand-typed", None),
+                ];
+                center.select_profile_model("gpt-5".to_string(), window, cx);
+
+                center.delete_profile_model("gpt-5".to_string(), window, cx);
+                assert!(center.profile_model_selection.is_none());
+                assert!(center.profile_model_edit_id.read(cx).value().is_empty());
+                // The catalogue still advertises it, so the row survives as the
+                // plain, unconfigured row a fetch would have produced.
+                let rows = center.profile_candidate_rows();
+                assert_eq!(rows.len(), 2);
+                assert!(!rows[0].is_configured());
+                assert!(!rows[0].is_declared());
+
+                // A hand-typed Model has no catalogue row to fall back to, so
+                // deleting it takes its row with it.
+                center.delete_profile_model("hand-typed".to_string(), window, cx);
+                let rows = center.profile_candidate_rows();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "gpt-5");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn deleting_a_released_model_forgets_the_declaration_a_recheck_would_restore(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            center.update(cx, |center, cx| {
+                center.profile_available_models = vec![test_provider_model("gpt-5", None)];
+                let mut configured = test_provider_model("gpt-5", None);
+                configured.capabilities.context_tokens = Some(128_000);
+                center.profile_configured_models = vec![configured];
+
+                let rows = center.profile_candidate_rows();
+                center.select_profile_candidate(&rows[0], false, cx);
+                assert_eq!(center.profile_detached_models.len(), 1);
+
+                center.delete_profile_model("gpt-5".to_string(), window, cx);
+                assert!(center.profile_detached_models.is_empty());
+                let rows = center.profile_candidate_rows();
+                assert_eq!(rows.len(), 1);
+                assert!(!rows[0].is_declared());
+
+                let rows = center.profile_candidate_rows();
+                center.select_profile_candidate(&rows[0], true, cx);
+                assert_eq!(
+                    center.profile_configured_models[0]
+                        .capabilities
+                        .context_tokens,
+                    None,
+                    "a deleted declaration is not restored by re-checking"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn thinking_level_chips_toggle_the_declaration_and_keep_custom_spellings() {
+        use vibex_core::ProviderReasoningEffortLevel as Level;
+
+        assert_eq!(toggled_reasoning_levels("", Level::Low), "low");
+        assert_eq!(
+            toggled_reasoning_levels("low", Level::Medium),
+            "low, medium"
+        );
+        // A level that is already declared is taken back out.
+        assert_eq!(
+            toggled_reasoning_levels("low, medium", Level::Low),
+            "medium"
+        );
+        // The declaration reads back in escalation order, however it was
+        // clicked into place.
+        assert_eq!(
+            toggled_reasoning_levels("max, off", Level::Medium),
+            "off, medium, max"
+        );
+        // A wire spelling belongs to its own level and survives a toggle.
+        assert_eq!(
+            toggled_reasoning_levels("low=xlow, high", Level::Minimal),
+            "minimal, low=xlow, high"
+        );
+        // An entry the vocabulary does not name keeps its text and its place.
+        assert_eq!(
+            toggled_reasoning_levels("turbo, low", Level::High),
+            "turbo, low, high"
+        );
+        assert_eq!(toggled_reasoning_levels("low", Level::Low), "");
+        assert_eq!(
+            reasoning_level_entries(""),
+            Vec::<ReasoningLevelEntry>::new()
+        );
+        assert_eq!(
+            reasoning_level_entries(" off , low=xlow "),
+            vec![
+                ReasoningLevelEntry::Level {
+                    level: Level::Off,
+                    wire: None,
+                },
+                ReasoningLevelEntry::Level {
+                    level: Level::Low,
+                    wire: Some("xlow".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn token_preset_labels_stay_short_and_exact() {
+        assert_eq!(management_token_count_label(128_000), "128k");
+        assert_eq!(management_token_count_label(1_000_000), "1M");
+        assert_eq!(management_token_count_label(4_000), "4k");
+        assert_eq!(management_token_count_label(1_500), "1500");
     }
 
     #[test]
@@ -21480,7 +22051,7 @@ mod tests {
             "provider-model-catalog-",
             "provider-model-wire-",
             "provider-model-reasoning-",
-            "provider-model-efforts-preset-",
+            "provider-model-efforts-level-",
         ] {
             assert!(
                 editor.contains(group),
@@ -21492,6 +22063,11 @@ mod tests {
             4,
             "each choice group draws its options through the shared chip"
         );
+        // The token limits are quick values over a field, not a choice group, so
+        // they draw through the same chip from their own helper.
+        assert!(editor.contains("management_token_field("));
+        assert!(editor.contains("MANAGEMENT_CONTEXT_TOKEN_PRESETS"));
+        assert!(editor.contains("MANAGEMENT_OUTPUT_TOKEN_PRESETS"));
     }
 
     #[gpui::test]
@@ -21656,6 +22232,58 @@ mod tests {
             .debug_bounds("provider-candidate-row-gpt-5")
             .expect("the picker must lay its rows out");
         assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
+    }
+
+    /// The whole row is the settings target, not just the width of the name.
+    #[gpui::test]
+    fn clicking_the_edge_of_a_picker_row_still_opens_that_model(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            center.profile_editor_open = true;
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+            center.profile_available_models = vec![
+                test_provider_model("gpt-5", Some("GPT-5")),
+                test_provider_model("gpt-5-mini", None),
+            ];
+            center.profile_configured_models = vec![test_provider_model("gpt-5", None)];
+            center.profile_model_selection = Some("gpt-5".to_string());
+        });
+
+        let dialog = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
+        let (_, cx) = cx.add_window_view(move |_, _| ProfileDialogHarness {
+            dialog: dialog.clone(),
+        });
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1080.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // The leading edge is padding, not the checkbox: a click there has to
+        // reach the row it belongs to instead of falling between the two
+        // controls.
+        let row = cx
+            .debug_bounds("provider-candidate-row-gpt-5-mini")
+            .expect("the picker must lay its rows out");
+        cx.simulate_click(
+            gpui::point(row.origin.x + px(2.0), row.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            center.read_with(cx, |center, _| center.profile_model_selection.clone()),
+            Some("gpt-5-mini".to_string()),
+            "a click on the row opens the Model it names"
+        );
+        assert_eq!(
+            center.read_with(cx, |center, _| center.profile_configured_models.len()),
+            1,
+            "opening a row is not the same intention as checking it"
+        );
     }
 
     #[test]

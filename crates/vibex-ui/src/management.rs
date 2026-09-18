@@ -1185,7 +1185,7 @@ mod tests {
         AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
         AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
         AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-        AgentModelProviderProfileSecretValueResponse,
+        AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
         AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
         AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
         AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentSnapshotEntry,
@@ -1457,6 +1457,13 @@ mod tests {
         fn mutate_agent_model_provider_profile_secret(
             &self,
             _request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+        ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
+            error_future()
+        }
+
+        fn get_agent_model_provider_profile_secret_value(
+            &self,
+            _request: AgentModelProviderProfileSecretValueRequest,
         ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
             error_future()
         }

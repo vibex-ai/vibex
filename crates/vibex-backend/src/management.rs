@@ -8,7 +8,7 @@ use vibex_core::{
     AgentModelProviderDisplayOrderSetRequest, AgentModelProviderDisplayOrderSetResponse,
     AgentModelProviderProfileCreateRequest, AgentModelProviderProfileDeleteRequest,
     AgentModelProviderProfileFetchModelsRequest, AgentModelProviderProfileFetchModelsResponse,
-    AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileSecretValueRequest, AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileTestRequest,
     AgentModelProviderProfileTestResult, AgentModelProviderProfileUpdateRequest,
     AgentProviderProjectionCapability, AgentProviderProjectionCapabilityRequest,
@@ -227,6 +227,12 @@ pub trait ManagementBackend: BackendBound {
     fn mutate_agent_model_provider_profile_secret(
         &self,
         request: MutationRequest<AgentModelProviderProfileSecretValueUpdateRequest>,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse>;
+
+    /// Reads the stored Secret back so the editor can reveal it on request.
+    fn get_agent_model_provider_profile_secret_value(
+        &self,
+        request: AgentModelProviderProfileSecretValueRequest,
     ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse>;
 
     fn create_agent_model_provider_profile(

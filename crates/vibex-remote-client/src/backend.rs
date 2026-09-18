@@ -22,7 +22,8 @@ use vibex_core::{
     AgentAuthenticationOperationId, AgentCatalogListResponse, AgentCommandDiscoverRequest,
     AgentCommandDiscovery, AgentCommandExecuteRequest, AgentCommandExecuteResult, AgentId,
     AgentListRequest, AgentListResponse, AgentLogoutRequest, AgentManagedInstallState,
-    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueResponse,
+    AgentModelProviderProfileCreateRequest, AgentModelProviderProfileSecretValueRequest,
+    AgentModelProviderProfileSecretValueResponse,
     AgentModelProviderProfileSecretValueUpdateRequest, AgentModelProviderProfileUpdateRequest,
     AgentNotificationIntent, AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse,
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentSession,
@@ -3875,6 +3876,34 @@ impl ManagementBackend for WebRemoteBackend {
                 .await?;
             Ok(
                 decode::<vibex_core::RemoteAgentModelProviderProfileSecretMutationResponse>(value)?
+                    .response,
+            )
+        })
+    }
+
+    fn get_agent_model_provider_profile_secret_value(
+        &self,
+        request: AgentModelProviderProfileSecretValueRequest,
+    ) -> BackendFuture<'_, AgentModelProviderProfileSecretValueResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteProviderRequest::GetAgentModelProviderProfileSecret(
+                vibex_core::RemoteAgentModelProviderProfileSecretGetRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(
+                decode::<vibex_core::RemoteAgentModelProviderProfileSecretGetResponse>(value)?
                     .response,
             )
         })
