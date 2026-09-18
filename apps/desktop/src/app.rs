@@ -21962,6 +21962,19 @@ impl VibexWorkbench {
         self.runtime_provider_reveal_selection = None;
     }
 
+    /// Drop the provider/model query together with the popover that owned it.
+    ///
+    /// The query only ever filters the list that was on screen, so it must not
+    /// outlive the panel: a later visit would otherwise open on a narrowed list
+    /// whose term the user can no longer see or edit. The composer and the
+    /// new-session home share one popover shape, so both fields are reset.
+    fn clear_runtime_provider_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_runtime_search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.new_session_runtime_search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
     /// Whether the Agent row is locked to the Agent it already has.
     ///
     /// A runtime switch in flight (or a pending new-session action) owns the
@@ -22057,6 +22070,9 @@ impl VibexWorkbench {
         self.runtime_provider_favorites_view = false;
         self.runtime_provider_scroll_to_selection = false;
         self.runtime_agent_row_reveal_pending = false;
+        // Unconditional: a teardown path may have dropped the flags above
+        // before the timeline reached here, and the query still has to go.
+        self.clear_runtime_provider_search(window, cx);
         if was_mounted {
             self.return_composer_focus(window, cx);
         }
@@ -22190,6 +22206,10 @@ impl VibexWorkbench {
         self.runtime_menu_closing_since = None;
         self.composer_runtime_menu_open = true;
         self.clear_runtime_provider_keyboard_selection();
+        // See `clear_runtime_provider_search`: a sibling chip's menu, Configure
+        // Agent and the attachment preview all tear the popover down without
+        // running the exit timeline, so the reset is repeated on the way back.
+        self.clear_runtime_provider_search(window, cx);
         self.runtime_provider_search_focus_pending = true;
         self.runtime_choice_menu_open = None;
         self.runtime_provider_scroll_to_selection = true;
@@ -22289,6 +22309,8 @@ impl VibexWorkbench {
         self.runtime_menu_closing_since = None;
         self.new_session_runtime_menu_open = true;
         self.clear_runtime_provider_keyboard_selection();
+        // See `clear_runtime_provider_search`.
+        self.clear_runtime_provider_search(window, cx);
         self.runtime_provider_search_focus_pending = true;
         self.runtime_choice_menu_open = None;
         self.runtime_provider_scroll_to_selection = true;
@@ -64120,6 +64142,61 @@ mod tests {
             runtime_model_choices(&catalog, &agent.id, &auth_sources[0].source, None, &[])
                 .is_empty()
         );
+    }
+
+    /// The provider/model filter belongs to the popover that shows it.
+    ///
+    /// A query left behind reopens the panel on a narrowed list whose term the
+    /// user can no longer see or edit, so the reset runs when the popover folds
+    /// away and again when it comes back: the paths that replace the popover (a
+    /// sibling chip's menu, Configure Agent, the attachment preview) tear it
+    /// down without the exit timeline.
+    #[test]
+    fn runtime_provider_search_does_not_outlive_the_popover() {
+        let source = include_str!("app.rs");
+        let reset = source
+            .split_once("    fn clear_runtime_provider_search(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether the Agent row is locked"))
+            .map(|(body, _)| body)
+            .expect("the provider search reset should remain inspectable");
+        assert!(
+            reset.contains("composer_runtime_search") && reset.contains("new_session_runtime_search"),
+            "the composer and the new-session home share one popover shape, so both fields reset"
+        );
+        assert!(
+            reset.contains("set_value(\"\", window, cx)"),
+            "the reset must empty the field instead of leaving its text in place"
+        );
+
+        let closing = source
+            .split_once("    fn finish_runtime_menu_close(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn choose_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("the popover teardown should remain inspectable");
+        assert!(
+            closing.contains("self.clear_runtime_provider_search(window, cx);"),
+            "folding the popover away must clear the search"
+        );
+
+        let composer_opening = source
+            .split_once("    fn set_composer_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn navigate_composer_runtime_menu("))
+            .map(|(body, _)| body)
+            .expect("composer menu opening should remain inspectable");
+        let new_session_opening = source
+            .split_once("    fn set_new_session_runtime_menu_open(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_runtime_choice_menu_open("))
+            .map(|(body, _)| body)
+            .expect("new-session menu opening should remain inspectable");
+        for (surface, opening) in [
+            ("composer", composer_opening),
+            ("new-session", new_session_opening),
+        ] {
+            assert!(
+                opening.contains("self.clear_runtime_provider_search(window, cx);"),
+                "reopening the {surface} popover must start from an empty search"
+            );
+        }
     }
 
     #[test]
