@@ -45,6 +45,7 @@ use gpui_component::{
         MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
         MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
     },
+    kbd::Kbd,
     marker::{Marker, MarkerIcon},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     message::MessageAlignment,
@@ -52997,21 +52998,34 @@ impl FoundationSettings {
             let edit_action = (*action).to_string();
             let edit_current = current.clone();
             let reset_action = (*action).to_string();
+            // A stored override can only come from the validated dialog, but a
+            // hand-edited state file can still hold a keystroke gpui refuses to
+            // parse; fall back to the raw text so the row stays editable.
+            let mut edit_button =
+                Button::new(SharedString::from(format!("edit-shortcut-{action}")))
+                    .small()
+                    .ghost()
+                    .tooltip(locale::text("Change shortcut", "更改快捷键", "變更快速鍵"))
+                    .accessibility_label(format!(
+                        "{}: {}",
+                        locale::text("Change shortcut", "更改快捷键", "變更快速鍵"),
+                        shortcut_action_label(action),
+                    ));
+            edit_button = match Keystroke::parse(&current) {
+                Ok(keystroke) => edit_button.child(Kbd::new(keystroke).outline()),
+                Err(_) => edit_button.label(current),
+            };
             let control = h_flex()
                 .gap_1()
                 .child(
-                    Button::new(SharedString::from(format!("edit-shortcut-{action}")))
-                        .small()
-                        .outline()
-                        .label(current)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_shortcut_dialog(
-                                edit_action.clone(),
-                                edit_current.clone(),
-                                window,
-                                cx,
-                            )
-                        })),
+                    edit_button.on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_shortcut_dialog(
+                            edit_action.clone(),
+                            edit_current.clone(),
+                            window,
+                            cx,
+                        )
+                    })),
                 )
                 .child(
                     Button::new(SharedString::from(format!("reset-shortcut-{action}")))
@@ -64992,6 +65006,32 @@ mod tests {
         assert!(editor.contains("redo-attachment-edit"));
         assert!(editor.contains("cancel-attachment-edit"));
         assert!(editor.contains("finish-attachment-edit"));
+    }
+
+    #[test]
+    fn shortcuts_settings_render_keycaps_with_a_raw_text_fallback() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_shortcuts_page(")
+            .expect("shortcuts page should remain inspectable")
+            .1;
+        let page = page
+            .split_once("\n    fn ")
+            .expect("shortcuts page should end before the next method")
+            .0;
+
+        assert!(
+            page.contains("Kbd::new(keystroke).outline()"),
+            "the shortcut value should render as a gpui-component keycap"
+        );
+        assert!(
+            page.contains("Err(_) => edit_button.label(current)"),
+            "an unparseable stored keystroke should fall back to raw text"
+        );
+        assert!(
+            page.contains("open_shortcut_dialog("),
+            "clicking the keycap should still open the edit dialog"
+        );
     }
 
     #[test]
