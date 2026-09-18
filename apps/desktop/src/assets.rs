@@ -53,6 +53,13 @@ pub(crate) const LILEX_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/fonts/lilex/Lilex-BoldItalic.ttf"
 ));
+/// The bundled sans family, whose italic face is loaded on every platform.
+///
+/// The interface family is user-configurable and may only install a roman
+/// face (a system SF Pro Display, for example), so a run that must render
+/// italics — the temporary preview tab — names this family instead of the
+/// configured one.
+pub const BUNDLED_SANS_FAMILY: &str = "IBM Plex Sans";
 const WQY_MICROHEI: &[u8] =
     include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
 const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[

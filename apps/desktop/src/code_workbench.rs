@@ -21,7 +21,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath, Rope,
     RopeExt as _, Selectable as _, Sizable as _, Size, StyledExt as _, Theme, WindowExt as _,
     alert::Alert,
-    button::{Button, ButtonRounded, ButtonVariants as _, DropdownButton},
+    button::{Button, ButtonVariants as _, DropdownButton},
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -79,7 +79,7 @@ use vibex_markdown::{
 use vibex_terminal::TerminalManager;
 
 use crate::app::VibexWorkbench;
-use crate::assets::{file_tree_asset_icon, open_tool_brand_icon};
+use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -6053,9 +6053,7 @@ impl CodeWorkbench {
                             .small()
                             .ghost()
                             .compact()
-                            .rounded(ButtonRounded::None)
-                            .h_full()
-                            .w(px(36.0))
+                            .ml_1()
                             .flex_none()
                             .icon(IconName::Plus)
                             .text_color(cx.theme().muted_foreground)
@@ -6091,9 +6089,8 @@ impl CodeWorkbench {
                             .small()
                             .ghost()
                             .compact()
-                            .rounded(ButtonRounded::None)
-                            .h_full()
-                            .w(px(30.0))
+                            .ml_1()
+                            .mr_1()
                             .flex_none()
                             .icon(IconName::Ellipsis)
                             .text_color(cx.theme().muted_foreground)
@@ -6611,7 +6608,13 @@ impl CodeWorkbench {
                 div()
                     .min_w_0()
                     .whitespace_nowrap()
-                    .when(temporary, |this| this.italic())
+                    .when(temporary, |this| {
+                        // A preview tab is marked with an oblique label. The
+                        // configured interface family may ship no italic face,
+                        // so ask for the bundled sans, whose italic is always
+                        // loaded, rather than silently rendering upright.
+                        this.font_family(BUNDLED_SANS_FAMILY).italic()
+                    })
                     .when_some(target_status_color, |this, color| this.text_color(color))
                     .when(target_deleted, |this| this.line_through())
                     .child(label),
