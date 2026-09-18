@@ -12,14 +12,15 @@ use std::time::Duration;
 
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Context, DragMoveEvent, Empty, Entity, EventEmitter,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render, Role,
-    SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
+    FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render,
+    Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _, Theme, WindowExt as _,
     animation::{EffectTransition as Transition, ease_out_cubic},
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonVariants as _, Toggle},
     checkbox::Checkbox,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
@@ -89,6 +90,15 @@ const MANAGEMENT_PROFILE_PANE_MAX_HEIGHT: f32 = 260.0;
 /// The identity and connection band stops growing at this height, so the Model
 /// panes keep the rest of the dialog even when a disclosure opens.
 const MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT: f32 = 320.0;
+/// How much foreground the caption and command strips of a pane carry.
+///
+/// A strip is read as part of the panel it belongs to, so it lifts from the
+/// dialog surface by a hair rather than becoming a second, competing plate.
+const MANAGEMENT_PANEL_STRIP_WASH: f32 = 0.05;
+/// The wash a picker row takes while the settings pane is showing it.
+const MANAGEMENT_PANEL_ROW_SELECTED_WASH: f32 = 0.10;
+/// The wash a row, chip, or disclosure takes under the pointer.
+const MANAGEMENT_PANEL_ROW_HOVER_WASH: f32 = 0.05;
 const MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT: f32 = 360.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MIN_HEIGHT: f32 = 192.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MAX_HEIGHT: f32 = 560.0;
@@ -10091,64 +10101,39 @@ impl ManagementCenter {
         let selected_visible = visible.iter().filter(|row| row.is_configured()).count();
         let all_selected = !visible.is_empty() && selected_visible == visible.len();
 
-        let mut header = h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Available models",
-                        "可选模型",
-                        "可選模型",
-                    )),
-            )
-            // How many the Provider actually offers, which is the number the
-            // list of a whole catalogue does not tell the user.
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if configured == 0 {
-                        management_locale_text("None offered", "尚未提供", "尚未提供").to_string()
-                    } else {
-                        management_model_count(configured)
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(1.0))
-                    .rounded_full()
-                    .bg(cx.theme().border.opacity(0.60)),
-            );
-        if let Some(profile_id) = editing_profile_id {
+        // The pane's caption names the list and counts what the Provider
+        // actually offers, which the size of a whole catalogue does not say.
+        let offered = if configured == 0 {
+            management_locale_text("None offered", "尚未提供", "尚未提供").to_string()
+        } else {
+            management_model_count(configured)
+        };
+        let fetch = editing_profile_id.map(|profile_id| {
             let agent_id = selected_agent_id.clone();
-            header = header.child(
-                Button::new("provider-candidates-fetch")
-                    .xsmall()
-                    .outline()
-                    // A refresh glyph, not the search glyph: this asks the
-                    // endpoint for its list instead of filtering one.
-                    .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
-                    .label(if fetching_models {
-                        management_locale_text("Fetching...", "获取中...", "取得中...")
-                    } else {
-                        management_fetch_models_label()
-                    })
-                    .loading(fetching_models)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
-                    })),
-            );
-        }
+            Button::new("provider-candidates-fetch")
+                .xsmall()
+                .outline()
+                // A refresh glyph, not the search glyph: this asks the
+                // endpoint for its list instead of filtering one.
+                .icon(Icon::default().path("icons/vibex/rotate-ccw.svg"))
+                .label(if fetching_models {
+                    management_locale_text("Fetching...", "获取中...", "取得中...")
+                } else {
+                    management_fetch_models_label()
+                })
+                .loading(fetching_models)
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
+                }))
+                .into_any_element()
+        });
+        let header = profile_pane_header(
+            management_locale_text("Available models", "可选模型", "可選模型"),
+            Some(offered.into()),
+            fetch,
+            cx,
+        );
 
         // "Select all" only means something once there is a choice to make, the
         // bulk switches need a list worth batching, and the search earns its
@@ -10156,7 +10141,17 @@ impl ManagementCenter {
         let shows_select_all = visible.len() > 1;
         let shows_bulk = configured > 3;
         let shows_search = total > 3;
-        let mut controls = h_flex().w_full().min_w_0().items_center().gap_2();
+        let mut controls = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .border_b_1()
+            .border_color(cx.theme().border);
         if shows_select_all {
             controls = controls.child(
                 Checkbox::new("provider-candidates-select-all")
@@ -10213,7 +10208,7 @@ impl ManagementCenter {
             );
         }
 
-        let mut body = v_flex().w_full().gap_1();
+        let mut body = v_flex().w_full().gap_1().p_1p5();
         if total == 0 {
             // The command that fetches models only exists once the Provider is
             // saved, so the empty state promises exactly what is available.
@@ -10230,7 +10225,7 @@ impl ManagementCenter {
                     "儲存後可以擷取模型，也可以直接新增模型 ID。",
                 )
             };
-            body = body.child(compact_empty_state(
+            body = body.child(bare_empty_state(
                 management_locale_text("No models fetched", "尚未获取模型", "尚未取得模型"),
                 description,
                 cx,
@@ -10241,9 +10236,6 @@ impl ManagementCenter {
                     .w_full()
                     .items_center()
                     .gap_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
                     .p_4()
                     .child(
                         div()
@@ -10287,11 +10279,19 @@ impl ManagementCenter {
         };
 
         // A hand-typed Model is a row the catalogue did not offer, so the field
-        // that creates it belongs to the list it joins.
+        // that creates it belongs to the list it joins — and it sits in the
+        // pane's own foot rather than floating under a list of any length.
         let add_row = h_flex()
             .w_full()
+            .min_w_0()
+            .flex_none()
             .items_end()
             .gap_2()
+            .px_3()
+            .py_2()
+            .bg(management_surface_wash(cx, MANAGEMENT_PANEL_STRIP_WASH))
+            .border_t_1()
+            .border_color(cx.theme().border)
             .child(div().min_w_0().flex_1().child(management_input_field(
                 management_locale_text("Custom model", "自定义模型", "自訂模型"),
                 &self.profile_model_draft,
@@ -10310,27 +10310,24 @@ impl ManagementCenter {
                     ),
             );
 
-        // The pane is a column of the same surface as the form above it, not a
-        // tray: a filled box here would put the rows, the Model editor, and the
-        // pane itself on three different greys.
-        let mut pane = v_flex()
-            .min_w_0()
-            .debug_selector(|| "provider-candidates-pane".to_string())
-            .gap_2()
-            .child(header)
-            .when(shows_select_all || shows_bulk || shows_search, |pane| {
-                pane.child(controls)
-            })
-            .child(list)
-            .child(add_row);
-        if bounded {
-            // Side by side the two panes split the width; stacked, each one
-            // owns a full row.
-            pane = pane.flex_1().min_h_0();
-        } else {
-            pane = pane.w_full();
+        let mut body_column = v_flex().min_w_0().min_h_0().flex_1().child(list);
+        if shows_select_all || shows_bulk || shows_search {
+            body_column = v_flex()
+                .min_w_0()
+                .min_h_0()
+                .flex_1()
+                .child(controls)
+                .child(body_column);
         }
-        pane.into_any_element()
+
+        profile_pane_shell(
+            "provider-candidates-pane",
+            bounded,
+            header,
+            body_column.into_any_element(),
+            Some(add_row.into_any_element()),
+            cx,
+        )
     }
 
     /// One picker row: the checkbox that decides whether the Provider offers
@@ -10369,16 +10366,32 @@ impl ManagementCenter {
             .min_w_0()
             .items_center()
             .gap_2()
-            .rounded(px(6.0))
-            .pl_2()
-            .pr_2p5()
+            .rounded(px(4.0))
+            // The leading edge is reserved at rest so the row does not shift
+            // when it becomes the one the settings pane is showing.
+            .border_l_2()
+            .pl_1p5()
+            .pr_2()
             .py_1p5()
             .debug_selector(move || format!("provider-candidate-row-{debug_id}"))
-            // The wash marks which Model the settings pane is showing; whether
-            // the Provider offers it is the checkbox's own answer.
-            .when(opened, |row| row.bg(cx.theme().primary.opacity(0.08)))
+            // The wash and the leading edge mark which Model the settings pane
+            // is showing; whether the Provider offers it is the checkbox's own
+            // answer, and hover is only a pointer cue.
+            .border_color(if opened {
+                cx.theme().primary.opacity(0.75)
+            } else {
+                cx.theme().transparent
+            })
+            .when(opened, |row| {
+                row.bg(cx
+                    .theme()
+                    .primary
+                    .opacity(MANAGEMENT_PANEL_ROW_SELECTED_WASH))
+            })
             .when(!opened, |row| {
-                row.hover(|row| row.bg(cx.theme().primary.opacity(0.04)))
+                row.hover(|row| {
+                    row.bg(management_surface_wash(cx, MANAGEMENT_PANEL_ROW_HOVER_WASH))
+                })
             })
             .child(
                 Checkbox::new(SharedString::from(format!("provider-candidate-{}", row.id)))
@@ -10407,7 +10420,23 @@ impl ManagementCenter {
                             .min_w_0()
                             .w_full()
                             .gap_0p5()
-                            .child(div().truncate().text_sm().font_medium().child(title))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    // An unoffered Model is a name in the
+                                    // catalogue, not a name in use: it stays
+                                    // legible but visibly secondary until it is
+                                    // checked, which is what makes a long
+                                    // catalogue scannable.
+                                    .text_color(if configured {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().foreground.opacity(0.75)
+                                    })
+                                    .child(title),
+                            )
                             .when(!meta.is_empty(), |row| {
                                 row.child(
                                     div()
@@ -10465,40 +10494,12 @@ impl ManagementCenter {
                 .unwrap_or_else(|| id.to_string())
         });
 
-        let header = h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Model settings",
-                        "模型设置",
-                        "模型設定",
-                    )),
-            )
-            .when_some(selected_title.clone(), |header, title| {
-                header.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(title),
-                )
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(1.0))
-                    .rounded_full()
-                    .bg(cx.theme().border.opacity(0.60)),
-            );
+        let header = profile_pane_header(
+            management_locale_text("Model settings", "模型设置", "模型設定"),
+            selected_title.clone().map(SharedString::from),
+            None,
+            cx,
+        );
 
         let body = match selected_index {
             Some(index) => self.render_profile_model_editor(index, &editor_context, cx),
@@ -10507,9 +10508,6 @@ impl ManagementCenter {
                     .w_full()
                     .items_center()
                     .gap_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
                     .p_4()
                     .child(div().text_sm().font_medium().child(title))
                     .child(
@@ -10538,7 +10536,7 @@ impl ManagementCenter {
                             })),
                     )
                     .into_any_element(),
-                None => compact_empty_state(
+                None => bare_empty_state(
                     management_locale_text("No model selected", "未选择模型", "未選擇模型"),
                     management_locale_text(
                         "Pick a model on the left to edit its settings.",
@@ -10550,31 +10548,25 @@ impl ManagementCenter {
             },
         };
 
-        let mut pane = v_flex()
-            .min_w_0()
-            .debug_selector(|| "provider-chosen-pane".to_string())
-            .gap_2()
-            .child(header)
-            .child(if bounded {
-                // The settings scroll on their own beside the picker, and grow
-                // with the stacked layout, where the body already scrolls.
-                v_flex()
-                    .w_full()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(body)
-                    .into_any_element()
-            } else {
-                body
-            });
-        if bounded {
-            pane = pane.flex_1().min_h_0();
+        // The settings scroll on their own beside the picker, and grow with the
+        // stacked layout, where the body already scrolls. The trailing padding
+        // keeps the last control clear of the panel's own edge instead of being
+        // cut by it.
+        let body = if bounded {
+            v_flex()
+                .debug_selector(|| "profile-settings-body".to_string())
+                .w_full()
+                .min_h_0()
+                .flex_1()
+                .overflow_y_scrollbar()
+                .pr_1()
+                .child(body)
+                .into_any_element()
         } else {
-            pane = pane.w_full();
-        }
-        pane.into_any_element()
+            body
+        };
+
+        profile_pane_shell("provider-chosen-pane", bounded, header, body, None, cx)
     }
 
     /// The editor for one Model, rendered under its own row.
@@ -10612,27 +10604,29 @@ impl ManagementCenter {
             .get(index)
             .is_none_or(|model| model.enabled);
 
-        // The editor belongs to the row it was opened from, so it reads as an
-        // indented continuation of that row: an accent on the leading edge and
-        // a wash, not another bordered card inside the pane.
+        // The editor is the settings pane's whole body, so it is a column of
+        // that panel rather than a card inside it: the panel already supplies
+        // the boundary, and a second one here would nest two boxes.
         let mut editor = v_flex()
+            .debug_selector(|| "profile-model-editor".to_string())
             .w_full()
             .min_w_0()
-            .gap_2p5()
-            .rounded(px(6.0))
-            .border_l_2()
-            .border_color(cx.theme().primary.opacity(0.55))
-            .bg(cx.theme().primary.opacity(0.05))
-            .p_2p5()
+            .gap_4()
+            .p_3()
             // Offering the Model is a setting of the Model, so it lives with
-            // the rest of them instead of on a list row of its own.
+            // the rest of them instead of on a list row of its own. It leads
+            // the panel because it decides whether any of the rest is read.
             .child(
                 h_flex()
+                    .debug_selector(|| "profile-model-enable-row".to_string())
                     .w_full()
                     .min_w_0()
                     .items_center()
                     .justify_between()
                     .gap_3()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         v_flex()
                             .min_w_0()
@@ -10669,24 +10663,25 @@ impl ManagementCenter {
 
         if agent_owns_catalog {
             let mut choices = v_flex().w_full().gap_2();
-            choices = choices.child(div().text_xs().font_medium().child(management_locale_text(
-                "Model (from the installed Agent)",
-                "模型（来自已安装的 Agent）",
-                "模型（來自已安裝的 Agent）",
-            )));
+            choices = choices.child(management_choice_group_label(
+                management_locale_text(
+                    "Model (from the installed Agent)",
+                    "模型（来自已安装的 Agent）",
+                    "模型（來自已安裝的 Agent）",
+                ),
+                cx,
+            ));
             if catalog_choices.is_empty() {
-                choices = choices.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text(
-                            "Fetch models to load the catalogue this Agent advertises.",
-                            "请先拉取模型，以载入该 Agent 自带的模型目录。",
-                            "請先擷取模型，以載入該 Agent 自帶的模型目錄。",
-                        )),
-                );
+                choices = choices.child(management_field_hint(
+                    management_locale_text(
+                        "Fetch models to load the catalogue this Agent advertises.",
+                        "请先拉取模型，以载入该 Agent 自带的模型目录。",
+                        "請先擷取模型，以載入該 Agent 自帶的模型目錄。",
+                    ),
+                    cx,
+                ));
             } else {
-                let mut options = h_flex().w_full().flex_wrap().gap_1();
+                let mut options = h_flex().w_full().flex_wrap().gap_1p5();
                 for (model_id, model_wire_api) in catalog_choices.iter().cloned() {
                     let selected = self.profile_model_edit_id.read(cx).value().trim() == model_id;
                     let label = model_wire_api.map_or_else(
@@ -10694,27 +10689,23 @@ impl ManagementCenter {
                         |wire_api| format!("{model_id} · {}", provider_wire_api_label(wire_api)),
                     );
                     let click_id = model_id.clone();
-                    options = options.child(
-                        Button::new(SharedString::from(format!(
-                            "provider-model-catalog-{index}-{model_id}"
-                        )))
-                        .small()
-                        .ghost()
-                        .selected(selected)
-                        .label(label)
-                        .disabled(pending)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.set_profile_model_id_from_catalog(
-                                    index,
-                                    click_id.clone(),
-                                    model_wire_api,
-                                    window,
-                                    cx,
-                                )
-                            },
-                        )),
-                    );
+                    options = options.child(management_option_chip(
+                        SharedString::from(format!("provider-model-catalog-{index}-{model_id}")),
+                        SharedString::from(label),
+                        selected,
+                        pending,
+                        None,
+                        cx.listener(move |this, _, window, cx| {
+                            this.set_profile_model_id_from_catalog(
+                                index,
+                                click_id.clone(),
+                                model_wire_api,
+                                window,
+                                cx,
+                            )
+                        }),
+                        cx,
+                    ));
                 }
                 choices = choices.child(options);
             }
@@ -10736,7 +10727,7 @@ impl ManagementCenter {
         ));
 
         if shows_wire_api {
-            let mut wire_controls = h_flex().w_full().flex_wrap().gap_1();
+            let mut wire_controls = h_flex().w_full().flex_wrap().gap_1p5();
             let candidates = std::iter::once(None)
                 .chain(wire_api_choices.iter().copied().map(Some))
                 .collect::<Vec<_>>();
@@ -10756,51 +10747,45 @@ impl ManagementCenter {
                     },
                 );
                 let unsupported = candidate.is_some() && integration.is_none();
-                wire_controls = wire_controls.child(
-                    Button::new(SharedString::from(format!(
-                        "provider-model-wire-{index}-{candidate:?}"
-                    )))
-                    .small()
-                    .ghost()
-                    .selected(selected)
-                    .label(label)
-                    .tooltip(if unsupported {
-                        management_locale_text(
+                wire_controls = wire_controls.child(management_option_chip(
+                    SharedString::from(format!("provider-model-wire-{index}-{candidate:?}")),
+                    SharedString::from(label),
+                    selected,
+                    pending || unsupported,
+                    // Only the blocked chip has something extra to say; the
+                    // rest are named by their own labels.
+                    unsupported.then(|| {
+                        SharedString::from(management_locale_text(
                             "This Agent cannot call this interface",
                             "这个 Agent 还无法调用该接口",
                             "這個 Agent 還無法呼叫該介面",
-                        )
-                    } else {
-                        management_locale_text("Model API protocol", "模型接口协议", "模型介面協定")
-                    })
-                    .disabled(pending || unsupported)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                        ))
+                    }),
+                    cx.listener(move |this, _, _, cx| {
                         this.set_profile_model_wire_api(index, candidate, cx)
-                    })),
-                );
+                    }),
+                    cx,
+                ));
             }
             editor = editor.child(
                 v_flex()
                     .w_full()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Model API protocol",
-                                "模型接口协议",
-                                "模型介面協定",
-                            )),
-                    )
+                    .gap_1p5()
+                    .child(management_choice_group_label(
+                        management_locale_text(
+                            "Model API protocol",
+                            "模型接口协议",
+                            "模型介面協定",
+                        ),
+                        cx,
+                    ))
                     .child(wire_controls),
             );
         }
 
         // Reasoning is two decisions, so it is two controls: whether the Model
         // reasons at all, and which level table its endpoint accepts.
-        let mut reasoning = h_flex().w_full().flex_wrap().gap_1();
+        let mut reasoning = h_flex().w_full().flex_wrap().gap_1p5();
         for (key, label, disabled) in [
             (
                 "default",
@@ -10818,31 +10803,26 @@ impl ManagementCenter {
             ),
         ] {
             let selected = reasoning_disabled == disabled;
-            reasoning = reasoning.child(
-                Button::new(SharedString::from(format!(
-                    "provider-model-reasoning-{index}-{key}"
-                )))
-                .small()
-                .ghost()
-                .selected(selected)
-                .label(label)
-                .disabled(pending)
-                .on_click(cx.listener(move |this, _, window, cx| {
+            reasoning = reasoning.child(management_option_chip(
+                SharedString::from(format!("provider-model-reasoning-{index}-{key}")),
+                SharedString::from(label),
+                selected,
+                pending,
+                None,
+                cx.listener(move |this, _, window, cx| {
                     this.set_profile_model_reasoning_draft(index, disabled, "", window, cx)
-                })),
-            );
+                }),
+                cx,
+            ));
         }
         editor = editor.child(
             v_flex()
                 .w_full()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(management_locale_text("Reasoning", "推理能力", "推理能力")),
-                )
+                .gap_1p5()
+                .child(management_choice_group_label(
+                    management_locale_text("Reasoning", "推理能力", "推理能力"),
+                    cx,
+                ))
                 .child(reasoning),
         );
 
@@ -10853,7 +10833,7 @@ impl ManagementCenter {
                 .value()
                 .trim()
                 .to_string();
-            let mut presets = h_flex().w_full().flex_wrap().gap_1();
+            let mut presets = h_flex().w_full().flex_wrap().gap_1p5();
             for (key, label, declaration) in [
                 ("deepseek", "DeepSeek", "off, low, high, max"),
                 (
@@ -10871,16 +10851,20 @@ impl ManagementCenter {
                     "off, low, medium, high, max",
                 ),
             ] {
-                presets = presets.child(
-                    Button::new(SharedString::from(format!(
-                        "provider-model-efforts-preset-{index}-{key}"
-                    )))
-                    .small()
-                    .ghost()
-                    .selected(current == declaration)
-                    .label(label)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                presets = presets.child(management_option_chip(
+                    SharedString::from(format!("provider-model-efforts-preset-{index}-{key}")),
+                    SharedString::from(label),
+                    current == declaration,
+                    pending,
+                    // The chip's label is the endpoint family; the tooltip says
+                    // what it writes, because the chip fills the field below
+                    // rather than choosing an abstraction.
+                    Some(SharedString::from(match locale::current_locale() {
+                        ResolvedLocale::En => format!("Write: {declaration}"),
+                        ResolvedLocale::ZhCn => format!("写入：{declaration}"),
+                        ResolvedLocale::ZhTw => format!("寫入：{declaration}"),
+                    })),
+                    cx.listener(move |this, _, window, cx| {
                         this.set_profile_model_reasoning_draft(
                             index,
                             false,
@@ -10888,24 +10872,18 @@ impl ManagementCenter {
                             window,
                             cx,
                         )
-                    })),
-                );
+                    }),
+                    cx,
+                ));
             }
             editor = editor.child(
                 v_flex()
                     .w_full()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Thinking levels",
-                                "思考档位",
-                                "思考檔位",
-                            )),
-                    )
+                    .gap_1p5()
+                    .child(management_choice_group_label(
+                        management_locale_text("Thinking levels", "思考档位", "思考檔位"),
+                        cx,
+                    ))
                     .child(presets)
                     .child(management_input_field_with_error(
                         management_locale_text("Declared levels", "档位列表", "檔位清單"),
@@ -10926,55 +10904,66 @@ impl ManagementCenter {
         }
 
         editor = editor.child(
-            Collapsible::new()
+            // The rule above the disclosure separates a rarely used group from
+            // the frequent fields, so the row does not read as one more field.
+            v_flex()
                 .w_full()
-                .open(advanced_open)
-                .child(profile_editor_disclosure(
-                    PROFILE_MODEL_ADVANCED_DISCLOSURE_ID,
-                    management_locale_text("Advanced", "高级", "進階").into(),
-                    advanced_open,
-                    None,
-                    cx,
-                ))
-                .content(
-                    v_flex()
+                .gap_2()
+                .pt_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Collapsible::new()
                         .w_full()
-                        .gap_2p5()
-                        .pt_2()
-                        .child(management_input_field_with_error(
-                            management_locale_text(
-                                "Context window (tokens)",
-                                "上下文窗口（Token）",
-                                "上下文視窗（Token）",
-                            ),
-                            &self.profile_model_edit_context_tokens,
-                            false,
-                            limits_error.as_deref(),
+                        .open(advanced_open)
+                        .child(profile_editor_disclosure(
+                            PROFILE_MODEL_ADVANCED_DISCLOSURE_ID,
+                            management_locale_text("Advanced", "高级", "進階").into(),
+                            advanced_open,
+                            None,
                             cx,
                         ))
-                        .child(management_input_field(
-                            management_locale_text(
-                                "Max output tokens",
-                                "最大输出 Token",
-                                "最大輸出 Token",
-                            ),
-                            &self.profile_model_edit_output_tokens,
-                            false,
-                            cx,
-                        ))
-                        .child(management_field_hint(
-                            management_locale_text(
-                                "Empty keeps the Agent's own default. Only Agents that read a declared limit are affected.",
-                                "留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
-                                "留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
-                            ),
-                            cx,
-                        )),
+                        .content(
+                            v_flex()
+                                .w_full()
+                                .gap_2p5()
+                                .pt_2()
+                                .child(management_input_field_with_error(
+                                    management_locale_text(
+                                        "Context window (tokens)",
+                                        "上下文窗口（Token）",
+                                        "上下文視窗（Token）",
+                                    ),
+                                    &self.profile_model_edit_context_tokens,
+                                    false,
+                                    limits_error.as_deref(),
+                                    cx,
+                                ))
+                                .child(management_input_field(
+                                    management_locale_text(
+                                        "Max output tokens",
+                                        "最大输出 Token",
+                                        "最大輸出 Token",
+                                    ),
+                                    &self.profile_model_edit_output_tokens,
+                                    false,
+                                    cx,
+                                ))
+                                .child(management_field_hint(
+                                    management_locale_text(
+                                        "Empty keeps the Agent's own default. Only Agents that read a declared limit are affected.",
+                                        "留空沿用 Agent 默认；只有会读取该设置的 Agent 受影响。",
+                                        "留空沿用 Agent 預設；只有會讀取該設定的 Agent 受影響。",
+                                    ),
+                                    cx,
+                                )),
+                        ),
                 ),
         );
 
         // The pane has no dismissable editor, so the only trailing command is
-        // the one that takes the Model back out of the Provider.
+        // the one that takes the Model back out of the Provider. It is set off
+        // by a rule so it cannot be hit while reaching for the last field.
         editor
             .child(
                 h_flex()
@@ -10982,6 +10971,9 @@ impl ManagementCenter {
                     .items_center()
                     .justify_start()
                     .gap_2()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
                     .child(
                         Button::new(SharedString::from(format!("provider-model-delete-{index}")))
                             .xsmall()
@@ -11363,7 +11355,9 @@ impl ManagementCenter {
             if shows_model {
                 // Choosing a Model and configuring it are one task, so the
                 // catalogue and the chosen settings share the remaining height
-                // and scroll independently.
+                // and scroll independently. The padding keeps the two panels
+                // off the form above them and off the dialog's own action bar,
+                // so three rules never stack into one line.
                 body = body.child(
                     h_flex()
                         .w_full()
@@ -11371,12 +11365,14 @@ impl ManagementCenter {
                         .min_h_0()
                         .items_stretch()
                         .gap_3()
+                        .pt_4()
+                        .pb_4()
                         .child(self.render_profile_candidates_pane(true, cx))
                         .child(self.render_profile_settings_pane(true, cx)),
                 );
             }
         } else {
-            let mut stacked = v_flex().w_full().gap_3().child(form_band);
+            let mut stacked = v_flex().w_full().gap_3().pt_4().pb_4().child(form_band);
             if shows_model {
                 stacked = stacked
                     .child(self.render_profile_candidates_pane(false, cx))
@@ -18864,6 +18860,164 @@ fn management_field_hint(message: impl Into<SharedString>, cx: &App) -> AnyEleme
         .into_any_element()
 }
 
+/// A wash that lifts a surface by a hair in either appearance.
+///
+/// Derived from the foreground instead of a fixed grey so it keeps the same
+/// relationship to the dialog on every palette in the catalog: it lightens a
+/// dark surface and darkens a light one, without assuming which of the two the
+/// user picked.
+fn management_surface_wash(cx: &App, strength: f32) -> Hsla {
+    cx.theme().foreground.opacity(strength)
+}
+
+/// The caption strip that names a pane and holds the one command local to it.
+///
+/// The caption is the pane's own name and the value is what it is showing, so
+/// the two panes read as a matched pair rather than as two unrelated columns.
+fn profile_pane_header(
+    caption: &'static str,
+    value: Option<SharedString>,
+    trailing: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .bg(management_surface_wash(cx, MANAGEMENT_PANEL_STRIP_WASH))
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child(caption),
+        )
+        .when_some(value, |header, value| {
+            header.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    // The caption names the pane and stays muted; the value is
+                    // what the pane is showing, so it carries full contrast.
+                    .text_color(cx.theme().foreground)
+                    .child(value),
+            )
+        })
+        .child(div().min_w_0().flex_1())
+        .children(trailing)
+        .into_any_element()
+}
+
+/// One pane of the Model editor: a named, bordered surface whose body is the
+/// only part that scrolls.
+///
+/// The two panes share the dialog's remaining height, so the picker keeps a
+/// bounded well under its rows instead of trailing off into the dialog's own
+/// background, and a long catalogue scrolls inside the panel rather than
+/// pushing the dialog's actions out of reach.
+fn profile_pane_shell(
+    id: &'static str,
+    bounded: bool,
+    header: AnyElement,
+    body: AnyElement,
+    footer: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    let mut pane = v_flex()
+        .debug_selector(move || id.to_string())
+        .min_w_0()
+        .min_h_0()
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(header)
+        .child(body)
+        .children(footer);
+    if bounded {
+        // Side by side the two panes split the row and share its height.
+        pane = pane.flex_1();
+    } else {
+        // Stacked, each pane owns a full row and sizes to its own content.
+        pane = pane.w_full();
+    }
+    pane.into_any_element()
+}
+
+/// One option in a row of mutually exclusive choices.
+///
+/// A choice has to look like a control before it is clicked. At rest the chip
+/// carries a boundary and a muted label; under the pointer it lifts; chosen, it
+/// takes the primary tint, a primary boundary, and the heavier label weight, so
+/// the answer is legible from shape and weight as well as from color.
+///
+/// The tooltip is optional and doubles as the accessible name, so it is passed
+/// only when it says something the visible label does not.
+fn management_option_chip(
+    id: SharedString,
+    label: SharedString,
+    checked: bool,
+    disabled: bool,
+    tooltip: Option<SharedString>,
+    on_click: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let foreground = if checked {
+        cx.theme().foreground
+    } else {
+        cx.theme().muted_foreground
+    };
+    Toggle::new(id)
+        .xsmall()
+        .checked(checked)
+        .disabled(disabled)
+        .border_1()
+        // An unavailable chip keeps saying which answer is current and only
+        // steps back, so a disabled group is still readable as a group.
+        .border_color(match (checked, disabled) {
+            (true, _) => cx.theme().primary.opacity(0.55),
+            (false, true) => cx.theme().border.opacity(0.55),
+            (false, false) => cx.theme().border,
+        })
+        .bg(if checked {
+            cx.theme().primary.opacity(0.14)
+        } else {
+            cx.theme().transparent
+        })
+        .text_color(if disabled {
+            foreground.opacity(0.55)
+        } else {
+            foreground
+        })
+        .when(checked, |chip| chip.font_weight(FontWeight::MEDIUM))
+        .when_some(tooltip, |chip, tooltip| chip.tooltip(tooltip))
+        .label(label)
+        .on_click(on_click)
+        .into_any_element()
+}
+
+/// The caption over a row of choices inside the Model editor.
+///
+/// Smaller and quieter than a field label, because it names a group of controls
+/// rather than one value, and the chips under it carry their own labels.
+fn management_choice_group_label(label: &'static str, cx: &App) -> AnyElement {
+    div()
+        .w_full()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
 /// A disclosure header: a quiet caption row that opens the content below it.
 ///
 /// Collapsed by default so a rarely used group does not push the frequent
@@ -19130,8 +19284,10 @@ fn profile_editor_section(
                     div()
                         .flex_none()
                         .text_xs()
-                        .font_semibold()
-                        .text_color(cx.theme().muted_foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        // Brighter than a hint but quieter than a field label:
+                        // the caption names a region, it does not label a value.
+                        .text_color(cx.theme().foreground.opacity(0.85))
                         .child(label),
                 )
                 .child(
@@ -19139,7 +19295,7 @@ fn profile_editor_section(
                         .flex_1()
                         .h(px(1.0))
                         .rounded_full()
-                        .bg(cx.theme().border.opacity(0.60)),
+                        .bg(cx.theme().border),
                 )
                 .children(trailing),
         )
@@ -19162,6 +19318,42 @@ fn compact_empty_state(
         .border_color(cx.theme().border.opacity(0.70))
         .bg(cx.theme().background.opacity(0.60))
         .p_3()
+        .text_center()
+        .child(compact_empty_state_content(title, description, cx))
+        .into_any_element()
+}
+
+/// The same empty state without its own box, for a region that already has a
+/// boundary — a pane, an inspector, or another card.
+///
+/// It grows into whatever room the region has, so an empty pane reads as
+/// deliberately empty rather than as content that failed to load.
+fn bare_empty_state(
+    title: &'static str,
+    description: &'static str,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_h_0()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .p_3()
+        .text_center()
+        .child(compact_empty_state_content(title, description, cx))
+        .into_any_element()
+}
+
+fn compact_empty_state_content(
+    title: &'static str,
+    description: &'static str,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    v_flex()
+        .items_center()
+        .justify_center()
+        .gap_1p5()
         .text_center()
         .child(
             h_flex()
@@ -21094,6 +21286,15 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("    fn render_profile_model_editor("))
             .map(|(body, _)| body)
             .expect("Model settings pane should remain inspectable");
+        let editor = source
+            .split_once("    fn render_profile_model_editor(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Checks or unchecks every picker row the current search shows.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("Model editor should remain inspectable");
 
         assert!(dialog.contains("self.render_profile_candidates_pane("));
         assert!(dialog.contains("self.render_profile_settings_pane("));
@@ -21103,11 +21304,36 @@ mod tests {
         assert!(picker.contains("provider-candidates-select-all"));
         assert!(picker.contains("set_visible_profile_candidates_selected"));
         assert!(picker.contains("provider-model-add"));
+        // Both panes are panels: a named header over a body that scrolls, not
+        // two columns of loose text sharing the dialog's own background.
+        assert!(picker.contains("profile_pane_header("));
+        assert!(picker.contains("profile_pane_shell("));
+        assert!(settings.contains("profile_pane_header("));
+        assert!(settings.contains("profile_pane_shell("));
         // The settings pane edits the selected Model, and offers to add it when
         // the Provider does not offer it yet.
         assert!(settings.contains("self.render_profile_model_editor("));
         assert!(settings.contains("provider-model-add-selected"));
         assert!(settings.contains("selected_profile_model_index()"));
+        // Every group of mutually exclusive choices draws its options as chips,
+        // so a choice never renders as a run of body text.
+        assert!(editor.contains("management_option_chip("));
+        for group in [
+            "provider-model-catalog-",
+            "provider-model-wire-",
+            "provider-model-reasoning-",
+            "provider-model-efforts-preset-",
+        ] {
+            assert!(
+                editor.contains(group),
+                "the editor must keep its {group} choices"
+            );
+        }
+        assert_eq!(
+            editor.matches("management_option_chip(").count(),
+            4,
+            "each choice group draws its options through the shared chip"
+        );
     }
 
     #[gpui::test]
@@ -21211,10 +21437,13 @@ mod tests {
             band.size.height < px(MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT),
             "the band must not stretch to its maximum"
         );
-        assert_eq!(
-            picker.origin.y,
-            band.bottom(),
-            "the panes begin where the band ends"
+        assert!(
+            picker.origin.y >= band.bottom(),
+            "the panes begin after the band ends"
+        );
+        assert!(
+            picker.origin.y < band.bottom() + px(32.0),
+            "the panes stay in the band's own reading order instead of drifting"
         );
         assert!(picker.size.width > px(0.0) && picker.size.height > px(0.0));
         assert!(settings.size.width > px(0.0) && settings.size.height > px(0.0));
@@ -21225,6 +21454,28 @@ mod tests {
         assert_eq!(
             picker.origin.y, settings.origin.y,
             "the two panes share a row"
+        );
+        // The two panels are peers: one row, one height, one trailing edge.
+        assert_eq!(
+            picker.size.height, settings.size.height,
+            "the two panes share a height"
+        );
+        assert_eq!(
+            picker.bottom(),
+            settings.bottom(),
+            "the two panes share a baseline"
+        );
+        // A row keeps its own geometry inside the picker's bounded well.
+        let row = cx
+            .debug_bounds("provider-candidate-row-gpt-5")
+            .expect("the wide layout must lay the picker rows out");
+        assert!(
+            row.origin.x > picker.origin.x && row.right() < picker.right(),
+            "the row is inset inside the pane it belongs to"
+        );
+        assert!(
+            row.origin.y > picker.origin.y,
+            "the row sits below the pane's own header"
         );
 
         // Narrow: they stack, and the picker still lays its rows out.
