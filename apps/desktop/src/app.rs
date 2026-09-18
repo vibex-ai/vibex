@@ -56,6 +56,7 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectDelegate, SelectEvent, SelectState},
+    shimmer::ShimmerText,
     spinner::Spinner,
     switch::Switch,
     tab::{Tab, TabBar},
@@ -402,8 +403,16 @@ const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
 const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
-const AGENT_THINKING_SHIMMER_DURATION: Duration = Duration::from_secs(12);
+const STARTUP_WORDMARK_SHIMMER_DURATION: Duration = Duration::from_secs(12);
 const SHIMMER_SCAN_PASSES: f32 = 10.0;
+/// One complete sweep of the collapsed thinking label's shimmer. The
+/// hand-rolled indicator ran ten passes through a twelve-second loop, so keep
+/// the same pace now that the kit's `ShimmerText` measures one sweep per
+/// duration.
+const AGENT_THINKING_SHIMMER_SWEEP: Duration = Duration::from_millis(1_200);
+/// Highlight half-width as a fraction of the label width, matching the scan
+/// radius the hand-rolled indicator used.
+const AGENT_THINKING_SHIMMER_SPREAD: f32 = 0.42;
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
 const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
@@ -46100,15 +46109,15 @@ fn render_agent_thinking_indicator(
     tooltip: &str,
     cx: &App,
 ) -> AnyElement {
-    let base = cx.theme().muted_foreground.opacity(0.75);
-    let glow = cx.theme().foreground;
     let label: SharedString = truncate_agent_thinking_label(label).into();
     let tooltip = tooltip.to_string();
     let element_id = format!("agent-thinking-{turn_id}");
     let animation_id = format!("{element_id}-animation");
-    // The indicator hugs its shimmer label so callers can place a disclosure
-    // chevron directly after it. Constrained rows shrink it via `min_w_0` and
-    // clip the nowrap label with `overflow_hidden`.
+    // The kit's `ShimmerText` owns the sweep: the label stays one text node,
+    // the highlight follows the theme, and reduced motion leaves it static.
+    // The indicator hugs that label so callers can place a disclosure chevron
+    // directly after it. Constrained rows shrink it via `min_w_0` and clip the
+    // nowrap label with `overflow_hidden`.
     h_flex()
         .min_w_0()
         .justify_start()
@@ -46121,18 +46130,12 @@ fn render_agent_thinking_indicator(
                 .overflow_hidden()
                 .text_sm()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .with_animation(
-                    animation_id,
-                    Animation::new(AGENT_THINKING_SHIMMER_DURATION).repeat(),
-                    move |this, delta| {
-                        let scan_position = shimmer_scan_position(delta, 0.0, 1.0);
-                        // Keep the animation on one text node. Building a GPUI
-                        // child for every glyph on every animation frame made
-                        // long streaming reasoning labels disproportionately
-                        // expensive to repaint.
-                        this.text_color(shimmer_color(base, glow, 0.5, scan_position, 0.42))
-                            .child(label.clone())
-                    },
+                .child(
+                    ShimmerText::new(label)
+                        .id(animation_id)
+                        .text_color(cx.theme().muted_foreground)
+                        .duration(AGENT_THINKING_SHIMMER_SWEEP)
+                        .spread(AGENT_THINKING_SHIMMER_SPREAD),
                 ),
         )
         .into_any_element()
@@ -54900,7 +54903,7 @@ fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
     container
         .with_animation(
             "startup-wordmark-shimmer",
-            Animation::new(AGENT_THINKING_SHIMMER_DURATION).repeat(),
+            Animation::new(STARTUP_WORDMARK_SHIMMER_DURATION).repeat(),
             move |this, delta| this.child(wordmark(Some(shimmer_scan_position(delta, 0.0, 1.0)))),
         )
         .into_any_element()
@@ -57402,9 +57405,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("thinking indicator renderer should remain inspectable");
 
-        assert!(renderer.contains(".with_animation("));
-        assert!(renderer.contains("shimmer_color("));
+        assert!(renderer.contains("ShimmerText::new(label)"));
         assert!(renderer.contains("truncate_agent_thinking_label(label)"));
+        assert!(renderer.contains("AGENT_THINKING_SHIMMER_SWEEP"));
+        assert!(renderer.contains("AGENT_THINKING_SHIMMER_SPREAD"));
         assert!(!renderer.contains("ScrollHandle"));
         assert!(!renderer.contains("set_offset"));
         assert!(!renderer.contains("overflow_x_scroll"));

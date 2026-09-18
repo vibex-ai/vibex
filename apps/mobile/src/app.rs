@@ -74,6 +74,7 @@ use crate::{locale, markdown, notifications, power, scanner, theme};
 use gpui_component::StyledExt as _;
 use gpui_component::input::TextareaState;
 use gpui_component::input::{Input, InputState, Textarea};
+use gpui_component::shimmer::ShimmerText;
 
 const TIMELINE_NEAR_BOTTOM_PX: f32 = 96.0;
 const TIMELINE_LIST_OVERDRAW_PX: f32 = 800.0;
@@ -83,8 +84,14 @@ const TIMELINE_EVENT_BATCH_LIMIT: usize = 256;
 const TIMELINE_EVENT_COALESCE_DELAY: Duration = Duration::from_millis(16);
 const TIMELINE_MARKDOWN_VIEW_CACHE_LIMIT: usize = 64;
 const TIMELINE_RUNTIME_LABEL_MAX_CHARS: usize = 48;
-const TIMELINE_SHIMMER_DURATION: Duration = Duration::from_secs(12);
-const TIMELINE_SHIMMER_SCAN_PASSES: f32 = 10.0;
+/// One complete sweep of the collapsed thinking label's shimmer. Desktop
+/// parity: `AGENT_THINKING_SHIMMER_SWEEP` — the hand-rolled indicator ran ten
+/// passes through a twelve-second loop, so keep the same pace now that the
+/// kit's `ShimmerText` measures one sweep per duration.
+const TIMELINE_SHIMMER_SWEEP: Duration = Duration::from_millis(1_200);
+/// Highlight half-width as a fraction of the label width. Desktop parity:
+/// `AGENT_THINKING_SHIMMER_SPREAD`.
+const TIMELINE_SHIMMER_SPREAD: f32 = 0.42;
 /// Desktop parity: `AGENT_THINKING_LABEL_MAX_CHARS`.
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
 /// Reasoning preview cache bounds — one entry per visible reasoning row.
@@ -16964,10 +16971,6 @@ fn truncate_single_line(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn shimmer_scan_position(delta: f32) -> f32 {
-    -0.35 + (delta * TIMELINE_SHIMMER_SCAN_PASSES).fract() * 1.7
-}
-
 /// Desktop parity: `truncate_agent_thinking_label`.
 fn truncate_agent_thinking_label(label: &str) -> String {
     let characters = label.chars().collect::<Vec<_>>();
@@ -17070,17 +17073,6 @@ fn reasoning_plain_text(source: &str) -> String {
     document.plain_text()
 }
 
-fn shimmer_color(base: Hsla, glow: Hsla, position: f32, scan_position: f32) -> Hsla {
-    let intensity = (1.0 - (position - scan_position).abs() / 0.42).clamp(0.0, 1.0);
-    let intensity = intensity * intensity * (3.0 - 2.0 * intensity);
-    Hsla {
-        h: base.h + (glow.h - base.h) * intensity,
-        s: base.s + (glow.s - base.s) * intensity,
-        l: base.l + (glow.l - base.l) * intensity,
-        a: base.a + (glow.a - base.a) * intensity,
-    }
-}
-
 /// Desktop parity: `agent_progress_label` — project the live progress label
 /// through the bounded markdown summary, trim dangling sentence dots, and
 /// always close with an ellipsis so the shimmer reads as in-progress text.
@@ -17123,13 +17115,11 @@ fn compact_preview_message(value: &str) -> String {
 }
 
 fn render_mobile_thinking_indicator(turn_id: &str, label: &str) -> gpui::AnyElement {
-    // Desktop parity (`render_agent_thinking_indicator`): the shimmer rides a
-    // single text node — building a GPUI child per glyph per frame made long
-    // streaming labels disproportionately expensive to repaint — and the
-    // pending-permission state is carried by the label text, not a color swap.
-    let base: Hsla = theme::text_muted().opacity(0.75);
-    let glow: Hsla = theme::text_primary();
-    let label: Arc<str> = truncate_agent_thinking_label(label).into();
+    // Desktop parity (`render_agent_thinking_indicator`): the kit's
+    // `ShimmerText` owns the sweep, so the label stays one text node, the
+    // highlight follows the bridged theme, and reduced motion leaves it
+    // static. The pending-permission state is carried by the label text, not a
+    // color swap.
     div()
         .flex()
         .w_full()
@@ -17143,14 +17133,12 @@ fn render_mobile_thinking_indicator(turn_id: &str, label: &str) -> gpui::AnyElem
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_size(px(theme::FONT_CAPTION))
-                .with_animation(
-                    format!("timeline-progress-animation:{turn_id}"),
-                    Animation::new(TIMELINE_SHIMMER_DURATION).repeat(),
-                    move |this, delta| {
-                        let scan_position = shimmer_scan_position(delta);
-                        this.text_color(shimmer_color(base, glow, 0.5, scan_position))
-                            .child(label.to_string())
-                    },
+                .child(
+                    ShimmerText::new(truncate_agent_thinking_label(label))
+                        .id(format!("timeline-progress-animation:{turn_id}"))
+                        .text_color(theme::text_muted())
+                        .duration(TIMELINE_SHIMMER_SWEEP)
+                        .spread(TIMELINE_SHIMMER_SPREAD),
                 ),
         )
         .into_any_element()
