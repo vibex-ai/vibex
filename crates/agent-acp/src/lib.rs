@@ -3960,6 +3960,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_without_an_announced_catalog_keeps_the_codex_pre_session_catalog() {
+        // `FixtureAcpClient` answers `Ok(None)`: the Agent is attached but never
+        // published a catalog, so discovery must not treat that as an
+        // authoritative empty one.
+        let provider = AcpAgentProvider::new(Arc::new(FixtureAcpClient::new(
+            AcpSession::default(),
+            Ok(AcpTurn {
+                events: Vec::new(),
+                binding_update: None,
+                completed: true,
+            }),
+        )));
+
+        let response = provider
+            .discover_commands(AgentCommandDiscoverRequest {
+                agent_id: Some(vibex_core::AgentId::parse(registry::CODEX_AGENT_ID).unwrap()),
+                provider_profile_id: None,
+                session_id: Some(VibexSessionId::new()),
+                workspace_id: None,
+                trigger: Some(AgentCommandTrigger::Slash),
+                query: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .entries
+                .iter()
+                .any(|entry| entry.label == "/status")
+        );
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key == "catalogSource" && diagnostic.value == "codex-acp-pinned-adapter"
+        }));
+    }
+
+    #[tokio::test]
     async fn empty_live_acp_catalog_suppresses_the_codex_pre_session_catalog() {
         let provider = AcpAgentProvider::new(Arc::new(
             FixtureAcpClient::new(

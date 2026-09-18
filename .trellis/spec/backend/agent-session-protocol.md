@@ -729,6 +729,15 @@ request: terminal/create { id, params.sessionId, ... }
   pooled-session route are delivered normally, and every other unroutable event
   keeps the normal diagnostic path. The buffer does not infer identity or become
   process-global session authority.
+- An Agent may also publish its catalog after the registration response. The
+  reader barrier is released as soon as the route is registered, so that update
+  can arrive while a prepared attachment is not yet committed. State-only
+  session updates (`available_commands_update`,
+  `config_option_update`/`config_options_update`) are then applied at that exact
+  fence instead of being quarantined: Agents publish them outside turns and
+  never replay them, so quarantining leaves a rebuilt attachment reporting an
+  empty command catalog for its whole lifetime. Ordered turn events keep the
+  committed-only quarantine.
 - Each created attachment subscribes to `ProcessLease::subscribe_crashes()`
   before load/new. Broadcast plus process snapshot closes the registration race;
   `mark_crashed(fence)` makes fan-out idempotent. Detach removes the route before
@@ -763,7 +772,8 @@ request: terminal/create { id, params.sessionId, ... }
 - More than 16 pending command catalogs -> evict the oldest native-session
   catalog; never grow process memory without a bound.
 - Binding or generation mismatch -> process diagnostic `acp_event_fence_stale`.
-- Prepared attachment -> quarantine `acp_event_attachment_prepared`.
+- Prepared attachment -> quarantine `acp_event_attachment_prepared`, except for
+  state-only session updates, which apply at the same fence.
 - Non-current/inactive attachment -> `acp_attachment_not_current` or
   `acp_event_attachment_inactive`.
 - Second active prompt -> `conflict/acp_turn_already_running`.
@@ -869,6 +879,22 @@ registration request pending + unknown exact route + available_commands_update
   -> bounded pending catalog[nativeSessionId]
 response validates nativeSessionId
   -> drain catalog into attachment -> register/activate route -> release barrier
+```
+
+#### Wrong
+
+```text
+available_commands_update after session/new response, prepared durable rebuild
+  -> route registered, attachment prepared -> quarantine -> discard
+commit -> attachment reports Some([]) -> composer loses every slash command
+```
+
+#### Correct
+
+```text
+available_commands_update after session/new response, prepared durable rebuild
+  -> route registered, attachment prepared, state-only update
+  -> apply at the exact fence -> commit keeps the announced catalog
 ```
 
 ## Scenario: ACP Permission Callback Loop
@@ -1308,8 +1334,9 @@ cannot distinguish ACP Agents.
   Tauri layer, but provider commands stay owned by provider adapters.
 - A live ACP `available_commands_update` catalog is authoritative for an
   attached session. `Some(commands)` means an attached authoritative catalog,
-  including `Some([])`; `None` means no attachment/catalog exists and permits a
-  pre-session fallback. Before a Logical Session exists, the provider adapter
+  including `Some([])`; `None` means no attachment exists, or the attached Agent
+  never published a catalog, and either way permits a pre-session fallback.
+  Before a Logical Session exists, the provider adapter
   may expose the built-in catalog of an exact pinned managed Adapter; the Codex
   fallback must match the selected `codex` Agent, a `codex-acp` launch shape,
   and a Profile with `slash_commands` enabled.

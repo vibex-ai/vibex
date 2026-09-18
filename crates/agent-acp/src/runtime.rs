@@ -300,6 +300,21 @@ const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &["user_message_chunk", "current_m
 const ACP_SESSION_REPLAY_EVENT_LIMIT: usize = 512;
 const ACP_SESSION_REPLAY_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
+/// Session-update kinds that only mutate attachment state and never emit turn
+/// events.
+///
+/// Agents publish these outside a turn — often immediately after the
+/// `session/new`, `session/resume` or `session/load` response — and never
+/// repeat them. The durable rebuild path registers its attachment as
+/// `Prepared` and releases its reader barrier before the commit, so routing
+/// them as ordered turn traffic would drop them for good.
+fn is_state_only_session_update(kind: &str) -> bool {
+    matches!(
+        kind,
+        "available_commands_update" | "config_option_update" | "config_options_update"
+    )
+}
+
 #[derive(Debug, Clone)]
 struct AcpRpcFailure {
     code: String,
@@ -1959,7 +1974,12 @@ struct AcpAttachmentShared {
     pending_terminal_creates: HashMap<String, PendingTerminalCreate>,
     terminal_creates_in_flight: usize,
     active_terminal_ids: BTreeSet<TerminalId>,
-    available_commands: Vec<AcpRuntimeCommand>,
+    /// Live command catalog announced through `available_commands_update`.
+    ///
+    /// `None` means the Agent never published one for this attachment, which
+    /// permits the pre-session catalog fallback. An announced-but-empty
+    /// catalog is `Some(Vec::new())` and stays authoritative.
+    available_commands: Option<Vec<AcpRuntimeCommand>>,
     current_mode_id: Option<String>,
     model_ids: Vec<String>,
     current_model_id: Option<String>,
@@ -4110,11 +4130,12 @@ impl AcpSessionAttachment {
         }
     }
 
-    fn available_commands(&self) -> Vec<AcpRuntimeCommand> {
+    /// The live command catalog this attachment was told about, if any.
+    fn available_commands(&self) -> Option<Vec<AcpRuntimeCommand>> {
         self.state
             .lock()
-            .map(|state| state.available_commands.clone())
-            .unwrap_or_default()
+            .ok()
+            .and_then(|state| state.available_commands.clone())
     }
 
     fn acp_session(&self) -> AcpSession {
@@ -4350,7 +4371,7 @@ impl AcpSessionAttachment {
             "available_commands_update" => {
                 let commands = parse_available_commands(update.get("availableCommands"));
                 if let Ok(mut state) = self.state.lock() {
-                    state.available_commands = commands;
+                    state.available_commands = Some(commands);
                 }
             }
             "current_mode_update" => {
@@ -5547,7 +5568,27 @@ impl AcpProcess {
         method: &str,
         operation: impl FnOnce(&AcpSessionAttachment) -> R,
     ) -> Option<R> {
-        match self.route_native(native_session_id, method, true, operation) {
+        match self.route_native(native_session_id, method, true, false, operation) {
+            AcpNativeRouteOutcome::Delivered(result) => Some(result),
+            AcpNativeRouteOutcome::Consumed | AcpNativeRouteOutcome::Diagnostic(_) => None,
+        }
+    }
+
+    /// Routes a state-only notification, which also reaches an attachment that
+    /// is still `Prepared` after a durable rebuild.
+    fn with_routed_state_update<R>(
+        &self,
+        params: &Value,
+        method: &str,
+        operation: impl FnOnce(&AcpSessionAttachment) -> R,
+    ) -> Option<R> {
+        match self.route_native(
+            params.get("sessionId").and_then(Value::as_str),
+            method,
+            true,
+            true,
+            operation,
+        ) {
             AcpNativeRouteOutcome::Delivered(result) => Some(result),
             AcpNativeRouteOutcome::Consumed | AcpNativeRouteOutcome::Diagnostic(_) => None,
         }
@@ -5558,6 +5599,7 @@ impl AcpProcess {
         native_session_id: Option<&str>,
         method: &str,
         diagnose_unroutable: bool,
+        deliver_prepared: bool,
         operation: impl FnOnce(&AcpSessionAttachment) -> R,
     ) -> AcpNativeRouteOutcome<R> {
         let method = protocol::safe_method_metadata(method);
@@ -5604,6 +5646,34 @@ impl AcpProcess {
                 }
             }
             SessionAttachmentRoute::Quarantine(handle) => {
+                if deliver_prepared {
+                    // A state-only notification carries no turn events and the
+                    // attachment is already registered at this exact fence, so
+                    // applying it now keeps state the Agent publishes only once
+                    // — the live command catalog in particular — instead of
+                    // losing it to the prepared window.
+                    return match router.registry.apply_fenced(handle.fence(), operation) {
+                        Ok(result) => {
+                            let _ = router.registry.touch(handle.fence(), unix_timestamp_ms());
+                            AcpNativeRouteOutcome::Delivered(result)
+                        }
+                        Err(error) => {
+                            router.observability.increment(
+                                RuntimeMetricName::UnroutableNativeEvent,
+                                None,
+                                RuntimeMetricResult::Unroutable,
+                            );
+                            tracing::debug!(
+                                target: "vibex_agent_acp",
+                                process_instance = %self.process_instance_id.as_str(),
+                                method = method.as_str(),
+                                code = %error.code,
+                                "ACP prepared-attachment state update failed its fence"
+                            );
+                            AcpNativeRouteOutcome::Consumed
+                        }
+                    };
+                }
                 router.observability.increment(
                     RuntimeMetricName::PreparedEventQuarantined,
                     None,
@@ -6437,17 +6507,20 @@ impl AcpProcess {
         if self.capture_session_replay(params) {
             return;
         }
-        let is_available_commands_update = params
+        let session_update_kind = params
             .get("update")
             .and_then(|update| update.get("sessionUpdate"))
-            .and_then(Value::as_str)
-            == Some("available_commands_update");
-        if is_available_commands_update && self.has_pending_registration_request() {
+            .and_then(Value::as_str);
+        let state_only_update = session_update_kind.is_some_and(is_state_only_session_update);
+        if session_update_kind == Some("available_commands_update")
+            && self.has_pending_registration_request()
+        {
             let native_session_id = params.get("sessionId").and_then(Value::as_str);
             match self.route_native(
                 native_session_id,
                 AcpOperation::SessionUpdate.method(),
                 false,
+                true,
                 |attachment| attachment.handle_session_update(params),
             ) {
                 AcpNativeRouteOutcome::Delivered(_) | AcpNativeRouteOutcome::Consumed => return,
@@ -6457,10 +6530,22 @@ impl AcpProcess {
                 AcpNativeRouteOutcome::Diagnostic(_) => {}
             }
         }
-        let _ =
+        // State-only notifications are published outside turns and never
+        // replayed, so a durable rebuild must apply them even while its
+        // attachment is still `Prepared`. Ordered turn traffic stays
+        // committed-only.
+        let routed = if state_only_update {
+            self.with_routed_state_update(
+                params,
+                AcpOperation::SessionUpdate.method(),
+                |attachment| attachment.handle_session_update(params),
+            )
+        } else {
             self.with_routed_params(params, AcpOperation::SessionUpdate.method(), |attachment| {
                 attachment.handle_session_update(params)
-            });
+            })
+        };
+        let _ = routed;
     }
 
     fn register_probe_config_update(&self, native_session_id: &str) -> oneshot::Receiver<Value> {
@@ -12825,7 +12910,7 @@ impl AcpRuntimeClient {
             &result,
         );
         if let Some(commands) = process.take_pending_available_commands(&native_session_id) {
-            state.available_commands = commands;
+            state.available_commands = Some(commands);
         }
         if let Some(update) = trailing_config_update {
             apply_session_state_to_attachment(
@@ -12939,7 +13024,7 @@ impl AcpRuntimeClient {
             &result,
         );
         if let Some(commands) = process.take_pending_available_commands(&native_session_id) {
-            state.available_commands = commands;
+            state.available_commands = Some(commands);
         }
         apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
@@ -12994,7 +13079,7 @@ impl AcpRuntimeClient {
             &result,
         );
         if let Some(commands) = process.take_pending_available_commands(native_session_id) {
-            state.available_commands = commands;
+            state.available_commands = Some(commands);
         }
         apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
@@ -13083,7 +13168,7 @@ impl AcpRuntimeClient {
             &result,
         );
         if let Some(commands) = process.take_pending_available_commands(native_session_id) {
-            state.available_commands = commands;
+            state.available_commands = Some(commands);
         }
         apply_startup_model_to_attachment_state(process, &mut state);
         Ok(OpenedAcpSession {
@@ -18193,9 +18278,12 @@ impl AcpClient for AcpRuntimeClient {
         &self,
         session_id: &VibexSessionId,
     ) -> VibexResult<Option<Vec<AcpRuntimeCommand>>> {
+        // `None` also covers an attachment whose Agent never announced a
+        // catalog: discovery then falls back to the pre-session catalog
+        // instead of reporting an authoritative empty one.
         Ok(self
             .current_attachment(session_id)
-            .map(|attachment| attachment.payload().available_commands()))
+            .and_then(|attachment| attachment.payload().available_commands()))
     }
 }
 
@@ -23945,6 +24033,27 @@ def control_value(name, fallback):
         return fallback
 
 
+def commands_after_response():
+    # DeepSeek Harness publishes its live command catalog right after the
+    # session/new, session/resume and session/load results; most other
+    # adapters announce it before the result instead.
+    return control_value("commands_after_response", "") == "1"
+
+
+def send_available_commands(session_id, name, description):
+    send({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{"name": name, "description": description}],
+            },
+        },
+    })
+
+
 def runtime_model_id(model_id):
     if not model_prefix:
         return model_id
@@ -24069,19 +24178,8 @@ for line in sys.stdin:
             })
             continue
         session_id = "mock-session-" + str(session_counter)
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "available_commands_update",
-                    "availableCommands": [
-                        {"name": "compact", "description": "Compact context"}
-                    ],
-                },
-            },
-        })
+        if not commands_after_response():
+            send_available_commands(session_id, "compact", "Compact context")
         # Copilot CLI shape: standard mode URIs in the session/new result, and
         # the reasoning-effort option only in an unsolicited follow-up update.
         standard_mode = "https://agentclientprotocol.com/protocol/session-modes#"
@@ -24168,6 +24266,8 @@ for line in sys.stdin:
             "id": mid,
             "result": session_result,
         })
+        if commands_after_response():
+            send_available_commands(session_id, "compact", "Compact context")
         if post_session_config_update:
             send({
                 "jsonrpc": "2.0",
@@ -24358,19 +24458,8 @@ for line in sys.stdin:
         elif restore_mode == "native_mismatch":
             send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "wrong-native-session"}})
         else:
-            send({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": [
-                            {"name": "resume-command", "description": "Restored by resume"}
-                        ],
-                    },
-                },
-            })
+            if not commands_after_response():
+                send_available_commands(session_id, "resume-command", "Restored by resume")
             send({
                 "jsonrpc": "2.0",
                 "id": mid,
@@ -24381,6 +24470,8 @@ for line in sys.stdin:
                     },
                 },
             })
+            if commands_after_response():
+                send_available_commands(session_id, "resume-command", "Restored by resume")
     elif method == "session/fork":
         fork_mode = control_value("fork_mode", "success")
         if fork_mode == "failure":
@@ -24444,19 +24535,8 @@ for line in sys.stdin:
         if restore_mode == "native_mismatch":
             send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "wrong-native-session"}})
             continue
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "available_commands_update",
-                    "availableCommands": [
-                        {"name": "load-command", "description": "Restored by load"}
-                    ],
-                },
-            },
-        })
+        if not commands_after_response():
+            send_available_commands(session_id, "load-command", "Restored by load")
         send({
             "jsonrpc": "2.0",
             "id": mid,
@@ -24500,6 +24580,8 @@ for line in sys.stdin:
                 ],
             },
         })
+        if commands_after_response():
+            send_available_commands(session_id, "load-command", "Restored by load")
     elif method == "session/prompt":
         prompt_mode = control_value("prompt_mode", prompt_mode)
         session_id = msg["params"]["sessionId"]
@@ -28789,6 +28871,87 @@ for line in sys.stdin:
         assert_eq!(
             warm_source.state().unwrap(),
             SessionAttachmentState::Inactive
+        );
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prepared_commit_keeps_a_catalog_published_after_the_session_new_response() {
+        let Some(fixture) = runtime_switch_fixture("prepared-command-catalog").await else {
+            return;
+        };
+        // The DeepSeek Harness bridge announces its live command catalog right
+        // after the session/new result, while a durable rebuild still has its
+        // attachment in the prepared window.
+        fixture
+            .fixture
+            .set_control_value("commands_after_response", "1");
+        let target_binding_id = RuntimeBindingId::new();
+        let intent = switch_intent(
+            &fixture,
+            target_binding_id.clone(),
+            "mock/model-2",
+            "review",
+        );
+        let process = fixture
+            .bridge
+            .ensure_process(&intent, &switch_operation("spawn"))
+            .await
+            .unwrap();
+        let prepared = fixture
+            .bridge
+            .restore_or_create_session(
+                &intent,
+                &process,
+                RuntimeSwitchStrategy::RestartFreshAndBridge,
+                &switch_operation("create"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .attachment_router
+                .registry
+                .attachment(&target_binding_id)
+                .unwrap()
+                .unwrap()
+                .state()
+                .unwrap(),
+            SessionAttachmentState::Prepared
+        );
+        // Let the reader deliver the notification while the attachment is still
+        // prepared, then commit exactly like the durable rebuild does.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        RuntimeBindingRepository::insert(&conn, &prepared.binding).unwrap();
+        fixture
+            .bridge
+            .apply_session_config(&intent, &prepared, &switch_operation("config"))
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .revalidate_prepared(&intent, &prepared)
+            .await
+            .unwrap();
+        fixture
+            .bridge
+            .activate(&intent, &prepared, prepared.binding.activation_generation)
+            .await
+            .unwrap();
+        let commands = fixture
+            .client
+            .list_session_commands(&fixture.session.id)
+            .await
+            .unwrap()
+            .expect("the committed attachment must expose the announced catalog");
+        assert_eq!(
+            commands.first().map(|command| command.name.as_str()),
+            Some("compact")
         );
         drop(fixture.manager);
         drop(fixture.bridge);
