@@ -18,10 +18,11 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
-    Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context, Decorations,
-    DismissEvent, Div, DragMoveEvent, ElementId, Empty, Entity, EntityInputHandler, ExternalPaths,
-    FocusHandle, Focusable as _, FontWeight, Global, HighlightStyle, Hsla, Image, ImageFormat,
-    IntoElement, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    AvailableSpace, Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context,
+    Decorations, DismissEvent, Div, DragMoveEvent, Element, ElementId, Empty, Entity,
+    EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight, Global,
+    GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
+    KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
     ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
@@ -10240,12 +10241,49 @@ impl VibexWorkbench {
     /// Mixed-worktree folders remain project-scoped and are intentionally left
     /// unchanged.
     fn reconcile_legacy_sidebar_folder_worktree_owners(&mut self) -> bool {
+        // This migration only ever acts on legacy folders, and a sidebar that
+        // has none is the common case. It runs on every render, so leave before
+        // building the indexes below.
+        let legacy_folder_ids = self
+            .ui_state
+            .sidebar
+            .organization
+            .folders
+            .iter()
+            .filter_map(|(folder_id, folder)| {
+                (folder.project_id.is_some() && folder.workspace_id.is_none())
+                    .then_some(folder_id.clone())
+            })
+            .collect::<Vec<_>>();
+        if legacy_folder_ids.is_empty() {
+            return false;
+        }
+
         let mut children = BTreeMap::<Option<String>, Vec<SidebarOrganizationItem>>::new();
         for placement in &self.ui_state.sidebar.organization.placements {
             children
                 .entry(placement.parent_folder_id.clone())
                 .or_default()
                 .push(placement.item.clone());
+        }
+
+        // Index the workspaces once. Resolving a session's workspace by
+        // rescanning the workspace list per session made this migration
+        // quadratic in the number of sessions the sidebar holds.
+        let mut workspaces_by_id = HashMap::<(String, String), String>::new();
+        let mut workspaces_by_root =
+            HashMap::<(String, String), Vec<(WorkspaceMode, String)>>::new();
+        for (project, workspace) in &self.workspaces {
+            let project_id = project.id.as_str().to_string();
+            let workspace_id = workspace.id.as_str().to_string();
+            workspaces_by_id.insert(
+                (project_id.clone(), workspace_id.clone()),
+                workspace_id.clone(),
+            );
+            workspaces_by_root
+                .entry((project_id, workspace.root_path.clone()))
+                .or_default()
+                .push((workspace.mode, workspace_id));
         }
 
         let mut session_workspaces = BTreeMap::<String, String>::new();
@@ -10260,20 +10298,23 @@ impl VibexWorkbench {
             })
             .collect::<BTreeMap<_, _>>();
         for session in &self.sessions {
-            let workspace_id = self
-                .workspaces
-                .iter()
-                .find(|(project, workspace)| {
-                    project.id == session.project_id && workspace.id == session.workspace_id
-                })
+            let project_id = session.project_id.as_str();
+            let workspace_id = workspaces_by_id
+                .get(&(
+                    project_id.to_string(),
+                    session.workspace_id.as_str().to_string(),
+                ))
+                .cloned()
                 .or_else(|| {
-                    self.workspaces.iter().find(|(project, workspace)| {
-                        project.id == session.project_id
-                            && workspace.root_path == session.workspace_root
-                            && workspace.mode == session.workspace_mode
-                    })
-                })
-                .map(|(_, workspace)| workspace.id.as_str().to_string());
+                    workspaces_by_root
+                        .get(&(project_id.to_string(), session.workspace_root.clone()))
+                        .and_then(|candidates| {
+                            candidates
+                                .iter()
+                                .find(|(mode, _)| *mode == session.workspace_mode)
+                                .map(|(_, workspace_id)| workspace_id.clone())
+                        })
+                });
             if let Some(workspace_id) = workspace_id {
                 session_workspaces.insert(session.id.as_str().to_string(), workspace_id);
             }
@@ -10302,17 +10343,6 @@ impl VibexWorkbench {
             }
         }
 
-        let legacy_folder_ids = self
-            .ui_state
-            .sidebar
-            .organization
-            .folders
-            .iter()
-            .filter_map(|(folder_id, folder)| {
-                (folder.project_id.is_some() && folder.workspace_id.is_none())
-                    .then_some(folder_id.clone())
-            })
-            .collect::<Vec<_>>();
         let mut inferred = BTreeMap::<String, String>::new();
         for folder_id in legacy_folder_ids {
             if !self
@@ -23039,6 +23069,16 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// The session a sidebar rename is editing, if any. Session rows change
+    /// height while they hold the rename input, so the sidebar's windowed row
+    /// runs need to know which one to lay out in flow instead.
+    fn sidebar_renaming_session_id(&self) -> Option<&str> {
+        match self.sidebar_rename_target.as_ref() {
+            Some(SidebarRenameTarget::Session(session_id)) => Some(session_id.as_str()),
+            Some(SidebarRenameTarget::Folder(_)) | None => None,
+        }
+    }
+
     fn finish_sidebar_rename_on_blur(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.sidebar_rename_target.clone() else {
             return;
@@ -27446,7 +27486,7 @@ impl VibexWorkbench {
                     .map(|session| session.workspace_id.as_str().to_string())
             });
         let group_elements = self.render_sidebar_root_children(
-            groups,
+            &groups,
             None,
             selected_workspace_id,
             reorder_enabled,
@@ -28237,7 +28277,7 @@ impl VibexWorkbench {
     #[allow(clippy::too_many_arguments)]
     fn render_sidebar_root_children(
         &mut self,
-        groups: Rc<Vec<SidebarProjectProjection>>,
+        groups: &Rc<Vec<SidebarProjectProjection>>,
         parent_folder_id: Option<String>,
         selected_workspace_id: Option<String>,
         reorder_enabled: bool,
@@ -28248,7 +28288,7 @@ impl VibexWorkbench {
         if depth > 32 {
             return Vec::new();
         }
-        let mut items = self.sidebar_root_organization_items(&groups, parent_folder_id.as_deref());
+        let mut items = self.sidebar_root_organization_items(groups, parent_folder_id.as_deref());
         if let Some(drag) = self
             .sidebar_project_drag_state
             .as_ref()
@@ -28266,14 +28306,16 @@ impl VibexWorkbench {
         for item in items {
             match item {
                 SidebarOrganizationItem::Project(project_id) => {
-                    let Some(group) = groups
+                    // The projection is cached behind this `Rc`, so a project is
+                    // rendered in place: copying it would copy every session it
+                    // owns on every frame.
+                    let Some(project_index) = groups
                         .iter()
-                        .find(|group| group.project.id.as_str() == project_id)
-                        .cloned()
+                        .position(|group| group.project.id.as_str() == project_id)
                     else {
                         continue;
                     };
-                    let active = group.workspaces.iter().any(|workspace| {
+                    let active = groups[project_index].workspaces.iter().any(|workspace| {
                         sidebar_project_is_active(
                             selected_workspace_id.as_deref(),
                             workspace.workspace.id.as_str(),
@@ -28281,7 +28323,8 @@ impl VibexWorkbench {
                         )
                     });
                     elements.push(self.render_sidebar_project(
-                        &group,
+                        groups,
+                        project_index,
                         active,
                         reorder_enabled,
                         strings,
@@ -28299,7 +28342,7 @@ impl VibexWorkbench {
                         Vec::new()
                     } else {
                         self.render_sidebar_root_children(
-                            groups.clone(),
+                            groups,
                             Some(folder_id.clone()),
                             selected_workspace_id.clone(),
                             reorder_enabled,
@@ -28325,7 +28368,8 @@ impl VibexWorkbench {
     #[allow(clippy::too_many_arguments)]
     fn render_sidebar_project_children(
         &mut self,
-        group: &SidebarProjectProjection,
+        groups: &Rc<Vec<SidebarProjectProjection>>,
+        project_index: usize,
         parent_folder_id: Option<String>,
         include_root_sessions: bool,
         legacy_project_folders_only: bool,
@@ -28337,6 +28381,7 @@ impl VibexWorkbench {
         if depth > 32 {
             return Vec::new();
         }
+        let group = &groups[project_index];
         let project_id = group.project.id.as_str().to_string();
         let mut items = if legacy_project_folders_only {
             self.sidebar_project_legacy_organization_items(
@@ -28362,10 +28407,41 @@ impl VibexWorkbench {
                 .collect::<Vec<_>>();
             items = sidebar_organization_items_with_drag_preview(&items, &preview_items);
         }
+        // Rows resolve their session by index, so the band never rescans the
+        // project's sessions once per row.
+        let session_indices = group
+            .compact_sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| (session.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let entity = cx.weak_entity();
+        // Owned, not borrowed: the row builders below take `&mut self`, so a
+        // borrow of the workbench could not stay live across them.
+        let rename_target = self.sidebar_renaming_session_id().map(str::to_string);
+        let selected_session = self
+            .selected_session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        let mut run = Vec::new();
         let mut elements = Vec::with_capacity(items.len());
         for item in items {
             match item {
                 SidebarOrganizationItem::Folder(folder_id) => {
+                    push_sidebar_session_run(
+                        &mut elements,
+                        &mut run,
+                        &entity,
+                        groups,
+                        project_index,
+                        None,
+                        &project_id,
+                        reorder_enabled,
+                        true,
+                        rename_target.as_deref(),
+                        selected_session.as_deref(),
+                        strings,
+                    );
                     let collapsed = self
                         .ui_state
                         .sidebar
@@ -28376,7 +28452,8 @@ impl VibexWorkbench {
                         Vec::new()
                     } else {
                         self.render_sidebar_project_children(
-                            group,
+                            groups,
+                            project_index,
                             Some(folder_id.clone()),
                             true,
                             legacy_project_folders_only,
@@ -28397,31 +28474,36 @@ impl VibexWorkbench {
                 SidebarOrganizationItem::Session(session_id)
                     if parent_folder_id.is_some() || include_root_sessions =>
                 {
-                    if let Some(session) = group
-                        .compact_sessions
-                        .iter()
-                        .find(|session| session.id.as_str() == session_id)
-                        .cloned()
-                    {
-                        elements.push(self.render_sidebar_session(
-                            &session,
-                            &project_id,
-                            reorder_enabled,
-                            true,
-                            strings,
-                            cx,
-                        ));
+                    if let Some(index) = session_indices.get(session_id.as_str()) {
+                        run.push(*index);
                     }
                 }
                 SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Session(_) => {}
             }
         }
+        push_sidebar_session_run(
+            &mut elements,
+            &mut run,
+            &entity,
+            groups,
+            project_index,
+            None,
+            &project_id,
+            reorder_enabled,
+            true,
+            rename_target.as_deref(),
+            selected_session.as_deref(),
+            strings,
+        );
         elements
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_workspace_children(
         &mut self,
-        projection: &SidebarWorkspaceProjection,
+        groups: &Rc<Vec<SidebarProjectProjection>>,
+        project_index: usize,
+        workspace_index: usize,
         parent_folder_id: Option<String>,
         reorder_enabled: bool,
         strings: Strings,
@@ -28431,6 +28513,7 @@ impl VibexWorkbench {
         if depth > 32 {
             return Vec::new();
         }
+        let projection = &groups[project_index].workspaces[workspace_index];
         let project_id = projection.workspace.project_id.as_str().to_string();
         let workspace_id = projection.workspace.id.as_str().to_string();
         let session_ids = projection
@@ -28448,10 +28531,39 @@ impl VibexWorkbench {
             &self.sidebar_state.pinned_ids,
             parent_folder_id.as_deref(),
         );
+        let session_indices = projection
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| (session.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let entity = cx.weak_entity();
+        // Owned, not borrowed: the row builders below take `&mut self`, so a
+        // borrow of the workbench could not stay live across them.
+        let rename_target = self.sidebar_renaming_session_id().map(str::to_string);
+        let selected_session = self
+            .selected_session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        let mut run = Vec::new();
         let mut elements = Vec::with_capacity(items.len());
         for item in items {
             match item {
                 SidebarOrganizationItem::Folder(folder_id) => {
+                    push_sidebar_session_run(
+                        &mut elements,
+                        &mut run,
+                        &entity,
+                        groups,
+                        project_index,
+                        Some(workspace_index),
+                        &project_id,
+                        reorder_enabled,
+                        false,
+                        rename_target.as_deref(),
+                        selected_session.as_deref(),
+                        strings,
+                    );
                     let collapsed = self
                         .ui_state
                         .sidebar
@@ -28462,7 +28574,9 @@ impl VibexWorkbench {
                         Vec::new()
                     } else {
                         self.render_sidebar_workspace_children(
-                            projection,
+                            groups,
+                            project_index,
+                            workspace_index,
                             Some(folder_id.clone()),
                             reorder_enabled,
                             strings,
@@ -28479,25 +28593,27 @@ impl VibexWorkbench {
                     ));
                 }
                 SidebarOrganizationItem::Session(session_id) => {
-                    if let Some(session) = projection
-                        .sessions
-                        .iter()
-                        .find(|session| session.id.as_str() == session_id)
-                        .cloned()
-                    {
-                        elements.push(self.render_sidebar_session(
-                            &session,
-                            &project_id,
-                            reorder_enabled,
-                            false,
-                            strings,
-                            cx,
-                        ));
+                    if let Some(index) = session_indices.get(session_id.as_str()) {
+                        run.push(*index);
                     }
                 }
                 SidebarOrganizationItem::Project(_) => {}
             }
         }
+        push_sidebar_session_run(
+            &mut elements,
+            &mut run,
+            &entity,
+            groups,
+            project_index,
+            Some(workspace_index),
+            &project_id,
+            reorder_enabled,
+            false,
+            rename_target.as_deref(),
+            selected_session.as_deref(),
+            strings,
+        );
         elements
     }
 
@@ -29131,12 +29247,14 @@ impl VibexWorkbench {
 
     fn render_sidebar_project(
         &mut self,
-        group: &SidebarProjectProjection,
+        groups: &Rc<Vec<SidebarProjectProjection>>,
+        project_index: usize,
         active: bool,
         reorder_enabled: bool,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let group = &groups[project_index];
         let project_id = group.project.id.clone();
         let project_id_string = project_id.as_str().to_string();
         let project_name = group.project.name.clone();
@@ -29544,7 +29662,8 @@ impl VibexWorkbench {
         if !collapsed {
             if detailed_hierarchy {
                 session_elements.extend(self.render_sidebar_project_children(
-                    group,
+                    groups,
+                    project_index,
                     None,
                     false,
                     true,
@@ -29553,9 +29672,11 @@ impl VibexWorkbench {
                     0,
                     cx,
                 ));
-                for workspace in &group.workspaces {
+                for workspace_index in 0..group.workspaces.len() {
                     session_elements.push(self.render_sidebar_workspace(
-                        workspace,
+                        groups,
+                        project_index,
+                        workspace_index,
                         reorder_enabled,
                         strings,
                         cx,
@@ -29563,7 +29684,8 @@ impl VibexWorkbench {
                 }
             } else {
                 session_elements = self.render_sidebar_project_children(
-                    group,
+                    groups,
+                    project_index,
                     None,
                     true,
                     false,
@@ -29704,11 +29826,14 @@ impl VibexWorkbench {
 
     fn render_sidebar_workspace(
         &mut self,
-        projection: &SidebarWorkspaceProjection,
+        groups: &Rc<Vec<SidebarProjectProjection>>,
+        project_index: usize,
+        workspace_index: usize,
         reorder_enabled: bool,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let projection = &groups[project_index].workspaces[workspace_index];
         let workspace = projection.workspace.clone();
         let workspace_id = workspace.id.as_str().to_string();
         let project_id = workspace.project_id.as_str().to_string();
@@ -30102,7 +30227,9 @@ impl VibexWorkbench {
         }
 
         let mut sessions = self.render_sidebar_workspace_children(
-            projection,
+            groups,
+            project_index,
+            workspace_index,
             None,
             reorder_enabled,
             strings,
@@ -46256,6 +46383,359 @@ fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
         .child(sidebar_icon("icons/vibex/message-square.svg").size(px(14.0)))
         .child(strings.sidebar_no_sessions)
         .into_any_element()
+}
+
+/// How far past the visible edge a session run still builds rows, so a scroll
+/// step never uncovers a row that has not been built yet.
+const SIDEBAR_SESSION_RUN_OVERSCAN_PX: f32 = 480.0;
+/// Rows a run lays out in flow rather than windowing. Below this the run costs
+/// less to build outright than to place row by row.
+const SIDEBAR_SESSION_RUN_FLOW_LIMIT: usize = 24;
+/// The vertical pitch of one session row: the row plus the gap its container
+/// inserts between it and the next row.
+const SIDEBAR_SESSION_ROW_STRIDE: f32 = SIDEBAR_SESSION_ROW_HEIGHT + SIDEBAR_SESSION_CONTENT_GAP;
+
+/// The session rows one [`SidebarSessionRun`] stands for.
+///
+/// The sidebar renders a cached projection behind an `Rc`, so a run can hold
+/// that projection and resolve its own sessions while it lays them out instead
+/// of copying any of them.
+struct SidebarSessionRunSource {
+    groups: Rc<Vec<SidebarProjectProjection>>,
+    project_index: usize,
+    /// `Some` when the rows belong to one worktree of the project.
+    workspace_index: Option<usize>,
+    /// Indices into the source slice, in display order.
+    session_indices: Vec<usize>,
+    project_scope_id: String,
+    reorder_enabled: bool,
+    show_worktree_identity: bool,
+    strings: Strings,
+}
+
+impl SidebarSessionRunSource {
+    fn sessions(&self) -> &[AgentSession] {
+        let group = &self.groups[self.project_index];
+        match self.workspace_index {
+            Some(index) => &group.workspaces[index].sessions,
+            None => &group.compact_sessions,
+        }
+    }
+
+    fn session(&self, row: usize) -> Option<&AgentSession> {
+        let index = *self.session_indices.get(row)?;
+        self.sessions().get(index)
+    }
+
+    /// Whether the session being renamed sits in this run. The rename row is a
+    /// different height from a session row, so a run holding it lays out in flow
+    /// where its measured height is always the real one.
+    fn renames_a_row(&self, rename_target: Option<&str>) -> bool {
+        let Some(rename_target) = rename_target else {
+            return false;
+        };
+        let sessions = self.sessions();
+        self.session_indices
+            .iter()
+            .any(|index| sessions[*index].id.as_str() == rename_target)
+    }
+}
+
+/// One contiguous band of session rows inside a sidebar container.
+///
+/// Project, worktree, and folder containers are ordinary flex columns, so a
+/// folder holding hundreds of sessions used to build, lay out, and paint every
+/// one of its rows on every frame the sidebar redrew — the sidebar's per-frame
+/// cost grew with the number of sessions it held, not with the number it
+/// showed. A run keeps the height its rows occupy in the flow and builds only
+/// the ones the sidebar's scroll container actually shows, placing each at its
+/// own origin. It is the same shape `MarkdownVirtualFlow` uses inside the
+/// timeline.
+/// Builds one row of a [`SidebarSessionRun`] on demand.
+///
+/// Runs are built during layout and prepaint, after the view's render has
+/// returned, so the builder may update the workbench to reach the row's current
+/// state.
+type SidebarSessionRowBuilder = Box<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
+
+struct SidebarSessionRun {
+    /// Rows this run stands for, in display order.
+    row_count: usize,
+    /// Whether to window the rows; a short run lays out in flow instead.
+    windowed: bool,
+    /// The row holding the selected session, which is built even when it is
+    /// outside the window: it carries the scroll anchor the workbench uses to
+    /// locate the current session.
+    selected_row: Option<usize>,
+    /// Builds row `index` on demand.
+    build_row: SidebarSessionRowBuilder,
+}
+
+impl SidebarSessionRun {
+    /// The height the rows occupy, gaps included.
+    fn flow_height(&self) -> f32 {
+        if self.row_count == 0 {
+            return 0.0;
+        }
+        self.row_count as f32 * SIDEBAR_SESSION_ROW_HEIGHT
+            + (self.row_count - 1) as f32 * SIDEBAR_SESSION_CONTENT_GAP
+    }
+
+    /// Where row `index` starts, relative to the run's own origin.
+    fn row_origin(&self, index: usize) -> f32 {
+        index as f32 * SIDEBAR_SESSION_ROW_STRIDE
+    }
+
+    /// The rows the content mask can see, widened by
+    /// [`SIDEBAR_SESSION_RUN_OVERSCAN_PX`].
+    ///
+    /// Rows are one fixed height, so the range is arithmetic rather than a
+    /// scan: row `i` covers `[i * stride, i * stride + row_height]`, and both
+    /// edges are divided by the same stride.
+    fn visible_rows(&self, bounds: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Range<usize> {
+        if self.row_count == 0 {
+            return 0..0;
+        }
+        let top =
+            f32::from(viewport.top()) - SIDEBAR_SESSION_RUN_OVERSCAN_PX - f32::from(bounds.top());
+        let bottom = f32::from(viewport.bottom()) + SIDEBAR_SESSION_RUN_OVERSCAN_PX
+            - f32::from(bounds.top());
+        let first = if top <= 0.0 {
+            0
+        } else {
+            (((top - SIDEBAR_SESSION_ROW_HEIGHT) / SIDEBAR_SESSION_ROW_STRIDE)
+                .ceil()
+                .max(0.0) as usize)
+                .min(self.row_count)
+        };
+        let end = if bottom < 0.0 {
+            0
+        } else {
+            ((bottom / SIDEBAR_SESSION_ROW_STRIDE).floor().max(0.0) as usize + 1)
+                .min(self.row_count)
+        };
+        first..end.max(first)
+    }
+}
+
+/// The flow child a run reserves its height with, or the column a run that
+/// lays out in flow holds its rows in.
+struct SidebarSessionRunLayout {
+    spacer: Option<AnyElement>,
+    column: Option<AnyElement>,
+    rows: Vec<AnyElement>,
+}
+
+impl IntoElement for SidebarSessionRun {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SidebarSessionRun {
+    type RequestLayoutState = SidebarSessionRunLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        if !self.windowed {
+            let mut column = v_flex()
+                .w_full()
+                .min_w_0()
+                .gap(px(SIDEBAR_SESSION_CONTENT_GAP));
+            for index in 0..self.row_count {
+                column = column.child((self.build_row)(index, window, cx));
+            }
+            let mut column = column.into_any_element();
+            let layout_id = column.request_layout(window, cx);
+            return (
+                layout_id,
+                SidebarSessionRunLayout {
+                    spacer: None,
+                    column: Some(column),
+                    rows: Vec::new(),
+                },
+            );
+        }
+        // The rows are placed by hand during prepaint, so the run only has to
+        // reserve the height they would have taken in the flow.
+        let mut spacer = div()
+            .w_full()
+            .min_w_0()
+            .h(px(self.flow_height()))
+            .flex_none()
+            .into_any_element();
+        let layout_id = spacer.request_layout(window, cx);
+        (
+            layout_id,
+            SidebarSessionRunLayout {
+                spacer: Some(spacer),
+                column: None,
+                rows: Vec::new(),
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(column) = layout.column.as_mut() {
+            column.prepaint(window, cx);
+            return;
+        }
+        let Some(spacer) = layout.spacer.as_mut() else {
+            return;
+        };
+        spacer.prepaint(window, cx);
+        layout.rows.clear();
+        if bounds.size.width <= px(0.0) {
+            return;
+        }
+        let viewport = window.content_mask().bounds;
+        let available_space = size(
+            AvailableSpace::Definite(bounds.size.width),
+            AvailableSpace::MinContent,
+        );
+        let visible = self.visible_rows(bounds, viewport);
+        // The selected row keeps its anchor even when it is scrolled out of the
+        // window, so `locate current session` still has somewhere to scroll to.
+        let selected = self
+            .selected_row
+            .filter(|index| !visible.contains(index))
+            .into_iter();
+        for index in visible.chain(selected) {
+            let mut row = (self.build_row)(index, window, cx);
+            row.layout_as_root(available_space, window, cx);
+            row.prepaint_at(
+                bounds.origin + point(px(0.0), px(self.row_origin(index))),
+                window,
+                cx,
+            );
+            layout.rows.push(row);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(column) = layout.column.as_mut() {
+            column.paint(window, cx);
+            return;
+        }
+        if let Some(spacer) = layout.spacer.as_mut() {
+            spacer.paint(window, cx);
+        }
+        for row in &mut layout.rows {
+            row.paint(window, cx);
+        }
+    }
+}
+
+/// One sidebar element standing for `source`'s rows.
+fn sidebar_session_run(
+    entity: WeakEntity<VibexWorkbench>,
+    source: Rc<SidebarSessionRunSource>,
+    rename_target: Option<&str>,
+    selected_session: Option<&str>,
+) -> AnyElement {
+    let windowed = !source.renames_a_row(rename_target)
+        && source.session_indices.len() > SIDEBAR_SESSION_RUN_FLOW_LIMIT;
+    let row_count = source.session_indices.len();
+    let selected_row = selected_session.and_then(|selected| {
+        let sessions = source.sessions();
+        source
+            .session_indices
+            .iter()
+            .position(|index| sessions[*index].id.as_str() == selected)
+    });
+    let build_source = source;
+    SidebarSessionRun {
+        row_count,
+        windowed,
+        selected_row,
+        build_row: Box::new(move |index, _window, cx| {
+            let Some(session) = build_source.session(index) else {
+                return Empty.into_any_element();
+            };
+            entity
+                .update(cx, |this, cx| {
+                    this.render_sidebar_session(
+                        session,
+                        &build_source.project_scope_id,
+                        build_source.reorder_enabled,
+                        build_source.show_worktree_identity,
+                        build_source.strings,
+                        cx,
+                    )
+                })
+                .unwrap_or_else(|_| Empty.into_any_element())
+        }),
+    }
+    .into_any_element()
+}
+
+/// Flushes the pending band of session rows into one run element.
+#[allow(clippy::too_many_arguments)]
+fn push_sidebar_session_run(
+    elements: &mut Vec<AnyElement>,
+    run: &mut Vec<usize>,
+    entity: &WeakEntity<VibexWorkbench>,
+    groups: &Rc<Vec<SidebarProjectProjection>>,
+    project_index: usize,
+    workspace_index: Option<usize>,
+    project_scope_id: &str,
+    reorder_enabled: bool,
+    show_worktree_identity: bool,
+    rename_target: Option<&str>,
+    selected_session: Option<&str>,
+    strings: Strings,
+) {
+    if run.is_empty() {
+        return;
+    }
+    elements.push(sidebar_session_run(
+        entity.clone(),
+        Rc::new(SidebarSessionRunSource {
+            groups: groups.clone(),
+            project_index,
+            workspace_index,
+            session_indices: std::mem::take(run),
+            project_scope_id: project_scope_id.to_string(),
+            reorder_enabled,
+            show_worktree_identity,
+            strings,
+        }),
+        rename_target,
+        selected_session,
+    ));
 }
 
 fn sidebar_workspace_branch_name(branch: &str) -> &str {
@@ -68655,6 +69135,250 @@ mod tests {
         assert!(
             height < 120.0,
             "first reasoning line should wrap horizontally instead of stacking one character per line, got height {height}"
+        );
+    }
+
+    /// A sidebar session run inside a scroll container, reporting the rows it
+    /// built and the height it reserved.
+    struct SidebarSessionRunProbe {
+        rows: usize,
+        windowed: bool,
+        built: Rc<RefCell<Vec<usize>>>,
+        reserved_height: Rc<Cell<f32>>,
+        scroll: ScrollHandle,
+    }
+
+    impl Render for SidebarSessionRunProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let built = self.built.clone();
+            let reserved_height = self.reserved_height.clone();
+            div()
+                .id("sidebar-session-run-probe")
+                .w(px(320.0))
+                .h(px(600.0))
+                .track_scroll(&self.scroll)
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .on_children_prepainted(move |bounds, _, _| {
+                            if let Some(run) = bounds.first() {
+                                reserved_height.set(f32::from(run.size.height));
+                            }
+                        })
+                        .child(SidebarSessionRun {
+                            row_count: self.rows,
+                            windowed: self.windowed,
+                            selected_row: None,
+                            build_row: Box::new(move |index, _window, _cx| {
+                                built.borrow_mut().push(index);
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .h(px(SIDEBAR_SESSION_ROW_HEIGHT))
+                                    .into_any_element()
+                            }),
+                        }),
+                )
+        }
+    }
+
+    /// The height every row of a band occupies in the flow, gaps included.
+    fn sidebar_session_run_flow_height(rows: usize) -> f32 {
+        rows as f32 * SIDEBAR_SESSION_ROW_HEIGHT + (rows - 1) as f32 * SIDEBAR_SESSION_CONTENT_GAP
+    }
+
+    #[gpui::test]
+    fn sidebar_session_run_builds_only_the_rows_the_viewport_shows(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        const ROWS: usize = 500;
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let reserved_height = Rc::new(Cell::new(0.0));
+        let scroll = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let built = built.clone();
+            let reserved_height = reserved_height.clone();
+            let scroll = scroll.clone();
+            move |_, _| SidebarSessionRunProbe {
+                rows: ROWS,
+                windowed: true,
+                built,
+                reserved_height,
+                scroll,
+            }
+        });
+        cx.run_until_parked();
+        // One frame with a forced repaint, so the probe reports exactly the rows
+        // a single render builds.
+        built.borrow_mut().clear();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        // The run reserves the height every row would have taken in the flow,
+        // so the scrollbar still spans the whole folder.
+        let expected = sidebar_session_run_flow_height(ROWS);
+        assert!(
+            (reserved_height.get() - expected).abs() < 0.5,
+            "a windowed run must keep its rows' flow height: {} vs {expected}",
+            reserved_height.get()
+        );
+
+        let built_at_top = built.borrow().clone();
+        assert!(
+            built_at_top.len() < 60,
+            "a 500-row folder should build a viewport's worth of rows, built {}",
+            built_at_top.len()
+        );
+        assert_eq!(
+            built_at_top.first(),
+            Some(&0),
+            "the first row is visible at the top of the folder"
+        );
+        assert!(
+            built_at_top.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "the window is one contiguous band: {built_at_top:?}"
+        );
+
+        // Scrolling moves the window instead of growing it.
+        scroll.set_offset(point(px(0.0), px(-10_000.0)));
+        built.borrow_mut().clear();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let built_scrolled = built.borrow().clone();
+        let first = *built_scrolled
+            .first()
+            .expect("the scrolled window builds rows");
+        assert!(
+            first > 200,
+            "scrolling past 10,000px should skip the rows above it, first was {first}"
+        );
+        assert!(
+            built_scrolled.len() < 60,
+            "the scrolled window stays bounded, built {}",
+            built_scrolled.len()
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_session_run_lays_short_bands_out_in_flow(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        const ROWS: usize = SIDEBAR_SESSION_RUN_FLOW_LIMIT;
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let reserved_height = Rc::new(Cell::new(0.0));
+        let scroll = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let built = built.clone();
+            let reserved_height = reserved_height.clone();
+            let scroll = scroll.clone();
+            move |_, _| SidebarSessionRunProbe {
+                rows: ROWS,
+                windowed: false,
+                built,
+                reserved_height,
+                scroll,
+            }
+        });
+        cx.run_until_parked();
+        built.borrow_mut().clear();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            built.borrow().as_slice(),
+            (0..ROWS).collect::<Vec<_>>(),
+            "a short band keeps every row in the flow"
+        );
+        let expected = sidebar_session_run_flow_height(ROWS);
+        assert!(
+            (reserved_height.get() - expected).abs() < 0.5,
+            "flow and windowed runs must reserve the same height: {} vs {expected}",
+            reserved_height.get()
+        );
+    }
+
+    #[test]
+    fn sidebar_session_run_window_is_arithmetic_on_a_uniform_stride() {
+        let run = SidebarSessionRun {
+            row_count: 500,
+            windowed: true,
+            selected_row: None,
+            build_row: Box::new(|_, _, _| Empty.into_any_element()),
+        };
+        let viewport = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(320.0), px(600.0)),
+        };
+        let top = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(320.0), px(run.flow_height())),
+        };
+        let visible = run.visible_rows(top, viewport);
+        assert_eq!(visible.start, 0);
+        assert!(visible.end < 60, "visible rows: {visible:?}");
+
+        // A run scrolled up by one viewport starts at the row covering the
+        // first offset the overscan cannot still see, rather than rescanning
+        // every row above it: (600 - 480) / 42 is the second row.
+        let scrolled = Bounds {
+            origin: point(px(0.0), px(-600.0)),
+            size: top.size,
+        };
+        let visible = run.visible_rows(scrolled, viewport);
+        assert!(visible.start >= 2 && visible.start <= 4, "{visible:?}");
+
+        // A run entirely below the viewport builds nothing.
+        let below = Bounds {
+            origin: point(px(0.0), px(4_000.0)),
+            size: top.size,
+        };
+        assert_eq!(run.visible_rows(below, viewport), 0..0);
+    }
+
+    #[test]
+    fn sidebar_rows_render_through_one_windowed_run_per_band() {
+        let source = include_str!("app.rs");
+        let project_children = source
+            .split_once("    fn render_sidebar_project_children(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_workspace_children("))
+            .map(|(body, _)| body)
+            .expect("the project children renderer should remain inspectable");
+        assert!(
+            project_children.contains("push_sidebar_session_run("),
+            "project sessions must render through a windowed run"
+        );
+        assert!(
+            !project_children.contains(".find(|session| session.id.as_str() == session_id)"),
+            "session rows must resolve by index, not by rescanning the project per row"
+        );
+
+        let workspace_children = source
+            .split_once("    fn render_sidebar_workspace_children(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_folder("))
+            .map(|(body, _)| body)
+            .expect("the workspace children renderer should remain inspectable");
+        assert!(
+            workspace_children.contains("push_sidebar_session_run("),
+            "worktree sessions must render through a windowed run"
+        );
+
+        let reconcile = source
+            .split_once("    fn reconcile_legacy_sidebar_folder_worktree_owners(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn ordered_sidebar_session_projects("))
+            .map(|(body, _)| body)
+            .expect("the legacy folder migration should remain inspectable");
+        assert!(
+            reconcile.contains("if legacy_folder_ids.is_empty()"),
+            "the migration must leave before indexing when no folder is legacy"
+        );
+        assert!(
+            !reconcile.contains("self.workspaces\n                .iter()\n                .find("),
+            "the migration must index workspaces instead of rescanning them per session"
         );
     }
 }

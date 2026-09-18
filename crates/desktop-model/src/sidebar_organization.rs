@@ -654,11 +654,6 @@ impl SidebarOrganizationState {
         available_items: &[SidebarOrganizationItem],
     ) -> Vec<SidebarOrganizationItem> {
         let available = available_items.iter().cloned().collect::<BTreeSet<_>>();
-        let placed = self
-            .placements
-            .iter()
-            .map(|placement| placement.item.clone())
-            .collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
         let mut children = self
             .placements
@@ -672,6 +667,14 @@ impl SidebarOrganizationState {
         if parent_folder_id.is_none() {
             // Newly discovered items without a placement fall back to the scope
             // root; placed items must appear only below their recorded parent.
+            // Only this branch needs to know which items are placed at all, so
+            // the other callers — every folder level of every render — do not
+            // pay for collecting the placement set.
+            let placed = self
+                .placements
+                .iter()
+                .map(|placement| placement.item.clone())
+                .collect::<BTreeSet<_>>();
             children.extend(
                 available_items
                     .iter()
