@@ -1206,12 +1206,16 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   not silently retarget the currently selected session; successful non-selected
   mutations refresh the session list while preserving the active generation.
 - The global short action lock is owned by the mutation operation, not by the
-  selected-session view generation. Every rename/delete (including optimistic
-  batch delete) completion releases `agent_action_pending` unconditionally;
-  generation fencing applies only to active-view data and error updates. A
-  deletion can refresh the sidebar and select a replacement session before its
-  backend completion arrives, and that navigation must not strand the global
-  lock or disable unrelated session, Composer, or new-session controls.
+  selected-session view generation. Every taker — rename/delete (including
+  optimistic batch delete), Composer/preview terminal create and teardown, shell
+  switch, permission and elicitation resolution, session interrupt, and session
+  fork — releases `agent_action_pending` unconditionally, before any
+  `session_generation` or selected-session fence; generation fencing applies only
+  to active-view data and error updates. A deletion can refresh the sidebar and
+  select a replacement session before its backend completion arrives, and a fork
+  navigates to the session it just announced inside the same operation, so that
+  navigation must not strand the global lock or disable unrelated session,
+  Composer, or new-session controls.
 - Session-row context menus reuse those captured typed targets. Pin/unpin must call
   the same persisted `SidebarState` mutation as the inline pin button; menu actions
   must not maintain a second pin projection or infer the target from selection.
@@ -1389,7 +1393,7 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   projection for authoritative refetch; never switch back to an unbounded queue.
 - Async result generation differs from active generation -> ignore active-view
   mutations; a global list refresh may still reconcile durable changes.
-- A rename/delete completion arrives after navigation changed the session
+- Any mutation completion arrives after navigation changed the session
   generation -> always release the operation's global short action lock, while
   suppressing stale active-view success/error updates.
 - Session switches while send/runtime/permission/interrupt is pending -> the
@@ -1564,9 +1568,11 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   probe fencing, and session-update invalidation. Session-row context-menu tests
   assert the captured row id and checked state drive the same session-scoped
   toggle as the Composer. Session mutation completion tests cover rename,
-  single/optimistic batch delete, and navigation changing the generation before
-  the backend result; each completion must release the global short action lock
-  without applying stale active-view state.
+  single/optimistic batch delete, terminal create/teardown, shell switch,
+  permission and elicitation resolution, session interrupt, and session fork —
+  including navigation changing the generation before the backend result and a
+  fork that already announced its session; each completion must release the
+  global short action lock without applying stale active-view state.
 - `desktop-model` navigation tests assert before/after insertion plus missing-id
   and already-adjacent no-op behavior.
 - Run targeted GPUI/model tests, `cargo check --workspace --all-targets --locked`,

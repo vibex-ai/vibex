@@ -18692,10 +18692,10 @@ impl VibexWorkbench {
             let outcome = runner.await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     if this.session_generation != generation {
                         return;
                     }
-                    this.agent_action_pending = false;
                     match outcome {
                         Ok(Ok(terminal)) => {
                             let terminal_id = terminal.id.clone();
@@ -18806,10 +18806,10 @@ impl VibexWorkbench {
             let outcome = runner.await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     if this.session_generation != generation {
                         return;
                     }
-                    this.agent_action_pending = false;
                     match outcome {
                         Ok(Ok(terminal)) => {
                             let terminal_id = terminal.id.clone();
@@ -18887,10 +18887,10 @@ impl VibexWorkbench {
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                this.agent_action_pending = false;
                 if this.session_generation != generation {
                     return;
                 }
-                this.agent_action_pending = false;
                 match outcome {
                     Ok((closed, errors)) => {
                         let closed_ids = closed
@@ -18985,10 +18985,10 @@ impl VibexWorkbench {
         self.agent_action_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                this.agent_action_pending = false;
                 if this.session_generation != generation {
                     return;
                 }
-                this.agent_action_pending = false;
                 match outcome {
                     Ok(Ok(session)) => {
                         if let Some(terminal) = this
@@ -19453,10 +19453,10 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     if this.session_generation != generation {
                         return;
                     }
-                    this.agent_action_pending = false;
                     if let Ok(Err(error)) = outcome {
                         this.agent_error = Some(format!("{}: {}", error.code, error.message));
                     }
@@ -19598,10 +19598,10 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let outcome = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.agent_action_pending = false;
                     if this.session_generation != generation {
                         return;
                     }
-                    this.agent_action_pending = false;
                     match outcome {
                         Ok(Ok(_)) => {
                             this.elicitation_drafts.remove(&request_id);
@@ -19715,13 +19715,13 @@ impl VibexWorkbench {
                         this.publish_sidebar_invalidation();
                         this.sync_auto_continue_for_session(&interrupted_session_id, cx);
                     }
+                    this.agent_action_pending = false;
                     if this.session_generation != generation
                         || this.selected_session_id.as_ref() != Some(&interrupted_session_id)
                     {
                         cx.notify();
                         return;
                     }
-                    this.agent_action_pending = false;
                     match &outcome {
                         Ok(Ok(_)) => {
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer
@@ -19986,12 +19986,15 @@ impl VibexWorkbench {
                 let outcome = runner.await;
                 let _ = entity.update_in(cx, |this, window, cx| {
                     this.fork_session_pending = false;
-                    if announced_session_id.is_none()
-                        && this.session_generation == generation
-                        && this.selected_session_id.as_ref() == Some(&selected_source_session_id)
-                    {
-                        this.agent_action_pending = false;
-                    }
+                    // The fork owns the window-wide short action lock until its
+                    // runtime settles, and nothing else can take the lock while
+                    // it is held. Releasing it must therefore never be fenced to
+                    // the announcement or to the session the user is looking at:
+                    // the announced path navigates to the forked session, which
+                    // bumps `session_generation`, so a fenced release left the
+                    // lock set forever and pinned every composer and the
+                    // new-session controls in their loading state until restart.
+                    this.agent_action_pending = false;
                     match outcome {
                         Ok((Ok(session), _)) => {
                             let session_id = session.id.clone();
@@ -58164,13 +58167,59 @@ mod tests {
     #[test]
     fn session_mutation_completions_release_the_action_lock_before_generation_fencing() {
         let source = include_str!("app.rs");
-        let mutation_completions = [(
-            "    fn rename_session(",
-            "\n    fn confirm_delete_session(",
-            "session rename",
-        )];
+        let generation_fence = "if this.session_generation != generation {";
+        let mutation_completions = [
+            (
+                "    fn rename_session(",
+                "\n    fn confirm_delete_session(",
+                "session rename",
+                "let active = this.session_generation == generation;",
+            ),
+            (
+                "    pub(crate) fn create_composer_terminal(",
+                "\n    pub(crate) fn create_preview_terminal(",
+                "composer terminal creation",
+                generation_fence,
+            ),
+            (
+                "    pub(crate) fn create_preview_terminal(",
+                "\n    fn kill_composer_terminal(",
+                "preview terminal creation",
+                generation_fence,
+            ),
+            (
+                "    fn kill_composer_terminals(",
+                "\n    fn switch_composer_terminal_shell(",
+                "composer terminal teardown",
+                generation_fence,
+            ),
+            (
+                "    fn switch_composer_terminal_shell(",
+                "\n    fn prompt_rename_composer_terminal(",
+                "terminal shell switch",
+                generation_fence,
+            ),
+            (
+                "    fn resolve_permission(",
+                "\n    fn elicitation_input_key(",
+                "permission resolution",
+                generation_fence,
+            ),
+            (
+                "    fn resolve_elicitation(",
+                "\n    fn interrupt_session(",
+                "elicitation resolution",
+                generation_fence,
+            ),
+            (
+                "    fn interrupt_session_with_queue_behavior(",
+                "\n    fn continue_session(",
+                "session interrupt",
+                "this.selected_session_id.as_ref() != Some(&interrupted_session_id)",
+            ),
+        ];
 
-        for (start, end, label) in mutation_completions {
+        for (start, end, label, fence) in mutation_completions {
             let completion = source
                 .split_once(start)
                 .and_then(|(_, tail)| tail.split_once(end))
@@ -58179,15 +58228,46 @@ mod tests {
             let release = completion
                 .find("this.agent_action_pending = false;")
                 .unwrap_or_else(|| panic!("{label} must release its action lock"));
-            let generation_fence = completion
-                .find("let active = this.session_generation == generation;")
+            let fence = completion
+                .find(fence)
                 .unwrap_or_else(|| panic!("{label} must fence active-view updates"));
 
             assert!(
-                release < generation_fence,
+                release < fence,
                 "{label} must release its operation lock even after navigation changes generation"
             );
         }
+    }
+
+    #[test]
+    fn fork_session_releases_the_action_lock_after_its_runtime_settles() {
+        let source = include_str!("app.rs");
+        let fork = source
+            .split_once("    fn fork_session_at(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_inline_user_message_edit("))
+            .map(|(body, _)| body)
+            .expect("fork session action should remain inspectable");
+        let completion = fork
+            .split_once("                let outcome = runner.await;")
+            .map(|(_, body)| body)
+            .expect("fork completion should remain inspectable");
+
+        let release = completion
+            .find("this.agent_action_pending = false;")
+            .expect("the fork must release the window-wide action lock");
+        let outcome = completion
+            .find("match outcome {")
+            .expect("the fork completion should branch on its outcome");
+
+        assert!(
+            release < outcome,
+            "the fork must release its action lock before any outcome branch"
+        );
+        assert!(
+            !completion[..release].contains("announced_session_id"),
+            "an announced fork navigates to the new session, so a release fenced to the \
+             announcement leaves every composer loading until the app restarts"
+        );
     }
 
     #[test]
