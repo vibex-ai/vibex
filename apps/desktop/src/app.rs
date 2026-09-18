@@ -637,6 +637,44 @@ struct ComposerSuggestionContext {
     character_range: Range<usize>,
 }
 
+/// `Up`/`Down` recall of the selected session's earlier user messages.
+///
+/// `index` walks that session's user messages from newest (`len - 1`) to oldest
+/// (`0`); `None` means the composer holds live text rather than a recalled
+/// message. `draft` keeps whatever the composer held when the walk started, so
+/// stepping past the newest message — or pressing Escape — restores it instead
+/// of leaving a recalled message behind. `session_id` pins the walk to one
+/// session, so switching sessions cannot resume a stale cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ComposerHistoryState {
+    draft: String,
+    index: Option<usize>,
+    session_id: Option<VibexSessionId>,
+}
+
+/// Older entry for `Up`: entering the walk lands on the newest message, and the
+/// oldest message is sticky rather than wrapping around to the newest.
+fn composer_history_previous(index: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match index {
+        None => Some(len - 1),
+        Some(0) => Some(0),
+        Some(index) => Some(index - 1),
+    }
+}
+
+/// Newer entry for `Down`; `None` means the walk ran past the newest message
+/// and the composer returns to its draft. `Down` never starts a walk on its
+/// own, so an empty composer cannot scroll forward into history.
+fn composer_history_next(index: Option<usize>, len: usize) -> Option<usize> {
+    match index {
+        Some(index) if index + 1 < len => Some(index + 1),
+        _ => None,
+    }
+}
+
 fn composer_suggestion_collection_matches(
     current: &ComposerSuggestionContext,
     next: &ComposerSuggestionContext,
@@ -5372,6 +5410,7 @@ pub struct VibexWorkbench {
     suggestions: Vec<AgentCommandEntry>,
     suggestion_selection: ComposerSuggestionSelection,
     suggestion_context: Option<ComposerSuggestionContext>,
+    composer_history: ComposerHistoryState,
     suggestion_loading: bool,
     suggestion_request_serial: u64,
     composer_command_entry: Option<AgentCommandEntry>,
@@ -5780,6 +5819,11 @@ impl VibexWorkbench {
                         if this.composer_input_syncing {
                             return;
                         }
+                        // Typing into a recalled message turns it into live
+                        // text, so the arrows stop walking history and the
+                        // preserved draft is dropped instead of overwriting
+                        // the edit later.
+                        this.reset_composer_history();
                         this.sync_inline_composer_attachments(false, cx);
                         this.sync_composer_command_entry(ComposerTarget::Session, cx);
                         this.refresh_suggestions(ComposerTarget::Session, window, cx);
@@ -6223,6 +6267,7 @@ impl VibexWorkbench {
             suggestions: Vec::new(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_context: None,
+            composer_history: ComposerHistoryState::default(),
             suggestion_loading: false,
             suggestion_request_serial: 0,
             composer_command_entry: None,
@@ -12204,6 +12249,7 @@ impl VibexWorkbench {
             .and_then(|session_id| self.composer_session_drafts.remove(session_id.as_str()))
             .unwrap_or_default();
         self.composer_input_session_id = self.selected_session_id.clone();
+        self.reset_composer_history();
         self.composer_attachments = draft.attachments;
         self.composer_command_entry = draft.command_entry;
         self.composer_input_syncing = true;
@@ -15569,6 +15615,205 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// `Up`/`Down` on the session composer: the suggestion popup owns the keys
+    /// while it is open, history recall owns them while the composer is empty
+    /// or already showing a recalled message, and everything else falls through
+    /// to the textarea's own caret movement.
+    fn capture_composer_arrow_action(
+        &mut self,
+        action: ComposerSuggestionAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = match action {
+            ComposerSuggestionAction::Previous => true,
+            ComposerSuggestionAction::Next => false,
+            ComposerSuggestionAction::Apply | ComposerSuggestionAction::Dismiss => return,
+        };
+        // An in-progress IME composition owns every arrow key, and a suggestion
+        // popup opened by the recalled text keeps its own selection keys.
+        let composing = self.composer_input.update(cx, |input, cx| {
+            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        });
+        if composing {
+            return;
+        }
+        if self.composer_suggestions_active(ComposerTarget::Session) {
+            self.capture_composer_suggestion_action(ComposerTarget::Session, action, window, cx);
+            return;
+        }
+        if self.navigate_composer_history(previous, window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Escape on the session composer. The suggestion popup dismisses first;
+    /// only once it is gone does Escape end a history recall and put the
+    /// preserved draft back.
+    fn capture_composer_escape_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_suggestions_active(ComposerTarget::Session) {
+            self.capture_composer_suggestion_action(
+                ComposerTarget::Session,
+                ComposerSuggestionAction::Dismiss,
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.cancel_composer_history_recall(window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Whether the suggestion popup currently owns the composer's arrow keys.
+    fn composer_suggestions_active(&self, target: ComposerTarget) -> bool {
+        self.suggestion_context
+            .as_ref()
+            .is_some_and(|context| context.target == target)
+    }
+
+    /// Whether the composer is showing a message recalled from history rather
+    /// than live text. A cursor left over from another session does not count.
+    fn composer_history_recall_active(&self) -> bool {
+        self.composer_history.index.is_some()
+            && self.composer_history.session_id == self.selected_session_id
+    }
+
+    /// Forget any in-flight recall. Called wherever the composer text changes
+    /// out from under the walk — a session switch, a send, or a user edit.
+    fn reset_composer_history(&mut self) {
+        self.composer_history = ComposerHistoryState::default();
+    }
+
+    /// The selected session's earlier user messages, oldest first — the pool
+    /// the composer's `Up`/`Down` walk draws from. Messages that carry no text
+    /// (attachment only) have nothing to recall and are skipped; a message
+    /// still waiting for its authoritative row is appended so the newest send
+    /// is recallable at once.
+    fn composer_history_entries(&self, session_id: &VibexSessionId) -> Vec<String> {
+        if self.timeline.session_id.as_ref() != Some(session_id) {
+            return Vec::new();
+        }
+        let mut entries = self
+            .timeline
+            .items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                TimelinePayload::UserMessage(message) => Some(message.text.clone()),
+                _ => None,
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        if let Some(pending) = self.optimistic_user_messages.get(session_id.as_str())
+            && !pending.is_confirmed_by(&self.timeline)
+            && !pending.text.trim().is_empty()
+        {
+            entries.push(pending.text.clone());
+        }
+        entries
+    }
+
+    /// Walk the selected session's user messages, one step per arrow press.
+    /// Returns whether the key was consumed; an unconsumed key keeps its normal
+    /// meaning inside the textarea.
+    fn navigate_composer_history(
+        &mut self,
+        previous: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return false;
+        };
+        let active = self.composer_history_recall_active();
+        let empty = self.composer_input.read(cx).value().trim().is_empty();
+        // `Up` is the way in, and only from an empty composer. `Down` only ever
+        // walks back toward that empty state.
+        if !active && !(previous && empty) {
+            return false;
+        }
+        let entries = self.composer_history_entries(&session_id);
+        let current = active.then_some(self.composer_history.index).flatten();
+        if let Some(index) = current
+            && index >= entries.len()
+        {
+            // The recalled message left the timeline — the session was cleared
+            // or reloaded. End the walk rather than pointing at nothing.
+            self.reset_composer_history();
+            return false;
+        }
+        let next = if previous {
+            composer_history_previous(current, entries.len())
+        } else {
+            composer_history_next(current, entries.len())
+        };
+        let Some(index) = next else {
+            if !active {
+                return false;
+            }
+            // Past the newest message: the walk ends and the draft returns.
+            let draft = std::mem::take(&mut self.composer_history.draft);
+            self.composer_history.index = None;
+            self.composer_history.session_id = None;
+            self.apply_composer_history_text(draft, window, cx);
+            return true;
+        };
+        if Some(index) == current {
+            // The oldest message is sticky; consume the key so the caret does
+            // not wander inside a recalled message instead.
+            return true;
+        }
+        let Some(text) = entries.get(index).cloned() else {
+            return false;
+        };
+        if !active {
+            self.composer_history.draft = self.composer_input.read(cx).value().to_string();
+            self.composer_history.session_id = Some(session_id);
+        }
+        self.composer_history.index = Some(index);
+        self.apply_composer_history_text(text, window, cx);
+        true
+    }
+
+    /// End a history recall without sending anything, restoring the draft the
+    /// composer held before the walk started. Returns whether one was running.
+    fn cancel_composer_history_recall(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.composer_history_recall_active() {
+            return false;
+        }
+        let draft = std::mem::take(&mut self.composer_history.draft);
+        self.composer_history.index = None;
+        self.composer_history.session_id = None;
+        self.apply_composer_history_text(draft, window, cx);
+        true
+    }
+
+    /// Write recalled history — or the restored draft — into the composer,
+    /// leaving the caret at the end so the next arrow press keeps walking.
+    fn apply_composer_history_text(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_input_syncing = true;
+        self.composer_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            let end = input.value().len();
+            input.set_selected_range(end..end, cx);
+            input.focus(window, cx);
+        });
+        self.composer_input_syncing = false;
+        self.sync_inline_composer_attachments(false, cx);
+        self.sync_composer_command_entry(ComposerTarget::Session, cx);
+        self.refresh_suggestions(ComposerTarget::Session, window, cx);
+        cx.notify();
+    }
+
     fn capture_composer_suggestion_action(
         &mut self,
         target: ComposerTarget,
@@ -16136,6 +16381,9 @@ impl VibexWorkbench {
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
+        // The sent message becomes the newest history entry; a walk that was
+        // still pointing at the previous timeline is stale from here on.
+        self.reset_composer_history();
         Some(message)
     }
 
@@ -16172,6 +16420,9 @@ impl VibexWorkbench {
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
+        // The sent message becomes the newest history entry; a walk that was
+        // still pointing at the previous timeline is stale from here on.
+        self.reset_composer_history();
         Some(message)
     }
 
@@ -42764,8 +43015,7 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveUp, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::Session,
+                                                    this.capture_composer_arrow_action(
                                                         ComposerSuggestionAction::Previous,
                                                         window,
                                                         cx,
@@ -42774,8 +43024,7 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveDown, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::Session,
+                                                    this.capture_composer_arrow_action(
                                                         ComposerSuggestionAction::Next,
                                                         window,
                                                         cx,
@@ -42804,12 +43053,7 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputEscape, window, cx| {
-                                                    this.capture_composer_suggestion_action(
-                                                        ComposerTarget::Session,
-                                                        ComposerSuggestionAction::Dismiss,
-                                                        window,
-                                                        cx,
-                                                    )
+                                                    this.capture_composer_escape_action(window, cx)
                                                 },
                                             ))
                                             .child(
@@ -57582,6 +57826,68 @@ mod tests {
     #[test]
     fn preview_terminal_title_matches_tauri() {
         assert_eq!(PREVIEW_TERMINAL_TITLE, "Vibex Shell");
+    }
+
+    #[test]
+    fn composer_history_walk_is_oldest_sticky_and_ends_on_the_draft() {
+        // Entering the walk lands on the newest message and walks backwards.
+        assert_eq!(composer_history_previous(None, 3), Some(2));
+        assert_eq!(composer_history_previous(Some(2), 3), Some(1));
+        assert_eq!(composer_history_previous(Some(1), 3), Some(0));
+        // The oldest message is sticky instead of wrapping to the newest, and
+        // a session without user messages has nothing to recall.
+        assert_eq!(composer_history_previous(Some(0), 3), Some(0));
+        assert_eq!(composer_history_previous(None, 0), None);
+
+        // `Down` only walks forward and past the newest message it ends the
+        // walk; it never starts one on its own.
+        assert_eq!(composer_history_next(Some(0), 3), Some(1));
+        assert_eq!(composer_history_next(Some(2), 3), None);
+        assert_eq!(composer_history_next(None, 3), None);
+    }
+
+    #[test]
+    fn composer_history_recall_is_gated_on_an_empty_or_recalled_composer() {
+        let source = include_str!("app.rs");
+        let arrow = source
+            .split_once("    fn capture_composer_arrow_action(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Escape on the session composer."))
+            .map(|(body, _)| body)
+            .expect("composer arrow handling should remain inspectable");
+        assert!(arrow.contains("EntityInputHandler::marked_text_range"));
+        assert!(arrow.contains("self.composer_suggestions_active(ComposerTarget::Session)"));
+        assert!(arrow.contains("self.navigate_composer_history(previous, window, cx)"));
+        assert!(arrow.contains("cx.stop_propagation()"));
+
+        let navigate = source
+            .split_once("    fn navigate_composer_history(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// End a history recall without sending anything")
+            })
+            .map(|(body, _)| body)
+            .expect("composer history navigation should remain inspectable");
+        // Only an empty composer starts a walk, and only `Up` starts it.
+        assert!(navigate.contains("if !active && !(previous && empty)"));
+        assert!(navigate.contains("composer_history_previous(current, entries.len())"));
+        assert!(navigate.contains("composer_history_next(current, entries.len())"));
+
+        // The composer's own change event ends the walk, so typed text is
+        // never replaced by a stale draft.
+        let subscription = source
+            .split_once("            cx.subscribe_in(\n                &composer_input,")
+            .and_then(|(_, tail)| tail.split_once("InputEvent::PressEnter { secondary, shift }"))
+            .map(|(body, _)| body)
+            .expect("composer input subscription should remain inspectable");
+        assert!(subscription.contains("this.reset_composer_history();"));
+
+        // The session composer wires both keys to the shared handler.
+        let composer = source
+            .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(composer.contains("this.capture_composer_arrow_action("));
+        assert!(composer.contains("this.capture_composer_escape_action(window, cx)"));
     }
 
     #[test]
