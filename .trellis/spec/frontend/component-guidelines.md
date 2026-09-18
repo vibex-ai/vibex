@@ -170,6 +170,45 @@ cx.defer(move |cx| {
 Keep local state mutations inside the active callback; only the hand-off to a
 currently-updating entity needs to be deferred.
 
+### GPUI Dialog Input Lifetime
+
+A `window.open_dialog` builder is evaluated again on every repaint of the view
+that renders the dialog layer, and the workbench repaints often. An
+`Entity<InputState>` created inside the builder is therefore replaced on each
+rebuild: the text resets to its default value and the focus handle the user is
+typing into disappears, which reads as an input that cannot be edited at all.
+
+Create the input entity once before `open_dialog`, move it into the builder, and
+request focus from `window.on_next_frame` because the dialog's focus trap claims
+focus while it mounts. Select the current value so typing replaces it rather
+than appending to it:
+
+```rust
+// Wrong: a new entity on every dialog repaint.
+window.open_dialog(cx, move |dialog, window, cx| {
+    let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+    dialog.child(Input::new(&input))
+});
+
+// Correct: one entity, focused after the dialog mounts.
+let input = cx.new(|cx| InputState::new(window, cx).default_value(current.clone()));
+let input_for_focus = input.clone();
+let selection_end = current.len();
+window.open_dialog(cx, move |dialog, _window, cx| {
+    dialog.child(Input::new(&input))
+});
+window.on_next_frame(move |window, cx| {
+    input_for_focus.update(cx, |input, cx| {
+        input.set_selected_range(0..selection_end, cx);
+        input.focus(window, cx);
+    });
+});
+```
+
+A dialog that can reject its input must surface the reason inside the dialog.
+Notes rendered on the page behind a modal are occluded, so a rejected value
+looks like an unresponsive control.
+
 ### GPUI Post-Mutation Scroll Timing
 
 When a GPUI action changes text or other content whose layout determines a scroll
