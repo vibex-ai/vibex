@@ -1385,8 +1385,22 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   hard fences, and the dispatch must still honor the global action lock, queue
   pause state, and Auto/Manual send mode. This same completion path applies to
   the initial prompt of a newly created Session: release the new-session action
-  lock before advancing the queue, preserve pause behavior after prompt failure
-  or a user interrupt, and honor an explicit queued-message steer request.
+  lock before advancing the queue and honor an explicit queued-message steer
+  request.
+- The Composer queue pause state means "the user interrupted this session": it
+  is installed only by an explicit user interrupt that has queued messages, and
+  it clears only through an explicit resume or a per-message send. An unobserved
+  turn boundary, or one that stopped abnormally for any other reason, never
+  pauses the queue — such a submission only skips that dispatch, leaving the
+  message armed for a later normal completion. The completion probe re-arms the
+  queue for a next-frame re-evaluation whenever the session revision changes or
+  the probe answers, so a settled normal completion still advances the queue
+  without user action. That background re-evaluation never clears the pause and
+  never dispatches into a session whose snapshot is not `Idle`/`Error`; only the
+  completion handoff may ignore a lagging `Running` snapshot, because it just
+  cleared the local turn-pending fence. An explicit composer send while the
+  session is idle advances the queue even after an abnormal stop, while still
+  honoring Auto/Manual send mode.
 - The Composer queue exposes native steering only as a capability-gated extra
   action. Probe `native_steering_supported(session_id)` once per runtime
   activation generation, cache the answer per session, and render the steer
