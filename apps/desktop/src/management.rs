@@ -20,6 +20,7 @@ use gpui_component::{
     StyledExt as _, Theme, WindowExt as _,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
     form::{Field, Form},
@@ -79,6 +80,15 @@ use crate::theme;
 
 const MANAGEMENT_SIDEBAR_WIDTH: f32 = 368.0;
 const MANAGEMENT_WIDE_BREAKPOINT: f32 = 1024.0;
+/// Below this the Provider editor stacks its Model picker and its settings
+/// instead of showing them side by side.
+const MANAGEMENT_PROFILE_PANES_MIN_WIDTH: f32 = 960.0;
+/// A stacked Model list stops growing at this height, so a long catalogue
+/// cannot push the dialog's own actions out of reach.
+const MANAGEMENT_PROFILE_PANE_MAX_HEIGHT: f32 = 260.0;
+/// The identity and connection band stops growing at this height, so the Model
+/// panes keep the rest of the dialog even when a disclosure opens.
+const MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT: f32 = 320.0;
 const MANAGEMENT_COMPACT_SIDEBAR_DEFAULT_HEIGHT: f32 = 360.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MIN_HEIGHT: f32 = 192.0;
 const MANAGEMENT_COMPACT_SIDEBAR_MAX_HEIGHT: f32 = 560.0;
@@ -125,6 +135,38 @@ struct ProfileModelEditorContext {
     wire_api_choices: Vec<vibex_core::ProviderModelWireApi>,
     shows_wire_api: bool,
     pending: bool,
+}
+
+/// One row of the Model picker.
+///
+/// A row is the union of what the endpoint advertised and what the draft
+/// already configures, so a Model can be recognised by the endpoint, chosen by
+/// the user, or both. `configured_index` is what makes the checkbox state and
+/// the removal path read from the same list the editor writes.
+#[derive(Debug, Clone)]
+struct ProfileCandidateRow {
+    id: String,
+    display_name: Option<String>,
+    wire_api: Option<vibex_core::ProviderModelWireApi>,
+    capabilities: vibex_core::ProviderModelCapabilities,
+    configured_index: Option<usize>,
+}
+
+impl ProfileCandidateRow {
+    fn is_configured(&self) -> bool {
+        self.configured_index.is_some()
+    }
+
+    /// The Model this row would contribute to the draft when it is chosen.
+    fn as_configured_model(&self) -> vibex_core::ProviderConfiguredModel {
+        vibex_core::ProviderConfiguredModel {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            enabled: true,
+            wire_api: self.wire_api,
+            capabilities: self.capabilities.clone(),
+        }
+    }
 }
 
 /// Disclosures the Provider editor owns, named so the toggle can find them.
@@ -801,6 +843,14 @@ pub struct ManagementCenter {
     /// instead of riding the notification layer over the dialog.
     profile_submit_error: Option<String>,
     profile_configured_models: Vec<vibex_core::ProviderConfiguredModel>,
+    /// The Model catalogue the endpoint advertised on the last fetch. It is
+    /// discovery data rather than a draft: the picker shows it so the user can
+    /// choose, and only a chosen row becomes a configured Model.
+    profile_available_models: Vec<vibex_core::ProviderConfiguredModel>,
+    /// Configurations released by unchecking a row, keyed by Model id. Keeping
+    /// them lets a re-checked row restore its declared capabilities instead of
+    /// starting from nothing.
+    profile_detached_models: Vec<vibex_core::ProviderConfiguredModel>,
     profile_model_edit_index: Option<usize>,
     profile_model_edit_wire_api: Option<vibex_core::ProviderModelWireApi>,
     /// The Model's declared thinking-depth opt-out: `true` writes
@@ -834,6 +884,7 @@ pub struct ManagementCenter {
     profile_protocol_base_urls: Vec<(vibex_core::ProviderModelWireApi, Entity<InputState>)>,
     profile_model_draft: Entity<InputState>,
     profile_model_search: Entity<InputState>,
+    profile_chosen_search: Entity<InputState>,
     profile_model_edit_id: Entity<InputState>,
     profile_model_edit_name: Entity<InputState>,
     profile_model_edit_efforts: Entity<InputState>,
@@ -993,6 +1044,13 @@ impl ManagementCenter {
                 "Search models",
                 "搜索模型",
                 "搜尋模型",
+            ))
+        });
+        let profile_chosen_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(management_locale_text(
+                "Search chosen models",
+                "搜索已选模型",
+                "搜尋已選模型",
             ))
         });
         let profile_model_edit_id = cx.new(|cx| {
@@ -1214,6 +1272,12 @@ impl ManagementCenter {
                 },
             ),
             cx.subscribe(&profile_model_search, |_, _, event: &InputEvent, cx| {
+                if !management_input_changed(event) {
+                    return;
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&profile_chosen_search, |_, _, event: &InputEvent, cx| {
                 if !management_input_changed(event) {
                     return;
                 }
@@ -1517,6 +1581,8 @@ impl ManagementCenter {
             profile_name_error: None,
             profile_submit_error: None,
             profile_configured_models: Vec::new(),
+            profile_available_models: Vec::new(),
+            profile_detached_models: Vec::new(),
             profile_model_edit_index: None,
             profile_model_edit_wire_api: None,
             profile_model_edit_reasoning_disabled: false,
@@ -1542,6 +1608,7 @@ impl ManagementCenter {
             profile_protocol_base_urls: Vec::new(),
             profile_model_draft,
             profile_model_search,
+            profile_chosen_search,
             profile_model_edit_id,
             profile_model_edit_name,
             profile_model_edit_efforts,
@@ -1654,6 +1721,10 @@ impl ManagementCenter {
             (
                 &self.profile_model_search,
                 ("Search models", "搜索模型", "搜尋模型"),
+            ),
+            (
+                &self.profile_chosen_search,
+                ("Search chosen models", "搜索已选模型", "搜尋已選模型"),
             ),
             (
                 &self.profile_model_edit_id,
@@ -4136,6 +4207,10 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_draft
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_model_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_chosen_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_id
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_name
@@ -4159,6 +4234,8 @@ impl ManagementCenter {
         self.profile_submit_error = None;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_configured_models.clear();
+        self.profile_available_models.clear();
+        self.profile_detached_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
@@ -4217,6 +4294,8 @@ impl ManagementCenter {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_search
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_chosen_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_id
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_model_edit_name
@@ -4236,6 +4315,11 @@ impl ManagementCenter {
             .as_ref()
             .map(|profile| profile.configured_models.clone())
             .unwrap_or_default();
+        // The catalogue is not persisted with the profile, so a reopened editor
+        // starts with only the configured Models as known rows until the user
+        // asks the endpoint again.
+        self.profile_available_models.clear();
+        self.profile_detached_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_reasoning_disabled = false;
@@ -4276,6 +4360,10 @@ impl ManagementCenter {
             state.set_placeholder(PROVIDER_API_KEY_PLACEHOLDER, window, cx);
             state.set_value("", window, cx);
         });
+        self.profile_model_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.profile_chosen_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.profile_editor_open = false;
         self.editing_profile_id = None;
         self.projection_editor.draft_revision = 0;
@@ -4284,6 +4372,8 @@ impl ManagementCenter {
         self.profile_name_error = None;
         self.projection_editor.set_secret_intent(false, false);
         self.profile_configured_models.clear();
+        self.profile_available_models.clear();
+        self.profile_detached_models.clear();
         self.profile_model_edit_index = None;
         self.profile_model_edit_wire_api = None;
         self.profile_model_edit_error = None;
@@ -4339,8 +4429,10 @@ impl ManagementCenter {
         let dialog_center = center.clone();
         let confirm_center = center.clone();
         let dialog_content = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 544.0);
-        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
+        // Wide enough for the Model picker and its settings side by side, and
+        // tall enough that the two panes, not the whole form, are what scrolls.
+        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 1040.0);
+        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(360.0, 760.0);
         let title = if self.editing_profile_id.is_some() {
             management_locale_text("Edit model provider", "编辑模型供应商", "編輯模型供應商")
         } else {
@@ -4376,20 +4468,153 @@ impl ManagementCenter {
         if model_id.is_empty() {
             return;
         }
-        merge_provider_models(
-            &mut self.profile_configured_models,
-            vec![vibex_core::ProviderConfiguredModel {
-                id: model_id,
-                display_name: None,
-                enabled: true,
-                wire_api: None,
-                capabilities: Default::default(),
-            }],
-        );
+        self.choose_profile_model(model_id, None);
         self.profile_model_draft
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.navigation.mark_dirty(ManagementSection::Agents, true);
         cx.notify();
+    }
+
+    /// Moves one Model id into the draft, restoring a released configuration
+    /// when the id was unchecked earlier.
+    ///
+    /// Returns whether the draft changed, so a bulk caller can decide if it
+    /// needs to mark the section dirty.
+    fn choose_profile_model(
+        &mut self,
+        model_id: String,
+        catalogue_entry: Option<vibex_core::ProviderConfiguredModel>,
+    ) -> bool {
+        if self
+            .profile_configured_models
+            .iter()
+            .any(|model| model.id == model_id)
+        {
+            return false;
+        }
+        let restored = self
+            .profile_detached_models
+            .iter()
+            .position(|model| model.id == model_id)
+            .map(|index| self.profile_detached_models.remove(index));
+        let model =
+            restored
+                .or(catalogue_entry)
+                .unwrap_or_else(|| vibex_core::ProviderConfiguredModel {
+                    id: model_id,
+                    display_name: None,
+                    enabled: true,
+                    wire_api: None,
+                    capabilities: Default::default(),
+                });
+        self.profile_configured_models.push(model);
+        true
+    }
+
+    /// Releases a configured Model at `index` while keeping its declaration
+    /// available for a later re-check.
+    fn detach_profile_model_at(&mut self, index: usize) -> bool {
+        if index >= self.profile_configured_models.len() {
+            return false;
+        }
+        let model = self.profile_configured_models.remove(index);
+        if !self
+            .profile_detached_models
+            .iter()
+            .any(|detached| detached.id == model.id)
+        {
+            self.profile_detached_models.push(model);
+        }
+        self.profile_model_edit_index = match self.profile_model_edit_index {
+            Some(edit_index) if edit_index == index => {
+                self.profile_model_edit_wire_api = None;
+                self.profile_model_edit_reasoning_disabled = false;
+                None
+            }
+            Some(edit_index) if edit_index > index => Some(edit_index - 1),
+            current => current,
+        };
+        true
+    }
+
+    /// Checks or unchecks one picker row against the draft.
+    fn select_profile_candidate(
+        &mut self,
+        row: &ProfileCandidateRow,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if selected {
+            self.choose_profile_model(row.id.clone(), Some(row.as_configured_model()))
+        } else {
+            match self
+                .profile_configured_models
+                .iter()
+                .position(|model| model.id == row.id)
+            {
+                Some(index) => self.detach_profile_model_at(index),
+                None => false,
+            }
+        };
+        if changed {
+            self.navigation.mark_dirty(ManagementSection::Agents, true);
+        }
+        cx.notify();
+    }
+
+    /// The picker's rows: what the endpoint advertised, plus every configured
+    /// Model the last answer did not mention, so nothing already saved can
+    /// silently disappear from the list.
+    fn profile_candidate_rows(&self) -> Vec<ProfileCandidateRow> {
+        let mut rows: Vec<ProfileCandidateRow> = Vec::new();
+        for model in &self.profile_available_models {
+            match rows.iter_mut().find(|row| row.id == model.id) {
+                Some(row) => {
+                    if row.display_name.is_none() {
+                        row.display_name = model.display_name.clone();
+                    }
+                    if row.wire_api.is_none() {
+                        row.wire_api = model.wire_api;
+                    }
+                    if row.capabilities.is_empty() {
+                        row.capabilities = model.capabilities.clone();
+                    }
+                }
+                None => rows.push(ProfileCandidateRow {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    wire_api: model.wire_api,
+                    capabilities: model.capabilities.clone(),
+                    configured_index: None,
+                }),
+            }
+        }
+        for (index, model) in self.profile_configured_models.iter().enumerate() {
+            match rows.iter_mut().find(|row| row.id == model.id) {
+                Some(row) => {
+                    row.configured_index = Some(index);
+                    // A declared capability is user data, so it outranks the
+                    // catalogue's own answer for the same Model.
+                    if !model.capabilities.is_empty() {
+                        row.capabilities = model.capabilities.clone();
+                    }
+                    if row.display_name.is_none() {
+                        row.display_name = model.display_name.clone();
+                    }
+                    if row.wire_api.is_none() {
+                        row.wire_api = model.wire_api;
+                    }
+                }
+                None => rows.push(ProfileCandidateRow {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    wire_api: model.wire_api,
+                    capabilities: model.capabilities.clone(),
+                    configured_index: Some(index),
+                }),
+            }
+        }
+        rows
     }
 
     fn toggle_profile_model(&mut self, index: usize, enabled: bool, cx: &mut Context<Self>) {
@@ -4401,17 +4626,7 @@ impl ManagementCenter {
     }
 
     fn remove_profile_model(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.profile_configured_models.len() {
-            self.profile_configured_models.remove(index);
-            self.profile_model_edit_index = match self.profile_model_edit_index {
-                Some(edit_index) if edit_index == index => {
-                    self.profile_model_edit_wire_api = None;
-                    self.profile_model_edit_reasoning_disabled = false;
-                    None
-                }
-                Some(edit_index) if edit_index > index => Some(edit_index - 1),
-                current => current,
-            };
+        if self.detach_profile_model_at(index) {
             self.navigation.mark_dirty(ManagementSection::Agents, true);
             cx.notify();
         }
@@ -5170,26 +5385,24 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(result)) => {
                         let count = result.models.len();
+                        // Discovery fills the picker's catalogue; it never
+                        // writes the draft. Which of these Models this Provider
+                        // offers is the user's answer, so a fetch must not
+                        // silently configure anything.
                         if agent_owns_catalog {
-                            // An authoritative catalogue replaces the draft:
-                            // ids the bridge no longer advertises cannot be
+                            // An authoritative catalogue replaces the previous
+                            // one: ids the bridge no longer advertises cannot be
                             // selected, so keeping them would offer dead rows.
-                            // A Model that survives the refresh keeps its
-                            // declared capabilities, which the catalogue does
-                            // not carry.
                             replace_provider_models_keeping_capabilities(
-                                &mut this.profile_configured_models,
+                                &mut this.profile_available_models,
                                 result.models,
                             );
                         } else {
                             merge_provider_models(
-                                &mut this.profile_configured_models,
+                                &mut this.profile_available_models,
                                 result.models,
                             );
                         }
-                        this.profile_model_edit_index = None;
-                        this.profile_model_edit_wire_api = None;
-                        this.profile_model_edit_reasoning_disabled = false;
                         this.navigation.mark_dirty(ManagementSection::Agents, true);
                         this.notice = Some(match active_locale {
                             ResolvedLocale::En => format!("Fetched {count} model(s)"),
@@ -9815,32 +10028,22 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_profile_model_section(
+    /// The picker's left pane: every Model the endpoint advertised, plus the
+    /// ones the draft already configures, each with a checkbox.
+    ///
+    /// Choosing a Model and configuring it are one task, so the catalogue and
+    /// the chosen settings sit side by side instead of stacking into one long
+    /// form where the catalogue is only ever implied.
+    fn render_profile_candidates_pane(
         &mut self,
-        selected_agent_id: String,
+        bounded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let selected_agent_id = self.selected_agent_id.clone().unwrap_or_default();
         let pending =
             self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
-        // Agents that own their Model catalogue accept only the ids they
-        // advertise, so their Model field is a closed choice list rather than a
-        // free-text id.
-        let agent_owns_catalog = AgentId::parse(selected_agent_id.clone())
-            .is_ok_and(|agent_id| vibex_core::agent_owns_model_catalog(&agent_id));
-        let catalog_choices = if agent_owns_catalog {
-            self.profile_configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .map(|model| (model.id.clone(), model.wire_api))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let wire_api_choices = self.projection_editor.wire_api_choices();
-        let shows_wire_api = self
-            .projection_editor
-            .shows(vibex_core::AgentProjectionFormControl::WireProtocol);
         let editing_profile_id = self.editing_profile_id.clone();
+        let fetchable = editing_profile_id.is_some();
         let fetching_models = editing_profile_id.as_ref().is_some_and(|profile_id| {
             matches!(
                 &self.mutation,
@@ -9854,215 +10057,91 @@ impl ManagementCenter {
             .value()
             .trim()
             .to_string();
-        let visible_models = self
-            .profile_configured_models
-            .iter()
-            .enumerate()
-            .filter(|(_, model)| profile_model_matches(model, &filter))
-            .map(|(index, model)| (index, model.clone()))
+        let rows = self.profile_candidate_rows();
+        let total = rows.len();
+        let visible = rows
+            .into_iter()
+            .filter(|row| profile_candidate_matches(row, &filter))
             .collect::<Vec<_>>();
-        let total = self.profile_configured_models.len();
-        let visible = visible_models.len();
-        // Everything the open Model editor needs from the projection, gathered
-        // once instead of threaded through every row.
-        let editor_context = ProfileModelEditorContext {
-            agent_owns_catalog,
-            catalog_choices,
-            wire_api_choices,
-            shows_wire_api,
-            pending,
-        };
+        let selected_visible = visible.iter().filter(|row| row.is_configured()).count();
+        let all_selected = !visible.is_empty() && selected_visible == visible.len();
 
-        let mut rows = v_flex().w_full().gap_1p5();
-        for (index, model) in visible_models {
-            let enabled = model.enabled;
-            let expanded = self.profile_model_edit_index == Some(index);
-            // The declaration is per Model, so the row states it: otherwise the
-            // only way to tell two Models' depths apart is to open each editor.
-            let depth = match (
-                model.capabilities.reasoning,
-                model.capabilities.reasoning_efforts.as_ref(),
-            ) {
-                (Some(false), _) => {
-                    Some(management_locale_text("Non-reasoning", "不推理", "不推理").to_string())
-                }
-                (_, Some(efforts)) if !efforts.is_empty() => Some(efforts.to_string()),
-                _ => None,
-            };
-            // A declared limit is per Model, so the row states the exact number
-            // the user declared; the token ring reports whatever the Agent
-            // later reports from it.
-            let context_limit =
-                model
-                    .capabilities
-                    .context_tokens
-                    .map(|tokens| match locale::current_locale() {
-                        ResolvedLocale::En => format!("{tokens} context"),
-                        ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {tokens}"),
-                    });
-            let meta = {
-                let protocol = match model.wire_api {
-                    Some(wire_api) => provider_wire_api_label(wire_api).to_string(),
-                    None => management_locale_text(
-                        "Inherit provider default",
-                        "继承供应商默认值",
-                        "繼承供應商預設值",
-                    )
-                    .to_string(),
-                };
-                let mut parts = vec![model.id.clone(), protocol];
-                if let Some(context_limit) = &context_limit {
-                    parts.push(context_limit.clone());
-                }
-                if let Some(depth) = &depth {
-                    parts.push(depth.clone());
-                }
-                parts.join(" · ")
-            };
-            // One row treatment for both states: the switch says whether the
-            // Model is offered, and a disabled row only lowers its own contrast
-            // instead of swapping background for border.
-            rows = rows.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .px_2p5()
-                    .py_1p5()
-                    .when(expanded, |row| row.bg(cx.theme().primary.opacity(0.08)))
-                    .when(!expanded, |row| row.bg(cx.theme().muted.opacity(0.18)))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .when(!enabled, |title| {
-                                        title.text_color(cx.theme().muted_foreground)
-                                    })
-                                    .child(model.display_name.unwrap_or_else(|| model.id.clone())),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(meta),
-                            ),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("provider-model-edit-{index}")))
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .icon(IconName::Settings2)
-                            .label(management_locale_text("Edit", "编辑", "編輯"))
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_profile_model_editor(index, window, cx)
-                            })),
-                    )
-                    .child(
-                        Switch::new(SharedString::from(format!(
-                            "provider-model-enabled-{index}"
-                        )))
-                        .small()
-                        .checked(enabled)
-                        .disabled(pending)
-                        .tooltip(management_enabled_label(enabled))
-                        .on_click(cx.listener(
-                            move |this, checked, _, cx| {
-                                this.toggle_profile_model(index, *checked, cx)
-                            },
-                        )),
-                    ),
+        let mut header = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Available models",
+                        "可选模型",
+                        "可選模型",
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(1.0))
+                    .rounded_full()
+                    .bg(cx.theme().border.opacity(0.60)),
             );
-            // The editor opens under the row it belongs to, so the fields a
-            // click just revealed are the ones next to the pointer.
-            if expanded {
-                rows = rows.child(self.render_profile_model_editor(index, &editor_context, cx));
-            }
-        }
-
-        let mut content = v_flex().w_full().gap_2p5();
-        // Search and bulk switches only earn their space once the list is long
-        // enough to need them.
-        if total > 3 {
-            content = content.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .child(management_search_input(&self.profile_model_search, cx)),
-                    )
-                    .child(
-                        Button::new("provider-models-enable-all")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_visible_profile_models_enabled(true, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("provider-models-disable-all")
-                            .xsmall()
-                            .ghost()
-                            .compact()
-                            .label(management_locale_text(
-                                "Disable all",
-                                "全部停用",
-                                "全部停用",
-                            ))
-                            .disabled(pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_visible_profile_models_enabled(false, cx)
-                            })),
-                    ),
+        if let Some(profile_id) = editing_profile_id {
+            let agent_id = selected_agent_id.clone();
+            header = header.child(
+                Button::new("provider-candidates-fetch")
+                    .xsmall()
+                    .outline()
+                    .icon(IconName::Search)
+                    .label(if fetching_models {
+                        management_locale_text("Fetching...", "获取中...", "取得中...")
+                    } else {
+                        management_fetch_models_label()
+                    })
+                    .loading(fetching_models)
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
+                    })),
             );
         }
-        content = content.child(
-            h_flex()
-                .w_full()
-                .items_end()
-                .gap_2()
-                .child(div().min_w_0().flex_1().child(management_input_field(
-                    management_locale_text("Model ID", "模型 ID", "模型 ID"),
-                    &self.profile_model_draft,
-                    false,
-                    cx,
-                )))
+
+        let mut controls = h_flex().w_full().min_w_0().items_center().gap_2().child(
+            Checkbox::new("provider-candidates-select-all")
+                .small()
+                .checked(all_selected)
+                .accessibility_label(management_locale_text("Select all", "全选", "全選"))
+                .disabled(pending || visible.is_empty())
                 .child(
-                    Button::new("provider-model-add")
-                        .small()
-                        .secondary()
-                        .icon(IconName::Plus)
-                        .label(management_add_label())
-                        .disabled(pending)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.add_profile_model(window, cx)),
-                        ),
-                ),
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_locale_text("Select all", "全选", "全選")),
+                )
+                .on_click(cx.listener(move |this, checked, _, cx| {
+                    this.set_visible_profile_candidates_selected(*checked, cx);
+                })),
         );
+        if total > 3 {
+            controls = controls.child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(management_search_input(&self.profile_model_search, cx)),
+            );
+        }
+
+        let mut body = v_flex().w_full().gap_1();
         if total == 0 {
             // The command that fetches models only exists once the Provider is
             // saved, so the empty state promises exactly what is available.
-            let description = if editing_profile_id.is_some() {
+            let description = if fetchable {
                 management_locale_text(
-                    "Fetch models, or add a model ID directly.",
+                    "Fetch the endpoint's list, or add a model ID directly.",
                     "可以拉取模型，也可以直接添加模型 ID。",
                     "可以擷取模型，也可以直接新增模型 ID。",
                 )
@@ -10073,13 +10152,13 @@ impl ManagementCenter {
                     "儲存後可以擷取模型，也可以直接新增模型 ID。",
                 )
             };
-            content = content.child(compact_empty_state(
-                management_locale_text("No configured models", "暂无已配置模型", "暫無已配置模型"),
+            body = body.child(compact_empty_state(
+                management_locale_text("No models fetched", "尚未获取模型", "尚未取得模型"),
                 description,
                 cx,
             ));
-        } else if visible == 0 {
-            content = content.child(
+        } else if visible.is_empty() {
+            body = body.child(
                 v_flex()
                     .w_full()
                     .items_center()
@@ -10099,7 +10178,7 @@ impl ManagementCenter {
                             )),
                     )
                     .child(
-                        Button::new("provider-models-clear-search")
+                        Button::new("provider-candidates-clear-search")
                             .xsmall()
                             .ghost()
                             .compact()
@@ -10116,50 +10195,459 @@ impl ManagementCenter {
                     ),
             );
         } else {
-            content = content.child(rows);
+            for row in &visible {
+                body = body.child(self.render_profile_candidate_row(row, pending, cx));
+            }
         }
 
-        let mut trailing = vec![management_status_badge(
-            if total == 0 {
-                management_locale_text("No models", "没有模型", "沒有模型").to_string()
-            } else {
-                management_model_count(total)
-            },
-            cx,
-        )];
-        if let Some(profile_id) = editing_profile_id {
-            let agent_id = selected_agent_id.clone();
-            trailing.push(
-                Button::new("provider-editor-fetch-models")
-                    .xsmall()
-                    .outline()
-                    .icon(IconName::Search)
-                    .label(if fetching_models {
-                        management_locale_text("Fetching...", "获取中...", "取得中...")
-                    } else {
-                        management_fetch_models_label()
-                    })
-                    .loading(fetching_models)
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.fetch_provider_models(profile_id.clone(), agent_id.clone(), cx)
-                    }))
-                    .into_any_element(),
-            );
+        let list = if bounded {
+            body.min_h_0().flex_1().overflow_y_scrollbar().pr_1()
+        } else {
+            body.max_h(px(MANAGEMENT_PROFILE_PANE_MAX_HEIGHT))
+                .overflow_y_scrollbar()
+                .pr_1()
+        };
+
+        let mut pane = v_flex()
+            .min_w_0()
+            .debug_selector(|| "provider-candidates-pane".to_string())
+            .gap_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().muted.opacity(0.22))
+            .p_2p5()
+            .child(header)
+            .child(controls)
+            .child(list);
+        if bounded {
+            // Side by side the two panes split the width; stacked, each one
+            // owns a full row.
+            pane = pane.flex_1().min_h_0();
+        } else {
+            pane = pane.w_full();
         }
-        profile_editor_section(
-            management_locale_text("Models", "模型", "模型"),
-            Some(
-                h_flex()
+        pane.into_any_element()
+    }
+
+    /// One picker row. The checkbox is the row, so the whole row is the hit
+    /// target and the state it toggles is the draft's own membership.
+    fn render_profile_candidate_row(
+        &self,
+        row: &ProfileCandidateRow,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let configured = row.is_configured();
+        // The id leads the second line only when the first one shows a friendly
+        // name; otherwise the id is already the row's identity.
+        let mut meta = Vec::new();
+        if row.display_name.is_some() {
+            meta.push(row.id.clone());
+        }
+        if let Some(wire_api) = row.wire_api {
+            meta.push(provider_wire_api_label(wire_api).to_string());
+        }
+        if let Some(limits) = profile_model_limits_label(&row.capabilities) {
+            meta.push(limits);
+        }
+        let meta = meta.join(" · ");
+        let title = row.display_name.clone().unwrap_or_else(|| row.id.clone());
+        let selected_row = row.clone();
+        let debug_id = row.id.clone();
+        Checkbox::new(SharedString::from(format!("provider-candidate-{}", row.id)))
+            .small()
+            .checked(configured)
+            .accessibility_label(SharedString::from(title.clone()))
+            .debug_selector(move || format!("provider-candidate-row-{debug_id}"))
+            .disabled(pending)
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .rounded(px(6.0))
+            .px_2p5()
+            .py_1p5()
+            .when(configured, |row| row.bg(cx.theme().primary.opacity(0.08)))
+            .when(!configured, |row| row.bg(cx.theme().muted.opacity(0.18)))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .w_full()
+                    .gap_0p5()
+                    .child(div().truncate().text_sm().font_medium().child(title))
+                    .when(!meta.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(meta),
+                        )
+                    }),
+            )
+            .on_click(cx.listener(move |this, checked, _, cx| {
+                this.select_profile_candidate(&selected_row, *checked, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The picker's right pane: the Models this Provider offers, with the
+    /// per-Model settings the editor already carried.
+    fn render_profile_chosen_pane(&mut self, bounded: bool, cx: &mut Context<Self>) -> AnyElement {
+        let selected_agent_id = self.selected_agent_id.clone().unwrap_or_default();
+        let pending =
+            self.mutation.is_some() || self.agent_mutations.contains_key(&selected_agent_id);
+        let agent_owns_catalog = AgentId::parse(selected_agent_id)
+            .is_ok_and(|agent_id| vibex_core::agent_owns_model_catalog(&agent_id));
+        // An Agent that owns its catalogue accepts only the ids it advertises,
+        // so its Model field is a closed choice list rather than a free-text
+        // id. The picker's rows are that list, because a fetch fills them.
+        let catalog_choices = if agent_owns_catalog {
+            // The whole advertised catalogue, not only the chosen rows: the
+            // editor's id field is a closed list, and a fetch is what fills it.
+            self.profile_candidate_rows()
+                .into_iter()
+                .map(|row| (row.id, row.wire_api))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let editor_context = ProfileModelEditorContext {
+            agent_owns_catalog,
+            catalog_choices,
+            wire_api_choices: self.projection_editor.wire_api_choices(),
+            shows_wire_api: self
+                .projection_editor
+                .shows(vibex_core::AgentProjectionFormControl::WireProtocol),
+            pending,
+        };
+        let total = self.profile_configured_models.len();
+        let filter = self
+            .profile_chosen_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let visible_models = self
+            .profile_configured_models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| profile_model_matches(model, &filter))
+            .map(|(index, model)| (index, model.clone()))
+            .collect::<Vec<_>>();
+        let visible = visible_models.len();
+
+        let mut header = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
                     .flex_none()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(management_locale_text(
+                        "Model settings",
+                        "模型设置",
+                        "模型設定",
+                    )),
+            )
+            .child(management_status_badge(
+                if total == 0 {
+                    management_locale_text("No models", "没有模型", "沒有模型").to_string()
+                } else {
+                    management_model_count(total)
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(1.0))
+                    .rounded_full()
+                    .bg(cx.theme().border.opacity(0.60)),
+            );
+        if total > 3 {
+            header = header
+                .child(
+                    Button::new("provider-models-enable-all")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_visible_profile_models_enabled(true, cx)
+                        })),
+                )
+                .child(
+                    Button::new("provider-models-disable-all")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .label(management_locale_text(
+                            "Disable all",
+                            "全部停用",
+                            "全部停用",
+                        ))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_visible_profile_models_enabled(false, cx)
+                        })),
+                );
+        }
+
+        let mut body = v_flex().w_full().gap_1p5();
+        if total == 0 {
+            body = body.child(compact_empty_state(
+                management_locale_text("No models chosen", "尚未选择模型", "尚未選擇模型"),
+                management_locale_text(
+                    "Check models on the left, or add a model ID directly.",
+                    "在左侧勾选模型，也可以直接添加模型 ID。",
+                    "在左側勾選模型，也可以直接新增模型 ID。",
+                ),
+                cx,
+            ));
+        } else if visible == 0 {
+            body = body.child(
+                v_flex()
+                    .w_full()
                     .items_center()
                     .gap_2()
-                    .children(trailing)
-                    .into_any_element(),
-            ),
-            content.into_any_element(),
-            cx,
-        )
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.70))
+                    .p_4()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_locale_text(
+                                "No chosen model matches this search.",
+                                "没有匹配该搜索的已选模型。",
+                                "沒有符合這個搜尋的已選模型。",
+                            )),
+                    )
+                    .child(
+                        Button::new("provider-chosen-clear-search")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .label(management_locale_text(
+                                "Clear search",
+                                "清除搜索",
+                                "清除搜尋",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.profile_chosen_search
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    ),
+            );
+        } else {
+            for (index, model) in visible_models {
+                body = body.child(self.render_profile_model_row(index, &model, pending, cx));
+                // The editor opens under the row it belongs to, so the fields a
+                // click just revealed are the ones next to the pointer.
+                if self.profile_model_edit_index == Some(index) {
+                    body = body.child(self.render_profile_model_editor(index, &editor_context, cx));
+                }
+            }
+        }
+
+        // A hand-typed Model is a choice the catalogue did not offer, so it
+        // joins the chosen list rather than the catalogue above it.
+        let add_row = h_flex()
+            .w_full()
+            .items_end()
+            .gap_2()
+            .child(div().min_w_0().flex_1().child(management_input_field(
+                management_locale_text("Custom model", "自定义模型", "自訂模型"),
+                &self.profile_model_draft,
+                false,
+                cx,
+            )))
+            .child(
+                Button::new("provider-model-add")
+                    .small()
+                    .secondary()
+                    .icon(IconName::Plus)
+                    .label(management_add_label())
+                    .disabled(pending)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.add_profile_model(window, cx)),
+                    ),
+            );
+
+        let list = if bounded {
+            body.min_h_0().flex_1().overflow_y_scrollbar().pr_1()
+        } else {
+            body.max_h(px(MANAGEMENT_PROFILE_PANE_MAX_HEIGHT))
+                .overflow_y_scrollbar()
+                .pr_1()
+        };
+
+        let mut pane = v_flex()
+            .min_w_0()
+            .debug_selector(|| "provider-chosen-pane".to_string())
+            .gap_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().muted.opacity(0.22))
+            .p_2p5()
+            .child(header)
+            .when(total > 3, |pane| {
+                pane.child(
+                    div()
+                        .min_w_0()
+                        .w_full()
+                        .child(management_search_input(&self.profile_chosen_search, cx)),
+                )
+            })
+            .child(list)
+            .child(add_row);
+        if bounded {
+            pane = pane.flex_1().min_h_0();
+        } else {
+            pane = pane.w_full();
+        }
+        pane.into_any_element()
+    }
+
+    /// One chosen Model: what it is, and the controls that act on it.
+    fn render_profile_model_row(
+        &self,
+        index: usize,
+        model: &vibex_core::ProviderConfiguredModel,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let enabled = model.enabled;
+        let expanded = self.profile_model_edit_index == Some(index);
+        // The declaration is per Model, so the row states it: otherwise the
+        // only way to tell two Models' depths apart is to open each editor.
+        let depth = match (
+            model.capabilities.reasoning,
+            model.capabilities.reasoning_efforts.as_ref(),
+        ) {
+            (Some(false), _) => {
+                Some(management_locale_text("Non-reasoning", "不推理", "不推理").to_string())
+            }
+            (_, Some(efforts)) if !efforts.is_empty() => Some(efforts.to_string()),
+            _ => None,
+        };
+        // A declared limit is per Model, so the row states the exact number the
+        // user declared; the token ring reports whatever the Agent later
+        // reports from it.
+        let context_limit =
+            model
+                .capabilities
+                .context_tokens
+                .map(|tokens| match locale::current_locale() {
+                    ResolvedLocale::En => format!("{tokens} context"),
+                    ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {tokens}"),
+                });
+        let output_limit =
+            model
+                .capabilities
+                .output_tokens
+                .map(|tokens| match locale::current_locale() {
+                    ResolvedLocale::En => format!("{tokens} output"),
+                    ResolvedLocale::ZhCn => format!("输出 {tokens}"),
+                    ResolvedLocale::ZhTw => format!("輸出 {tokens}"),
+                });
+        let meta = {
+            let protocol = match model.wire_api {
+                Some(wire_api) => provider_wire_api_label(wire_api).to_string(),
+                None => management_locale_text(
+                    "Inherit provider default",
+                    "继承供应商默认值",
+                    "繼承供應商預設值",
+                )
+                .to_string(),
+            };
+            let mut parts = vec![model.id.clone(), protocol];
+            if let Some(context_limit) = &context_limit {
+                parts.push(context_limit.clone());
+            }
+            if let Some(output_limit) = &output_limit {
+                parts.push(output_limit.clone());
+            }
+            if let Some(depth) = &depth {
+                parts.push(depth.clone());
+            }
+            parts.join(" · ")
+        };
+        // One row treatment for both states: the switch says whether the Model
+        // is offered, and a disabled row only lowers its own contrast instead
+        // of swapping background for border.
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .rounded(px(6.0))
+            .px_2p5()
+            .py_1p5()
+            .when(expanded, |row| row.bg(cx.theme().primary.opacity(0.08)))
+            .when(!expanded, |row| row.bg(cx.theme().muted.opacity(0.18)))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .when(!enabled, |title| {
+                                title.text_color(cx.theme().muted_foreground)
+                            })
+                            .child(
+                                model
+                                    .display_name
+                                    .clone()
+                                    .unwrap_or_else(|| model.id.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(meta),
+                    ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("provider-model-edit-{index}")))
+                    .xsmall()
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Settings2)
+                    .label(management_locale_text("Edit", "编辑", "編輯"))
+                    .disabled(pending)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_profile_model_editor(index, window, cx)
+                    })),
+            )
+            .child(
+                Switch::new(SharedString::from(format!(
+                    "provider-model-enabled-{index}"
+                )))
+                .small()
+                .checked(enabled)
+                .disabled(pending)
+                .tooltip(management_enabled_label(enabled))
+                .on_click(cx.listener(move |this, checked, _, cx| {
+                    this.toggle_profile_model(index, *checked, cx)
+                })),
+            )
+            .into_any_element()
     }
 
     /// The editor for one Model, rendered under its own row.
@@ -10572,9 +11060,47 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn set_visible_profile_models_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    /// Checks or unchecks every picker row the current search shows.
+    ///
+    /// "All" means the rows on screen: a filtered select-all leaves hidden
+    /// matches alone, and a filtered clear does not release Models the filter
+    /// is hiding.
+    fn set_visible_profile_candidates_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
         let filter = self
             .profile_model_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let rows = self
+            .profile_candidate_rows()
+            .into_iter()
+            .filter(|row| profile_candidate_matches(row, &filter))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for row in rows {
+            changed |= if selected {
+                self.choose_profile_model(row.id.clone(), Some(row.as_configured_model()))
+            } else {
+                match self
+                    .profile_configured_models
+                    .iter()
+                    .position(|model| model.id == row.id)
+                {
+                    Some(index) => self.detach_profile_model_at(index),
+                    None => false,
+                }
+            };
+        }
+        if changed {
+            self.navigation.mark_dirty(ManagementSection::Agents, true);
+            cx.notify();
+        }
+    }
+
+    fn set_visible_profile_models_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let filter = self
+            .profile_chosen_search
             .read(cx)
             .value()
             .trim()
@@ -10799,7 +11325,11 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_profile_editor_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_profile_editor_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if !self.profile_editor_open {
             return div().size_full().into_any_element();
         }
@@ -10818,143 +11348,93 @@ impl ManagementCenter {
         // while, and closing only discards the draft.
         let cancel_disabled =
             pending && !matches!(self.mutation, Some(ManagementMutation::ProviderProbe(_)));
-        let shows_endpoint = self
-            .projection_editor
-            .shows(vibex_core::AgentProjectionFormControl::Endpoint);
         let shows_model = self
             .projection_editor
             .shows(vibex_core::AgentProjectionFormControl::Model);
-        // An Agent-owned endpoint cannot be projected from the profile, so the
-        // field is locked to the value the Agent actually calls and the
-        // per-protocol overrides disappear with it.
-        let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
-        let credential_control = self.render_projection_credential_control(cx);
-        let model_section =
-            shows_model.then(|| self.render_profile_model_section(selected_agent_id.clone(), cx));
-
-        // Identity: name, note, and website. Name gets the primary emphasis.
-        let identity_section = profile_editor_section(
-            management_locale_text("Basics", "基本信息", "基本資訊"),
-            None,
+        // Two panes need room for two readable columns; below that the picker
+        // and its settings stack instead of being squeezed side by side.
+        let wide = f32::from(window.viewport_size().width) >= MANAGEMENT_PROFILE_PANES_MIN_WIDTH;
+        // The identity and the connection are what make a catalogue reachable,
+        // so they stay one compact band above the picker rather than competing
+        // with it for the dialog's height.
+        let form_band = if wide {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_4()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(self.render_profile_identity_section(cx)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(self.render_profile_connection_section(cx)),
+                )
+                .into_any_element()
+        } else {
             v_flex()
                 .w_full()
-                .gap_2p5()
-                .child(management_input_field_with_error(
-                    management_locale_text("Provider name", "供应商名称", "供應商名稱"),
-                    &self.profile_name,
-                    false,
-                    self.profile_name_error.as_deref(),
-                    cx,
-                ))
-                .child(
+                .gap_3()
+                .child(self.render_profile_identity_section(cx))
+                .child(self.render_profile_connection_section(cx))
+                .into_any_element()
+        };
+
+        let mut body = v_flex().w_full().min_h_0().flex_1();
+        if wide {
+            // The band is bounded so an expanded protocol override cannot eat
+            // the height the two panes need; it scrolls on its own if it does.
+            body = body.child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .min_h_0()
+                    .max_h(px(MANAGEMENT_PROFILE_FORM_BAND_MAX_HEIGHT))
+                    .overflow_y_scrollbar()
+                    .pr_1()
+                    .child(form_band),
+            );
+            if shows_model {
+                // Choosing a Model and configuring it are one task, so the
+                // catalogue and the chosen settings share the remaining height
+                // and scroll independently.
+                body = body.child(
                     h_flex()
                         .w_full()
-                        .items_start()
-                        .gap_2p5()
-                        .child(div().flex_1().min_w_0().child(management_input_field(
-                            management_locale_text("Note", "备注", "備註"),
-                            &self.profile_note,
-                            false,
-                            cx,
-                        )))
-                        .child(div().flex_1().min_w_0().child(management_input_field(
-                            management_locale_text("Website URL", "官网链接", "官網連結"),
-                            &self.profile_website_url,
-                            false,
-                            cx,
-                        ))),
-                )
-                .into_any_element(),
-            cx,
-        );
-
-        // Connection: credential surface, base URL, and per-protocol overrides.
-        // The overrides stay collapsed because most Providers only ever set one
-        // address.
-        let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
-        if shows_endpoint {
-            let endpoint_label = management_locale_text(
-                "Default API request URL",
-                "默认 API 请求地址",
-                "預設 API 請求位址",
-            );
-            connection_content = connection_content.child(match &fixed_endpoint {
-                Some(endpoint) => management_locked_field(
-                    endpoint_label,
-                    endpoint.clone(),
-                    management_locale_text(
-                        "The Cline Agent cannot change its base URL yet: it always calls api.openai.com.",
-                        "Cline 这个 Agent 暂时无法修改 baseUrl",
-                        "Cline 這個 Agent 暫時無法修改 baseUrl",
-                    ),
-                    cx,
-                ),
-                None => {
-                    management_input_field(endpoint_label, &self.profile_base_url, false, cx)
-                }
-            });
-        }
-        if shows_endpoint && fixed_endpoint.is_none() && !self.profile_protocol_base_urls.is_empty()
-        {
-            let open = self.profile_protocol_advanced_open;
-            let overrides = self.pending_protocol_overrides();
-            let mut fields = v_flex().w_full().gap_2p5();
-            for (wire_api, input) in &self.profile_protocol_base_urls {
-                fields = fields.child(management_input_field(
-                    provider_protocol_url_override_label(*wire_api),
-                    input,
-                    false,
-                    cx,
-                ));
+                        .flex_1()
+                        .min_h_0()
+                        .items_stretch()
+                        .gap_3()
+                        .child(self.render_profile_candidates_pane(true, cx))
+                        .child(self.render_profile_chosen_pane(true, cx)),
+                );
             }
-            connection_content = connection_content.child(
-                Collapsible::new()
-                    .w_full()
-                    .open(open)
-                    .child(profile_editor_disclosure(
-                        PROFILE_PROTOCOL_DISCLOSURE_ID,
-                        management_locale_text(
-                            "Set an address per protocol",
-                            "按协议分别设置地址",
-                            "按協定分別設定位址",
-                        )
-                        .into(),
-                        open,
-                        (overrides > 0).then(|| {
-                            management_status_badge(protocol_override_count(overrides), cx)
-                        }),
-                        cx,
-                    ))
-                    .content(fields),
-            );
-        }
-        let connection_section = profile_editor_section(
-            management_locale_text("Connection & credentials", "连接与凭证", "連線與憑證"),
-            None,
-            connection_content.into_any_element(),
-            cx,
-        );
-
-        // The connection comes before the Models: an address and a credential
-        // are what make a catalogue reachable, so they are filled in first and
-        // the list of Models reads as their result.
-        let mut sections = vec![identity_section, connection_section];
-        if let Some(section) = model_section {
-            sections.push(section);
-        }
-        let form = v_flex().w_full().gap_3().children(sections);
-
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .child(
+        } else {
+            let mut stacked = v_flex().w_full().gap_3().child(form_band);
+            if shows_model {
+                stacked = stacked
+                    .child(self.render_profile_candidates_pane(false, cx))
+                    .child(self.render_profile_chosen_pane(false, cx));
+            }
+            body = body.child(
                 div()
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
                     .pr_1()
-                    .child(form),
-            )
+                    .child(stacked),
+            );
+        }
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(body)
             .children(
                 self.profile_submit_error
                     .clone()
@@ -11043,6 +11523,115 @@ impl ManagementCenter {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Identity: name, note, and website. Name gets the primary emphasis.
+    fn render_profile_identity_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        profile_editor_section(
+            management_locale_text("Basics", "基本信息", "基本資訊"),
+            None,
+            v_flex()
+                .w_full()
+                .gap_2p5()
+                .child(management_input_field_with_error(
+                    management_locale_text("Provider name", "供应商名称", "供應商名稱"),
+                    &self.profile_name,
+                    false,
+                    self.profile_name_error.as_deref(),
+                    cx,
+                ))
+                .child(management_input_field(
+                    management_locale_text("Note", "备注", "備註"),
+                    &self.profile_note,
+                    false,
+                    cx,
+                ))
+                .child(management_input_field(
+                    management_locale_text("Website URL", "官网链接", "官網連結"),
+                    &self.profile_website_url,
+                    false,
+                    cx,
+                ))
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// Connection: credential surface, base URL, and per-protocol overrides.
+    /// The overrides stay collapsed because most Providers only ever set one
+    /// address.
+    fn render_profile_connection_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let shows_endpoint = self
+            .projection_editor
+            .shows(vibex_core::AgentProjectionFormControl::Endpoint);
+        // An Agent-owned endpoint cannot be projected from the profile, so the
+        // field is locked to the value the Agent actually calls and the
+        // per-protocol overrides disappear with it.
+        let fixed_endpoint = self.projection_editor.fixed_endpoint().map(str::to_string);
+        let credential_control = self.render_projection_credential_control(cx);
+        let mut connection_content = v_flex().w_full().gap_2p5().child(credential_control);
+        if shows_endpoint {
+            let endpoint_label = management_locale_text(
+                "Default API request URL",
+                "默认 API 请求地址",
+                "預設 API 請求位址",
+            );
+            connection_content = connection_content.child(match &fixed_endpoint {
+                Some(endpoint) => management_locked_field(
+                    endpoint_label,
+                    endpoint.clone(),
+                    management_locale_text(
+                        "The Cline Agent cannot change its base URL yet: it always calls api.openai.com.",
+                        "Cline 这个 Agent 暂时无法修改 baseUrl",
+                        "Cline 這個 Agent 暫時無法修改 baseUrl",
+                    ),
+                    cx,
+                ),
+                None => {
+                    management_input_field(endpoint_label, &self.profile_base_url, false, cx)
+                }
+            });
+        }
+        if shows_endpoint && fixed_endpoint.is_none() && !self.profile_protocol_base_urls.is_empty()
+        {
+            let open = self.profile_protocol_advanced_open;
+            let overrides = self.pending_protocol_overrides();
+            let mut fields = v_flex().w_full().gap_2p5();
+            for (wire_api, input) in &self.profile_protocol_base_urls {
+                fields = fields.child(management_input_field(
+                    provider_protocol_url_override_label(*wire_api),
+                    input,
+                    false,
+                    cx,
+                ));
+            }
+            connection_content = connection_content.child(
+                Collapsible::new()
+                    .w_full()
+                    .open(open)
+                    .child(profile_editor_disclosure(
+                        PROFILE_PROTOCOL_DISCLOSURE_ID,
+                        management_locale_text(
+                            "Set an address per protocol",
+                            "按协议分别设置地址",
+                            "按協定分別設定位址",
+                        )
+                        .into(),
+                        open,
+                        (overrides > 0).then(|| {
+                            management_status_badge(protocol_override_count(overrides), cx)
+                        }),
+                        cx,
+                    ))
+                    .content(fields),
+            );
+        }
+        profile_editor_section(
+            management_locale_text("Connection & credentials", "连接与凭证", "連線與憑證"),
+            None,
+            connection_content.into_any_element(),
+            cx,
+        )
     }
 
     fn open_agent_auth_link(&mut self, url: String, cx: &mut Context<Self>) {
@@ -16847,8 +17436,9 @@ impl Render for ManagementProfileDialog {
             });
             return div().size_full().into_any_element();
         }
-        self.center
-            .update(cx, |center, cx| center.render_profile_editor_dialog(cx))
+        self.center.update(cx, |center, cx| {
+            center.render_profile_editor_dialog(window, cx)
+        })
     }
 }
 
@@ -17946,13 +18536,49 @@ fn protocol_override_count(count: usize) -> String {
 /// Both the id and the display name are searched, because the list shows both
 /// and a user may remember either one.
 fn profile_model_matches(model: &vibex_core::ProviderConfiguredModel, filter: &str) -> bool {
+    profile_identity_matches(&model.id, model.display_name.as_deref(), filter)
+}
+
+fn profile_candidate_matches(row: &ProfileCandidateRow, filter: &str) -> bool {
+    profile_identity_matches(&row.id, row.display_name.as_deref(), filter)
+}
+
+/// The one search rule both Model panes use: a case-insensitive substring over
+/// the id and the display name.
+fn profile_identity_matches(id: &str, display_name: Option<&str>, filter: &str) -> bool {
     let filter = filter.trim().to_lowercase();
     filter.is_empty()
-        || model.id.to_lowercase().contains(&filter)
-        || model
-            .display_name
-            .as_deref()
-            .is_some_and(|name| name.to_lowercase().contains(&filter))
+        || id.to_lowercase().contains(&filter)
+        || display_name.is_some_and(|name| name.to_lowercase().contains(&filter))
+}
+
+/// A Model's declared token limits in the picker's own words.
+///
+/// Limits live per Model, so the row states the exact numbers the user
+/// declared; a Model that declares none says nothing rather than "0".
+fn profile_model_limits_label(
+    capabilities: &vibex_core::ProviderModelCapabilities,
+) -> Option<String> {
+    match (capabilities.context_tokens, capabilities.output_tokens) {
+        (None, None) => None,
+        (context, output) => {
+            let mut parts = Vec::new();
+            if let Some(context) = context {
+                parts.push(match locale::current_locale() {
+                    ResolvedLocale::En => format!("{context} context"),
+                    ResolvedLocale::ZhCn | ResolvedLocale::ZhTw => format!("上下文 {context}"),
+                });
+            }
+            if let Some(output) = output {
+                parts.push(match locale::current_locale() {
+                    ResolvedLocale::En => format!("{output} output"),
+                    ResolvedLocale::ZhCn => format!("输出 {output}"),
+                    ResolvedLocale::ZhTw => format!("輸出 {output}"),
+                });
+            }
+            Some(parts.join(" · "))
+        }
+    }
 }
 
 fn normalized_provider_models(
@@ -20376,6 +21002,236 @@ mod tests {
             Some(vibex_core::ProviderModelWireApi::OpenaiResponses)
         );
         assert_eq!(models[1].id, "claude-sonnet");
+    }
+
+    fn test_provider_model(
+        id: &str,
+        display_name: Option<&str>,
+    ) -> vibex_core::ProviderConfiguredModel {
+        vibex_core::ProviderConfiguredModel {
+            id: id.into(),
+            display_name: display_name.map(str::to_string),
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }
+    }
+
+    /// A projection that exposes the credential, endpoint, and Model controls,
+    /// which is what makes the Provider editor render its whole form.
+    fn projection_capability_with_models() -> vibex_core::AgentProviderProjectionCapability {
+        use vibex_core::AgentProjectionFormControl as Control;
+        vibex_core::AgentProviderProjectionCapability {
+            schema_version: vibex_core::PROVIDER_PROJECTION_SCHEMA_VERSION,
+            agent_id: AgentId::parse("codex").unwrap(),
+            adapter_id: vibex_core::AcpAdapterId::parse("codex-acp").unwrap(),
+            descriptor_id: Some(
+                vibex_core::AgentProviderProjectionDescriptorId::parse(
+                    vibex_core::CODEX_PROJECTION_DESCRIPTOR_ID,
+                )
+                .unwrap(),
+            ),
+            descriptor_version: "1".to_string(),
+            detected_agent_version: None,
+            detected_adapter_version: None,
+            match_kind: vibex_core::ProjectionDescriptorMatch::Exact,
+            evidence_state: vibex_core::ProjectionEvidenceState::Verified,
+            auth_state: vibex_core::ProjectionAuthState::Ready,
+            provider_control: vibex_core::AgentProviderControl::Unsupported,
+            credential_control: vibex_core::AgentCredentialControl::Unsupported,
+            model_control: vibex_core::AgentModelControl::Unsupported,
+            credential_kinds: Vec::new(),
+            model_interfaces: Vec::new(),
+            switch_behavior: vibex_core::ProviderSwitchBehavior::RestartAndResume,
+            form_controls: vec![Control::ApiKey, Control::Endpoint, Control::Model],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn picker_rows_union_the_catalogue_with_the_configured_models(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            center.profile_available_models = vec![test_provider_model("gpt-5", Some("GPT-5"))];
+            center.profile_configured_models = vec![
+                test_provider_model("gpt-5", None),
+                test_provider_model("hand-typed", None),
+            ];
+
+            let rows = center.profile_candidate_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].id, "gpt-5");
+            assert!(rows[0].is_configured());
+            // The catalogue's own name survives when the draft declares none.
+            assert_eq!(rows[0].display_name.as_deref(), Some("GPT-5"));
+            // A configured Model the last fetch did not mention still shows, so
+            // nothing already saved can silently disappear from the picker.
+            assert_eq!(rows[1].id, "hand-typed");
+            assert!(rows[1].is_configured());
+        });
+    }
+
+    #[gpui::test]
+    fn unchecking_a_picker_row_releases_and_restores_its_declaration(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, cx| {
+            center.profile_available_models = vec![test_provider_model("gpt-5", Some("GPT-5"))];
+            let mut configured = test_provider_model("gpt-5", None);
+            configured.capabilities.context_tokens = Some(128_000);
+            center.profile_configured_models = vec![configured];
+
+            let rows = center.profile_candidate_rows();
+            center.select_profile_candidate(&rows[0], false, cx);
+            assert!(center.profile_configured_models.is_empty());
+            assert_eq!(center.profile_detached_models.len(), 1);
+            assert!(!center.profile_candidate_rows()[0].is_configured());
+
+            let rows = center.profile_candidate_rows();
+            center.select_profile_candidate(&rows[0], true, cx);
+            assert_eq!(center.profile_configured_models.len(), 1);
+            assert_eq!(
+                center.profile_configured_models[0]
+                    .capabilities
+                    .context_tokens,
+                Some(128_000),
+                "re-checking a row must restore what the Model declared"
+            );
+        });
+    }
+
+    #[test]
+    fn model_discovery_fills_the_picker_without_configuring_anything() {
+        let source = include_str!("management.rs");
+        let fetch = source
+            .split_once("    fn fetch_provider_models(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_managed_delete("))
+            .map(|(body, _)| body)
+            .expect("Model discovery should remain inspectable");
+
+        assert!(fetch.contains("&mut this.profile_available_models,"));
+        assert!(
+            !fetch.contains("profile_configured_models"),
+            "a fetch must not configure Models the user has not chosen"
+        );
+    }
+
+    #[test]
+    fn provider_editor_pairs_a_model_picker_with_its_settings() {
+        let source = include_str!("management.rs");
+        let dialog = source
+            .split_once("    fn render_profile_editor_dialog(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Identity: name, note, and website."))
+            .map(|(body, _)| body)
+            .expect("Provider dialog renderer should remain inspectable");
+        let picker = source
+            .split_once("    fn render_profile_candidates_pane(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_profile_candidate_row("))
+            .map(|(body, _)| body)
+            .expect("Model picker should remain inspectable");
+        let settings = source
+            .split_once("    fn render_profile_chosen_pane(")
+            .and_then(|(_, tail)| tail.split_once("    fn render_profile_model_row("))
+            .map(|(body, _)| body)
+            .expect("Model settings pane should remain inspectable");
+
+        assert!(dialog.contains("self.render_profile_candidates_pane("));
+        assert!(dialog.contains("self.render_profile_chosen_pane("));
+        assert!(dialog.contains("MANAGEMENT_PROFILE_PANES_MIN_WIDTH"));
+        // The catalogue is a checked list, and the checkbox is the whole row.
+        assert!(picker.contains("Checkbox::new("));
+        assert!(picker.contains("provider-candidates-select-all"));
+        assert!(picker.contains("set_visible_profile_candidates_selected"));
+        // The settings pane keeps the per-Model editor and the custom id field.
+        assert!(settings.contains("self.render_profile_model_editor("));
+        assert!(settings.contains("provider-model-add"));
+    }
+
+    /// The panes are built from live state, so drawing them is the only check
+    /// that the picker and the settings survive a frame together.
+    struct ProfileDialogHarness {
+        dialog: Entity<ManagementProfileDialog>,
+    }
+
+    impl Render for ProfileDialogHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.dialog.clone()
+        }
+    }
+
+    #[gpui::test]
+    fn provider_editor_draws_its_model_panes(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (center, cx) = cx.add_window_view(ManagementCenter::new);
+        center.update(cx, |center, _| {
+            center.profile_editor_open = true;
+            center
+                .projection_editor
+                .replace_capability(projection_capability_with_models());
+            center.profile_available_models = vec![
+                test_provider_model("gpt-5", Some("GPT-5")),
+                test_provider_model("gpt-5-mini", None),
+            ];
+            let mut chosen = test_provider_model("gpt-5", None);
+            chosen.capabilities.context_tokens = Some(128_000);
+            center.profile_configured_models = vec![chosen];
+            // The editor expands under its own row, which is the tallest the
+            // right pane ever gets.
+            center.profile_model_edit_index = Some(0);
+        });
+
+        let dialog = cx.new(|cx| ManagementProfileDialog::new(center.clone(), cx));
+        let (_, cx) = cx.add_window_view(move |_, _| ProfileDialogHarness {
+            dialog: dialog.clone(),
+        });
+
+        // Wide: the picker and the settings split the width.
+        let handle = cx.windows().pop().expect("test window");
+        cx.simulate_window_resize(handle, gpui::size(px(1080.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let picker = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the wide layout must draw the picker");
+        let settings = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the wide layout must draw the settings");
+        assert!(picker.size.width > px(0.0) && picker.size.height > px(0.0));
+        assert!(settings.size.width > px(0.0) && settings.size.height > px(0.0));
+        assert!(
+            picker.origin.x < settings.origin.x,
+            "the picker reads first"
+        );
+        assert_eq!(
+            picker.origin.y, settings.origin.y,
+            "the two panes share a row"
+        );
+
+        // Narrow: they stack, and the picker still lays its rows out.
+        cx.simulate_window_resize(handle, gpui::size(px(720.0), px(720.0)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let picker = cx
+            .debug_bounds("provider-candidates-pane")
+            .expect("the stacked layout must draw the picker");
+        let settings = cx
+            .debug_bounds("provider-chosen-pane")
+            .expect("the stacked layout must draw the settings");
+        assert!(
+            picker.origin.y < settings.origin.y,
+            "the settings follow the picker"
+        );
+        let row = cx
+            .debug_bounds("provider-candidate-row-gpt-5")
+            .expect("the picker must lay its rows out");
+        assert!(row.size.width > px(0.0) && row.size.height > px(0.0));
     }
 
     #[test]
