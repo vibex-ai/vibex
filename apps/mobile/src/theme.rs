@@ -655,6 +655,12 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
     theme.tokens.title_bar = sidebar.into();
     theme.title_bar_border = token("sidebar-border");
     theme.tokens.title_bar_border = theme.title_bar_border.into();
+    // Everything above maps the product's own roles; the rest of the framework
+    // palette would keep the stock neutral colors `Theme::change` loaded.
+    // Complete it from the same variant, then publish the result to the base
+    // layer that owns scrollbars, resize handles, and text view defaults.
+    vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
+    Theme::sync_base(cx);
 }
 
 #[cfg(test)]

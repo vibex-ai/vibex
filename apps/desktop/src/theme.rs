@@ -324,6 +324,14 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
         theme.sidebar_border = theme.border;
         theme.title_bar_border = theme.border;
     }
+    // Everything above maps the product's own roles. The rest of the framework
+    // palette — switches, segmented tabs, outline buttons, scrollbars,
+    // skeletons, selections — would otherwise keep the stock neutral colors
+    // `Theme::change` loaded, which is why a themed window still showed grey
+    // chrome. Complete it from the same variant, then publish the result to the
+    // base layer that owns scrollbars, resize handles, and text view defaults.
+    vibex_ui::apply_component_palette(theme, active_theme(model_mode(is_dark)));
+    Theme::sync_base(cx);
     apply_code_font_weight(appearance.code_font.weight, cx);
 }
 
@@ -355,7 +363,106 @@ pub fn semantic_token(name: &str, dark: bool) -> Option<GpuiColorToken> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    /// Serializes the tests that move the process-wide appearance slots.
+    ///
+    /// `set_active_selection` writes process-wide atomics, so a test that
+    /// points them at a named variant must not overlap the one that asserts an
+    /// unset slot still resolves to the catalog default.
+    static SLOT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn slot_guard() -> MutexGuard<'static, ()> {
+        SLOT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Puts the process-wide appearance slots back when a test moves them.
+    ///
+    /// Restoring on drop keeps the moved state from leaking even if an
+    /// assertion fails partway through.
+    struct SlotRestore {
+        light: usize,
+        dark: usize,
+    }
+
+    impl SlotRestore {
+        fn capture() -> Self {
+            Self {
+                light: mode_slot(GpuiThemeMode::Light).load(Ordering::Relaxed),
+                dark: mode_slot(GpuiThemeMode::Dark).load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl Drop for SlotRestore {
+        fn drop(&mut self) {
+            mode_slot(GpuiThemeMode::Light).store(self.light, Ordering::Relaxed);
+            mode_slot(GpuiThemeMode::Dark).store(self.dark, Ordering::Relaxed);
+        }
+    }
+
+    #[gpui::test]
+    fn appearance_pass_completes_the_framework_palette(cx: &mut gpui::TestAppContext) {
+        let _guard = slot_guard();
+        let _slots = SlotRestore::capture();
+        cx.update(gpui_component::init);
+        for (mode, id) in [
+            (ThemeMode::Light, "gruvbox-light"),
+            (ThemeMode::Dark, "tokyo-night"),
+        ] {
+            let mut appearance = AppearanceUiState {
+                theme: mode,
+                ..Default::default()
+            };
+            appearance.theme_selection.select_light("gruvbox-light");
+            appearance.theme_selection.select_dark("tokyo-night");
+            cx.update(|cx| apply_appearance(&appearance, None, cx));
+
+            // gpui-component resets its palette to the stock neutrals on every
+            // `Theme::change`; the appearance pass has to fill the component
+            // roles back in from the selected variant, or switches, segmented
+            // tabs, and outline buttons paint the framework's greys. Read the
+            // expectation from the named variant rather than the process-wide
+            // selection slot, which parallel tests also move.
+            let definition = vibex_ui::theme(id).expect("built-in theme");
+            cx.update(|cx| {
+                let theme = Theme::global(cx);
+                for (name, expected, actual) in [
+                    (
+                        "switch",
+                        semantic_color_for(definition, "muted"),
+                        theme.tokens.switch.color,
+                    ),
+                    (
+                        "tab_bar_segmented",
+                        semantic_color_for(definition, "secondary"),
+                        theme.tokens.tab_bar_segmented.color,
+                    ),
+                    (
+                        "button",
+                        semantic_color_for(definition, "secondary"),
+                        theme.tokens.button.color,
+                    ),
+                    (
+                        "danger",
+                        semantic_color_for(definition, "destructive"),
+                        theme.tokens.danger.color,
+                    ),
+                    (
+                        "caret",
+                        semantic_color_for(definition, "primary"),
+                        theme.caret,
+                    ),
+                ] {
+                    assert_eq!(actual, expected, "{mode:?}: {name} is not themed");
+                }
+            });
+        }
+    }
 
     #[test]
     fn window_scale_applies_to_interface_and_code_metrics() {
@@ -387,6 +494,7 @@ mod tests {
 
     #[test]
     fn an_unset_slot_paints_the_catalog_default() {
+        let _guard = slot_guard();
         for mode in GpuiThemeMode::ALL {
             assert_eq!(active_theme(mode).id, default_theme(mode).id);
         }

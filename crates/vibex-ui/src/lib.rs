@@ -3,6 +3,8 @@
 pub mod agent;
 pub mod async_state;
 pub mod component_model;
+#[cfg(feature = "gpui-component")]
+pub mod component_palette;
 pub mod controller;
 pub mod files;
 mod generated_tokens;
@@ -18,6 +20,8 @@ pub mod workflow;
 pub use agent::*;
 pub use async_state::*;
 pub use component_model::*;
+#[cfg(feature = "gpui-component")]
+pub use component_palette::*;
 pub use controller::*;
 pub use files::*;
 pub use generated_tokens::*;

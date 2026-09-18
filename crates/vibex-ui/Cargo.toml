@@ -6,9 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["gpui-component"]
+# Bridges the shared semantic catalog onto gpui-component's global theme. On by
+# default so both GPUI clients compile the same mapping; the catalog, file
+# loader, and projection modules stay platform neutral either way.
+gpui-component = ["dep:gpui", "dep:gpui-component"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+gpui = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true }
 vibex-core = { path = "../core" }
 vibex-desktop-model = { path = "../desktop-model" }
 vibex-backend = { path = "../vibex-backend" }

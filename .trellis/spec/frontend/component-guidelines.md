@@ -753,6 +753,28 @@ to sRGB, and emits `crates/vibex-ui/src/generated_tokens.rs`.
   tinted palette does not receive neutral grey chrome.
 - **Contrast is a gate, not a preference.** Body and muted text must clear
   4.5:1 against the surface they are painted on, in every theme.
+- **The gpui-component palette is completed, never left partial.**
+  `Theme::change` reloads gpui-component's own palette, so every token an
+  appearance pass does not assign keeps a stock neutral color. After mapping
+  the product roles, a client calls
+  `vibex_ui::apply_component_palette(theme, active_theme)` and then
+  `Theme::sync_base(cx)`, which publishes the result to the base layer that
+  owns scrollbars, resize handles, and the text view defaults. Skipping either
+  step is what leaves switches, segmented tabs, outline buttons, and skeletons
+  grey under a tinted palette.
+- **Token ownership is explicit.** `CORE_TOKENS` is what a client maps before
+  the bridge runs (surfaces, text, borders, washes, high-contrast overrides);
+  `COMPONENT_TOKENS` is what the bridge owns. The two must together cover every
+  color token gpui-component defines — the bridge's coverage test fails on a
+  framework upgrade that adds one, so a new token is a decision rather than a
+  silent stock color.
+- **Component colors derive from the active theme; they are not authored
+  twice.** Where the catalog owns a matching role the bridge uses it directly
+  (`switch` ← `muted`, `danger` ← `destructive`, `success` ← `chart-2`,
+  `info` and `link` ← `chart-category-1`). Elsewhere it derives from the theme:
+  status inks take the pole that contrasts most with their plate, hover and
+  pressed plates mix toward the theme foreground, and `_light` swatches mix
+  toward the theme background.
 
 Users can add their own palettes by dropping a theme file into the `themes`
 directory under the app home. A file names only the roles it changes;
