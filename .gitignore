@@ -17,6 +17,10 @@ crates/core/bindings/
 /coverage/
 *.log
 *.tmp
+# Backup copies left behind by patch/merge/edit tooling. A stray copy of a
+# source file must never reach the public repository.
+*.orig
+*.rej
 *.db
 *.db-shm
 *.db-wal
