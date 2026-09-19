@@ -43,6 +43,11 @@ fn user_themes_join_the_catalog_and_can_shadow_a_built_in() {
     assert_eq!(errors.len(), 1);
 
     let installed = themes.len();
+    // Counted before the install, so these are the built-in catalog's own
+    // shape. The invariant below is about user themes not shifting the
+    // built-ins, not about how many palettes happen to ship.
+    let built_in_light = themes_for(GpuiThemeMode::Light).count();
+    let built_in_dark = themes_for(GpuiThemeMode::Dark).count();
     install_custom_themes(themes).expect("first install wins");
     assert_eq!(
         install_custom_themes(Vec::new()),
@@ -104,8 +109,8 @@ fn user_themes_join_the_catalog_and_can_shadow_a_built_in() {
     // the slot of the theme it replaces, and new themes append.
     assert_eq!(
         theme_index("vibex-dark", GpuiThemeMode::Dark),
-        Some(5),
-        "built-ins keep their original positions"
+        Some(built_in_light),
+        "the first dark built-in still sits right after the light block"
     );
     assert_eq!(
         theme_index("vibex-light", GpuiThemeMode::Light),
@@ -114,7 +119,7 @@ fn user_themes_join_the_catalog_and_can_shadow_a_built_in() {
     );
     let midnight_index = theme_index("test-midnight", GpuiThemeMode::Dark).unwrap();
     assert!(
-        midnight_index >= 10,
+        midnight_index >= built_in_light + built_in_dark,
         "a genuinely new theme appends after the built-ins, got {midnight_index}"
     );
 
