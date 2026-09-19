@@ -455,10 +455,17 @@ const AGENT_CONTENT_NARROW_MAX_WIDTH: f32 = 768.0;
 const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
 const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
 const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 32;
-const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 2 * 1024 * 1024;
-const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 64;
-const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// Snapshotted Markdown sources kept for the rows of one expanded turn.
+///
+/// A turn that ran for hours holds hundreds of rows, and an expanded turn
+/// renders all of them per frame. A table smaller than that window misses on
+/// almost every row every frame, so each miss re-copies the row body into a
+/// fresh `Arc<str>` and each hit still pays a full-body comparison. The limit
+/// is therefore sized to hold one long turn rather than one screen.
+const TIMELINE_MARKDOWN_SOURCE_CACHE_LIMIT: usize = 512;
+const TIMELINE_MARKDOWN_SOURCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const TIMELINE_REASONING_SUMMARY_CACHE_LIMIT: usize = 256;
+const TIMELINE_REASONING_SUMMARY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const STARTUP_WORDMARK_SHIMMER_DURATION: Duration = Duration::from_secs(12);
@@ -472,13 +479,17 @@ const AGENT_THINKING_SHIMMER_SWEEP: Duration = Duration::from_millis(1_200);
 /// radius the hand-rolled indicator used.
 const AGENT_THINKING_SHIMMER_SPREAD: f32 = 0.42;
 const AGENT_THINKING_LABEL_MAX_CHARS: usize = 48;
-const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 128;
-const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 2 * 1024 * 1024;
-const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 64;
-const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 128;
-const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 128;
-const TIMELINE_TURN_FILE_CHANGES_CACHE_BYTES: usize = 512 * 1024;
+/// Projection caches below are sized per expanded turn, not per screen: an
+/// expanded turn renders every one of its rows on every frame, so a table that
+/// only covers a viewport misses on nearly every row and rebuilds the
+/// projection it was meant to memoize.
+const TIMELINE_TOOL_PROJECTION_CACHE_LIMIT: usize = 512;
+const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 256;
+const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 512;
+const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 256;
+const TIMELINE_TURN_FILE_CHANGES_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TURN_FILE_CHANGES_VISIBLE_COUNT: usize = 3;
 const AGENT_TIMELINE_IDLE_POLL_THRESHOLD: u16 = 4;
 const AGENT_TIMELINE_IDLE_POLL_MAX_MS: u64 = 2_000;
@@ -1618,6 +1629,10 @@ fn timeline_markdown_source_snapshot(
     allow_throttle: bool,
 ) -> (Arc<str>, i64) {
     if let Some((cached_sequence, snapshot)) = cache.get(key) {
+        // A revision match means the caller handed back the same content. Only
+        // an append can keep that revision while growing the text, so length is
+        // enough to tell the two apart; comparing the bodies here would put a
+        // full memcmp of every visible row body into every frame.
         if *cached_sequence == sequence && snapshot.source.len() == source.len() {
             return (snapshot.source.clone(), *cached_sequence);
         }
@@ -2875,6 +2890,7 @@ struct AgentSessionViewCacheEntry {
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
+    timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
@@ -5915,6 +5931,7 @@ pub struct VibexWorkbench {
     timeline_streaming_shrink_candidates: BTreeMap<String, StreamingShrinkCandidate>,
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
+    timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
@@ -6805,6 +6822,7 @@ impl VibexWorkbench {
             timeline_streaming_shrink_candidates: BTreeMap::new(),
             timeline_pending_turn_heights: BTreeMap::new(),
             timeline_estimated_turn_heights: BTreeMap::new(),
+            timeline_turn_layout_signature_cache: BTreeMap::new(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
             timeline_reasoning_summaries: BTreeMap::new(),
@@ -12943,6 +12961,9 @@ impl VibexWorkbench {
             timeline_estimated_turn_heights: std::mem::take(
                 &mut self.timeline_estimated_turn_heights,
             ),
+            timeline_turn_layout_signature_cache: std::mem::take(
+                &mut self.timeline_turn_layout_signature_cache,
+            ),
             conversation_turns_cache: std::mem::replace(
                 &mut self.conversation_turns_cache,
                 Rc::new(Vec::new()),
@@ -13050,6 +13071,7 @@ impl VibexWorkbench {
         self.timeline_measured_turn_layout_signatures =
             entry.timeline_measured_turn_layout_signatures;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
+        self.timeline_turn_layout_signature_cache = entry.timeline_turn_layout_signature_cache;
         // A restored extent re-earns any reclaim from the first paints of the
         // switched-to session instead of carrying paint bookkeeping across.
         self.timeline_streaming_shrink_candidates.clear();
@@ -13890,6 +13912,9 @@ impl VibexWorkbench {
             let turns = self.conversation_turns_cache.as_slice();
             self.conversation_turns_summary = ConversationTurnsSummary::from_turns(turns);
             self.conversation_turns_cache_key = Some(key);
+            // The projection just moved, so every memoized render fingerprint
+            // describes a turn shape that no longer exists.
+            self.timeline_turn_layout_signature_cache.clear();
             self.sync_conversation_turns_render_cache();
         }
         self.conversation_turns_cache.clone()
@@ -15297,6 +15322,7 @@ impl VibexWorkbench {
         self.timeline_streaming_shrink_candidates.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
+        self.timeline_turn_layout_signature_cache.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
     }
 
@@ -15483,6 +15509,7 @@ impl VibexWorkbench {
         self.timeline_streaming_shrink_candidates.clear();
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
+        self.timeline_turn_layout_signature_cache.clear();
         // The row table is derived from the measurements just cleared. Drop it
         // so a caller that cannot rebuild immediately still cannot reuse stale
         // heights against a different turn projection; the next render rebuilds
@@ -15506,6 +15533,7 @@ impl VibexWorkbench {
         self.timeline_measured_turn_layout_signatures
             .remove(turn_id);
         self.timeline_streaming_shrink_candidates.remove(turn_id);
+        self.timeline_turn_layout_signature_cache.remove(turn_id);
         self.timeline_pending_turn_heights
             .retain(|_, (pending_turn_id, _)| pending_turn_id != turn_id);
     }
@@ -15529,7 +15557,100 @@ impl VibexWorkbench {
     /// Fingerprint the rendered shape of a turn without including body lengths.
     /// Streaming text can grow every frame, while row projection changes must
     /// invalidate a stale measured virtual-list extent so it can shrink.
+    ///
+    /// The fingerprint reads every row of the turn, including a substring scan
+    /// of each body, and prepaint re-records the same turn on every frame. It
+    /// is therefore memoized against [`Self::timeline_turn_shape_key`]: a cheap
+    /// digest of the turn-level inputs that change the rendered shape while the
+    /// body text keeps streaming.
     fn timeline_turn_layout_signature(
+        &mut self,
+        turn: &TimelineConversationTurn,
+        process_expansion: Option<bool>,
+    ) -> u64 {
+        let shape_key = self.timeline_turn_shape_key(turn, process_expansion);
+        if let Some((cached_key, signature)) =
+            self.timeline_turn_layout_signature_cache.get(&turn.id)
+            && *cached_key == shape_key
+        {
+            return *signature;
+        }
+        let signature = self.timeline_turn_layout_signature_uncached(turn, process_expansion);
+        self.timeline_turn_layout_signature_cache
+            .insert(turn.id.clone(), (shape_key, signature));
+        signature
+    }
+
+    /// The turn-level half of [`Self::timeline_turn_layout_signature`].
+    ///
+    /// Every field here is O(1) to read. Body text and row bodies are
+    /// deliberately absent: an append that only grows a row keeps the shape —
+    /// and therefore the memoized fingerprint — intact.
+    fn timeline_turn_shape_key(
+        &self,
+        turn: &TimelineConversationTurn,
+        process_expansion: Option<bool>,
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let file_changes_present = self
+            .timeline_turn_file_changes
+            .get(&turn.id)
+            .is_some_and(|(_, summary)| !summary.files.is_empty());
+        turn.complete.hash(&mut hasher);
+        turn.superseded.hash(&mut hasher);
+        turn.failed.hash(&mut hasher);
+        turn.pending_permission.hash(&mut hasher);
+        timeline_turn_process_expanded(turn, process_expansion).hash(&mut hasher);
+        turn.user_row.is_some().hash(&mut hasher);
+        turn.live_status
+            .as_ref()
+            .map(|body| body.is_empty())
+            .hash(&mut hasher);
+        turn.conclusion_row.is_some().hash(&mut hasher);
+        turn.runtime_attribution.is_some().hash(&mut hasher);
+        file_changes_present.hash(&mut hasher);
+        (file_changes_present
+            && self
+                .timeline_file_changes_expansion
+                .get(&turn.id)
+                .copied()
+                .unwrap_or(false))
+        .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_display_mode
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .reasoning_expanded_by_default
+            .hash(&mut hasher);
+        self.reasoning_expansion
+            .get(&format!("reasoning-live:{}", turn.id))
+            .copied()
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_command_execution_display
+            .hash(&mut hasher);
+        self.ui_state
+            .session
+            .enhanced_file_operation_display
+            .hash(&mut hasher);
+        turn.process_rows.len().hash(&mut hasher);
+        turn.process_activity_groups.len().hash(&mut hasher);
+        turn.process_activity_groups_with_commands
+            .len()
+            .hash(&mut hasher);
+        turn.process_activity_groups_with_file_operations
+            .len()
+            .hash(&mut hasher);
+        turn.process_activity_groups_with_commands_and_file_operations
+            .len()
+            .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn timeline_turn_layout_signature_uncached(
         &self,
         turn: &TimelineConversationTurn,
         process_expansion: Option<bool>,
@@ -15771,11 +15892,17 @@ impl VibexWorkbench {
         let measured_height = measured_height.ceil().max(72.0);
         let previous_height = self.timeline_measured_turn_heights.get(&turn_id).copied();
         let process_expansion = self.timeline_process_expansion.get(&turn_id).copied();
-        let layout_signature = self
+        // Prepaint records the same turn on every frame while it streams, so
+        // the fingerprint is memoized. It keys on the turn's rendered shape,
+        // and every toggle that changes that shape — plus every projection
+        // rebuild — drops the memoized entry.
+        let measured_turn = self
             .conversation_turns_cache
             .get(turn_index)
             .filter(|turn| turn.id == turn_id)
-            .map(|turn| self.timeline_turn_layout_signature(turn, process_expansion));
+            .cloned();
+        let layout_signature =
+            measured_turn.map(|turn| self.timeline_turn_layout_signature(&turn, process_expansion));
         let previous_layout_signature = self
             .timeline_measured_turn_layout_signatures
             .get(&turn_id)
@@ -40893,6 +41020,33 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// The disclosure header of an expanded reasoning row.
+    ///
+    /// Deliberately plain text: it is a single clipped line inside a row that
+    /// is already dominated by the Markdown body, so a second Markdown surface
+    /// here would double the per-row element count, keyed state and selection
+    /// bookkeeping for no visible gain. The live reasoning body has no
+    /// `TimelineRow` of its own and carries no search highlight, so it passes
+    /// `None`.
+    fn reasoning_first_line_text(
+        &self,
+        row: Option<&TimelineRow>,
+        source: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = match row {
+            Some(row) => self.session_search_highlighted_row_text(row, source.to_string(), cx),
+            None => StyledText::new(source.to_string()),
+        };
+        div()
+            .min_w_0()
+            .max_w_full()
+            .flex_shrink(1.0)
+            .truncate()
+            .child(text)
+            .into_any_element()
+    }
+
     fn reasoning_markdown_view(
         &mut self,
         id: impl Into<ElementId>,
@@ -40962,21 +41116,7 @@ impl VibexWorkbench {
             let (source, sequence) = self.timeline_live_reasoning_source(&turn_id, body);
             let revision = u64::try_from(sequence).unwrap_or_default();
             let (first_line_source, remaining_source) = reasoning_source_parts(source.as_ref());
-            let first_line = self
-                .reasoning_markdown_view(
-                    format!("thought:{row_id}:first-line"),
-                    Arc::<str>::from(first_line_source),
-                    revision,
-                    true,
-                    None,
-                    cx,
-                )
-                .flex_auto()
-                .min_w_0()
-                .max_w_full()
-                .flex_shrink(1.0)
-                .whitespace_normal()
-                .into_any_element();
+            let first_line = self.reasoning_first_line_text(None, first_line_source, cx);
             let remaining = remaining_source.map(|source| {
                 self.reasoning_markdown_view(
                     format!("thought:{row_id}:remaining"),
@@ -41042,21 +41182,12 @@ impl VibexWorkbench {
                 self.session_search_highlight_for_rows(std::slice::from_ref(row));
             let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
             let (first_line_source, remaining_source) = reasoning_source_parts(&markdown_source);
-            let first_line = self
-                .reasoning_markdown_view(
-                    format!("thought:{}:first-line", row.id),
-                    Arc::<str>::from(first_line_source),
-                    u64::try_from(markdown_sequence).unwrap_or_default(),
-                    row.streaming,
-                    search_highlight.clone(),
-                    cx,
-                )
-                .flex_auto()
-                .min_w_0()
-                .max_w_full()
-                .flex_shrink(1.0)
-                .whitespace_normal()
-                .into_any_element();
+            // The disclosure header is one short, muted line. Rendering it as a
+            // second `MarkdownView` bought nothing but a second element tree,
+            // keyed state entry, selection buffer and hitbox per reasoning row;
+            // a long turn expands hundreds of rows per frame, so the header
+            // stays plain text and only the body keeps the Markdown surface.
+            let first_line = self.reasoning_first_line_text(Some(row), first_line_source, cx);
             let remaining = remaining_source.map(|source| {
                 self.reasoning_markdown_view(
                     format!("thought:{}:remaining", row.id),
