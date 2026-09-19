@@ -71457,7 +71457,9 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, cx) = cx.add_window_view(|_, _| FontSearchProbe);
 
-        let _ = cx.update(|window, cx| choices.perform_search("jet", window, cx));
+        // `perform_search` filters eagerly and returns a ready task, so the
+        // future is dropped on purpose rather than awaited.
+        cx.update(|window, cx| drop(choices.perform_search("jet", window, cx)));
 
         assert_eq!(choices.items_count(0), 1, "only JetBrains Mono matches");
         let matched = choices
@@ -71468,7 +71470,7 @@ mod tests {
 
         // Reopening the popup clears the query through the same delegate, so
         // the full list has to come back.
-        let _ = cx.update(|window, cx| choices.perform_search("", window, cx));
+        cx.update(|window, cx| drop(choices.perform_search("", window, cx)));
         assert_eq!(choices.items_count(0), 3);
 
         let source = include_str!("app.rs");

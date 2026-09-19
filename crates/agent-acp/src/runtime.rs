@@ -32889,6 +32889,15 @@ for line in sys.stdin:
         assert!(events.iter().any(|event| {
             matches!(event, AcpEvent::Reasoning { text, .. } if text == "one recovery update")
         }));
+        // The cancel comes from the retry-recovery path, so the mock can record
+        // it a moment after the prompt future resolves; wait for it the same
+        // bounded way the sibling stream-error test above does.
+        for _ in 0..50 {
+            if logged_request_count(&fixture.request_log(), "session/cancel") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             logged_request_count(&fixture.request_log(), "session/cancel"),
             1

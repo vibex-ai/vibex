@@ -1914,9 +1914,11 @@ mod tests {
 
     #[test]
     fn editor_autosave_preferences_round_trip_through_json() {
-        let mut state = PreviewUiState::default();
-        state.editor_autosave = EditorAutosaveMode::OnFocusChange;
-        state.editor_autosave_delay_ms = 2_500;
+        let state = PreviewUiState {
+            editor_autosave: EditorAutosaveMode::OnFocusChange,
+            editor_autosave_delay_ms: 2_500,
+            ..Default::default()
+        };
 
         let encoded = serde_json::to_value(&state).unwrap();
         assert_eq!(

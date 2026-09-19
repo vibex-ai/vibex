@@ -4847,11 +4847,12 @@ mod tests {
     }
 
     fn device_registry(count: usize) -> PairingViewState {
-        let mut state = PairingViewState::default();
-        state.devices = (0..count)
-            .map(|_| device_detail(RemoteDeviceStatus::Revoked, None, Some(1)))
-            .collect();
-        state
+        PairingViewState {
+            devices: (0..count)
+                .map(|_| device_detail(RemoteDeviceStatus::Revoked, None, Some(1)))
+                .collect(),
+            ..Default::default()
+        }
     }
 
     #[test]

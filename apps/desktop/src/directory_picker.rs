@@ -248,6 +248,10 @@ pub struct DirectoryPickerDialog {
 }
 
 impl DirectoryPickerDialog {
+    // The seed data, the two host callbacks, and GPUI's own `window`/`cx`
+    // pair add up past clippy's threshold; bundling them would only move the
+    // same eight values into a struct at the single call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         locale_mode: LocaleMode,
         initial_dir: Option<PathBuf>,
