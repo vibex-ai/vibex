@@ -50688,36 +50688,6 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             &["update", "release", "更新", "版本"],
         ),
         settings_search_candidate(
-            SettingsSection::General,
-            locale::text("Agent completed", "Agent 完成", "Agent 完成"),
-            locale::text(
-                "Notify when an Agent turn completes.",
-                "Agent 回合完成时通知。",
-                "Agent 回合完成時通知。",
-            ),
-            &["completed", "finish", "完成"],
-        ),
-        settings_search_candidate(
-            SettingsSection::General,
-            locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
-            locale::text(
-                "Notify when an Agent is waiting for input.",
-                "Agent 等待输入时通知。",
-                "Agent 等待輸入時通知。",
-            ),
-            &["needs input", "waiting", "需要输入", "需要輸入"],
-        ),
-        settings_search_candidate(
-            SettingsSection::General,
-            locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
-            locale::text(
-                "Notify when an Agent turn fails.",
-                "Agent 回合失败时通知。",
-                "Agent 回合失敗時通知。",
-            ),
-            &["failed", "error", "失败", "失敗"],
-        ),
-        settings_search_candidate(
             SettingsSection::Appearance,
             strings.theme,
             strings.theme_description,
@@ -50884,6 +50854,43 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
                 "為目前選取的會話啟用自動繼續。",
             ),
             &["auto continue", "continue", "自动继续", "自動繼續"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Agent completed", "Agent 完成", "Agent 完成"),
+            locale::text(
+                "Notify when an Agent turn completes.",
+                "Agent 回合完成时通知。",
+                "Agent 回合完成時通知。",
+            ),
+            &["completed", "finish", "notification", "完成", "通知"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
+            locale::text(
+                "Notify when an Agent is waiting for input.",
+                "Agent 等待输入时通知。",
+                "Agent 等待輸入時通知。",
+            ),
+            &[
+                "needs input",
+                "waiting",
+                "notification",
+                "需要输入",
+                "需要輸入",
+                "通知",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Session,
+            locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
+            locale::text(
+                "Notify when an Agent turn fails.",
+                "Agent 回合失败时通知。",
+                "Agent 回合失敗時通知。",
+            ),
+            &["failed", "error", "notification", "失败", "失敗", "通知"],
         ),
         settings_search_candidate(
             SettingsSection::Session,
@@ -53144,27 +53151,6 @@ impl FoundationSettings {
             .on_click(
                 cx.listener(|this, enabled, _, cx| this.set_show_update_prompts(*enabled, cx)),
             );
-        let completed_notifications = Switch::new("notify-completed")
-            .small()
-            .checked(desktop_behavior.notify_agent_completed)
-            .disabled(!desktop_behavior.notifications_enabled)
-            .on_click(cx.listener(|this, enabled, _, cx| {
-                this.set_notification_kind(NotificationKind::Completed, *enabled, cx)
-            }));
-        let needs_input_notifications = Switch::new("notify-needs-input")
-            .small()
-            .checked(desktop_behavior.notify_agent_needs_input)
-            .disabled(!desktop_behavior.notifications_enabled)
-            .on_click(cx.listener(|this, enabled, _, cx| {
-                this.set_notification_kind(NotificationKind::NeedsInput, *enabled, cx)
-            }));
-        let failed_notifications = Switch::new("notify-failed")
-            .small()
-            .checked(desktop_behavior.notify_agent_failed)
-            .disabled(!desktop_behavior.notifications_enabled)
-            .on_click(cx.listener(|this, enabled, _, cx| {
-                this.set_notification_kind(NotificationKind::Failed, *enabled, cx)
-            }));
         settings_page(
             strings.general,
             strings.general_description,
@@ -53231,39 +53217,6 @@ impl FoundationSettings {
                         "顯示標題列更新按鈕與每個版本的一次性提示；背景安全檢查始終保持啟用。",
                     ),
                     update_prompts,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent completed", "Agent 完成", "Agent 完成"),
-                    locale::text(
-                        "Notify when an Agent turn completes.",
-                        "Agent 回合完成时通知。",
-                        "Agent 回合完成時通知。",
-                    ),
-                    completed_notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
-                    locale::text(
-                        "Notify when an Agent is waiting for input.",
-                        "Agent 等待输入时通知。",
-                        "Agent 等待輸入時通知。",
-                    ),
-                    needs_input_notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
-                    locale::text(
-                        "Notify when an Agent turn fails.",
-                        "Agent 回合失败时通知。",
-                        "Agent 回合失敗時通知。",
-                    ),
-                    failed_notifications,
                     stacked,
                     cx,
                 ),
@@ -53560,6 +53513,7 @@ impl FoundationSettings {
     fn render_session_page(
         &self,
         session: &SessionUiState,
+        desktop_behavior: &DesktopBehaviorUiState,
         stacked: bool,
         strings: Strings,
         cx: &mut Context<Self>,
@@ -53708,6 +53662,27 @@ impl FoundationSettings {
                     .workbench
                     .update(cx, |workbench, cx| workbench.open_management(cx));
             }));
+        let completed_notifications = Switch::new("notify-completed")
+            .small()
+            .checked(desktop_behavior.notify_agent_completed)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::Completed, *enabled, cx)
+            }));
+        let needs_input_notifications = Switch::new("notify-needs-input")
+            .small()
+            .checked(desktop_behavior.notify_agent_needs_input)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::NeedsInput, *enabled, cx)
+            }));
+        let failed_notifications = Switch::new("notify-failed")
+            .small()
+            .checked(desktop_behavior.notify_agent_failed)
+            .disabled(!desktop_behavior.notifications_enabled)
+            .on_click(cx.listener(|this, enabled, _, cx| {
+                this.set_notification_kind(NotificationKind::Failed, *enabled, cx)
+            }));
 
         settings_page(
             strings.session_settings,
@@ -53797,6 +53772,39 @@ impl FoundationSettings {
                         .on_click(
                             cx.listener(|this, _, _, cx| this.toggle_current_auto_continue(cx)),
                         ),
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent completed", "Agent 完成", "Agent 完成"),
+                    locale::text(
+                        "Notify when an Agent turn completes.",
+                        "Agent 回合完成时通知。",
+                        "Agent 回合完成時通知。",
+                    ),
+                    completed_notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
+                    locale::text(
+                        "Notify when an Agent is waiting for input.",
+                        "Agent 等待输入时通知。",
+                        "Agent 等待輸入時通知。",
+                    ),
+                    needs_input_notifications,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
+                    locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
+                    locale::text(
+                        "Notify when an Agent turn fails.",
+                        "Agent 回合失败时通知。",
+                        "Agent 回合失敗時通知。",
+                    ),
+                    failed_notifications,
                     stacked,
                     cx,
                 ),
@@ -54904,7 +54912,7 @@ impl Render for FoundationSettings {
                 self.render_appearance_page(&appearance, stacked_rows, strings, cx)
             }
             SettingsSection::Session => {
-                self.render_session_page(&session, stacked_rows, strings, cx)
+                self.render_session_page(&session, &desktop_behavior, stacked_rows, strings, cx)
             }
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
@@ -67182,6 +67190,13 @@ mod tests {
         assert!(notification_candidates.iter().any(|candidate| {
             candidate.section == SettingsSection::General && candidate.keywords.contains(&"通知")
         }));
+        assert!(notification_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Session
+                && candidate.keywords.contains(&"需要输入")
+        }));
+        assert!(notification_candidates.iter().any(|candidate| {
+            candidate.section == SettingsSection::Session && candidate.keywords.contains(&"failed")
+        }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
     }
 
@@ -67683,6 +67698,22 @@ mod tests {
         assert!(session.contains("set_enhanced_command_execution_display"));
         assert!(session.contains("enhanced_file_operation_display"));
         assert!(session.contains("set_enhanced_file_operation_display"));
+        assert!(session.contains("notify-completed"));
+        assert!(session.contains("notify-needs-input"));
+        assert!(session.contains("notify-failed"));
+        assert!(session.contains("set_notification_kind(NotificationKind::Completed"));
+        assert!(session.contains("set_notification_kind(NotificationKind::NeedsInput"));
+        assert!(session.contains("set_notification_kind(NotificationKind::Failed"));
+
+        let general = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("general settings should remain inspectable");
+        assert!(!general.contains("notify-completed"));
+        assert!(!general.contains("notify-needs-input"));
+        assert!(!general.contains("notify-failed"));
+        assert!(!general.contains("set_notification_kind("));
 
         let generation_status = source
             .split_once("    fn render_agent_generation_status(")
