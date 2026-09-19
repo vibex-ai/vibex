@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
-    ElicitationRequestStatus, GoalAction, GoalChangeKind, GoalPhase, GoalSnapshot,
-    PermissionRequestStatus, PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem,
-    TimelineItemKind, TimelinePayload, ToolCallStatus, VibexSessionId,
+    ElicitationRequestStatus, GoalAction, GoalChangeKind, GoalSnapshot, PermissionRequestStatus,
+    PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem, TimelineItemKind, TimelinePayload,
+    ToolCallStatus, VibexSessionId,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
