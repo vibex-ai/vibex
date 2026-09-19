@@ -5774,6 +5774,15 @@ pub struct VibexWorkbench {
     /// the workbench. `None` means the panel is hosted inline, and the two are
     /// mutually exclusive so the workbench never draws a second panel.
     preview_window: Option<AnyWindowHandle>,
+    /// The detached window the workbench is closing right now, if any.
+    ///
+    /// The window-closed observer runs from inside the window teardown, which
+    /// the workbench starts from inside its own update when it docks the panel
+    /// back — and an entity cannot be updated while it is still leased. Reading
+    /// this cell tells the observer its own close apart from the user's without
+    /// touching the workbench, so the hand-back is skipped entirely instead of
+    /// re-entering the update that is already running.
+    preview_window_closing: Rc<Cell<Option<WindowId>>>,
     /// Hands the panel back when the detached window closes for a reason the
     /// workbench did not initiate. Held only to keep the observer installed.
     _preview_window_closed_subscription: Option<Subscription>,
@@ -6616,16 +6625,13 @@ impl VibexWorkbench {
         // Closing the detached preview window is a request to dock the panel
         // back, not a request to drop it, so the workbench watches window
         // teardown instead of relying on its own close path.
-        let preview_window_closed_subscription = {
-            let workbench = cx.weak_entity();
-            cx.on_window_closed(move |cx, window_id| {
-                if let Some(workbench) = workbench.upgrade() {
-                    workbench.update(cx, |this, cx| {
-                        this.handle_preview_window_closed(window_id, cx)
-                    });
-                }
-            })
-        };
+        let preview_window_closing = Rc::new(Cell::new(None));
+        let preview_window_closed_subscription = observe_preview_window_close(
+            cx.weak_entity(),
+            preview_window_closing.clone(),
+            VibexWorkbench::handle_window_closed,
+            cx,
+        );
         let window_handle = Some(window.window_handle());
         let mut this = Self {
             focus_handle,
@@ -6694,6 +6700,7 @@ impl VibexWorkbench {
             code_workbench,
             preview_fullscreen_active: false,
             preview_window: None,
+            preview_window_closing,
             _preview_window_closed_subscription: Some(preview_window_closed_subscription),
             window_handle,
             code_preview_visible: false,
@@ -19836,7 +19843,7 @@ impl VibexWorkbench {
         let Some(handle) = self.take_preview_window(cx) else {
             return;
         };
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        self.remove_preview_window(handle, cx);
         // Docking back is a move, not a close: the panel has to be visible in
         // the workbench again.
         self.reveal_code_preview(cx);
@@ -19849,7 +19856,16 @@ impl VibexWorkbench {
         let Some(handle) = self.take_preview_window(cx) else {
             return;
         };
+        self.remove_preview_window(handle, cx);
+    }
+
+    /// Removes a window the workbench owns. The window-closed observer fires
+    /// while this runs, so the closing marker tells it the close is accounted
+    /// for and the hand-back is not needed.
+    fn remove_preview_window(&mut self, handle: AnyWindowHandle, cx: &mut Context<Self>) {
+        self.preview_window_closing.set(Some(handle.window_id()));
         let _ = handle.update(cx, |_, window, _| window.remove_window());
+        self.preview_window_closing.set(None);
     }
 
     fn take_preview_window(&mut self, cx: &mut Context<Self>) -> Option<AnyWindowHandle> {
@@ -19860,19 +19876,29 @@ impl VibexWorkbench {
         Some(handle)
     }
 
-    /// The detached window closed without the workbench asking. The panel must
-    /// come back inline instead of disappearing with the window.
-    fn handle_preview_window_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
-        if self.preview_window.map(|handle| handle.window_id()) != Some(window_id) {
+    /// A window this workbench owns was closed without it asking.
+    ///
+    /// The detached preview window hands the panel back inline, so it cannot
+    /// disappear with the window. The workbench window going away takes the
+    /// detached window with it instead, because the shell that owns the panel
+    /// is the only surface that can host it inline.
+    fn handle_window_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self.preview_window.map(|handle| handle.window_id()) == Some(window_id) {
+            self.preview_window = None;
+            self.code_workbench.update(cx, |workbench, cx| {
+                workbench.set_preview_detached(false, cx)
+            });
+            self.reveal_code_preview(cx);
+            self.activate_workbench_window(cx);
+            cx.notify();
             return;
         }
-        self.preview_window = None;
-        self.code_workbench.update(cx, |workbench, cx| {
-            workbench.set_preview_detached(false, cx)
-        });
-        self.reveal_code_preview(cx);
-        self.activate_workbench_window(cx);
-        cx.notify();
+        if self.window_handle.map(|handle| handle.window_id()) == Some(window_id) {
+            self.window_handle = None;
+            // The tabs survive: the panel is only rehosted, and the next
+            // workbench window renders it inline again.
+            self.close_preview_window(cx);
+        }
     }
 
     fn activate_workbench_window(&mut self, cx: &mut Context<Self>) {
@@ -46670,6 +46696,38 @@ fn preview_panel_placement(
     }
 }
 
+/// Watches for the detached preview window closing.
+///
+/// Closing that window is a request to dock the panel back, not a request to
+/// drop it, so the owner is told to rehost the panel instead of losing it.
+///
+/// The observer cannot call the owner inline. It fires from inside the window
+/// teardown, which the workbench itself starts from inside its own update when
+/// it docks the panel back, and updating an entity that is still leased panics.
+/// It therefore skips the closes the owner started itself — recorded in
+/// `closing` — and defers the rest to the end of the effect cycle, by which
+/// point every entity has been returned to the app.
+fn observe_preview_window_close<T: 'static>(
+    owner: WeakEntity<T>,
+    closing: Rc<Cell<Option<WindowId>>>,
+    on_closed: fn(&mut T, WindowId, &mut Context<T>),
+    cx: &mut App,
+) -> Subscription {
+    cx.on_window_closed(move |cx, window_id| {
+        if closing.get() == Some(window_id) {
+            // The owner closed this window itself and has already put the
+            // panel back where it belongs.
+            return;
+        }
+        let Some(owner) = owner.upgrade() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            owner.update(cx, |owner, cx| on_closed(owner, window_id, cx));
+        });
+    })
+}
+
 fn localize_network_proxy_error(error: &str) -> String {
     match error {
         "proxy address is required when the proxy is enabled" => locale::text(
@@ -63988,6 +64046,169 @@ mod tests {
     fn floating_sidebar_matches_tauri_width_cap() {
         assert_eq!(sidebar_floating_width(1_200), 320.0);
         assert!((sidebar_floating_width(360) - 316.8).abs() < f32::EPSILON * 8.0);
+    }
+
+    /// Stands in for the workbench: an entity that closes a window it owns from
+    /// inside its own update, exactly the way docking the preview panel does.
+    struct PreviewWindowCloseProbe {
+        closing: Rc<Cell<Option<WindowId>>>,
+        removal_returned: Rc<Cell<bool>>,
+        hand_backs: Rc<Cell<usize>>,
+        hand_back_saw_removal_return: Rc<Cell<bool>>,
+    }
+
+    impl PreviewWindowCloseProbe {
+        fn new(
+            closing: Rc<Cell<Option<WindowId>>>,
+            removal_returned: Rc<Cell<bool>>,
+            hand_backs: Rc<Cell<usize>>,
+            hand_back_saw_removal_return: Rc<Cell<bool>>,
+        ) -> Self {
+            Self {
+                closing,
+                removal_returned,
+                hand_backs,
+                hand_back_saw_removal_return,
+            }
+        }
+
+        fn close_owned_window(&mut self, handle: AnyWindowHandle, cx: &mut Context<Self>) {
+            self.closing.set(Some(handle.window_id()));
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            self.closing.set(None);
+        }
+
+        /// The hand-back the observer is expected to run.
+        fn hand_back(&mut self, _: WindowId, _: &mut Context<Self>) {
+            self.hand_backs.set(self.hand_backs.get() + 1);
+            self.hand_back_saw_removal_return
+                .set(self.removal_returned.get());
+        }
+    }
+
+    impl Render for PreviewWindowCloseProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// Registers the production window-closed hand-back against a probe owner.
+    ///
+    /// Using [`observe_preview_window_close`] itself is the point: the
+    /// regression these tests guard is in that observer, so a test-local copy
+    /// would keep passing after the observer regressed.
+    fn observe_probe_window_close(
+        owner: &Entity<PreviewWindowCloseProbe>,
+        cx: &mut App,
+    ) -> Subscription {
+        observe_preview_window_close(
+            owner.downgrade(),
+            owner.read(cx).closing.clone(),
+            PreviewWindowCloseProbe::hand_back,
+            cx,
+        )
+    }
+
+    #[gpui::test]
+    fn docking_a_preview_window_does_not_hand_the_panel_back_to_a_live_owner(
+        cx: &mut TestAppContext,
+    ) {
+        // The window-closed observer fires from inside the window teardown that
+        // `remove_window` performs, so a hand-back that updates the owner there
+        // panics on the owner's live lease. This is the regression the dock and
+        // close paths hit.
+        let closing = Rc::new(Cell::new(None));
+        let removal_returned = Rc::new(Cell::new(false));
+        let hand_backs = Rc::new(Cell::new(0));
+        let saw_removal_return = Rc::new(Cell::new(false));
+        let owner = cx.update(|cx| {
+            cx.new(|_| {
+                PreviewWindowCloseProbe::new(
+                    closing.clone(),
+                    removal_returned.clone(),
+                    hand_backs.clone(),
+                    saw_removal_return.clone(),
+                )
+            })
+        });
+        let _subscription = cx.update(|cx| observe_probe_window_close(&owner, cx));
+
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| {
+                    PreviewWindowCloseProbe::new(
+                        closing.clone(),
+                        removal_returned.clone(),
+                        hand_backs.clone(),
+                        saw_removal_return.clone(),
+                    )
+                })
+            })
+            .expect("preview window probe should open")
+        });
+        let handle: AnyWindowHandle = window.into();
+
+        cx.update(|cx| {
+            owner.update(cx, |owner, cx| owner.close_owned_window(handle, cx));
+            removal_returned.set(true);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            hand_backs.get(),
+            0,
+            "the owner's own close must not schedule a hand-back"
+        );
+    }
+
+    #[gpui::test]
+    fn a_window_closed_by_the_user_hands_the_panel_back_after_the_teardown_returns(
+        cx: &mut TestAppContext,
+    ) {
+        let closing = Rc::new(Cell::new(None));
+        let removal_returned = Rc::new(Cell::new(false));
+        let hand_backs = Rc::new(Cell::new(0));
+        let saw_removal_return = Rc::new(Cell::new(false));
+        let owner = cx.update(|cx| {
+            cx.new(|_| {
+                PreviewWindowCloseProbe::new(
+                    closing.clone(),
+                    removal_returned.clone(),
+                    hand_backs.clone(),
+                    saw_removal_return.clone(),
+                )
+            })
+        });
+        let _subscription = cx.update(|cx| observe_probe_window_close(&owner, cx));
+
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| {
+                    PreviewWindowCloseProbe::new(
+                        closing.clone(),
+                        removal_returned.clone(),
+                        hand_backs.clone(),
+                        saw_removal_return.clone(),
+                    )
+                })
+            })
+            .expect("preview window probe should open")
+        });
+        let handle: AnyWindowHandle = window.into();
+
+        // A close the owner did not start is the one that has to bring the
+        // panel back, and it must wait for the teardown to finish first.
+        cx.update(|cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            removal_returned.set(true);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(hand_backs.get(), 1);
+        assert!(
+            saw_removal_return.get(),
+            "the hand-back must run after the window teardown has returned"
+        );
     }
 
     #[test]
