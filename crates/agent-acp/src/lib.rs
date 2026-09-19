@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use vibex_agent::{
     AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderElicitationResolution,
-    ProviderEvent, ProviderPermissionResolution, ProviderRuntimeResources, ProviderSessionHandle,
-    ProviderSteerOutcome, ProviderSteerRequest, ProviderTurnAttachment,
-    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    ProviderEvent, ProviderGoalControlResult, ProviderPermissionResolution,
+    ProviderRuntimeResources, ProviderSessionHandle, ProviderSteerOutcome, ProviderSteerRequest,
+    ProviderTurnAttachment, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     materialize_provider_attachments, reject_forbidden_agent_smoke_workspace,
     resolve_agent_smoke_workspace,
 };
@@ -34,19 +34,20 @@ use vibex_core::{
     AgentAuthenticationCompleteRequest, AgentCommandDiscoverRequest, AgentCommandDiscoverResponse,
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecutionBehavior,
     AgentCommandSelectionBehavior, AgentCommandSourceKind, AgentCommandTrigger,
-    AgentEventRawExtension, AgentLogoutRequest, AgentMessageDeltaPayload, AgentMessagePayload,
-    AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse, AgentModelListSource,
-    AgentReasoningEffort, AgentRetryPayload, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest, MessageSubmissionId,
-    PermissionActionDetail, PermissionRequest, PermissionRequestStatus, PermissionResponseKind,
-    PermissionResponseOption, PermissionRiskCategory, PlanPayload, PlanStepPayload,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitySummary,
-    ProviderKind, ProviderNativeBinding, ProviderProfileId, ProviderRunCapabilityProbesRequest,
-    ProviderSessionConfigOption, ProviderSessionConfigValue, ReasoningPayload, RequestId,
-    RetryKind, RetryPhase, SessionRuntimeConfigMutationRequest, SessionRuntimeConfigMutationResult,
-    SessionRuntimeSelection, SystemNoticeLevel, SystemNoticePayload, TimelineErrorPayload,
-    TimelinePayload, TimelineRedactionState, ToolCallPayload, ToolCallStatus, UserMessagePayload,
-    VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
+    AgentEventRawExtension, AgentGoalControlRequest, AgentLogoutRequest, AgentMessageDeltaPayload,
+    AgentMessagePayload, AgentMessagePhase, AgentModelCapabilities, AgentModelListResponse,
+    AgentModelListSource, AgentReasoningEffort, AgentRetryPayload, AgentSessionConfigProbe,
+    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecutionContext, ElicitationRequest,
+    MessageSubmissionId, PermissionActionDetail, PermissionRequest, PermissionRequestStatus,
+    PermissionResponseKind, PermissionResponseOption, PermissionRiskCategory, PlanPayload,
+    PlanStepPayload, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilitySummary, ProviderKind, ProviderNativeBinding, ProviderProfileId,
+    ProviderRunCapabilityProbesRequest, ProviderSessionConfigOption, ProviderSessionConfigValue,
+    ReasoningPayload, RequestId, RetryKind, RetryPhase, SessionRuntimeConfigMutationRequest,
+    SessionRuntimeConfigMutationResult, SessionRuntimeSelection, SystemNoticeLevel,
+    SystemNoticePayload, TimelineErrorPayload, TimelinePayload, TimelineRedactionState,
+    ToolCallPayload, ToolCallStatus, UserMessagePayload, VibexError, VibexResult, VibexSessionId,
+    unix_timestamp_ms,
 };
 
 mod adapter_activation;
@@ -56,6 +57,7 @@ mod claude;
 mod codex;
 mod dialect;
 mod events;
+mod goal;
 mod grok;
 mod host_fs;
 mod managed_adapter;
@@ -96,6 +98,7 @@ pub use events::{
     ClaudeEventEnricher, CodexEventEnricher, NormalizedAgentEvent, PassthroughEventEnricher,
     normalize_agent_event, parse_event_locations, parse_event_meta, stable_event_correlation_id,
 };
+pub use goal::GoalDialect;
 pub use managed_adapter::{
     AcpAdapterHealthReport, ManagedAcpAdapterStore, ManagedAdapterCommand,
     VerifiedAcpAdapterInstallation,
@@ -436,6 +439,8 @@ pub enum AcpEvent {
     UserMessage {
         text: String,
     },
+    /// One normalized goal state change published by the Agent.
+    Goal(vibex_core::GoalPayload),
 }
 
 /// Slash command advertised by a live ACP agent through
@@ -569,6 +574,45 @@ pub trait AcpClient: Send + Sync {
     /// `false`.
     async fn native_steering_supported(&self, _binding: &ProviderBinding) -> bool {
         false
+    }
+
+    /// Control vocabulary the live activation advertises; empty when the
+    /// Agent has no goal surface. Used to stamp persisted snapshots so the UI
+    /// can gate its buttons without waiting for another goal event.
+    async fn goal_actions(
+        &self,
+        _binding: &ProviderBinding,
+        _session_id: &VibexSessionId,
+    ) -> Vec<vibex_core::GoalAction> {
+        Vec::new()
+    }
+
+    /// Sends one goal-control action to the live activation behind `binding`.
+    ///
+    /// The adapter must have advertised the action; implementations reject
+    /// anything outside their vocabulary instead of guessing.
+    async fn control_goal(
+        &self,
+        _binding: &ProviderBinding,
+        _session_id: &VibexSessionId,
+        _action: vibex_core::GoalAction,
+    ) -> VibexResult<Option<vibex_core::GoalSnapshot>> {
+        Err(VibexError::capability(
+            "acp_goal_control_unsupported",
+            "this ACP adapter does not support goal control",
+        ))
+    }
+
+    /// Registers the session-scoped sink for out-of-turn state events.
+    ///
+    /// Returns whether the live attachment accepted it; adapters without
+    /// out-of-turn state answer `false`.
+    async fn register_session_events(
+        &self,
+        _binding: &ProviderBinding,
+        _sender: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    ) -> VibexResult<bool> {
+        Ok(false)
     }
 
     async fn close_session(&self, _binding: &ProviderBinding) -> VibexResult<()> {
@@ -2581,6 +2625,38 @@ impl AgentProvider for AcpAgentProvider {
         self.send_turn(handle, turn).await
     }
 
+    async fn control_goal(
+        &self,
+        handle: ProviderSessionHandle,
+        request: AgentGoalControlRequest,
+    ) -> VibexResult<ProviderGoalControlResult> {
+        let goal = self
+            .client
+            .control_goal(&handle.binding, &request.session_id, request.action)
+            .await?;
+        let actions = self
+            .client
+            .goal_actions(&handle.binding, &request.session_id)
+            .await;
+        Ok(ProviderGoalControlResult { goal, actions })
+    }
+
+    async fn register_session_events(
+        &self,
+        binding: &ProviderBinding,
+        sender: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    ) -> VibexResult<bool> {
+        self.client.register_session_events(binding, sender).await
+    }
+
+    async fn goal_actions(
+        &self,
+        binding: &ProviderBinding,
+        session_id: &VibexSessionId,
+    ) -> Vec<vibex_core::GoalAction> {
+        self.client.goal_actions(binding, session_id).await
+    }
+
     async fn resolve_permission(&self, request: ProviderPermissionResolution) -> VibexResult<()> {
         self.client
             .resolve_permission(AcpPermissionResolution {
@@ -3506,6 +3582,7 @@ pub(crate) fn map_acp_event(
                 session_title: None,
             }
         }
+        AcpEvent::Goal(payload) => ProviderEvent::provider(TimelinePayload::Goal(payload)),
         AcpEvent::Unknown { event_kind } => {
             let event_kind = if looks_sensitive(&event_kind) {
                 "redacted".to_string()

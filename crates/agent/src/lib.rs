@@ -20,10 +20,10 @@ pub(crate) mod test_support;
 
 pub use adapter::{
     AgentProvider, AgentUsageTelemetryEvent, ProviderCreateRequest, ProviderElicitationResolution,
-    ProviderEvent, ProviderPermissionResolution, ProviderRuntimeMcpServer,
-    ProviderRuntimeMcpTransport, ProviderRuntimeResources, ProviderRuntimeSkill,
-    ProviderSessionHandle, ProviderSteerOutcome, ProviderSteerRequest, ProviderTurnAttachment,
-    ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
+    ProviderEvent, ProviderGoalControlResult, ProviderPermissionResolution,
+    ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
+    ProviderRuntimeSkill, ProviderSessionHandle, ProviderSteerOutcome, ProviderSteerRequest,
+    ProviderTurnAttachment, ProviderTurnExecutionIdentity, ProviderTurnRequest, ProviderTurnResult,
     legacy_provider_runtime_binding_id, materialize_provider_attachments,
     validate_legacy_provider_turn_execution_identity,
 };

@@ -48,7 +48,7 @@ use vibex_agent::runtime_switch::{
 use vibex_agent::{
     AGENT_DELEGATION_MCP_SERVER_ID, ActiveWorkGate, ActiveWorkSnapshot, AgentManager,
     AgentUsageTelemetryEvent, ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
-    PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment, PreparedProcess,
+    PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment, PreparedProcess, ProviderEvent,
     ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
     ProviderTurnAttachment, ProviderTurnExecutionIdentity, ResolvedInitialRuntimeSelection,
     ResolvedRuntimeSelection, RestoreAssessment, RuntimeBackendSnapshot, RuntimeLeaseGuard,
@@ -1987,6 +1987,10 @@ struct AcpAttachmentShared {
     /// permits the pre-session catalog fallback. An announced-but-empty
     /// catalog is `Some(Vec::new())` and stays authoritative.
     available_commands: Option<Vec<AcpRuntimeCommand>>,
+    /// Session-scoped sink for state events that arrive while no turn is
+    /// active. The provider registers it; `None` keeps the historical
+    /// drop-without-a-turn behavior.
+    session_event_sender: Option<mpsc::UnboundedSender<ProviderEvent>>,
     current_mode_id: Option<String>,
     model_ids: Vec<String>,
     current_model_id: Option<String>,
@@ -2220,6 +2224,12 @@ struct ProcessShared {
     supports_mcp_http: bool,
     supports_mcp_sse: bool,
     operation_evidence: BTreeMap<AcpOperation, SessionConfigOperationEvidence>,
+    /// Goal channel pinned at `initialize`; `None` when the Agent advertised
+    /// no goal surface.
+    goal_channel: Option<crate::goal::AcpGoalChannel>,
+    /// Last goal snapshot observed on this activation, used to answer control
+    /// requests and to close a card on a `null` clear.
+    last_goal: Option<vibex_core::GoalSnapshot>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2990,6 +3000,37 @@ impl AcpSessionAttachment {
                 true
             }
         }
+    }
+
+    /// Registers the session-scoped sink for out-of-turn state events.
+    fn set_session_event_sender(&self, sender: mpsc::UnboundedSender<ProviderEvent>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.session_event_sender = Some(sender);
+        }
+    }
+
+    /// Emits one goal state change.
+    ///
+    /// Goal state is the one provider event that stays meaningful outside a
+    /// turn: codex-acp reports goal-loop transitions while no prompt is open.
+    /// Inside a turn the event joins the turn stream; otherwise it goes to the
+    /// session-scoped sink so the manager can persist it without a prompt.
+    fn emit_goal_event(&self, payload: vibex_core::GoalPayload) -> bool {
+        if self.emit_turn_event(AcpEvent::Goal(payload.clone())) {
+            return true;
+        }
+        let sender = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_event_sender.clone());
+        sender.is_some_and(|sender| {
+            sender
+                .send(ProviderEvent::provider(vibex_core::TimelinePayload::Goal(
+                    payload,
+                )))
+                .is_ok()
+        })
     }
 
     fn retry_correlation_id(&self, kind: RetryKind) -> String {
@@ -4231,6 +4272,22 @@ impl AcpSessionAttachment {
                     .and_then(vibex_core::normalize_agent_session_title)
                 {
                     self.emit_turn_event(AcpEvent::SessionTitle { title });
+                }
+                if let Some(channel) = self.process().goal_channel()
+                    && let Some(goal_update) =
+                        crate::goal::goal_update_from_session_info(update, &channel)
+                {
+                    let payload = match goal_update {
+                        crate::goal::AcpGoalUpdate::Snapshot(goal) => {
+                            self.process().remember_goal(Some(goal.clone()));
+                            vibex_core::GoalPayload::snapshot(goal, channel.actions.clone())
+                        }
+                        crate::goal::AcpGoalUpdate::Cleared => {
+                            self.process().remember_goal(None);
+                            vibex_core::GoalPayload::cleared(channel.actions.clone())
+                        }
+                    };
+                    self.emit_goal_event(payload);
                 }
             }
             "agent_message_chunk" => {
@@ -6836,6 +6893,32 @@ impl AcpProcess {
             });
         }
         metadata
+    }
+
+    fn goal_channel(&self) -> Option<crate::goal::AcpGoalChannel> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.goal_channel.clone())
+    }
+
+    fn set_goal_channel(&self, channel: crate::goal::AcpGoalChannel) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.goal_channel = Some(channel);
+        }
+    }
+
+    fn remember_goal(&self, goal: Option<vibex_core::GoalSnapshot>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.last_goal = goal;
+        }
+    }
+
+    fn current_goal(&self) -> Option<vibex_core::GoalSnapshot> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.last_goal.clone())
     }
 
     fn operation_evidence(
@@ -12782,6 +12865,36 @@ impl AcpRuntimeClient {
                 },
             );
         }
+        let goal_dialect = self
+            .compatibility_registry
+            .for_agent(&process.agent_id)
+            .filter(|descriptor| {
+                descriptor.expected_compatibility_identity().to_string()
+                    == process.compatibility_identity
+            })
+            .map(|descriptor| descriptor.goal)
+            .unwrap_or_else(|| agent_dialect_profile(process.agent_id.as_str()).goal);
+        if let Some(channel) = crate::goal::goal_channel_from_initialize(&result, goal_dialect) {
+            // Goal state is presentation data, not a session-config fence, so
+            // its evidence is recorded per activation like steering.
+            let operation = if channel.neutral_namespace {
+                AcpOperation::SessionGoalControl
+            } else {
+                AcpOperation::SessionGoalControlLegacy
+            };
+            operation_evidence.insert(
+                operation,
+                SessionConfigOperationEvidence {
+                    support: CapabilitySupport::Supported,
+                    source: CapabilitySource::NegotiatedRuntime,
+                    encoding: AcpWireEncoding::ExtensionCodec,
+                    stability: AcpOperationStability::AdapterExtension,
+                    compatibility_identity: process.compatibility_identity.clone(),
+                    activation_generation: 0,
+                },
+            );
+            process.set_goal_channel(channel);
+        }
         if let Some(descriptor) = self.compatibility_registry.for_agent(&process.agent_id)
             && descriptor.expected_compatibility_identity().to_string()
                 == process.compatibility_identity
@@ -18105,6 +18218,62 @@ impl AcpClient for AcpRuntimeClient {
             .is_some_and(|evidence| {
                 evidence.supported_for(&process.compatibility_identity, generation)
             })
+    }
+
+    async fn control_goal(
+        &self,
+        _binding: &ProviderBinding,
+        session_id: &VibexSessionId,
+        action: vibex_core::GoalAction,
+    ) -> VibexResult<Option<vibex_core::GoalSnapshot>> {
+        let Some(attachment) = self.current_attachment(session_id) else {
+            return Err(VibexError::conflict(
+                "acp_goal_control_no_session",
+                "ACP session has no live attachment for goal control",
+            ));
+        };
+        let process = attachment.payload().process();
+        let Some(channel) = process.goal_channel() else {
+            return Err(VibexError::capability(
+                "acp_goal_control_unsupported",
+                "ACP agent did not advertise a goal surface",
+            ));
+        };
+        if !channel.supports(action) {
+            return Err(VibexError::capability(
+                "acp_goal_action_unsupported",
+                "ACP agent does not implement this goal action",
+            ));
+        }
+        let params =
+            crate::goal::build_goal_control_params(&attachment.fence().native_session_id, action);
+        process
+            .request(&channel.control_method, params, self.prompt_timeout)
+            .await?;
+        Ok(process.current_goal())
+    }
+
+    async fn register_session_events(
+        &self,
+        binding: &ProviderBinding,
+        sender: mpsc::UnboundedSender<ProviderEvent>,
+    ) -> VibexResult<bool> {
+        let Some(attachment) = self.current_attachment(&binding.session_id) else {
+            return Ok(false);
+        };
+        attachment.payload().set_session_event_sender(sender);
+        Ok(true)
+    }
+
+    async fn goal_actions(
+        &self,
+        binding: &ProviderBinding,
+        _session_id: &VibexSessionId,
+    ) -> Vec<vibex_core::GoalAction> {
+        self.current_attachment(&binding.session_id)
+            .and_then(|attachment| attachment.payload().process().goal_channel())
+            .map(|channel| channel.actions)
+            .unwrap_or_default()
     }
 
     async fn close_session(&self, binding: &ProviderBinding) -> VibexResult<()> {
@@ -24024,6 +24193,7 @@ restore_mode = os.environ.get("VIBEX_MOCK_ACP_RESTORE_MODE", "success")
 advertise_resume = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_RESUME") == "true"
 advertise_fork = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_FORK") == "true"
 advertise_steering = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_STEERING") == "true"
+advertise_goal = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_GOAL") == "true"
 advertise_auth = os.environ.get("VIBEX_MOCK_ACP_ADVERTISE_LOGIN") == "true"
 authenticate_hangs = os.environ.get("VIBEX_MOCK_ACP_LOGIN_HANG") == "true"
 initialize_mode = os.environ.get("VIBEX_MOCK_ACP_INITIALIZE_MODE", "success")
@@ -24059,6 +24229,29 @@ def send_available_commands(session_id, name, description):
             "update": {
                 "sessionUpdate": "available_commands_update",
                 "availableCommands": [{"name": name, "description": description}],
+            },
+        },
+    })
+
+
+def send_goal_update(session_id, status, objective):
+    # Codex reports goal-loop transitions while no prompt is open; the client
+    # has to consume them outside a turn.
+    send({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": {
+                    "goal": {
+                        "objective": objective,
+                        "status": status,
+                        "tokensUsed": 5,
+                        "tokenBudget": 100,
+                    },
+                },
             },
         },
     })
@@ -24119,6 +24312,12 @@ for line in sys.stdin:
         }
         if advertise_steering:
             result["_meta"] = {"steering": {"supported": True}}
+        if advertise_goal:
+            result.setdefault("_meta", {})["goal"] = {
+                "version": 1,
+                "controlMethod": "_session/goal",
+                "actions": ["pause", "clear"],
+            }
         if advertise_auth:
             result["authMethods"] = [
                 {
@@ -24295,6 +24494,19 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "injected"}})
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
+    elif method == "_session/goal":
+        goal_action = msg.get("params", {}).get("action", "")
+        goal_session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
+        if goal_action not in ("pause", "clear"):
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32602, "message": "unsupported goal action"},
+            })
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            if goal_action == "pause":
+                send_goal_update(goal_session_id, "paused", "ship it")
     elif method == "session/set_model":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         model_id = msg.get("params", {}).get("modelId", model_1)
@@ -25491,6 +25703,35 @@ for line in sys.stdin:
                 value: Some("true".to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock steering capability".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        /// Adds the mock goal-capability env before any process spawn, so the
+        /// next initialize advertises `_meta.goal` with pause/clear controls.
+        fn set_advertise_goal(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            if config
+                .env
+                .iter()
+                .any(|entry| entry.key == "VIBEX_MOCK_ACP_ADVERTISE_GOAL")
+            {
+                return;
+            }
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_ADVERTISE_GOAL".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock goal capability".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -33323,6 +33564,104 @@ for line in sys.stdin:
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_acp_agent_advertises_and_answers_goal_control() {
+        let Some(fixture) = MockAcpFixture::create("goal-control") else {
+            return;
+        };
+        fixture.set_advertise_goal();
+        let client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            fixture.db_path.clone(),
+        )));
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        assert_eq!(
+            client.goal_actions(&binding, &session_id).await,
+            vec![vibex_core::GoalAction::Pause, vibex_core::GoalAction::Clear]
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        assert!(
+            client
+                .register_session_events(&binding, sender)
+                .await
+                .unwrap()
+        );
+        client
+            .control_goal(&binding, &session_id, vibex_core::GoalAction::Pause)
+            .await
+            .expect("advertised pause must reach the agent");
+        let event = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("an out-of-turn goal update must arrive")
+            .expect("the goal sink stays open");
+        match event.payload {
+            vibex_core::TimelinePayload::Goal(payload) => {
+                let goal = payload.goal.expect("goal snapshot");
+                assert_eq!(goal.objective, "ship it");
+                assert_eq!(goal.phase, vibex_core::GoalPhase::Paused);
+                assert_eq!(goal.tokens_used, Some(5));
+            }
+            other => panic!("expected a goal payload, got {other:?}"),
+        }
+        let error = client
+            .control_goal(&binding, &session_id, vibex_core::GoalAction::Resume)
+            .await
+            .expect_err("resume was not advertised");
+        assert_eq!(error.code, "acp_goal_action_unsupported");
+
+        // An agent without the advertisement exposes no goal surface.
+        let Some(plain) = MockAcpFixture::create("goal-control-unsupported") else {
+            client.close_session(&binding).await.unwrap();
+            fixture.cleanup();
+            return;
+        };
+        let plain_client = Arc::new(AcpRuntimeClient::new(ProviderConfigService::new(
+            plain.db_path.clone(),
+        )));
+        let plain_session_id = VibexSessionId::new();
+        let plain_session = plain_client
+            .create_session(AcpCreateSessionRequest {
+                session_id: plain_session_id.clone(),
+                provider_profile_id: plain.profile_id.clone(),
+                model: None,
+                workspace_root: plain.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let plain_binding = test_binding_for(&plain_session_id, &plain.profile_id, &plain_session);
+        assert!(
+            plain_client
+                .goal_actions(&plain_binding, &plain_session_id)
+                .await
+                .is_empty()
+        );
+        let error = plain_client
+            .control_goal(
+                &plain_binding,
+                &plain_session_id,
+                vibex_core::GoalAction::Pause,
+            )
+            .await
+            .expect_err("goal control must be unsupported");
+        assert_eq!(error.code, "acp_goal_control_unsupported");
+
+        client.close_session(&binding).await.unwrap();
+        plain_client.close_session(&plain_binding).await.unwrap();
+        fixture.cleanup();
+        plain.cleanup();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

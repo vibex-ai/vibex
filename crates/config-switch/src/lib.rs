@@ -6977,6 +6977,11 @@ pub fn acp_capabilities_from_config(config: &AcpProviderConfig) -> ProviderCapab
         );
     capabilities.terminal_activity_hooks =
         acp_feature_enabled(config, &["terminal_activity_hooks", "terminal_hooks"]);
+    if acp_feature_enabled(config, &["goal", "goals", "goal_mode"]) {
+        // Static floor only: the live `initialize` advertisement decides which
+        // control verbs exist, and goal snapshots carry that vocabulary.
+        capabilities.goal = vibex_core::GoalCapability::observe();
+    }
     capabilities
 }
 

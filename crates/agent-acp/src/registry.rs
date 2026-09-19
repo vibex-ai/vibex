@@ -396,6 +396,9 @@ pub struct AcpAgentCompatibility {
     pub config_option_aliases: BTreeMap<String, Vec<String>>,
     pub transcript_strategy: TranscriptStrategy,
     pub event_enricher: AgentEventEnricherKind,
+    /// Goal wire dialect pinned to this adapter identity. Descriptor-backed
+    /// knowledge wins over the generic dialect profile.
+    pub goal: crate::goal::GoalDialect,
     pub known_quirks: Vec<VersionedAgentQuirk>,
     pub bridge_contract: Vec<BridgeContractCase>,
 }
@@ -984,6 +987,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         ]),
         transcript_strategy: TranscriptStrategy::ClaudeJsonl,
         event_enricher: AgentEventEnricherKind::Claude,
+        goal: crate::goal::GoalDialect::neutral(),
         known_quirks: vec![VersionedAgentQuirk {
             id: "claude-sdk-extension-notifications".to_string(),
             compatibility_identity: identity,
@@ -1096,6 +1100,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
         ]),
         transcript_strategy: TranscriptStrategy::CodexRollout,
         event_enricher: AgentEventEnricherKind::Codex,
+        goal: crate::goal::GoalDialect::codex(),
         known_quirks: vec![VersionedAgentQuirk {
             id: "codex-legacy-set-model-extension".to_string(),
             compatibility_identity: identity,
@@ -1200,6 +1205,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
         ]),
         transcript_strategy: TranscriptStrategy::ZcodeSession,
         event_enricher: AgentEventEnricherKind::Passthrough,
+        goal: crate::goal::GoalDialect::unsupported(),
         known_quirks: Vec::new(),
         bridge_contract: bridge_contract_cases(),
     })

@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
-    ElicitationRequestStatus, PermissionRequestStatus, PlanStepPayload, PlanStepStatus, RetryPhase,
-    TimelineItem, TimelineItemKind, TimelinePayload, ToolCallStatus, VibexSessionId,
+    ElicitationRequestStatus, GoalChangeKind, GoalPayload, PermissionRequestStatus,
+    PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem, TimelineItemKind, TimelinePayload,
+    ToolCallStatus, VibexSessionId,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
@@ -134,6 +135,7 @@ pub enum TimelineRowKind {
     AgentMessage,
     Reasoning,
     Plan,
+    Goal,
     ToolCall,
     Command,
     FileOperation,
@@ -1129,6 +1131,7 @@ fn timeline_rows_from_refs(items: &[&TimelineItem]) -> Vec<TimelineRow> {
                 false,
                 true,
             )),
+            TimelinePayload::Goal(goal) => rows.push(goal_row(item, goal)),
             TimelinePayload::ToolCall(tool) => rows.push(simple_row(
                 item,
                 format!("tool:{}", tool.tool_call_id),
@@ -1455,6 +1458,81 @@ fn decorate_turn_metadata(rows: &mut [TimelineRow], items: &[&TimelineItem]) {
             .conclusion_item_id
             .as_ref()
             .is_some_and(|conclusion_id| row.item_ids.iter().any(|id| id == conclusion_id));
+    }
+}
+
+fn goal_row(item: &TimelineItem, payload: &GoalPayload) -> TimelineRow {
+    let objective = payload
+        .goal
+        .as_ref()
+        .map(|goal| goal.objective.clone())
+        .unwrap_or_default();
+    let streaming = payload.change == GoalChangeKind::Snapshot
+        && payload
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.phase.is_open());
+    let failed = payload.change == GoalChangeKind::ControlFailed;
+    TimelineRow {
+        id: format!("goal:{}", item.id),
+        kind: TimelineRowKind::Goal,
+        item_ids: vec![item.id.to_string()],
+        turn_id: None,
+        turn_item_count: 0,
+        turn_failed: false,
+        turn_pending_permission: false,
+        conclusion: false,
+        first_sequence: item.sequence,
+        last_sequence: item.sequence,
+        title: if objective.is_empty() {
+            "Goal".to_string()
+        } else {
+            objective
+        },
+        body: goal_row_summary(payload),
+        streaming,
+        collapsible: true,
+        pending_permission: false,
+        failed,
+        runtime_attribution: runtime_attribution(item),
+        file_path: None,
+    }
+}
+
+/// Plain-text summary for previews and session search. The goal card renders
+/// the structured payload instead; this text only has to stay searchable.
+fn goal_row_summary(payload: &GoalPayload) -> String {
+    match payload.change {
+        GoalChangeKind::Snapshot => {
+            let Some(goal) = payload.goal.as_ref() else {
+                return String::new();
+            };
+            let mut parts = vec![format!("Goal {}", goal.phase.as_str())];
+            if let Some(used) = goal.tokens_used {
+                match goal.token_budget {
+                    Some(budget) => parts.push(format!("{used}/{budget} tokens")),
+                    None => parts.push(format!("{used} tokens")),
+                }
+            }
+            if let (Some(started), Some(max)) = (goal.rounds_started, goal.max_rounds) {
+                parts.push(format!("round {started}/{max}"));
+            }
+            if let Some(reason) = goal.blocked_reason.as_ref() {
+                parts.push(reason.message.clone());
+            }
+            parts.join(" · ")
+        }
+        GoalChangeKind::Cleared => "Goal cleared".to_string(),
+        GoalChangeKind::ControlRequested => match payload.action {
+            Some(action) => format!("Goal {} requested", action.as_str()),
+            None => "Goal control requested".to_string(),
+        },
+        GoalChangeKind::ControlFailed => match (payload.action, payload.message.as_deref()) {
+            (Some(action), Some(message)) => format!("Goal {} failed: {message}", action.as_str()),
+            (Some(action), None) => format!("Goal {} failed", action.as_str()),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "Goal control failed".to_string(),
+        },
     }
 }
 
@@ -3281,6 +3359,38 @@ mod tests {
         assert!(rows[1].conclusion);
         assert!(!rows[2].turn_failed);
         assert!(rows[2].conclusion);
+    }
+
+    #[test]
+    fn goal_rows_project_status_and_streaming() {
+        let mut active = vibex_core::GoalSnapshot::new("ship it", vibex_core::GoalPhase::Active);
+        active.tokens_used = Some(12);
+        active.token_budget = Some(100);
+        let rows = timeline_rows(&[
+            item(
+                1,
+                None,
+                TimelinePayload::Goal(vibex_core::GoalPayload::snapshot(
+                    active,
+                    vec![vibex_core::GoalAction::Pause, vibex_core::GoalAction::Clear],
+                )),
+            ),
+            item(
+                2,
+                None,
+                TimelinePayload::Goal(vibex_core::GoalPayload::cleared(Vec::new())),
+            ),
+        ]);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, TimelineRowKind::Goal);
+        assert_eq!(rows[0].title, "ship it");
+        assert!(rows[0].streaming);
+        assert!(rows[0].body.contains("active"));
+        assert!(rows[0].body.contains("12/100 tokens"));
+        assert_eq!(rows[1].kind, TimelineRowKind::Goal);
+        assert!(!rows[1].streaming);
+        assert_eq!(rows[1].body, "Goal cleared");
     }
 
     #[test]

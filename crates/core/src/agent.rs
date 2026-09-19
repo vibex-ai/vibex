@@ -289,6 +289,38 @@ pub struct ContinueAgentTurnRequest {
     pub correlation_id: Option<CorrelationId>,
 }
 
+/// One goal-control mutation requested by a client.
+///
+/// The action vocabulary is provider-advertised; callers must have checked
+/// [`crate::goal::GoalCapability::supports_control`] before sending. The
+/// provider answers with the resulting snapshot when it has one, otherwise the
+/// change arrives asynchronously as a `TimelinePayload::Goal` item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGoalControlRequest {
+    pub session_id: VibexSessionId,
+    pub action: crate::goal::GoalAction,
+    /// Replacement objective for `set`/`edit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// Optimistic-concurrency guard: when the live goal revision differs, the
+    /// mutation is rejected instead of clobbering a newer goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    pub correlation_id: Option<CorrelationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGoalControlResult {
+    /// The snapshot the provider returned inline, when it returned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::GoalSnapshot>,
+    /// Timeline items the control appended (control record, snapshot, error).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<crate::timeline::TimelineItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentModelListSource {

@@ -80,6 +80,12 @@ pub enum AcpOperation {
     /// Adapter extension `_session/steering`: injects a user message into the
     /// turn that is already running instead of starting a new turn.
     SessionSteering,
+    /// Adapter extension `_session/goal`: provider-neutral goal control
+    /// (claude-agent-acp 0.66+, codex-acp 1.2+).
+    SessionGoalControl,
+    /// Codex's bespoke `_codex/session/goal_control`, still accepted by newer
+    /// codex-acp builds as an alias.
+    SessionGoalControlLegacy,
     SessionLoad,
     SessionList,
     SessionSetMode,
@@ -114,6 +120,8 @@ impl AcpOperation {
             Self::SessionPrompt => "session/prompt",
             Self::SessionCancel => "session/cancel",
             Self::SessionSteering => "_session/steering",
+            Self::SessionGoalControl => "_session/goal",
+            Self::SessionGoalControlLegacy => "_codex/session/goal_control",
             Self::SessionLoad => "session/load",
             Self::SessionList => "session/list",
             Self::SessionSetMode => "session/set_mode",
@@ -146,6 +154,8 @@ impl AcpOperation {
             "session/prompt" => Self::SessionPrompt,
             "session/cancel" => Self::SessionCancel,
             "_session/steering" => Self::SessionSteering,
+            "_session/goal" => Self::SessionGoalControl,
+            "_codex/session/goal_control" => Self::SessionGoalControlLegacy,
             "session/load" => Self::SessionLoad,
             "session/list" => Self::SessionList,
             "session/set_mode" => Self::SessionSetMode,

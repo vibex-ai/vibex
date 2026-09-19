@@ -86,16 +86,17 @@ use vibex_core::{
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentCommandDiscoverRequest,
     AgentCommandDiscoverResponse, AgentCommandEntry, AgentCommandExecuteRequest,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentId, AgentListRequest, AgentMessagePhase,
-    AgentSession, AgentSessionRuntimeSelectionState, AgentSessionSafety, AgentSessionState,
-    AgentSnapshotEntry, AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode,
-    AgentTokenUsage, AttachRuntimeRequest, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest,
-    FileEntryKind, FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
-    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
-    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
-    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentGoalControlRequest, AgentId,
+    AgentListRequest, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
+    AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
+    AgentTimelineReasoningDisplayMode, AgentTokenUsage, AttachRuntimeRequest,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind, FileOperationKind,
+    FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalChangeKind, GoalPhase,
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
     PromptId, ProviderProfileSummary, RenameAgentSessionRequest, ReplaceUserMessagePayload,
@@ -2917,6 +2918,33 @@ impl AgentSessionViewCacheEntry {
     }
 }
 
+fn goal_phase_label(phase: GoalPhase) -> String {
+    match phase {
+        GoalPhase::Active => locale::text("Active", "进行中", "進行中").to_string(),
+        GoalPhase::Paused => locale::text("Paused", "已暂停", "已暫停").to_string(),
+        GoalPhase::Blocked => locale::text("Blocked", "已阻塞", "已阻塞").to_string(),
+        GoalPhase::UsageLimited => {
+            locale::text("Usage limited", "额度受限", "額度受限").to_string()
+        }
+        GoalPhase::BudgetLimited => {
+            locale::text("Budget limited", "预算耗尽", "預算耗盡").to_string()
+        }
+        GoalPhase::Complete => locale::text("Complete", "已完成", "已完成").to_string(),
+        GoalPhase::Unknown => locale::text("Unknown", "未知", "未知").to_string(),
+    }
+}
+
+fn format_goal_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    format!("{}h", minutes / 60)
+}
+
 fn timeline_items_resident_bytes(items: &[TimelineItem]) -> usize {
     items
         .iter()
@@ -2972,6 +3000,20 @@ fn timeline_item_resident_bytes(item: &TimelineItem) -> usize {
                 .map(|step| step.title.len())
                 .sum::<usize>(),
         ),
+        TimelinePayload::Goal(goal) => goal
+            .goal
+            .as_ref()
+            .map(|snapshot| {
+                snapshot.objective.len().saturating_add(
+                    snapshot
+                        .blocked_reason
+                        .as_ref()
+                        .map(|reason| reason.message.len())
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default()
+            .saturating_add(goal.message.as_deref().map(str::len).unwrap_or_default()),
         TimelinePayload::ToolCall(tool) => tool
             .tool_call_id
             .len()
@@ -39076,6 +39118,7 @@ impl VibexWorkbench {
             TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
                 self.render_thought_process_row(row, cx)
             }
+            TimelineRowKind::Goal => self.render_goal_card(row, window, cx),
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest if self.rendering_child_agent_timeline() => {
                 self.render_fallback_process_row(row, cx)
@@ -39435,6 +39478,18 @@ impl VibexWorkbench {
                     4.0
                 } else {
                     ((estimated_wrapped_lines(&row.body, 72) as f32) * 24.0).min(288.0) + 4.0
+                }
+            }
+            TimelineRowKind::Goal => {
+                if self
+                    .timeline_command_expansion
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    estimated_markdown_body_height(&row.body, 72) + 132.0
+                } else {
+                    44.0
                 }
             }
             TimelineRowKind::Error => {
@@ -41120,6 +41175,351 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         render_agent_file_diff_scroll_area(rows, scroll, cx)
+    }
+
+    fn render_goal_card(
+        &mut self,
+        row: &TimelineRow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(payload) =
+            self.timeline_row_latest_item(row)
+                .and_then(|item| match &item.payload {
+                    vibex_core::TimelinePayload::Goal(goal) => Some(goal.clone()),
+                    _ => None,
+                })
+        else {
+            return self.render_process_activity_line(row, cx);
+        };
+        let expanded = self
+            .timeline_command_expansion
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
+        let has_details = payload.goal.is_some() || payload.message.is_some();
+        let toggle_id = row.id.clone();
+        let measured_turn_id = row.turn_id.clone();
+        let goal = payload.goal.clone();
+        let objective = goal
+            .as_ref()
+            .map(|goal| goal.objective.clone())
+            .unwrap_or_default();
+        let phase = goal.as_ref().map(|goal| goal.phase);
+        let failed = payload.change == GoalChangeKind::ControlFailed
+            || matches!(
+                phase,
+                Some(GoalPhase::Blocked | GoalPhase::UsageLimited | GoalPhase::BudgetLimited)
+            );
+        let in_progress =
+            payload.change == GoalChangeKind::Snapshot && phase.is_some_and(GoalPhase::is_open);
+        let goal_label = locale::text("Goal", "目标", "目標").to_string();
+        let header_text = if objective.is_empty() {
+            goal_label
+        } else {
+            format!("{goal_label}: {objective}")
+        };
+        let actions = payload.actions.clone();
+        let show_pause = phase == Some(GoalPhase::Active) && actions.contains(&GoalAction::Pause);
+        let show_resume = matches!(
+            phase,
+            Some(GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited)
+        ) && actions.contains(&GoalAction::Resume);
+        let show_clear = matches!(phase, Some(GoalPhase::Active | GoalPhase::Paused))
+            && actions.contains(&GoalAction::Clear);
+        let accent = if failed {
+            cx.theme().danger
+        } else {
+            cx.theme().primary
+        };
+
+        let mut detail_rows = Vec::new();
+        if let Some(goal) = goal.as_ref() {
+            detail_rows.push(self.render_goal_detail_row(
+                locale::text("Status", "状态", "狀態").to_string(),
+                goal_phase_label(goal.phase),
+                cx,
+            ));
+            if let Some(used) = goal.tokens_used {
+                let value = match goal.token_budget {
+                    Some(budget) => format!("{used} / {budget}"),
+                    None => used.to_string(),
+                };
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Tokens used", "已用 tokens", "已用 tokens").to_string(),
+                    value,
+                    cx,
+                ));
+            }
+            if let Some(budget) = goal.token_budget {
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Budget", "预算", "預算").to_string(),
+                    budget.to_string(),
+                    cx,
+                ));
+            }
+            if let Some(remaining) = goal.remaining_tokens() {
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Remaining", "剩余", "剩餘").to_string(),
+                    remaining.to_string(),
+                    cx,
+                ));
+            }
+            if let Some(seconds) = goal.time_used_seconds {
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Elapsed", "耗时", "耗時").to_string(),
+                    format_goal_duration(seconds),
+                    cx,
+                ));
+            }
+            if let (Some(started), Some(max)) = (goal.rounds_started, goal.max_rounds) {
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Rounds", "轮次", "輪次").to_string(),
+                    format!("{started} / {max}"),
+                    cx,
+                ));
+            }
+            if let Some(reason) = goal.blocked_reason.as_ref() {
+                detail_rows.push(self.render_goal_detail_row(
+                    locale::text("Blocked", "阻塞", "阻塞").to_string(),
+                    reason.message.clone(),
+                    cx,
+                ));
+            }
+        }
+        if let Some(message) = payload.message.clone() {
+            detail_rows.push(self.render_goal_detail_row(
+                locale::text("Detail", "详情", "詳情").to_string(),
+                message,
+                cx,
+            ));
+        }
+
+        let mut action_buttons = Vec::new();
+        if show_pause {
+            action_buttons.push(self.render_goal_action_button(
+                row,
+                GoalAction::Pause,
+                locale::text("Pause", "暂停", "暫停").to_string(),
+                IconName::Pause,
+                cx,
+            ));
+        }
+        if show_resume {
+            action_buttons.push(self.render_goal_action_button(
+                row,
+                GoalAction::Resume,
+                locale::text("Resume", "继续", "繼續").to_string(),
+                IconName::Play,
+                cx,
+            ));
+        }
+        if show_clear {
+            action_buttons.push(self.render_goal_action_button(
+                row,
+                GoalAction::Clear,
+                locale::text("Clear", "清除", "清除").to_string(),
+                IconName::Close,
+                cx,
+            ));
+        }
+
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(if failed {
+                cx.theme().danger.opacity(0.38)
+            } else {
+                cx.theme().border
+            })
+            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("goal-card-header:{}", row.id)))
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(40.0))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .when(has_details, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(turn_id) = measured_turn_id.as_deref() {
+                                    this.invalidate_timeline_turn_measurement(turn_id);
+                                }
+                                this.timeline_command_expansion
+                                    .insert(toggle_id.clone(), !expanded);
+                                this.rebuild_timeline_sizes();
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        Icon::new(IconName::Map)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(accent),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .child(header_text),
+                    )
+                    .when(has_details, |this| {
+                        this.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                    }),
+            )
+            .when(expanded && has_details, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .px_3()
+                        .pb_3()
+                        .child(v_flex().w_full().min_w_0().gap_1().children(detail_rows))
+                        .when(!action_buttons.is_empty(), |this| {
+                            this.child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .pt_1()
+                                    .children(action_buttons),
+                            )
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_goal_detail_row(&self, label: String, value: String, cx: &App) -> AnyElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .w(px(88.0))
+                    .flex_none()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .text_color(cx.theme().foreground)
+                    .child(value),
+            )
+            .into_any_element()
+    }
+
+    fn render_goal_action_button(
+        &self,
+        row: &TimelineRow,
+        action: GoalAction,
+        label: String,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(SharedString::from(format!(
+                "goal-action:{}:{}",
+                row.id,
+                action.as_str()
+            )))
+            .cursor_pointer()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|style| style.bg(cx.theme().muted.opacity(0.5)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.control_session_goal(action, cx);
+            }))
+            .child(Icon::new(icon).size(px(12.0)).flex_none())
+            .child(label)
+            .into_any_element()
+    }
+
+    /// Applies one goal-control action to the selected session's live Agent.
+    ///
+    /// Goal state changes arrive back through the session event pump and the
+    /// live timeline stream, so the card refreshes without a manual reload.
+    fn control_session_goal(&mut self, action: GoalAction, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            self.agent_error = Some(
+                locale::text(
+                    "Local runtime is not ready",
+                    "本地运行时尚未就绪",
+                    "本地執行時尚未就緒",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        self.agent_error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            runtime
+                .agent()
+                .manager()
+                .control_goal(AgentGoalControlRequest {
+                    session_id: session_id.clone(),
+                    action,
+                    objective: None,
+                    expected_revision: None,
+                    correlation_id: None,
+                })
+                .await
+        });
+        cx.spawn(async move |entity, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                match &outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        this.agent_error = Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => {
+                        this.agent_error = Some(format!("Agent action failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_image_generation_card(

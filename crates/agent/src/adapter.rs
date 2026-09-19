@@ -10,14 +10,14 @@ use tokio::sync::mpsc;
 use vibex_core::{
     AgentAuthCatalog, AgentAuthenticateRequest, AgentAuthenticateResult,
     AgentAuthenticationCancelRequest, AgentAuthenticationCompleteRequest,
-    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest, AgentId,
-    AgentLogoutRequest, AgentModelListResponse, AgentModelListSource, AgentSessionConfigProbe,
-    AgentSessionSafety, AgentUsageCounterOrigin, AgentUsageExecution, AgentUsageExecutionContext,
-    AgentUsageExecutionStatusUpdate, AgentUsageObservation, ElicitationResolution,
-    MessageAttachment, MessageSubmissionId, PermissionResolution, ProviderBinding,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderKind, ProviderProfileId,
-    RuntimeBindingId, SessionRuntimeSelection, TimelinePayload, TimelineRedactionState,
-    TimelineSource, VibexError, VibexResult, VibexSessionId,
+    AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandExecuteRequest,
+    AgentGoalControlRequest, AgentId, AgentLogoutRequest, AgentModelListResponse,
+    AgentModelListSource, AgentSessionConfigProbe, AgentSessionSafety, AgentUsageCounterOrigin,
+    AgentUsageExecution, AgentUsageExecutionContext, AgentUsageExecutionStatusUpdate,
+    AgentUsageObservation, ElicitationResolution, MessageAttachment, MessageSubmissionId,
+    PermissionResolution, ProviderBinding, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderKind, ProviderProfileId, RuntimeBindingId, SessionRuntimeSelection, TimelinePayload,
+    TimelineRedactionState, TimelineSource, VibexError, VibexResult, VibexSessionId,
 };
 
 #[derive(Debug, Clone)]
@@ -418,6 +418,19 @@ impl ProviderEvent {
     }
 }
 
+/// Result of one goal-control mutation.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderGoalControlResult {
+    /// The snapshot the provider returned inline, when it returned one. A
+    /// provider that only publishes snapshots asynchronously leaves this
+    /// `None`; the manager still records the control request.
+    pub goal: Option<vibex_core::GoalSnapshot>,
+    /// The control vocabulary the live activation advertises. Carried on the
+    /// result so the persisted snapshot keeps gating the UI even when the
+    /// session-scoped goal event never re-announces it.
+    pub actions: Vec<vibex_core::GoalAction>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderTurnResult {
     pub events: Vec<ProviderEvent>,
@@ -624,6 +637,44 @@ pub trait AgentProvider: Send + Sync {
             "provider_command_execution_unsupported",
             "this provider does not support command execution",
         ))
+    }
+
+    /// Control vocabulary the live activation advertises; empty when the
+    /// Agent has no goal surface. Used to stamp persisted goal snapshots so
+    /// clients can gate their buttons without waiting for another event.
+    async fn goal_actions(
+        &self,
+        _binding: &ProviderBinding,
+        _session_id: &VibexSessionId,
+    ) -> Vec<vibex_core::GoalAction> {
+        Vec::new()
+    }
+
+    /// Applies one goal-control action (pause/resume/clear/edit/set).
+    ///
+    /// Providers without a goal surface keep the capability error default;
+    /// callers must gate on the advertised goal capability first.
+    async fn control_goal(
+        &self,
+        _handle: ProviderSessionHandle,
+        _request: AgentGoalControlRequest,
+    ) -> VibexResult<ProviderGoalControlResult> {
+        Err(VibexError::capability(
+            "provider_goal_control_unsupported",
+            "this provider does not support goal control",
+        ))
+    }
+
+    /// Registers a session-scoped event sink for provider state that arrives
+    /// while no turn is active (for example goal-loop transitions). Returns
+    /// whether the provider accepted the sink; providers without out-of-turn
+    /// state answer `false` and keep dropping such events.
+    async fn register_session_events(
+        &self,
+        _binding: &ProviderBinding,
+        _sender: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    ) -> VibexResult<bool> {
+        Ok(false)
     }
 
     async fn interrupt(&self, _handle: ProviderSessionHandle) -> VibexResult<()> {

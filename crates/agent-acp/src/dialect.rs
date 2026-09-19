@@ -26,6 +26,7 @@
 //! A descriptor always wins over a profile: managed adapters are exact-version
 //! contracts, profiles are best-effort family knowledge.
 
+use crate::goal::GoalDialect;
 use crate::registry::{AgentEventEnricherKind, RestorePolicy};
 
 /// How much is actually known about an agent's ACP behavior. Product surfaces
@@ -148,6 +149,9 @@ pub struct AgentDialectProfile {
     /// Why this agent deviates from the generic path. Recorded for
     /// diagnostics and to keep the table auditable.
     pub rationale: &'static str,
+    /// Goal wire dialect this agent speaks. Agents without a goal surface keep
+    /// [`GoalDialect::unsupported`].
+    pub goal: GoalDialect,
 }
 
 impl AgentDialectProfile {
@@ -164,6 +168,7 @@ impl AgentDialectProfile {
             restore_policy: RestorePolicy::ResumeThenLoadThenNew,
             parameterized_model_picker: false,
             rationale: "generic ACP behavior only; capability comes from runtime probing",
+            goal: GoalDialect::unsupported(),
         }
     }
 

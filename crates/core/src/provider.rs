@@ -2546,6 +2546,10 @@ pub struct ProviderCapabilities {
     pub terminal_tools: bool,
     pub terminal_auth: bool,
     pub terminal_activity_hooks: bool,
+    /// Goal/objective surface this Agent exposes, if any. Absent on profiles
+    /// whose Agent has no goal channel, so clients fail closed.
+    #[serde(default)]
+    pub goal: crate::goal::GoalCapability,
 }
 
 impl ProviderCapabilities {
@@ -2577,6 +2581,7 @@ impl ProviderCapabilities {
             terminal_tools: false,
             terminal_auth: false,
             terminal_activity_hooks: false,
+            goal: crate::goal::GoalCapability::unsupported(),
         }
     }
 }

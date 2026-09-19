@@ -1010,6 +1010,7 @@ mod tests {
             terminal_tools: false,
             terminal_auth: false,
             terminal_activity_hooks: false,
+            goal: vibex_core::GoalCapability::unsupported(),
         }
     }
 

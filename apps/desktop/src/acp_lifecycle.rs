@@ -538,6 +538,7 @@ fn event_kind(event: &ProviderEvent) -> &'static str {
         TimelineItemKind::AgentMessage => "agent_message",
         TimelineItemKind::Reasoning => "reasoning",
         TimelineItemKind::Plan => "plan",
+        TimelineItemKind::Goal => "goal",
         TimelineItemKind::ToolCall => "tool_call",
         TimelineItemKind::Command => "command",
         TimelineItemKind::FileOperation => "file_operation",

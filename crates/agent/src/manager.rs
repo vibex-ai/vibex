@@ -12,16 +12,17 @@ use vibex_core::{
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentConfig, AgentDelegation, AgentDelegationId,
-    AgentDelegationStatus, AgentId, AgentLogoutRequest, AgentModelListRequest,
-    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentRetryPayload,
-    AgentSession, AgentSessionConfigProbe, AgentSessionRestoreMethod, AgentSessionSafety,
-    AgentSessionState, AgentUsageCounterOrigin, AgentUsageExecutionContext,
-    AgentUsageStreamAttribution, BindingState, CancelAgentDelegationRequest,
-    ContinueAgentTurnRequest, CreateAgentDelegationRequest, CreateAgentSessionRequest,
-    ElicitationRequest, FetchTimelineRequest, ForkAgentSessionRequest, LocalHistoryImportResult,
-    LocalHistoryScanResult, LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget,
-    McpServer, McpServerSecretReference, McpServerTransportKind, MessageAttachment,
-    MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
+    AgentDelegationStatus, AgentGoalControlRequest, AgentGoalControlResult, AgentId,
+    AgentLogoutRequest, AgentModelListRequest, AgentModelListResponse, AgentModelListSource,
+    AgentNotificationIntent, AgentRetryPayload, AgentSession, AgentSessionConfigProbe,
+    AgentSessionRestoreMethod, AgentSessionSafety, AgentSessionState, AgentUsageCounterOrigin,
+    AgentUsageExecutionContext, AgentUsageStreamAttribution, BindingState,
+    CancelAgentDelegationRequest, ContinueAgentTurnRequest, CreateAgentDelegationRequest,
+    CreateAgentSessionRequest, ElicitationRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult, LocalHistoryScanResult,
+    LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget, McpServer,
+    McpServerSecretReference, McpServerTransportKind, MessageAttachment, MessageSubmissionId,
+    PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
     ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
@@ -97,6 +98,9 @@ pub struct AgentManager {
     /// query, never across an await.
     timeline_reader: StdMutex<Option<DbConnection>>,
     context_bridge: ContextBridgeService,
+    /// Sessions with a registered out-of-turn provider event pump. Shared with
+    /// the pump task so it can release the slot when the attachment goes away.
+    session_event_pumps: Arc<StdMutex<HashSet<String>>>,
 }
 
 /// Per-desktop-process launch metadata for the built-in, session-scoped MCP
@@ -222,6 +226,28 @@ impl AgentTurnDisplayPolicy {
 /// bookkeeping on every call; a single session-search index pass paid it 4,473
 /// times and spent most of its time doing so. Remembering the paths this
 /// process has verified keeps the guarantee at startup cost.
+/// Latest goal snapshot recorded on a session timeline.
+///
+/// `None` covers both "no goal ever" and "cleared"; callers that need the
+/// distinction read the last goal item directly.
+fn current_goal_snapshot(
+    conn: &DbConnection,
+    session_id: &VibexSessionId,
+) -> VibexResult<Option<GoalSnapshot>> {
+    let page =
+        TimelineRepository::fetch_after(conn, session_id, None, CONTINUE_TURN_TIMELINE_WINDOW)?;
+    for item in page.items.iter().rev() {
+        if let TimelinePayload::Goal(payload) = &item.payload {
+            match payload.change {
+                GoalChangeKind::Snapshot => return Ok(payload.goal.clone()),
+                GoalChangeKind::Cleared => return Ok(None),
+                GoalChangeKind::ControlRequested | GoalChangeKind::ControlFailed => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn verified_schema_paths() -> &'static StdMutex<HashSet<PathBuf>> {
     static VERIFIED_SCHEMA_PATHS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
     VERIFIED_SCHEMA_PATHS.get_or_init(|| StdMutex::new(HashSet::new()))
@@ -266,6 +292,7 @@ impl AgentManager {
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
             context_bridge,
+            session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
         };
         manager.recover_interrupted_sessions(&mut conn)?;
         Ok(manager)
@@ -1947,6 +1974,164 @@ impl AgentManager {
         .await
     }
 
+    /// Applies one goal-control mutation to the live provider.
+    ///
+    /// The control vocabulary is provider-advertised; this method records the
+    /// attempt before it reaches the Agent so the timeline shows rejected
+    /// controls too, and persists the returned snapshot when the provider
+    /// answers inline. Providers that only publish snapshots asynchronously
+    /// deliver them through the session event pump.
+    pub async fn control_goal(
+        &self,
+        request: AgentGoalControlRequest,
+    ) -> VibexResult<AgentGoalControlResult> {
+        let conn = self.open_migrated()?;
+        let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
+            VibexError::validation("session_not_found", "Agent session was not found")
+        })?;
+        let (selection, binding, _identity, route_key) =
+            self.durable_session_execution(&conn, &session)?;
+        let provider = self.runtime(&route_key)?;
+        if let Some(expected_revision) = request.expected_revision
+            && let Some(current) = current_goal_snapshot(&conn, &session.id)?
+            && current
+                .revision
+                .is_some_and(|revision| revision != expected_revision)
+        {
+            return Err(VibexError::conflict(
+                "agent_goal_revision_mismatch",
+                "The goal changed since this control was prepared",
+            ));
+        }
+        drop(conn);
+
+        self.ensure_session_event_pump(&provider, &binding);
+        let handle = ProviderSessionHandle {
+            binding: binding.clone(),
+            capabilities: provider.capabilities_for_profile(selection.provider_profile_id()),
+        };
+        let mut items = vec![self.append_goal_payload(
+            &session.id,
+            TimelineSource::System,
+            GoalPayload::control_requested(request.action),
+        )?];
+        match provider.control_goal(handle, request.clone()).await {
+            Ok(result) => {
+                if let Some(goal) = result.goal.clone() {
+                    items.push(self.append_goal_payload(
+                        &session.id,
+                        TimelineSource::Provider,
+                        GoalPayload::snapshot(goal.clone(), result.actions),
+                    )?);
+                }
+                Ok(AgentGoalControlResult {
+                    goal: result.goal,
+                    items,
+                })
+            }
+            Err(error) => {
+                let _ = self.append_goal_payload(
+                    &session.id,
+                    TimelineSource::Provider,
+                    GoalPayload::control_failed(request.action, error.message.clone()),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn append_goal_payload(
+        &self,
+        session_id: &VibexSessionId,
+        source: TimelineSource,
+        payload: GoalPayload,
+    ) -> VibexResult<TimelineItem> {
+        let mut conn = self.open_migrated()?;
+        self.append_provider_event(
+            &mut conn,
+            session_id,
+            ProviderEvent {
+                source,
+                payload: TimelinePayload::Goal(payload),
+                provider_correlation_id: None,
+                redaction_state: TimelineRedactionState::None,
+                session_title: None,
+            },
+            0,
+            None,
+        )
+    }
+
+    /// Ensures one out-of-turn event pump per session.
+    ///
+    /// Providers without out-of-turn state answer `false`; the slot is then
+    /// released so a later turn retries. The pump appends each event as a
+    /// timeline item and publishes it exactly like a streamed turn event, so
+    /// clients need no special case.
+    fn ensure_session_event_pump(
+        &self,
+        provider: &Arc<dyn AgentProvider>,
+        binding: &ProviderBinding,
+    ) {
+        let session_key = binding.session_id.as_str().to_string();
+        let pumps = Arc::clone(&self.session_event_pumps);
+        {
+            let Ok(mut registered) = pumps.lock() else {
+                return;
+            };
+            if !registered.insert(session_key.clone()) {
+                return;
+            }
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let db_path = self.db_path.clone();
+        let live_events = self.live_events.clone();
+        let session_events = self.session_events.clone();
+        let session_id = binding.session_id.clone();
+        let provider = Arc::clone(provider);
+        let binding = binding.clone();
+        let registry_key = session_key.clone();
+        tokio::spawn(async move {
+            match provider.register_session_events(&binding, sender).await {
+                Ok(true) => {}
+                _ => {
+                    if let Ok(mut registered) = pumps.lock() {
+                        registered.remove(&registry_key);
+                    }
+                    return;
+                }
+            }
+            while let Some(event) = receiver.recv().await {
+                let Ok(mut conn) = open_database(&db_path) else {
+                    continue;
+                };
+                let Ok(item) = TimelineRepository::append_with_attribution(
+                    &mut conn,
+                    &session_id,
+                    event.source,
+                    event.payload,
+                    None,
+                    event.provider_correlation_id.as_deref(),
+                    event.redaction_state,
+                    None,
+                ) else {
+                    continue;
+                };
+                let _ = live_events.send(TimelineLiveEvent {
+                    session_id: item.session_id.clone(),
+                    sequence: item.sequence,
+                    item,
+                });
+                if let Ok(Some(session)) = SessionRepository::get(&conn, &session_id) {
+                    let _ = session_events.send(session);
+                }
+            }
+            if let Ok(mut registered) = pumps.lock() {
+                registered.remove(&registry_key);
+            }
+        });
+    }
+
     async fn materialize_turn_runtime(
         &self,
         session_id: VibexSessionId,
@@ -2414,6 +2599,7 @@ impl AgentManager {
                 runtime_state.activation_generation,
             )?;
         let provider = self.runtime(&route_key)?;
+        self.ensure_session_event_pump(&provider, &binding);
         let prepared_context_bridge: Option<PreparedContextBridge> = match context_bridge_behavior {
             ContextBridgeTurnBehavior::ConsumePending => self.context_bridge.pending_for_turn(
                 &session.id,

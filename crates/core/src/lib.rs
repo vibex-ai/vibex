@@ -17,6 +17,7 @@ pub mod error;
 pub mod event;
 pub mod file;
 pub mod git;
+pub mod goal;
 pub mod ids;
 pub mod local_history;
 pub mod pairing_code_link;
@@ -42,17 +43,17 @@ pub use agent::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandDiscovery,
     AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecuteResult,
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSelectionBehavior,
-    AgentCommandSourceKind, AgentCommandTrigger, AgentModelCapabilities, AgentModelListRequest,
-    AgentModelListResponse, AgentModelListSource, AgentNotificationIntent, AgentNotificationKind,
-    AgentReasoningEffort, AgentSession, AgentSessionConfigProbe, AgentSessionSafety,
-    AgentSessionState, AgentSessionSummary, AgentTimelineDisplaySettings,
-    AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    FetchTimelineRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    MAX_AGENT_SESSION_TITLE_CHARS, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, MessageSubmissionState,
-    ProviderCapabilitiesResponse, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    SteerAgentMessageRequest, SteerAgentMessageResult, SteerMessageOutcome,
-    agent_session_turn_requires_continuation, normalize_agent_session_title,
+    AgentCommandSourceKind, AgentCommandTrigger, AgentGoalControlRequest, AgentGoalControlResult,
+    AgentModelCapabilities, AgentModelListRequest, AgentModelListResponse, AgentModelListSource,
+    AgentNotificationIntent, AgentNotificationKind, AgentReasoningEffort, AgentSession,
+    AgentSessionConfigProbe, AgentSessionSafety, AgentSessionState, AgentSessionSummary,
+    AgentTimelineDisplaySettings, AgentTimelineReasoningDisplayMode, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, FetchTimelineRequest, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, MAX_AGENT_SESSION_TITLE_CHARS, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN,
+    MessageSubmissionState, ProviderCapabilitiesResponse, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
+    SendAgentMessageRequest, SteerAgentMessageRequest, SteerAgentMessageResult,
+    SteerMessageOutcome, agent_session_turn_requires_continuation, normalize_agent_session_title,
 };
 pub use agent_auth::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -147,6 +148,10 @@ pub use git::{
     GitWorktreeReconciliationState, GitWorktreeRestoreRequest, GitWorktreeRisk,
     GitWorktreeRiskKind, GitWorktreeRunningConsumers, GitWorktreeSummary,
     managed_worktree_name_slug,
+};
+pub use goal::{
+    GoalAction, GoalActivation, GoalBlockedReason, GoalCapability, GoalChangeKind, GoalPayload,
+    GoalPhase, GoalSnapshot, GoalSupport,
 };
 pub use ids::{
     AgentAuthContextId, AgentAuthenticationOperationId, AgentConfiguredModelBindingId,
