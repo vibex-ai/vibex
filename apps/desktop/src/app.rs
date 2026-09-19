@@ -73,7 +73,9 @@ use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot, watch};
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
-use vibex_app_update::{CheckReason, UpdateSnapshot, UpdateState};
+use vibex_app_update::{
+    CheckReason, UpdateRelease, UpdateSnapshot, UpdateState, select_notes_section,
+};
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
     BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
@@ -27241,7 +27243,7 @@ impl VibexWorkbench {
             self.open_settings(window, cx);
         }
         self.settings_view.update(cx, |settings, cx| {
-            settings.active_section = SettingsSection::About;
+            settings.activate_settings_section(SettingsSection::About, cx);
             settings.shortcut_note = None;
             cx.notify();
         });
@@ -45102,6 +45104,18 @@ fn agent_turn_preview_file_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Publication time of a signed release, or `None` when the manifest carried a
+/// value that is not an RFC 3339 timestamp.
+fn format_release_published_at(published_at: &str) -> Option<String> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(published_at.trim()).ok()?;
+    Some(
+        timestamp
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+    )
+}
+
 fn format_timeline_hover_time(timestamp_ms: i64, locale: locale::ResolvedLocale) -> String {
     let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
         .map(|timestamp| timestamp.with_timezone(&chrono::Local))
@@ -51440,7 +51454,21 @@ struct FoundationSettings {
     /// result is a light hint and rides the workbench's notification layer.
     shortcut_note: Option<String>,
     active_section: SettingsSection,
+    /// Release notes selected for the About page, kept across frames so the
+    /// Markdown source is not re-selected and re-compared on every render.
+    about_notes: Option<AboutReleaseNotes>,
 }
+
+/// Localized release-notes source currently shown on the About page.
+struct AboutReleaseNotes {
+    tag: String,
+    locale: locale::ResolvedLocale,
+    source: Arc<str>,
+}
+
+/// Updater state rendered in the About card: a status chip, a description, and
+/// the single valid next action.
+type AboutUpdateAction = (&'static str, String, AnyElement);
 
 impl FoundationSettings {
     fn new(
@@ -51642,6 +51670,7 @@ impl FoundationSettings {
                 storage_cleanup_task: None,
                 shortcut_note: None,
                 active_section: SettingsSection::General,
+                about_notes: None,
             }
         })
     }
@@ -51659,6 +51688,46 @@ impl FoundationSettings {
         if section == SettingsSection::Data {
             self.start_storage_usage_probe(cx);
         }
+        if section == SettingsSection::About {
+            self.request_about_update_check(cx);
+        }
+    }
+
+    /// About checks for a newer release as soon as it is opened.
+    ///
+    /// The check is throttled so flipping between sections does not start one
+    /// per visit, and it is skipped while a release is already known or an
+    /// operation is in flight: those states own the page until the user acts.
+    fn request_about_update_check(&mut self, cx: &mut Context<Self>) {
+        const ABOUT_CHECK_THROTTLE_MS: i64 = 60_000;
+        let Some((state, last_successful_check_ms)) = self
+            .workbench
+            .read_with(cx, |workbench, _| {
+                (
+                    workbench.update_snapshot.state.clone(),
+                    workbench.update_snapshot.last_successful_check_ms,
+                )
+            })
+            .ok()
+        else {
+            return;
+        };
+        if !matches!(state, UpdateState::Idle | UpdateState::Error { .. }) {
+            return;
+        }
+        if let UpdateState::Error { failure, .. } = &state
+            && failure.code == "app_update_verification_key_unavailable"
+        {
+            return;
+        }
+        if last_successful_check_ms
+            .is_some_and(|last| unix_timestamp_ms().saturating_sub(last) < ABOUT_CHECK_THROTTLE_MS)
+        {
+            return;
+        }
+        let _ = self
+            .workbench
+            .update(cx, |workbench, cx| workbench.request_update_check(cx));
     }
 
     fn start_storage_usage_probe(&mut self, cx: &mut Context<Self>) {
@@ -54425,7 +54494,12 @@ impl FoundationSettings {
         )
     }
 
-    fn render_about_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_about_page(
+        &mut self,
+        stacked: bool,
+        resolved_locale: locale::ResolvedLocale,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let channel = release_channel()
             .map(|channel| format!("{channel:?}"))
             .unwrap_or_else(|_| "Preview".into());
@@ -54433,8 +54507,11 @@ impl FoundationSettings {
             .workbench
             .read_with(cx, |this, _| this.update_snapshot.clone())
             .unwrap_or_default();
-        let (update_description, update_control) = match update_snapshot.state {
+        let release = update_snapshot.state.release().cloned();
+        let notes_source = self.about_notes_source(release.as_ref(), resolved_locale);
+        let (update_status, update_description, update_control) = match &update_snapshot.state {
             UpdateState::Idle => (
+                locale::text("Up to date", "已是最新", "已是最新"),
                 locale::text(
                     "No newer signed release is available.",
                     "当前没有更高版本的已签名发行版。",
@@ -54453,6 +54530,7 @@ impl FoundationSettings {
                     .into_any_element(),
             ),
             UpdateState::Checking => (
+                locale::text("Checking", "检查中", "檢查中"),
                 locale::text(
                     "Checking GitHub Releases and verifying the signed manifest.",
                     "正在检查 GitHub Releases 并验证签名清单。",
@@ -54474,6 +54552,7 @@ impl FoundationSettings {
                     .map(|artifact| format_bytes(artifact.size))
                     .unwrap_or_default();
                 (
+                    locale::text("Update available", "有可用更新", "有可用更新"),
                     format!("Vibex {} · {size}", release.version),
                     Button::new("download-update")
                         .small()
@@ -54495,13 +54574,14 @@ impl FoundationSettings {
             } => {
                 let percent = downloaded_bytes
                     .saturating_mul(100)
-                    .checked_div(total_bytes)
+                    .checked_div(*total_bytes)
                     .unwrap_or(0);
                 (
+                    locale::text("Downloading", "下载中", "下載中"),
                     format!(
                         "{} / {} ({percent}%)",
-                        format_bytes(downloaded_bytes),
-                        format_bytes(total_bytes)
+                        format_bytes(*downloaded_bytes),
+                        format_bytes(*total_bytes)
                     ),
                     Button::new("downloading-update")
                         .small()
@@ -54513,6 +54593,7 @@ impl FoundationSettings {
                 )
             }
             UpdateState::Verifying { .. } => (
+                locale::text("Verifying", "验证中", "驗證中"),
                 locale::text(
                     "Verifying the signed size and cryptographic hashes.",
                     "正在验证签名大小和加密哈希。",
@@ -54528,9 +54609,14 @@ impl FoundationSettings {
                     .into_any_element(),
             ),
             UpdateState::Staged { release, .. } => (
+                locale::text("Ready to install", "可以安装", "可以安裝"),
                 format!(
                     "{} {}",
-                    locale::text("Verified and ready to install Vibex", "已验证并可安装 Vibex", "已驗證並可安裝 Vibex"),
+                    locale::text(
+                        "Verified and ready to install Vibex",
+                        "已验证并可安装 Vibex",
+                        "已驗證並可安裝 Vibex"
+                    ),
                     release.version
                 ),
                 Button::new("install-update")
@@ -54545,6 +54631,7 @@ impl FoundationSettings {
                     .into_any_element(),
             ),
             UpdateState::Installing { .. } => (
+                locale::text("Installing", "安装中", "安裝中"),
                 locale::text(
                     "The verified system installer has been opened. Complete its confirmation steps.",
                     "已打开验证通过的系统安装器，请完成其中的确认步骤。",
@@ -54559,9 +54646,14 @@ impl FoundationSettings {
                     .into_any_element(),
             ),
             UpdateState::RestartRequired { release } => (
+                locale::text("Restart required", "需要重启", "需要重新啟動"),
                 format!(
                     "{} {}",
-                    locale::text("Restart to run Vibex", "重启以运行 Vibex", "重新啟動以執行 Vibex"),
+                    locale::text(
+                        "Restart to run Vibex",
+                        "重启以运行 Vibex",
+                        "重新啟動以執行 Vibex"
+                    ),
                     release.version
                 ),
                 Button::new("restart-after-update")
@@ -54578,7 +54670,8 @@ impl FoundationSettings {
             UpdateState::Unsupported { release, reason } => {
                 let notes_url = release.notes_url.to_string();
                 (
-                    reason,
+                    locale::text("Manual update", "手动更新", "手動更新"),
+                    reason.clone(),
                     Button::new("open-update-release")
                         .small()
                         .outline()
@@ -54594,7 +54687,21 @@ impl FoundationSettings {
                     failure.code == "app_update_verification_key_unavailable";
                 let retry_download = release.is_some();
                 (
-                    format!("{}: {}", failure.code, failure.message),
+                    if verification_unavailable {
+                        locale::text("Unavailable", "不可用", "不可用")
+                    } else {
+                        locale::text("Check failed", "检查失败", "檢查失敗")
+                    },
+                    if verification_unavailable {
+                        locale::text(
+                            "This build does not include the release verification key, so update checks are unavailable.",
+                            "当前构建未包含发行验签密钥，因此无法检查更新。",
+                            "目前建置未包含發行驗簽金鑰，因此無法檢查更新。",
+                        )
+                        .to_string()
+                    } else {
+                        format!("{}: {}", failure.code, failure.message)
+                    },
                     Button::new("retry-update")
                         .small()
                         .outline()
@@ -54617,6 +54724,13 @@ impl FoundationSettings {
                 )
             }
         };
+        let update_card = self.render_about_update_card(
+            release.as_ref(),
+            notes_source,
+            (update_status, update_description, update_control),
+            stacked,
+            cx,
+        );
         let summary = format!(
             "Vibex {}\nChannel: {}\nPlatform: {} {}\nRust: {}",
             env!("CARGO_PKG_VERSION"),
@@ -54634,13 +54748,7 @@ impl FoundationSettings {
                 "版本、建置與專案資訊。",
             ),
             vec![
-                setting_row(
-                    locale::text("Software update", "软件更新", "軟體更新"),
-                    update_description,
-                    update_control,
-                    stacked,
-                    cx,
-                ),
+                update_card,
                 setting_row(
                     locale::text("Version", "版本", "版本"),
                     locale::text(
@@ -54737,6 +54845,221 @@ impl FoundationSettings {
         )
     }
 
+    /// Release notes Markdown for the About page, re-selected only when the
+    /// release or the resolved locale changes.
+    fn about_notes_source(
+        &mut self,
+        release: Option<&UpdateRelease>,
+        resolved_locale: locale::ResolvedLocale,
+    ) -> Option<Arc<str>> {
+        let Some(release) = release else {
+            self.about_notes = None;
+            return None;
+        };
+        if let Some(cached) = self.about_notes.as_ref()
+            && cached.tag == release.tag
+            && cached.locale == resolved_locale
+        {
+            return Some(cached.source.clone());
+        }
+        let source = release
+            .notes
+            .as_deref()
+            .and_then(|document| select_notes_section(document, resolved_locale.tag()))
+            .map(Arc::<str>::from);
+        self.about_notes = source.as_ref().map(|source| AboutReleaseNotes {
+            tag: release.tag.clone(),
+            locale: resolved_locale,
+            source: source.clone(),
+        });
+        source
+    }
+
+    /// The About update card: the state row plus, when a release is known, its
+    /// version facts and localized release notes.
+    fn render_about_update_card(
+        &self,
+        release: Option<&UpdateRelease>,
+        notes_source: Option<Arc<str>>,
+        action: AboutUpdateAction,
+        stacked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (status, description, control) = action;
+        let is_dark = cx.theme().is_dark();
+        let primary = theme::semantic_color("primary", is_dark);
+        let muted = theme::semantic_color("muted", is_dark);
+        let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+        let border = theme::semantic_color("border", is_dark);
+        let card = theme::semantic_color("card", is_dark);
+        let title = locale::text("Software update", "软件更新", "軟體更新");
+        let (target_anchor, is_highlighted) = settings_row_anchor(title, cx);
+
+        let mut body = v_flex().w_full().min_w_0().gap_3();
+        if let Some(release) = release {
+            let mut facts = vec![(
+                locale::text("Latest version", "最新版本", "最新版本"),
+                release.version.to_string(),
+            )];
+            if let Some(published) = format_release_published_at(&release.published_at) {
+                facts.push((locale::text("Published", "发布时间", "發佈時間"), published));
+            }
+            if let Some(artifact) = release.artifact.as_ref() {
+                facts.push((
+                    locale::text("Download size", "下载大小", "下載大小"),
+                    format!("{} · {}", format_bytes(artifact.size), artifact.package),
+                ));
+            }
+            body = body.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_x_6()
+                    .gap_y_2()
+                    .children(facts.into_iter().map(|(label, value)| {
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().text_xs().text_color(muted_foreground).child(label))
+                            .child(div().text_sm().font_medium().child(value))
+                    })),
+            );
+            if let Some(source) = notes_source {
+                let notes_url = release.notes_url.to_string();
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .child(div().text_xs().font_medium().child(locale::text(
+                            "What's new",
+                            "更新内容",
+                            "更新內容",
+                        )))
+                        .child(
+                            div()
+                                .id("about-release-notes")
+                                .w_full()
+                                .min_w_0()
+                                .max_h(px(320.0))
+                                .overflow_y_scroll()
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(border.opacity(0.5))
+                                .bg(if is_dark {
+                                    card.opacity(0.35)
+                                } else {
+                                    muted.opacity(0.45)
+                                })
+                                .px_3()
+                                .py_2()
+                                .child(
+                                    MarkdownView::new(
+                                        SharedString::from(format!(
+                                            "about-release-notes:{}",
+                                            release.tag
+                                        )),
+                                        MarkdownInput::new(source, "", 0),
+                                    )
+                                    .presentation(MarkdownPresentation::Document),
+                                ),
+                        )
+                        .child(
+                            h_flex().w_full().justify_end().child(
+                                Button::new("open-release-notes")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::ExternalLink)
+                                    .label(locale::text(
+                                        "Open on GitHub",
+                                        "在 GitHub 查看",
+                                        "在 GitHub 檢視",
+                                    ))
+                                    .on_click(move |_, _, _| {
+                                        let _ = open_external_url(&notes_url);
+                                    }),
+                            ),
+                        ),
+                );
+            } else {
+                // Older releases predate the notes asset; keep the signed
+                // release page reachable from the same card.
+                let notes_url = release.notes_url.to_string();
+                body = body.child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("open-release-page")
+                            .small()
+                            .ghost()
+                            .icon(IconName::ExternalLink)
+                            .label(locale::text(
+                                "View release page",
+                                "查看发行页面",
+                                "檢視發行頁面",
+                            ))
+                            .on_click(move |_, _, _| {
+                                let _ = open_external_url(&notes_url);
+                            }),
+                    ),
+                );
+            }
+        }
+
+        div()
+            .id("settings-row-about-software-update")
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .py(px(14.0))
+            .anchor_scroll(target_anchor)
+            .when(is_highlighted, |this| {
+                this.rounded(px(6.0))
+                    .bg(primary.opacity(if is_dark { 0.16 } else { 0.10 }))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .when(stacked, |this| this.flex_col().items_start())
+                    .when(!stacked, |this| {
+                        this.flex_row().items_center().justify_between()
+                    })
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_sm().font_medium().child(title))
+                                    .child(settings_value_chip(status)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(muted_foreground)
+                                    .child(description),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .when(stacked, |this| this.w_full())
+                            .child(control),
+                    ),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
     fn render_developer_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
         let developer = self.developer(cx);
         let fps_monitor_switch = Switch::new("developer-fps-monitor")
@@ -54777,10 +55100,9 @@ impl Render for FoundationSettings {
         let network_proxy = self.network_proxy(cx);
         let workbench = self.workbench_state(cx);
         let terminal = self.terminal_preferences(cx);
-        let strings = locale::strings(locale::resolve_locale(
-            appearance.locale,
-            locale::system_locale().as_deref(),
-        ));
+        let resolved_locale =
+            locale::resolve_locale(appearance.locale, locale::system_locale().as_deref());
+        let strings = locale::strings(resolved_locale);
         let viewport_width = f32::from(window.viewport_size().width);
         let vertical_tabs = viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH;
         let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
@@ -54808,7 +55130,7 @@ impl Render for FoundationSettings {
             SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, cx),
             SettingsSection::Data => self.render_data_page(stacked_rows, cx),
             SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
-            SettingsSection::About => self.render_about_page(stacked_rows, cx),
+            SettingsSection::About => self.render_about_page(stacked_rows, resolved_locale, cx),
         };
         let has_changes = self.has_changes(cx);
         let undo_label = strings.undo_changes;
@@ -55606,16 +55928,9 @@ fn settings_page(
         .into_any_element()
 }
 
-fn setting_row(
-    title: &'static str,
-    description: impl IntoElement,
-    control: impl IntoElement,
-    stacked: bool,
-    cx: &App,
-) -> AnyElement {
-    let is_dark = cx.theme().is_dark();
-    let primary = theme::semantic_color("primary", is_dark);
-    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+/// Scroll anchor and highlight state shared by plain settings rows and the
+/// composite About update card, so search can still target either one.
+fn settings_row_anchor(title: &'static str, cx: &App) -> (Option<ScrollAnchor>, bool) {
     let is_highlighted = cx
         .try_global::<SettingsRenderContext>()
         .map(|context| context.highlighted_title.borrow().as_deref() == Some(title))
@@ -55630,6 +55945,20 @@ fn setting_row(
             context.target_anchor.borrow_mut().replace(anchor.clone());
             Some(anchor)
         });
+    (target_anchor, is_highlighted)
+}
+
+fn setting_row(
+    title: &'static str,
+    description: impl IntoElement,
+    control: impl IntoElement,
+    stacked: bool,
+    cx: &App,
+) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let primary = theme::semantic_color("primary", is_dark);
+    let muted_foreground = theme::semantic_color("muted-foreground", is_dark);
+    let (target_anchor, is_highlighted) = settings_row_anchor(title, cx);
 
     div()
         .id(settings_row_id(title))
@@ -67498,6 +67827,87 @@ mod tests {
         assert!(generation_status.contains("Icon::new(IconName::ArrowDown)"));
         assert!(generation_status.contains("format_compact_tokens"));
         assert!(generation_status.contains("cache_hit_fraction"));
+    }
+
+    #[test]
+    fn about_checks_for_updates_when_the_section_opens() {
+        let source = include_str!("app.rs");
+        let activation = source
+            .split_once("    fn activate_settings_section(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// About checks for a newer release"))
+            .map(|(body, _)| body)
+            .expect("section activation should remain inspectable");
+        assert!(activation.contains("SettingsSection::About"));
+        assert!(activation.contains("request_about_update_check"));
+
+        let check = source
+            .split_once("    fn request_about_update_check(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_storage_usage_probe("))
+            .map(|(body, _)| body)
+            .expect("about update check should remain inspectable");
+        assert!(check.contains("ABOUT_CHECK_THROTTLE_MS"));
+        assert!(check.contains("UpdateState::Idle | UpdateState::Error"));
+        assert!(check.contains("app_update_verification_key_unavailable"));
+        assert!(check.contains("last_successful_check_ms"));
+        assert!(check.contains("request_update_check"));
+
+        let open_update_settings = source
+            .split_once("    fn open_update_settings(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn strings("))
+            .map(|(body, _)| body)
+            .expect("update settings entry should remain inspectable");
+        assert!(open_update_settings.contains("activate_settings_section(SettingsSection::About"));
+    }
+
+    #[test]
+    fn about_shows_the_release_facts_and_localized_notes() {
+        let source = include_str!("app.rs");
+        let about = source
+            .split_once("    fn render_about_page(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Release notes Markdown for the About page")
+            })
+            .map(|(body, _)| body)
+            .expect("about settings should remain inspectable");
+        assert!(about.contains("render_about_update_card"));
+        assert!(about.contains("about_notes_source"));
+        assert!(about.contains("UpdateState::Available"));
+        assert!(about.contains("This build does not include the release verification key"));
+
+        let card = source
+            .split_once("    fn render_about_update_card(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_developer_page("))
+            .map(|(body, _)| body)
+            .expect("about update card should remain inspectable");
+        assert!(card.contains("settings_row_anchor"));
+        assert!(card.contains("format_release_published_at"));
+        assert!(card.contains("Latest version"));
+        assert!(card.contains("Published"));
+        assert!(card.contains("Download size"));
+        assert!(card.contains("What's new"));
+        assert!(card.contains("about-release-notes"));
+        assert!(card.contains("MarkdownView::new("));
+        assert!(card.contains("MarkdownPresentation::Document"));
+        assert!(card.contains("open-release-notes"));
+        assert!(card.contains("open-release-page"));
+
+        let notes = source
+            .split_once("    fn about_notes_source(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The About update card"))
+            .map(|(body, _)| body)
+            .expect("about notes selection should remain inspectable");
+        assert!(notes.contains("select_notes_section(document, resolved_locale.tag())"));
+        assert!(notes.contains("cached.tag == release.tag"));
+        assert!(notes.contains("cached.locale == resolved_locale"));
+    }
+
+    #[test]
+    fn release_published_at_formats_rfc3339_and_rejects_other_values() {
+        assert!(format_release_published_at("2026-08-16T00:00:00Z").is_some());
+        assert!(format_release_published_at(" 2026-08-16T00:00:00+08:00 ").is_some());
+        assert_eq!(format_release_published_at(""), None);
+        assert_eq!(format_release_published_at("2026-08-16"), None);
+        assert_eq!(format_release_published_at("not a timestamp"), None);
     }
 
     #[test]
