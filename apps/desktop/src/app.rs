@@ -63235,6 +63235,56 @@ mod tests {
     }
 
     #[test]
+    fn detached_preview_panel_is_drawn_by_its_window_only() {
+        let placement = preview_panel_placement(true, true, false, true, true, true, true);
+
+        assert_eq!(placement, PreviewPanelPlacement::default());
+        assert!(!placement.docked && !placement.overlay && !placement.fullscreen);
+    }
+
+    #[test]
+    fn inline_preview_panel_keeps_its_docked_overlay_and_fullscreen_modes() {
+        assert_eq!(
+            preview_panel_placement(false, true, false, true, true, false, false),
+            PreviewPanelPlacement {
+                docked: true,
+                overlay: false,
+                fullscreen: false,
+            }
+        );
+        assert_eq!(
+            preview_panel_placement(false, true, false, false, true, true, false),
+            PreviewPanelPlacement {
+                docked: false,
+                overlay: true,
+                fullscreen: false,
+            }
+        );
+        assert_eq!(
+            preview_panel_placement(false, true, false, true, true, false, true),
+            PreviewPanelPlacement {
+                docked: false,
+                overlay: false,
+                fullscreen: true,
+            }
+        );
+        // A panel that is not open, another workbench tab, and the new-session
+        // panel all keep the workbench column clear.
+        assert_eq!(
+            preview_panel_placement(false, true, false, true, false, false, false),
+            PreviewPanelPlacement::default()
+        );
+        assert_eq!(
+            preview_panel_placement(false, false, false, true, true, true, true),
+            PreviewPanelPlacement::default()
+        );
+        assert_eq!(
+            preview_panel_placement(false, true, true, true, true, true, true),
+            PreviewPanelPlacement::default()
+        );
+    }
+
+    #[test]
     fn floating_sidebar_matches_tauri_width_cap() {
         assert_eq!(sidebar_floating_width(1_200), 320.0);
         assert!((sidebar_floating_width(360) - 316.8).abs() < f32::EPSILON * 8.0);
