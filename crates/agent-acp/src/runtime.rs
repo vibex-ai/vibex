@@ -300,19 +300,26 @@ const IGNORED_SESSION_UPDATE_KINDS: &[&str] = &["user_message_chunk", "current_m
 const ACP_SESSION_REPLAY_EVENT_LIMIT: usize = 512;
 const ACP_SESSION_REPLAY_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Session-update kinds that only mutate attachment state and never emit turn
-/// events.
+/// Session-update kinds that only mutate attachment state, never emit turn
+/// events, and stay safe to apply to a `Prepared` attachment.
 ///
-/// Agents publish these outside a turn — often immediately after the
-/// `session/new`, `session/resume` or `session/load` response — and never
-/// repeat them. The durable rebuild path registers its attachment as
-/// `Prepared` and releases its reader barrier before the commit, so routing
-/// them as ordered turn traffic would drop them for good.
-fn is_state_only_session_update(kind: &str) -> bool {
-    matches!(
-        kind,
-        "available_commands_update" | "config_option_update" | "config_options_update"
-    )
+/// Agents publish the command catalog outside a turn — often immediately after
+/// the `session/new`, `session/resume` or `session/load` response — and never
+/// repeat it. The durable rebuild path registers its attachment as `Prepared`
+/// and releases its reader barrier before the commit, so quarantining the
+/// catalog would drop it for good.
+///
+/// `config_option_update`/`config_options_update` are state-only as well, but
+/// they rewrite the runtime configuration state — revision and applied
+/// generation — that an in-flight `apply_session_config` fences on. The
+/// DeepSeek Harness bridge publishes one while it answers `session/set_mode`,
+/// which would invalidate the confirmation of the very mutation that asked for
+/// it, so config-option updates keep the committed-only quarantine. Agents
+/// whose option set only arrives as a trailing update (Copilot) are folded in
+/// by the registration path that arms `arm_initial_probe_config_update`
+/// instead.
+fn is_prepared_deliverable_session_update(kind: &str) -> bool {
+    matches!(kind, "available_commands_update")
 }
 
 #[derive(Debug, Clone)]
@@ -6511,7 +6518,8 @@ impl AcpProcess {
             .get("update")
             .and_then(|update| update.get("sessionUpdate"))
             .and_then(Value::as_str);
-        let state_only_update = session_update_kind.is_some_and(is_state_only_session_update);
+        let prepared_deliverable =
+            session_update_kind.is_some_and(is_prepared_deliverable_session_update);
         if session_update_kind == Some("available_commands_update")
             && self.has_pending_registration_request()
         {
@@ -6530,11 +6538,12 @@ impl AcpProcess {
                 AcpNativeRouteOutcome::Diagnostic(_) => {}
             }
         }
-        // State-only notifications are published outside turns and never
-        // replayed, so a durable rebuild must apply them even while its
-        // attachment is still `Prepared`. Ordered turn traffic stays
-        // committed-only.
-        let routed = if state_only_update {
+        // The command catalog is published outside turns and never replayed,
+        // so a durable rebuild must apply it even while its attachment is
+        // still `Prepared`. Ordered turn traffic and config-option updates —
+        // which rewrite the runtime configuration revision an in-flight
+        // mutation fences on — stay committed-only.
+        let routed = if prepared_deliverable {
             self.with_routed_state_update(
                 params,
                 AcpOperation::SessionUpdate.method(),
@@ -24005,6 +24014,7 @@ pending_empty_prompt_id = None
 request_log_path = os.environ.get("VIBEX_MOCK_ACP_REQUEST_LOG")
 set_model_mode = os.environ.get("VIBEX_MOCK_ACP_SET_MODEL_MODE", "supported")
 model_config_updates = os.environ.get("VIBEX_MOCK_ACP_MODEL_CONFIG_UPDATES") == "true"
+mode_config_update = os.environ.get("VIBEX_MOCK_ACP_MODE_CONFIG_UPDATE") == "true"
 post_session_config_update = (
     os.environ.get("VIBEX_MOCK_ACP_POST_SESSION_CONFIG_UPDATE") == "true"
 )
@@ -24345,6 +24355,31 @@ for line in sys.stdin:
     elif method == "session/set_mode":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         mode_id = msg.get("params", {}).get("modeId", "build")
+        if mode_config_update:
+            # The DeepSeek Harness bridge publishes the new option set as a
+            # `config_option_update` notification *before* it answers
+            # `session/set_mode`.
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [{
+                            "id": "mode",
+                            "category": "mode",
+                            "label": "Mode",
+                            "type": "select",
+                            "currentValue": mode_id,
+                            "options": [
+                                {"value": "build", "label": "Build"},
+                                {"value": "review", "label": "Review"},
+                            ],
+                        }],
+                    },
+                },
+            })
         send({
             "jsonrpc": "2.0",
             "id": mid,
@@ -25332,6 +25367,26 @@ for line in sys.stdin:
                 value: Some("true".to_string()),
                 secret_lookup_key: None,
                 redacted_hint: "mock model config updates".to_string(),
+            });
+            service
+                .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                    provider_profile_id: self.profile_id.clone(),
+                    config,
+                })
+                .unwrap();
+        }
+
+        fn enable_mode_config_update(&self) {
+            let service = self.service();
+            let mut config = service
+                .get_acp_profile_config(self.profile_id.clone())
+                .unwrap();
+            config.env.push(vibex_core::AcpProviderEnvReference {
+                key: "VIBEX_MOCK_ACP_MODE_CONFIG_UPDATE".to_string(),
+                source: AcpProviderEnvSource::Literal,
+                value: Some("true".to_string()),
+                secret_lookup_key: None,
+                redacted_hint: "mock mode config update".to_string(),
             });
             service
                 .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
@@ -27433,6 +27488,60 @@ for line in sys.stdin:
                 "continue after provider switch",
             ],
         );
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    /// The DeepSeek Harness bridge publishes a `config_option_update`
+    /// notification before it answers `session/set_mode`. A durable rebuild
+    /// keeps its attachment `Prepared` while it applies the requested session
+    /// configuration, and a state-only update is delivered to that attachment
+    /// at its exact fence, so the notification moves the runtime config
+    /// revision under the in-flight mutation and the confirmation is rejected
+    /// as stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prepared_switch_survives_the_mode_update_published_before_the_set_mode_response() {
+        let Some(fixture) = runtime_switch_fixture("prepared-mode-config-update").await else {
+            return;
+        };
+        fixture.fixture.enable_mode_config_update();
+        let state = AgentSessionRuntimeRepository::get_runtime_state(
+            &open_database(&fixture.fixture.db_path).unwrap(),
+            &fixture.session.id,
+        )
+        .unwrap()
+        .unwrap();
+        let mut target = fixture.selection.clone();
+        target.mode_id = Some("review".to_string());
+
+        let outcome = fixture
+            .runtime_selection
+            .switch_runtime(vibex_core::SwitchAgentSessionRuntimeRequest {
+                session_id: fixture.session.id.clone(),
+                idempotency_key: "prepared-mode-config-update".to_string(),
+                expected_revision: state.revision,
+                target: target.clone(),
+                target_adapter_id: None,
+                policy: vibex_core::RuntimeSwitchPolicy::ForceFreshSession,
+                active_work_policy: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            vibex_core::RuntimeSwitchStatus::Committed,
+            "a prepared rebuild must keep the mode update published by set_mode"
+        );
+        let ready = fixture
+            .runtime_selection
+            .get_selection_state(&fixture.session.id)
+            .unwrap();
+        assert_eq!(ready.effective.mode_id.as_deref(), Some("review"));
 
         drop(fixture.message_submission);
         drop(fixture.runtime_selection);

@@ -731,13 +731,22 @@ request: terminal/create { id, params.sessionId, ... }
   process-global session authority.
 - An Agent may also publish its catalog after the registration response. The
   reader barrier is released as soon as the route is registered, so that update
-  can arrive while a prepared attachment is not yet committed. State-only
-  session updates (`available_commands_update`,
-  `config_option_update`/`config_options_update`) are then applied at that exact
-  fence instead of being quarantined: Agents publish them outside turns and
-  never replay them, so quarantining leaves a rebuilt attachment reporting an
-  empty command catalog for its whole lifetime. Ordered turn events keep the
-  committed-only quarantine.
+  can arrive while a prepared attachment is not yet committed. The command
+  catalog (`available_commands_update`) is then applied at that exact fence
+  instead of being quarantined: Agents publish it outside turns and never replay
+  it, so quarantining leaves a rebuilt attachment reporting an empty command
+  catalog for its whole lifetime. Ordered turn events keep the committed-only
+  quarantine.
+- Config-option updates (`config_option_update`/`config_options_update`) are
+  state-only too, but they rewrite the runtime configuration state — revision
+  and applied generation — that an in-flight `apply_session_config` fences on.
+  The DeepSeek Harness bridge publishes one while it answers `session/set_mode`,
+  so applying it to the prepared attachment would stale-confirm the very
+  mutation that asked for the mode. They keep the committed-only quarantine
+  while the attachment is prepared; the confirmed mutation owns the effective
+  values, and Agents whose option set only arrives as a trailing update
+  (Copilot) are folded in by the registration path that arms the initial probe
+  slot before `session/new`.
 - Each created attachment subscribes to `ProcessLease::subscribe_crashes()`
   before load/new. Broadcast plus process snapshot closes the registration race;
   `mark_crashed(fence)` makes fan-out idempotent. Detach removes the route before
@@ -773,7 +782,11 @@ request: terminal/create { id, params.sessionId, ... }
   catalog; never grow process memory without a bound.
 - Binding or generation mismatch -> process diagnostic `acp_event_fence_stale`.
 - Prepared attachment -> quarantine `acp_event_attachment_prepared`, except for
-  state-only session updates, which apply at the same fence.
+  `available_commands_update`, which applies at the same fence. A
+  `config_option_update` that arrives while `apply_session_config` is in flight
+  must not be applied to the prepared attachment: it would bump the runtime
+  configuration revision and turn the mutation's confirmation into
+  `acp_session_config_confirmation_stale`.
 - Non-current/inactive attachment -> `acp_attachment_not_current` or
   `acp_event_attachment_inactive`.
 - Second active prompt -> `conflict/acp_turn_already_running`.
@@ -895,6 +908,28 @@ commit -> attachment reports Some([]) -> composer loses every slash command
 available_commands_update after session/new response, prepared durable rebuild
   -> route registered, attachment prepared, state-only update
   -> apply at the exact fence -> commit keeps the announced catalog
+```
+
+#### Wrong
+
+```text
+config_option_update published before the session/set_mode response,
+prepared durable rebuild
+  -> route registered, attachment prepared, config-option update applied
+  -> runtime config revision +1 -> set_mode response confirms against the old
+     revision -> acp_session_config_confirmation_stale
+  -> runtime_switch_configuration_unavailable, session stays on its previous
+     runtime
+```
+
+#### Correct
+
+```text
+config_option_update published before the session/set_mode response,
+prepared durable rebuild
+  -> route registered, attachment prepared -> config-option update quarantined
+  -> apply_session_config confirms the requested field -> commit publishes the
+     new effective mode
 ```
 
 ## Scenario: ACP Permission Callback Loop
