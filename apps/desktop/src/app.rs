@@ -41218,8 +41218,6 @@ impl VibexWorkbench {
                 phase,
                 Some(GoalPhase::Blocked | GoalPhase::UsageLimited | GoalPhase::BudgetLimited)
             );
-        let in_progress =
-            payload.change == GoalChangeKind::Snapshot && phase.is_some_and(GoalPhase::is_open);
         let goal_label = locale::text("Goal", "目标", "目標").to_string();
         let header_text = if objective.is_empty() {
             goal_label
