@@ -40654,6 +40654,7 @@ impl VibexWorkbench {
                     rows: row_index..row_index + 2,
                     id: command_row.id.clone(),
                     revision: command_row.last_sequence.max(permission_row.last_sequence),
+                    streaming: command_row.streaming || permission_row.streaming,
                     estimated_height: self
                         .estimated_timeline_row_height_projected(command_row, false)
                         + permission_height,
@@ -40677,6 +40678,9 @@ impl VibexWorkbench {
                     rows: group.start_row..group.end_row,
                     id: group.id.clone(),
                     revision: last_sequence,
+                    streaming: turn.process_rows[group.start_row..group.end_row]
+                        .iter()
+                        .any(|row| row.streaming),
                     estimated_height: self.estimated_process_activity_group_height(turn, group),
                     kind: TimelineProcessUnitKind::Group(group.clone()),
                 });
@@ -40688,6 +40692,7 @@ impl VibexWorkbench {
                     rows: row_index..row_index + 1,
                     id: row.id.clone(),
                     revision: row.last_sequence,
+                    streaming: row.streaming,
                     estimated_height: self.estimated_timeline_row_height_projected(row, false),
                     kind: TimelineProcessUnitKind::Row,
                 });
@@ -40708,7 +40713,7 @@ impl VibexWorkbench {
             let height = self
                 .timeline_process_unit_heights
                 .get(&unit.id)
-                .filter(|(revision, _)| *revision == unit.revision)
+                .filter(|(revision, _)| *revision == unit.revision || unit.streaming)
                 .map(|(_, height)| *height)
                 .unwrap_or(unit.estimated_height);
             sizes.push(px(height.max(1.0)));
@@ -40742,15 +40747,18 @@ impl VibexWorkbench {
                 continue;
             }
             let measured = measured.ceil().max(1.0);
-            let current = self.timeline_process_unit_heights.get(&unit.id);
-            if current.is_some_and(|(revision, height)| {
-                *revision == unit.revision && (*height - measured).abs() < 1.0
-            }) {
-                continue;
-            }
+            let current = self
+                .timeline_process_unit_heights
+                .get(&unit.id)
+                .map(|(_, height)| *height);
+            let settled = stable_process_unit_height(current, measured, unit.streaming);
+            // The revision is refreshed even when the height did not move, so
+            // the layout lookup keeps matching — but a chunk that only advanced
+            // the revision must not ask for another frame.
+            let moved = current.is_none_or(|height| (height - settled).abs() >= 1.0);
             self.timeline_process_unit_heights
-                .insert(unit.id.clone(), (unit.revision, measured));
-            changed = true;
+                .insert(unit.id.clone(), (unit.revision, settled));
+            changed |= moved;
         }
         if changed {
             cx.notify();
@@ -49261,6 +49269,8 @@ struct TimelineProcessUnit {
     id: String,
     /// Content revision the measured height belongs to.
     revision: i64,
+    /// Whether any row of this unit is still streaming.
+    streaming: bool,
     /// Height the unit takes before it has been measured.
     estimated_height: f32,
     /// What the renderer paints for this unit.
@@ -49316,6 +49326,20 @@ impl TimelineProcessRun {
             return 0..0;
         }
         timeline_process_visible_units(&self.origins, self.total_height, bounds, viewport)
+    }
+}
+
+/// The height a process unit settles at after a measurement.
+///
+/// While a unit is still streaming it never shrinks: incomplete Markdown lays
+/// out shorter between parses, and the outer timeline measures the run's total,
+/// so following a transient dip makes the whole turn — and the viewport
+/// following it — bounce. A settled unit takes the measurement as it is.
+fn stable_process_unit_height(current: Option<f32>, measured: f32, streaming: bool) -> f32 {
+    match current {
+        Some(height) if (height - measured).abs() < 1.0 => height,
+        Some(height) if streaming && measured < height => height,
+        _ => measured,
     }
 }
 
@@ -75198,6 +75222,37 @@ mod tests {
             "flow and windowed runs must reserve the same height: {} vs {expected}",
             reserved_height.get()
         );
+    }
+
+    #[test]
+    fn a_streaming_process_unit_never_shrinks_between_parses() {
+        // A streaming unit's revision advances with every chunk and incomplete
+        // Markdown transiently lays out shorter between parses. Following
+        // either makes the run — and with it the whole timeline — bounce while
+        // a turn streams, so the measured extent only ever grows.
+        assert_eq!(
+            stable_process_unit_height(Some(240.0), 120.0, true),
+            240.0,
+            "a streaming unit keeps the larger extent"
+        );
+        assert_eq!(
+            stable_process_unit_height(Some(120.0), 240.0, true),
+            240.0,
+            "a streaming unit still grows"
+        );
+        assert_eq!(
+            stable_process_unit_height(Some(240.0), 120.0, false),
+            120.0,
+            "a settled unit accepts a real shrink"
+        );
+        assert_eq!(
+            stable_process_unit_height(None, 120.0, true),
+            120.0,
+            "the first measurement is always taken"
+        );
+        // Sub-pixel noise is not a change at all.
+        assert_eq!(stable_process_unit_height(Some(120.0), 120.4, true), 120.0);
+        assert_eq!(stable_process_unit_height(Some(120.0), 120.4, false), 120.0);
     }
 
     #[test]
