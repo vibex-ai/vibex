@@ -82,8 +82,8 @@ use vibex_markdown::{
 };
 use vibex_terminal::TerminalManager;
 
-use crate::app::VibexWorkbench;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
+use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
 use crate::gpui_ext::solid_empty_border;
 use crate::locale;

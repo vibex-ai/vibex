@@ -19663,8 +19663,9 @@ impl VibexWorkbench {
             Ok(handle) => handle,
             Err(error) => {
                 // Nothing moved, so the panel stays exactly where it was.
-                self.code_workbench
-                    .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+                self.code_workbench.update(cx, |workbench, cx| {
+                    workbench.set_preview_detached(false, cx)
+                });
                 let message = format!("failed to open the preview window: {error}");
                 eprintln!("{message}");
                 let _ = origin_window.update(cx, |_, window, cx| {
@@ -19706,8 +19707,9 @@ impl VibexWorkbench {
 
     fn take_preview_window(&mut self, cx: &mut Context<Self>) -> Option<AnyWindowHandle> {
         let handle = self.preview_window.take()?;
-        self.code_workbench
-            .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_detached(false, cx)
+        });
         Some(handle)
     }
 
@@ -19718,8 +19720,9 @@ impl VibexWorkbench {
             return;
         }
         self.preview_window = None;
-        self.code_workbench
-            .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_detached(false, cx)
+        });
         self.reveal_code_preview(cx);
         self.activate_workbench_window(cx);
         cx.notify();
