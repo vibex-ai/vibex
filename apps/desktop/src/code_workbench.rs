@@ -8136,15 +8136,18 @@ impl CodeWorkbench {
                 cx,
             )
         };
+        // `git show --pretty=%B` returns the whole message, so its first line
+        // repeats the subject the header already draws. Drop it, or the
+        // three-line preview would spend a third of its budget on a duplicate.
         let body_lines = detail
             .body
             .as_deref()
             .filter(|body| !body.is_empty())
-            .map(|body| body.split('\n').map(str::to_string).collect::<Vec<_>>())
+            .map(|body| commit_body_content_lines(body, &detail.summary.subject))
             .unwrap_or_default();
-        let body_text = body_lines.join("\n");
         let body_can_expand = commit_body_can_expand(&body_lines);
         let body_expanded = self.commit_body_expanded.contains(&hash);
+        let body_preview_lines = commit_body_preview_lines(&body_lines, body_expanded);
         let body_toggle_hash = hash.clone();
         let body_key_hash = hash.clone();
         let file_count_label = commit_file_count_label(detail.files.len());
@@ -8196,7 +8199,7 @@ impl CodeWorkbench {
                                 git_commit_authored_at(detail.summary.authored_at_ms),
                             ]),
                     )
-                    .when(!body_text.is_empty(), |this| {
+                    .when(!body_lines.is_empty(), |this| {
                         this.child(
                             v_flex()
                                 .id(format!("commit-body:{hash}"))
@@ -8234,13 +8237,25 @@ impl CodeWorkbench {
                                         .min_w_0()
                                         .overflow_hidden()
                                         .whitespace_normal()
+                                        // The projection drops logical lines
+                                        // past the third; the cap is what
+                                        // clips a single long line that wraps
+                                        // to more rendered rows than that.
                                         .when(!body_expanded, |this| {
-                                            this.line_clamp(COMMIT_BODY_COLLAPSED_LINES)
+                                            this.max_h(commit_body_preview_max_height())
                                         })
                                         .line_height(gpui::relative(1.5))
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(body_text),
+                                        .children(body_preview_lines.into_iter().map(|line| {
+                                            div().min_w_0().whitespace_normal().child(
+                                                if line.is_empty() {
+                                                    " ".to_string()
+                                                } else {
+                                                    line
+                                                },
+                                            )
+                                        })),
                                 )
                                 .when(body_can_expand, |this| {
                                     this.child(
@@ -15359,6 +15374,10 @@ const COMMIT_BODY_COLLAPSED_LINES: usize = 3;
 /// A body line longer than this is expected to wrap at ordinary preview
 /// widths, so the collapsed preview is worth offering even for short bodies.
 const COMMIT_BODY_LONG_LINE_CHARS: usize = 96;
+/// The body renders at `text_xs` (0.75rem) with a 1.5 line height, so one
+/// rendered row is 1.125rem tall.
+const COMMIT_BODY_FONT_REMS: f32 = 0.75;
+const COMMIT_BODY_LINE_HEIGHT: f32 = 1.5;
 /// File rows carry a click target and a disclosure chevron, so they stand
 /// taller than a diff line.
 const COMMIT_FILE_ROW_HEIGHT: f32 = 36.0;
@@ -15366,7 +15385,47 @@ const COMMIT_FILE_ROW_HEIGHT: f32 = 36.0;
 /// additions and deletions are readable while scanning the gutter.
 const DIFF_CHANGE_RAIL_WIDTH: f32 = 3.0;
 
+/// The logical lines the header renders for the body: everything when the
+/// reader expanded it, otherwise the leading lines of the summary.
+///
+/// The projection is explicit because gpui's `line_clamp` gives every
+/// newline-separated line its own budget, so a commit body — which is one
+/// logical line per paragraph — would render in full under a clamp.
+fn commit_body_preview_lines(body_lines: &[String], expanded: bool) -> Vec<String> {
+    if expanded {
+        return body_lines.to_vec();
+    }
+    body_lines
+        .iter()
+        .take(COMMIT_BODY_COLLAPSED_LINES)
+        .cloned()
+        .collect()
+}
+
+/// The body lines worth drawing: the message without its subject line and
+/// without the blank separator git leaves between the two. A preview that
+/// opened on a blank line would spend a third of its budget on nothing.
+fn commit_body_content_lines(body: &str, subject: &str) -> Vec<String> {
+    let subject = subject.trim();
+    body.split('\n')
+        .map(str::to_string)
+        .skip_while(|line| line.trim() == subject)
+        .skip_while(|line| line.trim().is_empty())
+        .collect()
+}
+
+/// The collapsed body's height cap, in rems so accessibility text scaling
+/// keeps working. The projection drops logical lines past the third; this cap
+/// is what clips one soft-wrapped line to the same three rendered rows.
+fn commit_body_preview_max_height() -> gpui::Rems {
+    gpui::rems(COMMIT_BODY_FONT_REMS * COMMIT_BODY_LINE_HEIGHT * COMMIT_BODY_COLLAPSED_LINES as f32)
+}
+
 /// Whether the collapsed three-line body would hide anything.
+///
+/// A long logical line may also wrap past three rendered rows, which the cap
+/// clips without the projection dropping a line, so a line past the wrap
+/// threshold counts as hidden content too.
 fn commit_body_can_expand(body_lines: &[String]) -> bool {
     body_lines.len() > COMMIT_BODY_COLLAPSED_LINES
         || body_lines
@@ -17470,8 +17529,52 @@ mod tests {
         assert!(header.contains("toggle_all_commit_files"));
 
         // The message body is a three-line summary until the reader expands it.
+        // The projection is explicit because gpui's `line_clamp` budgets each
+        // newline-separated line separately, which would render the body whole.
         assert!(header.contains("commit_body_can_expand(&body_lines)"));
-        assert!(header.contains("line_clamp(COMMIT_BODY_COLLAPSED_LINES)"));
+        assert!(header.contains("commit_body_preview_lines(&body_lines, body_expanded)"));
+        assert!(header.contains("max_h(commit_body_preview_max_height())"));
+        assert!(!header.contains("line_clamp"));
+    }
+
+    #[test]
+    fn commit_body_preview_shows_three_logical_lines_until_expanded() {
+        let lines = (0..8)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commit_body_preview_lines(&lines, false),
+            vec!["line 0", "line 1", "line 2"]
+        );
+        assert_eq!(commit_body_preview_lines(&lines, true), lines);
+
+        // A body at or under the limit is never clipped in either mode.
+        let short = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(commit_body_preview_lines(&short, false), short);
+    }
+
+    #[test]
+    fn commit_body_content_drops_the_repeated_subject_and_separator() {
+        let body = "feat(desktop): do the thing\n\nThe reason it had to change.\n\n- one\n- two\n";
+        assert_eq!(
+            commit_body_content_lines(body, "feat(desktop): do the thing"),
+            vec!["The reason it had to change.", "", "- one", "- two", ""]
+        );
+
+        // A body that never repeats the subject keeps all of its lines, and a
+        // subject-only body reduces to nothing so no toggle is offered.
+        assert_eq!(
+            commit_body_content_lines("Just the body.", "unrelated subject"),
+            vec!["Just the body."]
+        );
+        assert!(commit_body_content_lines("only a subject", "only a subject").is_empty());
+    }
+
+    #[test]
+    fn commit_body_collapsed_cap_covers_exactly_three_rendered_rows() {
+        // text_xs is 0.75rem at a 1.5 line height, so three rows are 3.375rem.
+        let cap = commit_body_preview_max_height();
+        assert!((cap.0 - 3.375).abs() < 1e-6, "cap was {}", cap.0);
     }
 
     #[test]
