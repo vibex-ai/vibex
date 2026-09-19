@@ -14,6 +14,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     notification::Notification,
+    pagination::Pagination,
     spinner::Spinner,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -46,6 +47,9 @@ const DIALOG_MAX_WIDTH: f32 = 760.0;
 /// The trust store clamps an audit read to this many records, so the count the
 /// dialog shows is a floor rather than a total once it is reached.
 const DEVICE_AUDIT_COUNT_LIMIT: u32 = 500;
+/// Paired devices one page holds. The trust store has no paged read, so the
+/// dialog loads the registry once and windows it here.
+const DEVICE_PAGE_SIZE: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessMutation {
@@ -126,6 +130,7 @@ enum RemoteAccessAction {
     ShowDevices,
     ShowPairing,
     RefreshDevices,
+    SelectDevicePage(usize),
     RevokeDevice(String),
 }
 
@@ -344,6 +349,7 @@ struct PairingViewState {
     devices: Vec<RemoteDeviceDetail>,
     devices_loaded: bool,
     devices_error: Option<String>,
+    device_page: usize,
     audit_count: usize,
     audit_count_capped: bool,
     revoking_device: Option<String>,
@@ -405,6 +411,7 @@ impl Default for PairingViewState {
             devices: Vec::new(),
             devices_loaded: false,
             devices_error: None,
+            device_page: 1,
             audit_count: 0,
             audit_count_capped: false,
             revoking_device: None,
@@ -430,6 +437,30 @@ impl PairingViewState {
     fn show_devices(&mut self) {
         self.page = RemoteAccessPage::Devices;
         self.error_code = None;
+    }
+
+    /// Total pages the paired-device list is windowed into, never below one so
+    /// the pager keeps a stable single-page state instead of disappearing.
+    fn device_page_count(&self) -> usize {
+        self.devices.len().div_ceil(DEVICE_PAGE_SIZE).max(1)
+    }
+
+    /// The slice of the registry the current page shows.
+    fn device_page_slice(&self) -> &[RemoteDeviceDetail] {
+        let start = self
+            .device_page
+            .saturating_sub(1)
+            .saturating_mul(DEVICE_PAGE_SIZE);
+        let end = start
+            .saturating_add(DEVICE_PAGE_SIZE)
+            .min(self.devices.len());
+        self.devices.get(start..end).unwrap_or_default()
+    }
+
+    /// Selects a page, clamped so a shrinking list can never strand the pager
+    /// on a page that no longer holds rows.
+    fn select_device_page(&mut self, page: usize) {
+        self.device_page = page.clamp(1, self.device_page_count());
     }
 
     fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
@@ -651,6 +682,10 @@ impl RemoteAccessPairing {
                 cx.notify();
             }
             RemoteAccessAction::RefreshDevices => self.refresh_devices(cx),
+            RemoteAccessAction::SelectDevicePage(page) => {
+                self.state.select_device_page(page);
+                cx.notify();
+            }
             RemoteAccessAction::RevokeDevice(device_id) => self.revoke_device(device_id, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
                 self.state.select_connection_entry(entry);
@@ -741,6 +776,8 @@ impl RemoteAccessPairing {
                                 audit_count >= DEVICE_AUDIT_COUNT_LIMIT as usize;
                             this.state.devices_loaded = true;
                             this.state.devices_error = None;
+                            // A revoke can empty the page the pager was on.
+                            this.state.select_device_page(this.state.device_page);
                         }
                         Ok((Err(error), _)) => this.state.devices_error = Some(error.code),
                         Err(_) => {
@@ -1973,10 +2010,63 @@ impl RemoteAccessPairing {
         }
 
         let mut rows = v_flex().w_full().gap_2();
-        for device in self.state.devices.clone() {
+        for device in self.state.device_page_slice().to_vec() {
             rows = rows.child(self.render_device_row(device, cx));
         }
-        column.child(rows).into_any_element()
+        column = column.child(rows);
+
+        if self.state.device_page_count() > 1 {
+            column = column.child(self.render_device_pager(cx));
+        }
+        column.into_any_element()
+    }
+
+    /// Windows the registry so a long trust store cannot push the dialog past
+    /// the viewport. The range caption keeps the page's slice explicit even
+    /// when the pager collapses it into an ellipsis.
+    fn render_device_pager(&self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.state.devices.len();
+        let page = self.state.device_page;
+        let first = (page - 1) * DEVICE_PAGE_SIZE + 1;
+        let last = (first + DEVICE_PAGE_SIZE - 1).min(total);
+        let range = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("{first}–{last} of {total}"),
+            locale::ResolvedLocale::ZhCn => format!("第 {first}–{last} 台，共 {total} 台"),
+            locale::ResolvedLocale::ZhTw => format!("第 {first}–{last} 台，共 {total} 台"),
+        };
+        let entity = cx.weak_entity();
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(range),
+            )
+            .child(
+                Pagination::new("paired-device-pagination")
+                    .small()
+                    // The row already supplies the separation from the list.
+                    .py_0()
+                    .current_page(page)
+                    .total_pages(self.state.device_page_count())
+                    .visible_pages(5)
+                    .on_click(move |page, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.dispatch_action(RemoteAccessAction::SelectDevicePage(*page), cx)
+                        });
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_device_row(&self, device: RemoteDeviceDetail, cx: &mut Context<Self>) -> AnyElement {
@@ -4754,6 +4844,83 @@ mod tests {
 
         let capped = device_management_summary(3, 1, DEVICE_AUDIT_COUNT_LIMIT as usize, true);
         assert!(capped.contains("500+"));
+    }
+
+    fn device_registry(count: usize) -> PairingViewState {
+        let mut state = PairingViewState::default();
+        state.devices = (0..count)
+            .map(|_| device_detail(RemoteDeviceStatus::Revoked, None, Some(1)))
+            .collect();
+        state
+    }
+
+    #[test]
+    fn device_paging_windows_the_registry_and_clamps_the_page() {
+        // A registry that fits one page never grows a pager.
+        let single = device_registry(DEVICE_PAGE_SIZE);
+        assert_eq!(single.device_page_count(), 1);
+        assert_eq!(single.device_page_slice().len(), DEVICE_PAGE_SIZE);
+
+        // A longer one pages in fixed slices, with a short final page.
+        let mut state = device_registry(DEVICE_PAGE_SIZE * 2 + 3);
+        assert_eq!(state.device_page_count(), 3);
+        assert_eq!(state.device_page_slice().len(), DEVICE_PAGE_SIZE);
+
+        state.select_device_page(3);
+        assert_eq!(state.device_page, 3);
+        assert_eq!(state.device_page_slice().len(), 3);
+
+        // Selecting past the end lands on the last page rather than an empty one.
+        state.select_device_page(99);
+        assert_eq!(state.device_page, 3);
+        assert_eq!(state.device_page_slice().len(), 3);
+
+        // Page zero is not a page.
+        state.select_device_page(0);
+        assert_eq!(state.device_page, 1);
+        assert_eq!(state.device_page_slice().len(), DEVICE_PAGE_SIZE);
+    }
+
+    #[test]
+    fn device_paging_survives_a_registry_that_shrinks_or_empties() {
+        let mut state = device_registry(DEVICE_PAGE_SIZE * 2);
+        state.select_device_page(2);
+        assert_eq!(state.device_page_slice().len(), DEVICE_PAGE_SIZE);
+
+        // Revoking rows away drops the pager back onto a page that still holds
+        // devices instead of stranding it on an empty slice.
+        state.devices.truncate(DEVICE_PAGE_SIZE);
+        state.select_device_page(state.device_page);
+        assert_eq!(state.device_page, 1);
+        assert_eq!(state.device_page_slice().len(), DEVICE_PAGE_SIZE);
+
+        let empty = device_registry(0);
+        assert_eq!(empty.device_page_count(), 1);
+        assert!(empty.device_page_slice().is_empty());
+    }
+
+    #[test]
+    fn device_pager_uses_the_kit_pagination_component() {
+        let source = include_str!("remote_access_pairing.rs");
+        let pager = source
+            .split_once("    fn render_device_pager(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_device_row("))
+            .map(|(body, _)| body)
+            .expect("device pager should remain inspectable");
+        assert!(pager.contains("Pagination::new("));
+        assert!(pager.contains(".current_page(page)"));
+        assert!(pager.contains(".total_pages(self.state.device_page_count())"));
+        assert!(pager.contains("RemoteAccessAction::SelectDevicePage"));
+
+        let devices_page = source
+            .split_once("    fn render_devices_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Windows the registry"))
+            .map(|(body, _)| body)
+            .expect("device page should remain inspectable");
+        // The pager is only worth its row when the registry actually pages.
+        assert!(devices_page.contains("if self.state.device_page_count() > 1 {"));
+        assert!(devices_page.contains("self.state.device_page_slice()"));
+        assert!(!devices_page.contains("self.state.devices.clone()"));
     }
 
     #[test]
