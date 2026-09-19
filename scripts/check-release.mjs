@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -479,7 +479,11 @@ const report = {
 };
 
 if (WRITE) {
-  writeFileSync(path("docs/release/release-preflight.json"), `${JSON.stringify(report, null, 2)}\n`);
+  const evidencePath = path("docs/release/release-preflight.json");
+  // The evidence directory is not tracked, so a fresh checkout does not have
+  // it; create it instead of failing the documented `pnpm release:preflight`.
+  mkdirSync(dirname(evidencePath), { recursive: true });
+  writeFileSync(evidencePath, `${JSON.stringify(report, null, 2)}\n`);
 }
 console.log(JSON.stringify(report, null, 2));
 if (report.overallStatus !== "pass") process.exitCode = 1;

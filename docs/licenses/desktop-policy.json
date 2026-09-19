@@ -144,21 +144,21 @@
     {
       "id": "vibex-desktop-reviewed-icons",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
-      "version": "0.1.0-rc.4",
+      "version": "0.1.0-rc.5",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/icons",
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 190,
-      "treeSha256": "b75ba14e2dcc1bbee49721386d95bb7cac51a452883d01286f515e5d02318278",
+      "expectedFileCount": 191,
+      "treeSha256": "b59b29c36b8f9cbd319a73f0eec8921cab8fc0f71d7e23a4639135c6a5d21d2b",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "77 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "78 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
-          "fileCount": 77,
+          "fileCount": 78,
           "licenseExpression": "ISC",
           "source": "https://github.com/lucide-icons/lucide"
         },
@@ -215,7 +215,7 @@
     {
       "id": "vibex-desktop-application-icons",
       "name": "Vibex desktop application and tray icons",
-      "version": "0.1.0-rc.4",
+      "version": "0.1.0-rc.5",
       "ownerPackage": "vibex-desktop",
       "root": "apps/desktop/assets/app-icons",
       "extensions": [
@@ -231,7 +231,7 @@
     {
       "id": "vibex-mobile-brand-marks",
       "name": "Vibex native mobile brand mark",
-      "version": "0.1.0-rc.4",
+      "version": "0.1.0-rc.5",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/brand",
       "extensions": [
@@ -245,7 +245,7 @@
     {
       "id": "vibex-mobile-application-icons",
       "name": "Vibex native mobile application icons",
-      "version": "0.1.0-rc.4",
+      "version": "0.1.0-rc.5",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
       "extensions": [
@@ -260,7 +260,7 @@
     {
       "id": "vibex-mobile-native-icons",
       "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.0-rc.4",
+      "version": "0.1.0-rc.5",
       "ownerPackage": "vibex-ui",
       "root": "apps/mobile/assets/icons",
       "extensions": [

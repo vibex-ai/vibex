@@ -7,7 +7,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat" alt="License: AGPL-3.0-or-later" /></a>
   <img src="https://img.shields.io/badge/Rust-1.97.0-black?style=flat&logo=rust&logoColor=white" alt="Rust 1.97.0" />
   <img src="https://img.shields.io/badge/UI-GPUI-2563eb?style=flat" alt="GPUI" />
-  <img src="https://img.shields.io/badge/status-0.1.0--rc.4-f97316?style=flat" alt="Release status: 0.1.0-rc.4" />
+  <img src="https://img.shields.io/badge/status-0.1.0--rc.5-f97316?style=flat" alt="Release status: 0.1.0-rc.5" />
 </p>
 
 <p align="center">
@@ -328,7 +328,7 @@ developer or release pipeline.
 The Relay is optional. Pull the published image, or build it from source:
 
 ```bash
-export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.4
+export VIBEX_RELAY_IMAGE=ghcr.io/vibex-ai/vibex-relay-server:v0.1.0-rc.5
 docker compose -f deploy/relay/docker-compose.yml pull relay-server
 docker compose -f deploy/relay/docker-compose.yml up -d --no-build relay-server
 curl -fsS http://127.0.0.1:9700/health
