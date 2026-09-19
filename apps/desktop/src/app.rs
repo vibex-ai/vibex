@@ -56143,7 +56143,17 @@ impl FoundationSettings {
             .read_with(cx, |this, _| this.update_snapshot.clone())
             .unwrap_or_default();
         let release = update_snapshot.state.release().cloned();
-        let notes_source = self.about_notes_source(release.as_ref(), resolved_locale);
+        // A known release carries its own notes; when nothing newer exists the
+        // card falls back to the notes published for the installed version.
+        let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let (notes_tag, notes_document) = match release.as_ref() {
+            Some(release) => (release.tag.as_str(), release.notes.as_deref()),
+            None => (
+                current_tag.as_str(),
+                update_snapshot.current_notes.as_deref(),
+            ),
+        };
+        let notes_source = self.about_notes_source(notes_tag, notes_document, resolved_locale);
         let (update_status, update_description, update_control) = match &update_snapshot.state {
             UpdateState::Idle => (
                 locale::text("Up to date", "已是最新", "已是最新"),
@@ -56481,37 +56491,32 @@ impl FoundationSettings {
     }
 
     /// Release notes Markdown for the About page, re-selected only when the
-    /// release or the resolved locale changes.
+    /// published tag or the resolved locale changes.
     fn about_notes_source(
         &mut self,
-        release: Option<&UpdateRelease>,
+        tag: &str,
+        document: Option<&str>,
         resolved_locale: locale::ResolvedLocale,
     ) -> Option<Arc<str>> {
-        let Some(release) = release else {
-            self.about_notes = None;
-            return None;
-        };
         if let Some(cached) = self.about_notes.as_ref()
-            && cached.tag == release.tag
+            && cached.tag == tag
             && cached.locale == resolved_locale
         {
             return Some(cached.source.clone());
         }
-        let source = release
-            .notes
-            .as_deref()
+        let source = document
             .and_then(|document| select_notes_section(document, resolved_locale.tag()))
             .map(Arc::<str>::from);
         self.about_notes = source.as_ref().map(|source| AboutReleaseNotes {
-            tag: release.tag.clone(),
+            tag: tag.to_string(),
             locale: resolved_locale,
             source: source.clone(),
         });
         source
     }
 
-    /// The About update card: the state row plus, when a release is known, its
-    /// version facts and localized release notes.
+    /// The About update card: the state row plus, when notes are known, the
+    /// release facts and the localized changelog.
     fn render_about_update_card(
         &self,
         release: Option<&UpdateRelease>,
@@ -56560,84 +56565,94 @@ impl FoundationSettings {
                             .child(div().text_sm().font_medium().child(value))
                     })),
             );
-            if let Some(source) = notes_source {
-                let notes_url = release.notes_url.to_string();
-                body = body.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .child(div().text_xs().font_medium().child(locale::text(
-                            "What's new",
-                            "更新内容",
-                            "更新內容",
-                        )))
-                        .child(
-                            div()
-                                .id("about-release-notes")
-                                .w_full()
-                                .min_w_0()
-                                .max_h(px(320.0))
-                                .overflow_y_scroll()
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(border.opacity(0.5))
-                                .bg(if is_dark {
-                                    card.opacity(0.35)
-                                } else {
-                                    muted.opacity(0.45)
-                                })
-                                .px_3()
-                                .py_2()
-                                .child(
-                                    MarkdownView::new(
-                                        SharedString::from(format!(
-                                            "about-release-notes:{}",
-                                            release.tag
-                                        )),
-                                        MarkdownInput::new(source, "", 0),
-                                    )
-                                    .presentation(MarkdownPresentation::Document),
-                                ),
-                        )
-                        .child(
-                            h_flex().w_full().justify_end().child(
-                                Button::new("open-release-notes")
-                                    .small()
-                                    .ghost()
-                                    .icon(IconName::ExternalLink)
-                                    .label(locale::text(
-                                        "Open on GitHub",
-                                        "在 GitHub 查看",
-                                        "在 GitHub 檢視",
-                                    ))
-                                    .on_click(move |_, _, _| {
-                                        let _ = open_external_url(&notes_url);
-                                    }),
+        }
+        // The card shows the changelog of whatever the user would be running
+        // next: the discovered release when one exists, otherwise the installed
+        // version.
+        let notes_version = release
+            .map(|release| release.version.to_string())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let notes_url = release
+            .map(|release| release.notes_url.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "https://github.com/vibex-ai/vibex/releases/tag/v{}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            });
+        if let Some(source) = notes_source {
+            body = body.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(div().text_xs().font_medium().child(format!(
+                        "{} {notes_version}",
+                        locale::text("What's new in Vibex", "Vibex 更新内容", "Vibex 更新內容")
+                    )))
+                    .child(
+                        div()
+                            .id("about-release-notes")
+                            .w_full()
+                            .min_w_0()
+                            .max_h(px(320.0))
+                            .overflow_y_scroll()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(border.opacity(0.5))
+                            .bg(if is_dark {
+                                card.opacity(0.35)
+                            } else {
+                                muted.opacity(0.45)
+                            })
+                            .px_3()
+                            .py_2()
+                            .child(
+                                MarkdownView::new(
+                                    SharedString::from(format!(
+                                        "about-release-notes:{notes_version}"
+                                    )),
+                                    MarkdownInput::new(source, "", 0),
+                                )
+                                .presentation(MarkdownPresentation::Document),
                             ),
+                    )
+                    .child(
+                        h_flex().w_full().justify_end().child(
+                            Button::new("open-release-notes")
+                                .small()
+                                .ghost()
+                                .icon(IconName::ExternalLink)
+                                .label(locale::text(
+                                    "Open on GitHub",
+                                    "在 GitHub 查看",
+                                    "在 GitHub 檢視",
+                                ))
+                                .on_click(move |_, _, _| {
+                                    let _ = open_external_url(&notes_url);
+                                }),
                         ),
-                );
-            } else {
-                // Older releases predate the notes asset; keep the signed
-                // release page reachable from the same card.
-                let notes_url = release.notes_url.to_string();
-                body = body.child(
-                    h_flex().w_full().justify_end().child(
-                        Button::new("open-release-page")
-                            .small()
-                            .ghost()
-                            .icon(IconName::ExternalLink)
-                            .label(locale::text(
-                                "View release page",
-                                "查看发行页面",
-                                "檢視發行頁面",
-                            ))
-                            .on_click(move |_, _, _| {
-                                let _ = open_external_url(&notes_url);
-                            }),
                     ),
-                );
-            }
+            );
+        } else if release.is_some() {
+            // Older releases predate the notes asset; keep the signed release
+            // page reachable from the same card.
+            body = body.child(
+                h_flex().w_full().justify_end().child(
+                    Button::new("open-release-page")
+                        .small()
+                        .ghost()
+                        .icon(IconName::ExternalLink)
+                        .label(locale::text(
+                            "View release page",
+                            "查看发行页面",
+                            "檢視發行頁面",
+                        ))
+                        .on_click(move |_, _, _| {
+                            let _ = open_external_url(&notes_url);
+                        }),
+                ),
+            );
         }
 
         div()
@@ -69891,6 +69906,9 @@ mod tests {
         assert!(about.contains("about_notes_source"));
         assert!(about.contains("UpdateState::Available"));
         assert!(about.contains("This build does not include the release verification key"));
+        // With nothing newer available the card falls back to the notes of the
+        // installed version.
+        assert!(about.contains("update_snapshot.current_notes.as_deref()"));
 
         let card = source
             .split_once("    fn render_about_update_card(")
@@ -69902,7 +69920,8 @@ mod tests {
         assert!(card.contains("Latest version"));
         assert!(card.contains("Published"));
         assert!(card.contains("Download size"));
-        assert!(card.contains("What's new"));
+        assert!(card.contains("What's new in Vibex"));
+        assert!(card.contains("notes_version"));
         assert!(card.contains("about-release-notes"));
         assert!(card.contains("MarkdownView::new("));
         assert!(card.contains("MarkdownPresentation::Document"));
@@ -69915,7 +69934,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("about notes selection should remain inspectable");
         assert!(notes.contains("select_notes_section(document, resolved_locale.tag())"));
-        assert!(notes.contains("cached.tag == release.tag"));
+        assert!(notes.contains("cached.tag == tag"));
         assert!(notes.contains("cached.locale == resolved_locale"));
     }
 
