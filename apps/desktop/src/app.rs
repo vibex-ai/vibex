@@ -522,6 +522,11 @@ const COMMAND_PALETTE_DIALOG_MAX_WIDTH: f32 = 720.0;
 const COMMAND_PALETTE_DIALOG_MAX_HEIGHT: f32 = 620.0;
 const COMMAND_PALETTE_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
 const COMMAND_PALETTE_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
+const COMMAND_PALETTE_DIALOG_RADIUS: f32 = 8.0;
+/// The palette's frame paints a 1px border inside its bounds, so the command
+/// surface starts one pixel in and shrinks its radius by the same amount to sit
+/// flush against the border's inner edge.
+const COMMAND_PALETTE_DIALOG_CONTENT_RADIUS: f32 = COMMAND_PALETTE_DIALOG_RADIUS - 1.0;
 /// The keyboard legend under the list. Fixed so the list's share of the dialog
 /// is known before the footer renders.
 const COMMAND_PALETTE_FOOTER_HEIGHT: f32 = 34.0;
@@ -45602,6 +45607,9 @@ impl VibexWorkbench {
             // The dialog owns the frame and the elevation, so the palette only
             // draws its own content.
             .bordered(false)
+            // GPUI clips children to a square, so the command surface rounds
+            // the frame's corners itself instead of squaring them off.
+            .rounded(px(COMMAND_PALETTE_DIALOG_CONTENT_RADIUS))
             // The workbench answers the query. Sessions match on message text
             // the component cannot see, and the other groups reuse that same
             // pass, so one query produces one list.
@@ -45721,7 +45729,7 @@ impl VibexWorkbench {
                     .max_w_full()
                     .max_h_full()
                     .overflow_hidden()
-                    .rounded(px(8.0))
+                    .rounded(px(COMMAND_PALETTE_DIALOG_RADIUS))
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().popover)
@@ -59904,6 +59912,10 @@ mod tests {
         assert!(overlay.contains("Command::new(&self.command_palette)"));
         assert!(overlay.contains(".absolute()"));
         assert!(overlay.contains(".inset_0()"));
+        // The command surface paints its own background, and GPUI only clips
+        // children to a square, so it has to round the frame's corners itself.
+        assert!(overlay.contains(".rounded(px(COMMAND_PALETTE_DIALOG_CONTENT_RADIUS))"));
+        assert!(overlay.contains(".rounded(px(COMMAND_PALETTE_DIALOG_RADIUS))"));
         assert!(overlay.contains("CommandGroup::new()"));
         assert!(overlay.contains("skeleton_session_search(cx)"));
         assert!(overlay.contains("strings.command_palette_hint"));
