@@ -71,6 +71,10 @@ falls through to another channel.
 - Fetch release notes from the same verified tag, under a bounded size and a
   shorter timeout. A missing, oversized, non-UTF-8, or failed document leaves
   the release without notes; it must never fail or stall a check.
+- A check that finds no newer release also fetches the notes published for the
+  installed version and keeps them on the snapshot. Notes for a published tag
+  never change, so the first successful fetch is reused for the process; a
+  missing document is retried by the next check instead of cached as absent.
 - Build every release asset URL from the verified tag, never from a URL the
   manifest supplies. Reject tags that could escape the release download path.
 
@@ -124,6 +128,9 @@ without user interruption; manual failures publish a typed visible error.
   localized release notes as rendered Markdown. Notes selection resolves the
   interface language, falling back to the generic Chinese section and then to
   English; a release without notes keeps the signed release page as its link.
+- With nothing newer available the same card shows the notes published for the
+  installed version, and shows nothing when that release predates the notes
+  asset. The card therefore always answers "what am I running or about to run".
 - A known release shows a title-bar arrow before mobile pairing. The arrow
   toggles a rounded panel anchored below it; the panel stays open until the
   user closes it, and a newly discovered version opens it again.

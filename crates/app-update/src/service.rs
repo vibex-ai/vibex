@@ -163,6 +163,13 @@ pub struct UpdateSnapshot {
     pub state: UpdateState,
     pub last_successful_check_ms: Option<i64>,
     pub last_automatic_failure: Option<UpdateFailure>,
+    /// Notes published for the installed version, when its release ships any.
+    ///
+    /// Informational only, exactly like [`UpdateRelease::notes`]: the document
+    /// is not covered by the manifest signature. A check that finds no newer
+    /// release refreshes it; one that finds an update clears it, because the
+    /// release carries its own notes.
+    pub current_notes: Option<String>,
 }
 
 impl Default for UpdateSnapshot {
@@ -172,6 +179,23 @@ impl Default for UpdateSnapshot {
             state: UpdateState::Idle,
             last_successful_check_ms: None,
             last_automatic_failure: None,
+            current_notes: None,
+        }
+    }
+}
+
+/// One manifest check: the state to publish plus the notes that belong to the
+/// installed version when no newer release exists.
+struct CheckOutcome {
+    state: UpdateState,
+    current_notes: Option<String>,
+}
+
+impl CheckOutcome {
+    const fn new(state: UpdateState) -> Self {
+        Self {
+            state,
+            current_notes: None,
         }
     }
 }
@@ -243,6 +267,7 @@ impl AppUpdateService {
             },
             last_successful_check_ms: None,
             last_automatic_failure: None,
+            current_notes: None,
         };
         let (snapshot_tx, _) = watch::channel(snapshot.clone());
         Self {
@@ -318,8 +343,8 @@ impl AppUpdateService {
         }
         let result = self.check_inner().await;
         match &result {
-            Ok(state) => {
-                self.publish_successful_check(state.clone());
+            Ok(outcome) => {
+                self.publish_successful_check(outcome.state.clone(), outcome.current_notes.clone());
             }
             Err(error) if reason == CheckReason::Automatic => {
                 self.publish_automatic_failure(error, previous_state);
@@ -377,7 +402,7 @@ impl AppUpdateService {
         self.inner.config.installation.restart()
     }
 
-    async fn check_inner(&self) -> AppUpdateResult<UpdateState> {
+    async fn check_inner(&self) -> AppUpdateResult<CheckOutcome> {
         let public_key = self
             .inner
             .config
@@ -395,7 +420,10 @@ impl AppUpdateService {
             .latest_signed_manifest(self.inner.config.channel)
             .await?
         else {
-            return Ok(UpdateState::Idle);
+            return Ok(CheckOutcome {
+                state: UpdateState::Idle,
+                current_notes: self.current_version_notes().await,
+            });
         };
         let verified = verify_manifest(
             &signed.manifest,
@@ -405,7 +433,10 @@ impl AppUpdateService {
             &signed.tag,
         )?;
         if verified.manifest.version <= self.inner.config.current_version {
-            return Ok(UpdateState::Idle);
+            return Ok(CheckOutcome {
+                state: UpdateState::Idle,
+                current_notes: self.current_version_notes().await,
+            });
         }
         let artifact = verified
             .matching_artifact(
@@ -428,19 +459,33 @@ impl AppUpdateService {
             .as_ref()
             .map(|artifact| artifact.install_mode)
         else {
-            return Ok(UpdateState::Unsupported {
+            return Ok(CheckOutcome::new(UpdateState::Unsupported {
                 release,
                 reason: "No signed update package matches this operating system, architecture, and installation source."
                     .to_string(),
-            });
+            }));
         };
         if !self.inner.config.installation.supports(install_mode) {
-            return Ok(UpdateState::Unsupported {
+            return Ok(CheckOutcome::new(UpdateState::Unsupported {
                 release,
                 reason: external_install_reason(install_mode).to_string(),
-            });
+            }));
         }
-        Ok(UpdateState::Available { release })
+        Ok(CheckOutcome::new(UpdateState::Available { release }))
+    }
+
+    /// Notes for the installed version, so About can show a changelog even when
+    /// nothing newer exists.
+    ///
+    /// Notes for a published tag never change, so the first successful fetch is
+    /// reused for the rest of the process; a missing document is retried by the
+    /// next check rather than cached as absent.
+    async fn current_version_notes(&self) -> Option<String> {
+        if let Some(notes) = self.snapshot().current_notes {
+            return Some(notes);
+        }
+        let tag = format!("v{}", self.inner.config.current_version);
+        self.release_notes(&tag).await
     }
 
     /// Fetch informational notes without letting them fail or stall a check.
@@ -633,9 +678,10 @@ impl AppUpdateService {
         self.update_snapshot(|snapshot| snapshot.state = state);
     }
 
-    fn publish_successful_check(&self, state: UpdateState) {
+    fn publish_successful_check(&self, state: UpdateState, current_notes: Option<String>) {
         self.update_snapshot(|snapshot| {
             snapshot.state = state;
+            snapshot.current_notes = current_notes;
             snapshot.last_successful_check_ms = Some(now_ms());
             snapshot.last_automatic_failure = None;
         });
@@ -864,23 +910,38 @@ mod tests {
     }
 
     fn fixture() -> (AppUpdateConfig, Arc<dyn UpdateSource>) {
+        fixture_for(
+            "0.2.0",
+            "0.1.0",
+            Ok(Some(
+                "## English\n\n### Highlights\n\n- A verified change.\n".to_string(),
+            )),
+        )
+    }
+
+    fn fixture_for(
+        manifest_version: &str,
+        current_version: &str,
+        notes: AppUpdateResult<Option<String>>,
+    ) -> (AppUpdateConfig, Arc<dyn UpdateSource>) {
         let directory = tempdir().unwrap().keep();
         let bytes = b"verified package".to_vec();
         let sha256 = hex_lower(&Sha256::digest(&bytes));
+        let tag = format!("v{manifest_version}");
         let manifest = json!({
             "schema": 1,
             "channel": "stable",
-            "version": "0.2.0",
-            "tag": "v0.2.0",
+            "version": manifest_version,
+            "tag": tag,
             "published_at": "2026-08-16T00:00:00Z",
             "minimum_updater_version": "1",
-            "notes_url": "https://github.com/vibex-ai/vibex/releases/tag/v0.2.0",
+            "notes_url": format!("https://github.com/vibex-ai/vibex/releases/tag/{tag}"),
             "artifacts": [{
                 "os": "linux",
                 "arch": "x86_64",
                 "package": "deb",
                 "install_mode": "system_installer",
-                "url": "https://github.com/vibex-ai/vibex/releases/download/v0.2.0/vibex-0.2.0-linux-x86_64-deb.deb",
+                "url": format!("https://github.com/vibex-ai/vibex/releases/download/{tag}/vibex-{manifest_version}-linux-x86_64-deb.deb"),
                 "size": bytes.len(),
                 "sha256": sha256
             }]
@@ -889,7 +950,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[4; 32]);
         let signature = BASE64_STANDARD.encode(key.sign(&raw).to_bytes());
         let config = AppUpdateConfig {
-            current_version: Version::parse("0.1.0").unwrap(),
+            current_version: Version::parse(current_version).unwrap(),
             channel: UpdateChannel::Stable,
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
@@ -904,14 +965,12 @@ mod tests {
         };
         let source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
             signed: SignedManifest {
-                tag: "v0.2.0".to_string(),
+                tag,
                 manifest: raw,
                 signature_base64: signature,
             },
             artifact_bytes: bytes,
-            notes: Ok(Some(
-                "## English\n\n### Highlights\n\n- A verified change.\n".to_string(),
-            )),
+            notes,
         });
         (config, source)
     }
@@ -941,6 +1000,50 @@ mod tests {
             .as_deref()
             .expect("a published document should reach the release");
         assert!(notes.contains("A verified change."));
+        assert_eq!(
+            checked.current_notes, None,
+            "an available release must not keep the installed version's notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn up_to_date_check_attaches_the_installed_version_notes() {
+        let (config, source) = fixture_for(
+            "0.1.0",
+            "0.1.0",
+            Ok(Some(
+                "## English\n\n### Fixes\n\n- A shipped fix.\n".to_string(),
+            )),
+        );
+        let service = AppUpdateService::with_source(config, source).unwrap();
+
+        let checked = service.check(CheckReason::Manual).await.unwrap();
+
+        assert!(matches!(checked.state, UpdateState::Idle));
+        let notes = checked
+            .current_notes
+            .as_deref()
+            .expect("the installed version's notes should reach the snapshot");
+        assert!(notes.contains("A shipped fix."));
+    }
+
+    #[tokio::test]
+    async fn up_to_date_check_survives_missing_or_failed_installed_notes() {
+        for notes in [
+            Ok(None),
+            Err(AppUpdateError::new(
+                "app_update_network_failed",
+                "the update service could not be reached",
+            )),
+        ] {
+            let (config, source) = fixture_for("0.1.0", "0.1.0", notes);
+            let service = AppUpdateService::with_source(config, source).unwrap();
+
+            let checked = service.check(CheckReason::Manual).await.unwrap();
+
+            assert!(matches!(checked.state, UpdateState::Idle));
+            assert_eq!(checked.current_notes, None);
+        }
     }
 
     #[tokio::test]
