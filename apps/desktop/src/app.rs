@@ -53163,65 +53163,21 @@ impl FoundationSettings {
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let system_selected = appearance.theme == ModelThemeMode::System;
-        let light_selected = appearance.theme == ModelThemeMode::Light;
-        let dark_selected = appearance.theme == ModelThemeMode::Dark;
-        let theme_control = settings_segmented_control(
-            "theme-mode",
-            vec![
-                settings_segmented_option(
-                    div()
-                        .id("theme-system-icon")
-                        .px_2()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Icon::default()
-                                .path("icons/vibex/monitor.svg")
-                                .size(px(12.0)),
-                        )
-                        .tooltip(move |window, cx| Tooltip::new(strings.system).build(window, cx)),
-                    system_selected,
-                    cx.listener(|this, _, window, cx| {
-                        this.set_theme(ModelThemeMode::System, window, cx)
-                    }),
-                )
-                .aria_label(strings.system),
-                settings_segmented_option(
-                    div()
-                        .id("theme-light-icon")
-                        .px_2()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::new(IconName::Sun).size(px(12.0)))
-                        .tooltip(move |window, cx| Tooltip::new(strings.light).build(window, cx)),
-                    light_selected,
-                    cx.listener(|this, _, window, cx| {
-                        this.set_theme(ModelThemeMode::Light, window, cx)
-                    }),
-                )
-                .aria_label(strings.light),
-                settings_segmented_option(
-                    div()
-                        .id("theme-dark-icon")
-                        .px_2()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::new(IconName::Moon).size(px(12.0)))
-                        .tooltip(move |window, cx| Tooltip::new(strings.dark).build(window, cx)),
-                    dark_selected,
-                    cx.listener(|this, _, window, cx| {
-                        this.set_theme(ModelThemeMode::Dark, window, cx)
-                    }),
-                )
-                .aria_label(strings.dark),
-            ],
+        let theme_control = appearance_theme::theme_mode_picker(
+            &appearance.theme_selection,
+            appearance.theme,
+            appearance_theme::ThemeModeLabels {
+                system: strings.system,
+                light: strings.light,
+                dark: strings.dark,
+            },
+            cx.theme().is_dark(),
+            {
+                let this = cx.entity().downgrade();
+                move |mode, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.set_theme(mode, window, cx));
+                }
+            },
         );
         let interface_font_select = settings_select(
             &self.interface_fonts,
@@ -53267,11 +53223,13 @@ impl FoundationSettings {
             strings.appearance,
             strings.appearance_description,
             vec![
+                // The preview cards need the row's full width, so the
+                // appearance row stays stacked at every viewport size.
                 setting_row(
                     strings.theme,
                     strings.theme_description,
                     theme_control,
-                    stacked,
+                    true,
                     cx,
                 ),
                 setting_row(
