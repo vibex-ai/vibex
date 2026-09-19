@@ -36354,6 +36354,7 @@ impl VibexWorkbench {
                                             let measured_turn_id = turn.id.clone();
                                             let turn_content = this.render_timeline_turn(
                                                 turn,
+                                                index,
                                                 index == 0,
                                                 index + 1 == turn_count,
                                                 window,
@@ -39645,6 +39646,7 @@ impl VibexWorkbench {
         for (index, turn) in turns.iter().enumerate() {
             content = content.child(self.render_timeline_turn(
                 turn,
+                index,
                 index == 0,
                 index + 1 == turn_count,
                 window,
@@ -40536,7 +40538,7 @@ impl VibexWorkbench {
             {
                 group_index += 1;
             }
-            if enhanced_command_display
+            if pairs_commands
                 && let (Some(command_row), Some(permission_row)) = (
                     turn.process_rows.get(row_index),
                     turn.process_rows.get(row_index + 1),
