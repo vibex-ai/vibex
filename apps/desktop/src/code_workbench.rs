@@ -83,6 +83,7 @@ use vibex_markdown::{
 use vibex_terminal::TerminalManager;
 
 use crate::app::VibexWorkbench;
+use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
 use crate::gpui_ext::solid_empty_border;
 use crate::locale;
@@ -1003,6 +1004,10 @@ pub struct CodeWorkbench {
     pub(crate) git: GitWorkbenchState,
     pub(crate) preview: PreviewState,
     preview_panel_fullscreen: bool,
+    /// Whether the preview panel is hosted by its own window instead of the
+    /// workbench column. The entity is the same in either host, so tabs,
+    /// editors, and terminals move with it.
+    preview_detached: bool,
     preview_visible: bool,
     files_surface_visible: bool,
     git_surface_visible: bool,
@@ -1160,6 +1165,7 @@ impl CodeWorkbench {
             git: GitWorkbenchState::default(),
             preview,
             preview_panel_fullscreen: false,
+            preview_detached: false,
             preview_visible: false,
             files_surface_visible: false,
             git_surface_visible: false,
@@ -1569,6 +1575,16 @@ impl CodeWorkbench {
         }
         self.preview_panel_fullscreen = fullscreen;
         cx.emit(CodeWorkbenchEvent::LayoutChanged { fullscreen });
+    }
+
+    /// Records that the panel is now hosted by its own window. The workbench
+    /// owns the window, so this only mirrors the host the parent established.
+    pub(crate) fn set_preview_detached(&mut self, detached: bool, cx: &mut Context<Self>) {
+        if self.preview_detached == detached {
+            return;
+        }
+        self.preview_detached = detached;
+        cx.notify();
     }
 
     pub(crate) fn set_preview_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -2199,6 +2215,25 @@ impl CodeWorkbench {
         };
         cx.defer(move |cx| {
             let _ = parent.update(cx, |parent, cx| parent.close_code_preview(cx));
+        });
+    }
+
+    /// Asks the workbench to move the preview panel into its own window, or
+    /// back into the workbench column. The panel is never re-created, so every
+    /// open tab travels with it.
+    fn request_preview_window(
+        &self,
+        window_handle: gpui::AnyWindowHandle,
+        detached: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent) = self.parent.clone() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            let _ = parent.update(cx, |parent, cx| {
+                parent.set_preview_window_detached(window_handle, detached, cx)
+            });
         });
     }
 
@@ -8346,6 +8381,7 @@ impl Render for CodeWorkbench {
         self.git_preview_errors
             .retain(|tab_id, _| tab_ids.contains(tab_id));
         let is_fullscreen = self.preview_panel_fullscreen;
+        let is_detached = self.preview_detached;
         let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
         let root = self.preview.root.clone();
         let side_preview = self.preview.side_preview_tab_id.clone();
@@ -8440,33 +8476,67 @@ impl Render for CodeWorkbench {
                             )
                             .child(div().mx_1().h(px(20.0)).w(px(1.0)).bg(cx.theme().border))
                             .child(
-                                Button::new("toggle-preview-fullscreen")
+                                Button::new("toggle-preview-window")
                                     .small()
                                     .ghost()
                                     .compact()
                                     .size(px(28.0))
-                                    .icon(if is_fullscreen {
-                                        IconName::Minimize
+                                    .icon(if is_detached {
+                                        IconName::PanelRightClose
                                     } else {
-                                        IconName::Maximize
+                                        IconName::ExternalLink
                                     })
-                                    .tooltip(if is_fullscreen {
+                                    .tooltip(if is_detached {
                                         locale::text(
-                                            "Exit full screen",
-                                            "退出全屏",
-                                            "退出全螢幕",
+                                            "Dock preview into the main window",
+                                            "嵌入主窗口",
+                                            "嵌入主視窗",
                                         )
                                     } else {
                                         locale::text(
-                                            "Full screen",
-                                            "全屏",
-                                            "全螢幕",
+                                            "Pop out preview window",
+                                            "弹出为独立窗口",
+                                            "彈出為獨立視窗",
                                         )
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_fullscreen(cx);
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.request_preview_window(
+                                            window.window_handle(),
+                                            !is_detached,
+                                            cx,
+                                        )
                                     })),
                             )
+                            .when(!is_detached, |this| {
+                                this.child(
+                                    Button::new("toggle-preview-fullscreen")
+                                        .small()
+                                        .ghost()
+                                        .compact()
+                                        .size(px(28.0))
+                                        .icon(if is_fullscreen {
+                                            IconName::Minimize
+                                        } else {
+                                            IconName::Maximize
+                                        })
+                                        .tooltip(if is_fullscreen {
+                                            locale::text(
+                                                "Exit full screen",
+                                                "退出全屏",
+                                                "退出全螢幕",
+                                            )
+                                        } else {
+                                            locale::text(
+                                                "Full screen",
+                                                "全屏",
+                                                "全螢幕",
+                                            )
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_fullscreen(cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("close-preview-panel")
                                     .small()
@@ -8551,6 +8621,60 @@ impl Render for CodeWorkbench {
                         self.render_preview_node(root, window, cx)
                     }),
             )
+    }
+}
+
+/// Root view of the detached preview window.
+///
+/// The window hosts the very same [`CodeWorkbench`] entity the workbench column
+/// renders, so popping the panel out and docking it back never re-creates it
+/// and never drops a tab. This view only adds what the panel needs once it is
+/// on its own: a focus root for the editor actions that otherwise live on the
+/// workbench shell.
+pub(crate) struct PreviewWindowHost {
+    workbench: Entity<CodeWorkbench>,
+    focus_handle: FocusHandle,
+}
+
+impl PreviewWindowHost {
+    pub(crate) fn new(
+        workbench: Entity<CodeWorkbench>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        window.defer(cx, {
+            let focus_handle = focus_handle.clone();
+            move |window, cx| {
+                if window.focused(cx).is_none() {
+                    focus_handle.focus(window, cx);
+                }
+            }
+        });
+        Self {
+            workbench,
+            focus_handle,
+        }
+    }
+}
+
+impl Render for PreviewWindowHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("preview-window-host")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &SaveActiveFile, _, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.save_active_editor(cx));
+            }))
+            .on_action(cx.listener(|this, _: &GoToLineInEditor, window, cx| {
+                this.workbench
+                    .update(cx, |workbench, cx| workbench.begin_goto_line(window, cx));
+            }))
+            .child(self.workbench.clone())
     }
 }
 

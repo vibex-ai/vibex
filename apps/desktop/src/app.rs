@@ -26,9 +26,10 @@ use gpui::{
     ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
     ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
-    Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions, deferred, div,
-    img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
+    Subscription, Task, TitlebarOptions, Unbind, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions,
+    deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
+    size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -168,7 +169,8 @@ use crate::actions::{
 use crate::appearance_theme;
 use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
-    CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
+    CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState,
+    PreviewWindowHost, RightRailMode,
 };
 use crate::directory_picker::{
     DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
@@ -382,6 +384,12 @@ const SIDEBAR_RESIZE_KEYBOARD_STEP: f32 = 16.0;
 const PREVIEW_PANEL_MIN_WIDTH: f32 = 360.0;
 const PREVIEW_PANEL_MAX_WIDTH: f32 = 900.0;
 const PREVIEW_PANEL_VIEWPORT_RATIO: f32 = 0.62;
+/// The detached preview window opens wide enough for the tab strip and the
+/// side-by-side split the panel already supports.
+const PREVIEW_WINDOW_WIDTH: f32 = 1080.0;
+const PREVIEW_WINDOW_HEIGHT: f32 = 760.0;
+const PREVIEW_WINDOW_MIN_WIDTH: f32 = 360.0;
+const PREVIEW_WINDOW_MIN_HEIGHT: f32 = 320.0;
 const RIGHT_RAIL_PANEL_MIN_WIDTH: f32 = 224.0;
 const RIGHT_RAIL_PANEL_MAX_WIDTH: f32 = 720.0;
 const RIGHT_RAIL_PANEL_VIEWPORT_RATIO: f32 = 0.57;
@@ -5730,6 +5738,15 @@ pub struct VibexWorkbench {
     runtime_connect_errors: BTreeMap<String, String>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
+    /// The window hosting the multi-tab preview panel while it is popped out of
+    /// the workbench. `None` means the panel is hosted inline, and the two are
+    /// mutually exclusive so the workbench never draws a second panel.
+    preview_window: Option<AnyWindowHandle>,
+    /// Hands the panel back when the detached window closes for a reason the
+    /// workbench did not initiate.
+    preview_window_closed_subscription: Option<Subscription>,
+    /// The workbench window itself, so docking the panel back can raise it.
+    window_handle: Option<AnyWindowHandle>,
     code_preview_visible: bool,
     code_files_surface_visible: bool,
     code_git_surface_visible: bool,
@@ -6562,6 +6579,20 @@ impl VibexWorkbench {
                 .map(|config| config.home_dir.clone())
                 .unwrap_or_default(),
         );
+        // Closing the detached preview window is a request to dock the panel
+        // back, not a request to drop it, so the workbench watches window
+        // teardown instead of relying on its own close path.
+        let preview_window_closed_subscription = {
+            let workbench = cx.weak_entity();
+            cx.on_window_closed(move |cx, window_id| {
+                if let Some(workbench) = workbench.upgrade() {
+                    workbench.update(cx, |this, cx| {
+                        this.handle_preview_window_closed(window_id, cx)
+                    });
+                }
+            })
+        };
+        let window_handle = Some(window.window_handle());
         let mut this = Self {
             focus_handle,
             config,
@@ -6628,6 +6659,9 @@ impl VibexWorkbench {
             runtime_connect_errors: BTreeMap::new(),
             code_workbench,
             preview_fullscreen_active: false,
+            preview_window: None,
+            preview_window_closed_subscription: Some(preview_window_closed_subscription),
+            window_handle,
             code_preview_visible: false,
             code_files_surface_visible: false,
             code_git_surface_visible: false,
@@ -6973,6 +7007,7 @@ impl VibexWorkbench {
     }
 
     pub(crate) fn bind_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_handle = Some(window.window_handle());
         if self.ui_state.appearance.theme == ModelThemeMode::System {
             theme::apply_appearance(&self.ui_state.appearance, Some(window), cx);
         }
@@ -19554,6 +19589,10 @@ impl VibexWorkbench {
     }
 
     fn set_code_preview_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        // A detached panel is still the open panel: the workbench column stops
+        // drawing it, but its terminals and editors keep running in the window
+        // that does.
+        let visible = visible || self.preview_window.is_some();
         if self.code_preview_visible == visible {
             return;
         }
@@ -19561,6 +19600,143 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_preview_visible(visible, cx)
         });
+    }
+
+    /// Moves the multi-tab preview panel between the workbench column and its
+    /// own window. The panel entity changes host instead of being rebuilt, so
+    /// open tabs, editor buffers, and terminals travel with it and there is
+    /// never more than one panel.
+    pub(crate) fn set_preview_window_detached(
+        &mut self,
+        origin_window: AnyWindowHandle,
+        detached: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if detached {
+            self.detach_preview_window(origin_window, cx);
+        } else {
+            self.dock_preview_window(cx);
+        }
+    }
+
+    fn detach_preview_window(&mut self, origin_window: AnyWindowHandle, cx: &mut Context<Self>) {
+        if let Some(existing) = self.preview_window {
+            // One panel, one window: a second pop-out request raises the window
+            // that already hosts it rather than opening another.
+            let _ = existing.update(cx, |_, window, cx| {
+                window.activate_window();
+                cx.activate(true);
+            });
+            return;
+        }
+        // The panel is what travels, so make sure it is open before the move.
+        self.reveal_code_preview(cx);
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.exit_fullscreen(cx));
+        let window_bounds = WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(PREVIEW_WINDOW_WIDTH), px(PREVIEW_WINDOW_HEIGHT)),
+            cx,
+        ));
+        let options = WindowOptions {
+            window_bounds: Some(window_bounds),
+            titlebar: Some(TitlebarOptions {
+                title: Some(locale::text("Preview", "预览", "預覽").into()),
+                ..Default::default()
+            }),
+            app_id: release_application_id().ok().map(str::to_string),
+            icon: window_icon().ok(),
+            window_min_size: Some(size(
+                px(PREVIEW_WINDOW_MIN_WIDTH),
+                px(PREVIEW_WINDOW_MIN_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let code_workbench = self.code_workbench.clone();
+        let appearance = self.ui_state.appearance.clone();
+        let opened = cx.open_window(options, move |window, cx| {
+            theme::apply_appearance(&appearance, Some(window), cx);
+            let host = cx.new(|cx| PreviewWindowHost::new(code_workbench, window, cx));
+            cx.new(|cx| Root::new(host, window, cx).bordered(false))
+        });
+        let handle = match opened {
+            Ok(handle) => handle,
+            Err(error) => {
+                // Nothing moved, so the panel stays exactly where it was.
+                self.code_workbench
+                    .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+                let message = format!("failed to open the preview window: {error}");
+                eprintln!("{message}");
+                let _ = origin_window.update(cx, |_, window, cx| {
+                    window.push_notification(Notification::error(message.clone()), cx);
+                });
+                cx.notify();
+                return;
+            }
+        };
+        let handle: AnyWindowHandle = handle.into();
+        self.preview_window = Some(handle);
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.set_preview_detached(true, cx));
+        cx.notify();
+    }
+
+    /// Closes the detached window and hands the panel back to the workbench
+    /// column. Every path that takes the panel down uses this, so the panel
+    /// never ends up with no host.
+    fn dock_preview_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.take_preview_window(cx) else {
+            return;
+        };
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        // Docking back is a move, not a close: the panel has to be visible in
+        // the workbench again.
+        self.reveal_code_preview(cx);
+        self.activate_workbench_window(cx);
+    }
+
+    /// Drops the detached window without reopening the panel inline, for the
+    /// paths where the panel itself is being closed.
+    fn close_preview_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.take_preview_window(cx) else {
+            return;
+        };
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+
+    fn take_preview_window(&mut self, cx: &mut Context<Self>) -> Option<AnyWindowHandle> {
+        let handle = self.preview_window.take()?;
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+        Some(handle)
+    }
+
+    /// The detached window closed without the workbench asking. The panel must
+    /// come back inline instead of disappearing with the window.
+    fn handle_preview_window_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if self.preview_window.map(|handle| handle.window_id()) != Some(window_id) {
+            return;
+        }
+        self.preview_window = None;
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.set_preview_detached(false, cx));
+        self.reveal_code_preview(cx);
+        self.activate_workbench_window(cx);
+        cx.notify();
+    }
+
+    fn activate_workbench_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        if handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_err()
+        {
+            self.window_handle = None;
+            return;
+        }
+        cx.activate(true);
     }
 
     fn set_code_workspace_surface_visibility(
@@ -26594,6 +26770,9 @@ impl VibexWorkbench {
         if was_open {
             self.code_workbench
                 .update(cx, |workbench, cx| workbench.exit_fullscreen(cx));
+            // Hiding the panel hides it everywhere: leaving the detached window
+            // behind would keep a panel the workbench no longer shows.
+            self.close_preview_window(cx);
         }
         cx.notify();
     }
@@ -26612,6 +26791,9 @@ impl VibexWorkbench {
     }
 
     pub(crate) fn close_code_preview(&mut self, cx: &mut Context<Self>) {
+        // Closing the panel closes its window too; the workbench clears the
+        // handle first so the window teardown does not read as "dock it back".
+        self.close_preview_window(cx);
         self.code_workbench
             .update(cx, |workbench, cx| workbench.close_panel_tabs(cx));
         let visibility_changed = self.ui_state.workbench.preview_visible;
@@ -45910,12 +46092,17 @@ impl VibexWorkbench {
         let agent_open = self.ui_state.workbench.active_tab == "agent";
         let sidebar_docked = visibility.sidebar_docked && self.ui_state.workbench.sidebar_visible;
         let new_session_open = self.new_session_open;
-        let preview_fullscreen = agent_open && !new_session_open && self.preview_fullscreen_active;
-        let preview_docked = visibility.preview_docked
-            && self.ui_state.workbench.preview_visible
-            && agent_open
-            && !preview_fullscreen
-            && !new_session_open;
+        let placement = preview_panel_placement(
+            self.preview_window.is_some(),
+            agent_open,
+            new_session_open,
+            visibility.preview_docked,
+            self.ui_state.workbench.preview_visible,
+            self.preview_overlay_open,
+            self.preview_fullscreen_active,
+        );
+        let preview_fullscreen = placement.fullscreen;
+        let preview_docked = placement.docked;
         let right_rail_docked = visibility.right_rail_docked
             && self.right_rail_panel_open()
             && agent_open
@@ -46116,34 +46303,27 @@ impl VibexWorkbench {
                     .child(resize_handle)
             });
         shell
-            .when(
-                agent_open
-                    && !new_session_open
-                    && !visibility.preview_docked
-                    && self.preview_overlay_open
-                    && !preview_fullscreen,
-                |this| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .top(px(TITLE_BAR_HEIGHT))
-                            .bottom_0()
-                            .right(px(40.0))
-                            .w(px(visibility.layout.preview_min_width.max(280.0)))
-                            .max_w_full()
-                            .border_l_1()
-                            .border_color(cx.theme().border)
-                            .shadow_lg()
-                            .child(
-                                self.code_workbench
-                                    .clone()
-                                    .cached(StyleRefinement::default().size_full()),
-                            ),
-                    )
-                },
-            )
+            .when(placement.overlay, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(TITLE_BAR_HEIGHT))
+                        .bottom_0()
+                        .right(px(40.0))
+                        .w(px(visibility.layout.preview_min_width.max(280.0)))
+                        .max_w_full()
+                        .border_l_1()
+                        .border_color(cx.theme().border)
+                        .shadow_lg()
+                        .child(
+                            self.code_workbench
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
+                )
+            })
             .when_some(floating_right_rail, |this, panel| this.child(panel))
-            .when(preview_fullscreen, |this| {
+            .when(placement.fullscreen, |this| {
                 this.child(
                     // Full-bleed, but still below the floating chrome: the
                     // editor keeps its own controls reachable in the band the
@@ -46163,6 +46343,38 @@ impl VibexWorkbench {
                 )
             })
             .into_any_element()
+    }
+}
+
+/// Where the workbench column draws the multi-tab preview panel.
+///
+/// The panel has exactly one host at a time. While it is detached the workbench
+/// draws none of these surfaces, because the detached window draws the same
+/// panel entity instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PreviewPanelPlacement {
+    docked: bool,
+    overlay: bool,
+    fullscreen: bool,
+}
+
+fn preview_panel_placement(
+    detached: bool,
+    agent_open: bool,
+    new_session_open: bool,
+    preview_docked: bool,
+    preview_visible: bool,
+    overlay_open: bool,
+    fullscreen_active: bool,
+) -> PreviewPanelPlacement {
+    if detached || !agent_open || new_session_open {
+        return PreviewPanelPlacement::default();
+    }
+    let fullscreen = fullscreen_active;
+    PreviewPanelPlacement {
+        docked: preview_docked && preview_visible && !fullscreen,
+        overlay: !preview_docked && overlay_open && !fullscreen,
+        fullscreen,
     }
 }
 
