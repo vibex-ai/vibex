@@ -22,6 +22,9 @@ pub const DEFAULT_CORRUPT_BACKUP_LIMIT: usize = 3;
 pub const RUNTIME_SELECTION_PREFERENCE_LIMIT: usize = 256;
 pub const RUNTIME_MODEL_FAVORITE_LIMIT: usize = 256;
 pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
+/// Starred project directories offered as quick locations by the directory
+/// picker. Small on purpose: the rail is a shortcut, not a history.
+pub const PROJECT_DIRECTORY_FAVORITE_LIMIT: usize = 12;
 
 #[derive(Debug, Error)]
 pub enum UiStateError {
@@ -332,6 +335,12 @@ pub struct WorkbenchUiState {
     pub show_git_change_count: bool,
     #[serde(default)]
     pub default_new_session_location: NewSessionLocation,
+    /// Directories starred in the project-directory picker, most recently
+    /// starred first. The picker offers them as quick locations beside the
+    /// home and volume rows, so the list is bounded and de-duplicated rather
+    /// than a full browse history.
+    #[serde(default)]
+    pub favorite_project_directories: Vec<String>,
 }
 
 impl Default for WorkbenchUiState {
@@ -351,6 +360,7 @@ impl Default for WorkbenchUiState {
             remember_layout: default_remember_layout(),
             show_git_change_count: default_show_git_change_count(),
             default_new_session_location: NewSessionLocation::CurrentCheckout,
+            favorite_project_directories: Vec::new(),
         }
     }
 }
@@ -1074,6 +1084,11 @@ impl DesktopUiStateV1 {
             bounded_f32(self.workbench.preview_width, 360.0, 900.0, 520.0);
         self.workbench.right_rail_width =
             bounded_f32(self.workbench.right_rail_width, 224.0, 720.0, 336.0);
+        normalize_bounded_ids(
+            &mut self.workbench.favorite_project_directories,
+            4_096,
+            PROJECT_DIRECTORY_FAVORITE_LIMIT,
+        );
 
         let mut sidebar_arrangement = self.sidebar.arrangement();
         SidebarUiState::normalize_arrangement(&mut sidebar_arrangement);
@@ -1609,10 +1624,14 @@ fn bounded_f32(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
 }
 
 fn normalize_ids(ids: &mut Vec<String>, limit: usize) {
+    normalize_bounded_ids(ids, 256, limit);
+}
+
+fn normalize_bounded_ids(ids: &mut Vec<String>, max_chars: usize, limit: usize) {
     let mut seen = BTreeSet::new();
     *ids = std::mem::take(ids)
         .into_iter()
-        .filter_map(|id| bounded_required(&id, 256))
+        .filter_map(|id| bounded_required(&id, max_chars))
         .filter(|id| seen.insert(id.clone()))
         .take(limit)
         .collect();
@@ -1826,6 +1845,27 @@ mod tests {
         assert_eq!(state.sidebar_width, 320.0);
         assert_eq!(state.preview_width, 520.0);
         assert_eq!(state.right_rail_width, 336.0);
+        assert!(state.favorite_project_directories.is_empty());
+    }
+
+    #[test]
+    fn normalization_bounds_starred_project_directories() {
+        let mut state = DesktopUiStateV1::default();
+        state.workbench.favorite_project_directories = vec![
+            "  /home/ada/vibex  ".to_string(),
+            "/home/ada/vibex".to_string(),
+            String::new(),
+            "/home/ada/notes".to_string(),
+        ];
+        state
+            .workbench
+            .favorite_project_directories
+            .extend((0..PROJECT_DIRECTORY_FAVORITE_LIMIT).map(|index| format!("/tmp/{index}")));
+        state.normalize().expect("state normalizes");
+        let mut expected = vec!["/home/ada/vibex".to_string(), "/home/ada/notes".to_string()];
+        expected
+            .extend((0..PROJECT_DIRECTORY_FAVORITE_LIMIT - 2).map(|index| format!("/tmp/{index}")));
+        assert_eq!(state.workbench.favorite_project_directories, expected);
     }
 
     #[test]

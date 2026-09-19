@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -22,10 +22,11 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
     spinner::Spinner,
+    tooltip::Tooltip,
     v_flex,
 };
 use vibex_backend::BackendFacade;
-use vibex_desktop_model::LocaleMode;
+use vibex_desktop_model::{LocaleMode, PROJECT_DIRECTORY_FAVORITE_LIMIT};
 
 use crate::locale::{self, ResolvedLocale};
 
@@ -51,6 +52,8 @@ enum QuickLocation {
     Drive(usize),
     /// One browse root of a paired authority.
     Root(usize),
+    /// One starred directory, indexed into the picker's favorite list.
+    Favorite(usize),
 }
 
 /// Where a picker listing comes from.
@@ -127,6 +130,9 @@ struct PickerText {
     go_up: &'static str,
     open_path: &'static str,
     places: &'static str,
+    starred: &'static str,
+    star_folder: &'static str,
+    unstar_folder: &'static str,
     home: &'static str,
     choose_here: &'static str,
     cancel: &'static str,
@@ -144,6 +150,9 @@ fn text(locale: ResolvedLocale) -> PickerText {
             go_up: "Up",
             open_path: "Open this path",
             places: "Places",
+            starred: "Starred",
+            star_folder: "Star this folder",
+            unstar_folder: "Remove from starred",
             home: "Home",
             choose_here: "Open",
             cancel: "Cancel",
@@ -151,13 +160,16 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "Loading…",
             empty: "No folders here",
             no_matches: "No folders match",
-            hint: "↑↓ Navigate · Enter Open · ⌘Enter Choose here",
+            hint: "↑↓ Navigate · Enter Open · ⌘Enter Choose here · ⌘D Star",
         },
         ResolvedLocale::ZhCn => PickerText {
             search_placeholder: "筛选文件夹，或输入路径后按 Enter",
             go_up: "上一级",
             open_path: "打开该路径",
             places: "位置",
+            starred: "收藏",
+            star_folder: "收藏此文件夹",
+            unstar_folder: "取消收藏",
             home: "主目录",
             choose_here: "打开",
             cancel: "取消",
@@ -165,13 +177,16 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "正在加载…",
             empty: "这里没有文件夹",
             no_matches: "没有匹配的文件夹",
-            hint: "↑↓ 选择 · Enter 打开 · ⌘Enter 选定当前目录",
+            hint: "↑↓ 选择 · Enter 打开 · ⌘Enter 选定当前目录 · ⌘D 收藏",
         },
         ResolvedLocale::ZhTw => PickerText {
             search_placeholder: "篩選資料夾，或輸入路徑後按 Enter",
             go_up: "上一層",
             open_path: "開啟該路徑",
             places: "位置",
+            starred: "收藏",
+            star_folder: "收藏此資料夾",
+            unstar_folder: "取消收藏",
             home: "主資料夾",
             choose_here: "開啟",
             cancel: "取消",
@@ -179,7 +194,7 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "載入中…",
             empty: "這裡沒有資料夾",
             no_matches: "沒有符合的資料夾",
-            hint: "↑↓ 選擇 · Enter 開啟 · ⌘Enter 選定目前目錄",
+            hint: "↑↓ 選擇 · Enter 開啟 · ⌘Enter 選定目前目錄 · ⌘D 收藏",
         },
     }
 }
@@ -188,9 +203,16 @@ fn text(locale: ResolvedLocale) -> PickerText {
 /// the host to close the dialog (path accepted); `false` keeps it open.
 pub type DirectoryPickHandler = Arc<dyn Fn(String, &mut Window, &mut App) -> bool + 'static>;
 
+/// Callback invoked with the picker's full favorite list after every star
+/// toggle, most recently starred first. The host owns persistence; the picker
+/// keeps its own copy so the rail and the row stars repaint immediately.
+pub type DirectoryFavoritesHandler = Arc<dyn Fn(Vec<String>, &mut App) + 'static>;
+
 /// Row-id offset that keeps authority browse roots apart from local volumes in
 /// the quick-location rail.
 const ROOT_QUICK_LOCATION_ROW_OFFSET: usize = 1024;
+/// Row-id offset that keeps starred directories apart from both of the above.
+const FAVORITE_QUICK_LOCATION_ROW_OFFSET: usize = 2048;
 
 pub struct DirectoryPickerDialog {
     locale_mode: LocaleMode,
@@ -211,6 +233,9 @@ pub struct DirectoryPickerDialog {
     drives: Vec<PathBuf>,
     /// Browse roots of a paired authority, offered as quick locations.
     roots: Vec<PathBuf>,
+    /// Starred directories, most recently starred first. Mirrored to the host
+    /// through `on_favorites_change` after every toggle.
+    favorites: Vec<PathBuf>,
     entries: Vec<DirectoryEntry>,
     phase: BrowsePhase,
     search_input: Entity<InputState>,
@@ -220,7 +245,9 @@ pub struct DirectoryPickerDialog {
     drives_task: Option<Task<()>>,
     focus_pending: bool,
     list_scroll: ScrollHandle,
+    rail_scroll: ScrollHandle,
     on_pick: DirectoryPickHandler,
+    on_favorites_change: DirectoryFavoritesHandler,
     _search_events: gpui::Subscription,
 }
 
@@ -228,8 +255,10 @@ impl DirectoryPickerDialog {
     pub fn new(
         locale_mode: LocaleMode,
         initial_dir: Option<PathBuf>,
+        favorites: Vec<String>,
         source: DirectoryBrowseTarget,
         on_pick: DirectoryPickHandler,
+        on_favorites_change: DirectoryFavoritesHandler,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -256,6 +285,7 @@ impl DirectoryPickerDialog {
             home: local.then(user_home_directory).flatten(),
             drives: Vec::new(),
             roots: Vec::new(),
+            favorites: favorites.into_iter().map(PathBuf::from).collect(),
             entries: Vec::new(),
             phase: BrowsePhase::Loading,
             search_input,
@@ -264,7 +294,9 @@ impl DirectoryPickerDialog {
             drives_task: None,
             focus_pending: true,
             list_scroll: ScrollHandle::new(),
+            rail_scroll: ScrollHandle::new(),
             on_pick,
+            on_favorites_change,
             _search_events: search_events,
         };
         dialog.browse(initial_dir, cx);
@@ -425,10 +457,36 @@ impl DirectoryPickerDialog {
             QuickLocation::Home => self.home.clone(),
             QuickLocation::Drive(ix) => self.drives.get(*ix).cloned(),
             QuickLocation::Root(ix) => self.roots.get(*ix).cloned(),
+            QuickLocation::Favorite(ix) => self.favorites.get(*ix).cloned(),
         };
         if let Some(target) = target {
             self.browse(Some(target), cx);
         }
+    }
+
+    fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites.iter().any(|favorite| favorite == path)
+    }
+
+    /// Stars/unstars `path`, then hands the whole list to the host, which owns
+    /// persistence. The newest star leads so the rail shows it at once.
+    fn toggle_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        toggle_favorite_path(&mut self.favorites, path);
+        let favorites = self
+            .favorites
+            .iter()
+            .map(|favorite| favorite.to_string_lossy().into_owned())
+            .collect();
+        (self.on_favorites_change)(favorites, cx);
+        cx.notify();
+    }
+
+    /// ⌘D on the highlighted row: the keyboard path to that row's star.
+    fn toggle_active_favorite(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.filtered_entries(cx).get(self.active).cloned() else {
+            return;
+        };
+        self.toggle_favorite(entry.path, cx);
     }
 
     fn move_active(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -534,6 +592,157 @@ impl DirectoryPickerDialog {
                     ),
             )
     }
+
+    /// One row of the rail's quick-location column. A starred directory keeps a
+    /// filled star that removes it again; every row navigates on click.
+    fn render_rail_row(
+        &self,
+        location: QuickLocation,
+        label: SharedString,
+        path_tooltip: Option<SharedString>,
+        is_active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_dark = cx.theme().is_dark();
+        let foreground = crate::theme::semantic_color("popover-foreground", is_dark);
+        let muted = crate::theme::semantic_color("muted-foreground", is_dark);
+        let muted_bg = crate::theme::semantic_color("muted", is_dark);
+        let primary = cx.theme().primary;
+        let icon = match location {
+            QuickLocation::Home => IconName::CircleUser,
+            QuickLocation::Drive(_) => IconName::HardDrive,
+            QuickLocation::Root(_) => IconName::Globe,
+            // A starred row reads as the folder it is; the trailing star is
+            // the control that removes it again.
+            QuickLocation::Favorite(_) => IconName::Folder,
+        };
+        let row_key = match location {
+            QuickLocation::Home => 0usize,
+            QuickLocation::Drive(ix) => ix + 1,
+            // Local volumes and authority roots never share a rail; the
+            // offsets keep their row ids distinct anyway.
+            QuickLocation::Root(ix) => ix + ROOT_QUICK_LOCATION_ROW_OFFSET,
+            QuickLocation::Favorite(ix) => ix + FAVORITE_QUICK_LOCATION_ROW_OFFSET,
+        };
+        let favorite_index = match location {
+            QuickLocation::Favorite(ix) => Some(ix),
+            _ => None,
+        };
+        let target = location;
+        let mut row = h_flex()
+            .id(("directory-picker-location", row_key))
+            .min_h(px(30.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .gap_2()
+            .text_xs()
+            .cursor_pointer()
+            .when(is_active, |row| {
+                row.bg(primary.opacity(0.14)).text_color(foreground)
+            })
+            .when(!is_active, |row| {
+                row.text_color(muted)
+                    .hover(|style| style.bg(muted_bg.opacity(0.6)))
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.goto_quick_location(target.clone(), cx);
+            }))
+            .child(
+                Icon::new(icon)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(if is_active { primary } else { muted }),
+            )
+            .child(div().min_w_0().flex_1().truncate().child(label));
+        if let Some(path) = path_tooltip {
+            row = row.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx));
+        }
+        if let Some(index) = favorite_index {
+            row = row.child(favorite_star(
+                ("directory-picker-location-star", row_key),
+                true,
+                SharedString::from(text(self.locale()).unstar_folder),
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(path) = this.favorites.get(index).cloned() {
+                        this.toggle_favorite(path, cx);
+                    }
+                }),
+                cx,
+            ));
+        }
+        row.into_any_element()
+    }
+}
+
+/// Stars/unstars `path` in `favorites`, newest first. The list is bounded to
+/// [`PROJECT_DIRECTORY_FAVORITE_LIMIT`], so the oldest star falls off the end.
+fn toggle_favorite_path(favorites: &mut Vec<PathBuf>, path: PathBuf) {
+    match favorites.iter().position(|favorite| favorite == &path) {
+        Some(index) => {
+            favorites.remove(index);
+        }
+        None => {
+            favorites.retain(|favorite| favorite != &path);
+            favorites.insert(0, path);
+            favorites.truncate(PROJECT_DIRECTORY_FAVORITE_LIMIT);
+        }
+    }
+}
+
+/// The star toggle trailing a folder row or a starred rail row. It stays
+/// visible at rest — a star is state, not a hover reward — and stops the click
+/// so the row underneath is not activated too.
+fn favorite_star(
+    id: (&'static str, usize),
+    starred: bool,
+    tooltip: SharedString,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let is_dark = cx.theme().is_dark();
+    let muted_bg = crate::theme::semantic_color("muted", is_dark);
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(22.0))
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(muted_bg.opacity(0.6)))
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx);
+        })
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(
+            Icon::new(if starred {
+                IconName::StarFill
+            } else {
+                IconName::Star
+            })
+            .size(px(13.0))
+            .text_color(if starred {
+                cx.theme().warning
+            } else {
+                cx.theme().muted_foreground.opacity(0.45)
+            }),
+        )
+        .into_any_element()
+}
+
+/// A muted group label above a run of rail rows.
+fn rail_section_label(label: &'static str, top_padding: f32, muted: Hsla) -> AnyElement {
+    div()
+        .px(px(8.0))
+        .pt(px(top_padding))
+        .pb(px(6.0))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted.opacity(0.7))
+        .child(label)
+        .into_any_element()
 }
 
 impl gpui::Render for DirectoryPickerDialog {
@@ -589,8 +798,24 @@ impl gpui::Render for DirectoryPickerDialog {
             }));
             rows
         };
+        // Starred directories are their own rail group, newest first. Each row
+        // shows the folder name and keeps the full path in its tooltip, since
+        // two starred folders may share a name.
+        let favorite_rows: Vec<(QuickLocation, SharedString, SharedString)> = self
+            .favorites
+            .iter()
+            .enumerate()
+            .map(|(ix, favorite)| {
+                let path = SharedString::from(favorite.to_string_lossy().into_owned());
+                let label = favorite
+                    .file_name()
+                    .map(|name| SharedString::from(name.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| path.clone());
+                (QuickLocation::Favorite(ix), label, path)
+            })
+            .collect();
         let active_location: Option<QuickLocation> = browse_root.as_ref().and_then(|root| {
-            if self.source.is_authority() {
+            let built_in = if self.source.is_authority() {
                 self.roots
                     .iter()
                     .position(|candidate| candidate == root)
@@ -602,7 +827,15 @@ impl gpui::Render for DirectoryPickerDialog {
                     .iter()
                     .position(|drive| drive == root)
                     .map(QuickLocation::Drive)
-            }
+            };
+            // A starred copy of a built-in place does not steal its highlight;
+            // either row leads to the same directory.
+            built_in.or_else(|| {
+                self.favorites
+                    .iter()
+                    .position(|favorite| favorite == root)
+                    .map(QuickLocation::Favorite)
+            })
         });
 
         // Breadcrumbs fold the authority's browse root into one crumb, so the
@@ -734,6 +967,8 @@ impl gpui::Render for DirectoryPickerDialog {
                     let is_active = ix == self.active;
                     let name: SharedString = entry.name.clone().into();
                     let path = entry.path.clone();
+                    let star_path = path.clone();
+                    let starred = self.is_favorite(&entry.path);
                     h_flex()
                         .id(("directory-picker-row", ix))
                         .min_h(px(32.0))
@@ -760,10 +995,42 @@ impl gpui::Render for DirectoryPickerDialog {
                                 .flex_none()
                                 .text_color(if is_active { primary } else { muted }),
                         )
-                        .child(div().min_w_0().truncate().child(name))
+                        // The name owns the free width so the star stays pinned
+                        // to the row's trailing edge however long the name is.
+                        .child(div().min_w_0().flex_1().truncate().child(name))
+                        .child(favorite_star(
+                            ("directory-picker-row-star", ix),
+                            starred,
+                            SharedString::from(if starred {
+                                strings.unstar_folder
+                            } else {
+                                strings.star_folder
+                            }),
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.toggle_favorite(star_path.clone(), cx);
+                            }),
+                            cx,
+                        ))
                 }))
                 .into_any_element()
         };
+
+        // The rail scrolls as one column: the built-in places, then the starred
+        // directories the user added. The starred group is omitted entirely
+        // while it is empty, so the rail never shows a header without rows.
+        let mut rail_rows: Vec<AnyElement> = Vec::new();
+        rail_rows.push(rail_section_label(strings.places, 0.0, muted));
+        rail_rows.extend(quick_rows.into_iter().map(|(location, label)| {
+            let is_active = active_location.as_ref() == Some(&location);
+            self.render_rail_row(location, label, None, is_active, cx)
+        }));
+        if !favorite_rows.is_empty() {
+            rail_rows.push(rail_section_label(strings.starred, 10.0, muted));
+            rail_rows.extend(favorite_rows.into_iter().map(|(location, label, path)| {
+                let is_active = active_location.as_ref() == Some(&location);
+                self.render_rail_row(location, label, Some(path), is_active, cx)
+            }));
+        }
 
         let rail = v_flex()
             .w(px(172.0))
@@ -773,56 +1040,17 @@ impl gpui::Render for DirectoryPickerDialog {
             .px(px(8.0))
             .pt(px(10.0))
             .pb(px(8.0))
-            .gap(px(2.0))
             .child(
-                div()
-                    .px(px(8.0))
-                    .pb(px(6.0))
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted.opacity(0.7))
-                    .child(strings.places),
-            )
-            .children(quick_rows.into_iter().map(|(location, label)| {
-                let is_active = active_location.as_ref() == Some(&location);
-                let icon = match location {
-                    QuickLocation::Home => IconName::CircleUser,
-                    QuickLocation::Drive(_) => IconName::HardDrive,
-                    QuickLocation::Root(_) => IconName::Globe,
-                };
-                let row_key = match location {
-                    QuickLocation::Home => 0usize,
-                    QuickLocation::Drive(ix) => ix + 1,
-                    // Local volumes and authority roots never share a rail;
-                    // the offset keeps their row ids distinct anyway.
-                    QuickLocation::Root(ix) => ix + ROOT_QUICK_LOCATION_ROW_OFFSET,
-                };
-                h_flex()
-                    .id(("directory-picker-location", row_key))
-                    .min_h(px(30.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .gap_2()
-                    .text_xs()
-                    .cursor_pointer()
-                    .when(is_active, |row| {
-                        row.bg(primary.opacity(0.14)).text_color(foreground)
-                    })
-                    .when(!is_active, |row| {
-                        row.text_color(muted)
-                            .hover(|style| style.bg(muted_bg.opacity(0.6)))
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.goto_quick_location(location.clone(), cx);
-                    }))
-                    .child(
-                        Icon::new(icon)
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(if is_active { primary } else { muted }),
-                    )
-                    .child(div().min_w_0().truncate().child(label))
-            }));
+                v_flex()
+                    .id("directory-picker-rail")
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(2.0))
+                    .track_scroll(&self.rail_scroll)
+                    .overflow_y_scroll()
+                    .vertical_scrollbar(&self.rail_scroll)
+                    .children(rail_rows),
+            );
 
         let crumbs = h_flex()
             .flex_wrap()
@@ -880,6 +1108,7 @@ impl gpui::Render for DirectoryPickerDialog {
                 match event.keystroke.key.as_str() {
                     "up" if !event.keystroke.modifiers.modified() => this.move_active(-1, cx),
                     "down" if !event.keystroke.modifiers.modified() => this.move_active(1, cx),
+                    "d" if event.keystroke.modifiers.secondary() => this.toggle_active_favorite(cx),
                     "enter" if event.keystroke.modifiers.secondary() => {
                         if this.confirm(window, cx) {
                             window.close_dialog(cx);
@@ -1292,5 +1521,44 @@ mod tests {
         let crumbs = breadcrumb_segments(Path::new("/data"), Some(Path::new("/data")), "/data");
         assert_eq!(crumbs.len(), 1);
         assert_eq!(crumbs[0].label.as_ref(), "/data");
+    }
+
+    #[test]
+    fn toggling_a_favorite_leads_with_the_newest_and_removes_on_second_click() {
+        let mut favorites = vec![PathBuf::from("/home/ada/vibex")];
+        toggle_favorite_path(&mut favorites, PathBuf::from("/home/ada/notes"));
+        assert_eq!(
+            favorites,
+            vec![
+                PathBuf::from("/home/ada/notes"),
+                PathBuf::from("/home/ada/vibex")
+            ]
+        );
+        // Starring the same directory again unstars it rather than duplicating.
+        toggle_favorite_path(&mut favorites, PathBuf::from("/home/ada/notes"));
+        assert_eq!(favorites, vec![PathBuf::from("/home/ada/vibex")]);
+        // A path already in the list never gains a second entry.
+        toggle_favorite_path(&mut favorites, PathBuf::from("/home/ada/vibex"));
+        assert!(favorites.is_empty());
+        toggle_favorite_path(&mut favorites, PathBuf::from("/home/ada/vibex"));
+        assert_eq!(favorites, vec![PathBuf::from("/home/ada/vibex")]);
+    }
+
+    #[test]
+    fn starred_directories_stay_within_the_rail_budget() {
+        let mut favorites = Vec::new();
+        for index in 0..PROJECT_DIRECTORY_FAVORITE_LIMIT + 4 {
+            toggle_favorite_path(&mut favorites, PathBuf::from(format!("/home/ada/{index}")));
+        }
+        assert_eq!(favorites.len(), PROJECT_DIRECTORY_FAVORITE_LIMIT);
+        // The oldest stars are evicted first, so the newest one survives.
+        assert_eq!(
+            favorites.first(),
+            Some(&PathBuf::from(format!(
+                "/home/ada/{}",
+                PROJECT_DIRECTORY_FAVORITE_LIMIT + 3
+            )))
+        );
+        assert!(!favorites.contains(&PathBuf::from("/home/ada/0")));
     }
 }

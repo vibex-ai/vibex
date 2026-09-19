@@ -170,7 +170,9 @@ use crate::assets::{agent_brand_icon, model_brand_icon, window_icon};
 use crate::code_workbench::{
     CodeRightRail, CodeWorkbench, CodeWorkbenchEvent, CodeWorkbenchPersistedState, RightRailMode,
 };
-use crate::directory_picker::{DirectoryBrowseTarget, DirectoryPickHandler, DirectoryPickerDialog};
+use crate::directory_picker::{
+    DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
+};
 use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
@@ -20385,8 +20387,26 @@ impl VibexWorkbench {
                 })
                 .is_ok()
         });
+        // The picker repaints its own stars; the workbench owns the preference,
+        // so every star lands in the persisted UI state.
+        let favorites = self.ui_state.workbench.favorite_project_directories.clone();
+        let favorites_workbench = cx.weak_entity();
+        let on_favorites_change: DirectoryFavoritesHandler = Arc::new(move |favorites, cx| {
+            let _ = favorites_workbench.update(cx, |workbench, cx| {
+                workbench.set_favorite_project_directories(favorites, cx);
+            });
+        });
         let dialog_view: Entity<DirectoryPickerDialog> = cx.new(|cx| {
-            DirectoryPickerDialog::new(locale_mode, initial_dir, source, on_pick, window, cx)
+            DirectoryPickerDialog::new(
+                locale_mode,
+                initial_dir,
+                favorites,
+                source,
+                on_pick,
+                on_favorites_change,
+                window,
+                cx,
+            )
         });
         let title = locale::text("Choose project directory", "选择项目目录", "選擇專案目錄");
         let viewport = window.viewport_size();
@@ -20512,6 +20532,18 @@ impl VibexWorkbench {
                 cx.notify();
             });
         }));
+    }
+
+    /// Replaces the starred project directories the directory picker offers as
+    /// quick locations. The picker has already repainted its own stars; this
+    /// only records the preference so the next picker opens with it.
+    fn set_favorite_project_directories(&mut self, favorites: Vec<String>, cx: &mut Context<Self>) {
+        if self.ui_state.workbench.favorite_project_directories == favorites {
+            return;
+        }
+        self.ui_state.workbench.favorite_project_directories = favorites;
+        self.queue_ui_state();
+        cx.notify();
     }
 
     fn resolve_permission(
