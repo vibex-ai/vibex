@@ -82,6 +82,9 @@ pub enum MarkdownPresentation {
 pub struct MarkdownViewOptions {
     pub presentation: MarkdownPresentation,
     pub search_query: Option<Arc<str>>,
+    /// Whether [`Self::search_query`] names the match a find bar is currently
+    /// on, which paints it stronger than the other hits.
+    pub search_active: bool,
     pub images: Arc<BTreeMap<String, Arc<Image>>>,
     pub allow_http_images: bool,
     pub streaming: bool,
@@ -104,6 +107,7 @@ fn markdown_render_options_changed(
 ) -> bool {
     previous.presentation != next.presentation
         || previous.search_query != next.search_query
+        || previous.search_active != next.search_active
         || previous.allow_http_images != next.allow_http_images
         || previous.streaming != next.streaming
         || previous.scroll_handle.is_some() != next.scroll_handle.is_some()
@@ -184,6 +188,13 @@ impl MarkdownView {
 
     pub fn search_query(mut self, query: Option<impl Into<Arc<str>>>) -> Self {
         self.options.search_query = query.map(Into::into);
+        self
+    }
+
+    /// Marks [`Self::search_query`] as the find bar's current match, which
+    /// paints every hit in this view stronger than the other hits on screen.
+    pub fn search_active(mut self, active: bool) -> Self {
+        self.options.search_active = active;
         self
     }
 
@@ -2473,7 +2484,12 @@ impl MarkdownViewState {
         let mut highlights = combine_inline_highlights(
             text.len(),
             semantic,
-            search_highlights(text, self.options.search_query.as_deref(), cx),
+            search_highlights(
+                text,
+                self.options.search_query.as_deref(),
+                self.options.search_active,
+                cx,
+            ),
         );
         if let Some(extra) = extra {
             highlights = combine_highlights(highlights, [(0..text.len(), extra)]).collect();
@@ -2540,7 +2556,12 @@ impl MarkdownViewState {
                 let highlights = combine_inline_highlights(
                     text.len(),
                     semantic,
-                    search_highlights(text, self.options.search_query.as_deref(), cx),
+                    search_highlights(
+                        text,
+                        self.options.search_query.as_deref(),
+                        self.options.search_active,
+                        cx,
+                    ),
                 );
                 let text = self.selectable_styled_text(text.clone(), highlights, cx);
                 div().min_w_0().child(text).into_any_element()
@@ -3719,6 +3740,7 @@ fn normalize_code_language(language: &str) -> String {
 fn search_highlights(
     text: &str,
     query: Option<&str>,
+    active: bool,
     cx: &App,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     let Some(query) = query.filter(|query| !query.is_empty()) else {
@@ -3734,7 +3756,11 @@ fn search_highlights(
             (
                 range,
                 HighlightStyle {
-                    background_color: Some(cx.theme().warning.opacity(0.38)),
+                    background_color: Some(cx.theme().warning.opacity(if active {
+                        0.65
+                    } else {
+                        0.42
+                    })),
                     font_weight: Some(FontWeight::BOLD),
                     ..Default::default()
                 },

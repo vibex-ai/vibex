@@ -4565,6 +4565,23 @@ fn show_agent_answer_actions(conversation_conclusion: bool, row: &TimelineRow) -
     conversation_conclusion && !row.streaming && !row.body.is_empty()
 }
 
+/// Whether a row holds conversation text the find bar and the session search
+/// index may match.
+///
+/// Search covers prose only: what the user wrote, what the agent answered, and
+/// the reasoning or plan text behind it. Tool calls, commands, file operations,
+/// notices and the cards around them are activity, not searchable content, so a
+/// query never lands on a tool name or a command line.
+fn timeline_row_is_search_text(kind: TimelineRowKind) -> bool {
+    matches!(
+        kind,
+        TimelineRowKind::UserMessage
+            | TimelineRowKind::AgentMessage
+            | TimelineRowKind::Reasoning
+            | TimelineRowKind::Plan
+    )
+}
+
 fn session_search_documents(items: &[TimelineItem]) -> Vec<SessionSearchDocument> {
     let timestamps = items
         .iter()
@@ -4578,6 +4595,9 @@ fn session_search_documents(items: &[TimelineItem]) -> Vec<SessionSearchDocument
             .chain(turn.process_rows)
             .chain(turn.conclusion_row)
         {
+            if !timeline_row_is_search_text(row.kind) {
+                continue;
+            }
             let text = session_search_row_text(&row);
             if text.is_empty() {
                 continue;
@@ -4844,6 +4864,73 @@ fn session_search_highlighted_text(
         .into_iter()
         .map(|range| (range, highlight));
     StyledText::new(text).with_highlights(highlights)
+}
+
+/// Style painted behind one matched keyword.
+///
+/// Only the keyword is tinted — never the message around it — and the find
+/// bar's current match is painted stronger than the other hits, so the row the
+/// bar scrolled to stays identifiable inside a wall of text.
+fn session_search_keyword_highlight(active: bool, cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        background_color: Some(cx.theme().warning.opacity(if active { 0.65 } else { 0.42 })),
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    }
+}
+
+/// Where one match sits inside a row's text, as a 0..=1 fraction.
+///
+/// A row taller than the viewport cannot be revealed whole, so the reveal aims
+/// at this position rather than at the row's top: the keyword a long answer
+/// buries in its middle is exactly what the find bar is looking for.
+/// `ordinal` is which occurrence inside the row the find bar is on, so stepping
+/// through several hits in one message walks down the message.
+fn session_search_match_aim(text: &str, query: &str, ordinal: usize) -> f32 {
+    let ranges = session_search_match_ranges(text, query);
+    let Some(range) = ranges.get(ordinal).or_else(|| ranges.first()) else {
+        return 0.0;
+    };
+    // Characters, not bytes: a byte offset would overstate how far into a CJK
+    // row the match sits, and those rows are the common case here.
+    let characters_before = text[..range.start].chars().count();
+    let total = text.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    characters_before as f32 / total as f32
+}
+
+/// The smallest vertical scroll delta that puts a match row in view, leaving a
+/// margin so the revealed row is not flush against the edge.
+///
+/// `aim` is where inside the row the keyword sits (see
+/// [`session_search_match_aim`]). A row taller than the viewport cannot be
+/// shown whole, so the keyword is placed in the upper quarter instead of the
+/// row's top. `px(0.0)` means the row is already visible.
+fn session_search_reveal_delta(
+    bounds: Bounds<Pixels>,
+    viewport: Bounds<Pixels>,
+    aim: f32,
+) -> Pixels {
+    const REVEAL_MARGIN: f32 = 24.0;
+    /// How far down the viewport an aimed keyword lands.
+    const REVEAL_AIM_FRACTION: f32 = 0.25;
+    let margin = px(REVEAL_MARGIN);
+    let visible_top = viewport.top() + margin;
+    let visible_bottom = viewport.bottom() - margin;
+    let visible_height = visible_bottom - visible_top;
+    if bounds.size.height > visible_height {
+        let aimed = bounds.top() + bounds.size.height * aim.clamp(0.0, 1.0);
+        return visible_top + visible_height * REVEAL_AIM_FRACTION - aimed;
+    }
+    if bounds.top() < visible_top {
+        visible_top - bounds.top()
+    } else if bounds.bottom() > visible_bottom {
+        visible_bottom - bounds.bottom()
+    } else {
+        px(0.0)
+    }
 }
 
 fn agent_turn_is_active(
@@ -5436,6 +5523,15 @@ struct SessionSearchDocument {
     text: String,
 }
 
+/// The query one row's text should highlight, whether that row holds the match
+/// the find bar is currently on, and where inside the row the first hit sits.
+#[derive(Debug, Clone)]
+struct SessionSearchHighlight {
+    query: Arc<str>,
+    active: bool,
+    aim: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionSearchIndexEntry {
     session_id: VibexSessionId,
@@ -5663,6 +5759,13 @@ pub struct VibexWorkbench {
     pending_session_search_jump: Option<SessionSearchTarget>,
     session_search_highlight_item_id: Option<String>,
     session_search_highlight_query: Option<String>,
+    /// Which occurrence inside the active row the find bar is on, so stepping
+    /// through several hits in one long message moves down the message.
+    conversation_find_active_match_ordinal: usize,
+    /// Row holding the match the find bar is on, waiting for its next paint to
+    /// be scrolled into view. Cleared once the row has been revealed, so a
+    /// later manual scroll is never yanked back to an old match.
+    pending_session_search_reveal_item_id: Option<String>,
     sidebar_rename_input: Entity<InputState>,
     user_message_edit_input: Entity<TextareaState>,
     composer_queue_edit_input: Entity<TextareaState>,
@@ -6512,6 +6615,8 @@ impl VibexWorkbench {
             pending_session_search_jump: None,
             session_search_highlight_item_id: None,
             session_search_highlight_query: None,
+            conversation_find_active_match_ordinal: 0,
+            pending_session_search_reveal_item_id: None,
             sidebar_rename_input,
             user_message_edit_input,
             composer_queue_edit_input,
@@ -15889,6 +15994,9 @@ impl VibexWorkbench {
         self.timeline_scroll_wheel_idle_task = None;
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
+        // A manual scroll outranks a reveal that never landed, so a match the
+        // user scrolled away from is not yanked back into view later.
+        self.pending_session_search_reveal_item_id = None;
         self.timeline_follow.set_following_bottom(false);
         let scrolled_toward_bottom = delta_y < 0.0;
         let generation = self.session_generation;
@@ -15934,6 +16042,7 @@ impl VibexWorkbench {
         self.timeline_scrollbar_interaction_active = true;
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
+        self.pending_session_search_reveal_item_id = None;
         self.timeline_follow.set_following_bottom(false);
         cx.notify();
     }
@@ -24826,6 +24935,7 @@ impl VibexWorkbench {
     fn close_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.conversation_find_open = false;
         self.conversation_find_active_item_id = None;
+        self.pending_session_search_reveal_item_id = None;
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -24835,6 +24945,8 @@ impl VibexWorkbench {
         if count == 0 {
             self.conversation_find_active_index = 0;
             self.conversation_find_active_item_id = None;
+            self.conversation_find_active_match_ordinal = 0;
+            self.pending_session_search_reveal_item_id = None;
             cx.notify();
             return;
         }
@@ -24853,6 +24965,8 @@ impl VibexWorkbench {
         if matches.is_empty() {
             self.conversation_find_active_index = 0;
             self.conversation_find_active_item_id = None;
+            self.conversation_find_active_match_ordinal = 0;
+            self.pending_session_search_reveal_item_id = None;
             cx.notify();
             return;
         }
@@ -24867,6 +24981,19 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
         let target = &matches[self.conversation_find_active_index];
         self.conversation_find_active_item_id = target.item_id.clone();
+        // A row can hold several hits, and the entries for one row are adjacent,
+        // so counting back to the row's first entry says which hit is current.
+        self.conversation_find_active_match_ordinal = matches
+            [..self.conversation_find_active_index]
+            .iter()
+            .rev()
+            .take_while(|candidate| {
+                candidate.item_id == target.item_id && candidate.turn_id == target.turn_id
+            })
+            .count();
+        // The turn-level scroll below only guarantees the turn is on screen;
+        // the row itself is revealed once it has been laid out.
+        self.pending_session_search_reveal_item_id = target.item_id.clone();
         if let Some(turn_index) = self
             .conversation_turns()
             .iter()
@@ -24944,7 +25071,8 @@ impl VibexWorkbench {
     fn clear_session_search_highlight(&mut self, cx: &mut Context<Self>) {
         let had_item = self.session_search_highlight_item_id.take().is_some();
         let had_query = self.session_search_highlight_query.take().is_some();
-        if had_item || had_query {
+        let had_reveal = self.pending_session_search_reveal_item_id.take().is_some();
+        if had_item || had_query || had_reveal {
             cx.notify();
         }
     }
@@ -25274,7 +25402,10 @@ impl VibexWorkbench {
         };
         let turn_id = turn.id.clone();
         self.pending_session_search_jump = None;
-        self.session_search_highlight_item_id = target.item_id;
+        self.session_search_highlight_item_id = target.item_id.clone();
+        // Centering the turn is not enough: the matched row has to report its
+        // own bounds before the offset can be nudged onto it.
+        self.pending_session_search_reveal_item_id = target.item_id;
         self.timeline_process_expansion
             .insert(turn_id.clone(), true);
         self.invalidate_timeline_turn_measurement(&turn_id);
@@ -39177,54 +39308,154 @@ impl VibexWorkbench {
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
 
+    /// Wraps one row's element so the find bar's current match can be scrolled
+    /// into view once it has been laid out.
+    ///
+    /// The match itself is tinted inside the row's own text — see
+    /// [`Self::session_search_highlighted_row_text`] — and the wrapper paints
+    /// nothing: tinting the whole message buried the keyword the user was
+    /// looking for. The wrapper only exists for the row holding the active
+    /// match, and only until that row has been revealed.
     fn highlight_session_search_rows(
         &self,
         rows: &[TimelineRow],
         element: AnyElement,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.session_search_highlight_query_for_rows(rows).is_some() {
-            let active = self.conversation_find_open
-                && self
-                    .conversation_find_active_item_id
-                    .as_ref()
-                    .is_some_and(|active_id| {
-                        rows.iter()
-                            .any(|row| row.item_ids.iter().any(|id| id == active_id))
-                    });
-            div()
-                .w_full()
-                .min_w_0()
-                .rounded(px(6.0))
-                .bg(cx.theme().warning.opacity(if active { 0.20 } else { 0.10 }))
-                .child(element)
-                .into_any_element()
-        } else {
-            element
+        let Some(highlight) = self.session_search_highlight_for_rows(rows) else {
+            return element;
+        };
+        // The find bar searches the open conversation, and the child-agent
+        // panel scrolls its own handle, so a match must never nudge it.
+        if !highlight.active
+            || self.rendering_child_agent_timeline()
+            || !self.session_search_reveal_pending_for_rows(rows)
+        {
+            return element;
         }
+        let item_ids = rows
+            .iter()
+            .flat_map(|row| row.item_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let aim = highlight.aim;
+        let entity = cx.weak_entity();
+        let scroll = self.timeline_scroll.clone();
+        div()
+            .w_full()
+            .min_w_0()
+            .on_prepaint(move |bounds, _, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.reveal_session_search_row(&item_ids, aim, bounds, &scroll, cx);
+                });
+            })
+            .child(element)
+            .into_any_element()
     }
 
-    fn session_search_highlight_query_for_rows<'a>(
-        &'a self,
+    fn session_search_reveal_pending_for_rows(&self, rows: &[TimelineRow]) -> bool {
+        self.pending_session_search_reveal_item_id
+            .as_ref()
+            .is_some_and(|pending| {
+                rows.iter()
+                    .any(|row| row.item_ids.iter().any(|item_id| item_id == pending))
+            })
+    }
+
+    /// Nudges the timeline so a laid-out match row — or the keyword inside a
+    /// row taller than the viewport — sits inside the visible area.
+    ///
+    /// The virtual list can only scroll to whole turns, and one turn is
+    /// routinely taller than the viewport: an expanded process section alone
+    /// can be. The row therefore reports its own painted bounds once it has
+    /// been laid out, and the offset moves by the smallest amount that brings
+    /// the match into view.
+    fn reveal_session_search_row(
+        &mut self,
+        item_ids: &[String],
+        aim: f32,
+        bounds: Bounds<Pixels>,
+        scroll: &VirtualListScrollHandle,
+        cx: &mut Context<Self>,
+    ) {
+        if !item_ids
+            .iter()
+            .any(|item_id| Some(item_id) == self.pending_session_search_reveal_item_id.as_ref())
+        {
+            return;
+        }
+        // The row's prepaint bounds already carry the scroll offset, so they
+        // are directly comparable with the viewport the handle tracked. A
+        // viewport with no height has nothing to reveal inside, and the
+        // turn-level scroll the find bar already asked for still stands.
+        let viewport = scroll.bounds();
+        self.pending_session_search_reveal_item_id = None;
+        if viewport.size.height <= px(0.0) {
+            return;
+        }
+        let delta_y = session_search_reveal_delta(bounds, viewport, aim);
+        if delta_y == px(0.0) {
+            return;
+        }
+        let offset = scroll.offset();
+        scroll.set_offset(point(offset.x, offset.y + delta_y));
+        // The virtual list picked the rows it renders from the offset this
+        // frame was laid out with, so the shifted viewport needs one more pass
+        // to fill itself from the new position.
+        cx.notify();
+    }
+
+    /// What a row's text should highlight, whether it holds the match the find
+    /// bar is currently on, and where inside the row that match sits.
+    ///
+    /// `None` means the row carries no match, or carries no searchable text at
+    /// all: tool activity is not part of the search index, so it must not be
+    /// highlighted just because the query happens to appear in it.
+    fn session_search_highlight_for_rows(
+        &self,
         rows: &[TimelineRow],
-    ) -> Option<&'a str> {
+    ) -> Option<SessionSearchHighlight> {
         if self.conversation_find_open && !self.conversation_find_query.is_empty() {
-            return rows
-                .iter()
-                .any(|row| {
-                    !session_search_match_ranges(
-                        &session_search_row_text(row),
-                        &self.conversation_find_query,
-                    )
-                    .is_empty()
-                })
-                .then_some(self.conversation_find_query.as_str());
+            let query = self.conversation_find_query.as_str();
+            let matched_text = rows.iter().find_map(|row| {
+                if !timeline_row_is_search_text(row.kind) {
+                    return None;
+                }
+                let text = session_search_row_text(row);
+                (!session_search_match_ranges(&text, query).is_empty()).then_some(text)
+            })?;
+            let active = self
+                .conversation_find_active_item_id
+                .as_ref()
+                .is_some_and(|active_id| {
+                    rows.iter()
+                        .any(|row| row.item_ids.iter().any(|id| id == active_id))
+                });
+            let ordinal = if active {
+                self.conversation_find_active_match_ordinal
+            } else {
+                0
+            };
+            return Some(SessionSearchHighlight {
+                query: Arc::from(query),
+                active,
+                aim: session_search_match_aim(&matched_text, query, ordinal),
+            });
         }
         let query = self.session_search_highlight_query.as_deref()?;
         let item_id = self.session_search_highlight_item_id.as_deref()?;
-        rows.iter()
-            .any(|row| row.item_ids.iter().any(|candidate| candidate == item_id))
-            .then_some(query)
+        let matched_text = rows.iter().find_map(|row| {
+            if !timeline_row_is_search_text(row.kind)
+                || !row.item_ids.iter().any(|candidate| candidate == item_id)
+            {
+                return None;
+            }
+            Some(session_search_row_text(row))
+        })?;
+        Some(SessionSearchHighlight {
+            query: Arc::from(query),
+            active: true,
+            aim: session_search_match_aim(&matched_text, query, 0),
+        })
     }
 
     fn session_search_highlighted_row_text(
@@ -39233,17 +39464,14 @@ impl VibexWorkbench {
         text: String,
         cx: &App,
     ) -> StyledText {
-        let query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .unwrap_or_default();
+        let Some(highlight) = self.session_search_highlight_for_rows(std::slice::from_ref(row))
+        else {
+            return StyledText::new(text);
+        };
         session_search_highlighted_text(
             text,
-            query,
-            HighlightStyle {
-                background_color: Some(cx.theme().warning.opacity(0.42)),
-                font_weight: Some(FontWeight::BOLD),
-                ..Default::default()
-            },
+            &highlight.query,
+            session_search_keyword_highlight(highlight.active, cx),
         )
     }
 
@@ -39975,9 +40203,7 @@ impl VibexWorkbench {
             .inline_user_message_edit
             .as_ref()
             .is_some_and(|edit| edit.matches(&row.id, self.selected_session_id.as_ref()));
-        let search_query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .map(str::to_string);
+        let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let inline_content = if editing {
             self.render_inline_user_message_editor(&row.id, cx)
         } else {
@@ -39985,7 +40211,7 @@ impl VibexWorkbench {
                 &row.id,
                 row.body.clone(),
                 attachments,
-                search_query.as_deref(),
+                search_highlight,
                 cx,
             )
         };
@@ -40122,14 +40348,12 @@ impl VibexWorkbench {
                 _ => None,
             })
             .unwrap_or_default();
-        let search_query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .map(str::to_string);
+        let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let inline_content = self.render_user_message_inline_content(
             &row.id,
             row.body.clone(),
             attachments,
-            search_query.as_deref(),
+            search_highlight,
             cx,
         );
         div()
@@ -40162,9 +40386,7 @@ impl VibexWorkbench {
         answer_metadata: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let search_query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .map(str::to_string);
+        let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
         let markdown_view = MarkdownView::new(
@@ -40180,7 +40402,16 @@ impl VibexWorkbench {
         .streaming(row.streaming)
         .allow_http_images(true)
         .scroll_handle(self.timeline_scroll_handle())
-        .search_query(search_query)
+        .search_query(
+            search_highlight
+                .as_ref()
+                .map(|highlight| highlight.query.clone()),
+        )
+        .search_active(
+            search_highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.active),
+        )
         .on_open_resource(move |resource, window, cx| {
             let _ = markdown_entity.update(cx, |this, cx| {
                 this.open_markdown_resource(resource, window, cx)
@@ -40337,7 +40568,7 @@ impl VibexWorkbench {
         source: Arc<str>,
         sequence: u64,
         streaming: bool,
-        search_query: Option<String>,
+        search_highlight: Option<SessionSearchHighlight>,
         cx: &mut Context<Self>,
     ) -> MarkdownView {
         let markdown_entity = cx.weak_entity();
@@ -40349,7 +40580,16 @@ impl VibexWorkbench {
         .streaming(streaming)
         .allow_http_images(true)
         .scroll_handle(self.timeline_scroll_handle())
-        .search_query(search_query)
+        .search_query(
+            search_highlight
+                .as_ref()
+                .map(|highlight| highlight.query.clone()),
+        )
+        .search_active(
+            search_highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.active),
+        )
         .on_open_resource(move |resource, window, cx| {
             let _ = markdown_entity.update(cx, |this, cx| {
                 this.open_markdown_resource(resource, window, cx)
@@ -40467,9 +40707,8 @@ impl VibexWorkbench {
         let turn_id = row.turn_id.clone();
         let expanded = self.reasoning_row_expanded(&row_id);
         if expanded {
-            let search_query = self
-                .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-                .map(str::to_string);
+            let search_highlight =
+                self.session_search_highlight_for_rows(std::slice::from_ref(row));
             let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
             let (first_line_source, remaining_source) = reasoning_source_parts(&markdown_source);
             let first_line = self
@@ -40478,7 +40717,7 @@ impl VibexWorkbench {
                     Arc::<str>::from(first_line_source),
                     u64::try_from(markdown_sequence).unwrap_or_default(),
                     row.streaming,
-                    search_query.clone(),
+                    search_highlight.clone(),
                     cx,
                 )
                 .flex_auto()
@@ -40493,7 +40732,7 @@ impl VibexWorkbench {
                     Arc::<str>::from(source),
                     u64::try_from(markdown_sequence).unwrap_or_default(),
                     row.streaming,
-                    search_query,
+                    search_highlight,
                     cx,
                 )
                 .w_full()
@@ -40564,9 +40803,7 @@ impl VibexWorkbench {
         if row.body.is_empty() {
             return div().id(row.id.clone()).into_any_element();
         }
-        let search_query = self
-            .session_search_highlight_query_for_rows(std::slice::from_ref(row))
-            .map(str::to_string);
+        let search_highlight = self.session_search_highlight_for_rows(std::slice::from_ref(row));
         let (markdown_source, markdown_sequence) = self.timeline_markdown_source(row);
         let markdown_entity = cx.weak_entity();
         let markdown_view = MarkdownView::new(
@@ -40582,7 +40819,16 @@ impl VibexWorkbench {
         .streaming(row.streaming)
         .allow_http_images(true)
         .scroll_handle(self.timeline_scroll_handle())
-        .search_query(search_query)
+        .search_query(
+            search_highlight
+                .as_ref()
+                .map(|highlight| highlight.query.clone()),
+        )
+        .search_active(
+            search_highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.active),
+        )
         .on_open_resource(move |resource, window, cx| {
             let _ = markdown_entity.update(cx, |this, cx| {
                 this.open_markdown_resource(resource, window, cx)
@@ -40631,18 +40877,9 @@ impl VibexWorkbench {
         } else {
             self.strings().agent_expand_process
         };
-        let group_query = self
-            .session_search_highlight_query_for_rows(rows)
-            .unwrap_or_default();
-        let highlighted_title = session_search_highlighted_text(
-            projection.title.clone(),
-            group_query,
-            HighlightStyle {
-                background_color: Some(cx.theme().warning.opacity(0.42)),
-                font_weight: Some(FontWeight::BOLD),
-                ..Default::default()
-            },
-        );
+        // Tool activity is not searchable content, so the group header never
+        // carries a keyword tint even when the query appears in it.
+        let highlighted_title = StyledText::new(projection.title.clone());
 
         v_flex()
             .id(group.id.clone())
@@ -42852,14 +43089,14 @@ impl VibexWorkbench {
         message_id: &str,
         text: String,
         attachments: Vec<MessageAttachment>,
-        highlight_query: Option<&str>,
+        search_highlight: Option<SessionSearchHighlight>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if attachments.is_empty() {
             return render_user_message_text_segment(
                 format!("user-message-text:{message_id}"),
                 text,
-                highlight_query,
+                search_highlight,
             )
             .into_any_element();
         }
@@ -42876,7 +43113,16 @@ impl VibexWorkbench {
         let view = cx.entity().downgrade();
         MarkdownView::from_document(format!("user-message-text:{message_id}"), document)
             .presentation(MarkdownPresentation::Agent)
-            .search_query(highlight_query.map(Arc::<str>::from))
+            .search_query(
+                search_highlight
+                    .as_ref()
+                    .map(|highlight| highlight.query.clone()),
+            )
+            .search_active(
+                search_highlight
+                    .as_ref()
+                    .is_some_and(|highlight| highlight.active),
+            )
             .on_open_resource(move |resource, window, cx| {
                 let Some(action) = attachment_actions.get(&resource.source).cloned() else {
                     return;
@@ -57676,11 +57922,20 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
 fn render_user_message_text_segment(
     id: impl Into<ElementId>,
     value: String,
-    highlight_query: Option<&str>,
+    search_highlight: Option<SessionSearchHighlight>,
 ) -> MarkdownView {
     MarkdownView::plain_text(id, MarkdownInput::new(value, "", 0))
         .presentation(MarkdownPresentation::Agent)
-        .search_query(highlight_query.map(Arc::<str>::from))
+        .search_query(
+            search_highlight
+                .as_ref()
+                .map(|highlight| highlight.query.clone()),
+        )
+        .search_active(
+            search_highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.active),
+        )
         .w_auto()
         .min_w_0()
         .max_w_full()
@@ -59388,12 +59643,27 @@ mod tests {
         assert!(renderer.contains("self.conversation_find_matches(cx).len()"));
 
         let highlights = source
-            .split_once("    fn session_search_highlight_query_for_rows")
+            .split_once("    fn session_search_highlight_for_rows")
             .and_then(|(_, tail)| tail.split_once("\n    fn session_search_highlighted_row_text"))
             .map(|(body, _)| body)
             .expect("timeline highlighting should remain inspectable");
         assert!(highlights.contains("self.conversation_find_open"));
         assert!(highlights.contains("session_search_match_ranges"));
+        // Tool activity is not searchable, so a query that only appears in it
+        // must not tint the row.
+        assert!(highlights.contains("timeline_row_is_search_text(row.kind)"));
+
+        let reveal = source
+            .split_once("    fn highlight_session_search_rows(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn session_search_reveal_pending_for_rows(")
+            })
+            .map(|(body, _)| body)
+            .expect("timeline reveal wrapper should remain inspectable");
+        // The wrapper exists to scroll the active match into view; it must not
+        // paint a background, which used to bury the keyword in a yellow block.
+        assert!(!reveal.contains(".bg("));
+        assert!(reveal.contains(".on_prepaint("));
     }
 
     #[test]
@@ -59439,6 +59709,82 @@ mod tests {
     fn compact_session_search_text_collapses_whitespace_without_a_word_vector() {
         assert_eq!(compact_session_search_text("  a\n\n b\tc  "), "a b c");
         assert_eq!(compact_session_search_text("   "), "");
+    }
+
+    #[test]
+    fn session_search_reveal_delta_scrolls_the_match_just_into_view() {
+        let viewport = Bounds::new(point(px(0.0), px(100.0)), size(px(600.0), px(400.0)));
+        let row = |top: f32, height: f32| {
+            Bounds::new(point(px(0.0), px(top)), size(px(600.0), px(height)))
+        };
+
+        // Already visible, including inside the reveal margin: nothing moves,
+        // and a row that fits ignores where inside it the keyword sits.
+        for aim in [0.0, 0.5, 1.0] {
+            assert_eq!(
+                session_search_reveal_delta(row(200.0, 60.0), viewport, aim),
+                px(0.0)
+            );
+            assert_eq!(
+                session_search_reveal_delta(row(130.0, 60.0), viewport, aim),
+                px(0.0)
+            );
+        }
+
+        // Above the viewport scrolls down, below it scrolls up, and both land
+        // the row on the margin rather than on the edge.
+        assert_eq!(
+            session_search_reveal_delta(row(40.0, 60.0), viewport, 0.0),
+            px(84.0)
+        );
+        assert_eq!(
+            session_search_reveal_delta(row(470.0, 60.0), viewport, 0.0),
+            px(-54.0)
+        );
+
+        // A row taller than the viewport cannot be shown whole, so the reveal
+        // aims the keyword at the upper quarter of the viewport: the estimate
+        // is where the match sits in the row's text.
+        assert_eq!(
+            session_search_reveal_delta(row(300.0, 900.0), viewport, 0.0),
+            px(-88.0)
+        );
+        assert_eq!(
+            session_search_reveal_delta(row(300.0, 900.0), viewport, 0.5),
+            px(-538.0)
+        );
+        assert_eq!(
+            session_search_reveal_delta(row(300.0, 900.0), viewport, 1.0),
+            px(-988.0)
+        );
+    }
+
+    #[test]
+    fn session_search_match_aim_measures_characters_not_bytes() {
+        // "目标" starts two characters into a six-character row, but two bytes
+        // into a ten-byte one: the aim has to follow the characters, or a CJK
+        // row would reveal the wrong line.
+        let text = "ab目标cd";
+        assert!((session_search_match_aim(text, "目标", 0) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(session_search_match_aim(text, "ab", 0), 0.0);
+        assert_eq!(session_search_match_aim(text, "missing", 0), 0.0);
+        assert_eq!(session_search_match_aim("", "目标", 0), 0.0);
+    }
+
+    #[test]
+    fn session_search_match_aim_walks_the_ordinal_through_one_row() {
+        // Two hits in one row aim at different lines, so stepping to the next
+        // match moves inside a message instead of standing still on its first
+        // occurrence.
+        let text = "目标一二三四五六七八九十目标";
+        let first = session_search_match_aim(text, "目标", 0);
+        let second = session_search_match_aim(text, "目标", 1);
+        assert_eq!(first, 0.0);
+        assert!(second > 0.7, "second hit should sit near the end: {second}");
+
+        // An ordinal past the row's hits falls back to the first one rather
+        // than dropping the highlight.
+        assert_eq!(session_search_match_aim(text, "目标", 9), first);
     }
 
     #[test]
@@ -59488,8 +59834,25 @@ mod tests {
                     is_final: true,
                 }),
             ),
+            timeline_item(
+                TimelineItemId::new(),
+                9,
+                140,
+                TimelineSource::Agent,
+                TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "job_output".into(),
+                    status: vibex_core::ToolCallStatus::Completed,
+                    summary: "job_output 找到了 查找这段用户内容".into(),
+                    input_summary: None,
+                    output_summary: None,
+                    raw_extension: None,
+                }),
+            ),
         ]);
 
+        // Tool activity is not searchable content: the tool call above repeats
+        // the user's query, and it still produces no document to match on.
         assert_eq!(documents.len(), 2);
         assert_eq!(documents[0].item_id.as_deref(), Some(user_item_id.as_str()));
         assert_eq!(documents[0].first_sequence, 7);
@@ -59545,7 +59908,10 @@ mod tests {
         assert!(overlay.contains("skeleton_session_search(cx)"));
         assert!(overlay.contains("strings.command_palette_hint"));
         assert!(!overlay.contains("count_label"));
-        assert!(source.contains(".search_query(search_query)"));
+        // Matched rows tint the keyword through their Markdown views, and the
+        // find bar's current match is marked active so it paints stronger.
+        assert!(source.contains(".search_query("));
+        assert!(source.contains(".search_active("));
         assert!(source.contains("MarkdownView::new("));
 
         let rows = source
