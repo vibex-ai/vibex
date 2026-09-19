@@ -541,6 +541,13 @@ const COMMAND_PALETTE_DIALOG_CONTENT_RADIUS: f32 = COMMAND_PALETTE_DIALOG_RADIUS
 /// The keyboard legend under the list. Fixed so the list's share of the dialog
 /// is known before the footer renders.
 const COMMAND_PALETTE_FOOTER_HEIGHT: f32 = 34.0;
+/// The palette's horizontal gutter, between the dialog's edge and its content.
+///
+/// The component already insets a row by `p_1 + px_2` before its icon, so this
+/// is the outer half of one shared spine: with the same value again inside the
+/// query field, the caret, the row icons, and the footer legend all start at
+/// `2 * COMMAND_PALETTE_GUTTER` from the dialog's edge.
+const COMMAND_PALETTE_GUTTER: f32 = 12.0;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
 /// A keystroke waits this long before the result scan starts, so typing a word
 /// schedules one scan instead of one per character.
@@ -45810,6 +45817,11 @@ impl VibexWorkbench {
             // The dialog owns the frame and the elevation, so the palette only
             // draws its own content.
             .bordered(false)
+            // The list, the field, and the footer each reach the palette's own
+            // edge; this one inset holds all three off it, so the rows stop
+            // crowding the border and the scrollbar still sits on the palette's
+            // edge rather than inside the gutter.
+            .px(px(COMMAND_PALETTE_GUTTER))
             // GPUI clips children to a square, so the command surface rounds
             // the frame's corners itself instead of squaring them off.
             .rounded(px(COMMAND_PALETTE_DIALOG_CONTENT_RADIUS))
@@ -45829,7 +45841,10 @@ impl VibexWorkbench {
                 h_flex()
                     .flex_none()
                     .w_full()
-                    .px_3()
+                    // The outer gutter is the palette's; this is the field's own
+                    // half of the shared spine, so the caret lands where the row
+                    // icons do.
+                    .px(px(COMMAND_PALETTE_GUTTER))
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
