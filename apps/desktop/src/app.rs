@@ -567,6 +567,15 @@ const COMMAND_PALETTE_FOOTER_HEIGHT: f32 = 34.0;
 /// query field, the caret, the row icons, and the footer legend all start at
 /// `2 * COMMAND_PALETTE_GUTTER` from the dialog's edge.
 const COMMAND_PALETTE_GUTTER: f32 = 12.0;
+/// Extra trailing inset on a palette row, so the component's scrollbar covers no
+/// row content.
+///
+/// `Scrollbar::vertical` pins its track to the trailing edge of the list it
+/// scrolls, and the component insets a row by `p_1 + px_2` — less than the
+/// track is wide — so a session's timestamp and a quick action's keybinding
+/// hint sat underneath the thumb. The scrollbar keeps the list's edge, where a
+/// scrollbar belongs; this lane is added inside the row instead.
+const COMMAND_PALETTE_ROW_LANE: f32 = 8.0;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
 /// A keystroke waits this long before the result scan starts, so typing a word
 /// schedules one scan instead of one per character.
@@ -53807,6 +53816,9 @@ fn command_palette_row(
                         .min_w_0()
                         .items_center()
                         .gap_3()
+                        // The scrollbar paints over the list's trailing edge, so
+                        // the row keeps that lane clear.
+                        .pr(px(COMMAND_PALETTE_ROW_LANE))
                         .child(
                             div()
                                 .size(px(28.0))
@@ -53866,6 +53878,9 @@ fn command_palette_row(
                         .min_w_0()
                         .items_center()
                         .gap_3()
+                        // Matches the session rows, so both kinds of two-line
+                        // row end on the same trailing spine.
+                        .pr(px(COMMAND_PALETTE_ROW_LANE))
                         .child(
                             div()
                                 .size(px(28.0))
