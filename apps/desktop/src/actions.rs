@@ -30,6 +30,21 @@ pub struct OpenRuntimeManager;
 #[action(namespace = vibex, no_json)]
 pub struct OpenConversationFind;
 
+/// Opens the command palette, or closes it when it is already showing.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct OpenCommandPalette;
+
+/// Starts a new Agent session.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct NewSession;
+
+/// Opens the mobile device pairing flow.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = vibex, no_json)]
+pub struct PairMobileDevice;
+
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = vibex, no_json)]
 pub struct RetryRuntime;

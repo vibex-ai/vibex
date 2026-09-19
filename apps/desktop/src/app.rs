@@ -38,6 +38,7 @@ use gpui_component::{
     bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
+    command::{Command, CommandGroup, CommandItem, CommandState},
     dialog::{DialogAction, DialogClose, DialogFooter},
     empty::{
         Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
@@ -156,9 +157,10 @@ use vibex_ui::{
 };
 
 use crate::actions::{
-    GoToLineInEditor, NavigateBack, NavigateForward, OpenConversationFind, OpenRuntimeManager,
-    OpenSettings, RedoImageEdit, RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview,
-    ToggleRightRail, ToggleSidebar, UndoImageEdit,
+    GoToLineInEditor, NavigateBack, NavigateForward, NewSession, OpenCommandPalette,
+    OpenConversationFind, OpenRuntimeManager, OpenSettings, PairMobileDevice, RedoImageEdit,
+    RetryRuntime, SaveActiveFile, ToggleComposerMode, TogglePreview, ToggleRightRail,
+    ToggleSidebar, UndoImageEdit,
 };
 
 use crate::appearance_theme;
@@ -503,15 +505,25 @@ const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX: f32 = 16.0;
 const SESSION_SEARCH_RESULT_LIMIT: usize = 200;
-const SESSION_SEARCH_RESULT_ROW_HEIGHT: f32 = 68.0;
+/// Session rows the palette shows for a query. The scan itself keeps matching
+/// past this; the palette stops listing so one broad query cannot bury the
+/// settings and action groups under a hundred sessions.
+const COMMAND_PALETTE_SESSION_LIMIT: usize = 50;
+/// Session rows the palette shows before anything has been typed. An empty
+/// query is "where was I", not "list everything".
+const COMMAND_PALETTE_RECENT_SESSION_LIMIT: usize = 8;
+const COMMAND_PALETTE_SESSION_ROW_HEIGHT: f32 = 60.0;
 /// Result rows the indexing placeholder stands in for. The real count is only
 /// known once the index finishes, so the placeholder fills the dialog rather
 /// than guessing it.
-const SESSION_SEARCH_LOADING_ROWS: usize = 6;
-const SESSION_SEARCH_DIALOG_MAX_WIDTH: f32 = 720.0;
-const SESSION_SEARCH_DIALOG_MAX_HEIGHT: f32 = 620.0;
-const SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
-const SESSION_SEARCH_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
+const COMMAND_PALETTE_LOADING_ROWS: usize = 6;
+const COMMAND_PALETTE_DIALOG_MAX_WIDTH: f32 = 720.0;
+const COMMAND_PALETTE_DIALOG_MAX_HEIGHT: f32 = 620.0;
+const COMMAND_PALETTE_DIALOG_VIEWPORT_WIDTH_RATIO: f32 = 0.88;
+const COMMAND_PALETTE_DIALOG_VIEWPORT_HEIGHT_RATIO: f32 = 0.74;
+/// The keyboard legend under the list. Fixed so the list's share of the dialog
+/// is known before the footer renders.
+const COMMAND_PALETTE_FOOTER_HEIGHT: f32 = 34.0;
 const SESSION_SEARCH_EXCERPT_MAX_CHARS: usize = 180;
 /// A keystroke waits this long before the result scan starts, so typing a word
 /// schedules one scan instead of one per character.
@@ -4363,7 +4375,7 @@ fn timeline_turn_conclusion_row(turn: &TimelineConversationTurn) -> Option<&Time
 /// The index is built by fetching every stale session's timeline, which takes
 /// seconds on a long history, so without this the body claims "no results" for
 /// a query that is still being indexed. Rows reuse
-/// [`SESSION_SEARCH_RESULT_ROW_HEIGHT`], the pitch of the virtual list that
+/// [`COMMAND_PALETTE_SESSION_ROW_HEIGHT`], the pitch of the virtual list that
 /// replaces them. An empty query is answered synchronously from the in-memory
 /// session list, so it never reaches this.
 fn skeleton_session_search(cx: &App) -> AnyElement {
@@ -4375,11 +4387,11 @@ fn skeleton_session_search(cx: &App) -> AnyElement {
         .min_h_0()
         .w_full()
         .overflow_hidden()
-        .children((0..SESSION_SEARCH_LOADING_ROWS).map(|row| {
+        .children((0..COMMAND_PALETTE_LOADING_ROWS).map(|row| {
             h_flex()
                 .w_full()
                 .min_w_0()
-                .h(px(SESSION_SEARCH_RESULT_ROW_HEIGHT))
+                .h(px(COMMAND_PALETTE_SESSION_ROW_HEIGHT))
                 .flex_none()
                 .items_center()
                 .gap_3()
@@ -5419,6 +5431,49 @@ enum SessionSearchIndexSignal {
     Finished,
 }
 
+/// One confirmable row of the command palette.
+///
+/// The palette's groups are rebuilt from live workbench state on every render,
+/// so a row is addressed by where it sits — the group's index and the item's
+/// index inside it — rather than by an id the component would have to carry.
+#[derive(Clone)]
+enum CommandPaletteEntry {
+    /// A session, or one message inside it, that matched the query.
+    Session(SessionSearchResult),
+    /// One settings entry, confirmed by opening Settings on its section.
+    Setting(SettingsSearchCandidate),
+    /// A quick action, named by its id in [`COMMAND_PALETTE_ACTIONS`], and
+    /// whether it can run right now. The row dispatches its own Action, so
+    /// confirming it only has to dismiss the palette.
+    Action(&'static str, bool),
+}
+
+/// A titled group of palette rows, in the order the `Command` receives them.
+struct CommandPaletteSection {
+    heading: SharedString,
+    entries: Vec<CommandPaletteEntry>,
+}
+
+/// The palette's quick actions, in reading order: start something, go
+/// somewhere, then arrange the workbench.
+///
+/// Every one of them is a real [`gpui::Action`] registered on the workbench, so
+/// the row shows its keybinding and the command stays reachable from the menu
+/// bar, the toolbar, and the keyboard — not only from the palette.
+const COMMAND_PALETTE_ACTIONS: &[&str] = &[
+    "new_session",
+    "open_settings",
+    "open_runtime_manager",
+    "open_conversation_find",
+    "toggle_sidebar",
+    "toggle_composer_mode",
+    "toggle_preview",
+    "toggle_right_rail",
+    "navigate_back",
+    "navigate_forward",
+    "pair_mobile_device",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarSelectionState {
     Unchecked,
@@ -5529,15 +5584,19 @@ pub struct VibexWorkbench {
     usage_view: Entity<UsageView>,
     usage_session_filter: Option<VibexSessionId>,
     usage_refresh_in_flight: bool,
-    session_search: Entity<InputState>,
-    session_search_open: bool,
-    session_search_selected_index: usize,
+    /// The workbench-wide command palette: session content, settings entries,
+    /// and quick actions behind one query field. It owns the query and the
+    /// highlighted row; the workbench owns what the rows mean.
+    command_palette: Entity<CommandState>,
+    command_palette_open: bool,
+    /// The palette's raw query, mirrored out of [`CommandState`] so the result
+    /// scan can read it without borrowing the component.
+    command_palette_query: String,
     conversation_find: Entity<InputState>,
     conversation_find_open: bool,
     conversation_find_active_index: usize,
     conversation_find_query: String,
     conversation_find_active_item_id: Option<String>,
-    session_search_scroll: VirtualListScrollHandle,
     session_search_index: BTreeMap<String, SessionSearchIndexEntry>,
     session_search_index_loading: bool,
     session_search_generation: u64,
@@ -5901,11 +5960,7 @@ impl VibexWorkbench {
         let settings_open_on_start = std::env::var_os("VIBEX_FOUNDATION_OPEN_SETTINGS").is_some();
         let settings_view = FoundationSettings::new(cx.weak_entity(), &ui_state, window, cx);
         let initial_strings = locale::strings(initial_locale);
-        let session_search = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(initial_strings.session_search_placeholder)
-                .submit_on_enter(true)
-        });
+        let command_palette = cx.new(|cx| CommandState::new(window, cx));
         let conversation_find = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(locale::text(
@@ -6016,24 +6071,6 @@ impl VibexWorkbench {
             ))
         });
         let mut agent_subscriptions = vec![
-            cx.subscribe_in(
-                &session_search,
-                window,
-                |this, _, event, window, cx| match event {
-                    InputEvent::Change => {
-                        this.session_search_selected_index = 0;
-                        this.session_search_scroll = VirtualListScrollHandle::new();
-                        this.schedule_session_search_scan(SESSION_SEARCH_DEBOUNCE, cx);
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        this.activate_session_search_selection(window, cx)
-                    }
-                    InputEvent::Focus
-                    | InputEvent::Blur
-                    | InputEvent::PressEnter { shift: true, .. } => {}
-                },
-            ),
             cx.subscribe_in(
                 &conversation_find,
                 window,
@@ -6408,15 +6445,14 @@ impl VibexWorkbench {
             usage_view,
             usage_session_filter: None,
             usage_refresh_in_flight: false,
-            session_search,
-            session_search_open: false,
-            session_search_selected_index: 0,
+            command_palette,
+            command_palette_open: false,
+            command_palette_query: String::new(),
             conversation_find,
             conversation_find_open: false,
             conversation_find_active_index: 0,
             conversation_find_query: String::new(),
             conversation_find_active_item_id: None,
-            session_search_scroll: VirtualListScrollHandle::new(),
             session_search_index: BTreeMap::new(),
             session_search_index_loading: false,
             session_search_generation: 0,
@@ -24715,11 +24751,20 @@ impl VibexWorkbench {
             .collect()
     }
 
+    /// Whether the workbench is showing a session's conversation rather than
+    /// the new-session flow or another tab.
+    ///
+    /// Commands that act on "the conversation" — find, terminal mode — and the
+    /// palette rows that offer them share this one predicate, so a disabled row
+    /// and a refused command can never disagree.
+    fn conversation_context_active(&self) -> bool {
+        self.ui_state.workbench.active_tab == "agent"
+            && !self.new_session_open
+            && self.selected_session_id.is_some()
+    }
+
     fn open_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ui_state.workbench.active_tab != "agent"
-            || self.new_session_open
-            || self.selected_session_id.is_none()
-        {
+        if !self.conversation_context_active() {
             return;
         }
         self.conversation_find_open = true;
@@ -24788,29 +24833,47 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn open_session_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.session_search_open = true;
-        self.session_search_selected_index = 0;
-        self.session_search_scroll = VirtualListScrollHandle::new();
+    /// Opens the palette on a fresh query, or closes it when it is already up.
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette_open {
+            self.close_command_palette(window, cx);
+            return;
+        }
+        // A dialog or sheet is the topmost decision layer; the palette is a
+        // workbench surface and does not stack on top of one.
+        if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+            return;
+        }
+        self.open_command_palette(window, cx);
+    }
+
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette_open {
+            return;
+        }
+        self.command_palette_open = true;
+        self.command_palette_query.clear();
         self.session_search_highlight_item_id = None;
         self.session_search_highlight_query = None;
-        self.session_search.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-            input.focus(window, cx);
+        // The component owns the field, so a fresh open resets it rather than
+        // inheriting the query the last visit was abandoned with.
+        self.command_palette.update(cx, |state, cx| {
+            state.set_query("", window, cx);
+            state.focus(window, cx);
         });
         // Opening shows the recent list, which only needs the sessions.
-        self.ensure_session_search_results(cx);
-        // The index survives closing the dialog; this refreshes the sessions
+        self.ensure_session_search_results();
+        // The index survives closing the palette; this refreshes the sessions
         // that changed since it was built and is a no-op otherwise.
         self.refresh_session_search_index(cx);
         cx.notify();
     }
 
-    fn close_session_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.session_search_open {
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.command_palette_open {
             return;
         }
-        self.session_search_open = false;
+        self.command_palette_open = false;
         self.session_search_generation = self.session_search_generation.saturating_add(1);
         self.session_search_index_task = None;
         self.session_search_index_loading = false;
@@ -24821,7 +24884,11 @@ impl VibexWorkbench {
         self.session_search_scan_task = None;
         self.session_search_results = Rc::new(Vec::new());
         self.session_search_results_query = None;
-        self.focus_handle.focus(window, cx);
+        // A confirmed action may have opened a dialog of its own; focus belongs
+        // there, not back on the workbench behind it.
+        if !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
+            self.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -24909,9 +24976,9 @@ impl VibexWorkbench {
                                 // An open dialog is searching a growing index;
                                 // rescan so it sees the sessions that just
                                 // landed without waiting for the whole pass.
-                                if this.session_search_open
+                                if this.command_palette_open
                                     && !normalized_session_search_query(
-                                        this.session_search.read(cx).value().as_ref(),
+                                        this.command_palette_query.as_str(),
                                     )
                                     .is_empty()
                                 {
@@ -24984,13 +25051,10 @@ impl VibexWorkbench {
             .collect()
     }
 
-    /// The scan for the dialog's current query, recomputed on the UI thread
+    /// The scan for the palette's current query, recomputed on the UI thread
     /// when a scheduled scan has not landed yet.
-    fn ensure_session_search_results(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Rc<Vec<SessionSearchResult>> {
-        let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
+    fn ensure_session_search_results(&mut self) -> Rc<Vec<SessionSearchResult>> {
+        let query = normalized_session_search_query(self.command_palette_query.as_str());
         if self.session_search_results_query.as_deref() != Some(query.as_str()) {
             let sessions = self.session_search_scan_sessions();
             self.session_search_results = Rc::new(session_search_scan(&query, &sessions));
@@ -25003,7 +25067,7 @@ impl VibexWorkbench {
         self.session_search_results.clone()
     }
 
-    /// Recomputes the dialog's result list away from the UI thread.
+    /// Recomputes the palette's session results away from the UI thread.
     fn schedule_session_search_scan(&mut self, delay: Duration, cx: &mut Context<Self>) {
         self.session_search_scan_generation = self.session_search_scan_generation.wrapping_add(1);
         let generation = self.session_search_scan_generation;
@@ -25013,14 +25077,12 @@ impl VibexWorkbench {
                     cx.background_executor().timer(delay).await;
                 }
                 let request = entity
-                    .update(cx, |this, cx| {
+                    .update(cx, |this, _| {
                         if this.session_search_scan_generation != generation {
                             return None;
                         }
                         Some((
-                            normalized_session_search_query(
-                                this.session_search.read(cx).value().as_ref(),
-                            ),
+                            normalized_session_search_query(this.command_palette_query.as_str()),
                             this.session_search_scan_sessions(),
                         ))
                     })
@@ -25047,58 +25109,92 @@ impl VibexWorkbench {
         ));
     }
 
-    fn move_session_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let result_count = self.ensure_session_search_results(cx).len();
-        if result_count == 0 {
-            self.session_search_selected_index = 0;
-            return;
-        }
-        self.session_search_selected_index = if delta < 0 {
-            self.session_search_selected_index
-                .checked_sub(delta.unsigned_abs())
-                .unwrap_or(result_count - 1)
+    /// Adopts a query typed into the palette: the recent list needs no document
+    /// scan, so an empty query is answered in this frame, while anything else
+    /// waits out the debounce.
+    fn on_command_palette_query_changed(&mut self, query: String, cx: &mut Context<Self>) {
+        self.command_palette_query = query;
+        if normalized_session_search_query(self.command_palette_query.as_str()).is_empty() {
+            self.ensure_session_search_results();
         } else {
-            let next = self.session_search_selected_index + delta as usize;
-            if next >= result_count { 0 } else { next }
-        };
-        self.session_search_scroll
-            .scroll_to_item(self.session_search_selected_index, ScrollStrategy::Nearest);
+            self.schedule_session_search_scan(SESSION_SEARCH_DEBOUNCE, cx);
+        }
         cx.notify();
     }
 
-    fn activate_session_search_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(result) = self
-            .ensure_session_search_results(cx)
-            .get(self.session_search_selected_index)
-            .cloned()
-        else {
-            return;
-        };
-        let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
+    /// Confirms the palette's highlighted row, which is addressed by the
+    /// `Command`'s index path: `section` indexes the group and `row` the item
+    /// inside it, matching the order [`Self::command_palette_sections`] builds.
+    fn on_command_palette_confirm(
+        &mut self,
+        index: IndexPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.strings();
+        let query = normalized_session_search_query(self.command_palette_query.as_str());
+        let sections = self.command_palette_sections(&query, strings);
+        let entry = sections
+            .get(index.section)
+            .and_then(|section| section.entries.get(index.row))
+            .cloned();
+        match entry {
+            Some(CommandPaletteEntry::Session(result)) => {
+                self.activate_command_palette_session(result, window, cx)
+            }
+            Some(CommandPaletteEntry::Setting(candidate)) => {
+                self.activate_command_palette_setting(candidate, window, cx)
+            }
+            // The row's Action already ran during the same confirm; the palette
+            // only has to get out of its way.
+            Some(CommandPaletteEntry::Action(..)) | None => self.close_command_palette(window, cx),
+        }
+    }
+
+    /// Opens a session result and jumps to the message it matched.
+    fn activate_command_palette_session(
+        &mut self,
+        result: SessionSearchResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let query = normalized_session_search_query(self.command_palette_query.as_str());
         let target = result.target;
         self.session_search_highlight_item_id = None;
         self.session_search_highlight_query = target
             .as_ref()
             .and_then(|_| (!query.is_empty()).then_some(query));
         self.pending_session_search_jump = target;
-        self.close_session_search(window, cx);
+        self.close_command_palette(window, cx);
         self.select_session(result.session_id, cx);
         self.apply_pending_session_search_jump(cx);
     }
 
-    fn on_session_search_key_down(
+    /// Opens Settings on a matched entry's section and highlights that entry.
+    fn activate_command_palette_setting(
         &mut self,
-        event: &KeyDownEvent,
+        candidate: SettingsSearchCandidate,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event.keystroke.key.as_str() {
-            "up" => self.move_session_search_selection(-1, cx),
-            "down" => self.move_session_search_selection(1, cx),
-            "escape" => self.close_session_search(window, cx),
-            _ => return,
-        }
-        cx.stop_propagation();
+        self.close_command_palette(window, cx);
+        self.open_settings(window, cx);
+        self.settings_view.update(cx, |settings, cx| {
+            settings.activate_settings_section(candidate.section, cx);
+            settings.shortcut_note = None;
+            settings
+                .settings_render_context
+                .target_title
+                .borrow_mut()
+                .replace(candidate.title.to_string());
+            settings
+                .settings_render_context
+                .highlighted_title
+                .borrow_mut()
+                .replace(candidate.title.to_string());
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn apply_pending_session_search_jump(&mut self, cx: &mut Context<Self>) -> bool {
@@ -26635,10 +26731,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.ui_state.workbench.active_tab != "agent"
-            || self.new_session_open
-            || self.selected_session_id.is_none()
-        {
+        if !self.conversation_context_active() {
             return;
         }
         if self.composer_terminal_mode {
@@ -26664,7 +26757,34 @@ impl VibexWorkbench {
         self.open_conversation_find(window, cx);
     }
 
+    fn on_open_command_palette(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_command_palette(window, cx);
+    }
+
+    fn on_new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_action_pending || self.sidebar_picker_task.is_some() {
+            return;
+        }
+        self.open_new_project_session(window, cx);
+    }
+
+    fn on_pair_mobile_device(
+        &mut self,
+        _: &PairMobileDevice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_pairing(window, cx);
+    }
+
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        // The settings dialog is modal; a palette still up would paint over it.
+        self.close_command_palette(window, cx);
         self.toggle_settings(window, cx);
     }
 
@@ -26753,9 +26873,6 @@ impl VibexWorkbench {
 
     fn sync_locale_dependents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = self.strings();
-        self.session_search.update(cx, |input, cx| {
-            input.set_placeholder(strings.session_search_placeholder, window, cx)
-        });
         self.sidebar_rename_input.update(cx, |input, cx| {
             input.set_placeholder(strings.sidebar_rename_placeholder, window, cx)
         });
@@ -28506,20 +28623,6 @@ impl VibexWorkbench {
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_new_project_session(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("sidebar-search-sessions")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .icon(IconName::Search)
-                                    .tooltip(strings.session_search_open)
-                                    .disabled(self.sessions.is_empty())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_session_search(window, cx)
                                     })),
                             ),
                     ),
@@ -44740,187 +44843,213 @@ impl VibexWorkbench {
         )
     }
 
-    fn render_session_search_overlay(
+    /// The palette's groups for a query, in the order the `Command` receives
+    /// them.
+    ///
+    /// This is the palette's single source of truth: rendering walks it to
+    /// build the rows, and confirming an index path walks it again to find out
+    /// what the row meant. The two agree by construction.
+    fn command_palette_sections(
+        &self,
+        query: &str,
+        strings: Strings,
+    ) -> Vec<CommandPaletteSection> {
+        let query_empty = query.is_empty();
+        let mut sections = Vec::new();
+
+        // An empty query is "where was I", so it lists a few recent sessions
+        // rather than every session the index holds.
+        let session_limit = if query_empty {
+            COMMAND_PALETTE_RECENT_SESSION_LIMIT
+        } else {
+            COMMAND_PALETTE_SESSION_LIMIT
+        };
+        let sessions = self
+            .session_search_results
+            .iter()
+            .take(session_limit)
+            .cloned()
+            .map(CommandPaletteEntry::Session)
+            .collect::<Vec<_>>();
+        if !sessions.is_empty() {
+            sections.push(CommandPaletteSection {
+                heading: if query_empty {
+                    strings.command_palette_recent
+                } else {
+                    strings.command_palette_sessions
+                }
+                .into(),
+                entries: sessions,
+            });
+        }
+
+        // Settings entries are only meaningful once something has been asked
+        // for; there is no "recent settings" to fall back to.
+        if !query_empty {
+            let settings = settings_search_candidates_for_query(query, strings)
+                .into_iter()
+                .map(CommandPaletteEntry::Setting)
+                .collect::<Vec<_>>();
+            if !settings.is_empty() {
+                sections.push(CommandPaletteSection {
+                    heading: strings.command_palette_settings.into(),
+                    entries: settings,
+                });
+            }
+        }
+
+        let actions = COMMAND_PALETTE_ACTIONS
+            .iter()
+            .copied()
+            .filter(|action| command_palette_action_matches(action, query, strings))
+            .map(|action| {
+                CommandPaletteEntry::Action(action, command_palette_action_enabled(action, self))
+            })
+            .collect::<Vec<_>>();
+        if !actions.is_empty() {
+            sections.push(CommandPaletteSection {
+                heading: strings.command_palette_actions.into(),
+                entries: actions,
+            });
+        }
+
+        sections
+    }
+
+    fn render_command_palette_overlay(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.session_search_open {
+        if !self.command_palette_open {
             return None;
         }
         let strings = self.strings();
         let locale = self.resolved_locale();
-        let query = normalized_session_search_query(self.session_search.read(cx).value().as_ref());
-        let query_empty = query.is_empty();
-        // The scan is cached; a keystroke schedules one instead of paying it
-        // on every frame the dialog stays open.
+        let query = normalized_session_search_query(self.command_palette_query.as_str());
+        let sections = self.command_palette_sections(&query, strings);
+        // The session scan is cached; a keystroke schedules one instead of
+        // paying it on every frame the palette stays open.
         let results = self.session_search_results.clone();
-        if results.is_empty() {
-            self.session_search_selected_index = 0;
-        } else {
-            self.session_search_selected_index =
-                self.session_search_selected_index.min(results.len() - 1);
-        }
+        let index_loading = self.session_search_index_loading;
+        let scanning = self.session_search_scan_task.is_some();
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
-        let dialog_width = (viewport_width * SESSION_SEARCH_DIALOG_VIEWPORT_WIDTH_RATIO)
-            .clamp(280.0, SESSION_SEARCH_DIALOG_MAX_WIDTH);
-        let dialog_height = (viewport_height * SESSION_SEARCH_DIALOG_VIEWPORT_HEIGHT_RATIO)
-            .clamp(260.0, SESSION_SEARCH_DIALOG_MAX_HEIGHT);
-        let list_width = (dialog_width - 2.0).max(1.0);
-        let row_sizes = Rc::new(
-            (0..results.len())
-                .map(|_| size(px(list_width), px(SESSION_SEARCH_RESULT_ROW_HEIGHT)))
-                .collect::<Vec<_>>(),
-        );
-        let rendered_results = results.clone();
-        let rendered_query = query.clone();
-        let result_list = if results.is_empty() && self.session_search_index_loading {
-            skeleton_session_search(cx)
-        } else if results.is_empty() {
-            EmptyState::new()
-                .gap_2()
-                .header(
-                    EmptyHeader::new()
-                        .media(
-                            EmptyMedia::new()
-                                .mb_0()
-                                .child(Icon::new(IconName::Search).size(px(24.0))),
-                        )
-                        .description(
-                            EmptyDescription::new().child(strings.session_search_no_results),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            v_virtual_list(
-                cx.entity().clone(),
-                "session-search-results",
-                row_sizes,
-                move |this, visible_range, _window, cx| {
-                    visible_range
-                        .filter_map(|index| {
-                            let result = rendered_results.get(index)?.clone();
-                            let selected = index == this.session_search_selected_index;
-                            let title = result.session_title.clone();
-                            let detail = result
-                                .excerpt
-                                .clone()
-                                .map(|excerpt| format!("{} · {excerpt}", result.project_name))
-                                .unwrap_or_else(|| result.project_name.clone());
-                            let highlight = HighlightStyle {
-                                background_color: Some(cx.theme().warning.opacity(0.42)),
-                                font_weight: Some(FontWeight::BOLD),
-                                ..Default::default()
-                            };
-                            let highlighted_title = session_search_highlighted_text(
-                                title.clone(),
-                                &rendered_query,
-                                highlight,
-                            );
-                            let highlighted_detail = session_search_highlighted_text(
-                                detail.clone(),
-                                &rendered_query,
-                                highlight,
-                            );
-                            let timestamp = format_sidebar_session_time(
-                                result.last_message_at_ms,
-                                locale,
-                                strings,
-                            );
-                            let aria_label = format!("{title}, {detail}");
-                            let agent_color = if selected {
-                                cx.theme().accent_foreground.opacity(0.88)
-                            } else {
-                                cx.theme().popover_foreground.opacity(0.72)
-                            };
-                            Some(
-                                h_flex()
-                                    .id(format!("session-search-result-{index}"))
-                                    .w_full()
-                                    .h(px(SESSION_SEARCH_RESULT_ROW_HEIGHT))
-                                    .flex_none()
-                                    .items_center()
-                                    .gap_3()
-                                    .px_4()
-                                    .cursor_pointer()
-                                    .role(Role::Button)
-                                    .aria_label(aria_label)
-                                    .when(selected, |this| {
-                                        this.bg(cx.theme().accent.opacity(0.24))
-                                            .text_color(cx.theme().accent_foreground)
-                                    })
-                                    .when(!selected, |this| {
-                                        this.hover(|style| style.bg(cx.theme().muted.opacity(0.44)))
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.session_search_selected_index = index;
-                                        this.activate_session_search_selection(window, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .size(px(30.0))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(6.0))
-                                            .bg(cx.theme().muted.opacity(0.55))
-                                            .child(agent_brand_icon(
-                                                result.agent_id.as_str(),
-                                                px(16.0),
-                                                Some(agent_color),
-                                            )),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .gap(px(3.0))
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .font_medium()
-                                                    .child(highlighted_title),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(highlighted_detail),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(timestamp),
-                                    )
-                                    .into_any_element(),
-                            )
-                        })
-                        .collect()
-                },
-            )
-            .size_full()
-            .track_scroll(&self.session_search_scroll)
-            .into_any_element()
-        };
-        let section_label = if query_empty {
-            strings.session_search_recent
-        } else {
-            strings.session_search_results
-        };
-        let backdrop_opacity = if cx.theme().is_dark() { 0.72 } else { 0.46 };
+        let dialog_width = (viewport_width * COMMAND_PALETTE_DIALOG_VIEWPORT_WIDTH_RATIO)
+            .clamp(280.0, COMMAND_PALETTE_DIALOG_MAX_WIDTH);
+        let dialog_height = (viewport_height * COMMAND_PALETTE_DIALOG_VIEWPORT_HEIGHT_RATIO)
+            .clamp(260.0, COMMAND_PALETTE_DIALOG_MAX_HEIGHT);
+        let list_max_height = (dialog_height - COMMAND_PALETTE_FOOTER_HEIGHT).max(160.0);
 
-        let search_overlay = div()
-            .id("session-search-overlay")
+        let query_owner = cx.weak_entity();
+        let confirm_owner = cx.weak_entity();
+        let cancel_owner = cx.weak_entity();
+        let footer_owner = cx.weak_entity();
+        let footer_strings = strings;
+        let mut command = Command::new(&self.command_palette)
+            // The dialog owns the frame and the elevation, so the palette only
+            // draws its own content.
+            .bordered(false)
+            // The workbench answers the query. Sessions match on message text
+            // the component cannot see, and the other groups reuse that same
+            // pass, so one query produces one list.
+            .filterable(false)
+            .placeholder(strings.command_palette_placeholder)
+            .max_h(px(list_max_height))
+            .flex_1()
+            .min_h_0()
+            .empty(move |_, _, cx| {
+                // The index is built session by session, so an empty list right
+                // after opening means "still looking", not "nothing there".
+                if results.is_empty() && index_loading {
+                    return skeleton_session_search(cx);
+                }
+                EmptyState::new()
+                    .gap_2()
+                    .header(
+                        EmptyHeader::new()
+                            .media(
+                                EmptyMedia::new()
+                                    .mb_0()
+                                    .child(Icon::new(IconName::Search).size(px(24.0))),
+                            )
+                            .description(
+                                EmptyDescription::new().child(strings.command_palette_no_results),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .on_query(move |query, _, cx| {
+                let query = query.to_string();
+                let _ = query_owner.update(cx, |this, cx| {
+                    this.on_command_palette_query_changed(query, cx);
+                });
+            })
+            .on_confirm(move |index, window, cx| {
+                let _ = confirm_owner.update(cx, |this, cx| {
+                    this.on_command_palette_confirm(index, window, cx);
+                });
+            })
+            .on_cancel(move |window, cx| {
+                let _ = cancel_owner.update(cx, |this, cx| {
+                    this.close_command_palette(window, cx);
+                });
+            })
+            .footer(move |_, _, cx| {
+                let owner = footer_owner.clone();
+                h_flex()
+                    .h(px(COMMAND_PALETTE_FOOTER_HEIGHT))
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .px_3()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .when(scanning, |this| {
+                                this.child(Spinner::new().xsmall())
+                                    .child(footer_strings.command_palette_loading)
+                            })
+                            .when(!scanning, |this| {
+                                this.child(footer_strings.command_palette_hint)
+                            }),
+                    )
+                    .child(
+                        Button::new("command-palette-close")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(24.0))
+                            .px_0()
+                            .tooltip(footer_strings.command_palette_close)
+                            .icon(IconName::Close)
+                            .on_click(move |_, window, cx| {
+                                let _ = owner
+                                    .update(cx, |this, cx| this.close_command_palette(window, cx));
+                            }),
+                    )
+                    .into_any_element()
+            });
+        for section in &sections {
+            let mut group = CommandGroup::new().label(section.heading.clone());
+            for entry in &section.entries {
+                group = group.item(command_palette_row(entry, &query, strings, locale));
+            }
+            command = command.group(group);
+        }
+
+        let backdrop_opacity = if cx.theme().is_dark() { 0.72 } else { 0.46 };
+        let palette = div()
+            .id("command-palette-overlay")
             .absolute()
             .inset_0()
             .flex()
@@ -44929,14 +45058,13 @@ impl VibexWorkbench {
             .p_4()
             .bg(gpui::black().opacity(backdrop_opacity))
             .occlude()
-            .capture_key_down(cx.listener(Self::on_session_search_key_down))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_session_search(window, cx)),
+                cx.listener(|this, _, window, cx| this.close_command_palette(window, cx)),
             )
             .child(
                 v_flex()
-                    .id("session-search-dialog")
+                    .id("command-palette-dialog")
                     .w(px(dialog_width))
                     .h(px(dialog_height))
                     .max_w_full()
@@ -44949,76 +45077,11 @@ impl VibexWorkbench {
                     .text_color(cx.theme().popover_foreground)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        h_flex()
-                            .h(px(56.0))
-                            .w_full()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .px_3()
-                            .child(
-                                Input::new(&self.session_search)
-                                    .h(px(40.0))
-                                    .min_w_0()
-                                    .flex_1()
-                                    .prefix(
-                                        Icon::new(IconName::Search)
-                                            .small()
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
-                            )
-                            .child(
-                                Button::new("session-search-close")
-                                    .small()
-                                    .ghost()
-                                    .compact()
-                                    .size(px(32.0))
-                                    .icon(IconName::Close)
-                                    .tooltip(strings.session_search_close)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_session_search(window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .h(px(34.0))
-                            .w_full()
-                            .flex_none()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(cx.theme().border.opacity(0.70))
-                            .px_4()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(section_label)
-                            .when(self.session_search_index_loading, |this| {
-                                this.child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(Spinner::new().xsmall())
-                                        .child(strings.session_search_loading),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .w_full()
-                            .overflow_hidden()
-                            .child(result_list),
-                    ),
+                    .child(command),
             );
         // The overlay mounts once when opened — the one-shot entrance replays
         // only on a fresh open.
-        Some(motion::overlay_in("session-search-overlay-enter", search_overlay).into_any_element())
+        Some(motion::overlay_in("command-palette-overlay-enter", palette).into_any_element())
     }
 
     /// Toggle animation state for a docked right panel: the same width-clip
@@ -50761,6 +50824,7 @@ const FOUNDATION_SHORTCUTS: &[(&str, &str)] = &[
     ("open_settings", "cmd-,"),
     ("open_runtime_manager", "cmd-shift-o"),
     ("open_conversation_find", "cmd-f"),
+    ("open_command_palette", "cmd-k"),
     ("retry_runtime", "cmd-r"),
     ("save_active_file", "cmd-s"),
     ("goto_line_in_editor", "ctrl-g"),
@@ -50794,6 +50858,7 @@ fn shortcut_action_label(action: &str) -> &'static str {
         "open_settings" => "Open settings",
         "open_runtime_manager" => locale::text("Open runtimes", "打开运行时", "開啟執行階段"),
         "open_conversation_find" => "Find in conversation",
+        "open_command_palette" => locale::text("Search Vibex", "搜索 Vibex", "搜尋 Vibex"),
         "retry_runtime" => "Retry runtime",
         "save_active_file" => "Save active file",
         "goto_line_in_editor" => locale::text("Go to line in editor", "跳转到行", "跳轉到行"),
@@ -50811,7 +50876,7 @@ fn shortcut_action_group(action: &str) -> &'static str {
             "Workbench"
         }
         "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
-        "open_settings" | "open_conversation_find" => "Navigation",
+        "open_settings" | "open_conversation_find" | "open_command_palette" => "Navigation",
         "retry_runtime" => "Runtime",
         "save_active_file" | "goto_line_in_editor" => "Editor",
         "navigate_back" | "navigate_forward" => "Navigation",
@@ -51617,6 +51682,277 @@ fn settings_search_candidates_for_query(
         })
         .take(SETTINGS_SEARCH_RESULT_LIMIT)
         .collect()
+}
+
+/// The palette's label for a quick action.
+///
+/// The foundation actions already carry localized labels in
+/// [`shortcut_action_label`]; only the two the palette introduces on its own
+/// need wording here.
+fn command_palette_action_label(action: &'static str, strings: Strings) -> &'static str {
+    match action {
+        "new_session" => locale::text("New session", "新建会话", "新增工作階段"),
+        "pair_mobile_device" => strings.pair_mobile,
+        other => shortcut_action_label(other),
+    }
+}
+
+/// Extra search terms for a quick action, on top of its label.
+///
+/// The English action name is always included, so a user typing `rail` finds
+/// "Toggle right rail" even in a Chinese or Taiwanese locale where the label
+/// carries no Latin words.
+fn command_palette_action_keywords(action: &'static str) -> Vec<&'static str> {
+    let mut keywords = action.split('_').collect::<Vec<_>>();
+    keywords.push(match action {
+        "new_session" => "chat create",
+        "pair_mobile_device" => "phone qr link",
+        "open_settings" => "preferences",
+        "open_runtime_manager" => "provider model auth",
+        "open_conversation_find" => "find message",
+        "toggle_sidebar" => "rail projects",
+        "toggle_composer_mode" => "terminal shell",
+        "toggle_preview" => "browser web",
+        "toggle_right_rail" => "panel files git",
+        "navigate_back" => "history previous",
+        "navigate_forward" => "history next",
+        _ => "",
+    });
+    keywords
+}
+
+/// The `Action` a quick action row dispatches.
+///
+/// `None` means the action is not registered yet, which is a programming error
+/// rather than a state: the palette would then render a row that silently does
+/// nothing. The row is dropped instead.
+fn command_palette_action(action: &'static str) -> Option<Box<dyn gpui::Action>> {
+    Some(match action {
+        "new_session" => Box::new(NewSession),
+        "open_settings" => Box::new(OpenSettings),
+        "open_runtime_manager" => Box::new(OpenRuntimeManager),
+        "open_conversation_find" => Box::new(OpenConversationFind),
+        "toggle_sidebar" => Box::new(ToggleSidebar),
+        "toggle_composer_mode" => Box::new(ToggleComposerMode),
+        "toggle_preview" => Box::new(TogglePreview),
+        "toggle_right_rail" => Box::new(ToggleRightRail),
+        "navigate_back" => Box::new(NavigateBack),
+        "navigate_forward" => Box::new(NavigateForward),
+        "pair_mobile_device" => Box::new(PairMobileDevice),
+        _ => return None,
+    })
+}
+
+/// Whether a quick action can run right now.
+///
+/// The handlers already refuse when their precondition is unmet; a disabled row
+/// says so before the click instead of leaving the user with a command that
+/// silently did nothing.
+fn command_palette_action_enabled(action: &str, workbench: &VibexWorkbench) -> bool {
+    match action {
+        "new_session" => !workbench.agent_action_pending && workbench.sidebar_picker_task.is_none(),
+        // Find and terminal mode both act on the open conversation.
+        "open_conversation_find" | "toggle_composer_mode" => {
+            workbench.conversation_context_active()
+        }
+        "navigate_back" => workbench.navigation_history.can_go_back(),
+        "navigate_forward" => workbench.navigation_history.can_go_forward(),
+        _ => true,
+    }
+}
+
+/// The palette's leading glyph for a quick action.
+fn command_palette_action_icon(action: &'static str) -> Icon {
+    match action {
+        "new_session" => Icon::new(IconName::Plus),
+        "open_settings" => Icon::new(IconName::Settings),
+        "open_runtime_manager" => Icon::default().path(RUNTIME_MANAGER_ICON),
+        "open_conversation_find" => Icon::new(IconName::Search),
+        "toggle_sidebar" => Icon::new(IconName::PanelLeftClose),
+        "toggle_composer_mode" => Icon::new(IconName::SquareTerminal),
+        "toggle_preview" => Icon::new(IconName::Frame),
+        "toggle_right_rail" => Icon::new(IconName::PanelRightClose),
+        "navigate_back" => Icon::new(IconName::ArrowLeft),
+        "navigate_forward" => Icon::new(IconName::ArrowRight),
+        "pair_mobile_device" => Icon::new(IconName::Network),
+        _ => Icon::new(IconName::Asterisk),
+    }
+}
+
+/// Whether a quick action survives the palette's query.
+///
+/// The same rule the settings entries use: a case-insensitive substring over
+/// the label and every keyword, in either direction, so a short query still
+/// finds a longer term.
+fn command_palette_action_matches(action: &'static str, query: &str, strings: Strings) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    let mut terms = vec![command_palette_action_label(action, strings).to_lowercase()];
+    terms.extend(
+        command_palette_action_keywords(action)
+            .into_iter()
+            .filter(|keyword| !keyword.is_empty())
+            .map(str::to_lowercase),
+    );
+    terms
+        .iter()
+        .any(|term| term.contains(&query) || query.contains(term.as_str()))
+}
+
+/// The highlight a palette row paints over the part of its text that matched.
+fn palette_match_highlight(cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        background_color: Some(cx.theme().warning.opacity(0.42)),
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    }
+}
+
+/// One palette row.
+///
+/// A session or a settings entry draws its own two-line layout, because what a
+/// row is and where it lives is what the user is choosing between. A quick
+/// action keeps the component's single-line menu geometry, which is also what
+/// lets the row show the keybinding its Action resolves to.
+fn command_palette_row(
+    entry: &CommandPaletteEntry,
+    query: &str,
+    strings: Strings,
+    locale: locale::ResolvedLocale,
+) -> CommandItem {
+    match entry {
+        CommandPaletteEntry::Session(result) => {
+            let agent_id = result.agent_id.as_str().to_string();
+            let title = result.session_title.clone();
+            let detail = result
+                .excerpt
+                .clone()
+                .map(|excerpt| format!("{} · {excerpt}", result.project_name))
+                .unwrap_or_else(|| result.project_name.clone());
+            let timestamp = format_sidebar_session_time(result.last_message_at_ms, locale, strings);
+            let query = query.to_string();
+            CommandItem::new()
+                .label(title.clone())
+                .keywords([agent_id.clone(), result.project_name.clone()])
+                .child(move |_window, cx| {
+                    let highlight = palette_match_highlight(cx);
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(28.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.55))
+                                .child(agent_brand_icon(&agent_id, px(16.0), None)),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap(px(3.0))
+                                .child(div().min_w_0().truncate().text_sm().font_medium().child(
+                                    session_search_highlighted_text(
+                                        title.clone(),
+                                        &query,
+                                        highlight,
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(session_search_highlighted_text(
+                                            detail.clone(),
+                                            &query,
+                                            highlight,
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(timestamp.clone()),
+                        )
+                        .into_any_element()
+                })
+        }
+        CommandPaletteEntry::Setting(candidate) => {
+            let title = candidate.title;
+            let description = candidate.description;
+            let section = settings_section_label(candidate.section);
+            CommandItem::new()
+                .label(title)
+                .keywords([section, description])
+                .child(move |_window, cx| {
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(28.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.55))
+                                .child(Icon::new(IconName::Settings2).size(px(16.0))),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_medium()
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(section),
+                                ),
+                        )
+                        .into_any_element()
+                })
+        }
+        CommandPaletteEntry::Action(action, enabled) => {
+            let item = CommandItem::new()
+                .label(command_palette_action_label(action, strings))
+                .keywords(command_palette_action_keywords(action))
+                .icon(command_palette_action_icon(action))
+                .disabled(!enabled);
+            match command_palette_action(action) {
+                Some(dispatched) => item.action(dispatched),
+                // A curated entry without a registered Action would render a row
+                // that silently does nothing; leave it as an inert label rather
+                // than pretending it is a command.
+                None => item,
+            }
+        }
+    }
 }
 
 fn wrap_settings_search_selection(index: usize, delta: isize, count: usize) -> usize {
@@ -55939,7 +56275,7 @@ impl Render for VibexWorkbench {
             }
         };
         let floating_sidebar = self.render_floating_sidebar(visibility, window, cx);
-        let session_search_overlay = self.render_session_search_overlay(window, cx);
+        let command_palette_overlay = self.render_command_palette_overlay(window, cx);
         let inline_composer_attachments = self.render_inline_composer_attachments(cx);
         let suggestion_target = self
             .suggestion_context
@@ -56006,6 +56342,9 @@ impl Render for VibexWorkbench {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_runtime_manager))
             .on_action(cx.listener(Self::on_open_conversation_find))
+            .on_action(cx.listener(Self::on_open_command_palette))
+            .on_action(cx.listener(Self::on_new_session))
+            .on_action(cx.listener(Self::on_pair_mobile_device))
             .on_action(cx.listener(Self::on_retry_runtime))
             .on_action(cx.listener(Self::on_save_active_file))
             .on_action(cx.listener(Self::on_goto_line_in_editor))
@@ -56120,7 +56459,7 @@ impl Render for VibexWorkbench {
             .when_some(attachment_image_preview, |this, preview| {
                 this.child(preview)
             })
-            .when_some(session_search_overlay, |this, overlay| this.child(overlay))
+            .when_some(command_palette_overlay, |this, overlay| this.child(overlay))
             .when_some(runtime_add_dialog, |this, overlay| this.child(overlay))
             .when_some(startup_loading, |this, overlay| this.child(overlay))
     }
@@ -56176,6 +56515,9 @@ fn bind_action(bindings: &mut Vec<KeyBinding>, keystroke: &str, action: &str, un
         "open_conversation_find" | "vibex::OpenConversationFind" => {
             push!(OpenConversationFind, "vibex::OpenConversationFind")
         }
+        "open_command_palette" | "vibex::OpenCommandPalette" => {
+            push!(OpenCommandPalette, "vibex::OpenCommandPalette")
+        }
         "retry_runtime" | "vibex::RetryRuntime" => push!(RetryRuntime, "vibex::RetryRuntime"),
         "save_active_file" | "vibex::SaveActiveFile" => {
             push!(SaveActiveFile, "vibex::SaveActiveFile")
@@ -56202,6 +56544,7 @@ fn action_name(action: &str) -> &'static str {
         "open_settings" => "vibex::OpenSettings",
         "open_runtime_manager" => "vibex::OpenRuntimeManager",
         "open_conversation_find" => "vibex::OpenConversationFind",
+        "open_command_palette" => "vibex::OpenCommandPalette",
         "retry_runtime" => "vibex::RetryRuntime",
         "save_active_file" => "vibex::SaveActiveFile",
         "goto_line_in_editor" => "vibex::GoToLineInEditor",
@@ -58693,7 +59036,7 @@ mod tests {
     }
 
     #[test]
-    fn session_search_replaces_sidebar_input_with_modal_navigation() {
+    fn command_palette_replaces_the_sidebar_search_with_workbench_chrome() {
         let source = include_str!("app.rs");
         let sidebar = source
             .split_once("    fn render_agent_sidebar(")
@@ -58701,29 +59044,52 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar renderer should remain inspectable");
         assert!(!sidebar.contains("Input::new(&self.session_search)"));
-        let new_project = sidebar
-            .find("Button::new(\"sidebar-new-project\")")
-            .expect("new-project action should remain in the project toolbar");
-        let search = sidebar
-            .find("Button::new(\"sidebar-search-sessions\")")
-            .expect("search action should be in the project toolbar");
-        assert!(new_project < search);
+        // The palette searches sessions, settings, and actions, so its entry
+        // point sits in the title bar with the other workbench-wide controls
+        // rather than inside one project's toolbar.
+        assert!(!sidebar.contains("sidebar-search-sessions"));
+
+        let title_bar = source
+            .split_once("    fn render_title_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_title_session_menu("))
+            .map(|(body, _)| body)
+            .expect("title bar should remain inspectable");
+        let search = title_bar
+            .find("Button::new(\"open-command-palette\")")
+            .expect("the palette trigger should be in the title bar");
+        let runtime = title_bar
+            .find(".id(\"runtime-manager-hover\")")
+            .expect("the runtime control should be in the title bar");
+        assert!(
+            search < runtime,
+            "the palette trigger belongs immediately before the runtime control"
+        );
+        assert!(title_bar.contains("this.toggle_command_palette(window, cx)"));
 
         let overlay = source
-            .split_once("    fn render_session_search_overlay(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_shell("))
+            .split_once("    fn render_command_palette_overlay(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_docked_panel_animation("))
             .map(|(body, _)| body)
-            .expect("search overlay should remain inspectable");
+            .expect("palette overlay should remain inspectable");
+        assert!(overlay.contains("Command::new(&self.command_palette)"));
         assert!(overlay.contains(".absolute()"));
         assert!(overlay.contains(".inset_0()"));
-        assert!(overlay.contains("v_virtual_list("));
-        assert!(overlay.contains("Self::on_session_search_key_down"));
-        assert!(overlay.contains("activate_session_search_selection"));
-        assert!(overlay.contains("session_search_highlighted_text"));
-        assert!(overlay.contains("agent_brand_icon"));
+        assert!(overlay.contains("CommandGroup::new()"));
+        assert!(overlay.contains("skeleton_session_search(cx)"));
+        assert!(overlay.contains("strings.command_palette_hint"));
         assert!(!overlay.contains("count_label"));
         assert!(source.contains(".search_query(search_query)"));
         assert!(source.contains("MarkdownView::new("));
+
+        let rows = source
+            .split_once("fn command_palette_row(")
+            .and_then(|(_, tail)| tail.split_once("\nfn wrap_settings_search_selection("))
+            .map(|(body, _)| body)
+            .expect("palette row builder should remain inspectable");
+        assert!(rows.contains("session_search_highlighted_text"));
+        assert!(rows.contains("agent_brand_icon"));
+        assert!(rows.contains("settings_section_label"));
+        assert!(rows.contains("command_palette_action(action)"));
 
         let workbench_render = source
             .split_once("impl Render for VibexWorkbench")
@@ -67636,11 +68002,12 @@ mod tests {
         let create = sidebar
             .find("Button::new(\"sidebar-new-project\")")
             .expect("project creation control should exist");
-        let search = sidebar
-            .find("Button::new(\"sidebar-search-sessions\")")
-            .expect("search control should exist");
 
-        assert!(more < collapse && collapse < locate && locate < create && create < search);
+        assert!(more < collapse && collapse < locate && locate < create);
+        // The palette replaced the sidebar's session search: it searches far
+        // more than sessions now, so it belongs to the workbench chrome rather
+        // than to one project toolbar.
+        assert!(!sidebar.contains("sidebar-search-sessions"));
         assert!(!sidebar.contains("Button::new(\"sidebar-new-folder\")"));
         assert!(!sidebar.contains("Button::new(\"sidebar-toggle-hierarchy\")"));
         assert!(!sidebar.contains("Button::new(\"sidebar-toggle-batch\")"));
@@ -71208,25 +71575,28 @@ mod tests {
     }
 
     #[test]
-    fn closing_session_search_keeps_the_full_text_index_warm() {
+    fn closing_the_palette_keeps_the_full_text_index_warm() {
         let source = include_str!("app.rs");
         let close = source
-            .split_once("    fn close_session_search(")
+            .split_once("    fn close_command_palette(")
             .and_then(|(_, tail)| tail.split_once("\n    fn clear_session_search_highlight("))
             .map(|(body, _)| body)
-            .expect("session search close handler should remain inspectable");
+            .expect("palette close handler should remain inspectable");
 
         assert!(close.contains("self.session_search_generation"));
         assert!(close.contains("self.session_search_index_task = None;"));
         // Building the index reads every session's full timeline — tens of
-        // seconds of CPU for a large history — so closing the dialog releases
+        // seconds of CPU for a large history — so closing the palette releases
         // the in-flight work but not the documents.
         assert!(!close.contains("self.session_search_index.clear();"));
         assert!(close.contains("self.session_search_scan_task = None;"));
+        // An action confirmed from the palette may have opened a dialog that now
+        // owns focus.
+        assert!(close.contains("window.has_active_dialog(cx)"));
     }
 
     #[test]
-    fn reopening_session_search_refreshes_only_changed_sessions() {
+    fn reopening_the_palette_refreshes_only_changed_sessions() {
         let source = include_str!("app.rs");
         let refresh = source
             .split_once("    fn refresh_session_search_index(")
@@ -71242,18 +71612,81 @@ mod tests {
     }
 
     #[test]
-    fn session_search_overlay_renders_the_cached_scan() {
+    fn command_palette_renders_the_cached_scan() {
         let source = include_str!("app.rs");
         let overlay = source
-            .split_once("    fn render_session_search_overlay(")
+            .split_once("    fn render_command_palette_overlay(")
             .and_then(|(_, tail)| tail.split_once("\n    fn update_docked_panel_animation("))
             .map(|(body, _)| body)
-            .expect("session search overlay should remain inspectable");
+            .expect("command palette overlay should remain inspectable");
 
         // The scan walks every indexed document, so running it in `render`
-        // pinned the workbench at single-digit fps while the dialog was open.
+        // pinned the workbench at single-digit fps while the palette was open.
         assert!(!overlay.contains("session_search_results(cx)"));
         assert!(overlay.contains("self.session_search_results.clone()"));
+        // The component cannot see message text, so the workbench answers the
+        // query and the palette only presents what it is handed.
+        assert!(overlay.contains(".filterable(false)"));
+        assert!(overlay.contains(".on_query("));
+        assert!(overlay.contains(".on_confirm("));
+        assert!(overlay.contains(".on_cancel("));
+    }
+
+    #[test]
+    fn palette_rows_are_addressed_by_the_group_order_they_are_built_in() {
+        let source = include_str!("app.rs");
+        let sections = source
+            .split_once("    fn command_palette_sections(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_command_palette_overlay("))
+            .map(|(body, _)| body)
+            .expect("palette section builder should remain inspectable");
+        let confirm = source
+            .split_once("    fn on_command_palette_confirm(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activate_command_palette_session("))
+            .map(|(body, _)| body)
+            .expect("palette confirm handler should remain inspectable");
+
+        // Sessions, then settings, then actions: the order the builder pushes
+        // the groups is the order `IndexPath::section` indexes them by, and the
+        // confirm handler has to resolve a row through the same list.
+        let sessions = sections
+            .find("strings.command_palette_recent")
+            .expect("recent sessions group should exist");
+        let settings = sections
+            .find("strings.command_palette_settings")
+            .expect("settings group should exist");
+        let actions = sections
+            .find("strings.command_palette_actions")
+            .expect("quick actions group should exist");
+        assert!(sessions < settings && settings < actions);
+        assert!(confirm.contains("self.command_palette_sections(&query, strings)"));
+        // A row the workbench cannot run yet is disabled rather than silently
+        // inert: the enabled flag travels with the entry, not with the render.
+        assert!(sections.contains("command_palette_action_enabled(action, self)"));
+        assert!(source.contains(".disabled(!enabled)"));
+        assert!(confirm.contains("sections"));
+        assert!(confirm.contains(".entries.get(index.row)"));
+
+        // Every curated action must resolve to a real Action, or the row would
+        // render a command that silently does nothing.
+        for action in [
+            "new_session",
+            "open_settings",
+            "open_runtime_manager",
+            "open_conversation_find",
+            "toggle_sidebar",
+            "toggle_composer_mode",
+            "toggle_preview",
+            "toggle_right_rail",
+            "navigate_back",
+            "navigate_forward",
+            "pair_mobile_device",
+        ] {
+            assert!(
+                source.contains(&format!("\"{action}\" => Box::new(")),
+                "{action} is offered by the palette but dispatches nothing"
+            );
+        }
     }
 
     struct ReasoningFirstLineProbe {

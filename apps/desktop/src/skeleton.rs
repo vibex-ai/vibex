@@ -36,7 +36,9 @@ mod tests {
     #[test]
     fn placeholders_are_gated_on_an_empty_first_load() {
         let app = include_str!("app.rs");
-        assert!(app.contains("results.is_empty() && self.session_search_index_loading"));
+        // The command palette's session group indexes in the background; the
+        // placeholder stands in only while there is nothing to show yet.
+        assert!(app.contains("results.is_empty() && index_loading"));
         assert!(app.contains("skeleton_conversation(content_max_width, strings, cx)"));
         assert!(app.contains("if self.agent_loading {"));
         assert!(app.contains("loading && rows.is_empty()"));
