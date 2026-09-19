@@ -3599,6 +3599,89 @@ fn mark_agent_session_read(
     unread_session_ids.remove(session_id.as_str())
 }
 
+/// Tracks the approval and input requests a session is still waiting on.
+///
+/// The request timeline item arrives while the provider turn is still open, so
+/// it is the earliest reliable signal that the Agent stopped working and needs
+/// the user. Resolutions arrive as their own items; a session leaves the index
+/// only once every request it was asked has been answered.
+fn update_pending_user_requests(
+    pending: &mut BTreeMap<String, BTreeSet<String>>,
+    events: &[TimelineLiveEvent],
+) -> bool {
+    let mut changed = false;
+    for event in events {
+        if !timeline_live_event_is_well_formed(event) {
+            continue;
+        }
+        let session_id = event.session_id.as_str();
+        match &event.item.payload {
+            TimelinePayload::PermissionRequest(request)
+                if request.status == vibex_core::PermissionRequestStatus::Pending =>
+            {
+                changed |= pending
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .insert(request.id.to_string());
+            }
+            TimelinePayload::ElicitationRequest(request)
+                if request.status == vibex_core::ElicitationRequestStatus::Pending =>
+            {
+                changed |= pending
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .insert(request.id.to_string());
+            }
+            TimelinePayload::PermissionResolution(resolution) => {
+                changed |= resolve_pending_user_request(
+                    pending,
+                    session_id,
+                    resolution.request_id.as_str(),
+                );
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
+                changed |= resolve_pending_user_request(
+                    pending,
+                    session_id,
+                    resolution.request_id.as_str(),
+                );
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn resolve_pending_user_request(
+    pending: &mut BTreeMap<String, BTreeSet<String>>,
+    session_id: &str,
+    request_id: &str,
+) -> bool {
+    let Some(requests) = pending.get_mut(session_id) else {
+        return false;
+    };
+    let removed = requests.remove(request_id);
+    if requests.is_empty() {
+        pending.remove(session_id);
+    }
+    removed
+}
+
+/// Replaces one session's entry from an authoritative timeline, so a lagged
+/// stream cannot leave a resolved request looking unanswered.
+fn reset_pending_user_requests(
+    pending: &mut BTreeMap<String, BTreeSet<String>>,
+    session_id: &VibexSessionId,
+    items: &[TimelineItem],
+) {
+    let requests = vibex_desktop_model::pending_permission_ids(items);
+    if requests.is_empty() {
+        pending.remove(session_id.as_str());
+    } else {
+        pending.insert(session_id.as_str().to_string(), requests);
+    }
+}
+
 fn record_timeline_row_endpoint(item_ids: &mut Vec<String>, item_id: String) {
     match item_ids.len() {
         0 => item_ids.push(item_id),
@@ -6060,6 +6143,14 @@ pub struct VibexWorkbench {
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
     unread_agent_completion_session_ids: BTreeSet<String>,
+    /// Session ids with an unresolved approval or input request, mapped to the
+    /// request ids still waiting for an answer.
+    ///
+    /// A provider turn stays open while it waits for the user, so the session
+    /// state still reads `Running` until the turn ends. The sidebar follows the
+    /// requests themselves, so a session the Agent parked on the user never
+    /// looks like it is still making progress.
+    pending_user_request_ids: BTreeMap<String, BTreeSet<String>>,
     notification_suppressed_session_ids: BTreeSet<String>,
     agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
@@ -6940,6 +7031,7 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
+            pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
             agent_turn_pending: false,
             auto_continue_default_project_ids,
@@ -14243,6 +14335,11 @@ impl VibexWorkbench {
                                 this.invalidate_agent_generation_output_estimate();
                                 this.invalidate_agent_generation_compaction_count();
                             }
+                            reset_pending_user_requests(
+                                &mut this.pending_user_request_ids,
+                                &session_id,
+                                &items,
+                            );
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
                             this.reconcile_optimistic_user_message();
@@ -14303,6 +14400,11 @@ impl VibexWorkbench {
                                 this.invalidate_agent_generation_output_estimate();
                                 this.invalidate_agent_generation_compaction_count();
                             }
+                            reset_pending_user_requests(
+                                &mut this.pending_user_request_ids,
+                                &session_id,
+                                &items,
+                            );
                             this.timeline
                                 .replace_authoritative(session_id.clone(), items);
                             this.reconcile_optimistic_user_message();
@@ -14978,6 +15080,12 @@ impl VibexWorkbench {
             self.selected_session_id.as_ref(),
             &events,
         );
+        // The pending-request index feeds the sidebar rows directly, so it only
+        // needs a repaint and an invalidation broadcast, not a projection
+        // rebuild.
+        if update_pending_user_requests(&mut self.pending_user_request_ids, &events) {
+            sidebar_changed = true;
+        }
         if sidebar_changed || unread_changed {
             self.publish_sidebar_invalidation();
         }
@@ -24611,6 +24719,8 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.unread_agent_completion_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
+        self.pending_user_request_ids
+            .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_search_index
             .retain(|session_id, _| !session_ids.contains(session_id));
         if self
@@ -31501,11 +31611,22 @@ impl VibexWorkbench {
                         && session.workspace_root == workspace.root_path
                         && session.workspace_mode == workspace.mode))
         });
+        let awaiting_user = self.sessions.iter().any(|session| {
+            session.deleted_at_ms.is_none()
+                && self
+                    .pending_user_request_ids
+                    .contains_key(session.id.as_str())
+                && (session.workspace_id == workspace.id
+                    || (session.project_id == workspace.project_id
+                        && session.workspace_root == workspace.root_path
+                        && session.workspace_mode == workspace.mode))
+        });
         let workspace_status = sidebar_workspace_status(
             projection.agent_summary,
             lifecycle_running,
             lifecycle_error,
             has_unread_completion,
+            awaiting_user,
         );
         let status_indicator = match workspace_status {
             SidebarWorkspaceStatus::Running => Spinner::new()
@@ -31514,7 +31635,7 @@ impl VibexWorkbench {
                 .xsmall()
                 .into_any_element(),
             SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
-            SidebarWorkspaceStatus::NeedsInput => sidebar_status_dot(cx.theme().warning),
+            SidebarWorkspaceStatus::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
             SidebarWorkspaceStatus::UnreadCompletion => sidebar_status_dot(cx.theme().success),
             SidebarWorkspaceStatus::Complete => {
                 sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
@@ -31885,8 +32006,18 @@ impl VibexWorkbench {
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Session(session.id.clone()));
         let session_id_string = session.id.as_str().to_string();
-        let display_state =
-            sidebar_session_display_state(session.state, self.session_turn_pending(&session.id));
+        // An unanswered approval or input request outranks both the optimistic
+        // local dispatch and the still-open provider turn: the Agent is parked
+        // on the user, so the row must ask for the answer instead of spinning.
+        let session_awaiting_user = session.state == AgentSessionState::NeedsInput
+            || self
+                .pending_user_request_ids
+                .contains_key(session_id_string.as_str());
+        let display_state = if session_awaiting_user {
+            AgentSessionState::NeedsInput
+        } else {
+            sidebar_session_display_state(session.state, self.session_turn_pending(&session.id))
+        };
         let session_item = SidebarOrganizationItem::Session(session_id_string.clone());
         let move_selected = self.sidebar_move_selected_items.contains(&session_item);
         let drag_session_ids = self
@@ -32077,7 +32208,6 @@ impl VibexWorkbench {
             strings.sidebar_pin
         };
         let session_generating = display_state == AgentSessionState::Running;
-        let session_needs_approval = display_state == AgentSessionState::NeedsInput;
         let session_has_error = display_state == AgentSessionState::Error;
         let has_unread_completion = !selected
             && self
@@ -32498,7 +32628,7 @@ impl VibexWorkbench {
                             })
                             .when(
                                 !pinned
-                                    && !session_needs_approval
+                                    && !session_awaiting_user
                                     && !has_unread_completion
                                     && !session_has_error
                                     && display_state != AgentSessionState::Idle,
@@ -32510,28 +32640,15 @@ impl VibexWorkbench {
                                     ))
                                 },
                             )
-                            .when(!pinned && session_needs_approval, |this| {
-                                this.child(
-                                    div()
-                                        .id(format!("sidebar-session-approval-{session_id_string}"))
-                                        .size(px(16.0))
-                                        .flex()
-                                        .flex_none()
-                                        .items_center()
-                                        .justify_center()
-                                        .tooltip(|window, cx| {
-                                            Tooltip::new("Command approval required")
-                                                .build(window, cx)
-                                        })
-                                        .child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .size(px(14.0))
-                                                .text_color(cx.theme().warning),
-                                        ),
-                                )
+                            .when(!pinned && session_awaiting_user, |this| {
+                                this.child(sidebar_attention_icon(
+                                    format!("sidebar-session-attention-{session_id_string}"),
+                                    strings.sidebar_needs_input,
+                                    cx,
+                                ))
                             })
                             .when(
-                                !pinned && !session_needs_approval && !session_generating,
+                                !pinned && !session_awaiting_user && !session_generating,
                                 |this| {
                                     this.when_some(state_label, |this, label| {
                                         this.child(
@@ -51544,6 +51661,31 @@ fn sidebar_status_dot(color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+/// The call to action for a session the Agent parked on the user.
+///
+/// An approval or input request is not progress: a spinner would claim the
+/// Agent is still working and a bare dot disappears among the other status
+/// dots, so this state gets a glyph that reads as "answer me".
+fn sidebar_attention_glyph(cx: &App) -> Icon {
+    sidebar_icon("icons/vibex/circle-question-mark.svg")
+        .size(px(14.0))
+        .flex_none()
+        .text_color(cx.theme().warning)
+}
+
+fn sidebar_attention_icon(id: String, tooltip: &'static str, cx: &App) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(16.0))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .child(sidebar_attention_glyph(cx))
+        .into_any_element()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarWorkspaceStatus {
     Running,
@@ -51558,13 +51700,17 @@ fn sidebar_workspace_status(
     lifecycle_running: bool,
     lifecycle_error: bool,
     has_unread_completion: bool,
+    awaiting_user: bool,
 ) -> SidebarWorkspaceStatus {
-    if summary.running > 0 || lifecycle_running {
+    // A workspace holding a session that cannot move without the user is more
+    // actionable than one that is merely busy, so the call to action wins over
+    // the progress spinner.
+    if awaiting_user || summary.needs_input > 0 {
+        SidebarWorkspaceStatus::NeedsInput
+    } else if summary.running > 0 || lifecycle_running {
         SidebarWorkspaceStatus::Running
     } else if lifecycle_error || summary.failed > 0 {
         SidebarWorkspaceStatus::Error
-    } else if summary.needs_input > 0 {
-        SidebarWorkspaceStatus::NeedsInput
     } else if has_unread_completion {
         SidebarWorkspaceStatus::UnreadCompletion
     } else {
@@ -51587,7 +51733,7 @@ fn sidebar_session_status_indicator(
             })
             .xsmall()
             .into_any_element(),
-        AgentSessionState::NeedsInput => sidebar_status_dot(cx.theme().warning),
+        AgentSessionState::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
         AgentSessionState::Error => sidebar_status_dot(cx.theme().danger),
         AgentSessionState::Archived | AgentSessionState::Closed => {
             sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.35))
@@ -51596,11 +51742,22 @@ fn sidebar_session_status_indicator(
     }
 }
 
+/// Projects the state a sidebar row shows.
+///
+/// A locally dispatched turn is optimistic, so the row may show progress before
+/// the authority reports `Running`. That optimism must not hide a session the
+/// authority already parked on the user: the Agent is not working, it is
+/// waiting for an answer.
 fn sidebar_session_display_state(
     persisted_state: AgentSessionState,
     locally_pending: bool,
 ) -> AgentSessionState {
-    if locally_pending {
+    if locally_pending
+        && !matches!(
+            persisted_state,
+            AgentSessionState::NeedsInput | AgentSessionState::Error
+        )
+    {
         AgentSessionState::Running
     } else {
         persisted_state
@@ -59970,14 +60127,128 @@ mod tests {
     }
 
     #[test]
+    fn pending_user_requests_clear_only_when_the_session_answers_every_request() {
+        let session_id = VibexSessionId::new();
+        let first_request_id = RequestId::new();
+        let second_request_id = RequestId::new();
+        let request_event = |request_id: &RequestId, sequence: i64| TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence,
+            item: timeline_item_with_payload(
+                &session_id,
+                sequence,
+                TimelineSource::Provider,
+                TimelinePayload::ElicitationRequest(vibex_core::ElicitationRequest {
+                    id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    provider_request_id: None,
+                    tool_call_id: None,
+                    message: "Which environment?".into(),
+                    title: None,
+                    description: None,
+                    fields: Vec::new(),
+                    status: vibex_core::ElicitationRequestStatus::Pending,
+                    requested_at_ms: sequence,
+                }),
+            ),
+        };
+        let resolution_event = |request_id: &RequestId, sequence: i64| TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence,
+            item: timeline_item_with_payload(
+                &session_id,
+                sequence,
+                TimelineSource::User,
+                TimelinePayload::ElicitationResolution(vibex_core::ElicitationResolution {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    action: ElicitationResolutionAction::Accept,
+                    answers: BTreeMap::new(),
+                    responder_device_id: None,
+                    resolved_at_ms: sequence,
+                }),
+            ),
+        };
+        let mut pending = BTreeMap::new();
+
+        assert!(update_pending_user_requests(
+            &mut pending,
+            &[
+                request_event(&first_request_id, 1),
+                request_event(&second_request_id, 2)
+            ]
+        ));
+        assert_eq!(pending.get(session_id.as_str()).map(BTreeSet::len), Some(2));
+        assert!(!update_pending_user_requests(
+            &mut pending,
+            &[request_event(&second_request_id, 2)]
+        ));
+        assert!(update_pending_user_requests(
+            &mut pending,
+            &[resolution_event(&first_request_id, 3)]
+        ));
+        assert_eq!(pending.get(session_id.as_str()).map(BTreeSet::len), Some(1));
+        assert!(update_pending_user_requests(
+            &mut pending,
+            &[resolution_event(&second_request_id, 4)]
+        ));
+        assert!(pending.is_empty());
+        assert!(!update_pending_user_requests(
+            &mut pending,
+            &[resolution_event(&second_request_id, 4)]
+        ));
+    }
+
+    #[test]
+    fn authoritative_timeline_reset_drops_requests_that_were_answered_while_lagged() {
+        let session_id = VibexSessionId::new();
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            session_id.as_str().to_string(),
+            BTreeSet::from(["request_stale".to_string()]),
+        );
+
+        reset_pending_user_requests(&mut pending, &session_id, &[]);
+        assert!(pending.is_empty());
+
+        let request = vibex_core::PermissionRequest {
+            id: RequestId::new(),
+            session_id: session_id.clone(),
+            project_id: None,
+            workspace_id: None,
+            provider_request_id: None,
+            risk_category: vibex_core::PermissionRiskCategory::Command,
+            title: "execute".into(),
+            details: Vec::new(),
+            allowed_responses: vec![PermissionResponseKind::Approve],
+            response_options: Vec::new(),
+            status: vibex_core::PermissionRequestStatus::Pending,
+            requested_at_ms: 1,
+            expires_at_ms: None,
+        };
+        let request_id = request.id.clone();
+        let item = timeline_item_with_payload(
+            &session_id,
+            1,
+            TimelineSource::Provider,
+            TimelinePayload::PermissionRequest(request),
+        );
+        reset_pending_user_requests(&mut pending, &session_id, std::slice::from_ref(&item));
+        assert_eq!(
+            pending.get(session_id.as_str()),
+            Some(&BTreeSet::from([request_id.to_string()]))
+        );
+    }
+
+    #[test]
     fn workspace_status_prioritizes_running_errors_and_unread_completions() {
         let complete = vibex_desktop_model::WorkspaceAgentSummary::default();
         assert_eq!(
-            sidebar_workspace_status(complete, false, false, false),
+            sidebar_workspace_status(complete, false, false, false, false),
             SidebarWorkspaceStatus::Complete
         );
         assert_eq!(
-            sidebar_workspace_status(complete, false, false, true),
+            sidebar_workspace_status(complete, false, false, true, false),
             SidebarWorkspaceStatus::UnreadCompletion
         );
         assert_eq!(
@@ -59989,6 +60260,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
             ),
             SidebarWorkspaceStatus::NeedsInput
         );
@@ -60001,6 +60273,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
             ),
             SidebarWorkspaceStatus::Error
         );
@@ -60013,12 +60286,32 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
             ),
             SidebarWorkspaceStatus::Running
         );
         assert_eq!(
-            sidebar_workspace_status(complete, true, true, true),
+            sidebar_workspace_status(complete, true, true, true, false),
             SidebarWorkspaceStatus::Running
+        );
+        // A live approval or input request is a call to action, so it outranks
+        // the progress spinner the summary still reports for the open turn.
+        assert_eq!(
+            sidebar_workspace_status(
+                vibex_desktop_model::WorkspaceAgentSummary {
+                    running: 1,
+                    ..complete
+                },
+                false,
+                false,
+                false,
+                true,
+            ),
+            SidebarWorkspaceStatus::NeedsInput
+        );
+        assert_eq!(
+            sidebar_workspace_status(complete, true, true, false, true),
+            SidebarWorkspaceStatus::NeedsInput
         );
     }
 
@@ -65456,6 +65749,17 @@ mod tests {
             sidebar_session_display_state(AgentSessionState::Running, false),
             AgentSessionState::Running
         );
+        // An optimistic local turn must not cover a session that is already
+        // parked on the user, or the row would spin while waiting for an
+        // answer that only the user can give.
+        assert_eq!(
+            sidebar_session_display_state(AgentSessionState::NeedsInput, true),
+            AgentSessionState::NeedsInput
+        );
+        assert_eq!(
+            sidebar_session_display_state(AgentSessionState::Error, true),
+            AgentSessionState::Error
+        );
     }
 
     #[test]
@@ -65596,10 +65900,10 @@ mod tests {
         assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                                        display_state,\n                                        auto_continue_enabled,\n                                        cx,\n                                    )"));
         assert!(source.contains(".color(if auto_continue_enabled {"));
         assert!(source.contains("cx.theme().success"));
-        assert!(sidebar_session.contains("!session_needs_approval"));
+        assert!(sidebar_session.contains("!session_awaiting_user"));
         assert!(sidebar_session.contains("!has_unread_completion"));
         assert!(sidebar_session.contains("display_state != AgentSessionState::Idle"));
-        assert!(sidebar_session.contains("!session_needs_approval && !session_generating"));
+        assert!(sidebar_session.contains("!session_awaiting_user && !session_generating"));
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
         assert!(sidebar_session.contains(".icon(if pinned {"));
@@ -65607,7 +65911,9 @@ mod tests {
             "div()\n                                        .group_hover(&hover_group, |style| style.invisible())"
         ));
         assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode && !pinned, |this|"));
-        assert!(sidebar_session.contains("Icon::new(IconName::TriangleAlert)"));
+        assert!(sidebar_session.contains("sidebar_attention_icon("));
+        assert!(sidebar_session.contains("strings.sidebar_needs_input"));
+        assert!(!sidebar_session.contains("Icon::new(IconName::LoaderCircle)"));
         assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
         assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
         assert!(sidebar_session.contains("&& !session_has_error\n                                    && display_state != AgentSessionState::Idle"));

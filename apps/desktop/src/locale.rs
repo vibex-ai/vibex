@@ -195,6 +195,9 @@ pub struct Strings {
     pub sidebar_confirm_delete_session: &'static str,
     pub sidebar_confirm_delete_project: &'static str,
     pub sidebar_state_pending: &'static str,
+    /// Tooltip for the sidebar marker that tells the user the Agent is waiting
+    /// on an approval or an answer.
+    pub sidebar_needs_input: &'static str,
     pub sidebar_state_initializing: &'static str,
     pub sidebar_state_error: &'static str,
     pub sidebar_state_archived: &'static str,
@@ -384,6 +387,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             sidebar_confirm_delete_session: "Delete session?",
             sidebar_confirm_delete_project: "Delete project?",
             sidebar_state_pending: "PENDING",
+            sidebar_needs_input: "Waiting for your approval or input",
             sidebar_state_initializing: "INIT",
             sidebar_state_error: "ERROR",
             sidebar_state_archived: "ARCHIVED",
@@ -557,6 +561,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             sidebar_confirm_delete_session: "删除会话？",
             sidebar_confirm_delete_project: "删除项目？",
             sidebar_state_pending: "待处理",
+            sidebar_needs_input: "等待你的确认或输入",
             sidebar_state_initializing: "初始化",
             sidebar_state_error: "错误",
             sidebar_state_archived: "已归档",
@@ -730,6 +735,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             sidebar_confirm_delete_session: "刪除會話？",
             sidebar_confirm_delete_project: "刪除專案？",
             sidebar_state_pending: "待處理",
+            sidebar_needs_input: "等待你的確認或輸入",
             sidebar_state_initializing: "初始化",
             sidebar_state_error: "錯誤",
             sidebar_state_archived: "已封存",

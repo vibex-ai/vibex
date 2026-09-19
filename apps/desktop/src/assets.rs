@@ -197,6 +197,13 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/circle-question-mark.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/circle-question-mark.svg"
+        )),
+    ),
+    (
         "icons/vibex/sparkles.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
