@@ -5743,8 +5743,8 @@ pub struct VibexWorkbench {
     /// mutually exclusive so the workbench never draws a second panel.
     preview_window: Option<AnyWindowHandle>,
     /// Hands the panel back when the detached window closes for a reason the
-    /// workbench did not initiate.
-    preview_window_closed_subscription: Option<Subscription>,
+    /// workbench did not initiate. Held only to keep the observer installed.
+    _preview_window_closed_subscription: Option<Subscription>,
     /// The workbench window itself, so docking the panel back can raise it.
     window_handle: Option<AnyWindowHandle>,
     code_preview_visible: bool,
@@ -6660,7 +6660,7 @@ impl VibexWorkbench {
             code_workbench,
             preview_fullscreen_active: false,
             preview_window: None,
-            preview_window_closed_subscription: Some(preview_window_closed_subscription),
+            _preview_window_closed_subscription: Some(preview_window_closed_subscription),
             window_handle,
             code_preview_visible: false,
             code_files_surface_visible: false,
