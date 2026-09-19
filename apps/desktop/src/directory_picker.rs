@@ -140,7 +140,6 @@ struct PickerText {
     loading: &'static str,
     empty: &'static str,
     no_matches: &'static str,
-    hint: &'static str,
 }
 
 fn text(locale: ResolvedLocale) -> PickerText {
@@ -160,7 +159,6 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "Loading…",
             empty: "No folders here",
             no_matches: "No folders match",
-            hint: "↑↓ Navigate · Enter Open · ⌘Enter Choose here · ⌘D Star",
         },
         ResolvedLocale::ZhCn => PickerText {
             search_placeholder: "筛选文件夹，或输入路径后按 Enter",
@@ -177,7 +175,6 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "正在加载…",
             empty: "这里没有文件夹",
             no_matches: "没有匹配的文件夹",
-            hint: "↑↓ 选择 · Enter 打开 · ⌘Enter 选定当前目录 · ⌘D 收藏",
         },
         ResolvedLocale::ZhTw => PickerText {
             search_placeholder: "篩選資料夾，或輸入路徑後按 Enter",
@@ -194,7 +191,6 @@ fn text(locale: ResolvedLocale) -> PickerText {
             loading: "載入中…",
             empty: "這裡沒有資料夾",
             no_matches: "沒有符合的資料夾",
-            hint: "↑↓ 選擇 · Enter 開啟 · ⌘Enter 選定目前目錄 · ⌘D 收藏",
         },
     }
 }
@@ -527,7 +523,6 @@ impl DirectoryPickerDialog {
         let strings = text(self.locale());
         let is_dark = cx.theme().is_dark();
         let foreground = crate::theme::semantic_color("popover-foreground", is_dark);
-        let muted = crate::theme::semantic_color("muted-foreground", is_dark);
         let primary = cx.theme().primary;
         let selected_label = self
             .selected
@@ -559,13 +554,6 @@ impl DirectoryPickerDialog {
                             .text_color(foreground.opacity(0.75))
                             .child(selected_label),
                     ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(muted.opacity(0.7))
-                    .child(strings.hint),
             )
             .child(
                 h_flex()
