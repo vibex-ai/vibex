@@ -588,6 +588,8 @@ const COMPOSER_QUEUE_HORIZONTAL_INSET: f32 = 20.0;
 const COMPOSER_QUEUE_EDIT_ROW_HEIGHT: f32 = 38.0;
 const COMPOSER_QUEUE_HEADER_HEIGHT: f32 = 36.0;
 const COMPOSER_QUEUE_ROW_HEIGHT: f32 = 28.0;
+/// Height of the goal row that rides the composer extension surface.
+const COMPOSER_GOAL_BAR_HEIGHT: f32 = 40.0;
 /// Queued messages show at most this many lines outside of edit mode so a long
 /// message cannot push the queue over the rest of the interface.
 const COMPOSER_QUEUE_PREVIEW_MAX_LINES: usize = 3;
@@ -5927,6 +5929,7 @@ pub struct VibexWorkbench {
     sidebar_rename_input: Entity<InputState>,
     user_message_edit_input: Entity<TextareaState>,
     composer_queue_edit_input: Entity<TextareaState>,
+    composer_goal_edit_input: Entity<TextareaState>,
     composer_input: Entity<TextareaState>,
     image_editor_text_input: Entity<TextareaState>,
     composer_input_session_id: Option<VibexSessionId>,
@@ -6119,6 +6122,8 @@ pub struct VibexWorkbench {
     composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
     composer_queue_edit_geometry: ComposerGeometry,
     composer_queue_drop_target: Option<ComposerQueueDropTarget>,
+    /// Goal objective being edited inline in the composer goal bar.
+    composer_goal_editing: bool,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
     attachment_image_preview: Option<AttachmentImagePreviewState>,
@@ -6345,6 +6350,12 @@ impl VibexWorkbench {
                 .auto_grow(2, 6)
                 .submit_on_enter(true)
         });
+        let composer_goal_edit_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(locale::text("Goal objective", "目标内容", "目標內容"))
+                .auto_grow(1, 4)
+                .submit_on_enter(true)
+        });
         let composer_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 8)
@@ -6455,6 +6466,17 @@ impl VibexWorkbench {
                     InputEvent::PressEnter { shift: false, .. } => {
                         this.save_composer_queue_edit(cx)
                     }
+                    InputEvent::Change
+                    | InputEvent::Focus
+                    | InputEvent::Blur
+                    | InputEvent::PressEnter { shift: true, .. } => cx.notify(),
+                },
+            ),
+            cx.subscribe_in(
+                &composer_goal_edit_input,
+                window,
+                |this, _, event, _, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => this.save_composer_goal_edit(cx),
                     InputEvent::Change
                     | InputEvent::Focus
                     | InputEvent::Blur
@@ -6828,6 +6850,7 @@ impl VibexWorkbench {
             sidebar_rename_input,
             user_message_edit_input,
             composer_queue_edit_input,
+            composer_goal_edit_input,
             composer_input,
             image_editor_text_input,
             composer_input_session_id: selected_session_id.clone(),
@@ -7007,6 +7030,7 @@ impl VibexWorkbench {
             composer_queue_edit_attachments: Vec::new(),
             composer_queue_edit_geometry: ComposerGeometry::default(),
             composer_queue_drop_target: None,
+            composer_goal_editing: false,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
             attachment_image_preview: None,
@@ -14078,6 +14102,10 @@ impl VibexWorkbench {
             return;
         }
         let navigation_changed = self.selected_session_id.as_ref() != Some(&session_id);
+        if navigation_changed {
+            // The inline goal editor belongs to the session it was opened on.
+            self.composer_goal_editing = false;
+        }
         let runtime_initializing = self
             .sessions
             .iter()
@@ -18003,6 +18031,64 @@ impl VibexWorkbench {
             input.focus(window, cx);
         });
         cx.notify();
+    }
+
+    /// Opens the inline goal editor seeded with the live objective.
+    ///
+    /// Editing stays inside the goal bar: the composer keeps whatever draft the
+    /// user was writing, and saving issues a goal control instead of a prompt.
+    fn begin_composer_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = current_active_goal(&self.timeline.items) else {
+            return;
+        };
+        let objective = active.goal.objective.clone();
+        self.composer_goal_editing = true;
+        self.composer_goal_edit_input.update(cx, |input, cx| {
+            input.set_value(objective, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn cancel_composer_goal_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.composer_goal_editing {
+            return;
+        }
+        self.composer_goal_editing = false;
+        cx.notify();
+    }
+
+    /// Applies the edited objective through the goal control surface.
+    ///
+    /// `set` re-objectives the goal on the neutral surface; adapters that spell
+    /// it `edit` are honored when they advertise only that verb.
+    fn save_composer_goal_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.composer_goal_editing {
+            return;
+        }
+        let objective = self
+            .composer_goal_edit_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if objective.is_empty() {
+            return;
+        }
+        let Some(active) = current_active_goal(&self.timeline.items) else {
+            self.composer_goal_editing = false;
+            cx.notify();
+            return;
+        };
+        let action = if active.actions.contains(&GoalAction::Set) {
+            GoalAction::Set
+        } else if active.actions.contains(&GoalAction::Edit) {
+            GoalAction::Edit
+        } else {
+            return;
+        };
+        self.composer_goal_editing = false;
+        self.control_session_goal(action, Some(objective), cx);
     }
 
     fn save_composer_queue_edit(&mut self, cx: &mut Context<Self>) {
@@ -40934,28 +41020,29 @@ impl VibexWorkbench {
             )
         };
         // A `/goal` prompt is an ordinary message with a badge: the bubble
-        // carries a goal icon whose tooltip explains what the message did.
+        // carries a goal icon inside the bubble, and the mark is an icon-only
+        // ghost button whose library tooltip explains what the message did.
         let goal_message = parse_slash_command_invocation(&row.body)
             .is_some_and(|(name, _)| name.eq_ignore_ascii_case("goal"));
         let inline_content = if goal_message && !editing {
+            let label = SharedString::from(locale::text("Goal message", "目标消息", "目標訊息"));
             h_flex()
                 .min_w_0()
                 .items_start()
                 .gap_2()
                 .child(
-                    div()
-                        .id(SharedString::from(format!("goal-message-badge:{}", row.id)))
-                        .flex_none()
-                        .mt(px(1.0))
-                        .tooltip(|window, cx| {
-                            Tooltip::new(locale::text("Goal message", "目标消息", "目標訊息"))
-                                .build(window, cx)
-                        })
-                        .child(
+                    Button::new(SharedString::from(format!("goal-message-badge:{}", row.id)))
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .size(px(18.0))
+                        .icon(
                             Icon::new(IconName::Map)
                                 .size(px(13.0))
                                 .text_color(cx.theme().primary),
-                        ),
+                        )
+                        .accessibility_label(label.clone())
+                        .tooltip(label),
                 )
                 .child(div().min_w_0().flex_1().child(inline_content))
                 .into_any_element()
@@ -42176,7 +42263,12 @@ impl VibexWorkbench {
     ///
     /// Goal state changes arrive back through the session event pump and the
     /// live timeline stream, so the card refreshes without a manual reload.
-    fn control_session_goal(&mut self, action: GoalAction, cx: &mut Context<Self>) {
+    fn control_session_goal(
+        &mut self,
+        action: GoalAction,
+        objective: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
@@ -42200,7 +42292,7 @@ impl VibexWorkbench {
                 .control_goal(AgentGoalControlRequest {
                     session_id: session_id.clone(),
                     action,
-                    objective: None,
+                    objective,
                     expected_revision: None,
                     correlation_id: None,
                 })
@@ -44045,7 +44137,12 @@ impl VibexWorkbench {
     /// and rendered outside the transcript, directly below the queued-message
     /// bar. Controls use the vocabulary the live adapter advertised with the
     /// snapshot.
-    fn render_composer_goal(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The active goal as the composer's extension row.
+    ///
+    /// Returns the row alone: the caller decides whether it rides inside the
+    /// queued-message panel or wraps it in the standalone shell, so both
+    /// surfaces join the composer on the same seam.
+    fn render_composer_goal_row(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.rendering_child_agent_timeline() {
             return None;
         }
@@ -44063,6 +44160,69 @@ impl VibexWorkbench {
         } else {
             cx.theme().primary
         };
+        let actions = active.actions.clone();
+        // Re-objective is `set` on the neutral surface; `edit` is the explicit
+        // verb some adapters advertise instead.
+        let edit_action = if actions.contains(&GoalAction::Set) {
+            Some(GoalAction::Set)
+        } else if actions.contains(&GoalAction::Edit) {
+            Some(GoalAction::Edit)
+        } else {
+            None
+        };
+        let show_edit = edit_action.is_some() && !phase.is_terminal();
+        let show_pause = phase == GoalPhase::Active && actions.contains(&GoalAction::Pause);
+        let show_resume = matches!(
+            phase,
+            GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited
+        ) && actions.contains(&GoalAction::Resume);
+        let show_clear = !phase.is_terminal() && actions.contains(&GoalAction::Clear);
+
+        if self.composer_goal_editing {
+            return Some(
+                h_flex()
+                    .id("composer-goal-editor")
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(COMPOSER_GOAL_BAR_HEIGHT))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .child(
+                        div().min_w_0().flex_1().child(
+                            Textarea::new(&self.composer_goal_edit_input)
+                                .appearance(false)
+                                .w_full(),
+                        ),
+                    )
+                    .child(
+                        Button::new("cancel-composer-goal-edit")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(26.0))
+                            .icon(IconName::Close)
+                            .tooltip(locale::text("Cancel edit", "取消编辑", "取消編輯"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.cancel_composer_goal_edit(cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("save-composer-goal-edit")
+                            .xsmall()
+                            .primary()
+                            .compact()
+                            .size(px(26.0))
+                            .icon(IconName::Check)
+                            .tooltip(locale::text("Save goal", "保存目标", "儲存目標"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.save_composer_goal_edit(cx)),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
         let goal_label = locale::text("Goal", "目标", "目標");
         let title = if goal.objective.trim().is_empty() {
             format!("{goal_label} {}", goal_phase_label(phase))
@@ -44086,32 +44246,15 @@ impl VibexWorkbench {
         if let (Some(started), Some(max)) = (goal.rounds_started, goal.max_rounds) {
             meta.push(format!("{started}/{max}"));
         }
-        let actions = active.actions.clone();
-        let show_edit = !goal.objective.trim().is_empty() && !phase.is_terminal();
-        let show_pause = phase == GoalPhase::Active && actions.contains(&GoalAction::Pause);
-        let show_resume = matches!(
-            phase,
-            GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited
-        ) && actions.contains(&GoalAction::Resume);
-        let show_clear = !phase.is_terminal() && actions.contains(&GoalAction::Clear);
-        let edit_objective = goal.objective.clone();
 
         Some(
             h_flex()
                 .id("composer-goal-bar")
                 .w_full()
                 .min_w_0()
-                .h(px(40.0))
+                .min_h(px(COMPOSER_GOAL_BAR_HEIGHT))
                 .items_center()
                 .gap_2()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(if failed {
-                    cx.theme().danger.opacity(0.38)
-                } else {
-                    cx.theme().border
-                })
-                .bg(composer_queue_surface_background(cx.theme().is_dark()))
                 .px_3()
                 .child(
                     Icon::new(IconName::Map)
@@ -44146,15 +44289,8 @@ impl VibexWorkbench {
                             .size(px(28.0))
                             .icon(Icon::default().path("icons/vibex/pencil.svg"))
                             .tooltip(locale::text("Edit goal", "编辑目标", "編輯目標"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // Reuse the history-recall path: it replaces the
-                                // value, puts the caret at the end, focuses the
-                                // input and resyncs suggestions.
-                                this.apply_composer_history_text(
-                                    format!("/goal edit {} ", edit_objective.trim()),
-                                    window,
-                                    cx,
-                                );
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_composer_goal_edit(window, cx)
                             })),
                     )
                 })
@@ -44168,7 +44304,7 @@ impl VibexWorkbench {
                             .icon(IconName::Pause)
                             .tooltip(locale::text("Pause goal", "暂停目标", "暫停目標"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.control_session_goal(GoalAction::Pause, cx);
+                                this.control_session_goal(GoalAction::Pause, None, cx);
                             })),
                     )
                 })
@@ -44182,7 +44318,7 @@ impl VibexWorkbench {
                             .icon(IconName::Play)
                             .tooltip(locale::text("Resume goal", "继续目标", "繼續目標"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.control_session_goal(GoalAction::Resume, cx);
+                                this.control_session_goal(GoalAction::Resume, None, cx);
                             })),
                     )
                 })
@@ -44196,10 +44332,44 @@ impl VibexWorkbench {
                             .icon(IconName::Close)
                             .tooltip(locale::text("Clear goal", "清除目标", "清除目標"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.control_session_goal(GoalAction::Clear, cx);
+                                this.control_session_goal(GoalAction::Clear, None, cx);
                             })),
                     )
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// The goal bar when no queued-message panel sits above it.
+    ///
+    /// It wears the queue panel's shell — top corners rounded, bottom edge
+    /// open — so the two extension surfaces meet the composer on one seam
+    /// instead of a straight edge butting into a rounded corner.
+    fn render_composer_goal(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let failed = current_active_goal(&self.timeline.items).is_some_and(|active| {
+            matches!(
+                active.goal.phase,
+                GoalPhase::Blocked | GoalPhase::UsageLimited | GoalPhase::BudgetLimited
+            )
+        });
+        let row = self.render_composer_goal_row(cx)?;
+        Some(
+            v_flex()
+                .id("composer-goal")
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .rounded_tl(px(COMPOSER_SURFACE_RADIUS))
+                .rounded_tr(px(COMPOSER_SURFACE_RADIUS))
+                .border_1()
+                .border_b_0()
+                .border_color(if failed {
+                    cx.theme().danger.opacity(0.38)
+                } else {
+                    cx.theme().border
+                })
+                .bg(composer_queue_surface_background(cx.theme().is_dark()))
+                .child(row)
                 .into_any_element(),
         )
     }
@@ -44413,7 +44583,11 @@ impl VibexWorkbench {
         )
     }
 
-    fn render_composer_queue(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_composer_queue(
+        &mut self,
+        goal_row: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let session_id = self.selected_session_id.clone()?;
         let messages = self
             .composer_queue
@@ -44879,6 +45053,19 @@ impl VibexWorkbench {
                     .child(content),
             );
         }
+        // The goal row is the last row of the same surface, so the queued
+        // messages and the goal read as one card instead of two stacked
+        // rounded boxes with a seam between them.
+        if let Some(goal_row) = goal_row {
+            queue = queue.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.72))
+                    .child(goal_row),
+            );
+        }
         Some(queue.into_any_element())
     }
 
@@ -44935,9 +45122,25 @@ impl VibexWorkbench {
         let composer_background = composer_surface_background(is_dark);
         let composer_collaboration = self.render_composer_collaboration(cx);
         let composer_plan = self.render_composer_plan(cx);
-        let composer_queue = self.render_composer_queue(cx);
-        let composer_queue_visible = composer_queue.is_some();
-        let composer_goal = self.render_composer_goal(cx);
+        // The goal row rides the queued-message surface whenever that panel is
+        // up; on its own it wears the same shell as the panel.
+        let composer_queue_visible = self.selected_session_id.as_ref().is_some_and(|session_id| {
+            self.composer_queue
+                .iter()
+                .any(|message| &message.session_id == session_id)
+        });
+        let composer_goal_row = if composer_queue_visible {
+            self.render_composer_goal_row(cx)
+        } else {
+            None
+        };
+        let composer_queue = self.render_composer_queue(composer_goal_row, cx);
+        let composer_goal = if composer_queue_visible {
+            None
+        } else {
+            self.render_composer_goal(cx)
+        };
+        let composer_extension_visible = composer_queue.is_some() || composer_goal.is_some();
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let session_uninitialized = self.selected_session_runtime_uninitialized();
@@ -45307,7 +45510,7 @@ impl VibexWorkbench {
                             .border_1()
                             .border_color(cx.theme().border)
                             .bg(composer_background)
-                            .when(composer_queue_visible, |this| {
+                            .when(composer_extension_visible, |this| {
                                 this.shadow(vec![
                                     gpui::BoxShadow::new(
                                         px(0.0),
@@ -45327,8 +45530,8 @@ impl VibexWorkbench {
                                     .blur_radius(px(18.0)),
                                 ])
                             })
-                            .when(!composer_queue_visible && is_dark, |this| this.shadow_lg())
-                            .when(!composer_queue_visible && !is_dark, |this| this.shadow_sm())
+                            .when(!composer_extension_visible && is_dark, |this| this.shadow_lg())
+                            .when(!composer_extension_visible && !is_dark, |this| this.shadow_sm())
                             .on_prepaint(move |bounds, _, cx| {
                                 let _ = surface_geometry_entity.update(cx, |this, cx| {
                                     if this.composer_geometry.surface_bounds != Some(bounds) {
@@ -61715,6 +61918,9 @@ mod tests {
         row_height: Rc<Cell<f32>>,
         queue_bottom: Rc<Cell<f32>>,
         composer_top: Rc<Cell<f32>>,
+        goal_width: Rc<Cell<f32>>,
+        goal_top: Rc<Cell<f32>>,
+        queue_goal_bottom: Rc<Cell<f32>>,
     }
 
     struct ComposerBottomAnchorProbe {
@@ -62042,6 +62248,9 @@ mod tests {
             let row_height = self.row_height.clone();
             let queue_bottom = self.queue_bottom.clone();
             let composer_top = self.composer_top.clone();
+            let goal_width = self.goal_width.clone();
+            let goal_top = self.goal_top.clone();
+            let queue_goal_bottom = self.queue_goal_bottom.clone();
             let border = theme::semantic_color("border", true);
             let content_max_width =
                 session_content_max_width(SessionContentWidthMode::Narrow).unwrap();
@@ -62168,6 +62377,62 @@ mod tests {
                                                             "icons/vibex/trash-2.svg",
                                                         )),
                                                 ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .border_t_1()
+                                                .border_color(border)
+                                                .on_prepaint(move |bounds, _, _| {
+                                                    queue_goal_bottom.set(
+                                                        f32::from(bounds.origin.y)
+                                                            + f32::from(bounds.size.height),
+                                                    );
+                                                })
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .min_h(px(COMPOSER_GOAL_BAR_HEIGHT))
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .px_3()
+                                                        .on_prepaint(move |bounds, _, _| {
+                                                            goal_width
+                                                                .set(f32::from(bounds.size.width));
+                                                            goal_top
+                                                                .set(f32::from(bounds.origin.y));
+                                                        })
+                                                        .child(
+                                                            Icon::new(IconName::Map).size(px(16.0)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .flex_1()
+                                                                .truncate()
+                                                                .child("Goal active ship it"),
+                                                        )
+                                                        .child(
+                                                            Button::new(
+                                                                "composer-layout-goal-pause",
+                                                            )
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .compact()
+                                                            .size(px(28.0))
+                                                            .icon(IconName::Pause),
+                                                        )
+                                                        .child(
+                                                            Button::new(
+                                                                "composer-layout-goal-clear",
+                                                            )
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .compact()
+                                                            .size(px(28.0))
+                                                            .icon(IconName::Close),
+                                                        ),
+                                                ),
                                         ),
                                 ),
                         )
@@ -62282,6 +62547,9 @@ mod tests {
         let row_height = Rc::new(Cell::new(0.0));
         let queue_bottom = Rc::new(Cell::new(0.0));
         let composer_top = Rc::new(Cell::new(0.0));
+        let goal_width = Rc::new(Cell::new(0.0));
+        let goal_top = Rc::new(Cell::new(0.0));
+        let queue_goal_bottom = Rc::new(Cell::new(0.0));
         let observed_queue_width = queue_width.clone();
         let observed_header_height = header_height.clone();
         let observed_composer_width = composer_width.clone();
@@ -62289,6 +62557,9 @@ mod tests {
         let observed_row_height = row_height.clone();
         let observed_queue_bottom = queue_bottom.clone();
         let observed_composer_top = composer_top.clone();
+        let observed_goal_width = goal_width.clone();
+        let observed_goal_top = goal_top.clone();
+        let observed_queue_goal_bottom = queue_goal_bottom.clone();
         let (_, cx) = cx.add_window_view(|window, cx| ComposerLayoutProbe {
             input: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -62303,6 +62574,9 @@ mod tests {
             row_height,
             queue_bottom,
             composer_top,
+            goal_width,
+            goal_top,
+            queue_goal_bottom,
         });
 
         cx.run_until_parked();
@@ -62338,6 +62612,27 @@ mod tests {
             (observed_queue_bottom.get() - observed_composer_top.get()).abs() < 0.5,
             "queue bottom {} should meet composer top {}",
             observed_queue_bottom.get(),
+            observed_composer_top.get()
+        );
+        // The goal row is the queue surface's last row, so it inherits the
+        // queue's inset and width instead of forming a second rounded box.
+        assert!(
+            (observed_goal_width.get() - observed_queue_width.get()).abs() < 0.5,
+            "goal row width {} should match the queue surface width {}",
+            observed_goal_width.get(),
+            observed_queue_width.get()
+        );
+        // `queue_bottom` is the whole extension stack's bottom edge (it meets
+        // the composer top), so the goal row has to sit above it.
+        assert!(
+            observed_goal_top.get() < observed_queue_bottom.get(),
+            "goal row top {} should sit inside the extension stack above {}",
+            observed_goal_top.get(),
+            observed_queue_bottom.get()
+        );
+        assert!(
+            (observed_queue_goal_bottom.get() - observed_composer_top.get()).abs() < 0.5,
+            "the queue surface's goal row should still meet the composer top {}",
             observed_composer_top.get()
         );
     }
@@ -67637,7 +67932,7 @@ mod tests {
             .expect("composer terminal control should remain present");
         assert!(fullscreen_button < terminal_button);
         assert!(composer.contains(".pb_1()"));
-        assert!(composer.contains(".when(composer_queue_visible, |this|"));
+        assert!(composer.contains(".when(composer_extension_visible, |this|"));
         assert!(composer.contains("px(-2.0)"));
         assert!(composer.contains(".blur_radius(px(6.0))"));
         assert!(composer.contains(".px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))"));
@@ -67680,7 +67975,7 @@ mod tests {
         assert!(plan.contains("COMPOSER_PLAN_EXPANDED_MAX_HEIGHT"));
 
         let goal = source
-            .split_once("    fn render_composer_goal(")
+            .split_once("    fn render_composer_goal_row(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_plan("))
             .map(|(body, _)| body)
             .expect("composer goal renderer should remain inspectable");
@@ -67689,7 +67984,28 @@ mod tests {
         assert!(goal.contains("composer-goal-pause"));
         assert!(goal.contains("composer-goal-resume"));
         assert!(goal.contains("composer-goal-clear"));
+        // Editing happens in the bar itself: the pencil opens the inline
+        // editor and saving issues a goal control, never a composer draft.
+        assert!(goal.contains("begin_composer_goal_edit"));
+        assert!(goal.contains("composer-goal-editor"));
+        assert!(goal.contains("save-composer-goal-edit"));
+        assert!(!goal.contains("/goal edit"));
+        assert!(!goal.contains("apply_composer_history_text"));
+        let goal_editor = source
+            .split_once("    fn save_composer_goal_edit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn save_composer_queue_edit("))
+            .map(|(body, _)| body)
+            .expect("goal editor save path should remain inspectable");
+        assert!(goal_editor.contains("GoalAction::Set"));
+        assert!(goal_editor.contains("GoalAction::Edit"));
+        assert!(goal_editor.contains("control_session_goal(action, Some(objective), cx)"));
         assert!(source.contains("goal-message-badge:"));
+        // The goal row is the last row of the queued-message surface, so the
+        // two extension bars share one silhouette.
+        assert!(source.contains(
+            "fn render_composer_queue(\n        &mut self,\n        goal_row: Option<AnyElement>,"
+        ));
+        assert!(source.contains(".child(goal_row)"));
 
         let plan_details = source
             .split_once("fn render_composer_plan_details(")

@@ -254,12 +254,26 @@ fn integer_field(value: &Value, keys: &[&str]) -> Option<i64> {
     })
 }
 
-/// Request params for a goal control. Both dialects take the same shape.
-pub(crate) fn build_goal_control_params(session_id: &str, action: GoalAction) -> Value {
-    serde_json::json!({
+/// Request params for a goal control. Both dialects take the same shape; the
+/// objective rides along only for `set`/`edit`, where the provider needs it.
+pub(crate) fn build_goal_control_params(
+    session_id: &str,
+    action: GoalAction,
+    objective: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({
         "sessionId": session_id,
         "action": action.as_str(),
-    })
+    });
+    if let Some(objective) = objective.map(str::trim).filter(|value| !value.is_empty())
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert(
+            "objective".to_string(),
+            Value::String(objective.to_string()),
+        );
+    }
+    params
 }
 
 #[cfg(test)]
@@ -445,12 +459,24 @@ mod tests {
     #[test]
     fn control_params_use_the_lowercase_wire_action() {
         assert_eq!(
-            build_goal_control_params("session-1", GoalAction::Pause),
+            build_goal_control_params("session-1", GoalAction::Pause, None),
             json!({ "sessionId": "session-1", "action": "pause" })
         );
         assert_eq!(
-            build_goal_control_params("session-1", GoalAction::Clear),
+            build_goal_control_params("session-1", GoalAction::Clear, None),
             json!({ "sessionId": "session-1", "action": "clear" })
+        );
+    }
+
+    #[test]
+    fn control_params_carry_the_objective_only_when_provided() {
+        assert_eq!(
+            build_goal_control_params("session-1", GoalAction::Set, Some("  ship it  ")),
+            json!({ "sessionId": "session-1", "action": "set", "objective": "ship it" })
+        );
+        assert_eq!(
+            build_goal_control_params("session-1", GoalAction::Set, Some("   ")),
+            json!({ "sessionId": "session-1", "action": "set" })
         );
     }
 }

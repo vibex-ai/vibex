@@ -18225,6 +18225,7 @@ impl AcpClient for AcpRuntimeClient {
         _binding: &ProviderBinding,
         session_id: &VibexSessionId,
         action: vibex_core::GoalAction,
+        objective: Option<&str>,
     ) -> VibexResult<Option<vibex_core::GoalSnapshot>> {
         let Some(attachment) = self.current_attachment(session_id) else {
             return Err(VibexError::conflict(
@@ -18245,8 +18246,11 @@ impl AcpClient for AcpRuntimeClient {
                 "ACP agent does not implement this goal action",
             ));
         }
-        let params =
-            crate::goal::build_goal_control_params(&attachment.fence().native_session_id, action);
+        let params = crate::goal::build_goal_control_params(
+            &attachment.fence().native_session_id,
+            action,
+            objective,
+        );
         process
             .request(&channel.control_method, params, self.prompt_timeout)
             .await?;
@@ -24316,7 +24320,7 @@ for line in sys.stdin:
             result.setdefault("_meta", {})["goal"] = {
                 "version": 1,
                 "controlMethod": "_session/goal",
-                "actions": ["pause", "clear"],
+                "actions": ["set", "pause", "resume", "clear"],
             }
         if advertise_auth:
             result["authMethods"] = [
@@ -24495,9 +24499,17 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
     elif method == "_session/goal":
-        goal_action = msg.get("params", {}).get("action", "")
-        goal_session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
-        if goal_action not in ("pause", "clear"):
+        goal_params = msg.get("params", {})
+        goal_action = goal_params.get("action", "")
+        goal_session_id = goal_params.get("sessionId", "mock-session-1")
+        goal_objective = goal_params.get("objective", "ship it")
+        if goal_action == "set" and not str(goal_objective).strip():
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32602, "message": "goal objective is required"},
+            })
+        elif goal_action not in ("set", "pause", "resume", "clear"):
             send({
                 "jsonrpc": "2.0",
                 "id": mid,
@@ -24506,7 +24518,9 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {}})
             if goal_action == "pause":
-                send_goal_update(goal_session_id, "paused", "ship it")
+                send_goal_update(goal_session_id, "paused", goal_objective)
+            elif goal_action == "set":
+                send_goal_update(goal_session_id, "active", goal_objective)
     elif method == "session/set_model":
         session_id = msg.get("params", {}).get("sessionId", "mock-session-1")
         model_id = msg.get("params", {}).get("modelId", model_1)
@@ -33589,7 +33603,12 @@ for line in sys.stdin:
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         assert_eq!(
             client.goal_actions(&binding, &session_id).await,
-            vec![vibex_core::GoalAction::Pause, vibex_core::GoalAction::Clear]
+            vec![
+                vibex_core::GoalAction::Set,
+                vibex_core::GoalAction::Pause,
+                vibex_core::GoalAction::Resume,
+                vibex_core::GoalAction::Clear,
+            ]
         );
         let (sender, mut receiver) = mpsc::unbounded_channel();
         assert!(
@@ -33599,7 +33618,7 @@ for line in sys.stdin:
                 .unwrap()
         );
         client
-            .control_goal(&binding, &session_id, vibex_core::GoalAction::Pause)
+            .control_goal(&binding, &session_id, vibex_core::GoalAction::Pause, None)
             .await
             .expect("advertised pause must reach the agent");
         let event = timeout(Duration::from_secs(5), receiver.recv())
@@ -33615,10 +33634,33 @@ for line in sys.stdin:
             }
             other => panic!("expected a goal payload, got {other:?}"),
         }
-        let error = client
-            .control_goal(&binding, &session_id, vibex_core::GoalAction::Resume)
+        // Re-objective rides the same control call: the edited objective must
+        // reach the agent and come back on the goal snapshot.
+        client
+            .control_goal(
+                &binding,
+                &session_id,
+                vibex_core::GoalAction::Set,
+                Some("ship the fix"),
+            )
             .await
-            .expect_err("resume was not advertised");
+            .expect("advertised set must reach the agent");
+        let event = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("an out-of-turn goal update must arrive")
+            .expect("the goal sink stays open");
+        match event.payload {
+            vibex_core::TimelinePayload::Goal(payload) => {
+                let goal = payload.goal.expect("goal snapshot");
+                assert_eq!(goal.objective, "ship the fix");
+                assert_eq!(goal.phase, vibex_core::GoalPhase::Active);
+            }
+            other => panic!("expected a goal payload, got {other:?}"),
+        }
+        let error = client
+            .control_goal(&binding, &session_id, vibex_core::GoalAction::Edit, None)
+            .await
+            .expect_err("edit was not advertised");
         assert_eq!(error.code, "acp_goal_action_unsupported");
 
         // An agent without the advertisement exposes no goal surface.
@@ -33653,6 +33695,7 @@ for line in sys.stdin:
                 &plain_binding,
                 &plain_session_id,
                 vibex_core::GoalAction::Pause,
+                None,
             )
             .await
             .expect_err("goal control must be unsupported");

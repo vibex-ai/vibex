@@ -590,12 +590,14 @@ pub trait AcpClient: Send + Sync {
     /// Sends one goal-control action to the live activation behind `binding`.
     ///
     /// The adapter must have advertised the action; implementations reject
-    /// anything outside their vocabulary instead of guessing.
+    /// anything outside its vocabulary instead of guessing. `objective` is
+    /// required by `set`/`edit` and ignored by the lifecycle verbs.
     async fn control_goal(
         &self,
         _binding: &ProviderBinding,
         _session_id: &VibexSessionId,
         _action: vibex_core::GoalAction,
+        _objective: Option<&str>,
     ) -> VibexResult<Option<vibex_core::GoalSnapshot>> {
         Err(VibexError::capability(
             "acp_goal_control_unsupported",
@@ -2632,7 +2634,12 @@ impl AgentProvider for AcpAgentProvider {
     ) -> VibexResult<ProviderGoalControlResult> {
         let goal = self
             .client
-            .control_goal(&handle.binding, &request.session_id, request.action)
+            .control_goal(
+                &handle.binding,
+                &request.session_id,
+                request.action,
+                request.objective.as_deref(),
+            )
             .await?;
         let actions = self
             .client
