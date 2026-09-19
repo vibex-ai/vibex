@@ -59,7 +59,7 @@ use gpui_component::{
     popover::Popover,
     progress::{Progress, ProgressCircle},
     scroll::{ScrollableElement as _, ScrollbarAxis},
-    searchable_list::SearchableListItem,
+    searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectDelegate, SelectEvent, SelectState},
     shimmer::ShimmerText,
     spinner::Spinner,
@@ -54147,8 +54147,12 @@ struct FoundationSettings {
     workbench: WeakEntity<VibexWorkbench>,
     font_families: Vec<String>,
     language_modes: Entity<SelectState<Vec<LocaleChoice>>>,
-    interface_fonts: Entity<SelectState<Vec<FontChoice>>>,
-    code_fonts: Entity<SelectState<Vec<FontChoice>>>,
+    /// The font families on offer, filtered by the popup's own search box.
+    ///
+    /// A plain `Vec` delegate answers `perform_search` with the default no-op,
+    /// so the search box would type into a list that never narrows.
+    interface_fonts: Entity<SelectState<SearchableVec<FontChoice>>>,
+    code_fonts: Entity<SelectState<SearchableVec<FontChoice>>>,
     light_themes: Entity<SelectState<Vec<appearance_theme::ThemeOption>>>,
     dark_themes: Entity<SelectState<Vec<appearance_theme::ThemeOption>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
@@ -54224,10 +54228,18 @@ impl FoundationSettings {
         let language_modes =
             cx.new(|cx| SelectState::new(language_choices, language_selected, window, cx));
         let interface_fonts = cx.new(|cx| {
-            SelectState::new(interface_choices, interface_selected, window, cx).searchable(true)
+            SelectState::new(
+                SearchableVec::new(interface_choices),
+                interface_selected,
+                window,
+                cx,
+            )
+            .searchable(true)
         });
-        let code_fonts =
-            cx.new(|cx| SelectState::new(code_choices, code_selected, window, cx).searchable(true));
+        let code_fonts = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(code_choices), code_selected, window, cx)
+                .searchable(true)
+        });
         let light_themes = cx.new(|cx| {
             SelectState::new(
                 appearance_theme::theme_options(GpuiThemeMode::Light),
@@ -54984,11 +54996,11 @@ impl FoundationSettings {
             select.set_selected_value(&appearance.locale, window, cx)
         });
         self.interface_fonts.update(cx, |select, cx| {
-            select.set_items(interface_choices, window, cx);
+            select.set_items(SearchableVec::new(interface_choices), window, cx);
             select.set_selected_value(&appearance.interface_font.family, window, cx)
         });
         self.code_fonts.update(cx, |select, cx| {
-            select.set_items(code_choices, window, cx);
+            select.set_items(SearchableVec::new(code_choices), window, cx);
             select.set_selected_value(&appearance.code_font.family, window, cx)
         });
         for (mode, select) in [
@@ -71188,6 +71200,48 @@ mod tests {
             candidate.section == SettingsSection::Session && candidate.keywords.contains(&"failed")
         }));
         assert!(settings_search_candidates_for_query("", english).is_empty());
+    }
+
+    /// The font selects must narrow through `SearchableVec`.
+    ///
+    /// A bare `Vec` delegate inherits the default no-op `perform_search`, so
+    /// the popup's search box accepted typing and filtered nothing.
+    #[gpui::test]
+    fn font_select_search_narrows_the_family_list(cx: &mut TestAppContext) {
+        let families = vec!["IBM Plex Sans".to_string(), "JetBrains Mono".to_string()];
+        let mut choices = SearchableVec::new(font_choices(&families, "System UI"));
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|_, _| FontSearchProbe);
+
+        let _ = cx.update(|window, cx| choices.perform_search("jet", window, cx));
+
+        assert_eq!(choices.items_count(0), 1, "only JetBrains Mono matches");
+        let matched = choices
+            .item(IndexPath::default().row(0))
+            .expect("the matching family should be first");
+        assert_eq!(matched.title().as_ref(), "JetBrains Mono");
+        assert_eq!(matched.family.as_deref(), Some("JetBrains Mono"));
+
+        // Reopening the popup clears the query through the same delegate, so
+        // the full list has to come back.
+        let _ = cx.update(|window, cx| choices.perform_search("", window, cx));
+        assert_eq!(choices.items_count(0), 3);
+
+        let source = include_str!("app.rs");
+        assert!(source.contains("interface_fonts: Entity<SelectState<SearchableVec<FontChoice>>>"));
+        assert!(source.contains("code_fonts: Entity<SelectState<SearchableVec<FontChoice>>>"));
+        assert!(source.contains("SearchableVec::new(interface_choices)"));
+        assert!(source.contains("SearchableVec::new(code_choices)"));
+    }
+
+    /// A window view that paints nothing; the font-search test only needs a
+    /// `Window` to run the delegate's search through.
+    struct FontSearchProbe;
+
+    impl Render for FontSearchProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Empty
+        }
     }
 
     #[test]
