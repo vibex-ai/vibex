@@ -384,6 +384,24 @@ jobs:
           mkdir -p target/publish
           find target/release-downloads -type f ! -name 'release-assets.json' -exec cp {} target/publish/ \;
           test -n "$(find target/publish -type f -not -name '*.sha256' -print -quit)"
+      - name: Stage localized release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-meta.outputs.version }}"
+          notes="docs/operations/release-notes-v${version}.md"
+          # The desktop About page reads this asset to show the changelog in
+          # the selected language, so a release without it would silently ship
+          # an empty update card.
+          if [[ ! -f "${notes}" ]]; then
+            echo "release notes are missing from the tagged commit: ${notes}" >&2
+            exit 1
+          fi
+          if ! grep -qE '^## English[[:space:]]*$' "${notes}"; then
+            echo "${notes} has no English section" >&2
+            exit 1
+          fi
+          cp "${notes}" target/publish/vibex-release-notes.md
       - name: Generate and sign updater manifest when configured
         if: vars.VIBEX_UPDATE_SIGNING_ENABLED == 'true'
         env:

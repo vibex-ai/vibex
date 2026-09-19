@@ -24,12 +24,19 @@ Each supported GitHub Release publishes these assets together:
 vibex-<version>-<os>-<arch>-<package>.<extension>
 vibex-update.json
 vibex-update.json.sig
+vibex-release-notes.md
 ```
 
 The Ed25519 signature covers the exact `vibex-update.json` bytes. Release CI
 holds `VIBEX_UPDATE_SIGNING_KEY`; desktop release builds contain only
 `VIBEX_UPDATE_PUBLIC_KEY`. The manifest generator must verify its output and
 confirm that the signing key derives the public key embedded by the build.
+
+`vibex-release-notes.md` is copied from the tagged commit's
+`docs/operations/release-notes-v<version>.md`, and the publish job fails the
+release when that document is missing or carries no `## English` section. It is
+informational: the manifest signature does not cover it, and it never
+influences update decisions.
 
 The signed manifest binds:
 
@@ -61,6 +68,11 @@ falls through to another channel.
   verify size plus every signed hash before renaming it to a staged package.
 - Coalesce identical operations. Progress snapshots are throttled so network
   chunk size cannot flood the UI subscriber.
+- Fetch release notes from the same verified tag, under a bounded size and a
+  shorter timeout. A missing, oversized, non-UTF-8, or failed document leaves
+  the release without notes; it must never fail or stall a check.
+- Build every release asset URL from the verified tag, never from a URL the
+  manifest supplies. Reject tags that could escape the release download path.
 
 ## State And Scheduling
 
@@ -105,6 +117,13 @@ without user interruption; manual failures publish a typed visible error.
 
 - About shows current version/channel and every updater state with its valid
   next action.
+- Opening About requests a check when the state is idle or failed, throttled so
+  switching sections cannot start one check per visit. A build without a
+  verification key reports that checks are unavailable instead of retrying.
+- A known release shows its version, publication time, download size, and the
+  localized release notes as rendered Markdown. Notes selection resolves the
+  interface language, falling back to the generic Chinese section and then to
+  English; a release without notes keeps the signed release page as its link.
 - An available or unsupported release can show a compact title-bar entry before
   mobile pairing. The entry and one-time notice obey `show_update_prompts`.
 - Record `last_update_prompted_version` only when the notice is actually shown.

@@ -221,6 +221,21 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
   }
+  // The desktop About page resolves the changelog from a per-release notes
+  // asset, so the publish workflow must stage the tagged document under the
+  // exact name the updater requests.
+  assert(
+    releaseWorkflow.includes('notes="docs/operations/release-notes-v${version}.md"'),
+    "publish workflow does not read the release notes for the published version"
+  );
+  assert(
+    releaseWorkflow.includes("target/publish/vibex-release-notes.md"),
+    "publish workflow does not stage vibex-release-notes.md for upload"
+  );
+  assert(
+    releaseWorkflow.includes("has no English section"),
+    "publish workflow does not require an English release-notes section"
+  );
   // Container images publish from their own tag/branch-triggered workflow.
   // Keep the registry, the build inputs, the architecture coverage, and the
   // "latest only points at a stable release" guarantee under contract.
@@ -378,6 +393,11 @@ function validateCurrentReleaseDocs() {
     "runbook does not preserve published-artifact rollback"
   );
   assert(matrix.includes("package:stable"), "packaging matrix omits the stable desktop package");
+  assert(
+    runbook.includes("release-notes-v<version>.md") &&
+      runbook.includes("vibex-release-notes.md"),
+    "runbook does not document the localized release-notes asset"
+  );
 }
 
 function validateDependencyAndSupplyChain() {

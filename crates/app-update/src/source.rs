@@ -15,6 +15,7 @@ const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const OFFICIAL_RELEASES_FEED: &str = "https://github.com/vibex-ai/vibex/releases.atom";
+const RELEASE_NOTES_ASSET: &str = "vibex-release-notes.md";
 
 pub type UpdateDownloadProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
@@ -31,6 +32,12 @@ pub trait UpdateSource: Send + Sync {
         &self,
         channel: UpdateChannel,
     ) -> AppUpdateResult<Option<SignedManifest>>;
+
+    /// Informational release notes published beside `tag`.
+    ///
+    /// `Ok(None)` means the release publishes no notes. Callers must treat any
+    /// failure as "notes unavailable" and keep the update itself usable.
+    async fn release_notes(&self, tag: &str) -> AppUpdateResult<Option<String>>;
 
     async fn download_artifact(
         &self,
@@ -139,6 +146,7 @@ impl GitHubReleaseSource {
     }
 
     async fn release_asset(&self, tag: &str, name: &str, limit: usize) -> AppUpdateResult<Vec<u8>> {
+        validate_release_tag(tag)?;
         let url = Url::parse(&format!(
             "https://github.com/vibex-ai/vibex/releases/download/{tag}/{name}"
         ))
@@ -176,6 +184,31 @@ impl UpdateSource for GitHubReleaseSource {
             manifest,
             signature_base64,
         }))
+    }
+
+    async fn release_notes(&self, tag: &str) -> AppUpdateResult<Option<String>> {
+        validate_release_tag(tag)?;
+        let url = Url::parse(&format!(
+            "https://github.com/vibex-ai/vibex/releases/download/{tag}/{RELEASE_NOTES_ASSET}"
+        ))
+        .expect("release notes URL is valid");
+        let response = self.client.get(url).send().await.map_err(network_error)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = require_success(response, "app_update_release_notes_request_failed")?;
+        let bytes = bounded_response(
+            response,
+            crate::MAX_RELEASE_NOTES_BYTES,
+            "app_update_release_notes_too_large",
+        )
+        .await?;
+        String::from_utf8(bytes).map(Some).map_err(|_| {
+            AppUpdateError::new(
+                "app_update_release_notes_invalid",
+                "the release notes are not valid UTF-8",
+            )
+        })
     }
 
     async fn download_artifact(
@@ -299,6 +332,24 @@ fn latest_channel_release(
     Ok(releases.pop())
 }
 
+/// Reject tags that could escape the release download path they are
+/// interpolated into. The feed already constrains tags; this keeps every asset
+/// URL builder honest on its own.
+fn validate_release_tag(tag: &str) -> AppUpdateResult<()> {
+    if tag.is_empty()
+        || tag.len() > 120
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(AppUpdateError::new(
+            "app_update_release_tag_invalid",
+            "the release tag is invalid",
+        ));
+    }
+    Ok(())
+}
+
 fn release_from_link(link: &str) -> Option<(String, Version)> {
     let url = Url::parse(link).ok()?;
     if url.scheme() != "https"
@@ -389,6 +440,19 @@ fn network_error(error: reqwest::Error) -> AppUpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_tags_cannot_escape_the_release_download_path() {
+        assert!(validate_release_tag("v0.2.0").is_ok());
+        assert!(validate_release_tag("v0.2.0-rc.1").is_ok());
+        for tag in ["", "../v0.2.0", "v0.2.0/extra", "v0.2.0?x=1", "v0.2.0#frag"] {
+            assert_eq!(
+                validate_release_tag(tag).unwrap_err().code,
+                "app_update_release_tag_invalid",
+                "{tag} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn atom_feed_selects_only_the_requested_channel() {

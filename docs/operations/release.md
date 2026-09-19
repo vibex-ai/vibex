@@ -62,6 +62,33 @@ never rewrites an existing tag, reuses an asset name with different bytes, or
 rolls user data back with the application package. For AppImage self-updates,
 retain the previous binary until the new version completes its first startup.
 
+### Release notes
+
+The tagged commit must contain `docs/operations/release-notes-v<version>.md`
+before the release is published. The publish job stages that file as
+`vibex-release-notes.md`, fails the release when it is missing or has no
+`## English` section, and uploads it beside `vibex-update.json`. The desktop
+About page downloads the asset from the verified release tag and shows the
+section that matches the selected interface language, so the document is what
+users read as the changelog.
+
+Write one level-two section per language, using the headings the desktop
+resolves:
+
+```markdown
+## English
+
+## 简体中文
+
+## 繁體中文
+```
+
+English is required; `## 中文` remains accepted as the generic Chinese section.
+Missing translations fall back to the generic section and then to English, so a
+release may ship fewer sections than the interface offers. The notes asset is
+informational and is not covered by the manifest signature: never move install
+instructions, artifact hashes, or anything the updater must trust into it.
+
 ## Mobile
 
 Android and iOS are built independently from the desktop package. Tagged

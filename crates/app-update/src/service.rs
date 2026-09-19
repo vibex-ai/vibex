@@ -20,6 +20,8 @@ use crate::{
 const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(30);
 const STABLE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const PRERELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Notes are decoration; a slow notes request must not stall a check.
+const RELEASE_NOTES_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(15 * 60),
     Duration::from_secs(30 * 60),
@@ -93,6 +95,11 @@ pub struct UpdateRelease {
     pub published_at: String,
     pub notes_url: url::Url,
     pub artifact: Option<UpdateArtifact>,
+    /// Raw Markdown notes published with the release, when it ships any.
+    ///
+    /// Informational only: the document is not covered by the manifest
+    /// signature and never influences update decisions.
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,13 +414,15 @@ impl AppUpdateService {
                 &self.inner.config.installation.package,
             )
             .cloned();
-        let release = UpdateRelease {
+        let mut release = UpdateRelease {
             version: verified.manifest.version,
             tag: verified.manifest.tag,
             published_at: verified.manifest.published_at,
             notes_url: verified.manifest.notes_url,
             artifact,
+            notes: None,
         };
+        release.notes = self.release_notes(&release.tag).await;
         let Some(install_mode) = release
             .artifact
             .as_ref()
@@ -432,6 +441,20 @@ impl AppUpdateService {
             });
         }
         Ok(UpdateState::Available { release })
+    }
+
+    /// Fetch informational notes without letting them fail or stall a check.
+    ///
+    /// The signed manifest stays the only source of update truth, so a missing
+    /// document, a transport error, or a slow response simply leaves the About
+    /// page without notes.
+    async fn release_notes(&self, tag: &str) -> Option<String> {
+        match tokio::time::timeout(RELEASE_NOTES_TIMEOUT, self.inner.source.release_notes(tag))
+            .await
+        {
+            Ok(Ok(notes)) => notes,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
     async fn download_inner(&self) -> AppUpdateResult<()> {
@@ -660,6 +683,10 @@ impl UpdateSource for UnavailableSource {
         Err(self.error.clone())
     }
 
+    async fn release_notes(&self, _tag: &str) -> AppUpdateResult<Option<String>> {
+        Err(self.error.clone())
+    }
+
     async fn download_artifact(
         &self,
         _artifact: &UpdateArtifact,
@@ -806,6 +833,7 @@ mod tests {
     struct FakeSource {
         signed: SignedManifest,
         artifact_bytes: Vec<u8>,
+        notes: AppUpdateResult<Option<String>>,
     }
 
     #[async_trait]
@@ -815,6 +843,10 @@ mod tests {
             _channel: UpdateChannel,
         ) -> AppUpdateResult<Option<SignedManifest>> {
             Ok(Some(self.signed.clone()))
+        }
+
+        async fn release_notes(&self, _tag: &str) -> AppUpdateResult<Option<String>> {
+            self.notes.clone()
         }
 
         async fn download_artifact(
@@ -877,8 +909,15 @@ mod tests {
                 signature_base64: signature,
             },
             artifact_bytes: bytes,
+            notes: Ok(Some(
+                "## English\n\n### Highlights\n\n- A verified change.\n".to_string(),
+            )),
         });
         (config, source)
+    }
+
+    fn release_of(state: &UpdateState) -> &UpdateRelease {
+        state.release().expect("state should carry a release")
     }
 
     #[tokio::test]
@@ -893,6 +932,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_attaches_published_release_notes() {
+        let (config, source) = fixture();
+        let service = AppUpdateService::with_source(config, source).unwrap();
+        let checked = service.check(CheckReason::Manual).await.unwrap();
+        let notes = release_of(&checked.state)
+            .notes
+            .as_deref()
+            .expect("a published document should reach the release");
+        assert!(notes.contains("A verified change."));
+    }
+
+    #[tokio::test]
+    async fn notes_failure_never_fails_or_blocks_a_check() {
+        for notes in [
+            Ok(None),
+            Err(AppUpdateError::new(
+                "app_update_network_failed",
+                "the update service could not be reached",
+            )),
+        ] {
+            let (config, source) = fixture();
+            let signed = source
+                .latest_signed_manifest(UpdateChannel::Stable)
+                .await
+                .unwrap()
+                .unwrap();
+            let source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
+                signed,
+                artifact_bytes: b"verified package".to_vec(),
+                notes,
+            });
+            let service = AppUpdateService::with_source(config, source).unwrap();
+            let checked = service.check(CheckReason::Manual).await.unwrap();
+            assert!(matches!(checked.state, UpdateState::Available { .. }));
+            assert_eq!(release_of(&checked.state).notes, None);
+        }
+    }
+
+    #[tokio::test]
     async fn modified_download_is_rejected_and_not_staged() {
         let (config, source) = fixture();
         let bad_source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
@@ -902,6 +980,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             artifact_bytes: b"tampered package".to_vec(),
+            notes: Ok(None),
         });
         let service = AppUpdateService::with_source(config, bad_source).unwrap();
         service.check(CheckReason::Manual).await.unwrap();
