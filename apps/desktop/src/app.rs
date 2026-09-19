@@ -121,8 +121,8 @@ use vibex_desktop_model::{
     EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey, GitWorkbenchMode, LocaleMode,
     MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
     NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
-    NewSessionWorkspaceState, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    NewSessionWorkspaceState, PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT,
+    ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
     SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
     SidebarMutationOutcome, SidebarMutationRejection, SidebarOrganizationItem,
     SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
@@ -7387,6 +7387,28 @@ impl VibexWorkbench {
         self.startup_loading_indicator_visible = false;
         self.startup_loading_indicator_task = None;
         self.startup_loading_release_task = None;
+        // Deferred: this can run from the update that constructs the workbench,
+        // and a window may only be opened once that update has finished.
+        let workbench = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = workbench.update(cx, |this, cx| this.restore_preview_window_mode(cx));
+        });
+    }
+
+    /// Reopens a preview the restored layout left open in the host the user
+    /// configured. Runs once, after the runtime is ready, because opening a
+    /// window needs a settled workbench to hand it a panel.
+    fn restore_preview_window_mode(&mut self, cx: &mut Context<Self>) {
+        if !self.ui_state.workbench.preview_window_mode.is_window()
+            || !self.ui_state.workbench.preview_visible
+            || self.code_workbench.read(cx).preview.tabs.is_empty()
+        {
+            return;
+        }
+        let Some(window_handle) = self.window_handle else {
+            return;
+        };
+        self.detach_preview_window(window_handle, cx);
     }
 
     fn schedule_startup_loading_indicator(&mut self, cx: &mut Context<Self>) {
@@ -19969,11 +19991,46 @@ impl VibexWorkbench {
         detached: bool,
         cx: &mut Context<Self>,
     ) {
+        // The button and the setting are two views of one choice: whichever the
+        // user reaches for, the next preview opens the same way.
+        self.set_preview_window_mode(
+            if detached {
+                PreviewWindowMode::Window
+            } else {
+                PreviewWindowMode::Inline
+            },
+            cx,
+        );
         if detached {
             self.detach_preview_window(origin_window, cx);
         } else {
             self.dock_preview_window(cx);
         }
+    }
+
+    /// Records where the preview panel opens, and moves a panel that is already
+    /// open so the change is visible immediately instead of on the next open.
+    pub(crate) fn set_preview_window_mode(
+        &mut self,
+        mode: PreviewWindowMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ui_state.workbench.preview_window_mode != mode {
+            self.ui_state.workbench.preview_window_mode = mode;
+            self.queue_ui_state();
+        }
+        if mode.is_window() {
+            // Only a panel that is actually open travels; choosing the window
+            // mode with the preview closed leaves it closed until it is opened.
+            if self.code_preview_visible
+                && let Some(window_handle) = self.window_handle
+            {
+                self.detach_preview_window(window_handle, cx);
+            }
+        } else {
+            self.dock_preview_window(cx);
+        }
+        cx.notify();
     }
 
     fn detach_preview_window(&mut self, origin_window: AnyWindowHandle, cx: &mut Context<Self>) {
@@ -19987,7 +20044,7 @@ impl VibexWorkbench {
             return;
         }
         // The panel is what travels, so make sure it is open before the move.
-        self.reveal_code_preview(cx);
+        self.show_code_preview_inline(cx);
         self.code_workbench
             .update(cx, |workbench, cx| workbench.exit_fullscreen(cx));
         let window_bounds = WindowBounds::Windowed(Bounds::centered(
@@ -20049,7 +20106,7 @@ impl VibexWorkbench {
         self.remove_preview_window(handle, cx);
         // Docking back is a move, not a close: the panel has to be visible in
         // the workbench again.
-        self.reveal_code_preview(cx);
+        self.show_code_preview_inline(cx);
         self.activate_workbench_window(cx);
     }
 
@@ -20091,7 +20148,14 @@ impl VibexWorkbench {
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.set_preview_detached(false, cx)
             });
-            self.reveal_code_preview(cx);
+            // Closing the window is a request to work inline, not a one-off
+            // move: leaving the setting on the window mode would pop the panel
+            // straight back out the next time it opens.
+            if self.ui_state.workbench.preview_window_mode.is_window() {
+                self.ui_state.workbench.preview_window_mode = PreviewWindowMode::Inline;
+                self.queue_ui_state();
+            }
+            self.show_code_preview_inline(cx);
             self.activate_workbench_window(cx);
             cx.notify();
             return;
@@ -26450,10 +26514,11 @@ impl VibexWorkbench {
             && self.ui_state.workbench.preview_visible
             && !preview_fullscreen
             && !new_session_open;
+        // Full screen moves the panel into the workbench column, so the rail
+        // keeps its width and the auto-collapse has to count it.
         let right_rail_open = agent_workbench_active
             && visibility.right_rail_docked
             && self.ui_state.workbench.right_rail_visible
-            && !preview_fullscreen
             && !new_session_open;
         let sidebar_open = (agent_workbench_active || management_open || usage_open)
             && visibility.sidebar_docked
@@ -26475,10 +26540,8 @@ impl VibexWorkbench {
             self.last_visibility.layout.viewport_height,
         );
         let new_session_open = self.new_session_open;
-        let preview_fullscreen = !new_session_open && self.preview_fullscreen_active;
         visibility.right_rail_docked
             && self.ui_state.workbench.active_tab == "agent"
-            && !preview_fullscreen
             && !new_session_open
     }
 
@@ -26594,7 +26657,11 @@ impl VibexWorkbench {
                     || (!visibility.right_rail_docked && self.right_rail_overlay_open)
             }
         };
-        if !panel_visible || self.new_session_open || self.preview_fullscreen_active {
+        // Full screen puts the panel in the workbench column, so its own
+        // resize handle is gone while the rail beside it keeps working.
+        let preview_panel_fullscreen =
+            matches!(panel, RightPanelKind::Preview) && self.preview_fullscreen_active;
+        if !panel_visible || self.new_session_open || preview_panel_fullscreen {
             return None;
         }
         match panel {
@@ -27154,11 +27221,30 @@ impl VibexWorkbench {
             // Hiding the panel hides it everywhere: leaving the detached window
             // behind would keep a panel the workbench no longer shows.
             self.close_preview_window(cx);
+        } else if self.ui_state.workbench.preview_window_mode.is_window()
+            && let Some(window_handle) = self.window_handle
+        {
+            self.detach_preview_window(window_handle, cx);
         }
         cx.notify();
     }
 
+    /// Opens the preview panel where the user configured it to open.
     pub(crate) fn reveal_code_preview(&mut self, cx: &mut Context<Self>) {
+        self.show_code_preview_inline(cx);
+        if self.ui_state.workbench.preview_window_mode.is_window()
+            && let Some(window_handle) = self.window_handle
+        {
+            self.detach_preview_window(window_handle, cx);
+        }
+    }
+
+    /// Makes the panel visible without moving it between hosts.
+    ///
+    /// The dock, detach, and hand-back paths use this: they have already
+    /// decided where the panel lives, and re-reading the preference there would
+    /// undo the move they are in the middle of.
+    fn show_code_preview_inline(&mut self, cx: &mut Context<Self>) {
         let visibility_changed = !self.ui_state.workbench.preview_visible;
         self.ui_state.workbench.preview_visible = true;
         if !self.last_visibility.preview_docked {
@@ -46738,7 +46824,6 @@ impl VibexWorkbench {
         let right_rail_docked = visibility.right_rail_docked
             && self.right_rail_panel_open()
             && agent_open
-            && !preview_fullscreen
             && !new_session_open;
         let sidebar_width = self.sidebar_panel_width(visibility);
         let preview_width = self.preview_panel_width(visibility);
@@ -46787,6 +46872,21 @@ impl VibexWorkbench {
                 .into_any_element()
         } else if new_session_open {
             self.render_new_session_panel(strings, window, cx)
+        } else if preview_fullscreen {
+            // Full screen grows the panel over the conversation it belongs to,
+            // not over the shell: the sidebar and the right rail stay put, so
+            // the files, Git, and session context a reader came from remain one
+            // glance away instead of being covered.
+            div()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(
+                    self.code_workbench
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .into_any_element()
         } else {
             self.render_agent_workbench(window, cx)
         };
@@ -46897,43 +46997,42 @@ impl VibexWorkbench {
             right_rail_animation,
             right_rail_panel,
         ));
-        if agent_open && !new_session_open && !preview_fullscreen {
+        if agent_open && !new_session_open {
             shell = shell.child(self.render_right_rail_activity_bar(cx));
         }
         let floating_right_rail = (agent_open
             && !new_session_open
             && !visibility.right_rail_docked
-            && self.right_rail_panel_open()
-            && !preview_fullscreen)
-            .then(|| {
-                let resize_handle = self.render_right_panel_resize_handle(
-                    RightPanelKind::RightRail,
-                    visibility,
-                    right_rail_width,
-                    cx,
-                );
-                let panel = self.render_right_rail_panel(window, cx);
-                div()
-                    .absolute()
-                    // Overlay panels start below the floating chrome too.
-                    .top(px(TITLE_BAR_HEIGHT))
-                    .bottom_0()
-                    .right(px(RIGHT_ACTIVITY_BAR_WIDTH))
-                    .w(px(right_rail_width))
-                    .max_w_full()
-                    // The floating rail frames its panel in the same surface,
-                    // so the slide reads as one card.
-                    .bg(theme::semantic_color(
-                        "right-rail-surface",
-                        cx.theme().is_dark(),
-                    ))
-                    .occlude()
-                    .border_l_1()
-                    .border_color(cx.theme().border)
-                    .shadow_lg()
-                    .child(panel)
-                    .child(resize_handle)
-            });
+            && self.right_rail_panel_open())
+        .then(|| {
+            let resize_handle = self.render_right_panel_resize_handle(
+                RightPanelKind::RightRail,
+                visibility,
+                right_rail_width,
+                cx,
+            );
+            let panel = self.render_right_rail_panel(window, cx);
+            div()
+                .absolute()
+                // Overlay panels start below the floating chrome too.
+                .top(px(TITLE_BAR_HEIGHT))
+                .bottom_0()
+                .right(px(RIGHT_ACTIVITY_BAR_WIDTH))
+                .w(px(right_rail_width))
+                .max_w_full()
+                // The floating rail frames its panel in the same surface,
+                // so the slide reads as one card.
+                .bg(theme::semantic_color(
+                    "right-rail-surface",
+                    cx.theme().is_dark(),
+                ))
+                .occlude()
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .shadow_lg()
+                .child(panel)
+                .child(resize_handle)
+        });
         shell
             .when(placement.overlay, |this| {
                 this.child(
@@ -46955,25 +47054,6 @@ impl VibexWorkbench {
                 )
             })
             .when_some(floating_right_rail, |this, panel| this.child(panel))
-            .when(placement.fullscreen, |this| {
-                this.child(
-                    // Full-bleed, but still below the floating chrome: the
-                    // editor keeps its own controls reachable in the band the
-                    // bar reserves.
-                    div()
-                        .absolute()
-                        .top(px(TITLE_BAR_HEIGHT))
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .bg(cx.theme().background)
-                        .child(
-                            self.code_workbench
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
-                        ),
-                )
-            })
             .into_any_element()
     }
 }
@@ -53334,6 +53414,16 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Workbench,
+            locale::text("Preview window", "预览窗口", "預覽視窗"),
+            locale::text(
+                "Choose whether the multi-tab preview opens inside the workbench or in a window of its own.",
+                "选择多标签预览在主窗口内嵌打开，还是弹出为独立窗口。",
+                "選擇多分頁預覽在主視窗內嵌開啟，或彈出為獨立視窗。",
+            ),
+            &["preview", "window", "popup", "预览", "視窗", "獨立"],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
             locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
             locale::text(
                 "Restore panel visibility, sizes and open editor state.",
@@ -55259,6 +55349,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_preview_window_mode(&mut self, mode: PreviewWindowMode, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_preview_window_mode(mode, cx));
+        cx.notify();
+    }
+
     fn set_default_new_session_location(
         &mut self,
         location: NewSessionLocation,
@@ -56722,6 +56819,29 @@ impl FoundationSettings {
             .workbench
             .read_with(cx, |this, _| this.ui_state.preview.editor_autosave_delay_ms)
             .unwrap_or(DEFAULT_EDITOR_AUTOSAVE_DELAY_MS);
+        let preview_window_mode = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.workbench.preview_window_mode)
+            .unwrap_or_default();
+        let preview_window_control = settings_segmented_control(
+            "preview-window-mode",
+            vec![
+                settings_segmented_option(
+                    locale::text("Inline", "内嵌", "內嵌"),
+                    preview_window_mode == PreviewWindowMode::Inline,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_preview_window_mode(PreviewWindowMode::Inline, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("Separate window", "独立窗口", "獨立視窗"),
+                    preview_window_mode.is_window(),
+                    cx.listener(|this, _, _, cx| {
+                        this.set_preview_window_mode(PreviewWindowMode::Window, cx)
+                    }),
+                ),
+            ],
+        );
         let autosave_control = settings_segmented_control(
             "editor-autosave",
             vec![
@@ -56928,6 +57048,17 @@ impl FoundationSettings {
                 SettingsGroup::new(
                     locale::text("Layout", "布局", "版面"),
                     vec![
+                    setting_row(
+                        locale::text("Preview window", "预览窗口", "預覽視窗"),
+                        locale::text(
+                            "Choose whether the multi-tab preview opens inside the workbench or in a window of its own.",
+                            "选择多标签预览在主窗口内嵌打开，还是弹出为独立窗口。",
+                            "選擇多分頁預覽在主視窗內嵌開啟，或彈出為獨立視窗。",
+                        ),
+                        preview_window_control,
+                        stacked,
+                        cx,
+                    ),
                     setting_row(
                         locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
                         locale::text(
@@ -58443,10 +58574,8 @@ impl Render for VibexWorkbench {
         );
         let auto_collapse = self.workbench_auto_collapse(visibility, cx);
         visibility.sidebar_docked &= !auto_collapse.sidebar;
-        let preview_fullscreen = !self.new_session_open && self.preview_fullscreen_active;
-        let right_rail_suppressed = self.ui_state.workbench.active_tab != "agent"
-            || self.new_session_open
-            || preview_fullscreen;
+        let right_rail_suppressed =
+            self.ui_state.workbench.active_tab != "agent" || self.new_session_open;
         self.right_rail_overlay_open = resolved_right_rail_overlay_open(
             visibility.right_rail_docked,
             self.ui_state.workbench.right_rail_visible,
@@ -64643,6 +64772,97 @@ mod tests {
         assert!(!resolved_right_rail_overlay_open(true, true, false, false));
         assert!(!resolved_right_rail_overlay_open(false, true, false, true));
         assert!(!resolved_right_rail_overlay_open(false, true, true, false));
+    }
+
+    #[test]
+    fn the_preview_window_setting_and_the_panel_button_share_one_choice() {
+        let source = include_str!("app.rs");
+
+        // The setting offers both hosts.
+        let page = source
+            .split_once("    fn render_workbench_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_terminal_page("))
+            .map(|(body, _)| body)
+            .expect("the workbench settings page should remain inspectable");
+        assert!(page.contains("\"preview-window-mode\""));
+        assert!(page.contains("PreviewWindowMode::Inline"));
+        assert!(page.contains("PreviewWindowMode::Window"));
+        assert!(
+            page.contains("this.set_preview_window_mode(PreviewWindowMode::Inline, cx)"),
+            "the setting must reach the workbench, not only the settings snapshot"
+        );
+
+        // The panel header records the same choice, so the setting can never
+        // disagree with where the panel just went.
+        let button = source
+            .split_once("    pub(crate) fn set_preview_window_detached(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Records where the preview panel opens")
+            })
+            .map(|(body, _)| body)
+            .expect("the panel button should remain inspectable");
+        assert!(button.contains("self.set_preview_window_mode("));
+        assert!(button.contains("PreviewWindowMode::Window"));
+        assert!(button.contains("PreviewWindowMode::Inline"));
+
+        // Opening the preview honors the choice, and closing the detached
+        // window hands the panel back inline instead of popping straight out.
+        let reveal = source
+            .split_once("    pub(crate) fn reveal_code_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn show_code_preview_inline("))
+            .map(|(body, _)| body)
+            .expect("the reveal path should remain inspectable");
+        assert!(reveal.contains("preview_window_mode.is_window()"));
+        assert!(reveal.contains("self.detach_preview_window("));
+        let hand_back = source
+            .split_once("    fn handle_window_closed(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn activate_workbench_window("))
+            .map(|(body, _)| body)
+            .expect("the hand-back path should remain inspectable");
+        assert!(
+            hand_back.contains("preview_window_mode = PreviewWindowMode::Inline"),
+            "a user close must return the panel inline for good"
+        );
+    }
+
+    #[test]
+    fn preview_fullscreen_keeps_the_sidebar_and_the_right_rail() {
+        let source = include_str!("app.rs");
+        let shell = source
+            .split_once("    fn render_shell(")
+            .and_then(|(_, tail)| tail.split_once("\nfn preview_panel_placement("))
+            .map(|(body, _)| body)
+            .expect("shell should remain inspectable");
+
+        // The panel grows inside the workbench column, where the sidebar and
+        // the rail are siblings, instead of being drawn over the whole shell.
+        assert!(
+            shell.contains("} else if preview_fullscreen {"),
+            "full screen should hand the workbench column to the preview"
+        );
+        assert!(
+            !shell.contains(".when(placement.fullscreen"),
+            "full screen must not cover the shell: the sidebar and the rail stay visible"
+        );
+
+        // The rail keeps its column and its activity bar while the preview is
+        // full screen, so the panel never takes the file and Git context away.
+        let right_rail_docked = shell
+            .split_once("let right_rail_docked = ")
+            .and_then(|(_, tail)| tail.split_once(';'))
+            .map(|(body, _)| body)
+            .expect("the docked rail decision should remain inspectable");
+        assert!(
+            !right_rail_docked.contains("preview_fullscreen"),
+            "the docked rail must survive preview full screen"
+        );
+        assert!(
+            shell.contains("if agent_open && !new_session_open {\n            shell = shell.child(self.render_right_rail_activity_bar(cx));"),
+            "the activity bar must survive preview full screen"
+        );
+
+        // The workbench column keeps its own chrome reservation.
+        assert!(shell.contains(".pt(px(TITLE_BAR_HEIGHT))"));
     }
 
     #[test]

@@ -79,6 +79,26 @@ pub enum StartupDestination {
     NewSession,
 }
 
+/// Where the multi-tab preview panel opens.
+///
+/// The inline mode keeps the panel in the workbench column beside the
+/// conversation, which is what a fresh install starts with; the window mode
+/// gives it a window of its own so the tabs can be browsed and edited next to
+/// the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewWindowMode {
+    #[default]
+    Inline,
+    Window,
+}
+
+impl PreviewWindowMode {
+    pub const fn is_window(self) -> bool {
+        matches!(self, Self::Window)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ComposerQueueSendMode {
@@ -333,6 +353,10 @@ pub struct WorkbenchUiState {
     pub remember_layout: bool,
     #[serde(default = "default_show_git_change_count")]
     pub show_git_change_count: bool,
+    /// How the multi-tab preview panel opens: inline in the workbench column,
+    /// or in a window of its own.
+    #[serde(default)]
+    pub preview_window_mode: PreviewWindowMode,
     #[serde(default)]
     pub default_new_session_location: NewSessionLocation,
     /// Directories starred in the project-directory picker, most recently
@@ -359,6 +383,7 @@ impl Default for WorkbenchUiState {
             right_rail_width: 336.0,
             remember_layout: default_remember_layout(),
             show_git_change_count: default_show_git_change_count(),
+            preview_window_mode: PreviewWindowMode::default(),
             default_new_session_location: NewSessionLocation::CurrentCheckout,
             favorite_project_directories: Vec::new(),
         }
@@ -2325,6 +2350,43 @@ mod tests {
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
         assert!(decoded.desktop_behavior.close_to_tray);
+    }
+
+    #[test]
+    fn preview_window_mode_defaults_to_inline_and_round_trips_a_window_choice() {
+        assert_eq!(
+            WorkbenchUiState::default().preview_window_mode,
+            PreviewWindowMode::Inline
+        );
+        assert!(!PreviewWindowMode::Inline.is_window());
+        assert!(PreviewWindowMode::Window.is_window());
+
+        let mut state = DesktopUiStateV1::default();
+        state.workbench.preview_window_mode = PreviewWindowMode::Window;
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.workbench.preview_window_mode,
+            PreviewWindowMode::Window
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_a_preview_window_mode_opens_the_preview_inline() {
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .get_mut("workbench")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("previewWindowMode");
+
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.workbench.preview_window_mode,
+            PreviewWindowMode::Inline
+        );
     }
 
     #[test]
