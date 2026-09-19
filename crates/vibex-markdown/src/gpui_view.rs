@@ -48,11 +48,31 @@ use crate::resource::{ResolvedResource, ResourceKind};
 use crate::svg::{SvgArtifact, SvgPolicy};
 
 const SYNCHRONOUS_PARSE_BYTES: usize = 16 * 1024;
-const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 8;
-const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 8 * 1024;
-const AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 24;
-const AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 16 * 1024;
-const AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS: usize = 8;
+/// Largest reasoning document parsed on the main thread at creation.
+///
+/// Turning on "expand reasoning by default" creates one view per reasoning row
+/// of a long session inside a single frame. Parsing all of them synchronously
+/// stalls that frame, so past this small budget a thought takes the same
+/// background-parse path a streaming document does. Agent answers and document
+/// previews keep the larger [`SYNCHRONOUS_PARSE_BYTES`] budget: they are
+/// created a handful at a time, and a placeholder flash on an answer is a worse
+/// trade than one parse on the main thread.
+const SYNCHRONOUS_PARSE_BYTES_ON_CREATE: usize = 2 * 1024;
+/// Block-virtualization thresholds for the streaming Agent and Thought
+/// surfaces.
+///
+/// Every one of these is a "does this document ever reach the point where
+/// rendering it whole costs more than the virtual flow's bookkeeping" test.
+/// They are set low because the outer timeline re-renders an expanded turn's
+/// rows — and therefore these views — on every frame, so a document that only
+/// clears a high bar by being long is exactly the case that needed
+/// virtualizing all along. The cost of virtualizing too eagerly is one extra
+/// spacer element plus per-block height bookkeeping.
+const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 4;
+const AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 2 * 1024;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_BLOCKS: usize = 12;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES: usize = 4 * 1024;
+const AGENT_BLOCK_VIRTUALIZATION_MIN_LARGE_BLOCKS: usize = 4;
 const AGENT_BLOCK_VIRTUALIZATION_OVERSCAN_PX: f32 = 640.0;
 const AGENT_BLOCK_GAP_PX: f32 = 12.0;
 const AGENT_BLOCK_ESTIMATE_WIDTH_PX: f32 = 720.0;
@@ -665,7 +685,21 @@ pub struct MarkdownViewState {
     highlight_cache: HighlightCache,
     selection_frame: u64,
     selection_next_segment: usize,
-    selection_text: String,
+    /// Concatenated text of every rendered segment, in paint order.
+    ///
+    /// Only a document that is being selected needs it, so it is materialized
+    /// on demand instead of being rebuilt on every frame: an expanded Agent
+    /// timeline renders hundreds of these views per frame, and copying each
+    /// document into a buffer nobody reads was pure overhead.
+    selection_text: Option<String>,
+    /// Byte length the buffer will have once materialized.
+    selection_text_len: usize,
+    /// Whether the last pushed segment ended on a line break.
+    selection_text_ends_with_newline: bool,
+    /// Text of each segment in paint order, replayed to build the buffer.
+    selection_pieces: Vec<SharedString>,
+    /// Shared prefix of every text segment's element id, built once per view.
+    segment_id_prefix: SharedString,
     selection_segments: BTreeMap<usize, SelectionSegment>,
     text_selection: MarkdownTextSelection,
     virtual_block_sizes: Arc<Vec<Pixels>>,
@@ -685,13 +719,20 @@ impl MarkdownViewState {
         options: MarkdownViewOptions,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Reasoning is created in bulk — one view per reasoning row, and a
+        // whole turn's worth the moment reasoning expands by default — so it
+        // parses against the smaller create-time budget.
+        let synchronous_parse_bytes = match options.presentation {
+            MarkdownPresentation::Thought => SYNCHRONOUS_PARSE_BYTES_ON_CREATE,
+            MarkdownPresentation::Agent | MarkdownPresentation::Document => SYNCHRONOUS_PARSE_BYTES,
+        };
         let parse_in_background = document.is_none()
-            && (options.streaming || input.source.len() > SYNCHRONOUS_PARSE_BYTES);
+            && (options.streaming || input.source.len() > synchronous_parse_bytes);
         let background_input = parse_in_background.then(|| input.clone());
         let document = document.unwrap_or_else(|| {
             if parse_in_background {
                 let mut fallback = input.clone();
-                fallback.source = Arc::from(utf8_prefix(&input.source, SYNCHRONOUS_PARSE_BYTES));
+                fallback.source = Arc::from(utf8_prefix(&input.source, synchronous_parse_bytes));
                 Arc::new(MarkdownDocument::literal(
                     &fallback,
                     "markdown_parse_pending",
@@ -701,6 +742,7 @@ impl MarkdownViewState {
                 Arc::new(parse_markdown(input.clone()))
             }
         });
+        let segment_id_prefix = SharedString::from(format!("markdown-text:{view_id}"));
         let mut this = Self {
             view_id,
             focus_handle: cx.focus_handle(),
@@ -726,7 +768,11 @@ impl MarkdownViewState {
             highlight_cache: BTreeMap::new(),
             selection_frame: 0,
             selection_next_segment: 0,
-            selection_text: String::new(),
+            selection_text: None,
+            selection_text_len: 0,
+            selection_text_ends_with_newline: false,
+            selection_pieces: Vec::new(),
+            segment_id_prefix,
             selection_segments: BTreeMap::new(),
             text_selection: MarkdownTextSelection::default(),
             virtual_block_sizes: Arc::new(Vec::new()),
@@ -832,7 +878,10 @@ impl MarkdownViewState {
         self.text_selection = MarkdownTextSelection::default();
         self.select_all_document = false;
         self.selection_segments.clear();
-        self.selection_text.clear();
+        self.selection_text = None;
+        self.selection_text_len = 0;
+        self.selection_text_ends_with_newline = false;
+        self.selection_pieces.clear();
         self.virtual_visible_blocks = None;
         self.virtual_layout_width = virtual_layout.as_ref().map(|layout| layout.width);
         let mut live_nodes = BTreeSet::new();
@@ -885,6 +934,11 @@ impl MarkdownViewState {
             return false;
         }
         let block_count = self.document.blocks.len();
+        // The thresholds are deliberately low. A reasoning row is one of
+        // hundreds inside an expanded turn, and the outer timeline rebuilds
+        // every one of them on every frame; a five-block thought that skips
+        // virtualization still pays full block layout and selection-buffer work
+        // at frame rate. Only trivially short documents stay on the full path.
         (self.options.streaming
             && self.document.source.len() >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_SOURCE_BYTES
             && block_count >= AGENT_STREAMING_BLOCK_VIRTUALIZATION_MIN_BLOCKS)
@@ -1335,22 +1389,101 @@ impl MarkdownViewState {
     fn begin_selection_frame(&mut self) {
         self.selection_frame = self.selection_frame.saturating_add(1).max(1);
         self.selection_next_segment = 0;
-        self.selection_text.clear();
+        self.selection_pieces.clear();
+        self.selection_text_len = 0;
+        self.selection_text_ends_with_newline = false;
+        // A frame that is not being selected never reads the buffer, so the
+        // previous frame's text can be dropped and rebuilt on demand.
+        self.selection_text = None;
         self.selection_segments.clear();
     }
 
+    /// The concatenated text of the current frame's segments.
+    ///
+    /// Materialized from [`Self::selection_pieces`] only when a caller needs a
+    /// contiguous string, which is the double-click word and line selection.
+    /// Everything else slices the pieces directly.
+    fn materialize_selection_text(&mut self) -> &str {
+        if self.selection_text.is_none() {
+            let mut text = String::with_capacity(self.selection_text_len);
+            for piece in &self.selection_pieces {
+                text.push_str(piece);
+            }
+            self.selection_text = Some(text);
+        }
+        self.selection_text.as_deref().unwrap_or_default()
+    }
+
+    /// One byte range of the frame's selection text, without materializing it.
+    ///
+    /// Returns `None` when the range is not a byte range of the buffer.
+    fn selection_slice(&self, range: Range<usize>) -> Option<String> {
+        if range.start > range.end || range.end > self.selection_text_len {
+            return None;
+        }
+        let mut text = String::with_capacity(range.len());
+        let mut offset = 0;
+        for piece in &self.selection_pieces {
+            let start = offset;
+            let end = offset + piece.len();
+            offset = end;
+            if end <= range.start {
+                continue;
+            }
+            if start >= range.end {
+                break;
+            }
+            let from = range.start.saturating_sub(start);
+            let to = (range.end - start).min(piece.len());
+            text.push_str(piece.get(from..to)?);
+        }
+        (text.len() == range.len()).then_some(text)
+    }
+
+    /// Snap an index into the selection text down to a character boundary.
+    ///
+    /// Works on the piece list so hit testing does not force the whole document
+    /// into one allocation.
+    fn selection_boundary_at_or_before(&self, index: usize) -> usize {
+        let index = index.min(self.selection_text_len);
+        let mut offset = 0;
+        for piece in &self.selection_pieces {
+            let start = offset;
+            let end = offset + piece.len();
+            offset = end;
+            if index > end {
+                continue;
+            }
+            let mut local = index.saturating_sub(start).min(piece.len());
+            while local > 0 && !piece.is_char_boundary(local) {
+                local -= 1;
+            }
+            return start + local;
+        }
+        index
+    }
+
     fn selection_block_break(&mut self) {
-        if !self.selection_text.is_empty() && !self.selection_text.ends_with('\n') {
-            self.selection_text.push('\n');
+        if self.selection_text_len > 0 && !self.selection_text_ends_with_newline {
+            self.selection_pieces.push(SharedString::new_static("\n"));
+            self.selection_text_len += 1;
+            self.selection_text_ends_with_newline = true;
         }
     }
 
     fn selection_inline_break(&mut self) {
-        self.selection_text.push('\n');
+        self.selection_pieces.push(SharedString::new_static("\n"));
+        self.selection_text_len += 1;
+        self.selection_text_ends_with_newline = true;
     }
 
     fn push_selection_source(&mut self, source: &str) {
-        self.selection_text.push_str(source);
+        if source.is_empty() {
+            return;
+        }
+        self.selection_pieces.push(SharedString::new(source));
+        self.selection_text_len += source.len();
+        self.selection_text_ends_with_newline = source.ends_with('\n');
     }
 
     fn selectable_styled_text(
@@ -1371,9 +1504,11 @@ impl MarkdownViewState {
         cx: &mut Context<Self>,
     ) -> MarkdownSelectableText {
         let text = text.into();
-        let start = self.selection_text.len();
-        self.selection_text.push_str(&text);
-        let text_range = start..self.selection_text.len();
+        let start = self.selection_text_len;
+        self.selection_text_len += text.len();
+        self.selection_text_ends_with_newline = text.ends_with('\n');
+        self.selection_pieces.push(text.clone());
+        let text_range = start..self.selection_text_len;
         let selection = self.text_selection.range();
         let selection_start = selection.start.max(text_range.start);
         let selection_end = selection.end.min(text_range.end);
@@ -1390,7 +1525,11 @@ impl MarkdownViewState {
         let segment = self.selection_next_segment;
         self.selection_next_segment = self.selection_next_segment.saturating_add(1);
         MarkdownSelectableText::new(
-            format!("markdown-text:{}:{segment}", self.view_id),
+            // A named integer off the view's own id rather than a formatted
+            // string: a long Agent document can hold hundreds of segments, and
+            // building a fresh `String` per segment per frame was pure
+            // allocation churn. The shared prefix is built once per view.
+            ElementId::NamedInteger(self.segment_id_prefix.clone(), segment as u64),
             cx.entity().downgrade(),
             self.selection_frame,
             segment,
@@ -1428,26 +1567,39 @@ impl MarkdownViewState {
     }
 
     fn normalize_text_selection(&mut self) {
-        if self.selection_text.is_empty() {
+        if self.selection_text_len == 0 {
             self.text_selection = MarkdownTextSelection::default();
             return;
         }
         if self.select_all_document {
             self.text_selection = MarkdownTextSelection {
                 anchor: 0,
-                head: self.selection_text.len(),
+                head: self.selection_text_len,
                 pending: false,
             };
             return;
         }
-        self.text_selection.anchor = text_boundary_at_or_before(
-            &self.selection_text,
-            self.text_selection.anchor.min(self.selection_text.len()),
-        );
-        self.text_selection.head = text_boundary_at_or_before(
-            &self.selection_text,
-            self.text_selection.head.min(self.selection_text.len()),
-        );
+        // An empty range — the click that starts a drag — has nothing to snap:
+        // its index already came from `selection_boundary_at_or_before`, or is
+        // zero. Clamping is all that is left, and materializing the document to
+        // do it would put the whole copy back into every frame.
+        if self.text_selection.range().is_empty() {
+            self.text_selection.anchor = self.text_selection.anchor.min(self.selection_text_len);
+            self.text_selection.head = self.text_selection.head.min(self.selection_text_len);
+            return;
+        }
+        let text_len = self.selection_text_len;
+        let anchor = self.text_selection.anchor.min(text_len);
+        let head = self.text_selection.head.min(text_len);
+        let (anchor, head) = {
+            let text = self.materialize_selection_text();
+            (
+                text_boundary_at_or_before(text, anchor),
+                text_boundary_at_or_before(text, head),
+            )
+        };
+        self.text_selection.anchor = anchor;
+        self.text_selection.head = head;
     }
 
     fn exact_selection_index(&self, position: Point<Pixels>) -> Option<usize> {
@@ -1482,10 +1634,7 @@ impl MarkdownViewState {
             Ok(index) | Err(index) => index,
         }
         .min(segment.text_range.len());
-        text_boundary_at_or_before(
-            &self.selection_text,
-            segment.text_range.start.saturating_add(local),
-        )
+        self.selection_boundary_at_or_before(segment.text_range.start.saturating_add(local))
     }
 
     fn start_text_selection(
@@ -1500,9 +1649,15 @@ impl MarkdownViewState {
         };
         self.select_all_document = false;
         let range = match event.click_count {
-            2 => selection_word_range(&self.selection_text, index),
-            3 => selection_line_range(&self.selection_text, index),
-            count if count >= 4 => 0..self.selection_text.len(),
+            2 => {
+                let text = self.materialize_selection_text();
+                selection_word_range(text, index)
+            }
+            3 => {
+                let text = self.materialize_selection_text();
+                selection_line_range(text, index)
+            }
+            count if count >= 4 => 0..self.selection_text_len,
             _ => index..index,
         };
         if event.click_count == 1 && event.modifiers.shift {
@@ -1567,11 +1722,8 @@ impl MarkdownViewState {
         if self.select_all_document {
             return self.document.plain_text();
         }
-        let range = self.text_selection.range();
-        self.selection_text
-            .get(range)
+        self.selection_slice(self.text_selection.range())
             .unwrap_or_default()
-            .to_string()
     }
 
     fn copy_text_selection(&mut self, _: &CopyAction, _: &mut Window, cx: &mut Context<Self>) {
@@ -1584,14 +1736,14 @@ impl MarkdownViewState {
     }
 
     fn select_all_text(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selection_text.is_empty() && !self.virtualized_selection {
+        if self.selection_text_len == 0 && !self.virtualized_selection {
             cx.propagate();
             return;
         }
         self.select_all_document = self.virtualized_selection;
         self.text_selection = MarkdownTextSelection {
             anchor: 0,
-            head: self.selection_text.len(),
+            head: self.selection_text_len,
             pending: false,
         };
         cx.notify();
@@ -3471,7 +3623,7 @@ impl MarkdownViewState {
             .border_color(cx.theme().border)
             .children(row.cells.iter().enumerate().map(|(index, cell)| {
                 if index > 0 {
-                    self.selection_text.push('\t');
+                    self.push_selection_source("\t");
                 }
                 let alignment = alignments
                     .get(index)
@@ -3805,6 +3957,18 @@ fn case_insensitive_match_ranges(text: &str, query: &str, limit: usize) -> Vec<R
         }
     }
     ranges
+}
+
+#[cfg(test)]
+impl MarkdownViewState {
+    /// The concatenated selection text, materialized for assertions.
+    fn selection_text_snapshot(&self) -> String {
+        let mut text = String::with_capacity(self.selection_text_len);
+        for piece in &self.selection_pieces {
+            text.push_str(piece);
+        }
+        text
+    }
 }
 
 #[cfg(test)]
@@ -4199,11 +4363,15 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_component::init);
+        // Sized to clear the streaming threshold but neither of the two
+        // non-streaming ones, so the fixture keeps proving that a document
+        // virtualized only because it is streaming leaves the virtual path when
+        // the stream ends.
         let sections = (0..4)
             .map(|index| {
                 format!(
                     "## Section {index}\n\nParagraph {index}: {}",
-                    "streaming content ".repeat(128)
+                    "streaming content ".repeat(32)
                 )
             })
             .collect::<Vec<_>>()
@@ -4329,7 +4497,10 @@ mod tests {
                 .selection_segments
                 .values()
                 .find(|segment| {
-                    state.selection_text.get(segment.text_range.clone()) == Some("First")
+                    state
+                        .selection_text_snapshot()
+                        .get(segment.text_range.clone())
+                        == Some("First")
                 })
                 .map(|segment| segment.bounds.center())
                 .expect("table header should be laid out");
@@ -4387,7 +4558,10 @@ mod tests {
                     .selection_segments
                     .values()
                     .find(|segment| {
-                        state.selection_text.get(segment.text_range.clone()) == Some(needle)
+                        state
+                            .selection_text_snapshot()
+                            .get(segment.text_range.clone())
+                            == Some(needle)
                     })
                     .map(|segment| f32::from(segment.layout.line_height()))
                     .expect("heading selection segment")
@@ -4455,7 +4629,10 @@ mod tests {
                 .selection_segments
                 .values()
                 .filter(|segment| {
-                    state.selection_text.get(segment.text_range.clone()) == Some(expected)
+                    state
+                        .selection_text_snapshot()
+                        .get(segment.text_range.clone())
+                        == Some(expected)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(segments.len(), 1);
@@ -4513,22 +4690,21 @@ mod tests {
                     .selection_segments
                     .values()
                     .find(|segment| {
-                        state.selection_text.get(segment.text_range.clone()) == Some(expected)
+                        state.selection_text_snapshot().get(segment.text_range.clone()) == Some(expected)
                     })
                     .unwrap_or_else(|| {
+                        let selection = state.selection_text_snapshot();
                         let segments = state
                             .selection_segments
                             .values()
                             .filter_map(|segment| {
-                                state
-                                    .selection_text
+                                selection
                                     .get(segment.text_range.clone())
                                     .map(|text| (text, segment.layout.wrapped_text()))
                             })
                             .collect::<Vec<_>>();
                         panic!(
-                            "list item should use one selectable text segment; expected={expected:?}, selection={:?}, segments={segments:?}",
-                            state.selection_text,
+                            "list item should use one selectable text segment; expected={expected:?}, selection={selection:?}, segments={segments:?}",
                         );
                     });
                 assert_eq!(segment.layout.wrapped_text(), expected);
@@ -4558,7 +4734,10 @@ mod tests {
                     .selection_segments
                     .values()
                     .find(|segment| {
-                        state.selection_text.get(segment.text_range.clone()) == Some(needle)
+                        state
+                            .selection_text_snapshot()
+                            .get(segment.text_range.clone())
+                            == Some(needle)
                     })
                     .expect("fixture selection segment")
             };
@@ -4587,7 +4766,7 @@ mod tests {
 
         cx.dispatch_action(SelectAll);
         state.read_with(cx, |state, _| {
-            assert_eq!(state.selected_text(), state.selection_text);
+            assert_eq!(state.selected_text(), state.selection_text_snapshot());
             assert!(state.selected_text().contains("Heading\nFirst bold text."));
         });
     }
