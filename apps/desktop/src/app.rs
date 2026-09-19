@@ -55106,7 +55106,12 @@ impl FoundationSettings {
                     }),
                 ),
                 settings_segmented_option(
-                    "Worktree",
+                    // "Worktree" is a retained Git term in this product's Chinese
+                    // copy ("Worktree 名称", "重命名 Worktree"), but a bare Latin
+                    // word beside a translated option reads as half-translated.
+                    // Phrasing it as a Chinese phrase that carries the term keeps
+                    // the row in one language and the vocabulary unchanged.
+                    locale::text("New worktree", "新建 Worktree", "新增 Worktree"),
                     workbench.default_new_session_location == NewSessionLocation::NewWorktree,
                     cx.listener(|this, _, _, cx| {
                         this.set_default_new_session_location(NewSessionLocation::NewWorktree, cx)
