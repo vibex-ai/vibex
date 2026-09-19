@@ -51245,43 +51245,79 @@ const REDO_IMAGE_EDIT_SHORTCUT: &str = "cmd-shift-z";
 #[cfg(not(target_os = "macos"))]
 const REDO_IMAGE_EDIT_SHORTCUT: &str = "ctrl-shift-z";
 
-fn shortcut_action_label(action: &str) -> &'static str {
+/// The user-facing name of a foundation action.
+///
+/// One label serves the shortcuts settings page, the settings search results,
+/// and the command palette's quick actions, so the same command cannot be named
+/// two different things in two places. Every entry is localized — an English
+/// label here would surface as mixed-language copy on an otherwise translated
+/// page.
+fn shortcut_action_label(action: &str, strings: Strings) -> &'static str {
+    let locale = strings.locale;
     match action {
-        "toggle_sidebar" => "Toggle sidebar",
-        "toggle_preview" => "Toggle preview",
-        "toggle_right_rail" => "Toggle right rail",
-        "toggle_composer_mode" => locale::text(
+        "toggle_sidebar" => locale::text_for(locale, "Toggle sidebar", "切换侧栏", "切換側邊欄"),
+        "toggle_preview" => locale::text_for(locale, "Toggle preview", "切换预览", "切換預覽"),
+        "toggle_right_rail" => {
+            locale::text_for(locale, "Toggle right rail", "切换右侧栏", "切換右側欄")
+        }
+        "toggle_composer_mode" => locale::text_for(
+            locale,
             "Toggle conversation / terminal",
             "切换对话/终端模式",
             "切換對話/終端機模式",
         ),
-        "open_settings" => "Open settings",
-        "open_runtime_manager" => locale::text("Open runtimes", "打开运行时", "開啟執行階段"),
-        "open_conversation_find" => "Find in conversation",
-        "open_command_palette" => locale::text("Search Vibex", "搜索 Vibex", "搜尋 Vibex"),
-        "retry_runtime" => "Retry runtime",
-        "save_active_file" => "Save active file",
-        "goto_line_in_editor" => locale::text("Go to line in editor", "跳转到行", "跳轉到行"),
-        "navigate_back" => "Navigate back",
-        "navigate_forward" => "Navigate forward",
-        "undo_image_edit" => locale::text("Undo image edit", "撤销图片编辑", "復原圖片編輯"),
-        "redo_image_edit" => locale::text("Redo image edit", "重做图片编辑", "重做圖片編輯"),
-        _ => "Shortcut",
+        "open_settings" => locale::text_for(locale, "Open settings", "打开设置", "開啟設定"),
+        "open_runtime_manager" => {
+            locale::text_for(locale, "Open runtimes", "打开运行时", "開啟執行階段")
+        }
+        "open_conversation_find" => locale::text_for(
+            locale,
+            "Find in conversation",
+            "在当前会话中查找",
+            "在目前會話中尋找",
+        ),
+        "open_command_palette" => {
+            locale::text_for(locale, "Search Vibex", "搜索 Vibex", "搜尋 Vibex")
+        }
+        "retry_runtime" => locale::text_for(locale, "Retry runtime", "重试运行时", "重試執行階段"),
+        "save_active_file" => {
+            locale::text_for(locale, "Save active file", "保存当前文件", "儲存目前檔案")
+        }
+        "goto_line_in_editor" => {
+            locale::text_for(locale, "Go to line in editor", "跳转到行", "跳轉到行")
+        }
+        "navigate_back" => locale::text_for(locale, "Navigate back", "后退", "返回"),
+        "navigate_forward" => locale::text_for(locale, "Navigate forward", "前进", "前進"),
+        "undo_image_edit" => {
+            locale::text_for(locale, "Undo image edit", "撤销图片编辑", "復原圖片編輯")
+        }
+        "redo_image_edit" => {
+            locale::text_for(locale, "Redo image edit", "重做图片编辑", "重做圖片編輯")
+        }
+        _ => locale::text_for(locale, "Shortcut", "快捷键", "快速鍵"),
     }
 }
 
-fn shortcut_action_group(action: &str) -> &'static str {
+/// The group a foundation action belongs to, shown as the row's supporting line.
+///
+/// "Vibex" is the fallback for an action this table has not classified; it is a
+/// product name rather than a category, so it stays untranslated.
+fn shortcut_action_group(action: &str, strings: Strings) -> &'static str {
+    let locale = strings.locale;
+    let navigation = || locale::text_for(locale, "Navigation", "导航", "導覽");
     match action {
         "toggle_sidebar" | "toggle_preview" | "toggle_right_rail" | "open_runtime_manager" => {
-            "Workbench"
+            locale::text_for(locale, "Workbench", "工作台", "工作台")
         }
-        "toggle_composer_mode" => locale::text("Composer", "输入框", "輸入框"),
-        "open_settings" | "open_conversation_find" | "open_command_palette" => "Navigation",
-        "retry_runtime" => "Runtime",
-        "save_active_file" | "goto_line_in_editor" => "Editor",
-        "navigate_back" | "navigate_forward" => "Navigation",
+        "toggle_composer_mode" => locale::text_for(locale, "Composer", "输入框", "輸入框"),
+        "open_settings" | "open_conversation_find" | "open_command_palette" => navigation(),
+        "retry_runtime" => locale::text_for(locale, "Runtime", "运行时", "執行階段"),
+        "save_active_file" | "goto_line_in_editor" => {
+            locale::text_for(locale, "Editor", "编辑器", "編輯器")
+        }
+        "navigate_back" | "navigate_forward" => navigation(),
         "undo_image_edit" | "redo_image_edit" => {
-            locale::text("Image editor", "图片编辑器", "圖片編輯器")
+            locale::text_for(locale, "Image editor", "图片编辑器", "圖片編輯器")
         }
         _ => "Vibex",
     }
@@ -52038,8 +52074,8 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
     for (action, _) in FOUNDATION_SHORTCUTS {
         candidates.push(settings_search_candidate(
             SettingsSection::Shortcuts,
-            shortcut_action_label(action),
-            shortcut_action_group(action),
+            shortcut_action_label(action, strings),
+            shortcut_action_group(action, strings),
             &["shortcut", "key", "快捷键", "快速鍵"],
         ));
     }
@@ -52093,7 +52129,7 @@ fn command_palette_action_label(action: &'static str, strings: Strings) -> &'sta
     match action {
         "new_session" => locale::text("New session", "新建会话", "新增工作階段"),
         "pair_mobile_device" => strings.pair_mobile,
-        other => shortcut_action_label(other),
+        other => shortcut_action_label(other, strings),
     }
 }
 
@@ -53959,11 +53995,12 @@ impl FoundationSettings {
         &mut self,
         action: String,
         current: String,
+        strings: Strings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let entity = cx.weak_entity();
-        let action_label = shortcut_action_label(&action);
+        let action_label = shortcut_action_label(&action, strings);
         self.shortcut_note = None;
         // Keep the input entity outside the dialog builder. Dialog builders are
         // evaluated again whenever the workbench repaints, so creating the input
@@ -55359,7 +55396,12 @@ impl FoundationSettings {
         )
     }
 
-    fn render_shortcuts_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_shortcuts_page(
+        &self,
+        stacked: bool,
+        strings: Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let overrides = self.keyboard_shortcuts(cx);
         let mut rows = Vec::new();
         for (action, default) in FOUNDATION_SHORTCUTS {
@@ -55381,7 +55423,7 @@ impl FoundationSettings {
                     .accessibility_label(format!(
                         "{}: {}",
                         locale::text("Change shortcut", "更改快捷键", "變更快速鍵"),
-                        shortcut_action_label(action),
+                        shortcut_action_label(action, strings),
                     ));
             edit_button = match Keystroke::parse(&current) {
                 Ok(keystroke) => edit_button.child(Kbd::new(keystroke).outline()),
@@ -55394,6 +55436,7 @@ impl FoundationSettings {
                         this.open_shortcut_dialog(
                             edit_action.clone(),
                             edit_current.clone(),
+                            strings,
                             window,
                             cx,
                         )
@@ -55411,8 +55454,8 @@ impl FoundationSettings {
                         })),
                 );
             rows.push(setting_row(
-                shortcut_action_label(action),
-                shortcut_action_group(action),
+                shortcut_action_label(action, strings),
+                shortcut_action_group(action, strings),
                 control,
                 stacked,
                 cx,
@@ -56307,7 +56350,7 @@ impl Render for FoundationSettings {
             }
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
-            SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, cx),
+            SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, strings, cx),
             SettingsSection::Data => self.render_data_page(stacked_rows, cx),
             SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
             SettingsSection::About => self.render_about_page(stacked_rows, resolved_locale, cx),
@@ -68134,6 +68177,41 @@ mod tests {
         );
     }
 
+    /// One label serves the shortcuts page, the settings search, and the command
+    /// palette, so an untranslated entry shows up as English copy on three
+    /// otherwise translated surfaces. The palette shipped exactly that bug: the
+    /// label table had hardcoded English for most actions.
+    #[test]
+    fn every_foundation_shortcut_is_named_in_the_active_language() {
+        let en = locale::strings(locale::ResolvedLocale::En);
+        for strings in [
+            locale::strings(locale::ResolvedLocale::ZhCn),
+            locale::strings(locale::ResolvedLocale::ZhTw),
+        ] {
+            for (action, _) in FOUNDATION_SHORTCUTS {
+                // "Vibex" is the product name, and the one label that carries it
+                // keeps it in every locale; nothing else may stay Latin.
+                let label = shortcut_action_label(action, strings).replace("Vibex", "");
+                assert!(
+                    !label.chars().any(|c| c.is_ascii_alphabetic()),
+                    "{action} still reads English in {}: {label}",
+                    strings.locale.tag(),
+                );
+                let group = shortcut_action_group(action, strings);
+                assert!(
+                    !group.chars().any(|c| c.is_ascii_alphabetic()),
+                    "{action} still has an English group in {}: {group}",
+                    strings.locale.tag(),
+                );
+                assert_ne!(
+                    shortcut_action_label(action, en),
+                    shortcut_action_label(action, strings),
+                    "{action} has one label for every locale",
+                );
+            }
+        }
+    }
+
     #[test]
     fn image_edit_shortcuts_bind_undo_and_redo_without_stealing_text_input_chords() {
         assert!(shortcut_is_valid(UNDO_IMAGE_EDIT_SHORTCUT));
@@ -68149,14 +68227,15 @@ mod tests {
             "foundation shortcut defaults must stay conflict free"
         );
 
+        let english = locale::strings(locale::ResolvedLocale::En);
         for action in ["undo_image_edit", "redo_image_edit"] {
             assert!(
                 FOUNDATION_SHORTCUTS.iter().any(|(name, _)| *name == action),
                 "{action} must be remappable from the shortcuts settings page"
             );
             assert_ne!(action_name(action), "vibex::NoAction");
-            assert_ne!(shortcut_action_label(action), "Shortcut");
-            assert_ne!(shortcut_action_group(action), "Vibex");
+            assert_ne!(shortcut_action_label(action, english), "Shortcut");
+            assert_ne!(shortcut_action_group(action, english), "Vibex");
             let mut bindings = Vec::new();
             bind_action(&mut bindings, "ctrl-z", action, false);
             assert_eq!(bindings.len(), 1, "{action} must resolve to a key binding");

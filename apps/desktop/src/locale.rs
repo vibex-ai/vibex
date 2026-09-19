@@ -22,6 +22,13 @@ impl ResolvedLocale {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Strings {
+    /// The locale this snapshot was resolved for.
+    ///
+    /// Carried on the snapshot so a caller holding a [`Strings`] can resolve a
+    /// further label in the same language. Reaching for the process-wide locale
+    /// instead would make the same decision twice and let the two disagree —
+    /// which is how a screen ends up half translated.
+    pub locale: ResolvedLocale,
     pub sessions: &'static str,
     pub workbench: &'static str,
     pub preview: &'static str,
@@ -210,6 +217,7 @@ pub fn resolve_locale(mode: LocaleMode, system_locale: Option<&str>) -> Resolved
 pub fn strings(locale: ResolvedLocale) -> Strings {
     match locale {
         ResolvedLocale::En => Strings {
+            locale: ResolvedLocale::En,
             sessions: "Sessions",
             workbench: "Workbench",
             preview: "Preview",
@@ -382,6 +390,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             sidebar_yesterday: "Yesterday",
         },
         ResolvedLocale::ZhCn => Strings {
+            locale: ResolvedLocale::ZhCn,
             sessions: "会话",
             workbench: "工作台",
             preview: "预览",
@@ -554,6 +563,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             sidebar_yesterday: "昨天",
         },
         ResolvedLocale::ZhTw => Strings {
+            locale: ResolvedLocale::ZhTw,
             sessions: "工作階段",
             workbench: "工作台",
             preview: "預覽",
