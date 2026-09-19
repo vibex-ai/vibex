@@ -55026,81 +55026,94 @@ impl FoundationSettings {
             strings.general,
             strings.general_description,
             vec![
-                setting_row(
-                    strings.language,
-                    strings.language_description,
-                    language_select,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("General", "常规", "一般"),
+                    vec![
+                        setting_row(
+                            strings.language,
+                            strings.language_description,
+                            language_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.close_to_tray,
+                            strings.close_to_tray_description,
+                            close_to_tray_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Startup", "启动行为", "啟動行為"),
+                            locale::text(
+                                "Choose what opens after the local runtime is ready.",
+                                "选择本地运行时就绪后的打开内容。",
+                                "選擇本機執行階段就緒後要開啟的內容。",
+                            ),
+                            startup_control,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Launch at login", "开机启动", "登入時啟動"),
+                            locale::text(
+                                "Start Vibex when you sign in.",
+                                "登录系统时启动 Vibex。",
+                                "登入系統時啟動 Vibex。",
+                            ),
+                            launch_at_login,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.close_to_tray,
-                    strings.close_to_tray_description,
-                    close_to_tray_switch,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Network", "网络", "網路"),
+                    vec![setting_row(
+                        strings.network_proxy,
+                        strings.network_proxy_description,
+                        proxy_control,
+                        stacked,
+                        cx,
+                    )],
                 ),
-                setting_row(
-                    strings.network_proxy,
-                    strings.network_proxy_description,
-                    proxy_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Startup", "启动行为", "啟動行為"),
-                    locale::text(
-                        "Choose what opens after the local runtime is ready.",
-                        "选择本地运行时就绪后的打开内容。",
-                        "選擇本機執行階段就緒後要開啟的內容。",
-                    ),
-                    startup_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Launch at login", "开机启动", "登入時啟動"),
-                    locale::text(
-                        "Start Vibex when you sign in.",
-                        "登录系统时启动 Vibex。",
-                        "登入系統時啟動 Vibex。",
-                    ),
-                    launch_at_login,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("System notifications", "系统通知", "系統通知"),
-                    locale::text(
-                        "Show desktop notifications for Agent activity.",
-                        "显示 Agent 活动的桌面通知。",
-                        "顯示 Agent 活動的桌面通知。",
-                    ),
-                    notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Automatic updates", "自动更新", "自動更新"),
-                    locale::text(
-                        "Download a signed release as soon as it is found. Install it now, or let Vibex install it when you quit.",
-                        "发现已签名的新版本后立即下载；可立即安装，或在退出应用时自动安装。",
-                        "發現已簽署的新版本後立即下載；可立即安裝，或在結束應用程式時自動安裝。",
-                    ),
-                    auto_update,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Update prompts", "更新提示", "更新提示"),
-                    locale::text(
-                        "Show the title-bar update button and update panel. Background security checks remain enabled.",
-                        "显示标题栏更新按钮和更新浮层；后台安全检查始终保持启用。",
-                        "顯示標題列更新按鈕與更新浮層；背景安全檢查始終保持啟用。",
-                    ),
-                    update_prompts,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Notifications & updates", "通知与更新", "通知與更新"),
+                    vec![
+                        setting_row(
+                            locale::text("System notifications", "系统通知", "系統通知"),
+                            locale::text(
+                                "Show desktop notifications for Agent activity.",
+                                "显示 Agent 活动的桌面通知。",
+                                "顯示 Agent 活動的桌面通知。",
+                            ),
+                            notifications,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Automatic updates", "自动更新", "自動更新"),
+                            locale::text(
+                                "Download a signed release as soon as it is found. Install it now, or let Vibex install it when you quit.",
+                                "发现已签名的新版本后立即下载；可立即安装，或在退出应用时自动安装。",
+                                "發現已簽署的新版本後立即下載；可立即安裝，或在結束應用程式時自動安裝。",
+                            ),
+                            auto_update,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Update prompts", "更新提示", "更新提示"),
+                            locale::text(
+                                "Show the title-bar update button and update panel. Background security checks remain enabled.",
+                                "显示标题栏更新按钮和更新浮层；后台安全检查始终保持启用。",
+                                "顯示標題列更新按鈕與更新浮層；背景安全檢查始終保持啟用。",
+                            ),
+                            update_prompts,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
             ],
             cx,
@@ -55160,175 +55173,187 @@ impl FoundationSettings {
             Some(strings.choose_code_font),
             cx,
         );
-        settings_page_with_leading(
+        settings_page(
             strings.appearance,
             strings.appearance_description,
-            // The appearance control is a section of its own: the preview cards
-            // need the page's full width, which a row inside the panel cannot
-            // give them.
-            Some(
-                v_flex()
-                    .gap_3()
-                    .child(div().text_sm().font_semibold().child(strings.theme))
-                    .child(mode_cards)
-                    .into_any_element(),
-            ),
             vec![
-                setting_row(
-                    strings.light_theme,
-                    strings.light_theme_description,
-                    light_theme_select,
-                    stacked,
-                    cx,
+                // The preview cards need the page's full width, which a row
+                // inside the panel cannot give them.
+                SettingsGroup::with_leading(
+                    strings.theme,
+                    mode_cards,
+                    vec![
+                        setting_row(
+                            strings.light_theme,
+                            strings.light_theme_description,
+                            light_theme_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.dark_theme,
+                            strings.dark_theme_description,
+                            dark_theme_select,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.dark_theme,
-                    strings.dark_theme_description,
-                    dark_theme_select,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Display", "显示", "顯示"),
+                    vec![
+                        setting_row(
+                            strings.window_scale,
+                            strings.window_scale_description,
+                            settings_number_stepper(
+                                "window-scale",
+                                appearance.window_scale_percent,
+                                Some("%"),
+                                75,
+                                200,
+                                cx.listener(|this, _, window, cx| {
+                                    this.adjust_window_scale(-10, window, cx)
+                                }),
+                                cx.listener(|this, _, window, cx| {
+                                    this.adjust_window_scale(10, window, cx)
+                                }),
+                                strings.decrease_window_scale,
+                                strings.increase_window_scale,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Reduced motion", "减少动效", "減少動效"),
+                            locale::text(
+                                "Reduce non-essential interface animation.",
+                                "减少非必要界面动画。",
+                                "減少非必要介面動畫。",
+                            ),
+                            Switch::new("reduced-motion")
+                                .small()
+                                .checked(appearance.reduced_motion)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_reduced_motion(*enabled, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("High contrast", "高对比度", "高對比度"),
+                            locale::text(
+                                "Increase borders and focus contrast.",
+                                "提高边框和焦点对比度。",
+                                "提高邊框與焦點對比度。",
+                            ),
+                            Switch::new("high-contrast")
+                                .small()
+                                .checked(appearance.high_contrast)
+                                .on_click(cx.listener(|this, enabled, window, cx| {
+                                    this.set_high_contrast(*enabled, window, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.window_scale,
-                    strings.window_scale_description,
-                    settings_number_stepper(
-                        "window-scale",
-                        appearance.window_scale_percent,
-                        Some("%"),
-                        75,
-                        200,
-                        cx.listener(|this, _, window, cx| {
-                            this.adjust_window_scale(-10, window, cx)
-                        }),
-                        cx.listener(|this, _, window, cx| this.adjust_window_scale(10, window, cx)),
-                        strings.decrease_window_scale,
-                        strings.increase_window_scale,
-                        cx,
-                    ),
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Fonts", "字体", "字型"),
+                    vec![
+                        setting_row(
+                            strings.interface_font,
+                            strings.interface_font_description,
+                            interface_font_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.interface_font_size,
+                            strings.interface_font_size_description,
+                            settings_number_stepper(
+                                "interface-size",
+                                appearance.interface_font.size,
+                                Some("px"),
+                                12,
+                                24,
+                                cx.listener(|this, _, _, cx| this.adjust_interface_font(-1, 0, cx)),
+                                cx.listener(|this, _, _, cx| this.adjust_interface_font(1, 0, cx)),
+                                strings.decrease_font_size,
+                                strings.increase_font_size,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.interface_font_weight,
+                            strings.interface_font_weight_description,
+                            settings_number_stepper(
+                                "interface-weight",
+                                appearance.interface_font.weight,
+                                None,
+                                100,
+                                900,
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_interface_font(0, -100, cx)
+                                }),
+                                cx.listener(|this, _, _, cx| {
+                                    this.adjust_interface_font(0, 100, cx)
+                                }),
+                                strings.decrease_font_weight,
+                                strings.increase_font_weight,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.code_font,
+                            strings.code_font_description,
+                            code_font_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.code_font_size,
+                            strings.code_font_size_description,
+                            settings_number_stepper(
+                                "code-size",
+                                appearance.code_font.size,
+                                Some("px"),
+                                10,
+                                24,
+                                cx.listener(|this, _, _, cx| this.adjust_code_font(-1, 0, cx)),
+                                cx.listener(|this, _, _, cx| this.adjust_code_font(1, 0, cx)),
+                                strings.decrease_font_size,
+                                strings.increase_font_size,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.code_font_weight,
+                            strings.code_font_weight_description,
+                            settings_number_stepper(
+                                "code-weight",
+                                appearance.code_font.weight,
+                                None,
+                                100,
+                                900,
+                                cx.listener(|this, _, _, cx| this.adjust_code_font(0, -100, cx)),
+                                cx.listener(|this, _, _, cx| this.adjust_code_font(0, 100, cx)),
+                                strings.decrease_font_weight,
+                                strings.increase_font_weight,
+                                cx,
+                            ),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.interface_font,
-                    strings.interface_font_description,
-                    interface_font_select,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.interface_font_size,
-                    strings.interface_font_size_description,
-                    settings_number_stepper(
-                        "interface-size",
-                        appearance.interface_font.size,
-                        Some("px"),
-                        12,
-                        24,
-                        cx.listener(|this, _, _, cx| this.adjust_interface_font(-1, 0, cx)),
-                        cx.listener(|this, _, _, cx| this.adjust_interface_font(1, 0, cx)),
-                        strings.decrease_font_size,
-                        strings.increase_font_size,
-                        cx,
-                    ),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.interface_font_weight,
-                    strings.interface_font_weight_description,
-                    settings_number_stepper(
-                        "interface-weight",
-                        appearance.interface_font.weight,
-                        None,
-                        100,
-                        900,
-                        cx.listener(|this, _, _, cx| this.adjust_interface_font(0, -100, cx)),
-                        cx.listener(|this, _, _, cx| this.adjust_interface_font(0, 100, cx)),
-                        strings.decrease_font_weight,
-                        strings.increase_font_weight,
-                        cx,
-                    ),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.code_font,
-                    strings.code_font_description,
-                    code_font_select,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.code_font_size,
-                    strings.code_font_size_description,
-                    settings_number_stepper(
-                        "code-size",
-                        appearance.code_font.size,
-                        Some("px"),
-                        10,
-                        24,
-                        cx.listener(|this, _, _, cx| this.adjust_code_font(-1, 0, cx)),
-                        cx.listener(|this, _, _, cx| this.adjust_code_font(1, 0, cx)),
-                        strings.decrease_font_size,
-                        strings.increase_font_size,
-                        cx,
-                    ),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.code_font_weight,
-                    strings.code_font_weight_description,
-                    settings_number_stepper(
-                        "code-weight",
-                        appearance.code_font.weight,
-                        None,
-                        100,
-                        900,
-                        cx.listener(|this, _, _, cx| this.adjust_code_font(0, -100, cx)),
-                        cx.listener(|this, _, _, cx| this.adjust_code_font(0, 100, cx)),
-                        strings.decrease_font_weight,
-                        strings.increase_font_weight,
-                        cx,
-                    ),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Reduced motion", "减少动效", "減少動效"),
-                    locale::text(
-                        "Reduce non-essential interface animation.",
-                        "减少非必要界面动画。",
-                        "減少非必要介面動畫。",
-                    ),
-                    Switch::new("reduced-motion")
-                        .small()
-                        .checked(appearance.reduced_motion)
-                        .on_click(cx.listener(|this, enabled, _, cx| {
-                            this.set_reduced_motion(*enabled, cx)
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("High contrast", "高对比度", "高對比度"),
-                    locale::text(
-                        "Increase borders and focus contrast.",
-                        "提高边框和焦点对比度。",
-                        "提高邊框與焦點對比度。",
-                    ),
-                    Switch::new("high-contrast")
-                        .small()
-                        .checked(appearance.high_contrast)
-                        .on_click(cx.listener(|this, enabled, window, cx| {
-                            this.set_high_contrast(*enabled, window, cx)
-                        })),
-                    stacked,
-                    cx,
-                ),
-            ]
-            .into_iter()
-            .collect(),
+            ],
             cx,
         )
     }
@@ -55511,170 +55536,207 @@ impl FoundationSettings {
             strings.session_settings,
             strings.session_settings_description,
             vec![
-                setting_row(
-                    strings.session_turn_preview_rail,
-                    strings.session_turn_preview_rail_description,
-                    turn_preview_rail_switch,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Session display", "会话显示", "會話顯示"),
+                    vec![
+                        setting_row(
+                            strings.session_turn_preview_rail,
+                            strings.session_turn_preview_rail_description,
+                            turn_preview_rail_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.show_agent_generation_status,
+                            strings.show_agent_generation_status_description,
+                            show_agent_generation_status_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.session_content_width,
+                            strings.session_content_width_description,
+                            session_content_width_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.reasoning_display_mode,
+                            strings.reasoning_display_mode_description,
+                            reasoning_display_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.reasoning_expanded_by_default,
+                            strings.reasoning_expanded_by_default_description,
+                            reasoning_expanded_by_default_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.enhanced_command_execution_display,
+                            strings.enhanced_command_execution_display_description,
+                            enhanced_command_execution_switch,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            strings.enhanced_file_operation_display,
+                            strings.enhanced_file_operation_display_description,
+                            enhanced_file_operation_switch,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.show_agent_generation_status,
-                    strings.show_agent_generation_status_description,
-                    show_agent_generation_status_switch,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Composer", "输入与发送", "輸入與傳送"),
+                    vec![
+                        setting_row(
+                            locale::text("Queue sending", "队列发送", "佇列傳送"),
+                            locale::text(
+                                "Choose the default behavior while an Agent is running.",
+                                "选择 Agent 运行时的默认队列行为。",
+                                "選擇 Agent 執行時的預設佇列行為。",
+                            ),
+                            queue_control,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Message send key", "消息发送按键", "訊息傳送按鍵"),
+                            locale::text(
+                                "Choose whether Enter or Cmd/Ctrl+Enter sends a message.",
+                                "选择 Enter 或 Cmd/Ctrl+Enter 发送消息。",
+                                "選擇 Enter 或 Cmd/Ctrl+Enter 傳送訊息。",
+                            ),
+                            send_key_control,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    strings.session_content_width,
-                    strings.session_content_width_description,
-                    session_content_width_select,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.reasoning_display_mode,
-                    strings.reasoning_display_mode_description,
-                    reasoning_display_select,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.reasoning_expanded_by_default,
-                    strings.reasoning_expanded_by_default_description,
-                    reasoning_expanded_by_default_switch,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.enhanced_command_execution_display,
-                    strings.enhanced_command_execution_display_description,
-                    enhanced_command_execution_switch,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    strings.enhanced_file_operation_display,
-                    strings.enhanced_file_operation_display_description,
-                    enhanced_file_operation_switch,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Queue sending", "队列发送", "佇列傳送"),
-                    locale::text(
-                        "Choose the default behavior while an Agent is running.",
-                        "选择 Agent 运行时的默认队列行为。",
-                        "選擇 Agent 執行時的預設佇列行為。",
-                    ),
-                    queue_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Message send key", "消息发送按键", "訊息傳送按鍵"),
-                    locale::text(
-                        "Choose whether Enter or Cmd/Ctrl+Enter sends a message.",
-                        "选择 Enter 或 Cmd/Ctrl+Enter 发送消息。",
-                        "選擇 Enter 或 Cmd/Ctrl+Enter 傳送訊息。",
-                    ),
-                    send_key_control,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
+                SettingsGroup::new(
                     locale::text("Auto-continue", "自动继续", "自動繼續"),
-                    locale::text(
-                        "Apply auto-continue to the selected session.",
-                        "为当前选中的会话启用自动继续。",
-                        "為目前選取的會話啟用自動繼續。",
-                    ),
-                    Switch::new("auto-continue")
-                        .small()
-                        .checked(auto_continue)
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.toggle_current_auto_continue(cx)),
+                    vec![
+                        setting_row(
+                            locale::text("Auto-continue", "自动继续", "自動繼續"),
+                            locale::text(
+                                "Apply auto-continue to the selected session.",
+                                "为当前选中的会话启用自动继续。",
+                                "為目前選取的會話啟用自動繼續。",
+                            ),
+                            Switch::new("auto-continue")
+                                .small()
+                                .checked(auto_continue)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_current_auto_continue(cx)
+                                })),
+                            stacked,
+                            cx,
                         ),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent completed", "Agent 完成", "Agent 完成"),
-                    locale::text(
-                        "Notify when an Agent turn completes.",
-                        "Agent 回合完成时通知。",
-                        "Agent 回合完成時通知。",
-                    ),
-                    completed_notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
-                    locale::text(
-                        "Notify when an Agent is waiting for input.",
-                        "Agent 等待输入时通知。",
-                        "Agent 等待輸入時通知。",
-                    ),
-                    needs_input_notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
-                    locale::text(
-                        "Notify when an Agent turn fails.",
-                        "Agent 回合失败时通知。",
-                        "Agent 回合失敗時通知。",
-                    ),
-                    failed_notifications,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Remembered runtime", "已记住的运行时", "已記住的執行階段"),
-                    locale::text(
-                        "Clear the default and per-agent runtime selections used by new sessions.",
-                        "清除新会话使用的默认和按 Agent 记忆的运行时选择。",
-                        "清除新會話使用的預設與按 Agent 記住的執行階段選擇。",
-                    ),
-                    Button::new("clear-runtime-preferences")
-                        .small()
-                        .outline()
-                        .disabled(!runtime_preferences)
-                        .label(locale::text("Clear", "清除", "清除"))
-                        .on_click(cx.listener(|this, _, _, cx| this.clear_runtime_preferences(cx))),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Auto-continue defaults", "自动继续默认项", "自動繼續預設項"),
-                    locale::text(
-                        "Clear project and session auto-continue overrides.",
-                        "清除项目和会话的自动继续覆盖项。",
-                        "清除專案與會話的自動繼續覆寫項。",
-                    ),
-                    Button::new("clear-auto-continue-preferences")
-                        .small()
-                        .outline()
-                        .disabled(!auto_continue_preferences)
-                        .label(locale::text("Clear", "清除", "清除"))
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.clear_auto_continue_preferences(cx)),
+                        setting_row(
+                            locale::text(
+                                "Auto-continue defaults",
+                                "自动继续默认项",
+                                "自動繼續預設項",
+                            ),
+                            locale::text(
+                                "Clear project and session auto-continue overrides.",
+                                "清除项目和会话的自动继续覆盖项。",
+                                "清除專案與會話的自動繼續覆寫項。",
+                            ),
+                            Button::new("clear-auto-continue-preferences")
+                                .small()
+                                .outline()
+                                .disabled(!auto_continue_preferences)
+                                .label(locale::text("Clear", "清除", "清除"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_auto_continue_preferences(cx)
+                                })),
+                            stacked,
+                            cx,
                         ),
-                    stacked,
-                    cx,
+                    ],
                 ),
-                setting_row(
-                    locale::text("Agent configuration", "Agent 配置", "Agent 設定"),
-                    locale::text(
-                        "Credentials, providers, MCP, Skills and hooks stay in the Management Center.",
-                        "凭据、供应商、MCP、Skills 和 Hooks 仍由管理中心负责。",
-                        "憑證、供應商、MCP、Skills 與 Hooks 仍由管理中心負責。",
-                    ),
-                    agent_jump,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Agent notifications", "Agent 通知", "Agent 通知"),
+                    vec![
+                        setting_row(
+                            locale::text("Agent completed", "Agent 完成", "Agent 完成"),
+                            locale::text(
+                                "Notify when an Agent turn completes.",
+                                "Agent 回合完成时通知。",
+                                "Agent 回合完成時通知。",
+                            ),
+                            completed_notifications,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Agent needs input", "Agent 需要输入", "Agent 需要輸入"),
+                            locale::text(
+                                "Notify when an Agent is waiting for input.",
+                                "Agent 等待输入时通知。",
+                                "Agent 等待輸入時通知。",
+                            ),
+                            needs_input_notifications,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Agent failed", "Agent 失败", "Agent 失敗"),
+                            locale::text(
+                                "Notify when an Agent turn fails.",
+                                "Agent 回合失败时通知。",
+                                "Agent 回合失敗時通知。",
+                            ),
+                            failed_notifications,
+                            stacked,
+                            cx,
+                        ),
+                    ],
+                ),
+                SettingsGroup::new(
+                    locale::text("Runtime & agents", "运行时与 Agent", "執行階段與 Agent"),
+                    vec![
+                        setting_row(
+                            locale::text(
+                                "Remembered runtime",
+                                "已记住的运行时",
+                                "已記住的執行階段",
+                            ),
+                            locale::text(
+                                "Clear the default and per-agent runtime selections used by new sessions.",
+                                "清除新会话使用的默认和按 Agent 记忆的运行时选择。",
+                                "清除新會話使用的預設與按 Agent 記住的執行階段選擇。",
+                            ),
+                            Button::new("clear-runtime-preferences")
+                                .small()
+                                .outline()
+                                .disabled(!runtime_preferences)
+                                .label(locale::text("Clear", "清除", "清除"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.clear_runtime_preferences(cx)
+                                    }),
+                                ),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Agent configuration", "Agent 配置", "Agent 設定"),
+                            locale::text(
+                                "Credentials, providers, MCP, Skills and hooks stay in the Management Center.",
+                                "凭据、供应商、MCP、Skills 和 Hooks 仍由管理中心负责。",
+                                "憑證、供應商、MCP、Skills 與 Hooks 仍由管理中心負責。",
+                            ),
+                            agent_jump,
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
             ],
             cx,
@@ -55841,109 +55903,129 @@ impl FoundationSettings {
                 "設定版面與新會話預設值。",
             ),
             vec![
-                setting_row(
-                    locale::text("Sidebar hierarchy", "侧栏层级", "側欄層級"),
-                    locale::text(
-                        "Choose compact project groups or detailed workspace nesting.",
-                        "选择会话视图或工作区视图。",
-                        "選擇會話視圖或工作區視圖。",
+                SettingsGroup::new(
+                    locale::text("Sidebar", "侧栏", "側欄"),
+                    vec![
+                    setting_row(
+                        locale::text("Sidebar hierarchy", "侧栏层级", "側欄層級"),
+                        locale::text(
+                            "Choose compact project groups or detailed workspace nesting.",
+                            "选择会话视图或工作区视图。",
+                            "選擇會話視圖或工作區視圖。",
+                        ),
+                        hierarchy_control,
+                        stacked,
+                        cx,
                     ),
-                    hierarchy_control,
-                    stacked,
-                    cx,
+                    setting_row(
+                        locale::text(
+                            "Show Git change count",
+                            "显示 Git 变更数量",
+                            "顯示 Git 變更數量",
+                        ),
+                        locale::text(
+                            "Show the number of pending changes on the Git activity button.",
+                            "在 Git 活动按钮上显示待处理变更数量。",
+                            "在 Git 活動按鈕上顯示待處理變更數量。",
+                        ),
+                        Switch::new("show-git-change-count")
+                            .small()
+                            .checked(workbench.show_git_change_count)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.set_show_git_change_count(*enabled, cx)
+                            })),
+                        stacked,
+                        cx,
+                    ),
+                    ],
                 ),
-                setting_row(
-                    locale::text(
-                        "Default new-session location",
-                        "新会话默认位置",
-                        "新會話預設位置",
+                SettingsGroup::new(
+                    locale::text("New sessions", "新会话", "新會話"),
+                    vec![
+                    setting_row(
+                        locale::text(
+                            "Default new-session location",
+                            "新会话默认位置",
+                            "新會話預設位置",
+                        ),
+                        locale::text(
+                            "Used when a project has no explicit override.",
+                            "项目没有覆盖项时使用。",
+                            "專案沒有覆寫項時使用。",
+                        ),
+                        location_control,
+                        stacked,
+                        cx,
                     ),
-                    locale::text(
-                        "Used when a project has no explicit override.",
-                        "项目没有覆盖项时使用。",
-                        "專案沒有覆寫項時使用。",
+                    setting_row(
+                        locale::text("Project overrides", "项目覆盖项", "專案覆寫項"),
+                        locale::text(
+                            "Review and clear saved new-session location overrides.",
+                            "查看并清除已保存的新会话位置覆盖项。",
+                            "檢視並清除已儲存的新會話位置覆寫項。",
+                        ),
+                        clear_overrides,
+                        stacked,
+                        cx,
                     ),
-                    location_control,
-                    stacked,
-                    cx,
+                    ],
                 ),
-                setting_row(
-                    locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
-                    locale::text(
-                        "Restore panel visibility, sizes and open editor state.",
-                        "恢复面板可见性、尺寸和打开的编辑器状态。",
-                        "還原面板可見性、尺寸與開啟的編輯器狀態。",
+                SettingsGroup::new(
+                    locale::text("Layout", "布局", "版面"),
+                    vec![
+                    setting_row(
+                        locale::text("Remember layout", "记住工作台布局", "記住工作台版面"),
+                        locale::text(
+                            "Restore panel visibility, sizes and open editor state.",
+                            "恢复面板可见性、尺寸和打开的编辑器状态。",
+                            "還原面板可見性、尺寸與開啟的編輯器狀態。",
+                        ),
+                        Switch::new("remember-layout")
+                            .small()
+                            .checked(workbench.remember_layout)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.set_workbench_remember_layout(*enabled, cx)
+                            })),
+                        stacked,
+                        cx,
                     ),
-                    Switch::new("remember-layout")
-                        .small()
-                        .checked(workbench.remember_layout)
-                        .on_click(cx.listener(|this, enabled, _, cx| {
-                            this.set_workbench_remember_layout(*enabled, cx)
-                        })),
-                    stacked,
-                    cx,
+                    setting_row(
+                        locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+                        locale::text(
+                            "Restore default panel visibility and sizes without deleting sessions.",
+                            "恢复默认面板可见性和尺寸，不删除会话。",
+                            "還原預設面板可見性與尺寸，不刪除會話。",
+                        ),
+                        Button::new("reset-layout")
+                            .small()
+                            .outline()
+                            .label(locale::text("Reset layout", "重置布局", "重設版面"))
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
+                        stacked,
+                        cx,
+                    ),
+                    ],
                 ),
-                setting_row(
-                    locale::text(
-                        "Show Git change count",
-                        "显示 Git 变更数量",
-                        "顯示 Git 變更數量",
+                SettingsGroup::new(
+                    locale::text("Editor", "编辑器", "編輯器"),
+                    vec![
+                    setting_row(
+                        locale::text("Autosave", "自动保存", "自動儲存"),
+                        locale::text(
+                            "Write edited files without asking. Manual keeps the save shortcut as the only way to store changes.",
+                            "自动写回已编辑的文件；选择手动保存时，只有保存快捷键会写入更改。",
+                            "自動寫回已編輯的檔案；選擇手動儲存時，只有儲存快速鍵會寫入變更。",
+                        ),
+                        autosave_control,
+                        stacked,
+                        cx,
                     ),
-                    locale::text(
-                        "Show the number of pending changes on the Git activity button.",
-                        "在 Git 活动按钮上显示待处理变更数量。",
-                        "在 Git 活動按鈕上顯示待處理變更數量。",
-                    ),
-                    Switch::new("show-git-change-count")
-                        .small()
-                        .checked(workbench.show_git_change_count)
-                        .on_click(cx.listener(|this, enabled, _, cx| {
-                            this.set_show_git_change_count(*enabled, cx)
-                        })),
-                    stacked,
-                    cx,
+                    ]
+                    .into_iter()
+                    .chain(autosave_delay_row)
+                    .collect(),
                 ),
-                setting_row(
-                    locale::text("Project overrides", "项目覆盖项", "專案覆寫項"),
-                    locale::text(
-                        "Review and clear saved new-session location overrides.",
-                        "查看并清除已保存的新会话位置覆盖项。",
-                        "檢視並清除已儲存的新會話位置覆寫項。",
-                    ),
-                    clear_overrides,
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
-                    locale::text(
-                        "Restore default panel visibility and sizes without deleting sessions.",
-                        "恢复默认面板可见性和尺寸，不删除会话。",
-                        "還原預設面板可見性與尺寸，不刪除會話。",
-                    ),
-                    Button::new("reset-layout")
-                        .small()
-                        .outline()
-                        .label(locale::text("Reset layout", "重置布局", "重設版面"))
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Autosave", "自动保存", "自動儲存"),
-                    locale::text(
-                        "Write edited files without asking. Manual keeps the save shortcut as the only way to store changes.",
-                        "自动写回已编辑的文件；选择手动保存时，只有保存快捷键会写入更改。",
-                        "自動寫回已編輯的檔案；選擇手動儲存時，只有儲存快速鍵會寫入變更。",
-                    ),
-                    autosave_control,
-                    stacked,
-                    cx,
-                ),
-            ]
-            .into_iter()
-            .chain(autosave_delay_row)
-            .collect(),
+            ],
             cx,
         )
     }
@@ -56005,44 +56087,52 @@ impl FoundationSettings {
                 "設定新建終端機的預設值。",
             ),
             vec![
-                setting_row(
-                    locale::text("Default shell", "默认 Shell", "預設 Shell"),
-                    locale::text(
-                        "Applied to both composer and preview terminals.",
-                        "同时应用到对话和预览终端。",
-                        "同時套用到對話與預覽終端機。",
-                    ),
-                    shell_select,
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Shell", "Shell", "Shell"),
+                    vec![
+                        setting_row(
+                            locale::text("Default shell", "默认 Shell", "預設 Shell"),
+                            locale::text(
+                                "Applied to both composer and preview terminals.",
+                                "同时应用到对话和预览终端。",
+                                "同時套用到對話與預覽終端機。",
+                            ),
+                            shell_select,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Custom shell", "自定义 Shell", "自訂 Shell"),
+                            locale::text(
+                                "Use an executable not listed by the system.",
+                                "使用系统列表中没有的可执行文件。",
+                                "使用系統清單中沒有的可執行檔。",
+                            ),
+                            Button::new("custom-shell")
+                                .small()
+                                .outline()
+                                .label(locale::text("Choose path", "选择路径", "選擇路徑"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_custom_shell_dialog(window, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    locale::text("Custom shell", "自定义 Shell", "自訂 Shell"),
-                    locale::text(
-                        "Use an executable not listed by the system.",
-                        "使用系统列表中没有的可执行文件。",
-                        "使用系統清單中沒有的可執行檔。",
-                    ),
-                    Button::new("custom-shell")
-                        .small()
-                        .outline()
-                        .label(locale::text("Choose path", "选择路径", "選擇路徑"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_custom_shell_dialog(window, cx)
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
+                SettingsGroup::new(
                     locale::text("Working directory", "工作目录", "工作目錄"),
-                    locale::text(
-                        "Choose the initial directory for new terminals.",
-                        "选择新终端的初始目录。",
-                        "選擇新終端機的初始目錄。",
-                    ),
-                    cwd_control,
-                    stacked,
-                    cx,
+                    vec![setting_row(
+                        locale::text("Working directory", "工作目录", "工作目錄"),
+                        locale::text(
+                            "Choose the initial directory for new terminals.",
+                            "选择新终端的初始目录。",
+                            "選擇新終端機的初始目錄。",
+                        ),
+                        cwd_control,
+                        stacked,
+                        cx,
+                    )],
                 ),
             ],
             cx,
@@ -56144,7 +56234,7 @@ impl FoundationSettings {
                 "查看和自定义快捷键，修改立即生效。",
                 "檢視與自訂快速鍵，變更會立即生效。",
             ),
-            rows,
+            vec![SettingsGroup::unlabeled(rows)],
             cx,
         )
     }
@@ -56207,163 +56297,180 @@ impl FoundationSettings {
                 "檢查本機儲存並開啟現有診斷流程。",
             ),
             vec![
-                setting_row(
+                SettingsGroup::new(
                     locale::text("Local storage", "本地存储", "本機儲存"),
-                    locale::text(
-                        "Database, sessions, terminal records, attachments and diagnostics.",
-                        "数据库、会话、终端记录、附件和诊断文件。",
-                        "資料庫、會話、終端機記錄、附件與診斷檔案。",
-                    ),
-                    storage_control,
-                    stacked,
-                    cx,
+                    vec![
+                        setting_row(
+                            locale::text("Local storage", "本地存储", "本機儲存"),
+                            locale::text(
+                                "Database, sessions, terminal records, attachments and diagnostics.",
+                                "数据库、会话、终端记录、附件和诊断文件。",
+                                "資料庫、會話、終端機記錄、附件與診斷檔案。",
+                            ),
+                            storage_control,
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Sessions and attachments", "会话与附件", "會話與附件"),
+                            locale::text(
+                                "Remove local session history and uploaded or edited attachment files.",
+                                "删除本地会话历史以及已上传或编辑的附件文件。",
+                                "刪除本機會話記錄以及已上傳或編輯的附件檔案。",
+                            ),
+                            Button::new("clear-sessions-and-attachments")
+                                .small()
+                                .outline()
+                                .danger()
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .label(locale::text("Clear", "清理", "清理"))
+                                .disabled(cleanup_disabled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_storage_cleanup(
+                                        StorageCleanupKind::SessionsAndAttachments,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Terminal data", "终端数据", "終端機資料"),
+                            locale::text(
+                                "Stop active terminals and remove their local records.",
+                                "停止活动终端并删除本地终端记录。",
+                                "停止作用中的終端機並刪除本機終端機記錄。",
+                            ),
+                            Button::new("clear-terminal-data")
+                                .small()
+                                .outline()
+                                .danger()
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .label(locale::text("Clear", "清理", "清理"))
+                                .disabled(cleanup_disabled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_storage_cleanup(
+                                        StorageCleanupKind::Terminals,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Data directory", "数据目录", "資料目錄"),
+                            locale::text(
+                                "Reveal the authoritative local runtime home.",
+                                "打开权威本地运行时目录。",
+                                "開啟權威本機執行階段目錄。",
+                            ),
+                            Button::new("open-data-directory")
+                                .small()
+                                .outline()
+                                .disabled(open_home.is_none())
+                                .label(locale::text("Open", "打开", "開啟"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(path) = open_home.clone() {
+                                        let _ = reveal_path_in_file_manager(&path);
+                                    }
+                                    let _ = &this;
+                                    cx.notify();
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    locale::text("Sessions and attachments", "会话与附件", "會話與附件"),
-                    locale::text(
-                        "Remove local session history and uploaded or edited attachment files.",
-                        "删除本地会话历史以及已上传或编辑的附件文件。",
-                        "刪除本機會話記錄以及已上傳或編輯的附件檔案。",
-                    ),
-                    Button::new("clear-sessions-and-attachments")
-                        .small()
-                        .outline()
-                        .danger()
-                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                        .label(locale::text("Clear", "清理", "清理"))
-                        .disabled(cleanup_disabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_storage_cleanup(
-                                StorageCleanupKind::SessionsAndAttachments,
-                                window,
-                                cx,
-                            )
-                        })),
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Diagnostics & usage", "诊断与用量", "診斷與用量"),
+                    vec![
+                        setting_row(
+                            locale::text("Diagnostic data", "诊断数据", "診斷資料"),
+                            locale::text(
+                                "Remove diagnostic records, exported diagnostics and local backups.",
+                                "删除诊断记录、导出的诊断文件和本地备份。",
+                                "刪除診斷記錄、匯出的診斷檔案與本機備份。",
+                            ),
+                            Button::new("clear-diagnostic-data")
+                                .small()
+                                .outline()
+                                .danger()
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .label(locale::text("Clear", "清理", "清理"))
+                                .disabled(cleanup_disabled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_storage_cleanup(
+                                        StorageCleanupKind::Diagnostics,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Usage statistics", "用量统计", "用量統計"),
+                            locale::text(
+                                "Open the complete Usage page.",
+                                "打开完整的用量统计页面。",
+                                "開啟完整的用量統計頁面。",
+                            ),
+                            Button::new("open-usage-settings")
+                                .small()
+                                .outline()
+                                .label(locale::text("Open Usage", "打开用量统计", "開啟用量統計"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this
+                                        .workbench
+                                        .update(cx, |workbench, cx| workbench.open_usage(None, cx));
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Diagnostics & recovery", "诊断与恢复", "診斷與復原"),
+                            locale::text(
+                                "Export diagnostics, create backups and recover data in Management Center.",
+                                "在管理中心导出诊断、创建备份和恢复数据。",
+                                "在管理中心匯出診斷、建立備份與復原資料。",
+                            ),
+                            Button::new("open-recovery-settings")
+                                .small()
+                                .outline()
+                                .label(locale::text(
+                                    "Open Management Center",
+                                    "打开管理中心",
+                                    "開啟管理中心",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this
+                                        .workbench
+                                        .update(cx, |workbench, cx| workbench.open_management(cx));
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    locale::text("Terminal data", "终端数据", "終端機資料"),
-                    locale::text(
-                        "Stop active terminals and remove their local records.",
-                        "停止活动终端并删除本地终端记录。",
-                        "停止作用中的終端機並刪除本機終端機記錄。",
-                    ),
-                    Button::new("clear-terminal-data")
-                        .small()
-                        .outline()
-                        .danger()
-                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                        .label(locale::text("Clear", "清理", "清理"))
-                        .disabled(cleanup_disabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_storage_cleanup(StorageCleanupKind::Terminals, window, cx)
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Diagnostic data", "诊断数据", "診斷資料"),
-                    locale::text(
-                        "Remove diagnostic records, exported diagnostics and local backups.",
-                        "删除诊断记录、导出的诊断文件和本地备份。",
-                        "刪除診斷記錄、匯出的診斷檔案與本機備份。",
-                    ),
-                    Button::new("clear-diagnostic-data")
-                        .small()
-                        .outline()
-                        .danger()
-                        .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                        .label(locale::text("Clear", "清理", "清理"))
-                        .disabled(cleanup_disabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_storage_cleanup(
-                                StorageCleanupKind::Diagnostics,
-                                window,
-                                cx,
-                            )
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Data directory", "数据目录", "資料目錄"),
-                    locale::text(
-                        "Reveal the authoritative local runtime home.",
-                        "打开权威本地运行时目录。",
-                        "開啟權威本機執行階段目錄。",
-                    ),
-                    Button::new("open-data-directory")
-                        .small()
-                        .outline()
-                        .disabled(open_home.is_none())
-                        .label(locale::text("Open", "打开", "開啟"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(path) = open_home.clone() {
-                                let _ = reveal_path_in_file_manager(&path);
-                            }
-                            let _ = &this;
-                            cx.notify();
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Usage statistics", "用量统计", "用量統計"),
-                    locale::text(
-                        "Open the complete Usage page.",
-                        "打开完整的用量统计页面。",
-                        "開啟完整的用量統計頁面。",
-                    ),
-                    Button::new("open-usage-settings")
-                        .small()
-                        .outline()
-                        .label(locale::text("Open Usage", "打开用量统计", "開啟用量統計"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this
-                                .workbench
-                                .update(cx, |workbench, cx| workbench.open_usage(None, cx));
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Diagnostics & recovery", "诊断与恢复", "診斷與復原"),
-                    locale::text(
-                        "Export diagnostics, create backups and recover data in Management Center.",
-                        "在管理中心导出诊断、创建备份和恢复数据。",
-                        "在管理中心匯出診斷、建立備份與復原資料。",
-                    ),
-                    Button::new("open-recovery-settings")
-                        .small()
-                        .outline()
-                        .label(locale::text(
-                            "Open Management Center",
-                            "打开管理中心",
-                            "開啟管理中心",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this
-                                .workbench
-                                .update(cx, |workbench, cx| workbench.open_management(cx));
-                        })),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
-                    locale::text(
-                        "Does not remove projects, sessions or local data.",
-                        "不会删除项目、会话或本地数据。",
-                        "不會刪除專案、會話或本機資料。",
-                    ),
-                    Button::new("data-reset-layout")
-                        .small()
-                        .outline()
-                        .label(locale::text("Reset", "重置", "重設"))
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Reset", "重置", "重設"),
+                    vec![setting_row(
+                        locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
+                        locale::text(
+                            "Does not remove projects, sessions or local data.",
+                            "不会删除项目、会话或本地数据。",
+                            "不會刪除專案、會話或本機資料。",
+                        ),
+                        Button::new("data-reset-layout")
+                            .small()
+                            .outline()
+                            .label(locale::text("Reset", "重置", "重設"))
+                            .on_click(cx.listener(|this, _, _, cx| this.reset_layout(cx))),
+                        stacked,
+                        cx,
+                    )],
                 ),
             ],
             cx,
@@ -56634,97 +56741,119 @@ impl FoundationSettings {
                 "版本、建置與專案資訊。",
             ),
             vec![
-                update_card,
-                setting_row(
-                    locale::text("Version", "版本", "版本"),
-                    locale::text(
-                        "Installed Vibex desktop version and release channel.",
-                        "已安装的 Vibex 桌面版本和发布通道。",
-                        "已安裝的 Vibex 桌面版本與發行通道。",
-                    ),
-                    settings_value_chip(format!("{} · {}", env!("CARGO_PKG_VERSION"), channel)),
-                    stacked,
-                    cx,
+                SettingsGroup::with_leading(
+                    locale::text("Software update", "软件更新", "軟體更新"),
+                    update_card,
+                    vec![setting_row(
+                        locale::text("Release notes", "发行说明", "發行說明"),
+                        locale::text(
+                            "Review changes for published releases.",
+                            "查看已发布版本的变更。",
+                            "檢視已發行版本的變更。",
+                        ),
+                        Button::new("open-releases")
+                            .small()
+                            .outline()
+                            .label(locale::text("Open", "打开", "開啟"))
+                            .on_click(|_, _, _| {
+                                let _ =
+                                    open_external_url("https://github.com/vibex-ai/vibex/releases");
+                            }),
+                        stacked,
+                        cx,
+                    )],
                 ),
-                setting_row(
-                    locale::text("Platform", "平台", "平台"),
-                    locale::text(
-                        "Current operating system and architecture.",
-                        "当前操作系统和架构。",
-                        "目前作業系統與架構。",
-                    ),
-                    settings_value_chip(format!(
-                        "{} · {}",
-                        std::env::consts::OS,
-                        std::env::consts::ARCH
-                    )),
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Version information", "版本信息", "版本資訊"),
+                    vec![
+                        setting_row(
+                            locale::text("Version", "版本", "版本"),
+                            locale::text(
+                                "Installed Vibex desktop version and release channel.",
+                                "已安装的 Vibex 桌面版本和发布通道。",
+                                "已安裝的 Vibex 桌面版本與發行通道。",
+                            ),
+                            settings_value_chip(format!(
+                                "{} · {}",
+                                env!("CARGO_PKG_VERSION"),
+                                channel
+                            )),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Platform", "平台", "平台"),
+                            locale::text(
+                                "Current operating system and architecture.",
+                                "当前操作系统和架构。",
+                                "目前作業系統與架構。",
+                            ),
+                            settings_value_chip(format!(
+                                "{} · {}",
+                                std::env::consts::OS,
+                                std::env::consts::ARCH
+                            )),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Environment summary", "环境摘要", "環境摘要"),
+                            locale::text(
+                                "Copy a non-secret summary for support.",
+                                "复制不包含密钥的支持摘要。",
+                                "複製不包含密鑰的支援摘要。",
+                            ),
+                            Button::new("copy-environment-summary")
+                                .small()
+                                .outline()
+                                .icon(IconName::Copy)
+                                .label(locale::text("Copy", "复制", "複製"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_summary.clone(),
+                                    ))
+                                }),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
-                setting_row(
-                    locale::text("Environment summary", "环境摘要", "環境摘要"),
-                    locale::text(
-                        "Copy a non-secret summary for support.",
-                        "复制不包含密钥的支持摘要。",
-                        "複製不包含密鑰的支援摘要。",
-                    ),
-                    Button::new("copy-environment-summary")
-                        .small()
-                        .outline()
-                        .icon(IconName::Copy)
-                        .label(locale::text("Copy", "复制", "複製"))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_summary.clone()))
-                        }),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("License", "许可证", "授權條款"),
-                    "AGPL-3.0-or-later",
-                    Button::new("open-license")
-                        .small()
-                        .outline()
-                        .label(locale::text("Open", "打开", "開啟"))
-                        .on_click(|_, _, _| {
-                            let _ = open_external_url("https://www.gnu.org/licenses/agpl-3.0.html");
-                        }),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Source code", "源代码", "原始碼"),
-                    locale::text(
-                        "Vibex is open source.",
-                        "Vibex 是开源软件。",
-                        "Vibex 是開源軟體。",
-                    ),
-                    Button::new("open-source")
-                        .small()
-                        .outline()
-                        .label("GitHub")
-                        .on_click(|_, _, _| {
-                            let _ = open_external_url("https://github.com/vibex-ai/vibex");
-                        }),
-                    stacked,
-                    cx,
-                ),
-                setting_row(
-                    locale::text("Release notes", "发行说明", "發行說明"),
-                    locale::text(
-                        "Review changes for published releases.",
-                        "查看已发布版本的变更。",
-                        "檢視已發行版本的變更。",
-                    ),
-                    Button::new("open-releases")
-                        .small()
-                        .outline()
-                        .label(locale::text("Open", "打开", "開啟"))
-                        .on_click(|_, _, _| {
-                            let _ = open_external_url("https://github.com/vibex-ai/vibex/releases");
-                        }),
-                    stacked,
-                    cx,
+                SettingsGroup::new(
+                    locale::text("Open source", "开源", "開源"),
+                    vec![
+                        setting_row(
+                            locale::text("License", "许可证", "授權條款"),
+                            "AGPL-3.0-or-later",
+                            Button::new("open-license")
+                                .small()
+                                .outline()
+                                .label(locale::text("Open", "打开", "開啟"))
+                                .on_click(|_, _, _| {
+                                    let _ = open_external_url(
+                                        "https://www.gnu.org/licenses/agpl-3.0.html",
+                                    );
+                                }),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text("Source code", "源代码", "原始碼"),
+                            locale::text(
+                                "Vibex is open source.",
+                                "Vibex 是开源软件。",
+                                "Vibex 是開源軟體。",
+                            ),
+                            Button::new("open-source")
+                                .small()
+                                .outline()
+                                .label("GitHub")
+                                .on_click(|_, _, _| {
+                                    let _ = open_external_url("https://github.com/vibex-ai/vibex");
+                                }),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
             ],
             cx,
@@ -56967,7 +57096,7 @@ impl FoundationSettings {
                 "用于诊断和分析工作台自身的性能。",
                 "用於診斷與分析工作台自身的效能。",
             ),
-            vec![setting_row(
+            vec![SettingsGroup::unlabeled(vec![setting_row(
                 locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
                 locale::text(
                     "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it; while it is on, one sample a second is recorded to the diagnostics folder.",
@@ -56977,7 +57106,7 @@ impl FoundationSettings {
                 fps_monitor_switch,
                 stacked,
                 cx,
-            )],
+            )])],
             cx,
         )
     }
@@ -57787,26 +57916,51 @@ fn settings_appearance_cards_width(viewport_width: f32) -> f32 {
     (dialog_width - navigation_width - SETTINGS_PAGE_PADDING_X * 2.0).max(0.0)
 }
 
+/// One labeled section of a settings page.
+///
+/// A page splits its rows the way a reader would: each group carries a small
+/// label, an optional control that needs the group's full width, and one
+/// rounded panel. An unlabeled group is the whole page — that is what pages
+/// with a single natural section keep using.
+struct SettingsGroup {
+    label: Option<&'static str>,
+    leading: Option<AnyElement>,
+    rows: Vec<AnyElement>,
+}
+
+impl SettingsGroup {
+    fn new(label: &'static str, rows: Vec<AnyElement>) -> Self {
+        Self {
+            label: Some(label),
+            leading: None,
+            rows,
+        }
+    }
+
+    /// A group whose control sits above the panel instead of inside a row, the
+    /// way the appearance preview cards need the page's full width.
+    fn with_leading(label: &'static str, leading: AnyElement, rows: Vec<AnyElement>) -> Self {
+        Self {
+            label: Some(label),
+            leading: Some(leading),
+            rows,
+        }
+    }
+
+    /// A page with one section and nothing to separate it from.
+    fn unlabeled(rows: Vec<AnyElement>) -> Self {
+        Self {
+            label: None,
+            leading: None,
+            rows,
+        }
+    }
+}
+
 fn settings_page(
     title: &'static str,
     description: &'static str,
-    rows: Vec<AnyElement>,
-    cx: &App,
-) -> AnyElement {
-    settings_page_with_leading(title, description, None, rows, cx)
-}
-
-/// The settings page shell, with an optional section between the page header
-/// and the grouped panel.
-///
-/// The appearance page uses it for the theme preview cards: they are a control
-/// that needs the page's full width and a section label of its own, not a row
-/// inside the panel.
-fn settings_page_with_leading(
-    title: &'static str,
-    description: &'static str,
-    leading: Option<AnyElement>,
-    rows: Vec<AnyElement>,
+    groups: Vec<SettingsGroup>,
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
@@ -57820,7 +57974,9 @@ fn settings_page_with_leading(
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .gap_5()
+        // Labeled groups need more air between them than inside one, or the
+        // page reads as a single run of panels.
+        .gap_6()
         // No page background: the scroll viewport behind it paints the surface
         // and rounds the dialog's corners, and a square page fill would cover
         // those corners again while the page is scrolled.
@@ -57839,35 +57995,70 @@ fn settings_page_with_leading(
                         .child(description),
                 ),
         )
-        .when_some(leading, |this, leading| this.child(leading))
-        // Group all rows in one rounded panel with inset separators so the
-        // page reads as a calm grouped list instead of a stack of dividers.
-        .child({
-            let mut panel_rows = Vec::with_capacity(rows.len().saturating_mul(2));
-            for (index, row) in rows.into_iter().enumerate() {
-                if index > 0 {
-                    panel_rows.push(
-                        div()
-                            .flex_none()
-                            .h(px(1.0))
-                            .bg(border.opacity(0.5))
-                            .into_any_element(),
-                    );
-                }
-                panel_rows.push(row);
-            }
-            v_flex()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(border.opacity(0.55))
-                .bg(if is_dark {
-                    card.opacity(0.35)
-                } else {
-                    muted.opacity(0.45)
-                })
-                .px_4()
-                .py_1()
-                .children(panel_rows)
+        .children(
+            groups
+                .into_iter()
+                .map(|group| settings_group(group, is_dark, border, card, muted, muted_foreground)),
+        )
+        .into_any_element()
+}
+
+/// One group: its label, an optional full-width control, then its panel.
+///
+/// Rows sit in a rounded panel with inset separators so a group reads as one
+/// calm list instead of a stack of dividers, and the labels are what tell the
+/// reader where one subject ends and the next begins.
+fn settings_group(
+    group: SettingsGroup,
+    is_dark: bool,
+    border: Hsla,
+    card: Hsla,
+    muted: Hsla,
+    muted_foreground: Hsla,
+) -> AnyElement {
+    let mut panel_rows = Vec::with_capacity(group.rows.len().saturating_mul(2));
+    for (index, row) in group.rows.into_iter().enumerate() {
+        if index > 0 {
+            panel_rows.push(
+                div()
+                    .flex_none()
+                    .h(px(1.0))
+                    .bg(border.opacity(0.5))
+                    .into_any_element(),
+            );
+        }
+        panel_rows.push(row);
+    }
+
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_3()
+        .when_some(group.label, |this, label| {
+            this.child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(muted_foreground)
+                    .child(label),
+            )
+        })
+        .when_some(group.leading, |this, leading| this.child(leading))
+        .when(!panel_rows.is_empty(), |this| {
+            this.child(
+                v_flex()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(border.opacity(0.55))
+                    .bg(if is_dark {
+                        card.opacity(0.35)
+                    } else {
+                        muted.opacity(0.45)
+                    })
+                    .px_4()
+                    .py_1()
+                    .children(panel_rows),
+            )
         })
         .into_any_element()
 }
