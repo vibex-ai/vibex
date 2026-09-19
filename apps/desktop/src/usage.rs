@@ -45,9 +45,8 @@ const USAGE_HEATMAP_MIN_WIDTH: f32 = 840.0;
 const USAGE_MODEL_CHART_MIN_WIDTH: f32 = 720.0;
 const USAGE_SESSION_FILTER_MENU_WIDTH: f32 = 420.0;
 const USAGE_SESSION_FILTER_LABEL_MAX_WIDTH_UNITS: usize = 48;
-/// One toolbar control: the range shell's segment plus its inset and hairline.
-const USAGE_TOOLBAR_CONTROL_HEIGHT: f32 =
-    USAGE_RANGE_SEGMENT_HEIGHT + USAGE_RANGE_INSET * 2.0 + 2.0;
+/// One toolbar control: the range shell's segment plus its inset on both edges.
+const USAGE_TOOLBAR_CONTROL_HEIGHT: f32 = USAGE_RANGE_SEGMENT_HEIGHT + USAGE_RANGE_INSET * 2.0;
 /// One summary tile: `py_3` + a 20px label row + `gap_2` + the `text_xl` value
 /// line at `relative(1.2)` + `py_3`. The loading placeholder uses the same
 /// figure so the grid does not resize when the numbers land.
@@ -78,13 +77,10 @@ const USAGE_RANGES: [AgentUsageRange; 4] = [
 /// shell's so the two curves stay concentric.
 const USAGE_RANGE_INSET: f32 = 2.0;
 
-/// Width of the shell's hairline.
-const USAGE_RANGE_BORDER: f32 = 1.0;
-
-/// Height of one segment. The shell adds [`USAGE_RANGE_INSET`] and its hairline
-/// on both edges, which lands the slider on the height of the toolbar's outline
-/// controls beside it.
-const USAGE_RANGE_SEGMENT_HEIGHT: f32 = 18.0;
+/// Height of one segment. The shell adds [`USAGE_RANGE_INSET`] on both edges,
+/// which lands the slider on the height of the toolbar's outline controls
+/// beside it.
+const USAGE_RANGE_SEGMENT_HEIGHT: f32 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageFilterKind {
@@ -464,7 +460,10 @@ impl UsageView {
     /// the width their label needs, so a locale that spells "30 days" wider
     /// gets a wider segment instead of a clipped one. The thumb is paint behind
     /// them: it reads where the segments landed and travels to the newly
-    /// selected one over the app's movement spec.
+    /// selected one over the app's movement spec. Shell and pill carry the
+    /// segmented-bar treatment the settings and management pages use — a filled
+    /// track with a raised page-coloured pill and no outlines — so the three
+    /// read as one control family.
     fn render_range_slider(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.request.range;
         let selected_index = usage_range_index(selected);
@@ -522,7 +521,11 @@ impl UsageView {
                     div()
                         .size_full()
                         .rounded(thumb_radius)
-                        .bg(cx.theme().secondary),
+                        // The segmented bar's active pill: the page surface
+                        // raised out of the track, so the range control matches
+                        // the settings and management segmented controls.
+                        .bg(cx.theme().background)
+                        .shadow_xs(),
                 )
                 .into_any_element()
         });
@@ -540,6 +543,10 @@ impl UsageView {
                 })
                 .child(
                     Button::new(SharedString::from(format!("usage-range-{range:?}")))
+                        // A segment is a cell of the track, not an outlined
+                        // control: the travelling pill marks the choice, so the
+                        // button keeps no border of its own.
+                        .ghost()
                         .accessibility_label(usage_range_label(*range))
                         // The label is a plain nowrap child rather than the
                         // button's own label slot: it must never ellipsize,
@@ -570,8 +577,9 @@ impl UsageView {
         div()
             .debug_selector(|| "usage-range-slider".to_string())
             .rounded(cx.theme().radius)
-            .border(px(USAGE_RANGE_BORDER))
-            .border_color(cx.theme().border)
+            // The shell: a filled track with no outline, matching the
+            // segmented bars. The pill is the only raised surface in it.
+            .bg(cx.theme().secondary)
             .p(px(USAGE_RANGE_INSET))
             .child(
                 h_flex()
@@ -2912,7 +2920,7 @@ mod tests {
             .debug_bounds("usage-range-slider")
             .expect("usage range slider should be laid out");
         // The slider sits level with the filter buttons beside it: one segment
-        // plus the shell's inset and hairline on both edges.
+        // plus the shell's inset on both edges.
         let filter = cx
             .debug_bounds("usage-filter-Agent")
             .expect("usage agent filter should be laid out");
@@ -2945,7 +2953,7 @@ mod tests {
             assert!(segment.size.width > px(0.0));
             track_width += segment.size.width;
         }
-        let track_inset = px(USAGE_RANGE_INSET + USAGE_RANGE_BORDER);
+        let track_inset = px(USAGE_RANGE_INSET);
         assert_eq!(segments[0].origin.x - slider.origin.x, track_inset);
         assert_eq!(slider.size.width, track_width + track_inset * 2.0);
 
