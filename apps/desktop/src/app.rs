@@ -5738,6 +5738,12 @@ pub struct VibexWorkbench {
     /// and quick actions behind one query field. It owns the query and the
     /// highlighted row; the workbench owns what the rows mean.
     command_palette: Entity<CommandState>,
+    /// The palette's query field.
+    ///
+    /// The component's own field is a fixed medium input with no way to grow it,
+    /// so the palette renders its own and drives [`CommandState`] through
+    /// `set_query` — the API the component exposes for a programmatic write.
+    command_palette_input: Entity<InputState>,
     command_palette_open: bool,
     /// The palette's raw query, mirrored out of [`CommandState`] so the result
     /// scan can read it without borrowing the component.
@@ -6118,6 +6124,11 @@ impl VibexWorkbench {
         let settings_view = FoundationSettings::new(cx.weak_entity(), &ui_state, window, cx);
         let initial_strings = locale::strings(initial_locale);
         let command_palette = cx.new(|cx| CommandState::new(window, cx));
+        let command_palette_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(initial_strings.command_palette_placeholder)
+                .submit_on_enter(true)
+        });
         let conversation_find = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(locale::text(
@@ -6228,6 +6239,25 @@ impl VibexWorkbench {
             ))
         });
         let mut agent_subscriptions = vec![
+            cx.subscribe_in(
+                &command_palette_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Change => {
+                        let query = this.command_palette_input.read(cx).value().to_string();
+                        // Write through to the component so the query it
+                        // highlights and filters by stays the one on screen;
+                        // the field is a view of it, not a second source.
+                        this.command_palette
+                            .update(cx, |state, cx| state.set_query(query.clone(), window, cx));
+                        this.on_command_palette_query_changed(query, cx);
+                    }
+                    // Enter propagates out of the single-line field to the
+                    // component's own Confirm binding, which is what opens the
+                    // highlighted row.
+                    InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+                },
+            ),
             cx.subscribe_in(
                 &conversation_find,
                 window,
@@ -6603,6 +6633,7 @@ impl VibexWorkbench {
             usage_session_filter: None,
             usage_refresh_in_flight: false,
             command_palette,
+            command_palette_input,
             command_palette_open: false,
             command_palette_query: String::new(),
             conversation_find,
@@ -25036,12 +25067,15 @@ impl VibexWorkbench {
         self.command_palette_query.clear();
         self.session_search_highlight_item_id = None;
         self.session_search_highlight_query = None;
-        // The component owns the field, so a fresh open resets it rather than
-        // inheriting the query the last visit was abandoned with.
-        self.command_palette.update(cx, |state, cx| {
-            state.set_query("", window, cx);
-            state.focus(window, cx);
+        // A fresh open resets the field rather than inheriting the query the
+        // last visit was abandoned with. `set_value` suppresses its own change
+        // event, so the query is written through to the component here too.
+        self.command_palette_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
         });
+        self.command_palette
+            .update(cx, |state, cx| state.set_query("", window, cx));
         // Opening shows the recent list, which only needs the sessions.
         self.ensure_session_search_results();
         // The index survives closing the palette; this refreshes the sessions
@@ -25289,6 +25323,46 @@ impl VibexWorkbench {
                 });
             },
         ));
+    }
+
+    /// Moves the palette's highlight by one row, wrapping around and skipping
+    /// the rows that cannot run.
+    ///
+    /// The component moves its own highlight from a key binding, but a
+    /// single-line field shadows that binding with caret movement, so the
+    /// palette resolves the step and hands the component the row to highlight.
+    fn move_command_palette_selection(
+        &mut self,
+        step: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.strings();
+        let query = normalized_session_search_query(self.command_palette_query.as_str());
+        let rows = command_palette_selectable_rows(&self.command_palette_sections(&query, strings));
+        if rows.is_empty() {
+            return;
+        }
+        let current = self.command_palette.read(cx).selected_index();
+        let next = match current.and_then(|index| rows.iter().position(|row| *row == index)) {
+            Some(position) => (position as isize + step).rem_euclid(rows.len() as isize) as usize,
+            // Nothing highlighted yet: the first step enters from the end the
+            // step comes from.
+            None if step >= 0 => 0,
+            None => rows.len() - 1,
+        };
+        self.command_palette.update(cx, |state, cx| {
+            state.set_selected_index(Some(rows[next]), window, cx)
+        });
+    }
+
+    /// Empties the palette's query, as its first Escape does.
+    fn clear_command_palette_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.command_palette
+            .update(cx, |state, cx| state.set_query("", window, cx));
+        self.on_command_palette_query_changed(String::new(), cx);
     }
 
     /// Adopts a query typed into the palette: the recent list needs no document
@@ -27058,6 +27132,9 @@ impl VibexWorkbench {
 
     fn sync_locale_dependents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = self.strings();
+        self.command_palette_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.command_palette_placeholder, window, cx)
+        });
         self.sidebar_rename_input.update(cx, |input, cx| {
             input.set_placeholder(strings.sidebar_rename_placeholder, window, cx)
         });
@@ -45598,11 +45675,11 @@ impl VibexWorkbench {
             .clamp(260.0, COMMAND_PALETTE_DIALOG_MAX_HEIGHT);
         let list_max_height = (dialog_height - COMMAND_PALETTE_FOOTER_HEIGHT).max(160.0);
 
-        let query_owner = cx.weak_entity();
         let confirm_owner = cx.weak_entity();
         let cancel_owner = cx.weak_entity();
         let footer_owner = cx.weak_entity();
         let footer_strings = strings;
+        let query_input = self.command_palette_input.clone();
         let mut command = Command::new(&self.command_palette)
             // The dialog owns the frame and the elevation, so the palette only
             // draws its own content.
@@ -45614,10 +45691,34 @@ impl VibexWorkbench {
             // the component cannot see, and the other groups reuse that same
             // pass, so one query produces one list.
             .filterable(false)
-            .placeholder(strings.command_palette_placeholder)
+            // The component's own field is a fixed medium input, and the palette
+            // wants a large one, so it renders the field itself. The field still
+            // writes through `set_query`, which keeps the component the one
+            // source of the query it highlights and resets the selection by.
+            .searchable(false)
             .max_h(px(list_max_height))
             .flex_1()
             .min_h_0()
+            .header(move |_, _, cx| {
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Input::new(&query_input)
+                            .large()
+                            .w_full()
+                            .appearance(false)
+                            .p_0()
+                            .prefix(
+                                Icon::new(IconName::Search).text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                    .into_any_element()
+            })
             .empty(move |_, _, cx| {
                 // The index is built session by session, so an empty list right
                 // after opening means "still looking", not "nothing there".
@@ -45638,12 +45739,6 @@ impl VibexWorkbench {
                             ),
                     )
                     .into_any_element()
-            })
-            .on_query(move |query, _, cx| {
-                let query = query.to_string();
-                let _ = query_owner.update(cx, |this, cx| {
-                    this.on_command_palette_query_changed(query, cx);
-                });
             })
             .on_confirm(move |index, window, cx| {
                 let _ = confirm_owner.update(cx, |this, cx| {
@@ -45698,7 +45793,12 @@ impl VibexWorkbench {
                     )
                     .into_any_element()
             });
-        for section in &sections {
+        for (index, section) in sections.iter().enumerate() {
+            // Groups already carry a heading; the rule makes the boundary
+            // between two of them visible while the list is scrolled.
+            if index > 0 {
+                command = command.separator();
+            }
             let mut group = CommandGroup::new().label(section.heading.clone());
             for entry in &section.entries {
                 group = group.item(command_palette_row(entry, &query, strings, locale));
@@ -45717,6 +45817,27 @@ impl VibexWorkbench {
             .p_4()
             .bg(gpui::black().opacity(backdrop_opacity))
             .occlude()
+            // A single-line field binds up/down to caret movement, which is a
+            // no-op in a one-line field but still outranks the component's own
+            // binding and never propagates, so the palette intercepts the action
+            // and moves the highlight itself.
+            .capture_action(cx.listener(|this, _: &InputMoveUp, window, cx| {
+                this.move_command_palette_selection(-1, window, cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &InputMoveDown, window, cx| {
+                this.move_command_palette_selection(1, window, cx);
+                cx.stop_propagation();
+            }))
+            // Escape reaches the field first. A non-empty query clears, and only
+            // the second press reaches the component's Cancel and closes the
+            // palette — the contract the component's own field has.
+            .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if !this.command_palette_query.is_empty() {
+                    this.clear_command_palette_query(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close_command_palette(window, cx)),
@@ -51535,9 +51656,7 @@ fn shortcut_action_label(action: &str, strings: Strings) -> &'static str {
             "在当前会话中查找",
             "在目前會話中尋找",
         ),
-        "open_command_palette" => {
-            locale::text_for(locale, "Search Vibex", "搜索 Vibex", "搜尋 Vibex")
-        }
+        "open_command_palette" => locale::text_for(locale, "Global search", "全局搜索", "全域搜尋"),
         "retry_runtime" => locale::text_for(locale, "Retry runtime", "重试运行时", "重試執行階段"),
         "save_active_file" => {
             locale::text_for(locale, "Save active file", "保存当前文件", "儲存目前檔案")
@@ -52494,6 +52613,33 @@ fn command_palette_action_matches(action: &'static str, query: &str, strings: St
     terms
         .iter()
         .any(|term| term.contains(&query) || query.contains(term.as_str()))
+}
+
+/// Whether a palette row can be confirmed.
+fn command_palette_entry_enabled(entry: &CommandPaletteEntry) -> bool {
+    match entry {
+        CommandPaletteEntry::Action(_, enabled) => *enabled,
+        CommandPaletteEntry::Session(_) | CommandPaletteEntry::Setting(_) => true,
+    }
+}
+
+/// The rows the palette's highlight can land on, in list order.
+///
+/// The component skips a disabled item when it moves its own highlight; the
+/// palette resolves the same list so both agree on where the next press lands.
+fn command_palette_selectable_rows(sections: &[CommandPaletteSection]) -> Vec<IndexPath> {
+    sections
+        .iter()
+        .enumerate()
+        .flat_map(|(section, group)| {
+            group
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| command_palette_entry_enabled(entry))
+                .map(move |(row, _)| IndexPath::new(row).section(section))
+        })
+        .collect()
 }
 
 /// The highlight a palette row paints over the part of its text that matched.
@@ -72523,9 +72669,23 @@ mod tests {
         // The component cannot see message text, so the workbench answers the
         // query and the palette only presents what it is handed.
         assert!(overlay.contains(".filterable(false)"));
-        assert!(overlay.contains(".on_query("));
         assert!(overlay.contains(".on_confirm("));
         assert!(overlay.contains(".on_cancel("));
+        // The palette renders its own query field — the component's is a fixed
+        // medium input — so the query reaches the component through the
+        // subscription's write-through instead of the component's own callback.
+        assert!(overlay.contains(".searchable(false)"));
+        assert!(overlay.contains("Input::new(&query_input)"));
+        assert!(!overlay.contains(".on_query("));
+        assert!(source.contains("state.set_query(query.clone(), window, cx)"));
+        // Groups are separated so the boundary between two of them stays visible
+        // while the list is scrolled.
+        assert!(overlay.contains("command = command.separator();"));
+        // A single-line field shadows the component's up/down binding, so the
+        // palette has to route those keystrokes to the highlight itself.
+        assert!(overlay.contains("this.move_command_palette_selection(-1, window, cx)"));
+        assert!(overlay.contains("this.move_command_palette_selection(1, window, cx)"));
+        assert!(overlay.contains("this.clear_command_palette_query(window, cx)"));
     }
 
     #[test]
