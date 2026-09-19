@@ -586,23 +586,16 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
                 .iter()
                 .any(|item| is_final_agent_message(item) || is_turn_boundary_error(item));
             let complete = has_terminal_response || provider_finished_for_turn;
-            // A streamed thought chunk is persisted with `is_final: false` and
-            // no later marker ever closes it, so the row's own flag cannot tell
-            // "still arriving" from "already finished". Only the trailing run
-            // is genuinely live; every earlier segment is history. Both
-            // presentation modes need that distinction: Timeline mode renders
-            // the live row, and LatestAtBottom mode filters exactly the live
-            // row out of `process_rows` and shows it through `live_status`.
-            // Leaving the stale flag in place made LatestAtBottom drop every
-            // reasoning row for the rest of the turn and after it settled.
-            for row in &mut turn_rows {
-                if row.kind == TimelineRowKind::Reasoning {
-                    row.streaming = !complete
-                        && !superseded
-                        && row
-                            .item_ids
-                            .iter()
-                            .any(|item_id| trailing_reasoning_item_ids.contains(item_id));
+            if reasoning_display_mode == ReasoningDisplayMode::Timeline {
+                for row in &mut turn_rows {
+                    if row.kind == TimelineRowKind::Reasoning {
+                        row.streaming = !complete
+                            && !superseded
+                            && row
+                                .item_ids
+                                .iter()
+                                .any(|item_id| trailing_reasoning_item_ids.contains(item_id));
+                    }
                 }
             }
             turn_rows.retain(|row| {
@@ -2155,21 +2148,13 @@ mod tests {
         let active = timeline_conversation_turns(&items, Some(AgentSessionState::Running), false);
         assert_eq!(active.len(), 1);
         // Consecutive thought deltas accumulate instead of flashing the latest
-        // fragment; the run stops at the tool call boundary. The earlier
-        // segment is already history, so only the trailing run moves to the
-        // bottom indicator.
+        // fragment; the run stops at the tool call boundary.
         assert_eq!(
             active[0].live_status.as_deref(),
             Some("Evaluating persistence strategy")
         );
-        assert_eq!(active[0].process_rows.len(), 2);
-        assert_eq!(active[0].process_rows[0].kind, TimelineRowKind::Reasoning);
-        assert_eq!(
-            active[0].process_rows[0].body,
-            "Planning targeted extraction"
-        );
-        assert!(!active[0].process_rows[0].streaming);
-        assert_eq!(active[0].process_rows[1].kind, TimelineRowKind::ToolCall);
+        assert_eq!(active[0].process_rows.len(), 1);
+        assert_eq!(active[0].process_rows[0].kind, TimelineRowKind::ToolCall);
 
         items.push(item(
             6,
@@ -2182,29 +2167,8 @@ mod tests {
         let completed = timeline_conversation_turns(&items, Some(AgentSessionState::Idle), false);
         assert!(completed[0].complete);
         assert!(completed[0].live_status.is_none());
-        // The streamed thought is closed by the turn settling, not by an
-        // `is_final` marker, so the compact mode has to hand it back to the
-        // process history instead of dropping it with the live indicator.
-        assert_eq!(completed[0].process_rows.len(), 3);
-        assert_eq!(
-            completed[0].process_rows[0].kind,
-            TimelineRowKind::Reasoning
-        );
-        assert_eq!(
-            completed[0].process_rows[0].body,
-            "Planning targeted extraction"
-        );
-        assert!(!completed[0].process_rows[0].streaming);
-        assert_eq!(completed[0].process_rows[1].kind, TimelineRowKind::ToolCall);
-        assert_eq!(
-            completed[0].process_rows[2].kind,
-            TimelineRowKind::Reasoning
-        );
-        assert_eq!(
-            completed[0].process_rows[2].body,
-            "Evaluating persistence strategy"
-        );
-        assert!(!completed[0].process_rows[2].streaming);
+        assert_eq!(completed[0].process_rows.len(), 1);
+        assert_eq!(completed[0].process_rows[0].kind, TimelineRowKind::ToolCall);
     }
 
     #[test]
@@ -2458,12 +2422,7 @@ mod tests {
 
         assert!(turns[0].complete);
         assert!(turns[0].live_status.is_none());
-        // Settling retires the live indicator, and the thought it was showing
-        // stays in the process history.
-        assert_eq!(turns[0].process_rows.len(), 1);
-        assert_eq!(turns[0].process_rows[0].kind, TimelineRowKind::Reasoning);
-        assert_eq!(turns[0].process_rows[0].body, "Inspecting files");
-        assert!(!turns[0].process_rows[0].streaming);
+        assert!(turns[0].process_rows.is_empty());
         assert!(turns[0].conclusion_row.is_none());
     }
 
@@ -3776,133 +3735,5 @@ mod tests {
         }
 
         assert!(tick >= duration_seconds as i64 * 25);
-    }
-
-    /// ACP thought chunks are persisted with `is_final: false` and no later
-    /// marker ever closes them, so the trailing-run test is the only thing that
-    /// distinguishes a live thought from a finished one. LatestAtBottom must
-    /// move only the live one to the bottom indicator and keep every earlier
-    /// segment in the process history.
-    #[test]
-    fn latest_at_bottom_moves_only_the_live_thought_to_the_indicator() {
-        let reasoning = |sequence: i64, text: &str| {
-            item(
-                sequence,
-                None,
-                TimelinePayload::Reasoning(ReasoningPayload {
-                    text: text.into(),
-                    is_final: false,
-                }),
-            )
-        };
-        let tool = |sequence: i64, status: ToolCallStatus| {
-            item(
-                sequence,
-                None,
-                TimelinePayload::ToolCall(ToolCallPayload {
-                    tool_call_id: "tool_1".into(),
-                    tool_name: "execute".into(),
-                    status,
-                    summary: "ls".into(),
-                    input_summary: None,
-                    output_summary: None,
-                    raw_extension: None,
-                }),
-            )
-        };
-        let user = item(
-            1,
-            None,
-            TimelinePayload::UserMessage(UserMessagePayload {
-                text: "investigate".into(),
-                attachments: Vec::new(),
-                ..Default::default()
-            }),
-        );
-        let reasoning_kinds = |turn: &TimelineConversationTurn| {
-            turn.process_rows
-                .iter()
-                .filter(|row| row.kind == TimelineRowKind::Reasoning)
-                .map(|row| (row.body.clone(), row.streaming))
-                .collect::<Vec<_>>()
-        };
-
-        // The thought is still arriving: LatestAtBottom hides the row and hands
-        // the text to the bottom indicator instead.
-        let live_trailing = [
-            user.clone(),
-            reasoning(2, "Let me grep server.js"),
-            reasoning(3, " for the mapping"),
-        ];
-        let turn = timeline_conversation_turns_with_reasoning_mode(
-            &live_trailing,
-            Some(AgentSessionState::Running),
-            false,
-            ReasoningDisplayMode::LatestAtBottom,
-        )
-        .pop()
-        .expect("live turn");
-        assert_eq!(
-            turn.live_status.as_deref(),
-            Some("Let me grep server.js for the mapping")
-        );
-        assert!(reasoning_kinds(&turn).is_empty());
-
-        // A tool call supersedes the thought while the turn is still running:
-        // the text returns to the process history and stops shimmering.
-        let mut superseded = live_trailing.to_vec();
-        superseded.push(tool(4, ToolCallStatus::Started));
-        superseded.push(tool(5, ToolCallStatus::Completed));
-        let turn = timeline_conversation_turns_with_reasoning_mode(
-            &superseded,
-            Some(AgentSessionState::Running),
-            false,
-            ReasoningDisplayMode::LatestAtBottom,
-        )
-        .pop()
-        .expect("running turn");
-        assert_eq!(turn.live_status, None);
-        assert_eq!(
-            reasoning_kinds(&turn),
-            vec![("Let me grep server.js for the mapping".into(), false)]
-        );
-
-        // Once the turn settles the whole thought history stays readable in
-        // both presentation modes.
-        let mut settled = superseded.clone();
-        settled.push(reasoning(6, "Second thought"));
-        settled.push(tool(7, ToolCallStatus::Started));
-        settled.push(tool(8, ToolCallStatus::Completed));
-        settled.push(item(
-            9,
-            None,
-            TimelinePayload::AgentMessage(AgentMessagePayload {
-                text: "The answer".into(),
-                is_final: true,
-            }),
-        ));
-        for mode in [
-            ReasoningDisplayMode::Timeline,
-            ReasoningDisplayMode::LatestAtBottom,
-        ] {
-            let turn = timeline_conversation_turns_with_reasoning_mode(
-                &settled,
-                Some(AgentSessionState::Idle),
-                false,
-                mode,
-            )
-            .pop()
-            .expect("settled turn");
-            assert!(turn.complete, "{mode:?}");
-            assert_eq!(turn.live_status, None, "{mode:?}");
-            assert_eq!(
-                reasoning_kinds(&turn),
-                vec![
-                    ("Let me grep server.js for the mapping".into(), false),
-                    ("Second thought".into(), false),
-                ],
-                "{mode:?}"
-            );
-        }
     }
 }
