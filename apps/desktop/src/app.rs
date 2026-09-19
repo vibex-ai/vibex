@@ -43441,8 +43441,7 @@ impl VibexWorkbench {
             phase,
             GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited
         ) && actions.contains(&GoalAction::Resume);
-        let show_clear = matches!(phase, GoalPhase::Active | GoalPhase::Paused)
-            && actions.contains(&GoalAction::Clear);
+        let show_clear = !phase.is_terminal() && actions.contains(&GoalAction::Clear);
         let edit_objective = goal.objective.clone();
 
         Some(
