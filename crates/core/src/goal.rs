@@ -195,7 +195,7 @@ impl GoalSnapshot {
     pub fn remaining_tokens(&self) -> Option<i64> {
         let budget = self.token_budget?;
         let used = self.tokens_used?;
-        Some(budget.saturating_sub(used))
+        Some(budget.saturating_sub(used).max(0))
     }
 }
 
@@ -334,9 +334,14 @@ impl GoalCapability {
 fn normalize_wire_token(value: &str) -> String {
     let trimmed = value.trim();
     let mut out = String::with_capacity(trimmed.len() + 2);
-    for (index, ch) in trimmed.chars().enumerate() {
+    let mut previous: Option<char> = None;
+    for ch in trimmed.chars() {
         if ch.is_ascii_uppercase() {
-            if index != 0 && !out.ends_with('_') {
+            // Only a camelCase boundary gets a separator: `budgetLimited` folds
+            // to `budget_limited`, while an all-caps `RESUME` stays one token.
+            let previous_is_word = previous
+                .is_some_and(|previous| previous.is_ascii_lowercase() || previous.is_ascii_digit());
+            if previous_is_word && !out.ends_with('_') {
                 out.push('_');
             }
             out.push(ch.to_ascii_lowercase());
@@ -347,6 +352,7 @@ fn normalize_wire_token(value: &str) -> String {
         } else {
             out.push(ch.to_ascii_lowercase());
         }
+        previous = Some(ch);
     }
     out
 }
