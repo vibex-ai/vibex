@@ -2041,9 +2041,11 @@ fn estimated_markdown_block_height(block: &BlockNode, source: &str, chars_per_li
             4 => 24.0,
             _ => 22.0,
         },
-        Block::Code { source, .. } | Block::Literal(source) => {
-            source.lines().count().max(1) as f32 * 20.0 + 42.0
-        }
+        // A code card is a header plus mono lines; a literal is prose, so it
+        // estimates like one — including the wrap, which is what the parse it
+        // stands in for will do.
+        Block::Code { source, .. } => source.lines().count().max(1) as f32 * 20.0 + 42.0,
+        Block::Literal(_) => wrapped_lines * 22.0,
         Block::Diff { source } => source.lines().count().max(1) as f32 * 20.0 + 30.0,
         Block::Math { .. } | Block::Diagram { .. } => 220.0,
         Block::Table { header, rows, .. } => {
@@ -2444,7 +2446,14 @@ impl MarkdownViewState {
                         .map(|child| self.render_block(child, window, cx)),
                 )
                 .into_any_element(),
-            Block::Literal(source) => self.render_code(block.id, None, source, cx),
+            // `Literal` is the fallback the parser and the parse-pending path
+            // both produce: source that was kept verbatim rather than
+            // interpreted. It is prose, not code — a fenced block with no
+            // language is `Block::Code` with `language: None`, which is what
+            // the code card is for. Rendering it as a code card made every
+            // streaming Thought flash a "text" card for the frames its
+            // background parse was still running, then snap into prose.
+            Block::Literal(source) => self.render_literal_block(block.id, source, cx),
         }
     }
 
@@ -3054,6 +3063,28 @@ impl MarkdownViewState {
         );
         self.image_cache_bytes = self.image_cache_bytes.saturating_add(resident_bytes);
         Some(image)
+    }
+
+    /// Source kept verbatim, rendered as prose.
+    ///
+    /// The text is shown exactly as it arrived — no Markdown interpretation, no
+    /// syntax highlighting, no code chrome — which is what both callers of
+    /// [`crate::MarkdownDocument::literal`] mean by it.
+    fn render_literal_block(
+        &mut self,
+        node_id: NodeId,
+        source: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text =
+            self.selectable_styled_text(SharedString::from(source.to_string()), Vec::new(), cx);
+        div()
+            .id(format!("markdown-literal:{}", node_id.0))
+            .w_full()
+            .min_w_0()
+            .whitespace_normal()
+            .child(text)
+            .into_any_element()
     }
 
     fn render_code(
@@ -4997,6 +5028,101 @@ mod tests {
                     .diagnostics
                     .iter()
                     .all(|diagnostic| diagnostic.code != "markdown_parse_pending")
+            );
+        });
+    }
+
+    #[::gpui::test]
+    fn the_parse_pending_fallback_is_prose_not_a_code_card(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        // A Thought long enough to take the background path on creation, which
+        // is what a streaming reasoning row does. The fallback is inspected
+        // where it is built: by the time the executor is parked the parse has
+        // already replaced it.
+        let source = format!(
+            "Let me check the badge rendering.\n\n{}",
+            "Also the composer asserts on the goal message id.\n\n".repeat(80)
+        );
+        let observed = Rc::new(Cell::new(None::<(bool, bool, f32, f32)>));
+        let capture = observed.clone();
+        let (state, cx) = cx.add_window_view(move |_, cx| {
+            let state = MarkdownViewState::new(
+                "pending-prose".into(),
+                MarkdownInput::new(source, "", 1).surface(MarkdownSurface::Agent),
+                None,
+                MarkdownViewOptions {
+                    presentation: MarkdownPresentation::Thought,
+                    streaming: true,
+                    ..MarkdownViewOptions::default()
+                },
+                cx,
+            );
+            let pending = state
+                .document
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "markdown_parse_pending");
+            let painted_as_code = state
+                .document
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, Block::Code { .. }));
+            let literal = state
+                .document
+                .blocks
+                .iter()
+                .find(|block| matches!(block.kind, Block::Literal(_)));
+            let (estimated, prose, card) = match literal {
+                Some(block) => {
+                    let source = state.document.source_for(block.range);
+                    let wrapped = source
+                        .lines()
+                        .map(|line| line.chars().count().max(1).div_ceil(72))
+                        .sum::<usize>()
+                        .max(1) as f32;
+                    (
+                        estimated_markdown_block_height(block, source, 72),
+                        wrapped * 22.0,
+                        source.lines().count().max(1) as f32 * 20.0 + 42.0,
+                    )
+                }
+                None => (0.0, 0.0, 0.0),
+            };
+            capture.set(Some((
+                pending,
+                painted_as_code,
+                estimated,
+                if (prose - card).abs() < 1.0 {
+                    0.0
+                } else {
+                    prose
+                },
+            )));
+            state
+        });
+
+        let (pending, painted_as_code, estimated, card) = observed
+            .get()
+            .expect("the view must build a pending document");
+        assert!(pending, "this fixture must exercise the pending fallback");
+        // Painting source kept verbatim through the code card made every
+        // streaming Thought flash a "text" card and then snap into prose.
+        assert!(
+            !painted_as_code,
+            "the pending fallback must not paint as a code card"
+        );
+        assert!(
+            estimated > 0.0 && (estimated - card).abs() < 1.0,
+            "a literal must reserve prose height, not card height: {estimated} vs {card}"
+        );
+        state.read_with(cx, |state, _| {
+            assert!(
+                state
+                    .document
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != "markdown_parse_pending"),
+                "the background parse must replace the fallback"
             );
         });
     }
