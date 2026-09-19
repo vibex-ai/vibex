@@ -8987,7 +8987,6 @@ impl MobileApp {
             }
             TimelineRowKind::FileOperation => self.render_process_activity_line(row, cx),
             TimelineRowKind::ImageGeneration => self.render_image_generation_card(row, cx),
-            TimelineRowKind::Goal => self.render_fallback_process_row(row),
             TimelineRowKind::ToolCall
             | TimelineRowKind::WebSearch
             | TimelineRowKind::TodoUpdate
@@ -16853,7 +16852,6 @@ fn process_title(row: &TimelineRow) -> String {
     locale::common(match row.kind {
         TimelineRowKind::Reasoning => "Reasoning",
         TimelineRowKind::Plan => "Plan",
-        TimelineRowKind::Goal => "Goal",
         TimelineRowKind::ToolCall => "Tool",
         TimelineRowKind::Command => "Command",
         TimelineRowKind::FileOperation => "File operation",
@@ -17361,7 +17359,6 @@ fn timeline_activity_icon_color(row: &TimelineRow) -> Hsla {
 fn timeline_row_icon_path(kind: TimelineRowKind) -> &'static str {
     match kind {
         TimelineRowKind::Reasoning => "icons/brain.svg",
-        TimelineRowKind::Goal => "icons/crosshair.svg",
         TimelineRowKind::Plan | TimelineRowKind::TodoUpdate => "icons/list-checks.svg",
         TimelineRowKind::ToolCall => "icons/zap.svg",
         TimelineRowKind::Command => "icons/square-terminal.svg",
@@ -17388,6 +17385,8 @@ fn timeline_payload_icon_path(payload: &TimelinePayload) -> &'static str {
         TimelinePayload::AgentMessage(_) => "icons/message-square.svg",
         TimelinePayload::Reasoning(_) => "icons/brain.svg",
         TimelinePayload::Plan(_) => "icons/list-checks.svg",
+        // Goal state feeds the desktop composer bar; mobile keeps a fallback
+        // icon for completeness even though it projects no goal rows.
         TimelinePayload::Goal(_) => "icons/crosshair.svg",
         TimelinePayload::ToolCall(tool) => timeline_tool_icon_path(&tool.tool_name, &tool.summary),
         TimelinePayload::Command(_) => "icons/square-terminal.svg",

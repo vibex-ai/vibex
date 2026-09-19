@@ -96,7 +96,7 @@ use vibex_core::{
     FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
     GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
     GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalChangeKind, GoalPhase,
+    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
     PromptId, ProviderProfileSummary, RenameAgentSessionRequest, ReplaceUserMessagePayload,
@@ -131,12 +131,13 @@ use vibex_desktop_model::{
     TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
     TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
     WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    clamp_editor_autosave_delay_ms, complete_string_order, composer_trigger_at, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
-    move_strings_relative, ordered_agent_ids, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    clamp_editor_autosave_delay_ms, complete_string_order, composer_trigger_at,
+    current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
@@ -39338,7 +39339,6 @@ impl VibexWorkbench {
             TimelineRowKind::Reasoning | TimelineRowKind::Plan => {
                 self.render_thought_process_row(row, cx)
             }
-            TimelineRowKind::Goal => self.render_goal_card(row, window, cx),
             TimelineRowKind::Error => self.render_error_row(row, conversation_conclusion, cx),
             TimelineRowKind::PermissionRequest if self.rendering_child_agent_timeline() => {
                 self.render_fallback_process_row(row, cx)
@@ -39795,18 +39795,6 @@ impl VibexWorkbench {
                     4.0
                 } else {
                     ((estimated_wrapped_lines(&row.body, 72) as f32) * 24.0).min(288.0) + 4.0
-                }
-            }
-            TimelineRowKind::Goal => {
-                if self
-                    .timeline_command_expansion
-                    .get(&row.id)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    estimated_markdown_body_height(&row.body, 72) + 132.0
-                } else {
-                    44.0
                 }
             }
             TimelineRowKind::Error => {
@@ -40296,6 +40284,35 @@ impl VibexWorkbench {
                 search_highlight,
                 cx,
             )
+        };
+        // A `/goal` prompt is an ordinary message with a badge: the bubble
+        // carries a goal icon whose tooltip explains what the message did.
+        let goal_message = parse_slash_command_invocation(&row.body)
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("goal"));
+        let inline_content = if goal_message && !editing {
+            h_flex()
+                .min_w_0()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("goal-message-badge:{}", row.id)))
+                        .flex_none()
+                        .mt(px(1.0))
+                        .tooltip(|window, cx| {
+                            Tooltip::new(locale::text("Goal message", "目标消息", "目標訊息"))
+                                .build(window, cx)
+                        })
+                        .child(
+                            Icon::new(IconName::Map)
+                                .size(px(13.0))
+                                .text_color(cx.theme().primary),
+                        ),
+                )
+                .child(div().min_w_0().flex_1().child(inline_content))
+                .into_any_element()
+        } else {
+            inline_content
         };
         // The delivery mark rides the bubble's lower edge. Edit mode swaps the
         // bubble for the inline editor, which carries no delivery marker.
@@ -41501,297 +41518,6 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         render_agent_file_diff_scroll_area(rows, scroll, cx)
-    }
-
-    fn render_goal_card(
-        &mut self,
-        row: &TimelineRow,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(payload) =
-            self.timeline_row_latest_item(row)
-                .and_then(|item| match &item.payload {
-                    vibex_core::TimelinePayload::Goal(goal) => Some(goal.clone()),
-                    _ => None,
-                })
-        else {
-            return self.render_process_activity_line(row, cx);
-        };
-        let expanded = self
-            .timeline_command_expansion
-            .get(&row.id)
-            .copied()
-            .unwrap_or(false);
-        let has_details = payload.goal.is_some() || payload.message.is_some();
-        let toggle_id = row.id.clone();
-        let measured_turn_id = row.turn_id.clone();
-        let goal = payload.goal.clone();
-        let objective = goal
-            .as_ref()
-            .map(|goal| goal.objective.clone())
-            .unwrap_or_default();
-        let phase = goal.as_ref().map(|goal| goal.phase);
-        let failed = payload.change == GoalChangeKind::ControlFailed
-            || matches!(
-                phase,
-                Some(GoalPhase::Blocked | GoalPhase::UsageLimited | GoalPhase::BudgetLimited)
-            );
-        let goal_label = locale::text("Goal", "目标", "目標").to_string();
-        let header_text = if objective.is_empty() {
-            goal_label
-        } else {
-            format!("{goal_label}: {objective}")
-        };
-        let actions = payload.actions.clone();
-        let show_pause = phase == Some(GoalPhase::Active) && actions.contains(&GoalAction::Pause);
-        let show_resume = matches!(
-            phase,
-            Some(GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited)
-        ) && actions.contains(&GoalAction::Resume);
-        let show_clear = matches!(phase, Some(GoalPhase::Active | GoalPhase::Paused))
-            && actions.contains(&GoalAction::Clear);
-        let accent = if failed {
-            cx.theme().danger
-        } else {
-            cx.theme().primary
-        };
-
-        let mut detail_rows = Vec::new();
-        if let Some(goal) = goal.as_ref() {
-            detail_rows.push(self.render_goal_detail_row(
-                locale::text("Status", "状态", "狀態").to_string(),
-                goal_phase_label(goal.phase),
-                cx,
-            ));
-            if let Some(used) = goal.tokens_used {
-                let value = match goal.token_budget {
-                    Some(budget) => format!("{used} / {budget}"),
-                    None => used.to_string(),
-                };
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Tokens used", "已用 tokens", "已用 tokens").to_string(),
-                    value,
-                    cx,
-                ));
-            }
-            if let Some(budget) = goal.token_budget {
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Budget", "预算", "預算").to_string(),
-                    budget.to_string(),
-                    cx,
-                ));
-            }
-            if let Some(remaining) = goal.remaining_tokens() {
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Remaining", "剩余", "剩餘").to_string(),
-                    remaining.to_string(),
-                    cx,
-                ));
-            }
-            if let Some(seconds) = goal.time_used_seconds {
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Elapsed", "耗时", "耗時").to_string(),
-                    format_goal_duration(seconds),
-                    cx,
-                ));
-            }
-            if let (Some(started), Some(max)) = (goal.rounds_started, goal.max_rounds) {
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Rounds", "轮次", "輪次").to_string(),
-                    format!("{started} / {max}"),
-                    cx,
-                ));
-            }
-            if let Some(reason) = goal.blocked_reason.as_ref() {
-                detail_rows.push(self.render_goal_detail_row(
-                    locale::text("Blocked", "阻塞", "阻塞").to_string(),
-                    reason.message.clone(),
-                    cx,
-                ));
-            }
-        }
-        if let Some(message) = payload.message.clone() {
-            detail_rows.push(self.render_goal_detail_row(
-                locale::text("Detail", "详情", "詳情").to_string(),
-                message,
-                cx,
-            ));
-        }
-
-        let mut action_buttons = Vec::new();
-        if show_pause {
-            action_buttons.push(self.render_goal_action_button(
-                row,
-                GoalAction::Pause,
-                locale::text("Pause", "暂停", "暫停").to_string(),
-                IconName::Pause,
-                cx,
-            ));
-        }
-        if show_resume {
-            action_buttons.push(self.render_goal_action_button(
-                row,
-                GoalAction::Resume,
-                locale::text("Resume", "继续", "繼續").to_string(),
-                IconName::Play,
-                cx,
-            ));
-        }
-        if show_clear {
-            action_buttons.push(self.render_goal_action_button(
-                row,
-                GoalAction::Clear,
-                locale::text("Clear", "清除", "清除").to_string(),
-                IconName::Close,
-                cx,
-            ));
-        }
-
-        v_flex()
-            .id(row.id.clone())
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .overflow_hidden()
-            .rounded_lg()
-            .border_1()
-            .border_color(if failed {
-                cx.theme().danger.opacity(0.38)
-            } else {
-                cx.theme().border
-            })
-            .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("goal-card-header:{}", row.id)))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(40.0))
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .when(has_details, |this| {
-                        this.cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().muted.opacity(0.35)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(turn_id) = measured_turn_id.as_deref() {
-                                    this.invalidate_timeline_turn_measurement(turn_id);
-                                }
-                                this.timeline_command_expansion
-                                    .insert(toggle_id.clone(), !expanded);
-                                this.rebuild_timeline_sizes();
-                                cx.notify();
-                            }))
-                    })
-                    .child(
-                        Icon::new(IconName::Map)
-                            .size(px(15.0))
-                            .flex_none()
-                            .text_color(accent),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_sm()
-                            .child(header_text),
-                    )
-                    .when(has_details, |this| {
-                        this.child(
-                            Icon::new(if expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground),
-                        )
-                    }),
-            )
-            .when(expanded && has_details, |this| {
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .px_3()
-                        .pb_3()
-                        .child(v_flex().w_full().min_w_0().gap_1().children(detail_rows))
-                        .when(!action_buttons.is_empty(), |this| {
-                            this.child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .pt_1()
-                                    .children(action_buttons),
-                            )
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_goal_detail_row(&self, label: String, value: String, cx: &App) -> AnyElement {
-        h_flex()
-            .w_full()
-            .min_w_0()
-            .items_start()
-            .gap_2()
-            .text_xs()
-            .child(
-                div()
-                    .w(px(88.0))
-                    .flex_none()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_color(cx.theme().foreground)
-                    .child(value),
-            )
-            .into_any_element()
-    }
-
-    fn render_goal_action_button(
-        &self,
-        row: &TimelineRow,
-        action: GoalAction,
-        label: String,
-        icon: IconName,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        h_flex()
-            .id(SharedString::from(format!(
-                "goal-action:{}:{}",
-                row.id,
-                action.as_str()
-            )))
-            .cursor_pointer()
-            .items_center()
-            .gap_1()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().border)
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .hover(|style| style.bg(cx.theme().muted.opacity(0.5)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.control_session_goal(action, cx);
-            }))
-            .child(Icon::new(icon).size(px(12.0)).flex_none())
-            .child(label)
-            .into_any_element()
     }
 
     /// Applies one goal-control action to the selected session's live Agent.
@@ -43661,6 +43387,172 @@ impl VibexWorkbench {
         )
     }
 
+    /// Fixed goal bar above the composer.
+    ///
+    /// Goal state is folded from the session timeline (`TimelinePayload::Goal`)
+    /// and rendered outside the transcript, directly below the queued-message
+    /// bar. Controls use the vocabulary the live adapter advertised with the
+    /// snapshot.
+    fn render_composer_goal(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.rendering_child_agent_timeline() {
+            return None;
+        }
+        let active = current_active_goal(&self.timeline.items)?;
+        let goal = active.goal.clone();
+        let phase = goal.phase;
+        let failed = matches!(
+            phase,
+            GoalPhase::Blocked | GoalPhase::UsageLimited | GoalPhase::BudgetLimited
+        );
+        let accent = if failed {
+            cx.theme().danger
+        } else if phase == GoalPhase::Complete {
+            cx.theme().success
+        } else {
+            cx.theme().primary
+        };
+        let goal_label = locale::text("Goal", "目标", "目標");
+        let title = if goal.objective.trim().is_empty() {
+            format!("{goal_label} {}", goal_phase_label(phase))
+        } else {
+            format!(
+                "{goal_label} {} {}",
+                goal_phase_label(phase),
+                goal.objective
+            )
+        };
+        let mut meta = Vec::new();
+        if let Some(seconds) = goal.time_used_seconds {
+            meta.push(format_goal_duration(seconds));
+        }
+        if let Some(used) = goal.tokens_used {
+            meta.push(match goal.token_budget {
+                Some(budget) => format!("{used}/{budget}"),
+                None => used.to_string(),
+            });
+        }
+        if let (Some(started), Some(max)) = (goal.rounds_started, goal.max_rounds) {
+            meta.push(format!("{started}/{max}"));
+        }
+        let actions = active.actions.clone();
+        let show_edit = !goal.objective.trim().is_empty() && !phase.is_terminal();
+        let show_pause = phase == GoalPhase::Active && actions.contains(&GoalAction::Pause);
+        let show_resume = matches!(
+            phase,
+            GoalPhase::Paused | GoalPhase::Blocked | GoalPhase::UsageLimited
+        ) && actions.contains(&GoalAction::Resume);
+        let show_clear = matches!(phase, GoalPhase::Active | GoalPhase::Paused)
+            && actions.contains(&GoalAction::Clear);
+        let edit_objective = goal.objective.clone();
+
+        Some(
+            h_flex()
+                .id("composer-goal-bar")
+                .w_full()
+                .min_w_0()
+                .h(px(40.0))
+                .items_center()
+                .gap_2()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if failed {
+                    cx.theme().danger.opacity(0.38)
+                } else {
+                    cx.theme().border
+                })
+                .bg(composer_queue_surface_background(cx.theme().is_dark()))
+                .px_3()
+                .child(
+                    Icon::new(IconName::Map)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(accent),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .font_medium()
+                        .child(title),
+                )
+                .when(!meta.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(meta.join(" · ")),
+                    )
+                })
+                .when(show_edit, |this| {
+                    this.child(
+                        Button::new("composer-goal-edit")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                            .tooltip(locale::text("Edit goal", "编辑目标", "編輯目標"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // Reuse the history-recall path: it replaces the
+                                // value, puts the caret at the end, focuses the
+                                // input and resyncs suggestions.
+                                this.apply_composer_history_text(
+                                    format!("/goal edit {} ", edit_objective.trim()),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                })
+                .when(show_pause, |this| {
+                    this.child(
+                        Button::new("composer-goal-pause")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .icon(IconName::Pause)
+                            .tooltip(locale::text("Pause goal", "暂停目标", "暫停目標"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.control_session_goal(GoalAction::Pause, cx);
+                            })),
+                    )
+                })
+                .when(show_resume, |this| {
+                    this.child(
+                        Button::new("composer-goal-resume")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .icon(IconName::Play)
+                            .tooltip(locale::text("Resume goal", "继续目标", "繼續目標"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.control_session_goal(GoalAction::Resume, cx);
+                            })),
+                    )
+                })
+                .when(show_clear, |this| {
+                    this.child(
+                        Button::new("composer-goal-clear")
+                            .xsmall()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .icon(IconName::Close)
+                            .tooltip(locale::text("Clear goal", "清除目标", "清除目標"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.control_session_goal(GoalAction::Clear, cx);
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_composer_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session_id = self.selected_session_id.as_ref()?;
         let plan = current_agent_plan(&self.timeline.items)?;
@@ -44394,6 +44286,7 @@ impl VibexWorkbench {
         let composer_plan = self.render_composer_plan(cx);
         let composer_queue = self.render_composer_queue(cx);
         let composer_queue_visible = composer_queue.is_some();
+        let composer_goal = self.render_composer_goal(cx);
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let session_uninitialized = self.selected_session_runtime_uninitialized();
@@ -44740,6 +44633,15 @@ impl VibexWorkbench {
                                 .min_w_0()
                                 .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
                                 .child(queue),
+                        )
+                    })
+                    .when_some(composer_goal, |this, goal| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .child(goal),
                         )
                     })
                     .child(
@@ -66091,6 +65993,10 @@ mod tests {
             .find(".when_some(composer_queue, |this, queue|")
             .expect("the queued messages should remain attached to the composer");
         assert!(plan_position < queue_position);
+        let goal_position = composer
+            .find(".when_some(composer_goal, |this, goal|")
+            .expect("the active goal should render below the queued messages");
+        assert!(queue_position < goal_position);
         let generation_status_position = composer
             .find(".when_some(generation_status, |this, status|")
             .expect("the live generation status should remain attached to the composer");
@@ -66117,6 +66023,18 @@ mod tests {
         assert!(plan.contains("dismiss-composer-plan"));
         assert!(plan.contains("tooltip_show_delay(COMPOSER_PLAN_TOOLTIP_DELAY)"));
         assert!(plan.contains("COMPOSER_PLAN_EXPANDED_MAX_HEIGHT"));
+
+        let goal = source
+            .split_once("    fn render_composer_goal(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_plan("))
+            .map(|(body, _)| body)
+            .expect("composer goal renderer should remain inspectable");
+        assert!(goal.contains("current_active_goal(&self.timeline.items)"));
+        assert!(goal.contains("composer-goal-edit"));
+        assert!(goal.contains("composer-goal-pause"));
+        assert!(goal.contains("composer-goal-resume"));
+        assert!(goal.contains("composer-goal-clear"));
+        assert!(source.contains("goal-message-badge:"));
 
         let plan_details = source
             .split_once("fn render_composer_plan_details(")
