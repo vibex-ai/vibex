@@ -117,6 +117,10 @@ const GIT_HISTORY_LOAD_MORE_THRESHOLD_PX: f32 = 192.0;
 /// guessing it.
 const GIT_HISTORY_LOADING_ROWS: usize = 8;
 const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
+/// A commit tab shows a shortened subject. The strip keeps a fixed budget per
+/// commit tab instead of widening with an arbitrarily long message.
+const COMMIT_TAB_LABEL_MAX_CHARS: usize = 48;
+const COMMIT_TAB_LABEL_MAX_WIDTH: f32 = 260.0;
 const DIFF_ROW_MIN_HEIGHT: f32 = 22.0;
 const DIFF_LIST_OVERDRAW: f32 = 512.0;
 const DIFF_LINE_VERTICAL_PADDING: f32 = 2.0;
@@ -1061,6 +1065,10 @@ pub struct CodeWorkbench {
     preview_diff_lists: BTreeMap<String, PatchListState>,
     preview_commit_lists: BTreeMap<String, PatchListState>,
     preview_commit_focus_requests: BTreeMap<String, u64>,
+    /// Commit hashes whose message body the reader expanded past the collapsed
+    /// preview. A long body would otherwise push the patch off screen, so the
+    /// three-line summary is the default and this is the opt-out.
+    commit_body_expanded: BTreeSet<String>,
     git_preview_errors: BTreeMap<String, String>,
     preview_tab_scrolls: BTreeMap<String, ScrollHandle>,
     markdown_scrolls: BTreeMap<String, ScrollHandle>,
@@ -1219,6 +1227,7 @@ impl CodeWorkbench {
             preview_diff_lists: BTreeMap::new(),
             preview_commit_lists: BTreeMap::new(),
             preview_commit_focus_requests: BTreeMap::new(),
+            commit_body_expanded: BTreeSet::new(),
             git_preview_errors: BTreeMap::new(),
             preview_tab_scrolls: BTreeMap::new(),
             markdown_scrolls: BTreeMap::new(),
@@ -6828,6 +6837,13 @@ impl CodeWorkbench {
                         // loaded, rather than silently rendering upright.
                         this.font_family(BUNDLED_SANS_FAMILY).italic()
                     })
+                    // A commit subject is free-form and can run long, so its
+                    // tab keeps a fixed share of the strip and ellipsizes; the
+                    // tooltip carries the whole message.
+                    .when(
+                        matches!(tab.target, PreviewTarget::GitCommit { .. }),
+                        |this| this.max_w(px(COMMIT_TAB_LABEL_MAX_WIDTH)).truncate(),
+                    )
                     .when_some(target_status_color, |this, color| this.text_color(color))
                     .when(target_deleted, |this| this.line_through())
                     .child(label),
@@ -7943,7 +7959,7 @@ impl CodeWorkbench {
                     else {
                         return div().w_full().h(px(diff_row_height)).into_any_element();
                     };
-                    render_diff_row(row, &code_font_family, diff_row_height, cx)
+                    render_diff_row(row, &code_font_family, diff_row_height, true, cx)
                 },
                 cx,
             )
@@ -8066,16 +8082,19 @@ impl CodeWorkbench {
                     .insert(tab_id.to_string(), request_id);
             }
         }
+        let view_options = self.git.commit_view_options(&hash);
+        let all_files_collapsed = self.git.commit_all_files_collapsed(&hash);
         let row_count = self.git.commit_preview_row_count(&hash);
         let commit_revision = format!("commit:{hash}");
         let diff_row_height = diff_row_height(self.code_font_size);
+        let file_row_height = commit_file_row_height(diff_row_height);
         let list_state = self
             .preview_commit_lists
             .entry(tab_id.to_string())
             .or_insert_with(|| {
-                PatchListState::new(commit_revision.clone(), row_count, diff_row_height)
+                PatchListState::new(commit_revision.clone(), row_count, file_row_height)
             });
-        list_state.reconcile(&commit_revision, row_count, diff_row_height);
+        list_state.reconcile(&commit_revision, row_count, file_row_height);
         let list_state = list_state.list.clone();
         if let Some(row_index) = focused_row_index {
             list_state.scroll_to(ListOffset {
@@ -8085,6 +8104,8 @@ impl CodeWorkbench {
         }
         let hash_for_list = hash.clone();
         let code_font_family = self.code_font_family.clone();
+        let list_font_family = code_font_family.clone();
+        let wrap_lines = view_options.wrap_lines;
         let list = if row_count == 0 {
             self.render_empty(
                 locale::text("Commit detail", "提交详情", "提交詳細資料"),
@@ -8103,31 +8124,17 @@ impl CodeWorkbench {
                             render_commit_patch_row(
                                 row,
                                 hash_for_list.clone(),
-                                code_font_family.clone(),
+                                list_font_family.clone(),
                                 diff_row_height,
+                                file_row_height,
+                                wrap_lines,
                                 cx,
                             )
                         })
-                        .unwrap_or_else(|| div().w_full().h(px(diff_row_height)).into_any_element())
+                        .unwrap_or_else(|| div().w_full().h(px(file_row_height)).into_any_element())
                 },
                 cx,
             )
-        };
-        let patch_status = if detail.patch_truncated {
-            locale::text("truncated", "已截断", "已截斷")
-        } else {
-            locale::text("loaded", "已加载", "已載入")
-        };
-        let patch_badge = match locale::current_locale() {
-            locale::ResolvedLocale::En => {
-                format!("{} files · patch {}", detail.files.len(), patch_status)
-            }
-            locale::ResolvedLocale::ZhCn => {
-                format!("{} 个文件 · 补丁{}", detail.files.len(), patch_status)
-            }
-            locale::ResolvedLocale::ZhTw => {
-                format!("{} 個檔案 · 補丁{}", detail.files.len(), patch_status)
-            }
         };
         let body_lines = detail
             .body
@@ -8135,6 +8142,26 @@ impl CodeWorkbench {
             .filter(|body| !body.is_empty())
             .map(|body| body.split('\n').map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_default();
+        let body_text = body_lines.join("\n");
+        let body_can_expand = commit_body_can_expand(&body_lines);
+        let body_expanded = self.commit_body_expanded.contains(&hash);
+        let body_toggle_hash = hash.clone();
+        let body_key_hash = hash.clone();
+        let file_count_label = commit_file_count_label(detail.files.len());
+        let total_additions: u64 = detail
+            .files
+            .iter()
+            .map(|file| u64::from(file.additions))
+            .sum();
+        let total_deletions: u64 = detail
+            .files
+            .iter()
+            .map(|file| u64::from(file.deletions))
+            .sum();
+        let split_hash = hash.clone();
+        let wrap_hash = hash.clone();
+        let wrap_tab_id = tab_id.to_string();
+        let collapse_hash = hash.clone();
         v_flex()
             .size_full()
             .min_h_0()
@@ -8149,21 +8176,13 @@ impl CodeWorkbench {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().muted.opacity(0.20))
                     .child(
-                        h_flex()
+                        div()
                             .min_w_0()
-                            .items_start()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(detail.summary.subject.clone()),
-                            )
-                            .child(preview_badge(patch_badge, cx)),
+                            .w_full()
+                            .truncate()
+                            .text_sm()
+                            .font_semibold()
+                            .child(detail.summary.subject.clone()),
                     )
                     .child(
                         h_flex()
@@ -8177,22 +8196,152 @@ impl CodeWorkbench {
                                 git_commit_authored_at(detail.summary.authored_at_ms),
                             ]),
                     )
-                    .when(!body_lines.is_empty(), |this| {
+                    .when(!body_text.is_empty(), |this| {
                         this.child(
                             v_flex()
-                                .mt_3()
-                                .line_height(gpui::relative(1.5))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .children(body_lines.into_iter().map(|line| {
-                                    div().whitespace_normal().child(if line.is_empty() {
-                                        " ".to_string()
-                                    } else {
-                                        line
-                                    })
-                                })),
+                                .id(format!("commit-body:{hash}"))
+                                .mt_2()
+                                .min_w_0()
+                                .gap_1()
+                                .when(body_can_expand, |this| {
+                                    this.cursor_pointer()
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .role(Role::Button)
+                                        .aria_expanded(body_expanded)
+                                        .aria_label(locale::text(
+                                            "Commit message",
+                                            "提交信息",
+                                            "提交資訊",
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_commit_body(&body_toggle_hash, cx);
+                                        }))
+                                        .on_key_down(cx.listener(
+                                            move |this, event: &KeyDownEvent, _, cx| {
+                                                if event.keystroke.key != "enter"
+                                                    && event.keystroke.key != "space"
+                                                {
+                                                    return;
+                                                }
+                                                this.toggle_commit_body(&body_key_hash, cx);
+                                                cx.stop_propagation();
+                                            },
+                                        ))
+                                })
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_normal()
+                                        .when(!body_expanded, |this| {
+                                            this.line_clamp(COMMIT_BODY_COLLAPSED_LINES)
+                                        })
+                                        .line_height(gpui::relative(1.5))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(body_text),
+                                )
+                                .when(body_can_expand, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_1()
+                                            .text_xs()
+                                            .text_color(cx.theme().primary)
+                                            .child(
+                                                Icon::new(if body_expanded {
+                                                    IconName::ChevronUp
+                                                } else {
+                                                    IconName::ChevronDown
+                                                })
+                                                .size(px(12.0)),
+                                            )
+                                            .child(if body_expanded {
+                                                locale::text("Collapse", "收起", "收起")
+                                            } else {
+                                                locale::text("Expand", "展开", "展開")
+                                            }),
+                                    )
+                                }),
                         )
-                    }),
+                    })
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .pt_1()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(file_count_label),
+                            )
+                            .child(commit_stat_label(
+                                format!("+{total_additions}"),
+                                cx.theme().success,
+                                &code_font_family,
+                                cx,
+                            ))
+                            .child(commit_stat_label(
+                                format!("-{total_deletions}"),
+                                cx.theme().danger,
+                                &code_font_family,
+                                cx,
+                            ))
+                            .child(div().flex_1())
+                            .child(commit_view_toggle(
+                                format!("commit-split:{hash}"),
+                                Icon::default()
+                                    .path("icons/vibex/columns-2.svg")
+                                    .size(px(14.0))
+                                    .into_any_element(),
+                                locale::text("Side-by-side diff", "双栏显示", "雙欄顯示"),
+                                view_options.split_view,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_commit_split_view(&split_hash, cx);
+                                }),
+                            ))
+                            .child(commit_view_toggle(
+                                format!("commit-wrap:{hash}"),
+                                Icon::default()
+                                    .path("icons/vibex/text-wrap.svg")
+                                    .size(px(14.0))
+                                    .into_any_element(),
+                                locale::text("Wrap long lines", "自动换行", "自動換行"),
+                                view_options.wrap_lines,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_commit_wrap_lines(&wrap_hash, &wrap_tab_id, cx);
+                                }),
+                            ))
+                            .child(commit_view_toggle(
+                                format!("commit-collapse-all:{hash}"),
+                                if all_files_collapsed {
+                                    Icon::new(IconName::ChevronsUpDown)
+                                        .size(px(14.0))
+                                        .into_any_element()
+                                } else {
+                                    Icon::default()
+                                        .path("icons/vibex/chevrons-down-up.svg")
+                                        .size(px(14.0))
+                                        .into_any_element()
+                                },
+                                if all_files_collapsed {
+                                    locale::text("Expand all files", "展开全部文件", "展開全部檔案")
+                                } else {
+                                    locale::text(
+                                        "Collapse all files",
+                                        "折叠全部文件",
+                                        "摺疊全部檔案",
+                                    )
+                                },
+                                all_files_collapsed,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_all_commit_files(&collapse_hash, cx);
+                                }),
+                            )),
+                    ),
             )
             .child(
                 v_flex()
@@ -8202,6 +8351,46 @@ impl CodeWorkbench {
                     .child(div().relative().flex_1().min_h_0().child(list)),
             )
             .into_any_element()
+    }
+
+    /// Flips one commit's message body between the three-line summary and the
+    /// full text.
+    fn toggle_commit_body(&mut self, hash: &str, cx: &mut Context<Self>) {
+        if !self.commit_body_expanded.remove(hash) {
+            self.commit_body_expanded.insert(hash.to_string());
+        }
+        cx.notify();
+    }
+
+    fn toggle_commit_split_view(&mut self, hash: &str, cx: &mut Context<Self>) {
+        let mut options = self.git.commit_view_options(hash);
+        options.split_view = !options.split_view;
+        if self.git.set_commit_view_options(hash, options) {
+            // The row count changes with the projection, so the list state
+            // resizes on its own through the reconcile pass.
+            cx.notify();
+        }
+    }
+
+    fn toggle_commit_wrap_lines(&mut self, hash: &str, tab_id: &str, cx: &mut Context<Self>) {
+        let mut options = self.git.commit_view_options(hash);
+        options.wrap_lines = !options.wrap_lines;
+        if !self.git.set_commit_view_options(hash, options) {
+            return;
+        }
+        // Wrapping keeps the row count but changes every row's height, so the
+        // measured list has to be re-measured rather than resized.
+        if let Some(list_state) = self.preview_commit_lists.get(tab_id) {
+            list_state.list.remeasure();
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_commit_files(&mut self, hash: &str, cx: &mut Context<Self>) {
+        let collapsed = !self.git.commit_all_files_collapsed(hash);
+        if self.git.set_all_commit_files_collapsed(hash, collapsed) {
+            cx.notify();
+        }
     }
 
     fn render_patch_list<F>(
@@ -14744,8 +14933,20 @@ fn tab_label(target: &PreviewTarget) -> String {
             ..
         } => subject
             .clone()
+            .map(|subject| truncate_label(&subject, COMMIT_TAB_LABEL_MAX_CHARS))
             .unwrap_or_else(|| commit_hash.chars().take(8).collect()),
     }
+}
+
+/// Shortens a tab label on a character boundary, marking the cut with an
+/// ellipsis so the tab never widens with the content behind it.
+fn truncate_label(label: &str, max_chars: usize) -> String {
+    if label.chars().count() <= max_chars {
+        return label.to_string();
+    }
+    let mut truncated = label.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
@@ -14757,6 +14958,12 @@ fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
                 format!("{label}\n{path}")
             }
         }
+        // The tab shortens a long subject, so the tooltip is where the whole
+        // commit message stays readable.
+        PreviewTarget::GitCommit {
+            subject: Some(subject),
+            ..
+        } => subject.clone(),
         _ => label.to_string(),
     }
 }
@@ -15146,11 +15353,90 @@ fn render_truncated_alert(truncated: bool, _cx: &Context<CodeWorkbench>) -> AnyE
     .into_any_element()
 }
 
+/// The commit header keeps a three-line summary of the message body; a long
+/// body otherwise fills the pane before the patch starts.
+const COMMIT_BODY_COLLAPSED_LINES: usize = 3;
+/// A body line longer than this is expected to wrap at ordinary preview
+/// widths, so the collapsed preview is worth offering even for short bodies.
+const COMMIT_BODY_LONG_LINE_CHARS: usize = 96;
+/// File rows carry a click target and a disclosure chevron, so they stand
+/// taller than a diff line.
+const COMMIT_FILE_ROW_HEIGHT: f32 = 36.0;
+/// The left rail that marks a changed row. It sits at the row's very edge so
+/// additions and deletions are readable while scanning the gutter.
+const DIFF_CHANGE_RAIL_WIDTH: f32 = 3.0;
+
+/// Whether the collapsed three-line body would hide anything.
+fn commit_body_can_expand(body_lines: &[String]) -> bool {
+    body_lines.len() > COMMIT_BODY_COLLAPSED_LINES
+        || body_lines
+            .iter()
+            .any(|line| line.chars().count() > COMMIT_BODY_LONG_LINE_CHARS)
+}
+
+fn commit_file_count_label(file_count: usize) -> String {
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => {
+            if file_count == 1 {
+                "1 changed file in this commit".to_string()
+            } else {
+                format!("{file_count} changed files in this commit")
+            }
+        }
+        locale::ResolvedLocale::ZhCn => format!("此提交中 {file_count} 个文件变更"),
+        locale::ResolvedLocale::ZhTw => format!("此提交中 {file_count} 個檔案變更"),
+    }
+}
+
+fn commit_stat_label(
+    text: String,
+    color: Hsla,
+    code_font_family: &str,
+    cx: &Context<CodeWorkbench>,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .font_family(code_font_family.to_string())
+        .text_size(cx.theme().mono_font_size)
+        .font_weight(code_font_weight(cx))
+        .text_color(color)
+        .child(text)
+        .into_any_element()
+}
+
+fn commit_view_toggle(
+    id: String,
+    icon: AnyElement,
+    tooltip: &'static str,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    Button::new(id)
+        .small()
+        .ghost()
+        .compact()
+        .w(px(24.0))
+        .h(px(24.0))
+        .p_0()
+        .selected(active)
+        .toggled(active)
+        .tooltip(tooltip)
+        .child(icon)
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn commit_file_row_height(diff_row_height: f32) -> f32 {
+    diff_row_height.max(COMMIT_FILE_ROW_HEIGHT)
+}
+
 fn render_commit_patch_row(
     row: GitCommitPatchRow,
     hash: String,
     code_font_family: String,
     diff_row_height: f32,
+    file_row_height: f32,
+    wrap_lines: bool,
     cx: &Context<CodeWorkbench>,
 ) -> AnyElement {
     match row {
@@ -15173,7 +15459,7 @@ fn render_commit_patch_row(
             let key_path = path.clone();
             h_flex()
                 .id(format!("commit-file:{hash}:{file_index}"))
-                .h(px(diff_row_height))
+                .h(px(file_row_height))
                 .w_full()
                 .flex_none()
                 .min_w_0()
@@ -15260,11 +15546,19 @@ fn render_commit_patch_row(
                 .into_any_element()
         }
         GitCommitPatchRow::Diff(row) => {
-            render_diff_row(row, &code_font_family, diff_row_height, cx)
+            render_diff_row(row, &code_font_family, diff_row_height, wrap_lines, cx)
         }
+        GitCommitPatchRow::SplitDiff { left, right } => render_split_diff_row(
+            left,
+            right,
+            &code_font_family,
+            diff_row_height,
+            wrap_lines,
+            cx,
+        ),
         GitCommitPatchRow::Empty { file_index, path } => div()
             .id(format!("commit-file-empty:{hash}:{file_index}"))
-            .h(px(diff_row_height))
+            .h(px(file_row_height))
             .flex_none()
             .px_3()
             .border_b_1()
@@ -15285,33 +15579,84 @@ fn render_commit_patch_row(
     }
 }
 
-fn render_diff_row(
-    row: vibex_desktop_model::PreparedDiffRow,
-    code_font_family: &str,
-    diff_row_height: f32,
+fn diff_row_palette(
+    kind: UnifiedDiffLineKind,
     cx: &Context<CodeWorkbench>,
-) -> AnyElement {
-    let background = match row.row.kind {
+) -> (Hsla, Hsla, &'static str) {
+    let background = match kind {
         UnifiedDiffLineKind::Add => cx.theme().success.opacity(0.10),
         UnifiedDiffLineKind::Delete => cx.theme().danger.opacity(0.10),
         UnifiedDiffLineKind::Hunk => cx.theme().info.opacity(0.10),
         UnifiedDiffLineKind::Meta => cx.theme().muted.opacity(0.30),
         UnifiedDiffLineKind::Context => cx.theme().background,
     };
-    let foreground = match row.row.kind {
+    let foreground = match kind {
         UnifiedDiffLineKind::Add => cx.theme().success,
         UnifiedDiffLineKind::Delete => cx.theme().danger,
         UnifiedDiffLineKind::Hunk => cx.theme().info,
         UnifiedDiffLineKind::Meta => cx.theme().muted_foreground,
         UnifiedDiffLineKind::Context => cx.theme().foreground.opacity(0.85),
     };
-    let prefix = match row.row.kind {
+    let prefix = match kind {
         UnifiedDiffLineKind::Add => "+",
         UnifiedDiffLineKind::Delete => "-",
         UnifiedDiffLineKind::Hunk => "",
         UnifiedDiffLineKind::Meta => " ",
         UnifiedDiffLineKind::Context => " ",
     };
+    (background, foreground, prefix)
+}
+
+/// The rail that marks a changed row. It is the row's first child, so an
+/// addition or deletion reads from the pane's left edge.
+fn diff_change_rail(kind: UnifiedDiffLineKind, cx: &Context<CodeWorkbench>) -> AnyElement {
+    let color = match kind {
+        UnifiedDiffLineKind::Add => cx.theme().success,
+        UnifiedDiffLineKind::Delete => cx.theme().danger,
+        _ => cx.theme().transparent,
+    };
+    div()
+        .w(px(DIFF_CHANGE_RAIL_WIDTH))
+        .flex_none()
+        .bg(color)
+        .into_any_element()
+}
+
+fn diff_line_number(line: Option<u32>, cx: &Context<CodeWorkbench>) -> AnyElement {
+    div()
+        .w(px(DIFF_GUTTER_WIDTH))
+        .flex_none()
+        .border_r_1()
+        .border_color(cx.theme().border.opacity(0.30))
+        .px_2()
+        .py(px(DIFF_LINE_VERTICAL_PADDING))
+        .text_right()
+        .text_color(cx.theme().muted_foreground.opacity(0.70))
+        .child(line.map(|line| line.to_string()).unwrap_or_default())
+        .into_any_element()
+}
+
+fn diff_line_content(text: String, wrap_lines: bool) -> AnyElement {
+    div()
+        .min_w_0()
+        .flex_1()
+        .when(wrap_lines, |this| this.whitespace_normal())
+        .when(!wrap_lines, |this| this.truncate())
+        .px_3()
+        .py(px(DIFF_LINE_VERTICAL_PADDING))
+        .child(text)
+        .into_any_element()
+}
+
+fn render_diff_row(
+    row: vibex_desktop_model::PreparedDiffRow,
+    code_font_family: &str,
+    diff_row_height: f32,
+    wrap_lines: bool,
+    cx: &Context<CodeWorkbench>,
+) -> AnyElement {
+    let kind = row.row.kind;
+    let (background, foreground, prefix) = diff_row_palette(kind, cx);
     let content = if row.row.content.is_empty() {
         " ".to_string()
     } else {
@@ -15331,49 +15676,126 @@ fn render_diff_row(
         .text_color(foreground)
         .border_b_1()
         .border_color(cx.theme().border.opacity(0.30))
-        .child(
+        .child(diff_change_rail(kind, cx))
+        .child(diff_line_number(row.row.old_line, cx))
+        .child(diff_line_number(row.row.new_line, cx))
+        .child(diff_line_content(format!("{prefix}{content}"), wrap_lines))
+        .into_any_element()
+}
+
+/// One aligned row of the side-by-side projection. Each half keeps its own
+/// gutter and change rail; an absent side is a filler that holds the divider.
+fn render_split_diff_row(
+    left: Option<vibex_desktop_model::PreparedDiffRow>,
+    right: Option<vibex_desktop_model::PreparedDiffRow>,
+    code_font_family: &str,
+    diff_row_height: f32,
+    wrap_lines: bool,
+    cx: &Context<CodeWorkbench>,
+) -> AnyElement {
+    let kind = left
+        .as_ref()
+        .map(|row| row.row.kind)
+        .or_else(|| right.as_ref().map(|row| row.row.kind))
+        .unwrap_or(UnifiedDiffLineKind::Context);
+    let (background, foreground, _) = diff_row_palette(kind, cx);
+    let left = left
+        .map(|row| {
+            render_split_diff_side(
+                row,
+                SplitDiffSide::Left,
+                background,
+                foreground,
+                wrap_lines,
+                cx,
+            )
+        })
+        .unwrap_or_else(|| {
             div()
-                .w(px(DIFF_GUTTER_WIDTH))
-                .flex_none()
-                .border_r_1()
-                .border_color(cx.theme().border.opacity(0.30))
-                .px_2()
-                .py(px(DIFF_LINE_VERTICAL_PADDING))
-                .text_right()
-                .text_color(cx.theme().muted_foreground.opacity(0.70))
-                .child(
-                    row.row
-                        .old_line
-                        .map(|line| line.to_string())
-                        .unwrap_or_default(),
-                ),
-        )
-        .child(
-            div()
-                .w(px(DIFF_GUTTER_WIDTH))
-                .flex_none()
-                .border_r_1()
-                .border_color(cx.theme().border.opacity(0.30))
-                .px_2()
-                .py(px(DIFF_LINE_VERTICAL_PADDING))
-                .text_right()
-                .text_color(cx.theme().muted_foreground.opacity(0.70))
-                .child(
-                    row.row
-                        .new_line
-                        .map(|line| line.to_string())
-                        .unwrap_or_default(),
-                ),
-        )
-        .child(
-            div()
-                .min_w_0()
                 .flex_1()
-                .whitespace_normal()
-                .px_3()
-                .py(px(DIFF_LINE_VERTICAL_PADDING))
-                .child(format!("{prefix}{content}")),
+                .min_w_0()
+                .bg(cx.theme().muted.opacity(0.12))
+                .into_any_element()
+        });
+    let right = right
+        .map(|row| {
+            render_split_diff_side(
+                row,
+                SplitDiffSide::Right,
+                background,
+                foreground,
+                wrap_lines,
+                cx,
+            )
+        })
+        .unwrap_or_else(|| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .bg(cx.theme().muted.opacity(0.12))
+                .into_any_element()
+        });
+    h_flex()
+        .min_h(px(diff_row_height))
+        .w_full()
+        .flex_none()
+        .min_w_0()
+        .items_stretch()
+        .font_family(code_font_family.to_string())
+        .text_size(cx.theme().mono_font_size)
+        .font_weight(code_font_weight(cx))
+        .line_height(gpui::relative(1.5))
+        .border_b_1()
+        .border_color(cx.theme().border.opacity(0.30))
+        .child(left)
+        .child(
+            div()
+                .w(px(1.0))
+                .flex_none()
+                .bg(cx.theme().border.opacity(0.45)),
         )
+        .child(right)
+        .into_any_element()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitDiffSide {
+    Left,
+    Right,
+}
+
+fn render_split_diff_side(
+    row: vibex_desktop_model::PreparedDiffRow,
+    side: SplitDiffSide,
+    background: Hsla,
+    foreground: Hsla,
+    wrap_lines: bool,
+    cx: &Context<CodeWorkbench>,
+) -> AnyElement {
+    let kind = row.row.kind;
+    let prefix = match kind {
+        UnifiedDiffLineKind::Add => "+",
+        UnifiedDiffLineKind::Delete => "-",
+        _ => " ",
+    };
+    let content = if row.row.content.is_empty() {
+        " ".to_string()
+    } else {
+        row.row.content
+    };
+    let line = match side {
+        SplitDiffSide::Left => row.row.old_line,
+        SplitDiffSide::Right => row.row.new_line,
+    };
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .items_stretch()
+        .bg(background)
+        .text_color(foreground)
+        .child(diff_change_rail(kind, cx))
+        .child(diff_line_number(line, cx))
+        .child(diff_line_content(format!("{prefix}{content}"), wrap_lines))
         .into_any_element()
 }
 
@@ -17010,6 +17432,121 @@ mod tests {
         assert_eq!(diff_row_height(13), 24.0);
         assert_eq!(diff_row_height(24), 40.0);
         assert_eq!(diff_row_height(100), diff_row_height(24));
+    }
+
+    #[test]
+    fn commit_file_rows_stand_taller_than_diff_lines() {
+        assert_eq!(commit_file_row_height(diff_row_height(13)), 36.0);
+        assert_eq!(commit_file_row_height(diff_row_height(10)), 36.0);
+        // A larger code font still grows the row with the text.
+        assert_eq!(commit_file_row_height(diff_row_height(24)), 40.0);
+    }
+
+    #[test]
+    fn commit_header_carries_the_file_summary_and_the_view_toggles() {
+        let source = include_str!("code_workbench.rs");
+        let header = source
+            .split_once("fn render_commit_content")
+            .and_then(|(_, tail)| tail.split_once("fn toggle_commit_body"))
+            .map(|(header, _)| header)
+            .expect("the commit header should remain inspectable");
+
+        // The old "N files · patch loaded" badge is gone; the summary row
+        // below the header reports the count and the line totals instead.
+        assert!(!header.contains("patch_badge"));
+        assert!(!header.contains("个文件 · 补丁"));
+        assert!(header.contains("commit_file_count_label(detail.files.len())"));
+        assert!(header.contains("format!(\"+{total_additions}\")"));
+        assert!(header.contains("format!(\"-{total_deletions}\")"));
+
+        // The three view toggles ride the same row.
+        assert!(header.contains("commit-split:"));
+        assert!(header.contains("commit-wrap:"));
+        assert!(header.contains("commit-collapse-all:"));
+        assert!(header.contains("icons/vibex/columns-2.svg"));
+        assert!(header.contains("icons/vibex/text-wrap.svg"));
+        assert!(header.contains("toggle_commit_split_view"));
+        assert!(header.contains("toggle_commit_wrap_lines"));
+        assert!(header.contains("toggle_all_commit_files"));
+
+        // The message body is a three-line summary until the reader expands it.
+        assert!(header.contains("commit_body_can_expand(&body_lines)"));
+        assert!(header.contains("line_clamp(COMMIT_BODY_COLLAPSED_LINES)"));
+    }
+
+    #[test]
+    fn changed_diff_rows_start_with_a_colour_rail() {
+        let source = include_str!("code_workbench.rs");
+        let row = source
+            .split_once("fn render_diff_row(")
+            .and_then(|(_, tail)| tail.split_once("fn render_split_diff_row("))
+            .map(|(row, _)| row)
+            .expect("the unified diff row should remain inspectable");
+        let rail = row
+            .find(".child(diff_change_rail(kind, cx))")
+            .expect("a changed row should start with its colour rail");
+        let numbers = row
+            .find(".child(diff_line_number(row.row.old_line, cx))")
+            .expect("the rail should precede the line numbers");
+        assert!(rail < numbers);
+
+        let split = source
+            .split_once("fn render_split_diff_side(")
+            .and_then(|(_, tail)| tail.split_once("\nfn "))
+            .map(|(side, _)| side)
+            .expect("the split diff side should remain inspectable");
+        assert!(split.contains(".child(diff_change_rail(kind, cx))"));
+    }
+
+    #[test]
+    fn commit_body_expands_only_when_the_three_line_summary_would_clip() {
+        let short = vec!["one".to_string(), "two".to_string()];
+        assert!(!commit_body_can_expand(&short));
+
+        let long = (0..4)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
+        assert!(commit_body_can_expand(&long));
+
+        let wrapped = vec!["x".repeat(COMMIT_BODY_LONG_LINE_CHARS + 1)];
+        assert!(commit_body_can_expand(&wrapped));
+    }
+
+    #[test]
+    fn commit_tab_labels_shorten_long_subjects_on_a_character_boundary() {
+        assert_eq!(truncate_label("short subject", 48), "short subject");
+        assert_eq!(truncate_label("提交信息", 48), "提交信息");
+
+        let subject = "style(desktop): match the usage range control to the segmented bars";
+        let label = truncate_label(subject, COMMIT_TAB_LABEL_MAX_CHARS);
+        assert_eq!(label.chars().count(), COMMIT_TAB_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+        assert!(subject.starts_with(label.trim_end_matches('…')));
+
+        let chinese = "修复".repeat(40);
+        let label = truncate_label(&chinese, COMMIT_TAB_LABEL_MAX_CHARS);
+        assert_eq!(label.chars().count(), COMMIT_TAB_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn commit_file_count_label_reads_naturally_per_locale() {
+        assert_eq!(
+            commit_file_count_label(1),
+            locale::text(
+                "1 changed file in this commit",
+                "此提交中 1 个文件变更",
+                "此提交中 1 個檔案變更"
+            )
+        );
+        assert_eq!(
+            commit_file_count_label(3),
+            locale::text(
+                "3 changed files in this commit",
+                "此提交中 3 个文件变更",
+                "此提交中 3 個檔案變更"
+            )
+        );
     }
 
     #[test]

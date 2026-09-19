@@ -7,7 +7,9 @@ use vibex_core::{
     GitHistoryResponse, GitStatusSummary, GitWorktreeListResponse, WorkspaceId,
 };
 
-use crate::{PreparedDiffRow, UnifiedDiffFile, VirtualDiffRows, parse_unified_diff};
+use crate::{
+    PreparedDiffRow, UnifiedDiffFile, UnifiedDiffLineKind, VirtualDiffRows, parse_unified_diff,
+};
 
 pub const GIT_HISTORY_MAX_ROWS: usize = 10_000;
 pub const GIT_CHANGE_MAX_ROWS: usize = 100_000;
@@ -190,11 +192,24 @@ impl GitDiffDocument {
     }
 }
 
+/// One visible row of a commit preview. `Split` is an aligned side-by-side
+/// row: a side is absent when the hunk only changed the other one (a pure
+/// addition or deletion).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GitCommitPatchRowRef {
-    FileHeader { file_index: usize },
-    Diff { row_index: usize },
-    Empty { file_index: usize },
+    FileHeader {
+        file_index: usize,
+    },
+    Diff {
+        row_index: usize,
+    },
+    Split {
+        left: Option<usize>,
+        right: Option<usize>,
+    },
+    Empty {
+        file_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -208,10 +223,31 @@ pub enum GitCommitPatchRow {
         collapsed: bool,
     },
     Diff(PreparedDiffRow),
+    SplitDiff {
+        left: Option<PreparedDiffRow>,
+        right: Option<PreparedDiffRow>,
+    },
     Empty {
         file_index: usize,
         path: String,
     },
+}
+
+/// How one commit preview presents its patch. Both switches are presentation
+/// state owned by the document so a tab keeps its layout across reloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitCommitViewOptions {
+    pub split_view: bool,
+    pub wrap_lines: bool,
+}
+
+impl Default for GitCommitViewOptions {
+    fn default() -> Self {
+        Self {
+            split_view: false,
+            wrap_lines: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -219,12 +255,17 @@ pub struct GitCommitDocument {
     pub detail: GitCommitDetail,
     pub patch: Option<GitDiffDocument>,
     collapsed_files: BTreeSet<String>,
+    view_options: GitCommitViewOptions,
     file_row_ranges: Vec<std::ops::Range<usize>>,
     visible_rows: Vec<GitCommitPatchRowRef>,
 }
 
 impl GitCommitDocument {
-    fn new(detail: GitCommitDetail, collapsed_files: BTreeSet<String>) -> Self {
+    fn new(
+        detail: GitCommitDetail,
+        collapsed_files: BTreeSet<String>,
+        view_options: GitCommitViewOptions,
+    ) -> Self {
         let patch = detail.patch.as_deref().map(|patch| {
             let content_hash = format!("sha256:{:x}", Sha256::digest(patch.as_bytes()));
             GitDiffDocument::new(
@@ -239,11 +280,58 @@ impl GitCommitDocument {
             detail,
             patch,
             collapsed_files,
+            view_options,
             file_row_ranges: Vec::new(),
             visible_rows: Vec::new(),
         };
         document.rebuild_visible_rows();
         document
+    }
+
+    pub fn view_options(&self) -> GitCommitViewOptions {
+        self.view_options
+    }
+
+    /// Applies a presentation switch and rebuilds the visible projection only
+    /// when it actually changed. Returns whether the document was rebuilt.
+    pub fn set_view_options(&mut self, options: GitCommitViewOptions) -> bool {
+        if self.view_options == options {
+            return false;
+        }
+        let split_changed = self.view_options.split_view != options.split_view;
+        self.view_options = options;
+        if split_changed {
+            self.rebuild_visible_rows();
+        }
+        true
+    }
+
+    pub fn all_files_collapsed(&self) -> bool {
+        self.patch
+            .as_ref()
+            .is_some_and(|patch| !patch.files.is_empty())
+            && patch_files_are_collapsed(self.patch.as_ref(), &self.collapsed_files)
+    }
+
+    pub fn set_all_files_collapsed(&mut self, collapsed: bool) -> bool {
+        let Some(patch) = self.patch.as_ref() else {
+            return false;
+        };
+        let next = if collapsed {
+            patch
+                .files
+                .iter()
+                .map(|file| file.display_path().to_string())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if self.collapsed_files == next {
+            return false;
+        }
+        self.collapsed_files = next;
+        self.rebuild_visible_rows();
+        true
     }
 
     pub fn has_patch(&self) -> bool {
@@ -292,6 +380,13 @@ impl GitCommitDocument {
                     .rows
                     .prepared_row(row_index)
                     .map(GitCommitPatchRow::Diff),
+                GitCommitPatchRowRef::Split { left, right } => {
+                    let rows = &mut self.patch.as_mut()?.rows;
+                    Some(GitCommitPatchRow::SplitDiff {
+                        left: left.and_then(|row_index| rows.prepared_row(row_index)),
+                        right: right.and_then(|row_index| rows.prepared_row(row_index)),
+                    })
+                }
                 GitCommitPatchRowRef::Empty { file_index } => {
                     let file = self.patch.as_ref()?.files.get(file_index)?;
                     Some(GitCommitPatchRow::Empty {
@@ -409,6 +504,9 @@ impl GitCommitDocument {
             if range.is_empty() {
                 self.visible_rows
                     .push(GitCommitPatchRowRef::Empty { file_index });
+            } else if self.view_options.split_view {
+                self.visible_rows
+                    .extend(split_row_refs(&patch.rows, range.clone()));
             } else {
                 self.visible_rows.extend(
                     range
@@ -418,6 +516,76 @@ impl GitCommitDocument {
             }
         }
     }
+}
+
+/// True when every file in the patch is already collapsed. An empty patch has
+/// nothing to collapse, so it never reports the collapsed state.
+fn patch_files_are_collapsed(
+    patch: Option<&GitDiffDocument>,
+    collapsed_files: &BTreeSet<String>,
+) -> bool {
+    patch.is_some_and(|patch| {
+        !patch.files.is_empty()
+            && patch
+                .files
+                .iter()
+                .all(|file| collapsed_files.contains(file.display_path()))
+    })
+}
+
+/// Pairs one file's patch rows into side-by-side rows. Hunk and metadata rows
+/// keep the full width; context rows feed both columns, and a delete run is
+/// zipped with the add run that follows it so an edit reads across the split.
+fn split_row_refs(
+    rows: &VirtualDiffRows,
+    range: std::ops::Range<usize>,
+) -> Vec<GitCommitPatchRowRef> {
+    let mut refs = Vec::with_capacity(range.len());
+    let mut index = range.start;
+    while index < range.end {
+        let Some(kind) = rows.row(index).map(|row| row.kind) else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        match kind {
+            UnifiedDiffLineKind::Hunk | UnifiedDiffLineKind::Meta => {
+                refs.push(GitCommitPatchRowRef::Diff { row_index: index });
+                index = index.saturating_add(1);
+            }
+            UnifiedDiffLineKind::Context => {
+                refs.push(GitCommitPatchRowRef::Split {
+                    left: Some(index),
+                    right: Some(index),
+                });
+                index = index.saturating_add(1);
+            }
+            UnifiedDiffLineKind::Delete | UnifiedDiffLineKind::Add => {
+                let deletes_start = index;
+                while index < range.end
+                    && rows.row(index).map(|row| row.kind) == Some(UnifiedDiffLineKind::Delete)
+                {
+                    index = index.saturating_add(1);
+                }
+                let deletes_end = index;
+                let adds_start = index;
+                while index < range.end
+                    && rows.row(index).map(|row| row.kind) == Some(UnifiedDiffLineKind::Add)
+                {
+                    index = index.saturating_add(1);
+                }
+                let adds_end = index;
+                let deletes = deletes_end.saturating_sub(deletes_start);
+                let adds = adds_end.saturating_sub(adds_start);
+                for offset in 0..deletes.max(adds) {
+                    refs.push(GitCommitPatchRowRef::Split {
+                        left: (offset < deletes).then_some(deletes_start + offset),
+                        right: (offset < adds).then_some(adds_start + offset),
+                    });
+                }
+            }
+        }
+    }
+    refs
 }
 
 #[derive(Debug, Clone, Default)]
@@ -666,9 +834,14 @@ impl GitWorkbenchState {
             previous.expect("patch-bearing document checked above")
         } else {
             let collapsed_files = previous
-                .map(|document| document.collapsed_files)
+                .as_ref()
+                .map(|document| document.collapsed_files.clone())
                 .unwrap_or_default();
-            GitCommitDocument::new(detail, collapsed_files)
+            let view_options = previous
+                .as_ref()
+                .map(GitCommitDocument::view_options)
+                .unwrap_or_default();
+            GitCommitDocument::new(detail, collapsed_files, view_options)
         };
         self.commit_cache_epoch = self.commit_cache_epoch.saturating_add(1).max(1);
         self.commit_document_epochs
@@ -717,6 +890,31 @@ impl GitWorkbenchState {
         self.commit_documents
             .get_mut(hash)
             .is_some_and(|document| document.toggle_file(path))
+    }
+
+    pub fn commit_view_options(&self, hash: &str) -> GitCommitViewOptions {
+        self.commit_documents
+            .get(hash)
+            .map(GitCommitDocument::view_options)
+            .unwrap_or_default()
+    }
+
+    pub fn set_commit_view_options(&mut self, hash: &str, options: GitCommitViewOptions) -> bool {
+        self.commit_documents
+            .get_mut(hash)
+            .is_some_and(|document| document.set_view_options(options))
+    }
+
+    pub fn commit_all_files_collapsed(&self, hash: &str) -> bool {
+        self.commit_documents
+            .get(hash)
+            .is_some_and(GitCommitDocument::all_files_collapsed)
+    }
+
+    pub fn set_all_commit_files_collapsed(&mut self, hash: &str, collapsed: bool) -> bool {
+        self.commit_documents
+            .get_mut(hash)
+            .is_some_and(|document| document.set_all_files_collapsed(collapsed))
     }
 
     pub fn focus_commit_file(&mut self, hash: &str, path: &str) -> Option<usize> {
@@ -2130,5 +2328,129 @@ mod tests {
         assert_eq!(state.focus_commit_file("commit-a", "src/one.rs"), Some(0));
         assert_eq!(state.commit_preview_row_count("commit-a"), 7);
         assert_eq!(state.focus_commit_file("commit-a", "src/two.rs"), Some(4));
+    }
+
+    #[test]
+    fn commit_split_view_zips_delete_runs_with_the_add_run_that_follows() {
+        let workspace_id = WorkspaceId::new();
+        let patch = concat!(
+            "diff --git a/src/one.rs b/src/one.rs\n",
+            "--- a/src/one.rs\n",
+            "+++ b/src/one.rs\n",
+            "@@ -1,4 +1,3 @@\n",
+            " context\n",
+            "-old one\n",
+            "-old two\n",
+            "+new one\n",
+            " tail\n",
+            "diff --git a/src/two.rs b/src/two.rs\n",
+            "--- /dev/null\n",
+            "+++ b/src/two.rs\n",
+            "@@ -0,0 +1 @@\n",
+            "+two\n",
+        );
+        let mut state = GitWorkbenchState::default();
+        state.reset_workspace(workspace_id.clone());
+        let ticket = state
+            .begin_query(GitQueryKind::CommitDetail, "commit-a")
+            .unwrap();
+        assert!(state.apply_commit_detail(
+            &ticket,
+            commit_detail(&workspace_id, "commit-a", Some(patch)),
+        ));
+
+        // Unified: header + (hunk, context, delete, delete, add, context) + header + (hunk, add).
+        assert_eq!(state.commit_preview_row_count("commit-a"), 10);
+        assert_eq!(
+            state.commit_view_options("commit-a"),
+            GitCommitViewOptions::default()
+        );
+
+        assert!(state.set_commit_view_options(
+            "commit-a",
+            GitCommitViewOptions {
+                split_view: true,
+                wrap_lines: true,
+            },
+        ));
+        // Split: the two deletes zip against the single add, so the file's six
+        // patch rows project onto five aligned rows.
+        assert_eq!(state.commit_preview_row_count("commit-a"), 9);
+        let rows = state.commit_preview_window("commit-a", 0, 9);
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                GitCommitPatchRow::FileHeader { .. },
+                GitCommitPatchRow::Diff(_),
+                GitCommitPatchRow::SplitDiff {
+                    left: Some(_),
+                    right: Some(_)
+                },
+                GitCommitPatchRow::SplitDiff {
+                    left: Some(_),
+                    right: Some(_)
+                },
+                GitCommitPatchRow::SplitDiff {
+                    left: Some(_),
+                    right: None
+                },
+                GitCommitPatchRow::SplitDiff {
+                    left: Some(_),
+                    right: Some(_)
+                },
+                GitCommitPatchRow::FileHeader { .. },
+                GitCommitPatchRow::Diff(_),
+                GitCommitPatchRow::SplitDiff {
+                    left: None,
+                    right: Some(_)
+                },
+            ]
+        ));
+
+        // Toggling back restores the unified projection.
+        assert!(state.set_commit_view_options(
+            "commit-a",
+            GitCommitViewOptions {
+                split_view: false,
+                wrap_lines: true,
+            },
+        ));
+        assert_eq!(state.commit_preview_row_count("commit-a"), 10);
+    }
+
+    #[test]
+    fn commit_preview_collapses_and_expands_every_file_at_once() {
+        let workspace_id = WorkspaceId::new();
+        let patch = concat!(
+            "diff --git a/src/one.rs b/src/one.rs\n",
+            "--- a/src/one.rs\n",
+            "+++ b/src/one.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/src/two.rs b/src/two.rs\n",
+            "--- /dev/null\n",
+            "+++ b/src/two.rs\n",
+            "@@ -0,0 +1 @@\n",
+            "+two\n",
+        );
+        let mut state = GitWorkbenchState::default();
+        state.reset_workspace(workspace_id.clone());
+        let ticket = state
+            .begin_query(GitQueryKind::CommitDetail, "commit-a")
+            .unwrap();
+        assert!(state.apply_commit_detail(
+            &ticket,
+            commit_detail(&workspace_id, "commit-a", Some(patch)),
+        ));
+
+        assert!(!state.commit_all_files_collapsed("commit-a"));
+        assert!(state.set_all_commit_files_collapsed("commit-a", true));
+        assert!(state.commit_all_files_collapsed("commit-a"));
+        assert_eq!(state.commit_preview_row_count("commit-a"), 2);
+        assert!(!state.set_all_commit_files_collapsed("commit-a", true));
+        assert!(state.set_all_commit_files_collapsed("commit-a", false));
+        assert!(!state.commit_all_files_collapsed("commit-a"));
+        assert_eq!(state.commit_preview_row_count("commit-a"), 7);
     }
 }

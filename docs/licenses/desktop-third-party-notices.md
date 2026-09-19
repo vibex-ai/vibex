@@ -1127,7 +1127,7 @@ This inventory records source and license provenance. The corresponding license 
 | Input | Files | Source | Declared license | Policy selection |
 | --- | ---: | --- | --- | --- |
 | gpui-kit bundled Lucide icon set | 1830 | https://github.com/longbridge/gpui-kit | Apache-2.0 AND ISC | (Apache-2.0 AND ISC) |
-| Vibex Desktop GPUI reviewed icon bundle | 188 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
+| Vibex Desktop GPUI reviewed icon bundle | 190 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
 | Vibex desktop application and tray icons | 15 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex native mobile brand mark | 1 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex native mobile application icons | 19 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset | AGPL-3.0-or-later | AGPL-3.0-or-later |

@@ -150,15 +150,15 @@
       "extensions": [
         ".svg"
       ],
-      "expectedFileCount": 188,
-      "treeSha256": "f23fe8f66fd057971844223cd8cf26ee01a84064cd79304d79a84e1b160d563f",
+      "expectedFileCount": 190,
+      "treeSha256": "b75ba14e2dcc1bbee49721386d95bb7cac51a452883d01286f515e5d02318278",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
-      "licenseEvidence": "75 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
+      "licenseEvidence": "77 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks (third-party brand marks). Brand names and marks remain the property of their respective owners.",
       "sourceComponents": [
         {
           "name": "Lucide",
-          "fileCount": 75,
+          "fileCount": 77,
           "licenseExpression": "ISC",
           "source": "https://github.com/lucide-icons/lucide"
         },
