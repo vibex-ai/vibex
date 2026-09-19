@@ -35155,6 +35155,74 @@ impl VibexWorkbench {
         } else {
             self.composer_expanded
         };
+        // The follow-the-agent affordance floats over the timeline instead of
+        // occupying a row above the composer. A reserved row shortened the
+        // timeline viewport by its full height, so the band it painted hid the
+        // last timeline row; now only the button's own rect covers content.
+        let timeline_bottom_control = if timeline_bottom_control_mounted && !composer_fullscreen {
+            let button = Button::new("follow-agent-bottom").small().primary();
+            let button = if self.timeline_follow.unread_count > 0 {
+                button.label(match self.resolved_locale() {
+                    locale::ResolvedLocale::En => {
+                        format!("{} new", self.timeline_follow.unread_count)
+                    }
+                    locale::ResolvedLocale::ZhCn => {
+                        format!("{} 条新消息", self.timeline_follow.unread_count)
+                    }
+                    locale::ResolvedLocale::ZhTw => {
+                        format!("{} 條新訊息", self.timeline_follow.unread_count)
+                    }
+                })
+            } else {
+                button
+                    .icon(Icon::new(IconName::ArrowDown).size(px(14.0)))
+                    .tooltip(match self.resolved_locale() {
+                        locale::ResolvedLocale::En => "Scroll to conversation bottom",
+                        locale::ResolvedLocale::ZhCn => "滚动到会话底部",
+                        locale::ResolvedLocale::ZhTw => "捲動到會話底部",
+                    })
+            };
+            let control = h_flex()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .child(
+                    button
+                        // The button now sits above timeline content, so it
+                        // carries the elevation that explains the stacking.
+                        .when(cx.theme().shadow, |this| this.shadow_sm())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.timeline_scroll_wheel_idle_task = None;
+                            this.timeline_follow.set_following_bottom(true);
+                            this.request_timeline_scroll_to_latest();
+                            cx.notify();
+                        })),
+                );
+            Some(if self.ui_state.appearance.reduced_motion {
+                control.into_any_element()
+            } else if timeline_bottom_control_visible {
+                Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
+                    .ease(motion::EASE.easing())
+                    .height(px(0.0), px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
+                    .fade(0.0, 1.0)
+                    .apply(control, "agent-timeline-bottom-control-open")
+                    .into_any_element()
+            } else {
+                Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
+                    .ease(motion::EASE.easing())
+                    .height(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX), px(0.0))
+                    .fade(1.0, 0.0)
+                    .apply(control, "agent-timeline-bottom-control-close")
+                    .into_any_element()
+            })
+        } else {
+            None
+        };
         v_flex()
             .id("agent-workbench")
             .size_full()
@@ -35165,6 +35233,7 @@ impl VibexWorkbench {
             .bg(cx.theme().background)
             .child(
                 v_flex()
+                    .relative()
                     .when(!composer_fullscreen, |this| this.flex_1())
                     .when(composer_fullscreen, |this| this.h_0().flex_none())
                     .min_h_0()
@@ -35228,62 +35297,9 @@ impl VibexWorkbench {
                                 ),
                         )
                     })
-                    .child(timeline_surface),
+                    .child(timeline_surface)
+                    .when_some(timeline_bottom_control, |this, control| this.child(control)),
             )
-            .when(timeline_bottom_control_mounted && !composer_fullscreen, |this| {
-                let button = Button::new("follow-agent-bottom").small().primary();
-                let button = if self.timeline_follow.unread_count > 0 {
-                    button.label(match self.resolved_locale() {
-                        locale::ResolvedLocale::En => {
-                            format!("{} new", self.timeline_follow.unread_count)
-                        }
-                        locale::ResolvedLocale::ZhCn => {
-                            format!("{} 条新消息", self.timeline_follow.unread_count)
-                        }
-                        locale::ResolvedLocale::ZhTw => {
-                            format!("{} 條新訊息", self.timeline_follow.unread_count)
-                        }
-                    })
-                } else {
-                    button
-                        .icon(Icon::new(IconName::ArrowDown).size(px(14.0)))
-                        .tooltip(match self.resolved_locale() {
-                            locale::ResolvedLocale::En => "Scroll to conversation bottom",
-                            locale::ResolvedLocale::ZhCn => "滚动到会话底部",
-                            locale::ResolvedLocale::ZhTw => "捲動到會話底部",
-                        })
-                };
-                let control = h_flex()
-                    .flex_none()
-                    .h(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .child(button.on_click(cx.listener(|this, _, _, cx| {
-                        this.timeline_scroll_wheel_idle_task = None;
-                        this.timeline_follow.set_following_bottom(true);
-                        this.request_timeline_scroll_to_latest();
-                        cx.notify();
-                    })));
-                let control = if self.ui_state.appearance.reduced_motion {
-                    control.into_any_element()
-                } else if timeline_bottom_control_visible {
-                    Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
-                        .ease(motion::EASE.easing())
-                        .height(px(0.0), px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX))
-                        .fade(0.0, 1.0)
-                        .apply(control, "agent-timeline-bottom-control-open")
-                        .into_any_element()
-                } else {
-                    Transition::new(AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION)
-                        .ease(motion::EASE.easing())
-                        .height(px(AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX), px(0.0))
-                        .fade(1.0, 0.0)
-                        .apply(control, "agent-timeline-bottom-control-close")
-                        .into_any_element()
-                };
-                this.child(control)
-            })
             .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
             .into_any_element()
