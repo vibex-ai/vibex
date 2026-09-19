@@ -55,7 +55,7 @@ use gpui_component::{
     message::MessageAlignment,
     notification::Notification,
     popover::Popover,
-    progress::ProgressCircle,
+    progress::{Progress, ProgressCircle},
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectDelegate, SelectEvent, SelectState},
@@ -74,7 +74,7 @@ use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot, watch};
 use vibex_agent_acp::build_runtime_option_catalog_for_agents;
 use vibex_app_update::{
-    CheckReason, UpdateRelease, UpdateSnapshot, UpdateState, select_notes_section,
+    AppUpdateError, CheckReason, UpdateRelease, UpdateSnapshot, UpdateState, select_notes_section,
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
@@ -5469,10 +5469,16 @@ pub struct VibexWorkbench {
     fps_monitor_recorder: Option<Task<()>>,
     pair_button_hovered: bool,
     update_snapshot: UpdateSnapshot,
-    update_prompt_visible: bool,
+    /// Whether the title-bar update panel is open. The panel stays open until
+    /// the user closes it or the release it describes stops being relevant.
+    update_panel_open: bool,
+    /// Release version the panel currently describes, so a newly discovered
+    /// version reopens it while snapshot progress updates do not.
+    update_panel_version: Option<String>,
+    /// Release version whose automatic download has already been requested.
+    update_auto_download_version: Option<String>,
     update_status_task: Option<Task<()>>,
     update_action_task: Option<Task<()>>,
-    update_prompt_timeout_task: Option<Task<()>>,
     timeline_command_expansion: BTreeMap<String, bool>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
@@ -6356,10 +6362,11 @@ impl VibexWorkbench {
             fps_monitor_recorder: None,
             pair_button_hovered: false,
             update_snapshot: UpdateSnapshot::default(),
-            update_prompt_visible: false,
+            update_panel_open: false,
+            update_panel_version: None,
+            update_auto_download_version: None,
             update_status_task: None,
             update_action_task: None,
-            update_prompt_timeout_task: None,
             timeline_command_expansion: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
@@ -6682,8 +6689,26 @@ impl VibexWorkbench {
                     Err(error) => eprintln!("GPUI UI-state exit flush failed: {error}"),
                 }
             }
+            // A user who turned on automatic updates and then quit without
+            // pressing Install still gets the verified update: install it
+            // before the runtime stops, so the next launch runs it. The
+            // self-replacing AppImage path is already complete at that point;
+            // system installers finish in their own window.
+            let install_on_exit = this.ui_state.desktop_behavior.auto_update
+                && matches!(this.update_snapshot.state, UpdateState::Staged { .. });
             let shutdown = this.runtime.clone().map(|runtime| {
-                gpui_tokio::Tokio::spawn(cx, async move { runtime.shutdown().await })
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    if install_on_exit {
+                        match runtime.app_update().install().await {
+                            Ok(_) => eprintln!("vibex-foundation: update-installed-on-exit"),
+                            Err(error) => eprintln!(
+                                "vibex-foundation: update-install-on-exit-failed code={}",
+                                error.code
+                            ),
+                        }
+                    }
+                    runtime.shutdown().await
+                })
             });
             async move {
                 if let Some(shutdown) = shutdown {
@@ -7302,57 +7327,84 @@ impl VibexWorkbench {
             return;
         }
         self.update_snapshot = snapshot;
-        if !self.update_snapshot.state.should_show_update_entry() {
-            self.update_prompt_visible = false;
-            self.update_prompt_timeout_task = None;
-        } else {
-            self.maybe_show_update_prompt(cx);
-        }
+        self.sync_update_panel(cx);
+        self.maybe_auto_download(cx);
         cx.notify();
     }
 
-    fn maybe_show_update_prompt(&mut self, cx: &mut Context<Self>) {
-        if !self.ui_state.desktop_behavior.show_update_prompts
-            || self.last_visibility.layout.viewport_width < 760
-            || self.update_prompt_visible
-        {
-            return;
-        }
+    /// Whether update surfaces may appear at all.
+    ///
+    /// Automatic updates always show their progress; otherwise the title-bar
+    /// entry and panel follow the update-prompts preference. With both off a
+    /// discovered release stays silent.
+    fn update_surfaces_enabled(&self) -> bool {
+        self.ui_state.desktop_behavior.auto_update
+            || self.ui_state.desktop_behavior.show_update_prompts
+    }
+
+    /// Keep the title-bar panel in step with the current release.
+    ///
+    /// A newly discovered version opens the panel so the user sees the
+    /// download or the offered update; snapshot progress updates for the same
+    /// version leave the user's open/closed choice alone.
+    fn sync_update_panel(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.update_panel_open;
         let Some(version) = self
             .update_snapshot
             .state
             .release()
             .map(|release| release.version.to_string())
         else {
+            self.update_panel_version = None;
+            self.update_auto_download_version = None;
+            self.update_panel_open = false;
+            if was_open {
+                cx.notify();
+            }
             return;
         };
-        if self
-            .ui_state
-            .desktop_behavior
-            .last_update_prompted_version
-            .as_deref()
-            == Some(version.as_str())
-        {
+        if !self.update_surfaces_enabled() {
+            // Do not record the version while the surfaces are hidden, so
+            // enabling a preference later reveals the release.
+            self.update_panel_version = None;
+            self.update_panel_open = false;
+            if was_open {
+                cx.notify();
+            }
             return;
         }
-        self.update_prompt_visible = true;
-        self.ui_state.desktop_behavior.last_update_prompted_version = Some(version);
-        self.queue_ui_state();
-        self.update_prompt_timeout_task = Some(cx.spawn(
-            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                cx.background_executor().timer(Duration::from_secs(8)).await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.update_prompt_visible = false;
-                    this.update_prompt_timeout_task = None;
-                    cx.notify();
-                });
-            },
-        ));
+        if self.update_panel_version.as_deref() != Some(version.as_str()) {
+            self.update_panel_version = Some(version);
+            self.update_panel_open = true;
+            if !was_open {
+                cx.notify();
+            }
+        }
     }
 
-    fn dismiss_update_prompt(&mut self, cx: &mut Context<Self>) {
-        self.update_prompt_visible = false;
-        self.update_prompt_timeout_task = None;
+    /// Start the download as soon as a release is found when the user asked
+    /// for automatic updates. The service coalesces duplicate downloads; the
+    /// recorded version keeps one release from requesting repeatedly.
+    fn maybe_auto_download(&mut self, cx: &mut Context<Self>) {
+        if !self.ui_state.desktop_behavior.auto_update {
+            return;
+        }
+        let UpdateState::Available { release } = &self.update_snapshot.state else {
+            return;
+        };
+        let version = release.version.to_string();
+        if self.update_auto_download_version.as_deref() == Some(version.as_str()) {
+            return;
+        }
+        self.update_auto_download_version = Some(version);
+        self.request_update_download(cx);
+    }
+
+    fn set_update_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.update_panel_open == open {
+            return;
+        }
+        self.update_panel_open = open;
         cx.notify();
     }
 
@@ -7425,6 +7477,56 @@ impl VibexWorkbench {
                             )),
                             cx,
                         );
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Install the staged update and restart when the platform requires it.
+    ///
+    /// System installers keep running after they are opened, so only a
+    /// self-replacing package turns into a restart; the panel's label promises
+    /// both, and this is where the two platform paths diverge.
+    fn install_update_and_restart(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let service = runtime.app_update();
+            let snapshot = service.install().await?;
+            if matches!(snapshot.state, UpdateState::RestartRequired { .. }) {
+                service.restart()?;
+                Ok::<bool, AppUpdateError>(true)
+            } else {
+                Ok::<bool, AppUpdateError>(false)
+            }
+        });
+        self.update_action_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.update_action_task = None;
+                    match outcome {
+                        Ok(Ok(restarted)) => {
+                            if restarted {
+                                cx.quit();
+                            }
+                        }
+                        Ok(Err(error)) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            )),
+                            cx,
+                        ),
+                        Err(error) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "Update install task stopped unexpectedly: {error}"
+                            )),
+                            cx,
+                        ),
                     }
                     cx.notify();
                 });
@@ -27153,12 +27255,7 @@ impl VibexWorkbench {
             });
         });
         self.rebuild_timeline_sizes();
-        if self.ui_state.desktop_behavior.show_update_prompts {
-            self.maybe_show_update_prompt(cx);
-        } else {
-            self.update_prompt_visible = false;
-            self.update_prompt_timeout_task = None;
-        }
+        self.sync_update_panel(cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -27258,16 +27355,73 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Open About and scroll to the update card, which carries the full
+    /// release notes for the release the title-bar panel describes.
     fn open_update_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_open {
             self.open_settings(window, cx);
         }
+        let title = locale::text("Software update", "软件更新", "軟體更新");
         self.settings_view.update(cx, |settings, cx| {
             settings.activate_settings_section(SettingsSection::About, cx);
             settings.shortcut_note = None;
+            settings
+                .settings_render_context
+                .target_title
+                .borrow_mut()
+                .replace(title.to_string());
+            settings
+                .settings_render_context
+                .highlighted_title
+                .borrow_mut()
+                .replace(title.to_string());
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// The title-bar update entry: an arrow that toggles the update panel.
+    ///
+    /// `Popover` owns the toggle from its mouse-down handler and applies the
+    /// trigger's selected state itself, so the trigger must not add its own
+    /// click handler.
+    fn render_update_entry(&mut self, version: &str, cx: &mut Context<Self>) -> AnyElement {
+        let panel = self.render_update_panel(cx);
+        let tooltip = if version.is_empty() {
+            locale::text("Update available", "有可用更新", "有可用更新").to_string()
+        } else {
+            format!(
+                "{} {version}",
+                locale::text("Update available", "有可用更新", "有可用更新")
+            )
+        };
+        let trigger = Button::new("open-update")
+            .small()
+            .ghost()
+            .compact()
+            .size(px(32.0))
+            .px_0()
+            .tooltip(tooltip)
+            .child(Icon::new(IconName::ArrowDown).size(px(18.0)));
+        div()
+            .flex_none()
+            .child(
+                Popover::new("update-popover")
+                    .anchor(Anchor::TopRight)
+                    .appearance(false)
+                    // The panel reports progress and offers the install; it
+                    // stays until the user closes it instead of disappearing
+                    // on the next click elsewhere.
+                    .overlay_closable(false)
+                    .open(self.update_panel_open)
+                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                        this.set_update_panel_open(*open, cx);
+                    }))
+                    .trigger(trigger)
+                    .child(panel)
+                    .top(px(6.0)),
+            )
+            .into_any_element()
     }
 
     fn strings(&self) -> Strings {
@@ -27286,6 +27440,286 @@ impl VibexWorkbench {
             return;
         };
         open_remote_access_pairing(runtime, window, cx);
+    }
+
+    /// The rounded panel below the title-bar arrow.
+    ///
+    /// It reports what the updater is doing and offers the one valid next
+    /// action for the current state. With automatic updates on the download
+    /// already runs, so the panel only reports progress; otherwise it asks
+    /// before downloading. Release notes stay on About, which the footer
+    /// opens.
+    fn render_update_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.update_snapshot.state.clone();
+        let release = state.release().cloned();
+        let auto_update = self.ui_state.desktop_behavior.auto_update;
+        let muted_foreground = cx.theme().muted_foreground;
+
+        let (description, control): (SharedString, AnyElement) = match &state {
+            UpdateState::Idle | UpdateState::Checking => (
+                locale::text(
+                    "Checking for a signed release…",
+                    "正在检查已签名版本…",
+                    "正在檢查已簽署版本…",
+                )
+                .into(),
+                div().into_any_element(),
+            ),
+            UpdateState::Available { .. } => {
+                if auto_update {
+                    (
+                        locale::text("Starting the download…", "正在开始下载…", "正在開始下載…")
+                            .into(),
+                        Progress::new("update-panel-progress")
+                            .small()
+                            .loading(true)
+                            .into_any_element(),
+                    )
+                } else {
+                    (
+                        locale::text(
+                            "A newer signed release is available.",
+                            "发现新的已签名版本。",
+                            "發現新的已簽署版本。",
+                        )
+                        .into(),
+                        Button::new("update-panel-download")
+                            .small()
+                            .primary()
+                            .icon(IconName::ArrowDown)
+                            .label(locale::text("Update", "更新", "更新"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.request_update_download(cx)),
+                            )
+                            .into_any_element(),
+                    )
+                }
+            }
+            UpdateState::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                let percent = downloaded_bytes
+                    .saturating_mul(100)
+                    .checked_div(*total_bytes)
+                    .unwrap_or(0);
+                let progress = v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        Progress::new("update-panel-progress")
+                            .small()
+                            .value(percent as f32),
+                    )
+                    .child(div().text_xs().text_color(muted_foreground).child(format!(
+                        "{} / {} ({percent}%)",
+                        format_bytes(*downloaded_bytes),
+                        format_bytes(*total_bytes)
+                    )));
+                (
+                    locale::text(
+                        "Downloading the signed update…",
+                        "正在下载已签名的更新…",
+                        "正在下載已簽署的更新…",
+                    )
+                    .into(),
+                    progress.into_any_element(),
+                )
+            }
+            UpdateState::Verifying { .. } => (
+                locale::text(
+                    "Verifying the download…",
+                    "正在验证下载内容…",
+                    "正在驗證下載內容…",
+                )
+                .into(),
+                Progress::new("update-panel-progress")
+                    .small()
+                    .loading(true)
+                    .into_any_element(),
+            ),
+            UpdateState::Staged { .. } => (
+                locale::text(
+                    "Downloaded and verified. Installing restarts Vibex.",
+                    "已下载并通过验证，安装后将重启 Vibex。",
+                    "已下載並通過驗證，安裝後將重新啟動 Vibex。",
+                )
+                .into(),
+                Button::new("update-panel-install")
+                    .small()
+                    .primary()
+                    .label(locale::text(
+                        "Install and restart",
+                        "安装并重启",
+                        "安裝並重新啟動",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.install_update_and_restart(cx)))
+                    .into_any_element(),
+            ),
+            UpdateState::Installing { .. } => (
+                locale::text(
+                    "The system installer is open. Complete its confirmation steps.",
+                    "系统安装器已打开，请完成确认步骤。",
+                    "系統安裝器已開啟，請完成確認步驟。",
+                )
+                .into(),
+                Button::new("update-panel-installer")
+                    .small()
+                    .outline()
+                    .disabled(true)
+                    .label(locale::text(
+                        "Installer open",
+                        "安装器已打开",
+                        "安裝器已開啟",
+                    ))
+                    .into_any_element(),
+            ),
+            UpdateState::RestartRequired { .. } => (
+                locale::text(
+                    "Installed. Restart to run the new version.",
+                    "已安装，重启后运行新版本。",
+                    "已安裝，重新啟動後執行新版本。",
+                )
+                .into(),
+                Button::new("update-panel-restart")
+                    .small()
+                    .primary()
+                    .label(locale::text("Restart now", "立即重启", "立即重新啟動"))
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_after_update(cx)))
+                    .into_any_element(),
+            ),
+            UpdateState::Unsupported { release, reason } => {
+                let notes_url = release.notes_url.to_string();
+                (
+                    reason.clone().into(),
+                    Button::new("update-panel-release")
+                        .small()
+                        .outline()
+                        .label(locale::text("Open release", "打开发行版", "開啟發行版"))
+                        .on_click(move |_, _, _| {
+                            let _ = open_external_url(&notes_url);
+                        })
+                        .into_any_element(),
+                )
+            }
+            UpdateState::Error { failure, release } => {
+                let verification_unavailable =
+                    failure.code == "app_update_verification_key_unavailable";
+                let retry_download = release.is_some();
+                let description: SharedString = if verification_unavailable {
+                    locale::text(
+                        "This build does not include the release verification key, so update checks are unavailable.",
+                        "当前构建未包含发行验签密钥，因此无法检查更新。",
+                        "目前建置未包含發行驗簽金鑰，因此無法檢查更新。",
+                    )
+                    .into()
+                } else {
+                    format!("{}: {}", failure.code, failure.message).into()
+                };
+                let control = if verification_unavailable {
+                    Button::new("update-panel-unavailable")
+                        .small()
+                        .outline()
+                        .disabled(true)
+                        .label(locale::text("Unavailable", "不可用", "不可用"))
+                        .into_any_element()
+                } else {
+                    Button::new("update-panel-retry")
+                        .small()
+                        .outline()
+                        .label(locale::text("Retry", "重试", "重試"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if retry_download {
+                                this.request_update_download(cx);
+                            } else {
+                                this.request_update_check(cx);
+                            }
+                        }))
+                        .into_any_element()
+                };
+                (description, control)
+            }
+        };
+
+        let mut body = v_flex().w_full().min_w_0().gap_3();
+        if let Some(release) = release.as_ref() {
+            body = body.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .child(format!("Vibex {}", release.version)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(muted_foreground)
+                            .child(description),
+                    )
+                    .child(control),
+            );
+        }
+
+        v_flex()
+            .id("update-panel")
+            .w_80()
+            .min_w_0()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.70))
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .p_3()
+            .gap_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().font_medium().child(locale::text(
+                        "Software update",
+                        "软件更新",
+                        "軟體更新",
+                    )))
+                    .child(
+                        Button::new("close-update-panel")
+                            .small()
+                            .ghost()
+                            .compact()
+                            .size(px(24.0))
+                            .px_0()
+                            .tooltip(locale::text("Close", "关闭", "關閉"))
+                            .icon(IconName::Close)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_update_panel_open(false, cx)),
+                            ),
+                    ),
+            )
+            .child(body)
+            .child(
+                h_flex().w_full().min_w_0().justify_end().child(
+                    Button::new("open-update-notes")
+                        .small()
+                        .ghost()
+                        .icon(IconName::BookOpen)
+                        .label(locale::text("Release notes", "更新日志", "更新日誌"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_update_panel_open(false, cx);
+                            this.open_update_settings(window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_title_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -27389,19 +27823,15 @@ impl VibexWorkbench {
         // desktop's own layout.
         let window_controls = window_control_layout(window);
         let window_controls_maximized = window.is_maximized();
-        let show_update_entry = self.ui_state.desktop_behavior.show_update_prompts
-            && self.update_snapshot.state.should_show_update_entry();
+        let show_update_entry =
+            self.update_surfaces_enabled() && self.update_snapshot.state.should_show_update_entry();
         let update_version = self
             .update_snapshot
             .state
             .release()
             .map(|release| release.version.to_string())
             .unwrap_or_default();
-        let update_prompt = match self.resolved_locale() {
-            locale::ResolvedLocale::En => format!("Vibex {update_version} is available"),
-            locale::ResolvedLocale::ZhCn => format!("发现 Vibex {update_version}"),
-            locale::ResolvedLocale::ZhTw => format!("發現 Vibex {update_version}"),
-        };
+        let update_entry = show_update_entry.then(|| self.render_update_entry(&update_version, cx));
 
         // The bar floats above the shell instead of taking a row of it: every
         // column keeps its full height underneath, and each one that must not
@@ -27716,47 +28146,20 @@ impl VibexWorkbench {
                             // the rail beneath cannot bleed into the band.
                             .bg(cx.theme().background)
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .when(show_update_entry, |this| {
-                                this.child(
-                                    h_flex()
-                                        .h_full()
-                                        .gap_1()
-                                        .when(self.update_prompt_visible, |this| {
-                                            this.child(
-                                                div()
-                                                    .max_w(px(220.0))
-                                                    .truncate()
-                                                    .rounded(px(6.0))
-                                                    .bg(cx.theme().accent.opacity(0.72))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_xs()
-                                                    .font_medium()
-                                                    .child(update_prompt),
-                                            )
-                                        })
-                                        .child(
-                                            Button::new("open-update")
-                                                .small()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(32.0))
-                                                .px_0()
-                                                .tooltip(locale::text(
-                                                    "Update available",
-                                                    "有可用更新",
-                                                    "有可用更新",
-                                                ))
-                                                .child(
-                                                    Icon::new(IconName::ArrowDown).size(px(18.0)),
-                                                )
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.dismiss_update_prompt(cx);
-                                                    this.open_update_settings(window, cx);
-                                                })),
-                                        ),
-                                )
-                            })
+                            .when_some(update_entry, |this, entry| this.child(entry))
+                            .child(
+                                Button::new("open-command-palette")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .size(px(32.0))
+                                    .px_0()
+                                    .tooltip(strings.command_palette_open)
+                                    .child(Icon::new(IconName::Search).size(px(18.0)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_command_palette(window, cx)
+                                    })),
+                            )
                             .child(
                                 div()
                                     .id("runtime-manager-hover")
@@ -52528,12 +52931,18 @@ impl FoundationSettings {
     fn set_show_update_prompts(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.desktop_behavior.show_update_prompts = enabled;
-            if enabled {
-                this.maybe_show_update_prompt(cx);
-            } else {
-                this.update_prompt_visible = false;
-                this.update_prompt_timeout_task = None;
-            }
+            this.sync_update_panel(cx);
+            this.queue_ui_state();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn set_auto_update(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.ui_state.desktop_behavior.auto_update = enabled;
+            this.sync_update_panel(cx);
+            this.maybe_auto_download(cx);
             this.queue_ui_state();
             cx.notify();
         });
@@ -53165,6 +53574,10 @@ impl FoundationSettings {
             .on_click(
                 cx.listener(|this, enabled, _, cx| this.set_notifications_enabled(*enabled, cx)),
             );
+        let auto_update = Switch::new("auto-update-enabled")
+            .small()
+            .checked(desktop_behavior.auto_update)
+            .on_click(cx.listener(|this, enabled, _, cx| this.set_auto_update(*enabled, cx)));
         let update_prompts = Switch::new("update-prompts-enabled")
             .small()
             .checked(desktop_behavior.show_update_prompts)
@@ -53230,11 +53643,22 @@ impl FoundationSettings {
                     cx,
                 ),
                 setting_row(
+                    locale::text("Automatic updates", "自动更新", "自動更新"),
+                    locale::text(
+                        "Download a signed release as soon as it is found. Install it now, or let Vibex install it when you quit.",
+                        "发现已签名的新版本后立即下载；可立即安装，或在退出应用时自动安装。",
+                        "發現已簽署的新版本後立即下載；可立即安裝，或在結束應用程式時自動安裝。",
+                    ),
+                    auto_update,
+                    stacked,
+                    cx,
+                ),
+                setting_row(
                     locale::text("Update prompts", "更新提示", "更新提示"),
                     locale::text(
-                        "Show the title-bar update button and one-time version notice. Background security checks remain enabled.",
-                        "显示标题栏更新按钮和每个版本的一次性提示；后台安全检查始终保持启用。",
-                        "顯示標題列更新按鈕與每個版本的一次性提示；背景安全檢查始終保持啟用。",
+                        "Show the title-bar update button and update panel. Background security checks remain enabled.",
+                        "显示标题栏更新按钮和更新浮层；后台安全检查始终保持启用。",
+                        "顯示標題列更新按鈕與更新浮層；背景安全檢查始終保持啟用。",
                     ),
                     update_prompts,
                     stacked,
@@ -55492,9 +55916,6 @@ impl Render for VibexWorkbench {
             self.close_sidebar_hover_preview();
         }
         self.last_visibility = visibility;
-        if visibility.layout.viewport_width >= 760 {
-            self.maybe_show_update_prompt(cx);
-        }
         let preview_visible = self.ui_state.workbench.active_tab == "agent"
             && !self.new_session_open
             && (self.preview_fullscreen_active
@@ -67980,10 +68401,71 @@ mod tests {
 
         let open_update_settings = source
             .split_once("    fn open_update_settings(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn strings("))
+            .and_then(|(_, tail)| tail.split_once("\n    /// The title-bar update entry"))
             .map(|(body, _)| body)
             .expect("update settings entry should remain inspectable");
         assert!(open_update_settings.contains("activate_settings_section(SettingsSection::About"));
+        assert!(open_update_settings.contains("highlighted_title"));
+    }
+
+    #[test]
+    fn update_panel_reports_progress_and_keeps_notes_on_about() {
+        let source = include_str!("app.rs");
+        let entry = source
+            .split_once("    fn render_update_entry(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_pairing("))
+            .map(|(body, _)| body)
+            .expect("the title-bar update entry should remain inspectable");
+        assert!(entry.contains("Popover::new(\"update-popover\")"));
+        assert!(entry.contains(".overlay_closable(false)"));
+        assert!(entry.contains(".on_open_change("));
+        assert!(
+            !entry.contains(".on_click("),
+            "the popover owns the toggle; a click handler here closes the panel on mouse-up"
+        );
+
+        let panel = source
+            .split_once("    fn render_update_panel(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_title_bar("))
+            .map(|(body, _)| body)
+            .expect("the update panel should remain inspectable");
+        assert!(panel.contains("Progress::new(\"update-panel-progress\")"));
+        assert!(panel.contains("UpdateState::Downloading"));
+        assert!(panel.contains("update-panel-download"));
+        assert!(panel.contains("update-panel-install"));
+        assert!(panel.contains("install_update_and_restart"));
+        assert!(panel.contains("update-panel-restart"));
+        assert!(panel.contains("close-update-panel"));
+        assert!(panel.contains("open-update-notes"));
+        assert!(panel.contains("open_update_settings"));
+
+        let auto = source
+            .split_once("    fn maybe_auto_download(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_update_panel_open("))
+            .map(|(body, _)| body)
+            .expect("automatic download should remain inspectable");
+        assert!(auto.contains("desktop_behavior.auto_update"));
+        assert!(auto.contains("UpdateState::Available"));
+        assert!(auto.contains("request_update_download"));
+
+        let surfaces = source
+            .split_once("    fn update_surfaces_enabled(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Keep the title-bar panel"))
+            .map(|(body, _)| body)
+            .expect("update surface policy should remain inspectable");
+        assert!(surfaces.contains("auto_update"));
+        assert!(surfaces.contains("show_update_prompts"));
+
+        let quit = source
+            .split_once("            let install_on_exit =")
+            .map(|(_, tail)| tail)
+            .expect("install on exit should remain inspectable");
+        assert!(quit.contains("desktop_behavior.auto_update"));
+        assert!(quit.contains("UpdateState::Staged"));
+        assert!(quit.contains("app_update().install()"));
+
+        assert!(source.contains("Switch::new(\"auto-update-enabled\")"));
+        assert!(source.contains("fn set_auto_update("));
     }
 
     #[test]

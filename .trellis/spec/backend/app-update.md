@@ -124,11 +124,21 @@ without user interruption; manual failures publish a typed visible error.
   localized release notes as rendered Markdown. Notes selection resolves the
   interface language, falling back to the generic Chinese section and then to
   English; a release without notes keeps the signed release page as its link.
-- An available or unsupported release can show a compact title-bar entry before
-  mobile pairing. The entry and one-time notice obey `show_update_prompts`.
-- Record `last_update_prompted_version` only when the notice is actually shown.
-  Disabling prompts does not disable background checks or the About controls.
-- Persist both fields only in bounded desktop UI state; they are not Relay data.
+- A known release shows a title-bar arrow before mobile pairing. The arrow
+  toggles a rounded panel anchored below it; the panel stays open until the
+  user closes it, and a newly discovered version opens it again.
+- The panel renders the current state: download progress through the component
+  progress bar, then the install action. An already staged release skips the
+  progress and offers install directly. Its footer opens About and scrolls to
+  the update card, which carries the full release notes.
+- With `auto_update` on, discovery starts the download without a prompt, and a
+  staged release is installed on quit when the user did not install it. With
+  automatic updates off, the panel offers the update and waits for
+  confirmation. With both `auto_update` and `show_update_prompts` off, a
+  discovered release stays silent.
+- Persist `show_update_prompts` and `auto_update` only in bounded desktop UI
+  state; they are not Relay data. Disabling prompts does not disable background
+  checks, and the panel's open state is session-local.
 
 ## Error And Logging Rules
 

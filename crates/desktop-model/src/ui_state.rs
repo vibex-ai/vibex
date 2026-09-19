@@ -859,7 +859,7 @@ pub struct DesktopBehaviorUiState {
     #[serde(default = "default_update_prompts_enabled")]
     pub show_update_prompts: bool,
     #[serde(default)]
-    pub last_update_prompted_version: Option<String>,
+    pub auto_update: bool,
 }
 
 impl Default for DesktopBehaviorUiState {
@@ -873,7 +873,7 @@ impl Default for DesktopBehaviorUiState {
             notify_agent_needs_input: default_notifications_enabled(),
             notify_agent_failed: default_notifications_enabled(),
             show_update_prompts: default_update_prompts_enabled(),
-            last_update_prompted_version: None,
+            auto_update: false,
         }
     }
 }
@@ -1152,10 +1152,6 @@ impl DesktopUiStateV1 {
             })
             .take(KEYBOARD_SHORTCUT_OVERRIDE_LIMIT)
             .collect();
-        self.desktop_behavior.last_update_prompted_version = bounded_optional(
-            self.desktop_behavior.last_update_prompted_version.take(),
-            80,
-        );
         self.developer.fps_monitor_placement = self.developer.fps_monitor_placement.clamped();
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
         normalize_set(&mut self.session.auto_continue_paused_session_ids, 1_000);
@@ -2351,12 +2347,7 @@ mod tests {
         assert_eq!(decoded.composer.message_send_key, MessageSendKey::Enter);
         assert!(decoded.desktop_behavior.notifications_enabled);
         assert!(decoded.desktop_behavior.show_update_prompts);
-        assert!(
-            decoded
-                .desktop_behavior
-                .last_update_prompted_version
-                .is_none()
-        );
+        assert!(!decoded.desktop_behavior.auto_update);
         assert_eq!(
             decoded.terminal_preferences,
             TerminalPreferencesUiState::default()
@@ -2372,7 +2363,7 @@ mod tests {
         state.desktop_behavior.launch_at_login = true;
         state.desktop_behavior.notify_agent_failed = false;
         state.desktop_behavior.show_update_prompts = false;
-        state.desktop_behavior.last_update_prompted_version = Some(" 0.2.0 ".into());
+        state.desktop_behavior.auto_update = true;
         state.composer.queue_send_mode = ComposerQueueSendMode::Manual;
         state.composer.message_send_key = MessageSendKey::CommandEnter;
         state.agent_sort_strategy = AgentSortStrategy::UsageFrequency;
@@ -2398,13 +2389,7 @@ mod tests {
         assert!(round_trip.desktop_behavior.launch_at_login);
         assert!(!round_trip.desktop_behavior.notify_agent_failed);
         assert!(!round_trip.desktop_behavior.show_update_prompts);
-        assert_eq!(
-            round_trip
-                .desktop_behavior
-                .last_update_prompted_version
-                .as_deref(),
-            Some("0.2.0")
-        );
+        assert!(round_trip.desktop_behavior.auto_update);
         assert_eq!(
             round_trip.composer.queue_send_mode,
             ComposerQueueSendMode::Manual
