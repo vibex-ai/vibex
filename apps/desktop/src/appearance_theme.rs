@@ -1,4 +1,4 @@
-//! The appearance settings theme pickers.
+//! The appearance settings theme controls.
 //!
 //! Each appearance gets its own picker, because the two choices are
 //! independent: a user can keep the product default for dark while running a
@@ -6,47 +6,41 @@
 //! appearance, since adopting a palette built for the opposite one would paint
 //! unreadable text.
 //!
-//! The theme control is a segmented strip of palette swatches rather than a
-//! dropdown: the catalog is curated and small, and a swatch shows what the
-//! theme actually looks like — surface, raised surface, and accent — without a
-//! preview pane.
+//! An appearance's picker is a dropdown whose rows — and whose closed trigger —
+//! carry the palette swatch, so the catalog stays scannable without a wall of
+//! chips inside the settings panel.
 //!
 //! The appearance control is a row of preview cards rather than a segmented
 //! icon strip: each card paints a miniature workbench in the palette its mode
 //! resolves to, so the choice is legible before it is made instead of only
-//! after the window has repainted.
+//! after the window has repainted. The cards sit outside the settings panel and
+//! share its width three ways, which is what makes the previews readable.
 
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, Hsla, IntoElement, Role, SharedString,
+    AnyElement, App, ClickEvent, Hsla, IntoElement, Role, SharedString,
     StatefulInteractiveElement as _, Window, div, prelude::*, px, relative,
 };
 use gpui_component::{
-    Selectable as _, Sizable as _, StyledExt as _, h_flex,
-    tab::{Tab, TabBar},
-    v_flex,
+    IndexPath, StyledExt as _, h_flex, searchable_list::SearchableListItem, v_flex,
 };
 use vibex_desktop_model::{ThemeMode, ThemeSelection};
 use vibex_ui::{GpuiThemeDefinition, GpuiThemeMode, resolve_selection, themes_for};
 
 use crate::theme;
 
-/// Swatch metrics. The strip sits inside the 28px settings control shell, so
-/// each swatch is a small rounded chip with three color bands.
-const SWATCH_WIDTH: f32 = 34.0;
-const SWATCH_HEIGHT: f32 = 22.0;
-const SWATCH_RADIUS: f32 = 5.0;
+/// Swatch metrics for a dropdown row and for the closed trigger, which show the
+/// theme's background, raised surface, and accent in the order they stack.
+const SWATCH_WIDTH: f32 = 24.0;
+const SWATCH_HEIGHT: f32 = 16.0;
+const SWATCH_RADIUS: f32 = 4.0;
 const SWATCH_BAND_WIDTH: f32 = 3.0;
 
-/// The theme a picker for `mode` currently shows as selected.
-pub fn selected_theme(
-    selection: &ThemeSelection,
-    mode: GpuiThemeMode,
-) -> &'static GpuiThemeDefinition {
+/// The theme `mode` currently resolves to.
+fn selected_theme(selection: &ThemeSelection, mode: GpuiThemeMode) -> &'static GpuiThemeDefinition {
     resolve_selection(selection, mode)
 }
 
-/// One palette swatch: the theme's background, raised surface, and accent, in
-/// the order they stack in the product.
+/// One palette swatch: the theme's background, raised surface, and accent.
 fn swatch(theme_definition: &GpuiThemeDefinition) -> AnyElement {
     let token = |name: &str| theme::semantic_color_for(theme_definition, name);
     let background = token("background");
@@ -57,6 +51,7 @@ fn swatch(theme_definition: &GpuiThemeDefinition) -> AnyElement {
     div()
         .w(px(SWATCH_WIDTH))
         .h(px(SWATCH_HEIGHT))
+        .flex_none()
         .rounded(px(SWATCH_RADIUS))
         .overflow_hidden()
         .flex()
@@ -69,64 +64,90 @@ fn swatch(theme_definition: &GpuiThemeDefinition) -> AnyElement {
         .into_any_element()
 }
 
-/// A segmented picker over every theme authored for `mode`.
+/// One theme in an appearance dropdown: the palette swatch and its name.
 ///
-/// `on_select` receives the chosen theme id. The strip keeps the shared 28px
-/// settings control shell metric so it lines up with the adjacent font and
-/// window-scale rows.
-///
-/// Each swatch paints its own candidate's colors, so the control previews
-/// every palette at once rather than only the active one.
-pub fn theme_picker(
-    id: &'static str,
-    mode: GpuiThemeMode,
-    selection: &ThemeSelection,
-    on_select: impl Fn(&'static str, &mut Window, &mut App) + Clone + 'static,
-) -> AnyElement {
-    let selected = selected_theme(selection, mode);
-    let options: Vec<&'static GpuiThemeDefinition> = themes_for(mode).collect();
-    let selected_index = options
-        .iter()
-        .position(|candidate| candidate.id == selected.id);
+/// `title()` stays the plain name because that is what assistive technology
+/// reads as the committed value; the swatch is presentation only.
+#[derive(Clone)]
+pub struct ThemeOption {
+    definition: &'static GpuiThemeDefinition,
+    id: String,
+}
 
-    let tabs: Vec<Tab> = options
-        .iter()
-        .map(|definition| {
-            let definition = *definition;
-            let on_select = on_select.clone();
-            Tab::new()
-                .child(swatch(definition))
-                .selected(definition.id == selected.id)
-                .on_click(move |_, window, cx| {
-                    on_select(definition.id, window, cx);
-                })
-        })
-        .collect();
+impl ThemeOption {
+    fn new(definition: &'static GpuiThemeDefinition) -> Self {
+        Self {
+            definition,
+            id: definition.id.to_string(),
+        }
+    }
+}
 
-    div()
-        .id(ElementId::Name(SharedString::from(id)))
-        .h(px(28.0))
-        .flex()
-        .items_center()
-        .child(
-            TabBar::new(id)
-                .segmented()
-                .small()
-                .h(px(28.0))
-                .when_some(selected_index, |bar, index| bar.selected_index(index))
-                .children(tabs),
-        )
+impl SearchableListItem for ThemeOption {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.definition.name)
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(theme_option_row(self.definition))
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        theme_option_row(self.definition)
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+}
+
+/// A dropdown row: the palette swatch, then the theme's name.
+fn theme_option_row(definition: &'static GpuiThemeDefinition) -> AnyElement {
+    h_flex()
+        .gap_2()
+        .child(swatch(definition))
+        .child(div().child(definition.name))
         .into_any_element()
 }
 
-/// Card metrics for the appearance control. Three cards and their gaps share
-/// the row's full width, so each preview stays large enough to read.
-const MODE_CARD_WIDTH: f32 = 104.0;
-const MODE_CARD_HEIGHT: f32 = 64.0;
+/// Every theme authored for `mode`, as dropdown options.
+pub fn theme_options(mode: GpuiThemeMode) -> Vec<ThemeOption> {
+    themes_for(mode).map(ThemeOption::new).collect()
+}
+
+/// The catalog position of the theme `mode` currently resolves to, so the
+/// dropdown states the active palette — including the catalog default an unset
+/// slot falls back to.
+pub fn selected_theme_index(mode: GpuiThemeMode, selection: &ThemeSelection) -> Option<IndexPath> {
+    let selected = selected_theme(selection, mode);
+    themes_for(mode)
+        .position(|definition| definition.id == selected.id)
+        .map(|row| IndexPath::default().row(row))
+}
+
+/// Card metrics for the appearance control.
+///
+/// The three cards share the settings page's width, so the height follows from
+/// [`mode_card_height`]. The face metrics are authored for a card of
+/// [`MODE_CARD_REFERENCE_HEIGHT`] and scale with it, which keeps the miniature
+/// workbench in proportion at every window size.
+const MODE_CARD_ASPECT: f32 = 1.65;
+const MODE_CARD_GAP: f32 = 12.0;
+const MODE_CARD_REFERENCE_HEIGHT: f32 = 64.0;
+const MODE_CARD_MIN_HEIGHT: f32 = 56.0;
 const MODE_CARD_RADIUS: f32 = 8.0;
 const MODE_CARD_PADDING: f32 = 3.0;
-const MODE_CARD_GAP: f32 = 12.0;
 const MODE_LABEL_GAP: f32 = 8.0;
+
+/// The height one appearance card takes when the row is `available_width`
+/// wide. Cards flex to a third of the row, so the height follows from that
+/// width to hold the authored aspect ratio.
+pub fn mode_card_height(available_width: f32) -> f32 {
+    let card_width = ((available_width - 2.0 * MODE_CARD_GAP) / 3.0).max(1.0);
+    (card_width / MODE_CARD_ASPECT).max(MODE_CARD_MIN_HEIGHT)
+}
 
 /// Metrics for one miniature workbench face.
 #[derive(Clone, Copy)]
@@ -139,6 +160,21 @@ struct FaceMetrics {
     bar_radius: f32,
     panel_padding: f32,
     panel_radius: f32,
+}
+
+impl FaceMetrics {
+    fn scaled(self, scale: f32) -> Self {
+        Self {
+            padding: self.padding * scale,
+            gap: self.gap * scale,
+            sidebar_width: self.sidebar_width * scale,
+            bar_height: self.bar_height * scale,
+            bar_gap: self.bar_gap * scale,
+            bar_radius: self.bar_radius * scale,
+            panel_padding: self.panel_padding * scale,
+            panel_radius: self.panel_radius * scale,
+        }
+    }
 }
 
 /// A face that fills a whole mode card.
@@ -256,10 +292,10 @@ fn mode_palettes(selection: &ThemeSelection, mode: ThemeMode) -> ModePalettes {
 
 /// The preview a mode card paints: one face, or two when the mode follows the
 /// system.
-fn mode_preview(selection: &ThemeSelection, mode: ThemeMode) -> AnyElement {
+fn mode_preview(selection: &ThemeSelection, mode: ThemeMode, scale: f32) -> AnyElement {
     let palettes = mode_palettes(selection, mode);
     let Some(secondary) = palettes.secondary else {
-        return preview_face(palettes.primary, FULL_FACE);
+        return preview_face(palettes.primary, FULL_FACE.scaled(scale));
     };
     div()
         .size_full()
@@ -270,14 +306,14 @@ fn mode_preview(selection: &ThemeSelection, mode: ThemeMode) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .child(preview_face(palettes.primary, SPLIT_FACE)),
+                .child(preview_face(palettes.primary, SPLIT_FACE.scaled(scale))),
         )
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .child(preview_face(secondary, SPLIT_FACE)),
+                .child(preview_face(secondary, SPLIT_FACE.scaled(scale))),
         )
         .into_any_element()
 }
@@ -310,6 +346,7 @@ fn mode_card(
     preview: AnyElement,
     selected: bool,
     is_dark: bool,
+    height: f32,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let border = theme::semantic_color("border", is_dark);
@@ -319,13 +356,15 @@ fn mode_card(
     let hover_border = muted_foreground.opacity(0.45);
 
     v_flex()
+        .flex_1()
+        .min_w_0()
         .items_center()
         .gap(px(MODE_LABEL_GAP))
         .child(
             div()
                 .id(id)
-                .w(px(MODE_CARD_WIDTH))
-                .h(px(MODE_CARD_HEIGHT))
+                .w_full()
+                .h(px(height))
                 .p(px(MODE_CARD_PADDING))
                 .rounded(px(MODE_CARD_RADIUS))
                 .border_1()
@@ -359,21 +398,27 @@ fn mode_card(
         .into_any_element()
 }
 
-/// The appearance control: one preview card per mode.
+/// The appearance control: one preview card per mode, sharing the row's width.
 ///
-/// `on_select` receives the chosen mode. The cards state the choice in words
-/// as well as in color, and the system card paints both appearances so
-/// "follow the platform" is visible before it is chosen.
+/// `available_width` is the settings page's content width; the cards take a
+/// third of it each and derive their height from it. `on_select` receives the
+/// chosen mode. The cards state the choice in words as well as in color, and
+/// the system card paints both appearances so "follow the platform" is visible
+/// before it is chosen.
 pub fn theme_mode_picker(
     selection: &ThemeSelection,
     selected: ThemeMode,
     labels: ThemeModeLabels,
     is_dark: bool,
+    available_width: f32,
     on_select: impl Fn(ThemeMode, &mut Window, &mut App) + Clone + 'static,
 ) -> AnyElement {
+    let height = mode_card_height(available_width);
+    let scale = height / MODE_CARD_REFERENCE_HEIGHT;
     h_flex()
         .id("theme-mode-cards")
         .role(Role::RadioGroup)
+        .w_full()
         .items_start()
         .gap(px(MODE_CARD_GAP))
         .children(mode_options(labels).into_iter().map(|(id, mode, label)| {
@@ -381,31 +426,14 @@ pub fn theme_mode_picker(
             mode_card(
                 id,
                 label,
-                mode_preview(selection, mode),
+                mode_preview(selection, mode, scale),
                 mode == selected,
                 is_dark,
+                height,
                 move |_, window, cx| on_select(mode, window, cx),
             )
         }))
         .into_any_element()
-}
-
-/// The description under a picker row: the selected theme's name, so the row
-/// states the current choice in words as well as in color.
-pub fn selected_theme_description(
-    selection: &ThemeSelection,
-    mode: GpuiThemeMode,
-    fallback: &'static str,
-) -> SharedString {
-    let selected = selected_theme(selection, mode);
-    let explicit = match mode {
-        GpuiThemeMode::Light => selection.light(),
-        GpuiThemeMode::Dark => selection.dark(),
-    };
-    if explicit.is_none() {
-        return SharedString::from(format!("{} — {fallback}", selected.name));
-    }
-    SharedString::from(selected.name.to_string())
 }
 
 #[cfg(test)]
@@ -430,6 +458,7 @@ mod tests {
                     dark: "Dark",
                 },
                 false,
+                600.0,
                 |_, _, _| {},
             ))
         }
@@ -463,30 +492,39 @@ mod tests {
     }
 
     #[test]
-    fn a_picker_never_offers_the_other_appearance() {
+    fn a_dropdown_never_offers_the_other_appearance() {
         for mode in GpuiThemeMode::ALL {
-            for definition in themes_for(mode) {
+            for option in theme_options(mode) {
                 assert_eq!(
-                    definition.mode, mode,
-                    "{} must not appear in the {mode:?} picker",
-                    definition.id
+                    option.definition.mode, mode,
+                    "{} must not appear in the {mode:?} dropdown",
+                    option.id
                 );
             }
         }
     }
 
     #[test]
-    fn an_explicit_choice_is_named_without_the_default_suffix() {
+    fn a_dropdown_selects_the_theme_its_slot_resolves_to() {
         let mut selection = ThemeSelection::default();
+        selection.select_light("gruvbox-light");
         selection.select_dark("nord");
+
+        for (mode, expected) in [
+            (GpuiThemeMode::Light, "gruvbox-light"),
+            (GpuiThemeMode::Dark, "nord"),
+        ] {
+            let index = selected_theme_index(mode, &selection).expect("a selected row");
+            let options = theme_options(mode);
+            assert_eq!(options[index.row].id, expected);
+        }
+
+        // An untouched slot still points at the catalog default.
+        let unset = ThemeSelection::default();
+        let index = selected_theme_index(GpuiThemeMode::Dark, &unset).expect("a selected row");
         assert_eq!(
-            selected_theme_description(&selection, GpuiThemeMode::Dark, "default"),
-            "Nord"
-        );
-        // The untouched light slot still says it is the product default.
-        assert_eq!(
-            selected_theme_description(&selection, GpuiThemeMode::Light, "default"),
-            "Vibex Light — default"
+            theme_options(GpuiThemeMode::Dark)[index.row].id,
+            "vibex-dark"
         );
     }
 
@@ -530,5 +568,23 @@ mod tests {
             options.len(),
             "each card needs its own element id"
         );
+    }
+
+    #[test]
+    fn a_card_keeps_its_aspect_as_the_row_grows() {
+        let narrow = mode_card_height(480.0);
+        let wide = mode_card_height(960.0);
+        assert!(wide > narrow, "a wider row gives taller cards");
+        for width in [320.0, 480.0, 764.0, 1200.0] {
+            let card_width = (width - 2.0 * MODE_CARD_GAP) / 3.0;
+            let height = mode_card_height(width);
+            if height > MODE_CARD_MIN_HEIGHT {
+                assert!(
+                    (card_width / height - MODE_CARD_ASPECT).abs() < 0.01,
+                    "width {width} lost the authored aspect: {card_width} x {height}"
+                );
+            }
+        }
+        assert_eq!(mode_card_height(0.0), MODE_CARD_MIN_HEIGHT);
     }
 }

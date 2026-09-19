@@ -621,6 +621,9 @@ const SETTINGS_DIALOG_RADIUS: f32 = 12.0;
 /// inside its bounds, which puts the content box one pixel in; shrinking the
 /// radius by the same amount keeps the two outlines concentric.
 const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
+/// Leading and trailing inset of every settings page. The appearance preview
+/// cards measure their row from the same value, so they line up with the panel.
+const SETTINGS_PAGE_PADDING_X: f32 = 70.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
@@ -27108,7 +27111,7 @@ impl VibexWorkbench {
     fn set_theme_variant(
         &mut self,
         mode: GpuiThemeMode,
-        id: &'static str,
+        id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -52937,6 +52940,8 @@ struct FoundationSettings {
     language_modes: Entity<SelectState<Vec<LocaleChoice>>>,
     interface_fonts: Entity<SelectState<Vec<FontChoice>>>,
     code_fonts: Entity<SelectState<Vec<FontChoice>>>,
+    light_themes: Entity<SelectState<Vec<appearance_theme::ThemeOption>>>,
+    dark_themes: Entity<SelectState<Vec<appearance_theme::ThemeOption>>>,
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
@@ -53014,6 +53019,28 @@ impl FoundationSettings {
         });
         let code_fonts =
             cx.new(|cx| SelectState::new(code_choices, code_selected, window, cx).searchable(true));
+        let light_themes = cx.new(|cx| {
+            SelectState::new(
+                appearance_theme::theme_options(GpuiThemeMode::Light),
+                appearance_theme::selected_theme_index(
+                    GpuiThemeMode::Light,
+                    &ui_state.appearance.theme_selection,
+                ),
+                window,
+                cx,
+            )
+        });
+        let dark_themes = cx.new(|cx| {
+            SelectState::new(
+                appearance_theme::theme_options(GpuiThemeMode::Dark),
+                appearance_theme::selected_theme_index(
+                    GpuiThemeMode::Dark,
+                    &ui_state.appearance.theme_selection,
+                ),
+                window,
+                cx,
+            )
+        });
         let session_content_widths = cx.new(|cx| {
             SelectState::new(
                 session_content_width_choices,
@@ -53111,6 +53138,44 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            let light_theme_workbench = workbench.clone();
+            cx.subscribe_in(
+                &light_themes,
+                window,
+                move |_: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<appearance_theme::ThemeOption>>,
+                      window,
+                      cx| {
+                    let SelectEvent::Confirm(id) = event;
+                    if let Some(id) = id.clone() {
+                        let _ = light_theme_workbench.update(cx, |this, cx| {
+                            this.set_theme_variant(GpuiThemeMode::Light, &id, window, cx)
+                        });
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
+            let dark_theme_workbench = workbench.clone();
+            cx.subscribe_in(
+                &dark_themes,
+                window,
+                move |_: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<appearance_theme::ThemeOption>>,
+                      window,
+                      cx| {
+                    let SelectEvent::Confirm(id) = event;
+                    if let Some(id) = id.clone() {
+                        let _ = dark_theme_workbench.update(cx, |this, cx| {
+                            this.set_theme_variant(GpuiThemeMode::Dark, &id, window, cx)
+                        });
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
             let session_content_width_workbench = workbench.clone();
             cx.subscribe(
                 &session_content_widths,
@@ -53158,6 +53223,8 @@ impl FoundationSettings {
                 language_modes,
                 interface_fonts,
                 code_fonts,
+                light_themes,
+                dark_themes,
                 session_content_widths,
                 reasoning_display_modes,
                 terminal_shells,
@@ -53715,6 +53782,19 @@ impl FoundationSettings {
             select.set_items(code_choices, window, cx);
             select.set_selected_value(&appearance.code_font.family, window, cx)
         });
+        for (mode, select) in [
+            (GpuiThemeMode::Light, &self.light_themes),
+            (GpuiThemeMode::Dark, &self.dark_themes),
+        ] {
+            select.update(cx, |select, cx| {
+                select.set_items(appearance_theme::theme_options(mode), window, cx);
+                select.set_selected_index(
+                    appearance_theme::selected_theme_index(mode, &appearance.theme_selection),
+                    window,
+                    cx,
+                );
+            });
+        }
         self.terminal_shells.update(cx, |select, cx| {
             select.set_items(shell_choices(), window, cx);
             let shell = terminal_preferences.shell.clone().unwrap_or_default();
@@ -53739,19 +53819,6 @@ impl FoundationSettings {
         let _ = self
             .workbench
             .update(cx, |this, cx| this.set_theme(mode, window, cx));
-        cx.notify();
-    }
-
-    fn set_theme_variant(
-        &mut self,
-        mode: GpuiThemeMode,
-        id: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let _ = self
-            .workbench
-            .update(cx, |this, cx| this.set_theme_variant(mode, id, window, cx));
         cx.notify();
     }
 
@@ -54754,10 +54821,11 @@ impl FoundationSettings {
         &self,
         appearance: &AppearanceUiState,
         stacked: bool,
+        cards_width: f32,
         strings: Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme_control = appearance_theme::theme_mode_picker(
+        let mode_cards = appearance_theme::theme_mode_picker(
             &appearance.theme_selection,
             appearance.theme,
             appearance_theme::ThemeModeLabels {
@@ -54766,6 +54834,7 @@ impl FoundationSettings {
                 dark: strings.dark,
             },
             cx.theme().is_dark(),
+            cards_width,
             {
                 let this = cx.entity().downgrade();
                 move |mode, window, cx| {
@@ -54780,31 +54849,19 @@ impl FoundationSettings {
             Some(strings.choose_interface_font),
             cx,
         );
-        let light_theme_picker = appearance_theme::theme_picker(
-            "light-theme-picker",
-            GpuiThemeMode::Light,
-            &appearance.theme_selection,
-            {
-                let this = cx.entity().downgrade();
-                move |id, window, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.set_theme_variant(GpuiThemeMode::Light, id, window, cx)
-                    });
-                }
-            },
+        let light_theme_select = settings_select(
+            &self.light_themes,
+            Some(px(240.0)),
+            stacked,
+            None::<&str>,
+            cx,
         );
-        let dark_theme_picker = appearance_theme::theme_picker(
-            "dark-theme-picker",
-            GpuiThemeMode::Dark,
-            &appearance.theme_selection,
-            {
-                let this = cx.entity().downgrade();
-                move |id, window, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.set_theme_variant(GpuiThemeMode::Dark, id, window, cx)
-                    });
-                }
-            },
+        let dark_theme_select = settings_select(
+            &self.dark_themes,
+            Some(px(240.0)),
+            stacked,
+            None::<&str>,
+            cx,
         );
         let code_font_select = settings_select(
             &self.code_fonts,
@@ -54813,38 +54870,31 @@ impl FoundationSettings {
             Some(strings.choose_code_font),
             cx,
         );
-        settings_page(
+        settings_page_with_leading(
             strings.appearance,
             strings.appearance_description,
+            // The appearance control is a section of its own: the preview cards
+            // need the page's full width, which a row inside the panel cannot
+            // give them.
+            Some(
+                v_flex()
+                    .gap_3()
+                    .child(div().text_sm().font_semibold().child(strings.theme))
+                    .child(mode_cards)
+                    .into_any_element(),
+            ),
             vec![
-                // The preview cards need the row's full width, so the
-                // appearance row stays stacked at every viewport size.
-                setting_row(
-                    strings.theme,
-                    strings.theme_description,
-                    theme_control,
-                    true,
-                    cx,
-                ),
                 setting_row(
                     strings.light_theme,
-                    appearance_theme::selected_theme_description(
-                        &appearance.theme_selection,
-                        GpuiThemeMode::Light,
-                        strings.system_default,
-                    ),
-                    light_theme_picker,
+                    strings.light_theme_description,
+                    light_theme_select,
                     stacked,
                     cx,
                 ),
                 setting_row(
                     strings.dark_theme,
-                    appearance_theme::selected_theme_description(
-                        &appearance.theme_selection,
-                        GpuiThemeMode::Dark,
-                        strings.system_default,
-                    ),
-                    dark_theme_picker,
+                    strings.dark_theme_description,
+                    dark_theme_select,
                     stacked,
                     cx,
                 ),
@@ -56670,9 +56720,13 @@ impl Render for FoundationSettings {
                 strings,
                 cx,
             ),
-            SettingsSection::Appearance => {
-                self.render_appearance_page(&appearance, stacked_rows, strings, cx)
-            }
+            SettingsSection::Appearance => self.render_appearance_page(
+                &appearance,
+                stacked_rows,
+                settings_appearance_cards_width(viewport_width),
+                strings,
+                cx,
+            ),
             SettingsSection::Session => {
                 self.render_session_page(&session, &desktop_behavior, stacked_rows, strings, cx)
             }
@@ -57427,9 +57481,41 @@ fn resolve_release_channel(
     Ok(packaged.or(runtime).unwrap_or(ReleaseChannel::Preview))
 }
 
+/// Width the appearance preview cards share: the settings page's content
+/// column, once the dialog margins, the navigation, and the page inset are
+/// removed.
+///
+/// The cards flex to a third of this, so it only has to be close enough to give
+/// them their height; the row itself always fits the page.
+fn settings_appearance_cards_width(viewport_width: f32) -> f32 {
+    let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
+    let navigation_width = if viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH {
+        SETTINGS_NAVIGATION_WIDTH
+    } else {
+        0.0
+    };
+    (dialog_width - navigation_width - SETTINGS_PAGE_PADDING_X * 2.0).max(0.0)
+}
+
 fn settings_page(
     title: &'static str,
     description: &'static str,
+    rows: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    settings_page_with_leading(title, description, None, rows, cx)
+}
+
+/// The settings page shell, with an optional section between the page header
+/// and the grouped panel.
+///
+/// The appearance page uses it for the theme preview cards: they are a control
+/// that needs the page's full width and a section label of its own, not a row
+/// inside the panel.
+fn settings_page_with_leading(
+    title: &'static str,
+    description: &'static str,
+    leading: Option<AnyElement>,
     rows: Vec<AnyElement>,
     cx: &App,
 ) -> AnyElement {
@@ -57449,7 +57535,7 @@ fn settings_page(
         // and rounds the dialog's corners, and a square page fill would cover
         // those corners again while the page is scrolled.
         .text_color(foreground)
-        .px(px(70.0))
+        .px(px(SETTINGS_PAGE_PADDING_X))
         .py_8()
         .child(
             v_flex()
@@ -57463,6 +57549,7 @@ fn settings_page(
                         .child(description),
                 ),
         )
+        .when_some(leading, |this, leading| this.child(leading))
         // Group all rows in one rounded panel with inset separators so the
         // page reads as a calm grouped list instead of a stack of dividers.
         .child({
