@@ -35,7 +35,7 @@ use gpui_component::{
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
     TitleBar, VirtualListScrollHandle, WindowExt as _,
     animation::EffectTransition as Transition,
-    bubble::{Bubble, BubbleContent},
+    bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -39425,10 +39425,9 @@ impl VibexWorkbench {
                 cx,
             )
         };
-        // The delivery logo leads the message's first line inside the bubble.
-        // Edit mode swaps the bubble for the inline editor, which carries no
-        // delivery marker.
-        let delivery_marker = if editing {
+        // The delivery mark rides the bubble's lower edge. Edit mode swaps the
+        // bubble for the inline editor, which carries no delivery marker.
+        let delivery_reactions = if editing {
             None
         } else {
             render_user_message_delivery_marker(&row.id, delivery, cx)
@@ -39465,7 +39464,7 @@ impl VibexWorkbench {
                     .gap_1()
                     .child(render_user_message_bubble(
                         inline_content,
-                        delivery_marker,
+                        delivery_reactions,
                         cx.theme().muted,
                         cx.theme().foreground,
                         editing,
@@ -56363,18 +56362,18 @@ fn user_message_inline_document(
     (Arc::new(document), Arc::new(attachment_actions))
 }
 
-/// The logo a user message wears when a queued action delivered it.
+/// The edge mark a user message wears when a queued action delivered it.
 ///
-/// The logo leads the message's first line inside the bubble and carries the
-/// delivery accent itself — steer is green, an interrupted resend is yellow —
-/// so the two deliveries stay distinguishable by glyph and by hue without
-/// tinting the bubble edge. The delivery label lives in the logo's tooltip,
-/// which also names the marker for assistive technology.
+/// The mark is the library's bubble reaction region: an icon-only ghost button
+/// anchored to the bubble's lower edge, carrying the delivery accent itself —
+/// steer is green, an interrupted resend is yellow — so the two deliveries stay
+/// distinguishable by glyph and by hue without tinting the bubble edge. The
+/// delivery label is the button's tooltip and its accessibility name.
 fn render_user_message_delivery_marker(
     row_id: &str,
     delivery: UserMessageDelivery,
     cx: &App,
-) -> Option<AnyElement> {
+) -> Option<BubbleReactions> {
     let (icon_path, label, accent) = match delivery {
         UserMessageDelivery::Steer => (
             "icons/vibex/corner-down-right.svg",
@@ -56398,30 +56397,31 @@ fn render_user_message_delivery_marker(
     };
     let label = SharedString::from(label);
     Some(
-        div()
-            .id(SharedString::from(format!(
+        BubbleReactions::new().action(
+            Button::new(SharedString::from(format!(
                 "user-message-delivery:{row_id}"
             )))
-            .flex_shrink_0()
-            // Optical centering on the message's first line box: the markdown
-            // body sets a 22px line height, so a 14px glyph drops (22 - 14) / 2
-            // below the line top instead of sitting on it.
-            .mt(px(4.0))
-            .aria_label(label.clone())
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-            .child(
-                Icon::default()
-                    .path(icon_path)
-                    .size(px(14.0))
-                    .text_color(accent),
-            )
-            .into_any_element(),
+            .ghost()
+            .xsmall()
+            // The accent belongs to the glyph, not to the button's text style, so
+            // hovering the pill cannot wash the delivery hue out.
+            .icon(Icon::default().path(icon_path).text_color(accent))
+            .accessibility_label(label.clone())
+            .tooltip(label),
+        ),
     )
 }
 
+/// The strip an edge-anchored delivery reaction hangs into below the bubble.
+///
+/// `BubbleReactions` anchors itself a fixed `1.25rem` below the bubble's bottom
+/// edge. Reserving the same strip under the bubble keeps the pill clear of the
+/// row's hover action line instead of overlapping it.
+const USER_MESSAGE_DELIVERY_REACTION_HANG: f32 = 20.0;
+
 fn render_user_message_bubble(
     body: AnyElement,
-    delivery_marker: Option<AnyElement>,
+    delivery_reactions: Option<BubbleReactions>,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
     fill_width: bool,
@@ -56434,22 +56434,17 @@ fn render_user_message_bubble(
     // Bubble and its visible BubbleContent surface or the hug collapses the
     // pill.
     //
-    // A queued delivery's logo leads the first line inside the pill. It owns a
-    // fixed column so wrapped lines align to the text, not under the glyph.
-    let body = match delivery_marker {
-        Some(marker) => h_flex()
-            .items_start()
-            .gap_1()
-            .child(marker)
-            .child(div().min_w_0().flex_shrink(1.0).child(body))
-            .into_any_element(),
-        None => body,
-    };
+    // A queued delivery rides the library's edge reaction region, so the body
+    // keeps the full content width and wrapped lines align to the text.
     Bubble::new()
         .alignment(MessageAlignment::End)
         .flex_shrink(1.0)
         .max_w_full()
         .when(fill_width, |this| this.w_full())
+        .when_some(delivery_reactions, |this, reactions| {
+            this.mb(px(USER_MESSAGE_DELIVERY_REACTION_HANG))
+                .reactions(reactions)
+        })
         .content(
             BubbleContent::new()
                 .bg(background)
@@ -69363,35 +69358,36 @@ mod tests {
     }
 
     /// Renders a delivered user message through the real bubble so the test can
-    /// measure what a user message row paints, and where the delivery logo
-    /// lands relative to the message's first line.
+    /// measure what a user message row paints, and where the delivery mark
+    /// lands relative to the message and to the row that follows it.
     struct UserMessageDeliveryMarkerProbe {
         delivery: Rc<Cell<UserMessageDelivery>>,
-        /// Left edge, top edge, and height of the logo's column.
-        measured_marker: Rc<Cell<(f32, f32, f32)>>,
+        /// Vertical center of the reaction pill's content.
+        measured_marker_center: Rc<Cell<f32>>,
         /// Left edge, top edge, and height of the message text.
         measured_body: Rc<Cell<(f32, f32, f32)>>,
+        /// Top edge of the row that follows the bubble.
+        measured_next_row_top: Rc<Cell<f32>>,
     }
 
     impl Render for UserMessageDeliveryMarkerProbe {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let measured_marker = self.measured_marker.clone();
+            let measured_marker_center = self.measured_marker_center.clone();
             let measured_body = self.measured_body.clone();
+            let measured_next_row_top = self.measured_next_row_top.clone();
             let marker =
                 render_user_message_delivery_marker("delivery-probe", self.delivery.get(), cx).map(
-                    |marker| {
-                        // The wrapper hugs the logo, so its bounds report where
-                        // the logo actually paints inside the bubble.
-                        div()
-                            .on_prepaint(move |bounds, _, _| {
-                                measured_marker.set((
-                                    f32::from(bounds.origin.x),
-                                    f32::from(bounds.origin.y),
-                                    f32::from(bounds.size.height),
-                                ));
-                            })
-                            .child(marker)
-                            .into_any_element()
+                    |reactions| {
+                        // The pill centers its children, so a tiny child reports the
+                        // pill's own vertical center: where the mark actually paints.
+                        reactions.child(div().w(px(1.0)).h(px(1.0)).on_prepaint(
+                            move |bounds, _, _| {
+                                measured_marker_center.set(
+                                    f32::from(bounds.origin.y)
+                                        + f32::from(bounds.size.height) / 2.0,
+                                );
+                            },
+                        ))
                     },
                 );
             let body = div()
@@ -69407,28 +69403,41 @@ mod tests {
                     "hi".to_string(),
                     None,
                 ));
-            h_flex().w(px(320.0)).child(render_user_message_bubble(
-                body.into_any_element(),
-                marker,
-                theme::semantic_color("muted", true),
-                theme::semantic_color("foreground", true),
-                false,
-            ))
+            v_flex()
+                .w(px(320.0))
+                .items_end()
+                .gap_1()
+                .child(render_user_message_bubble(
+                    body.into_any_element(),
+                    marker,
+                    theme::semantic_color("muted", true),
+                    theme::semantic_color("foreground", true),
+                    false,
+                ))
+                .child(
+                    // Stands in for the row's hover action line, which the
+                    // reaction pill must not overlap.
+                    div().w_full().h(px(24.0)).on_prepaint(move |bounds, _, _| {
+                        measured_next_row_top.set(f32::from(bounds.origin.y));
+                    }),
+                )
         }
     }
 
     #[gpui::test]
-    fn user_message_delivery_marker_leads_the_first_line_for_queued_deliveries(
+    fn user_message_delivery_marker_rides_the_bubble_edge_for_queued_deliveries(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_component::init);
         let delivery = Rc::new(Cell::new(UserMessageDelivery::Prompt));
-        let measured_marker = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let measured_marker_center = Rc::new(Cell::new(0.0));
         let measured_body = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let measured_next_row_top = Rc::new(Cell::new(0.0));
         let (_, cx) = cx.add_window_view(|_, _| UserMessageDeliveryMarkerProbe {
             delivery: delivery.clone(),
-            measured_marker: measured_marker.clone(),
+            measured_marker_center: measured_marker_center.clone(),
             measured_body: measured_body.clone(),
+            measured_next_row_top: measured_next_row_top.clone(),
         });
 
         for (case, paints_marker) in [
@@ -69437,39 +69446,44 @@ mod tests {
             (UserMessageDelivery::Resend, true),
         ] {
             delivery.set(case);
-            measured_marker.set((0.0, 0.0, 0.0));
+            measured_marker_center.set(0.0);
             cx.run_until_parked();
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
             });
-            let (marker_left, marker_top, marker_height) = measured_marker.get();
-            let (body_left, body_top, body_height) = measured_body.get();
+            let marker_center = measured_marker_center.get();
+            let (_, body_top, body_height) = measured_body.get();
+            let body_bottom = body_top + body_height;
+            let strip_below_body = measured_next_row_top.get() - body_bottom;
             if !paints_marker {
                 assert_eq!(
-                    marker_height, 0.0,
-                    "an ordinary prompt should not paint a delivery logo"
+                    marker_center, 0.0,
+                    "an ordinary prompt should not paint a delivery mark"
+                );
+                assert!(
+                    strip_below_body < USER_MESSAGE_DELIVERY_REACTION_HANG,
+                    "an ordinary prompt should not reserve the reaction strip: {strip_below_body}"
                 );
                 continue;
             }
+            // The mark rides the bubble's lower edge, not its first line: the
+            // kit anchors the pill 1.25rem below the bubble's bottom edge, and
+            // the 20px icon-only button plus the pill's 3px borders make the
+            // pill 26px tall, so its center lands 18px below the message text
+            // (the bubble's 10px bottom padding and 1px border included).
+            let expected_center = body_bottom + 18.0;
             assert!(
-                marker_left < body_left,
-                "{case:?} logo should lead the message text: {marker_left} vs {body_left}"
+                (marker_center - expected_center).abs() <= 1.0,
+                "{case:?} mark should ride the bubble's lower edge: {marker_center} vs {expected_center}"
             );
+            // The reserved strip is exactly the pill's hang: the bubble's own
+            // bottom padding and border (11px), the row gap (4px), and the
+            // hang. Padding it further would push every delivered message's
+            // hover action line away from its bubble.
+            let expected_strip = USER_MESSAGE_DELIVERY_REACTION_HANG + 15.0;
             assert!(
-                (marker_top - body_top).abs() <= 0.5,
-                "{case:?} logo column should start on the first line: {marker_top} vs {body_top}"
-            );
-            // The column is the 4px leading inset plus the 14px glyph, so the
-            // glyph center lands on the center of the 22px first line box.
-            assert!(
-                (marker_height - 18.0).abs() <= 0.5,
-                "{case:?} logo column should inset half the line leading: {marker_height}"
-            );
-            let glyph_center = marker_top + marker_height - 7.0;
-            let line_center = body_top + body_height / 2.0;
-            assert!(
-                (glyph_center - line_center).abs() <= 1.0,
-                "{case:?} logo should center on the first line: {glyph_center} vs {line_center}"
+                (strip_below_body - expected_strip).abs() <= 1.0,
+                "{case:?} bubble should reserve exactly the strip the mark hangs into: {strip_below_body} vs {expected_strip}"
             );
         }
     }
@@ -69531,18 +69545,20 @@ mod tests {
         assert!(helper.contains(".max_w_full()"));
         assert!(helper.contains(".rounded(px(12.0))"));
         assert!(!helper.contains(".overflow_y_scrollbar()"));
-        // A queued delivery is marked by the logo leading the bubble's first
-        // line, never by a chip above it or a tinted bubble edge.
+        // A queued delivery rides the library reaction region on the bubble's
+        // lower edge, never a chip above it or a tinted bubble edge.
         assert!(row.contains("render_user_message_delivery_marker"));
         assert!(!row.contains("render_user_message_delivery_hint"));
         assert!(!row.contains(".border_color("));
-        assert!(helper.contains("delivery_marker"));
+        assert!(helper.contains("delivery_reactions"));
+        assert!(helper.contains(".reactions("));
+        assert!(helper.contains("USER_MESSAGE_DELIVERY_REACTION_HANG"));
         assert!(!helper.contains("border_1"));
         assert!(!helper.contains("border_color"));
     }
 
     #[test]
-    fn user_message_delivery_marker_colors_the_logo_by_delivery() {
+    fn user_message_delivery_marker_colors_the_edge_reaction_by_delivery() {
         let source = include_str!("app.rs");
         let marker = source
             .split_once("fn render_user_message_delivery_marker(")
@@ -69550,15 +69566,22 @@ mod tests {
             .map(|(body, _)| body)
             .expect("delivery marker helper should remain inspectable");
 
-        // The two deliveries stay distinguishable by glyph, by hue, and by the
-        // tooltip that carries the label the old chip printed.
+        // The two deliveries stay distinguishable by glyph, by hue on the
+        // glyph, and by the library tooltip that carries the label the old chip
+        // printed. The mark is an icon-only ghost button inside the bubble's
+        // reaction region, not a hand-rolled tooltip host.
+        assert!(marker.contains("BubbleReactions::new()"));
+        assert!(marker.contains("Button::new("));
+        assert!(marker.contains(".ghost()"));
+        assert!(marker.contains(".xsmall()"));
         assert!(marker.contains("icons/vibex/corner-down-right.svg"));
         assert!(marker.contains("icons/vibex/rotate-ccw.svg"));
         assert!(marker.contains("cx.theme().success"));
         assert!(marker.contains("cx.theme().warning"));
-        assert!(marker.contains("Tooltip::new"));
-        assert!(marker.contains(".aria_label("));
+        assert!(marker.contains(".tooltip("));
+        assert!(marker.contains(".accessibility_label("));
         assert!(marker.contains(".text_color(accent)"));
+        assert!(!marker.contains("Tooltip::new"));
     }
 
     #[test]

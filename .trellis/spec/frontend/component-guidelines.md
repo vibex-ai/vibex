@@ -408,11 +408,14 @@ Render Agent activity through provider-neutral cards:
 Cards that can grow large must be collapsible. Tool, diff, terminal, and plan
 cards should support compact summaries for mobile.
 
-A user message delivered by a queued action marks itself inside the bubble: the
-delivery logo leads the message's first line in its own column, colored by
-delivery (steer green, interrupted resend yellow), with the delivery label in
-its tooltip. Do not tint the bubble border or paint a separate chip above the
-bubble; the glyph shape, its hue, and the tooltip together carry the meaning.
+A user message delivered by a queued action marks itself on the bubble's lower
+edge through the kit's reaction region (`BubbleReactions` with an icon-only ghost
+`Button`), never through a chip above the bubble or a tinted bubble border. The
+glyph carries the delivery hue (steer green, interrupted resend yellow) so the
+hue survives hover, while the delivery label is the button's tooltip and its
+accessibility name. A bubble that owns a reaction reserves the strip the pill
+hangs into (the kit anchors it `1.25rem` below the edge) so the mark cannot
+overlap the row's hover action line.
 
 Delegation and Team cards should show parent/child session links, role or slot,
 current state, pending permission ownership, and latest result summary without
