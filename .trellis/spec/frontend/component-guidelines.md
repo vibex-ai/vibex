@@ -223,7 +223,9 @@ The reasons are the ones the kit component already solves: the notification laye
 stacks above sheets and dialogs, it auto-hides, it is click-dismissable, and a
 hint pushed with the same `.id::<T>()` replaces the previous one instead of
 stacking duplicates. A page banner has none of that and needs the page to
-remember to clear it on the next action.
+remember to clear it on the next action. That the hint clears a dialog backdrop
+is not free — it comes from the layer's deferred priority, so read "Overlay Layer
+Z-Order" before moving or re-mounting the layer.
 
 ```rust
 struct GitMutationNotification;
@@ -273,6 +275,8 @@ and assert that the target range is actually laid out inside the viewport. A
 source-string assertion or a test that only checks callback registration does not
 prove scroll behavior.
 
+### Overlay Layer Z-Order
+
 Production GPUI workbench roots must mount the component overlay hosts after the
 main shell content. Append `Root::render_sheet_layer`,
 `Root::render_dialog_layer`, and `Root::render_notification_layer` in that
@@ -281,6 +285,40 @@ stacking order from the root view that owns the window. Calling
 alone is not evidence that the corresponding layer is rendered. Keep sheet
 state in the window/root owner (`has_active_sheet`, `close_sheet`) so title-bar
 buttons, Escape/outside close, and programmatic startup all observe one overlay.
+
+Mounting order is not z-order. Only inline content paints in tree order: the kit
+renders dialogs through `gpui_base::Dialog`, which is a `deferred` draw at
+priority `10 + layer`, popups (menus, selects, popovers, `gpui_base::Popup`) at
+`POPUP_PRIORITY` (100), and tooltips at 200. A layer left inline therefore paints
+*under* every dialog backdrop, which dims anything it hosts. Any overlay whose
+content must stay readable over a dialog — the workbench's top-centered
+notification layer, for example — has to be deferred at a priority inside the
+band it belongs to:
+
+```rust
+const NOTIFICATION_LAYER_PRIORITY: usize = 99;
+
+fn render_notification_layer(window: &Window, cx: &App) -> impl IntoElement + use<> {
+    deferred(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(Root::read(window, cx).notification.clone()),
+    )
+    .with_priority(NOTIFICATION_LAYER_PRIORITY)
+}
+```
+
+Pick the band from what the surface is for: above the dialog band for transient
+feedback that answers an action taken in the dialog, below `POPUP_PRIORITY` so an
+open menu or the tooltip under the pointer still wins. Assert the result against
+the painted scene (`window.painted_quads()`), not against the element tree: two
+layers can sit in the order the root mounts them and still paint the wrong way
+round.
 
 Floating sidebars rendered with shadcn/Radix `Sheet` must account for nested
 portaled overlays such as `DropdownMenu`. If a sidebar action menu portals its

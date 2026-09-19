@@ -27,8 +27,8 @@ use gpui::{
     ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, Unbind, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions, div, img,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
+    WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions, deferred, div,
+    img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -1649,15 +1649,35 @@ fn ambiguous_message_submission_notice() -> &'static str {
     )
 }
 
+/// Deferred paint priority for the notification layer.
+///
+/// Tree order does not decide z-order in GPUI: the kit renders dialogs as
+/// deferred draws at priority `10 + layer`, popups (menus, selects, popovers)
+/// at `gpui_base::POPUP_PRIORITY` (100), and tooltips at 200. An inline layer
+/// therefore paints under a dialog's backdrop, which is what dimmed every hint
+/// pushed while a dialog was still open. The layer takes the gap between the
+/// dialog band and the popup band: above every dialog backdrop, below the menus
+/// and tooltips the user is actively pointing at.
+const NOTIFICATION_LAYER_PRIORITY: usize = 99;
+
+/// The workbench's top-centered hint layer.
+///
+/// The hints it hosts answer an action the user just took, and the dialog that
+/// asked for the action is often still open, so the layer is deferred at
+/// [`NOTIFICATION_LAYER_PRIORITY`] instead of relying on where the root happens
+/// to mount it.
 fn render_top_centered_notification_layer(window: &Window, cx: &App) -> impl IntoElement + use<> {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .flex()
-        .justify_center()
-        .child(Root::read(window, cx).notification.clone())
+    deferred(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(Root::read(window, cx).notification.clone()),
+    )
+    .with_priority(NOTIFICATION_LAYER_PRIORITY)
 }
 
 impl VibexWorkbench {
@@ -63978,6 +63998,10 @@ mod tests {
         assert!(notification_layer.contains(".right_0()"));
         assert!(notification_layer.contains(".justify_center()"));
         assert!(notification_layer.contains("Root::read(window, cx).notification.clone()"));
+        assert!(
+            notification_layer.contains(".with_priority(NOTIFICATION_LAYER_PRIORITY)"),
+            "the layer must be a deferred draw, or an open dialog paints over the hint"
+        );
 
         let workbench_setup = source
             .split_once("    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {")
@@ -64008,6 +64032,109 @@ mod tests {
         assert!(!renderer.contains("AmbiguousPromptDispatch"));
         assert!(!renderer.contains("发送结果不确定"));
         assert!(!renderer.contains("Review the Timeline before sending again"));
+    }
+
+    /// Renders the notification layer the way the workbench root does — the
+    /// dialog layer first, the hint layer after it — so a test can read the
+    /// painted scene and see which one actually ended up on top.
+    struct NotificationLayerOrderProbe;
+
+    impl Render for NotificationLayerOrderProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let dialog_layer = Root::render_dialog_layer(window, cx);
+            v_flex()
+                .id("notification-layer-order-probe")
+                .size_full()
+                .child(div().size_full().bg(gpui::black()))
+                .children(dialog_layer)
+                .child(render_top_centered_notification_layer(window, cx))
+        }
+    }
+
+    /// Whether a painted quad carries `hue`.
+    ///
+    /// The scene is read by hue because the enter animation multiplies the
+    /// quad's alpha, so the exact color is not stable across frames.
+    fn painted_quad_has_hue(quad: &gpui::Quad, hue: f32) -> bool {
+        format!("{:?}", quad.background).contains(&format!("h: {hue}"))
+    }
+
+    /// A dialog that is still open when a hint is pushed must not hide it: the
+    /// dialog's backdrop is a deferred draw, so an inline notification layer
+    /// paints underneath it and the hint only shows through the dimmed
+    /// backdrop. This asserts the hint's quad reaches the scene after the
+    /// dialog body's quad, which is the paint order that keeps it readable.
+    #[gpui::test]
+    fn the_notification_layer_paints_above_an_open_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| Theme::global_mut(cx).notification.placement = Anchor::TopCenter);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let probe = cx.new(|_| NotificationLayerOrderProbe);
+            Root::new(probe, window, cx).bordered(false)
+        });
+
+        cx.update(|window, cx| {
+            window.open_dialog(cx, |dialog, _, _| {
+                dialog
+                    .overlay(true)
+                    .w(px(320.0))
+                    .h(px(200.0))
+                    .content(|content, _, _| {
+                        content.child(div().size_full().bg(Hsla {
+                            h: 0.33,
+                            s: 1.0,
+                            l: 0.5,
+                            a: 1.0,
+                        }))
+                    })
+            });
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        cx.update(|window, cx| {
+            window.push_notification(
+                Notification::new().autohide(false).content(|_, _, _| {
+                    div()
+                        .w(px(160.0))
+                        .h(px(48.0))
+                        .bg(Hsla {
+                            h: 0.77,
+                            s: 1.0,
+                            l: 0.5,
+                            a: 1.0,
+                        })
+                        .into_any_element()
+                }),
+                cx,
+            );
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        cx.update(|window, _| {
+            let quads = window.painted_quads();
+            let dialog = quads
+                .iter()
+                .rposition(|quad| painted_quad_has_hue(quad, 0.33))
+                .expect("the dialog body should be painted");
+            let notification = quads
+                .iter()
+                .rposition(|quad| painted_quad_has_hue(quad, 0.77))
+                .expect("the hint should be painted");
+            assert!(
+                notification > dialog,
+                "the hint must paint after the dialog body: dialog quad at {dialog}, hint quad at {notification}"
+            );
+        });
     }
 
     #[test]
