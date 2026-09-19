@@ -3958,8 +3958,6 @@ pub struct RemoteProviderManagementSnapshot {
     pub automation_graphs: Vec<AutomationGraph>,
     pub automation_runs: Vec<AutomationRun>,
     pub automation_steps: Vec<AutomationRunStep>,
-    pub devices: Vec<RemoteDeviceDetail>,
-    pub audit_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

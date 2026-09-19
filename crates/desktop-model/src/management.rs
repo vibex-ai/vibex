@@ -30,12 +30,11 @@ pub enum ManagementSection {
     Advanced,
     Scheduled,
     Automation,
-    Relay,
     Recovery,
 }
 
 impl ManagementSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Agents,
         Self::ModelProviders,
         Self::Mcp,
@@ -44,7 +43,6 @@ impl ManagementSection {
         Self::Advanced,
         Self::Scheduled,
         Self::Automation,
-        Self::Relay,
         Self::Recovery,
     ];
 
@@ -58,7 +56,6 @@ impl ManagementSection {
             Self::Advanced => "advanced",
             Self::Scheduled => "scheduled",
             Self::Automation => "automation",
-            Self::Relay => "relay",
             Self::Recovery => "recovery",
         }
     }
@@ -73,7 +70,6 @@ impl ManagementSection {
             Self::Advanced => "Advanced",
             Self::Scheduled => "Scheduled",
             Self::Automation => "Automation",
-            Self::Relay => "Relay",
             Self::Recovery => "Recovery",
         }
     }
@@ -345,17 +341,6 @@ pub struct ScheduledManagementState {
     pub audit: Vec<ScheduledTaskAuditRecord>,
     pub selected_task_id: Option<String>,
     pub destructive_confirmation: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayManagementState {
-    pub status: String,
-    pub settings_loaded: bool,
-    pub trusted_device_count: usize,
-    pub revoked_device_count: usize,
-    pub audit_count: usize,
-    pub retryable_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]

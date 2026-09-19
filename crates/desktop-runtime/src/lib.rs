@@ -1207,15 +1207,6 @@ pub async fn assemble_management_snapshot(
                 limit: Some(500),
             })?;
 
-    let devices = management.remote().list_devices()?;
-    let audit_count = management
-        .remote()
-        .list_audit(vibex_core::RemoteAuditListRequest {
-            device_id: None,
-            limit: Some(100),
-        })?
-        .len();
-
     Ok(vibex_core::RemoteProviderManagementSnapshot {
         agents,
         catalog,
@@ -1238,8 +1229,6 @@ pub async fn assemble_management_snapshot(
         automation_graphs,
         automation_runs,
         automation_steps,
-        devices,
-        audit_count,
     })
 }
 

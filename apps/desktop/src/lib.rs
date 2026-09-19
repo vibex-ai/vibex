@@ -138,7 +138,7 @@ mod tests {
             probe.code_workbench_contract.file_tree_fixture_rows,
             100_000
         );
-        assert_eq!(probe.management_contract.section_count, 10);
+        assert_eq!(probe.management_contract.section_count, 9);
         assert!(probe.management_contract.section_generation_fenced);
         assert!(probe.management_contract.graph_cas_versioned);
     }

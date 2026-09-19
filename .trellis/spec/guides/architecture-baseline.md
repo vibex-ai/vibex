@@ -169,7 +169,7 @@ authority role through `NativeBackend`; paired with a headless runtime it
 drives the identical facade through `WebRemoteBackend` (the "Remote Runtime"
 settings page, credential store under the desktop home). Every Config Center
 section — Agents, provider settings, MCP/Skills/Prompts/Hooks, scheduled tasks,
-automation, device management and recovery (diagnostic export plus database
+automation and recovery (diagnostic export plus database
 backup) — runs through that facade, so the remote runtime serves it; the
 recovery artifacts themselves are written where the runtime data lives and the
 client displays the reported path. Agent account authentication,
@@ -178,9 +178,10 @@ travels the same way.
 
 Operations that genuinely belong to the machine in front of the user stay
 local and degrade with explicit messages instead of silently failing: the
-desktop's own self-update, remote-access connectivity/pairing setup, and
-reading a stored provider credential back into a form (a paired runtime never
-returns stored secrets, so the field opens empty and a typed value replaces
+desktop's own self-update, remote-access connectivity/pairing setup together
+with the paired-device management that shares its dialog, and reading a stored
+provider credential back into a form (a paired runtime never returns stored
+secrets, so the field opens empty and a typed value replaces
 it). Live updates arrive through the same `BackendEvent` pump mapped onto the
 desktop event pipeline.
 

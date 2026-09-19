@@ -8670,7 +8670,7 @@ impl VibexWorkbench {
                 let id = runtime.id.clone();
                 let is_active = active_id == id;
                 let state = self.runtime_state(RuntimeTarget::Remote(runtime.id.as_str()));
-                let meta = self.remote_runtime_meta(&runtime, is_active, state, cx);
+                let meta = self.remote_runtime_meta(&runtime, is_active, state);
                 let label = runtime.display_label();
                 let pending = switching.as_deref() == Some(id.as_str());
                 rows.push(self.render_runtime_row(
@@ -8921,7 +8921,7 @@ impl VibexWorkbench {
                 locale::text("Last connected", "最近连接", "最近連線"),
                 runtime
                     .last_connected_at_ms
-                    .map(|at| relative_time_label(at, cx))
+                    .map(relative_time_label)
                     .unwrap_or_else(|| locale::text("Never", "从未", "從未").to_string()),
                 cx,
             ));
@@ -9279,7 +9279,6 @@ impl VibexWorkbench {
         runtime: &RegisteredRuntime,
         is_active: bool,
         state: RuntimeStatePresentation,
-        cx: &App,
     ) -> String {
         let address = runtime.credential.record.server_url.clone();
         if is_active {
@@ -9298,7 +9297,7 @@ impl VibexWorkbench {
             Some(at) => format!(
                 "{address} · {} {}",
                 locale::text("last connected", "上次连接", "上次連線"),
-                relative_time_label(at, cx)
+                relative_time_label(at)
             ),
             None => format!(
                 "{address} · {}",
@@ -58400,7 +58399,7 @@ fn runtime_add_hint(text: &'static str, cx: &App) -> AnyElement {
 
 /// "3 minutes ago" without a formatting dependency: the panel only needs
 /// enough resolution to separate "just now" from a stale pairing.
-fn relative_time_label(at_ms: i64, _cx: &App) -> String {
+pub(crate) fn relative_time_label(at_ms: i64) -> String {
     let now = unix_timestamp_ms();
     let elapsed_seconds = ((now - at_ms) / 1_000).max(0);
     if elapsed_seconds < 60 {

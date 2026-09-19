@@ -101,7 +101,6 @@ pub struct ManagementContractProbe {
     pub provider_secret_redacted: bool,
     pub scheduled_facade_wired: bool,
     pub automation_facade_wired: bool,
-    pub relay_facade_wired: bool,
     pub recovery_facade_wired: bool,
 }
 
@@ -147,7 +146,6 @@ pub fn management_contract_probe() -> ManagementContractProbe {
         provider_secret_redacted,
         scheduled_facade_wired: true,
         automation_facade_wired: true,
-        relay_facade_wired: true,
         recovery_facade_wired: true,
     }
 }
@@ -311,7 +309,7 @@ mod tests {
     #[test]
     fn management_contract_covers_security_and_generation_boundaries() {
         let probe = management_contract_probe();
-        assert_eq!(probe.section_count, 10);
+        assert_eq!(probe.section_count, 9);
         assert!(probe.section_generation_fenced);
         assert!(probe.graph_cas_versioned);
         assert!(probe.static_pairing_urls_removed);
@@ -319,7 +317,6 @@ mod tests {
         assert!(probe.provider_secret_redacted);
         assert!(probe.scheduled_facade_wired);
         assert!(probe.automation_facade_wired);
-        assert!(probe.relay_facade_wired);
         assert!(probe.recovery_facade_wired);
     }
 }

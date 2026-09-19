@@ -75,7 +75,6 @@ use crate::assets::agent_brand_icon;
 use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
-use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::resize_seam;
 use crate::skeleton;
 use crate::terminal_surface::TerminalSurface;
@@ -360,15 +359,11 @@ struct ManagementSnapshot {
     capability_summaries: Vec<vibex_core::ProviderCapabilitySummary>,
     usage_summaries: Vec<vibex_core::ProviderUsageSummary>,
     native_exports: Vec<vibex_core::ProviderNativeExportRecordSummary>,
-    device_count: usize,
-    revoked_device_count: usize,
-    audit_count: usize,
     scheduled_runs: Vec<ScheduledTaskRun>,
     scheduled_attention: Vec<vibex_core::ScheduledTaskAttentionSummary>,
     scheduled_audit: Vec<vibex_core::ScheduledTaskAuditRecord>,
     automation_runs: Vec<AutomationRun>,
     automation_steps: Vec<AutomationRunStep>,
-    devices: Vec<vibex_core::RemoteDeviceDetail>,
 }
 
 #[derive(Clone)]
@@ -523,7 +518,6 @@ enum ManagementMutation {
     AutomationSave,
     AutomationCreate,
     ScheduledCreate,
-    RemoteRevoke(String),
     AutomationCancel(String),
     DiagnosticsExport,
     BackupCreate,
@@ -651,7 +645,6 @@ impl ManagementMutation {
             Self::AutomationSave => "automation:save".into(),
             Self::AutomationCreate => "automation:create".into(),
             Self::ScheduledCreate => "scheduled:create".into(),
-            Self::RemoteRevoke(id) => format!("remote:revoke:{id}"),
             Self::AutomationCancel(id) => format!("automation:cancel:{id}"),
             Self::DiagnosticsExport => "diagnostics:export".into(),
             Self::BackupCreate => "backup:create".into(),
@@ -781,15 +774,11 @@ pub struct ManagementCenter {
     pairing_workspace_id: Option<vibex_core::WorkspaceId>,
     diagnostics: RedactedDiagnosticProjection,
     recovery: RecoveryOperationState,
-    device_count: usize,
-    revoked_device_count: usize,
-    audit_count: usize,
     scheduled_runs: Vec<ScheduledTaskRun>,
     scheduled_attention: Vec<vibex_core::ScheduledTaskAttentionSummary>,
     scheduled_audit: Vec<vibex_core::ScheduledTaskAuditRecord>,
     automation_runs: Vec<AutomationRun>,
     automation_steps: Vec<AutomationRunStep>,
-    devices: Vec<vibex_core::RemoteDeviceDetail>,
     loading: bool,
     details_ready: bool,
     mutation: Option<ManagementMutation>,
@@ -1533,15 +1522,11 @@ impl ManagementCenter {
             pairing_workspace_id: None,
             diagnostics: RedactedDiagnosticProjection::default(),
             recovery: RecoveryOperationState::default(),
-            device_count: 0,
-            revoked_device_count: 0,
-            audit_count: 0,
             scheduled_runs: Vec::new(),
             scheduled_attention: Vec::new(),
             scheduled_audit: Vec::new(),
             automation_runs: Vec::new(),
             automation_steps: Vec::new(),
-            devices: Vec::new(),
             loading: false,
             details_ready: false,
             mutation: None,
@@ -3656,7 +3641,6 @@ impl ManagementCenter {
             ManagementSection::PromptsHooks
             | ManagementSection::Scheduled
             | ManagementSection::Automation
-            | ManagementSection::Relay
             | ManagementSection::Recovery => ManagementSection::Advanced,
             section => section,
         };
@@ -4035,15 +4019,11 @@ impl ManagementCenter {
         self.capability_summaries = snapshot.capability_summaries;
         self.usage_summaries = snapshot.usage_summaries;
         self.native_exports = snapshot.native_exports;
-        self.device_count = snapshot.device_count;
-        self.revoked_device_count = snapshot.revoked_device_count;
-        self.audit_count = snapshot.audit_count;
         self.scheduled_runs = snapshot.scheduled_runs;
         self.scheduled_attention = snapshot.scheduled_attention;
         self.scheduled_audit = snapshot.scheduled_audit;
         self.automation_runs = snapshot.automation_runs;
         self.automation_steps = snapshot.automation_steps;
-        self.devices = snapshot.devices;
         self.sync_projection_editor();
         self.load_agent_auth(false, cx);
         self.schedule_agent_install_refresh(cx);
@@ -9253,7 +9233,6 @@ impl ManagementCenter {
             ManagementSection::Advanced => self.render_advanced(window, cx),
             ManagementSection::Scheduled => self.render_scheduled(window, cx),
             ManagementSection::Automation => self.render_automation(cx),
-            ManagementSection::Relay => self.render_relay(window, cx),
             ManagementSection::Recovery => self.render_recovery(cx),
         }
     }
@@ -17048,218 +17027,6 @@ impl ManagementCenter {
         .into_any_element()
     }
 
-    fn render_relay(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let mut device_rows = v_flex().w_full().gap_1();
-        if self.devices.is_empty() {
-            device_rows = device_rows.child(compact_empty_state(
-                management_locale_text("No paired devices", "暂无配对设备", "暫無配對裝置"),
-                management_locale_text(
-                    "Paired devices will appear here with their permissions and status.",
-                    "设备配对后会在此显示权限与状态。",
-                    "裝置配對後會在此顯示權限與狀態。",
-                ),
-                cx,
-            ));
-        }
-        for device in self.devices.clone() {
-            let revoked = device.status == vibex_core::RemoteDeviceStatus::Revoked;
-            let detail = management_remote_device_detail(device.status, device.permission_level);
-            let revoke_id = device.device_id.as_str().to_string();
-            device_rows = device_rows.child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
-                    .px_3()
-                    .py_2()
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(div().text_sm().font_medium().child(device.display_name))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(detail),
-                            ),
-                    )
-                    .when(!revoked, |row| {
-                        row.child(
-                            Button::new(SharedString::from(format!("revoke-device-{revoke_id}")))
-                                .small()
-                                .danger()
-                                .label(management_locale_text("Revoke", "撤销", "撤銷"))
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_revoke_device(revoke_id.clone(), window, cx)
-                                })),
-                        )
-                    }),
-            );
-        }
-        section_layout(
-            management_locale_text(
-                "Remote access and devices",
-                "远程访问与设备",
-                "遠端存取與裝置",
-            ),
-            management_locale_text(
-                "Configure remote methods in one place, then manage trusted devices and audit",
-                "集中配置远程连接方式，并管理受信任设备及审计",
-                "集中配置遠端連線方式，並管理受信任裝置及稽核",
-            ),
-            cx,
-        )
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(cx.theme().border.opacity(0.70))
-                .px_3()
-                .py_3()
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .gap_1()
-                        .child(div().text_sm().font_medium().child(management_locale_text(
-                            "Remote access methods",
-                            "远程连接方式",
-                            "遠端連線方式",
-                        )))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "Tailscale Serve, self-managed Direct, and self-hosted Relay",
-                                    "Tailscale Serve、自管 Direct 与自建 Relay",
-                                    "Tailscale Serve、自管 Direct 與自建 Relay",
-                                )),
-                        ),
-                )
-                .child(
-                    Button::new("manage-remote-access")
-                        .primary()
-                        .icon(IconName::Network)
-                        .label(management_locale_text(
-                            "Manage remote access",
-                            "管理远程访问",
-                            "管理遠端存取",
-                        ))
-                        .disabled(self.runtime.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(runtime) = this.runtime.clone() {
-                                open_remote_access_pairing(runtime, window, cx);
-                            }
-                        })),
-                ),
-        )
-        .child(description_rows([
-            (
-                management_locale_text("Trusted devices", "受信任设备", "受信任裝置"),
-                self.device_count.to_string(),
-            ),
-            (
-                management_locale_text("Revoked devices", "已撤销设备", "已撤銷裝置"),
-                self.revoked_device_count.to_string(),
-            ),
-            (
-                management_locale_text("Audit records", "审计记录", "稽核記錄"),
-                self.audit_count.to_string(),
-            ),
-        ]))
-        .child(device_rows)
-        .into_any_element()
-    }
-
-    fn confirm_revoke_device(
-        &mut self,
-        device_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let entity = cx.weak_entity();
-        let active_locale = locale::current_locale();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let entity = entity.clone();
-            let device_id = device_id.clone();
-            dialog
-                .title(management_locale_text_for(
-                    active_locale,
-                    "Revoke remote device?",
-                    "撤销远程设备？",
-                    "撤銷遠端裝置？",
-                ))
-                .child(management_locale_text_for(
-                    active_locale,
-                    "The device will lose access immediately. This action is audited.",
-                    "该设备会立即失去访问权限，此操作将写入审计记录。",
-                    "該裝置會立即失去存取權限，此操作將寫入稽核記錄。",
-                ))
-                .footer(
-                    gpui_component::dialog::DialogFooter::new()
-                        .child(gpui_component::dialog::DialogClose::new().child(
-                            Button::new("cancel-device-revoke").outline().label(
-                                management_locale_text_for(active_locale, "Cancel", "取消", "取消"),
-                            ),
-                        ))
-                        .child(gpui_component::dialog::DialogAction::new().child(
-                            Button::new("confirm-device-revoke").danger().label(
-                                management_locale_text_for(active_locale, "Revoke", "撤销", "撤銷"),
-                            ),
-                        )),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        if let (Some(backend), Ok(id)) = (
-                            this.backend.clone(),
-                            vibex_core::DeviceId::parse(device_id.clone()),
-                        ) {
-                            this.begin_simple_task(
-                                ManagementMutation::RemoteRevoke(device_id.clone()),
-                                cx,
-                                async move {
-                                    backend
-                                        .device()
-                                        .revoke_device(MutationRequest::new(
-                                            vibex_core::RemoteRevokeDeviceRequest {
-                                                device_id: id,
-                                                reason: Some("revoked from GPUI management".into()),
-                                            },
-                                        ))
-                                        .await
-                                        .map_err(crate::app::remote_error_into_vibex)
-                                        .map(|_| {
-                                            management_locale_text_for(
-                                                active_locale,
-                                                "Remote device revoked",
-                                                "远程设备已撤销",
-                                                "遠端裝置已撤銷",
-                                            )
-                                            .to_string()
-                                        })
-                                },
-                            );
-                        }
-                    });
-                    true
-                })
-        });
-    }
-
     fn begin_backup_create(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -18022,7 +17789,6 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
         | ManagementSection::Advanced
         | ManagementSection::Scheduled
         | ManagementSection::Automation
-        | ManagementSection::Relay
         | ManagementSection::Recovery => ManagementSection::Advanced,
     }
 }
@@ -18452,7 +18218,6 @@ fn management_secondary_label(section: ManagementSection) -> &'static str {
         }
         ManagementSection::Scheduled => management_locale_text("Scheduled", "定时任务", "排程任務"),
         ManagementSection::Automation => management_locale_text("Automation", "自动化", "自動化"),
-        ManagementSection::Relay => management_locale_text("Relay", "中继与设备", "中繼與裝置"),
         ManagementSection::Recovery => {
             management_locale_text("Recovery", "诊断与恢复", "診斷與復原")
         }
@@ -20338,35 +20103,6 @@ fn management_operation_state_label(value: &str) -> String {
     label.to_string()
 }
 
-fn management_remote_device_detail(
-    status: vibex_core::RemoteDeviceStatus,
-    permission: vibex_core::RemoteDevicePermissionLevel,
-) -> String {
-    let status = match status {
-        vibex_core::RemoteDeviceStatus::Pending => {
-            management_locale_text("Pending", "待确认", "待確認")
-        }
-        vibex_core::RemoteDeviceStatus::Active => {
-            management_locale_text("Active", "已启用", "已啟用")
-        }
-        vibex_core::RemoteDeviceStatus::Revoked => {
-            management_locale_text("Revoked", "已撤销", "已撤銷")
-        }
-    };
-    let permission = match permission {
-        vibex_core::RemoteDevicePermissionLevel::ReadOnly => {
-            management_locale_text("Read only", "只读", "唯讀")
-        }
-        vibex_core::RemoteDevicePermissionLevel::ApproveOnly => {
-            management_locale_text("Approval only", "仅审批", "僅審批")
-        }
-        vibex_core::RemoteDevicePermissionLevel::FullControl => {
-            management_locale_text("Full control", "完全控制", "完全控制")
-        }
-    };
-    format!("{status} · {permission}")
-}
-
 fn management_model_count(count: usize) -> String {
     match locale::current_locale() {
         ResolvedLocale::En => format!("{count} model(s)"),
@@ -20661,12 +20397,6 @@ async fn load_snapshot(
     let graphs = bundle.automation_graphs;
     let automation_runs = bundle.automation_runs;
     let automation_steps = bundle.automation_steps;
-    let devices = bundle.devices;
-    let revoked_device_count = devices
-        .iter()
-        .filter(|device| device.status == vibex_core::RemoteDeviceStatus::Revoked)
-        .count();
-    let audit_count = bundle.audit_count;
     Ok(ManagementSnapshot {
         center: ProviderCenterSnapshot {
             agents,
@@ -20693,15 +20423,11 @@ async fn load_snapshot(
         capability_summaries,
         usage_summaries,
         native_exports,
-        device_count: devices.len().saturating_sub(revoked_device_count),
-        revoked_device_count,
-        audit_count,
         scheduled_runs,
         scheduled_attention,
         scheduled_audit,
         automation_runs,
         automation_steps,
-        devices,
     })
 }
 
@@ -21291,7 +21017,6 @@ mod tests {
             ManagementSection::Advanced,
             ManagementSection::Scheduled,
             ManagementSection::Automation,
-            ManagementSection::Relay,
             ManagementSection::Recovery,
         ] {
             assert_eq!(
@@ -21314,6 +21039,31 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Mcp"));
         assert!(renderer.contains("ManagementSection::Skills"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    /// Remote access and its paired devices live in the mobile pairing dialog
+    /// now, so the Config Center must not grow a second copy of them.
+    #[test]
+    fn config_center_no_longer_renders_remote_device_management() {
+        // The assertions below name the removed symbols, so they are checked
+        // against the production source only.
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
+        assert!(!production.contains("ManagementSection::Relay"));
+        assert!(!production.contains("Remote access and devices"));
+        assert!(!production.contains("revoke-device-"));
+        assert!(!production.contains("ManagementMutation::RemoteRevoke"));
+
+        let pairing = include_str!("remote_access_pairing.rs");
+        let pairing_production = pairing
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("pairing tests should remain inspectable");
+        assert!(pairing_production.contains("fn render_devices_page("));
+        assert!(pairing_production.contains("fn confirm_revoke_device("));
     }
 
     #[test]

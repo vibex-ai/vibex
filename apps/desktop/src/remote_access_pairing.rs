@@ -9,7 +9,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _, Theme,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
-    dialog::DialogButtonProps,
+    dialog::{DialogAction, DialogButtonProps, DialogClose, DialogFooter},
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -25,13 +25,15 @@ use qrcode::{Color as QrColor, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use vibex_core::{
-    RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel, RemoteLanPairingRequestState,
-    RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary, RemotePairingTransport, RequestId,
-    VibexError, VibexResult, unix_timestamp_ms,
+    DeviceId, RemoteAuditListRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
+    RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteLanPairingRequestState,
+    RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary, RemotePairingTransport,
+    RemoteRevokeDeviceRequest, RequestId, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_desktop_runtime::{
     DesktopRuntime, RemoteConnectivityController, RemoteConnectivityMethod,
-    RemoteConnectivitySnapshot, RemoteMethodState, RemoteRecoveryAction, normalize_https_origin,
+    RemoteConnectivitySnapshot, RemoteHandle, RemoteMethodState, RemoteRecoveryAction,
+    normalize_https_origin,
 };
 
 use crate::{locale, theme};
@@ -41,6 +43,9 @@ const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const QR_QUIET_ZONE_MODULES: usize = 4;
 const QR_MODULE_SCALE: usize = 2;
 const DIALOG_MAX_WIDTH: f32 = 760.0;
+/// The trust store clamps an audit read to this many records, so the count the
+/// dialog shows is a floor rather than a total once it is reached.
+const DEVICE_AUDIT_COUNT_LIMIT: u32 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessMutation {
@@ -71,6 +76,7 @@ enum RemoteAccessEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessPage {
     Setup,
+    Devices,
     Pairing,
 }
 
@@ -117,7 +123,10 @@ enum RemoteAccessAction {
     ApproveZeroConfigPairing(RequestId),
     RejectZeroConfigPairing(RequestId),
     ShowSetup,
+    ShowDevices,
     ShowPairing,
+    RefreshDevices,
+    RevokeDevice(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -332,6 +341,12 @@ struct PairingViewState {
     pending: Option<RemoteAccessMutation>,
     error_code: Option<String>,
     notice: Option<RemoteAccessNotice>,
+    devices: Vec<RemoteDeviceDetail>,
+    devices_loaded: bool,
+    devices_error: Option<String>,
+    audit_count: usize,
+    audit_count_capped: bool,
+    revoking_device: Option<String>,
 }
 
 /// One light hint the Remote Access page has to show.
@@ -387,6 +402,12 @@ impl Default for PairingViewState {
             pending: None,
             error_code: None,
             notice: None,
+            devices: Vec::new(),
+            devices_loaded: false,
+            devices_error: None,
+            audit_count: 0,
+            audit_count_capped: false,
+            revoking_device: None,
         }
     }
 }
@@ -403,6 +424,11 @@ impl PairingViewState {
 
     fn show_pairing(&mut self) {
         self.page = RemoteAccessPage::Pairing;
+        self.error_code = None;
+    }
+
+    fn show_devices(&mut self) {
+        self.page = RemoteAccessPage::Devices;
         self.error_code = None;
     }
 
@@ -540,10 +566,13 @@ struct OfferPollOutcome {
 
 pub(crate) struct RemoteAccessPairing {
     controller: RemoteConnectivityController,
+    remote: RemoteHandle,
     state: PairingViewState,
     direct_origin: Entity<InputState>,
     relay_origin: Entity<InputState>,
     refresh_task: Option<Task<()>>,
+    devices_task: Option<Task<()>>,
+    revoke_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     offer_poll_task: Option<Task<()>>,
     lan_poll_task: Option<Task<()>>,
@@ -591,10 +620,13 @@ impl RemoteAccessPairing {
         ];
         Self {
             controller: runtime.remote_connectivity(),
+            remote: runtime.management().remote(),
             state: PairingViewState::default(),
             direct_origin,
             relay_origin,
             refresh_task: None,
+            devices_task: None,
+            revoke_task: None,
             mutation_task: None,
             offer_poll_task: None,
             lan_poll_task: None,
@@ -614,6 +646,12 @@ impl RemoteAccessPairing {
                 self.state.show_pairing();
                 cx.notify();
             }
+            RemoteAccessAction::ShowDevices => {
+                self.state.show_devices();
+                cx.notify();
+            }
+            RemoteAccessAction::RefreshDevices => self.refresh_devices(cx),
+            RemoteAccessAction::RevokeDevice(device_id) => self.revoke_device(device_id, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
                 self.state.select_connection_entry(entry);
                 cx.notify();
@@ -651,6 +689,7 @@ impl RemoteAccessPairing {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_devices(cx);
         let controller = self.controller.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move { controller.snapshot().await });
         self.refresh_task = Some(cx.spawn(
@@ -669,6 +708,158 @@ impl RemoteAccessPairing {
                 });
             },
         ));
+    }
+
+    /// Reads the paired-device registry out of the runtime trust store.
+    ///
+    /// This dialog owns both halves of remote access, so the device list is
+    /// loaded by the same refresh that fetches connectivity and again whenever
+    /// a pairing or a revoke changes the registry.
+    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        let remote = self.remote.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let devices = remote.list_devices();
+            let audit_count = remote
+                .list_audit(RemoteAuditListRequest {
+                    device_id: None,
+                    limit: Some(DEVICE_AUDIT_COUNT_LIMIT),
+                })
+                .map(|records| records.len())
+                .unwrap_or_default();
+            (devices, audit_count)
+        });
+        self.devices_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.devices_task = None;
+                    match outcome {
+                        Ok((Ok(devices), audit_count)) => {
+                            this.state.devices = devices;
+                            this.state.audit_count = audit_count;
+                            this.state.audit_count_capped =
+                                audit_count >= DEVICE_AUDIT_COUNT_LIMIT as usize;
+                            this.state.devices_loaded = true;
+                            this.state.devices_error = None;
+                        }
+                        Ok((Err(error), _)) => this.state.devices_error = Some(error.code),
+                        Err(_) => {
+                            this.state.devices_error =
+                                Some("remote_device_list_task_failed".to_string())
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn revoke_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let Ok(device_id_value) = DeviceId::parse(device_id.clone()) else {
+            self.state.devices_error = Some("remote_device_id_invalid".to_string());
+            cx.notify();
+            return;
+        };
+        let remote = self.remote.clone();
+        self.state.revoking_device = Some(device_id);
+        self.state.error_code = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            remote.revoke_device(RemoteRevokeDeviceRequest {
+                device_id: device_id_value,
+                reason: Some("revoked from the mobile pairing dialog".to_string()),
+            })
+        });
+        self.revoke_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.revoke_task = None;
+                    this.state.revoking_device = None;
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
+                                "Device access revoked",
+                                "已撤销设备访问权限",
+                                "已撤銷裝置存取權限",
+                            )));
+                            this.refresh_devices(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.state.notice = Some(RemoteAccessNotice::error(locale::text(
+                                "The device could not be revoked",
+                                "撤销设备失败",
+                                "撤銷裝置失敗",
+                            )));
+                            this.state.devices_error = Some(error.code);
+                        }
+                        Err(_) => {
+                            this.state.devices_error =
+                                Some("remote_device_revoke_task_failed".to_string())
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn confirm_revoke_device(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let description = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!(
+                "\"{device_name}\" loses access immediately and is disconnected. This action is audited."
+            ),
+            locale::ResolvedLocale::ZhCn => {
+                format!("“{device_name}”将立即失去访问权限并断开连接。此操作会写入审计记录。")
+            }
+            locale::ResolvedLocale::ZhTw => {
+                format!("「{device_name}」將立即失去存取權限並中斷連線。此操作會寫入稽核記錄。")
+            }
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let device_id = device_id.clone();
+            let description = description.clone();
+            dialog
+                .title(locale::text(
+                    "Revoke device access?",
+                    "撤销设备访问权限？",
+                    "撤銷裝置存取權限？",
+                ))
+                .child(description)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-device-revoke")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-device-revoke")
+                                    .danger()
+                                    .label(locale::text("Revoke", "撤销", "撤銷")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.dispatch_action(
+                            RemoteAccessAction::RevokeDevice(device_id.clone()),
+                            cx,
+                        )
+                    });
+                    true
+                })
+        });
     }
 
     fn begin_mutation<F>(
@@ -1168,6 +1359,7 @@ impl RemoteAccessPairing {
                     }
                     if let Some((offer_id, method)) = claimed_entry {
                         this.record_claimed_entry(offer_id, method, cx);
+                        this.refresh_devices(cx);
                     }
                     if continue_polling {
                         this.schedule_offer_poll(cx);
@@ -1215,6 +1407,9 @@ impl RemoteAccessPairing {
                                     })
                                 });
                             this.clear_lan_window();
+                            if had_approved_request {
+                                this.refresh_devices(cx);
+                            }
                             this.state.notice = Some(if had_approved_request {
                                 RemoteAccessNotice::success(locale::text(
                                     "Device paired",
@@ -1283,6 +1478,9 @@ impl RemoteAccessPairing {
                                     },
                                 );
                             this.clear_zero_config_window();
+                            if had_approved_request {
+                                this.refresh_devices(cx);
+                            }
                             let controller = this.controller.clone();
                             gpui_tokio::Tokio::spawn(cx, async move {
                                 let _ = controller.cancel_zero_config_lan_pairing().await;
@@ -1623,6 +1821,245 @@ impl RemoteAccessPairing {
                         });
                     }),
             )
+            .into_any_element()
+    }
+
+    /// The dialog's two modes: pairing a new device, and managing the devices
+    /// that already hold a grant on this computer.
+    fn render_mode_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let paired = self
+            .state
+            .devices
+            .iter()
+            .filter(|device| device.status != RemoteDeviceStatus::Revoked)
+            .count();
+        let devices_label = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Paired devices ({paired})"),
+            locale::ResolvedLocale::ZhCn => format!("已配对设备 ({paired})"),
+            locale::ResolvedLocale::ZhTw => format!("已配對裝置 ({paired})"),
+        };
+        let selected_index = match self.state.page {
+            RemoteAccessPage::Devices => 1,
+            _ => 0,
+        };
+        TabBar::new("remote-access-mode")
+            .segmented()
+            .selected_index(selected_index)
+            .children([
+                Tab::new()
+                    .flex_1()
+                    .label(locale::text("Pair", "配对", "配對")),
+                Tab::new().flex_1().label(devices_label),
+            ])
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                let action = if *index == 1 {
+                    RemoteAccessAction::ShowDevices
+                } else {
+                    RemoteAccessAction::ShowSetup
+                };
+                this.dispatch_action(action, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_devices_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let paired = self
+            .state
+            .devices
+            .iter()
+            .filter(|device| device.status != RemoteDeviceStatus::Revoked)
+            .count();
+        let revoked = self.state.devices.len().saturating_sub(paired);
+        let summary = device_management_summary(
+            paired,
+            revoked,
+            self.state.audit_count,
+            self.state.audit_count_capped,
+        );
+        let refresh_entity = cx.weak_entity();
+        let pending = self.state.revoking_device.is_some();
+        let mut column = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary),
+                    )
+                    .child(
+                        Button::new("refresh-paired-devices")
+                            .small()
+                            .ghost()
+                            .compact()
+                            .size(px(28.0))
+                            .px_0()
+                            .tooltip(locale::text(
+                                "Refresh devices",
+                                "刷新设备",
+                                "重新整理裝置",
+                            ))
+                            .disabled(pending)
+                            .child(Icon::new(IconName::Redo2).size(px(15.0)))
+                            .on_click(move |_, _, cx| {
+                                let _ = refresh_entity.update(cx, |this, cx| {
+                                    this.dispatch_action(RemoteAccessAction::RefreshDevices, cx)
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "Devices listed here hold a grant on this computer. Revoking one disconnects it immediately.",
+                        "这里的设备已获得本机访问授权。撤销后该设备会立即断开连接。",
+                        "這裡的裝置已取得本機存取授權。撤銷後該裝置會立即中斷連線。",
+                    )),
+            );
+
+        if !self.state.devices_loaded && self.state.devices_error.is_none() {
+            column = column.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .py(px(32.0))
+                    .child(
+                        Spinner::new()
+                            .with_size(Size::Size(px(18.0)))
+                            .color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "Reading paired devices…",
+                                "正在读取已配对设备…",
+                                "正在讀取已配對裝置…",
+                            )),
+                    ),
+            );
+            return column.into_any_element();
+        }
+
+        if let Some(error) = self.state.devices_error.clone() {
+            column = column.child(self.render_status_banner(
+                IconName::TriangleAlert,
+                cx.theme().danger,
+                remote_error_label(&error),
+                cx,
+            ));
+        }
+        if self.state.devices.is_empty() {
+            if self.state.devices_error.is_none() {
+                column = column.child(device_list_empty_state(cx));
+            }
+            return column.into_any_element();
+        }
+
+        let mut rows = v_flex().w_full().gap_2();
+        for device in self.state.devices.clone() {
+            rows = rows.child(self.render_device_row(device, cx));
+        }
+        column.child(rows).into_any_element()
+    }
+
+    fn render_device_row(&self, device: RemoteDeviceDetail, cx: &mut Context<Self>) -> AnyElement {
+        let revoked = device.status == RemoteDeviceStatus::Revoked;
+        let pending = self.state.revoking_device.is_some();
+        let revoking = self.state.revoking_device.as_deref() == Some(device.device_id.as_str());
+        let status_color = device_status_color(device.status, cx);
+        let activity = device_activity_label(&device);
+        let detail = format!(
+            "{} · {}",
+            permission_label(device.permission_level),
+            activity
+        );
+        let device_id = device.device_id.as_str().to_string();
+        let device_name = device.display_name.clone();
+        let entity = cx.weak_entity();
+
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background.opacity(0.6))
+            .px_3()
+            .py_2()
+            .when(revoked, |row| row.opacity(0.62))
+            .child(icon_tile(IconName::CircleUser, px(32.0), px(18.0), cx))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(device.display_name.clone()),
+                            )
+                            .child(status_pill(
+                                device_status_label(device.status),
+                                status_color,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(detail),
+                    ),
+            )
+            .when(!revoked, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!("revoke-device-{device_id}")))
+                        .small()
+                        .danger()
+                        .label(locale::text("Revoke", "撤销", "撤銷"))
+                        .loading(revoking)
+                        .disabled(pending)
+                        .on_click(move |_, window, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.confirm_revoke_device(
+                                    device_id.clone(),
+                                    device_name.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                )
+            })
             .into_any_element()
     }
 
@@ -3112,6 +3549,7 @@ impl Render for RemoteAccessPairing {
                 }
                 column.into_any_element()
             }
+            RemoteAccessPage::Devices => self.render_devices_page(cx),
             RemoteAccessPage::Pairing => {
                 let back_entity = cx.weak_entity();
                 let mut column = v_flex().w_full().min_w_0().gap_3().child(
@@ -3163,6 +3601,9 @@ impl Render for RemoteAccessPairing {
             }
         };
 
+        let mode_tabs = matches!(page, RemoteAccessPage::Setup | RemoteAccessPage::Devices)
+            .then(|| self.render_mode_tabs(cx));
+
         v_flex()
             .id("remote-access-pairing")
             .w_full()
@@ -3174,6 +3615,7 @@ impl Render for RemoteAccessPairing {
             .pt_2()
             .pr_1()
             .pb_1()
+            .when_some(mode_tabs, |column, tabs| column.child(tabs))
             .child(page_content)
     }
 }
@@ -3589,6 +4031,102 @@ fn permission_description(permission: RemoteDevicePermissionLevel) -> &'static s
     }
 }
 
+fn device_status_label(status: RemoteDeviceStatus) -> &'static str {
+    match status {
+        RemoteDeviceStatus::Pending => locale::text("Pending", "待确认", "待確認"),
+        RemoteDeviceStatus::Active => locale::text("Active", "已启用", "已啟用"),
+        RemoteDeviceStatus::Revoked => locale::text("Revoked", "已撤销", "已撤銷"),
+    }
+}
+
+fn device_status_color(status: RemoteDeviceStatus, cx: &App) -> gpui::Hsla {
+    match status {
+        RemoteDeviceStatus::Pending => cx.theme().warning,
+        RemoteDeviceStatus::Active => cx.theme().success,
+        RemoteDeviceStatus::Revoked => cx.theme().muted_foreground,
+    }
+}
+
+/// The "when" half of a device row: last connection while the grant is live,
+/// revocation time once it is gone, and an explicit empty state before the
+/// device has ever connected.
+fn device_activity_label(device: &RemoteDeviceDetail) -> String {
+    match device.status {
+        RemoteDeviceStatus::Revoked => match device.revoked_at_ms {
+            Some(at) => format!(
+                "{} {}",
+                locale::text("revoked", "撤销于", "撤銷於"),
+                crate::app::relative_time_label(at)
+            ),
+            None => locale::text("access revoked", "已撤销访问", "已撤銷存取").to_string(),
+        },
+        RemoteDeviceStatus::Pending => {
+            locale::text("waiting for approval", "等待确认", "等待確認").to_string()
+        }
+        RemoteDeviceStatus::Active => match device.last_seen_at_ms {
+            Some(at) => format!(
+                "{} {}",
+                locale::text("last seen", "最后在线", "最後上線"),
+                crate::app::relative_time_label(at)
+            ),
+            None => locale::text("never connected", "尚未连接", "尚未連線").to_string(),
+        },
+    }
+}
+
+fn device_management_summary(
+    paired: usize,
+    revoked: usize,
+    audit_count: usize,
+    audit_count_capped: bool,
+) -> String {
+    let audit = if audit_count_capped {
+        format!("{audit_count}+")
+    } else {
+        audit_count.to_string()
+    };
+    match locale::current_locale() {
+        locale::ResolvedLocale::En => {
+            format!("{paired} paired · {revoked} revoked · {audit} audit records")
+        }
+        locale::ResolvedLocale::ZhCn => {
+            format!("{paired} 台已配对 · {revoked} 台已撤销 · {audit} 条审计记录")
+        }
+        locale::ResolvedLocale::ZhTw => {
+            format!("{paired} 台已配對 · {revoked} 台已撤銷 · {audit} 條稽核記錄")
+        }
+    }
+}
+
+fn device_list_empty_state(cx: &App) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap_1()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.72))
+        .bg(cx.theme().background.opacity(0.4))
+        .px_3()
+        .py_3()
+        .child(
+            div()
+                .text_sm()
+                .font_medium()
+                .child(locale::text("No paired devices", "暂无配对设备", "暫無配對裝置")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(locale::text(
+                    "Generate a pairing QR code under Pair, then scan it with the Vibex mobile app. The device appears here once it is paired.",
+                    "在「配对」中生成二维码，用 Vibex 移动应用扫描后，设备会显示在这里。",
+                    "在「配對」中產生 QR Code，用 Vibex 行動應用程式掃描後，裝置會顯示在這裡。",
+                )),
+        )
+        .into_any_element()
+}
+
 fn method_state_label(state: RemoteMethodState) -> &'static str {
     match state {
         RemoteMethodState::Disabled => locale::text("Off", "未启用", "未啟用"),
@@ -3678,6 +4216,19 @@ fn remote_error_label(code: &str) -> &'static str {
             "The pairing QR could not be generated",
             "无法生成配对二维码",
             "無法產生配對 QR Code",
+        ),
+        "remote_device_list_failed" | "remote_device_list_task_failed" => locale::text(
+            "The paired-device list could not be read",
+            "无法读取已配对设备列表",
+            "無法讀取已配對裝置清單",
+        ),
+        "remote_device_revoke_failed"
+        | "remote_device_revoke_task_failed"
+        | "remote_device_unknown"
+        | "remote_device_id_invalid" => locale::text(
+            "The device could not be revoked. Refresh the list and try again",
+            "无法撤销该设备，请刷新列表后重试",
+            "無法撤銷該裝置，請重新整理清單後再試",
         ),
         _ => locale::text(
             "Remote access action failed",
@@ -4137,5 +4688,100 @@ mod tests {
             i32::try_from(expected_size).unwrap()
         );
         assert_eq!(private.qr_size_px as usize % QR_MODULE_SCALE, 0);
+    }
+
+    fn device_detail(
+        status: RemoteDeviceStatus,
+        last_seen_at_ms: Option<i64>,
+        revoked_at_ms: Option<i64>,
+    ) -> RemoteDeviceDetail {
+        RemoteDeviceDetail {
+            device_id: DeviceId::parse("device_0123456789abcdef0123456789abcdef").unwrap(),
+            display_name: "Pixel 8".to_string(),
+            public_key: None,
+            grant_revision: 1,
+            permission_level: RemoteDevicePermissionLevel::FullControl,
+            status,
+            paired_at_ms: Some(1),
+            last_seen_at_ms,
+            revoked_at_ms,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn device_activity_prefers_last_seen_and_revocation_over_a_bare_status() {
+        let now = unix_timestamp_ms();
+        let active = device_detail(RemoteDeviceStatus::Active, Some(now - 120_000), None);
+        assert!(device_activity_label(&active).contains(locale::text(
+            "last seen",
+            "最后在线",
+            "最後上線"
+        )));
+
+        let never_connected = device_detail(RemoteDeviceStatus::Active, None, None);
+        assert_eq!(
+            device_activity_label(&never_connected),
+            locale::text("never connected", "尚未连接", "尚未連線")
+        );
+
+        let revoked = device_detail(
+            RemoteDeviceStatus::Revoked,
+            Some(now - 300_000),
+            Some(now - 60_000),
+        );
+        assert!(device_activity_label(&revoked).contains(locale::text(
+            "revoked",
+            "撤销于",
+            "撤銷於"
+        )));
+
+        let revoked_without_time = device_detail(RemoteDeviceStatus::Revoked, None, None);
+        assert_eq!(
+            device_activity_label(&revoked_without_time),
+            locale::text("access revoked", "已撤销访问", "已撤銷存取")
+        );
+    }
+
+    #[test]
+    fn device_summary_marks_a_capped_audit_total() {
+        let summary = device_management_summary(3, 1, 12, false);
+        assert!(summary.contains('3'));
+        assert!(summary.contains("12"));
+        assert!(!summary.contains('+'));
+        assert_eq!(summary.matches('·').count(), 2);
+
+        let capped = device_management_summary(3, 1, DEVICE_AUDIT_COUNT_LIMIT as usize, true);
+        assert!(capped.contains("500+"));
+    }
+
+    #[test]
+    fn pairing_dialog_renders_device_management_beside_pairing() {
+        let source = include_str!("remote_access_pairing.rs");
+        let devices_page = source
+            .split_once("    fn render_devices_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_device_row("))
+            .map(|(body, _)| body)
+            .expect("device page should remain inspectable");
+        assert!(devices_page.contains("RemoteAccessAction::RefreshDevices"));
+        assert!(devices_page.contains("device_list_empty_state(cx)"));
+
+        let device_row = source
+            .split_once("    fn render_device_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connection_list("))
+            .map(|(body, _)| body)
+            .expect("device row should remain inspectable");
+        assert!(device_row.contains("confirm_revoke_device("));
+        assert!(device_row.contains(".danger()"));
+        assert!(device_row.contains("revoke-device-"));
+
+        let renderer = source
+            .split_once("impl Render for RemoteAccessPairing {")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("pairing renderer should remain inspectable");
+        assert!(renderer.contains("RemoteAccessPage::Devices => self.render_devices_page(cx)"));
+        assert!(renderer.contains("self.render_mode_tabs(cx)"));
     }
 }
