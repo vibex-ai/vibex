@@ -35466,9 +35466,6 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let locale = self.resolved_locale();
-        let active_index = self
-            .turn_preview_active_index
-            .filter(|index| *index < turns.len());
         let reduced_motion = self.ui_state.appearance.reduced_motion;
         let foreground = cx.theme().foreground;
         let muted_foreground = cx.theme().muted_foreground;
@@ -35493,18 +35490,24 @@ impl VibexWorkbench {
 
         // The rail only mounts its list while hovered, so building a preview card
         // per turn on every frame would scale the frame cost with conversation
-        // length for something that is not on screen.
-        let rail_turns: &[Rc<TimelineConversationTurn>] = if self.turn_preview_rail_visible {
-            turns
+        // length for something that is not on screen. Continuation turns never
+        // open a slot: the rail numbers only the user turns that own them.
+        let rail_entries = if self.turn_preview_rail_visible {
+            agent_turn_preview_rail_entries(turns)
         } else {
-            &[]
+            Vec::new()
         };
-        let items = rail_turns
+        let rail_turn_count = rail_entries.len();
+        let active_index = self
+            .turn_preview_active_index
+            .filter(|index| *index < rail_turn_count);
+        let items = rail_entries
             .iter()
             .enumerate()
-            .map(|(preview_index, turn)| {
-                let turn_number = preview_index + 1;
-                let row_index = preview_index;
+            .map(|(preview_index, entry)| {
+                let turn_number = entry.turn_number;
+                let row_index = entry.turn_index;
+                let turn = &turns[row_index];
                 let label = format!("#{turn_number}");
                 let title = agent_turn_preview_title(turn, &label);
                 let aria_label = match locale {
@@ -35653,8 +35656,8 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .justify_start()
-                    .when(turns.len() == 1, |this| this.h(px(32.0)).flex_none())
-                    .when(turns.len() > 1, |this| {
+                    .when(rail_turn_count == 1, |this| this.h(px(32.0)).flex_none())
+                    .when(rail_turn_count > 1, |this| {
                         this.flex_1()
                             .min_h_0()
                             .max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))
@@ -35788,8 +35791,11 @@ impl VibexWorkbench {
         self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
-        let turn_preview_rail = (self.ui_state.session.turn_preview_rail && !turns.is_empty())
-            .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
+        let turn_preview_rail = (self.ui_state.session.turn_preview_rail
+            && turns
+                .iter()
+                .any(|turn| agent_turn_preview_rail_numbers_turn(turn)))
+        .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
         let timeline_layout_entity = cx.weak_entity();
         let timeline_surface = div()
             .relative()
@@ -46304,6 +46310,46 @@ fn agent_turn_preview_file_name(path: &str) -> &str {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(path)
+}
+
+/// Whether a conversation turn owns a numbered slot in the session preview
+/// rail.
+///
+/// Only turns the user started are numbered. A continuation turn — auto-continue
+/// or an explicit continue after a failed turn — carries no user message: it is
+/// an internal retry of the user turn that triggered it, so the rail folds it
+/// into that turn instead of counting it as a round of its own.
+fn agent_turn_preview_rail_numbers_turn(turn: &TimelineConversationTurn) -> bool {
+    turn.user_row.is_some()
+}
+
+/// One slot of the session preview rail: the conversation turn to scroll to and
+/// the number the rail shows for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTurnPreviewRailEntry {
+    /// Index of the turn inside the rendered conversation, which is also its
+    /// virtual-list row. It survives the numbering filter so activating an entry
+    /// still scrolls to the turn it previews.
+    turn_index: usize,
+    /// One-based number shown in the rail, counted over user turns only.
+    turn_number: usize,
+}
+
+fn agent_turn_preview_rail_entries(
+    turns: &[Rc<TimelineConversationTurn>],
+) -> Vec<AgentTurnPreviewRailEntry> {
+    turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| agent_turn_preview_rail_numbers_turn(turn))
+        .enumerate()
+        .map(
+            |(number_index, (turn_index, _))| AgentTurnPreviewRailEntry {
+                turn_index,
+                turn_number: number_index + 1,
+            },
+        )
+        .collect()
 }
 
 /// Publication time of a signed release, or `None` when the manifest carried a
@@ -70233,12 +70279,90 @@ mod tests {
         assert!(renderer.contains("AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT"));
         assert!(renderer.contains("format!(\"+{remaining_file_count}\")"));
         assert!(renderer.contains("if self.turn_preview_rail_visible"));
-        assert!(renderer.contains("let items = rail_turns"));
+        assert!(renderer.contains("let items = rail_entries"));
         assert!(renderer.contains(".max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))"));
         assert!(renderer.contains(".justify_center()"));
         assert!(renderer.contains(".gap_0()"));
         assert!(!renderer.contains("AGENT_TURN_PREVIEW_COMPACT_MAX_TURNS"));
         assert!(!renderer.contains("format_timeline_hover_time(turn.started_at_ms"));
+    }
+
+    /// A continuation turn has the shape auto-continue produces: response items
+    /// only, no user row.
+    fn rail_preview_turn(id: &str, has_user_row: bool) -> Rc<TimelineConversationTurn> {
+        let user_row = has_user_row.then(|| TimelineRow {
+            id: format!("{id}:user"),
+            kind: TimelineRowKind::UserMessage,
+            item_ids: vec![format!("{id}:user")],
+            turn_id: Some(id.to_string()),
+            turn_item_count: 1,
+            turn_failed: false,
+            turn_pending_permission: false,
+            conclusion: false,
+            first_sequence: 1,
+            last_sequence: 1,
+            title: "prompt".into(),
+            body: "prompt".into(),
+            streaming: false,
+            collapsible: false,
+            pending_permission: false,
+            failed: false,
+            runtime_attribution: None,
+            file_path: None,
+        });
+        Rc::new(TimelineConversationTurn {
+            id: id.to_string(),
+            user_row,
+            process_rows: Vec::new(),
+            process_activity_groups: Vec::new(),
+            process_activity_groups_with_commands: Vec::new(),
+            process_activity_groups_with_file_operations: Vec::new(),
+            process_activity_groups_with_commands_and_file_operations: Vec::new(),
+            live_status: None,
+            conclusion_row: None,
+            runtime_attribution: None,
+            complete: true,
+            superseded: false,
+            failed: false,
+            pending_permission: false,
+            item_count: 1,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+        })
+    }
+
+    #[test]
+    fn turn_preview_rail_numbers_only_user_turns() {
+        let turns = vec![
+            rail_preview_turn("turn:user-1", true),
+            rail_preview_turn("turn:continuation:1", false),
+            rail_preview_turn("turn:continuation:2", false),
+            rail_preview_turn("turn:user-2", true),
+            rail_preview_turn("turn:continuation:3", false),
+        ];
+
+        assert_eq!(
+            agent_turn_preview_rail_entries(&turns),
+            vec![
+                AgentTurnPreviewRailEntry {
+                    turn_index: 0,
+                    turn_number: 1,
+                },
+                AgentTurnPreviewRailEntry {
+                    turn_index: 3,
+                    turn_number: 2,
+                },
+            ]
+        );
+        assert!(agent_turn_preview_rail_numbers_turn(&turns[0]));
+        assert!(!agent_turn_preview_rail_numbers_turn(&turns[1]));
+        // A conversation of continuation turns only — the pending auto-continue
+        // turn, or a session continued from an empty transcript — has nothing to
+        // number, so the workbench must not mount the rail.
+        assert!(
+            agent_turn_preview_rail_entries(&[rail_preview_turn("turn:continuation:only", false)])
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1226,9 +1226,13 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   and workspace-resource budget. The full selected-session timeline remains
   authoritative; only the compact preview is truncated and bounded.
 - A compact Turn preview rail may derive one button per stable `turnId` from the
-  visible row projection. Activating a preview only scrolls the virtual list to
-  that row and marks the reader away from the bottom; it must not mutate timeline
-  items, turn grouping, or authoritative cursor state.
+  visible row projection. Only turns anchored by a user message are numbered: a
+  continuation turn — auto-continue, or an explicit continue after a failed turn
+  — carries no user message and belongs to the user turn that triggered it, so
+  the rail folds it into that turn instead of giving it a slot and a number of
+  its own. Activating a preview only scrolls the virtual list to that row and
+  marks the reader away from the bottom; it must not mutate timeline items, turn
+  grouping, or authoritative cursor state.
 - Session-row rename/delete controls capture the target `VibexSessionId` before
   opening their dialog and call the typed manager mutation for that id. They must
   not silently retarget the currently selected session; successful non-selected
