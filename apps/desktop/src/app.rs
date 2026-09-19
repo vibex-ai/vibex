@@ -608,6 +608,13 @@ const SETTINGS_SEARCH_RESULT_LIMIT: usize = 32;
 const SETTINGS_SEARCH_RESULT_MAX_HEIGHT: f32 = 480.0;
 const SETTINGS_DIALOG_MAX_WIDTH: f32 = 1160.0;
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 900.0;
+const SETTINGS_DIALOG_RADIUS: f32 = 12.0;
+/// GPUI clips children to a square, so the dialog's rounded outline never trims
+/// the content's own background. The full-bleed settings surfaces therefore
+/// round their outer corners themselves. The dialog paints its 1px border
+/// inside its bounds, which puts the content box one pixel in; shrinking the
+/// radius by the same amount keeps the two outlines concentric.
+const SETTINGS_DIALOG_CONTENT_RADIUS: f32 = SETTINGS_DIALOG_RADIUS - 1.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoContinueCountdown {
@@ -27492,7 +27499,7 @@ impl VibexWorkbench {
                 .h(px(dialog_height))
                 .margin_top(px(dialog_margin_top))
                 .p_0()
-                .rounded(px(12.0))
+                .rounded(px(SETTINGS_DIALOG_RADIUS))
                 .bg(popover)
                 .text_color(popover_foreground)
                 .border_color(popover_foreground.opacity(0.16))
@@ -54242,6 +54249,8 @@ impl FoundationSettings {
             .border_r_1()
             .border_color(border.opacity(0.72))
             .bg(theme::semantic_color("sidebar", is_dark))
+            .rounded_tl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+            .rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
             .child(search)
             .when_some(search_results, |this, results| this.child(results))
             .when(!has_search_results, |this| this.child(navigation_groups))
@@ -56418,6 +56427,17 @@ impl Render for FoundationSettings {
                     .flex_1()
                     .track_scroll(&self.settings_render_context.scroll)
                     .bg(theme::semantic_color("background", cx.theme().is_dark()))
+                    // The page viewport owns the dialog's right (or bottom)
+                    // corners, so it rounds them instead of painting over the
+                    // dialog's outline.
+                    .when(vertical_tabs, |this| {
+                        this.rounded_tr(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                            .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                    })
+                    .when(!vertical_tabs, |this| {
+                        this.rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                            .rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))
+                    })
                     .overflow_y_scroll()
                     .child(page),
             )
@@ -57095,7 +57115,6 @@ fn settings_page(
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
-    let background = theme::semantic_color("background", is_dark);
     let foreground = theme::semantic_color("foreground", is_dark);
     let border = theme::semantic_color("border", is_dark);
     let card = theme::semantic_color("card", is_dark);
@@ -57107,7 +57126,9 @@ fn settings_page(
         .min_w_0()
         .overflow_hidden()
         .gap_5()
-        .bg(background)
+        // No page background: the scroll viewport behind it paints the surface
+        // and rounds the dialog's corners, and a square page fill would cover
+        // those corners again while the page is scrolled.
         .text_color(foreground)
         .px(px(70.0))
         .py_8()
@@ -68626,6 +68647,7 @@ mod tests {
         assert!(open_settings.contains(".content(move |content, _, _|"));
         assert!(open_settings.contains(".min_h_0()"));
         assert!(open_settings.contains(".child(settings_for_content.clone())"));
+        assert!(open_settings.contains(".rounded(px(SETTINGS_DIALOG_RADIUS))"));
         assert!(!open_settings.contains("\n                .child(settings.clone())"));
 
         let settings = source
@@ -68646,6 +68668,11 @@ mod tests {
         assert!(!page_viewport.contains(".on_scroll_wheel(|_, _, cx| cx.stop_propagation()"));
         assert!(!page_viewport.contains(".overflow_y_scrollbar()"));
         assert!(page_viewport.contains(".track_scroll(&self.settings_render_context.scroll)"));
+        // GPUI only clips children to a square, so every settings surface that
+        // reaches the dialog's outline has to round those corners itself.
+        assert!(page_viewport.contains(".rounded_tr(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
+        assert!(page_viewport.contains(".rounded_br(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
+        assert!(page_viewport.contains(".rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
         let settings_root = &settings[..page_scroll];
         assert!(settings_root.contains(".id(\"foundation-settings\")"));
         assert!(settings_root.contains(".overflow_hidden()"));
@@ -68657,6 +68684,15 @@ mod tests {
             .expect("settings navigation should remain inspectable");
         assert!(navigation.contains(".overflow_hidden()"));
         assert!(!navigation.contains(".overflow_y_scrollbar()"));
+        assert!(navigation.contains(".rounded_tl(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
+        assert!(navigation.contains(".rounded_bl(px(SETTINGS_DIALOG_CONTENT_RADIUS))"));
+
+        let page = source
+            .split_once("fn settings_page(")
+            .and_then(|(_, tail)| tail.split_once("\nfn settings_row_anchor("))
+            .map(|(body, _)| body)
+            .expect("settings page surface should remain inspectable");
+        assert!(!page.contains(".bg(background)"));
     }
 
     #[test]
