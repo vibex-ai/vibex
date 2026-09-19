@@ -41028,42 +41028,17 @@ impl VibexWorkbench {
                 cx,
             )
         };
-        // A `/goal` prompt is an ordinary message with a badge: the bubble
-        // carries a goal icon inside the bubble, and the mark is an icon-only
-        // ghost button whose library tooltip explains what the message did.
+        // A `/goal` prompt is an ordinary message with a badge. The badge and
+        // the delivery mark share the bubble's lower-edge reaction region, so
+        // the body keeps the full content width and wrapped lines stay aligned.
+        // Edit mode swaps the bubble for the inline editor, which carries
+        // neither mark.
         let goal_message = parse_slash_command_invocation(&row.body)
             .is_some_and(|(name, _)| name.eq_ignore_ascii_case("goal"));
-        let inline_content = if goal_message && !editing {
-            let label = SharedString::from(locale::text("Goal message", "目标消息", "目標訊息"));
-            h_flex()
-                .min_w_0()
-                .items_start()
-                .gap_2()
-                .child(
-                    Button::new(SharedString::from(format!("goal-message-badge:{}", row.id)))
-                        .ghost()
-                        .xsmall()
-                        .compact()
-                        .size(px(18.0))
-                        .icon(
-                            Icon::new(IconName::Map)
-                                .size(px(13.0))
-                                .text_color(cx.theme().primary),
-                        )
-                        .accessibility_label(label.clone())
-                        .tooltip(label),
-                )
-                .child(div().min_w_0().flex_1().child(inline_content))
-                .into_any_element()
-        } else {
-            inline_content
-        };
-        // The delivery mark rides the bubble's lower edge. Edit mode swaps the
-        // bubble for the inline editor, which carries no delivery marker.
-        let delivery_reactions = if editing {
+        let edge_reactions = if editing {
             None
         } else {
-            render_user_message_delivery_marker(&row.id, delivery, cx)
+            render_user_message_edge_reactions(&row.id, delivery, goal_message, cx)
         };
         let hover_group: SharedString = format!("timeline-user-{}", row.id).into();
         let edit_text = row.body.clone();
@@ -41097,7 +41072,7 @@ impl VibexWorkbench {
                     .gap_1()
                     .child(render_user_message_bubble(
                         inline_content,
-                        delivery_reactions,
+                        edge_reactions,
                         cx.theme().muted,
                         cx.theme().foreground,
                         editing,
@@ -59676,18 +59651,18 @@ fn user_message_inline_document(
     (Arc::new(document), Arc::new(attachment_actions))
 }
 
-/// The edge mark a user message wears when a queued action delivered it.
+/// The mark a user message wears when a queued action delivered it.
 ///
-/// The mark is the library's bubble reaction region: an icon-only ghost button
-/// anchored to the bubble's lower edge, carrying the delivery accent itself —
-/// steer is green, an interrupted resend is yellow — so the two deliveries stay
-/// distinguishable by glyph and by hue without tinting the bubble edge. The
-/// delivery label is the button's tooltip and its accessibility name.
-fn render_user_message_delivery_marker(
+/// The mark is an icon-only ghost button that rides the bubble's lower edge,
+/// carrying the delivery accent itself — steer is green, an interrupted resend
+/// is yellow — so the two deliveries stay distinguishable by glyph and by hue
+/// without tinting the bubble edge. The delivery label is the button's tooltip
+/// and its accessibility name.
+fn render_user_message_delivery_button(
     row_id: &str,
     delivery: UserMessageDelivery,
     cx: &App,
-) -> Option<BubbleReactions> {
+) -> Option<Button> {
     let (icon_path, label, accent) = match delivery {
         UserMessageDelivery::Steer => (
             "icons/vibex/corner-down-right.svg",
@@ -59711,31 +59686,68 @@ fn render_user_message_delivery_marker(
     };
     let label = SharedString::from(label);
     Some(
-        BubbleReactions::new().action(
-            Button::new(SharedString::from(format!(
-                "user-message-delivery:{row_id}"
-            )))
-            .ghost()
-            .xsmall()
-            // The accent belongs to the glyph, not to the button's text style, so
-            // hovering the pill cannot wash the delivery hue out.
-            .icon(Icon::default().path(icon_path).text_color(accent))
-            .accessibility_label(label.clone())
-            .tooltip(label),
-        ),
+        Button::new(SharedString::from(format!(
+            "user-message-delivery:{row_id}"
+        )))
+        .ghost()
+        .xsmall()
+        // The accent belongs to the glyph, not to the button's text style, so
+        // hovering the pill cannot wash the delivery hue out.
+        .icon(Icon::default().path(icon_path).text_color(accent))
+        .accessibility_label(label.clone())
+        .tooltip(label),
     )
 }
 
-/// The strip an edge-anchored delivery reaction hangs into below the bubble.
+/// The mark a `/goal` user message wears on the same edge as a delivery.
+///
+/// A goal prompt is an ordinary message, so it is marked the way deliveries
+/// are: an icon-only ghost button in the bubble's lower-edge reaction region
+/// whose library tooltip says what the message did, never a glyph wedged into
+/// the first line of the bubble body.
+fn render_user_message_goal_button(row_id: &str, cx: &App) -> Button {
+    let label = SharedString::from(locale::text("Goal message", "目标消息", "目標訊息"));
+    Button::new(SharedString::from(format!("goal-message-badge:{row_id}")))
+        .ghost()
+        .xsmall()
+        .icon(Icon::new(IconName::Map).text_color(cx.theme().primary))
+        .accessibility_label(label.clone())
+        .tooltip(label)
+}
+
+/// The bubble's lower-edge reaction region, holding every mark the row earned.
+///
+/// Both marks share one pill: the goal badge sits inboard of the delivery
+/// accent so the delivery hue keeps the corner it has always held.
+fn render_user_message_edge_reactions(
+    row_id: &str,
+    delivery: UserMessageDelivery,
+    is_goal_message: bool,
+    cx: &App,
+) -> Option<BubbleReactions> {
+    let mut reactions = BubbleReactions::new();
+    let mut has_mark = false;
+    if is_goal_message {
+        reactions = reactions.action(render_user_message_goal_button(row_id, cx));
+        has_mark = true;
+    }
+    if let Some(delivery) = render_user_message_delivery_button(row_id, delivery, cx) {
+        reactions = reactions.action(delivery);
+        has_mark = true;
+    }
+    has_mark.then_some(reactions)
+}
+
+/// The strip an edge-anchored reaction hangs into below the bubble.
 ///
 /// `BubbleReactions` anchors itself a fixed `1.25rem` below the bubble's bottom
 /// edge. Reserving the same strip under the bubble keeps the pill clear of the
 /// row's hover action line instead of overlapping it.
-const USER_MESSAGE_DELIVERY_REACTION_HANG: f32 = 20.0;
+const USER_MESSAGE_EDGE_REACTION_HANG: f32 = 20.0;
 
 fn render_user_message_bubble(
     body: AnyElement,
-    delivery_reactions: Option<BubbleReactions>,
+    edge_reactions: Option<BubbleReactions>,
     background: gpui::Hsla,
     foreground: gpui::Hsla,
     fill_width: bool,
@@ -59755,8 +59767,8 @@ fn render_user_message_bubble(
         .flex_shrink(1.0)
         .max_w_full()
         .when(fill_width, |this| this.w_full())
-        .when_some(delivery_reactions, |this, reactions| {
-            this.mb(px(USER_MESSAGE_DELIVERY_REACTION_HANG))
+        .when_some(edge_reactions, |this, reactions| {
+            this.mb(px(USER_MESSAGE_EDGE_REACTION_HANG))
                 .reactions(reactions)
         })
         .content(
@@ -68014,7 +68026,11 @@ mod tests {
         assert!(goal_editor.contains("GoalAction::Set"));
         assert!(goal_editor.contains("GoalAction::Edit"));
         assert!(goal_editor.contains("control_session_goal(action, Some(objective), cx)"));
+        // A `/goal` prompt wears its badge on the bubble's lower edge, in the
+        // same reaction region as a queued delivery — never inline in the body.
+        assert!(source.contains("render_user_message_goal_button"));
         assert!(source.contains("goal-message-badge:"));
+        assert!(source.contains("render_user_message_edge_reactions"));
         // The goal row is the last row of the queued-message surface, so the
         // two extension bars share one silhouette.
         assert!(source.contains(
@@ -73604,21 +73620,26 @@ mod tests {
             let measured_marker_center = self.measured_marker_center.clone();
             let measured_body = self.measured_body.clone();
             let measured_next_row_top = self.measured_next_row_top.clone();
-            let marker =
-                render_user_message_delivery_marker("delivery-probe", self.delivery.get(), cx).map(
-                    |reactions| {
-                        // The pill centers its children, so a tiny child reports the
-                        // pill's own vertical center: where the mark actually paints.
-                        reactions.child(div().w(px(1.0)).h(px(1.0)).on_prepaint(
-                            move |bounds, _, _| {
-                                measured_marker_center.set(
-                                    f32::from(bounds.origin.y)
-                                        + f32::from(bounds.size.height) / 2.0,
-                                );
-                            },
-                        ))
-                    },
-                );
+            let marker = render_user_message_edge_reactions(
+                "delivery-probe",
+                self.delivery.get(),
+                false,
+                cx,
+            )
+            .map(|reactions| {
+                // The pill centers its children, so a tiny child reports the
+                // pill's own vertical center: where the mark actually paints.
+                reactions.child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .on_prepaint(move |bounds, _, _| {
+                            measured_marker_center.set(
+                                f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0,
+                            );
+                        }),
+                )
+            });
             let body = div()
                 .on_prepaint(move |bounds, _, _| {
                     measured_body.set((
@@ -73650,6 +73671,145 @@ mod tests {
                         measured_next_row_top.set(f32::from(bounds.origin.y));
                     }),
                 )
+        }
+    }
+
+    struct UserMessageGoalBadgeProbe {
+        is_goal_message: Rc<Cell<bool>>,
+        /// Vertical center of the reaction pill's content.
+        measured_mark_center: Rc<Cell<f32>>,
+        /// Left and right edge of the reaction pill's content.
+        measured_mark_span: Rc<Cell<(f32, f32)>>,
+        /// Left edge, top edge, and height of the message text.
+        measured_body: Rc<Cell<(f32, f32, f32)>>,
+        /// Left and right edge of the bubble's visible surface.
+        measured_surface_span: Rc<Cell<(f32, f32)>>,
+    }
+
+    impl Render for UserMessageGoalBadgeProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let measured_mark_center = self.measured_mark_center.clone();
+            let measured_mark_span = self.measured_mark_span.clone();
+            let measured_body = self.measured_body.clone();
+            let measured_surface_span = self.measured_surface_span.clone();
+            let reactions = render_user_message_edge_reactions(
+                "goal-badge-probe",
+                UserMessageDelivery::Prompt,
+                self.is_goal_message.get(),
+                cx,
+            )
+            .map(|reactions| {
+                reactions.child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .on_prepaint(move |bounds, _, _| {
+                            measured_mark_center.set(
+                                f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0,
+                            );
+                            measured_mark_span.set((
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.origin.x) + f32::from(bounds.size.width),
+                            ));
+                        }),
+                )
+            });
+            let body = div()
+                .on_prepaint(move |bounds, _, _| {
+                    measured_body.set((
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.height),
+                    ));
+                })
+                .child(render_user_message_text_segment(
+                    "user-message-goal-probe",
+                    "/goal hi".to_string(),
+                    None,
+                ));
+            v_flex().w(px(320.0)).items_end().gap_1().child(
+                render_user_message_bubble(
+                    body.into_any_element(),
+                    reactions,
+                    theme::semantic_color("muted", true),
+                    theme::semantic_color("foreground", true),
+                    false,
+                )
+                .on_prepaint(move |bounds, _, _| {
+                    measured_surface_span.set((
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.x) + f32::from(bounds.size.width),
+                    ));
+                }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn goal_badge_rides_the_bubble_edge_instead_of_the_first_line(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let is_goal_message = Rc::new(Cell::new(false));
+        let mark_center = Rc::new(Cell::new(0.0));
+        let mark_span = Rc::new(Cell::new((0.0, 0.0)));
+        let body = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+        let surface_span = Rc::new(Cell::new((0.0, 0.0)));
+        let (_, cx) = cx.add_window_view(|_, _| UserMessageGoalBadgeProbe {
+            is_goal_message: is_goal_message.clone(),
+            measured_mark_center: mark_center.clone(),
+            measured_mark_span: mark_span.clone(),
+            measured_body: body.clone(),
+            measured_surface_span: surface_span.clone(),
+        });
+
+        let mut ordinary_left = 0.0;
+        for (case, is_goal) in [("ordinary", false), ("goal", true)] {
+            is_goal_message.set(is_goal);
+            mark_center.set(0.0);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let (body_left, body_top, body_height) = body.get();
+            if !is_goal {
+                assert_eq!(
+                    mark_center.get(),
+                    0.0,
+                    "an ordinary prompt should not paint a goal badge"
+                );
+                ordinary_left = body_left;
+                continue;
+            }
+            // The badge rides the bubble's lower edge like a delivery mark: the
+            // kit anchors the pill 1.25rem below the bubble's bottom edge, and
+            // the 20px icon-only button plus the pill's 3px borders make the
+            // pill 26px tall, so its center lands 18px below the message text.
+            let body_bottom = body_top + body_height;
+            let expected_center = body_bottom + 18.0;
+            assert!(
+                (mark_center.get() - expected_center).abs() <= 1.0,
+                "{case} badge should ride the bubble's lower edge: {} vs {expected_center}",
+                mark_center.get()
+            );
+            // A badge wedged into the body would indent the text; riding the
+            // edge leaves the wrapped line starting exactly where an ordinary
+            // message's does.
+            assert!(
+                (body_left - ordinary_left).abs() <= 0.5,
+                "{case} body should keep the full content width: {body_left} vs {ordinary_left}"
+            );
+            // It is the bottom-RIGHT corner, like a delivery mark: the pill
+            // hugs the bubble's trailing edge rather than its leading one.
+            let (mark_left, mark_right) = mark_span.get();
+            let (surface_left, surface_right) = surface_span.get();
+            let midpoint = (surface_left + surface_right) / 2.0;
+            assert!(
+                mark_left > midpoint,
+                "{case} badge should ride the trailing edge: {mark_left} vs midpoint {midpoint}"
+            );
+            assert!(
+                mark_right <= surface_right && mark_right > surface_right - 40.0,
+                "{case} badge should hug the bubble's right edge: {mark_right} vs {surface_right}"
+            );
         }
     }
 
@@ -73690,7 +73850,7 @@ mod tests {
                     "an ordinary prompt should not paint a delivery mark"
                 );
                 assert!(
-                    strip_below_body < USER_MESSAGE_DELIVERY_REACTION_HANG,
+                    strip_below_body < USER_MESSAGE_EDGE_REACTION_HANG,
                     "an ordinary prompt should not reserve the reaction strip: {strip_below_body}"
                 );
                 continue;
@@ -73709,7 +73869,7 @@ mod tests {
             // bottom padding and border (11px), the row gap (4px), and the
             // hang. Padding it further would push every delivered message's
             // hover action line away from its bubble.
-            let expected_strip = USER_MESSAGE_DELIVERY_REACTION_HANG + 15.0;
+            let expected_strip = USER_MESSAGE_EDGE_REACTION_HANG + 15.0;
             assert!(
                 (strip_below_body - expected_strip).abs() <= 1.0,
                 "{case:?} bubble should reserve exactly the strip the mark hangs into: {strip_below_body} vs {expected_strip}"
@@ -73776,12 +73936,15 @@ mod tests {
         assert!(!helper.contains(".overflow_y_scrollbar()"));
         // A queued delivery rides the library reaction region on the bubble's
         // lower edge, never a chip above it or a tinted bubble edge.
-        assert!(row.contains("render_user_message_delivery_marker"));
+        // Every edge mark — the queued delivery and the goal badge — rides the
+        // library reaction region on the bubble's lower edge, never a chip
+        // above it, a glyph in the body, or a tinted bubble edge.
+        assert!(row.contains("render_user_message_edge_reactions"));
         assert!(!row.contains("render_user_message_delivery_hint"));
         assert!(!row.contains(".border_color("));
-        assert!(helper.contains("delivery_reactions"));
+        assert!(helper.contains("edge_reactions"));
         assert!(helper.contains(".reactions("));
-        assert!(helper.contains("USER_MESSAGE_DELIVERY_REACTION_HANG"));
+        assert!(helper.contains("USER_MESSAGE_EDGE_REACTION_HANG"));
         assert!(!helper.contains("border_1"));
         assert!(!helper.contains("border_color"));
     }
@@ -73790,7 +73953,7 @@ mod tests {
     fn user_message_delivery_marker_colors_the_edge_reaction_by_delivery() {
         let source = include_str!("app.rs");
         let marker = source
-            .split_once("fn render_user_message_delivery_marker(")
+            .split_once("fn render_user_message_delivery_button(")
             .and_then(|(_, tail)| tail.split_once("\nfn render_user_message_bubble("))
             .map(|(body, _)| body)
             .expect("delivery marker helper should remain inspectable");
