@@ -488,6 +488,14 @@ const TIMELINE_TOOL_PROJECTION_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_LIMIT: usize = 256;
 const TIMELINE_FILE_DIFF_PREVIEW_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TIMELINE_FILE_DIFF_SCROLL_CACHE_LIMIT: usize = 512;
+/// Vertical slack kept above and below the timeline viewport when a turn
+/// windows its process rows.
+const TIMELINE_PROCESS_RUN_OVERSCAN_PX: f32 = 640.0;
+/// Units a turn lays out in flow rather than windowing. Below this the run
+/// costs less to build outright than to place unit by unit.
+const TIMELINE_PROCESS_RUN_FLOW_LIMIT: usize = 16;
+/// The gap the response column puts between two process units.
+const TIMELINE_PROCESS_UNIT_GAP: f32 = 12.0;
 const TIMELINE_TURN_FILE_CHANGES_CACHE_LIMIT: usize = 256;
 const TIMELINE_TURN_FILE_CHANGES_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const TURN_FILE_CHANGES_VISIBLE_COUNT: usize = 3;
@@ -2891,6 +2899,7 @@ struct AgentSessionViewCacheEntry {
     timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
+    timeline_process_unit_heights: BTreeMap<String, (i64, f32)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
@@ -5932,6 +5941,7 @@ pub struct VibexWorkbench {
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
+    timeline_process_unit_heights: BTreeMap<String, (i64, f32)>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
@@ -6823,6 +6833,7 @@ impl VibexWorkbench {
             timeline_pending_turn_heights: BTreeMap::new(),
             timeline_estimated_turn_heights: BTreeMap::new(),
             timeline_turn_layout_signature_cache: BTreeMap::new(),
+            timeline_process_unit_heights: BTreeMap::new(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
             timeline_reasoning_summaries: BTreeMap::new(),
@@ -12964,6 +12975,7 @@ impl VibexWorkbench {
             timeline_turn_layout_signature_cache: std::mem::take(
                 &mut self.timeline_turn_layout_signature_cache,
             ),
+            timeline_process_unit_heights: std::mem::take(&mut self.timeline_process_unit_heights),
             conversation_turns_cache: std::mem::replace(
                 &mut self.conversation_turns_cache,
                 Rc::new(Vec::new()),
@@ -13072,6 +13084,7 @@ impl VibexWorkbench {
             entry.timeline_measured_turn_layout_signatures;
         self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
         self.timeline_turn_layout_signature_cache = entry.timeline_turn_layout_signature_cache;
+        self.timeline_process_unit_heights = entry.timeline_process_unit_heights;
         // A restored extent re-earns any reclaim from the first paints of the
         // switched-to session instead of carrying paint bookkeeping across.
         self.timeline_streaming_shrink_candidates.clear();
@@ -15510,6 +15523,7 @@ impl VibexWorkbench {
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
+        self.timeline_process_unit_heights.clear();
         // The row table is derived from the measurements just cleared. Drop it
         // so a caller that cannot rebuild immediately still cannot reuse stale
         // heights against a different turn projection; the next render rebuilds
@@ -38362,6 +38376,7 @@ impl VibexWorkbench {
     fn render_timeline_turn(
         &mut self,
         turn: &TimelineConversationTurn,
+        turn_index: usize,
         is_first: bool,
         is_last: bool,
         window: &mut Window,
@@ -38543,7 +38558,7 @@ impl VibexWorkbench {
                     ),
             );
             if process_expanded {
-                for row in self.render_timeline_process_rows(turn, window, cx) {
+                for row in self.render_timeline_process_rows(turn, turn_index, window, cx) {
                     response = response.child(row);
                 }
             }
@@ -38988,66 +39003,62 @@ impl VibexWorkbench {
     fn render_timeline_process_rows(
         &mut self,
         turn: &TimelineConversationTurn,
+        turn_index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let mut elements = Vec::new();
-        let mut row_index = 0;
-        let mut group_index = 0;
-        let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
-        let process_activity_groups = timeline_process_activity_groups_for_display(
-            turn,
-            enhanced_command_display,
-            self.ui_state.session.enhanced_file_operation_display,
-        );
-
-        while row_index < turn.process_rows.len() {
-            while process_activity_groups
-                .get(group_index)
-                .is_some_and(|group| group.end_row <= row_index)
-            {
-                group_index += 1;
-            }
-            if !self.rendering_child_agent_timeline()
-                && enhanced_command_display
-                && let (Some(command_row), Some(permission_row)) = (
-                    turn.process_rows.get(row_index),
-                    turn.process_rows.get(row_index + 1),
-                )
-                && self.command_permission_rows_are_linked(command_row, permission_row)
-            {
-                let pair_rows = &turn.process_rows[row_index..row_index + 2];
-                let element =
-                    self.render_command_execution_card(command_row, Some(permission_row), cx);
-                elements.push(self.highlight_session_search_rows(pair_rows, element, cx));
-                row_index += 2;
-                continue;
-            }
-            let group = process_activity_groups.get(group_index).filter(|group| {
-                group.start_row == row_index
-                    && group.end_row <= turn.process_rows.len()
-                    && group.end_row > group.start_row
-            });
-            if let Some(group) = group {
-                let group_rows = &turn.process_rows[group.start_row..group.end_row];
-                let group_element = self.render_process_activity_group(group, group_rows, cx);
-                elements.push(self.highlight_session_search_rows(group_rows, group_element, cx));
-                row_index = group.end_row;
-                group_index += 1;
-            } else {
-                elements.push(self.render_timeline_row(
-                    &turn.process_rows[row_index],
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                ));
-                row_index += 1;
-            }
+        let units = Rc::new(self.timeline_process_units(turn));
+        if units.is_empty() {
+            return Vec::new();
         }
-
-        elements
+        // A short section, and every child-agent preview, lays out in flow
+        // where the measured height is always the real one.
+        if self.rendering_child_agent_timeline() || units.len() <= TIMELINE_PROCESS_RUN_FLOW_LIMIT {
+            return units
+                .iter()
+                .map(|unit| self.render_timeline_process_unit(turn, unit, window, cx))
+                .collect();
+        }
+        let (sizes, origins) = self.timeline_process_run_layout(&units);
+        let total_height = origins
+            .last()
+            .zip(sizes.last())
+            .map(|(origin, size)| *origin + *size)
+            .unwrap_or_default();
+        let pinned_unit = self.timeline_process_pinned_unit(turn, &units);
+        let turn_id = turn.id.clone();
+        let entity = cx.weak_entity();
+        // The run builds its units during prepaint, after this render has
+        // returned, so it resolves the turn from the same projection the
+        // virtual list is rendering rather than borrowing it here.
+        let turns = self.conversation_turns_render_cache.clone();
+        let build_units = units.clone();
+        let build_entity = entity.clone();
+        vec![
+            TimelineProcessRun {
+                units,
+                origins,
+                total_height,
+                pinned_unit,
+                entity,
+                build_unit: Box::new(move |index, window, cx| {
+                    let turn = turns
+                        .borrow()
+                        .get(turn_index)
+                        .cloned()
+                        .filter(|turn| turn.id == turn_id);
+                    let (Some(turn), Some(unit)) = (turn, build_units.get(index)) else {
+                        return Empty.into_any_element();
+                    };
+                    build_entity
+                        .update(cx, |this, cx| {
+                            this.render_timeline_process_unit(&turn, unit, window, cx)
+                        })
+                        .unwrap_or_else(|_| Empty.into_any_element())
+                }),
+            }
+            .into_any_element(),
+        ]
     }
 
     fn command_permission_rows_are_linked(
@@ -40351,16 +40362,30 @@ impl VibexWorkbench {
     }
 
     fn estimated_timeline_process_rows_height(&self, turn: &TimelineConversationTurn) -> f32 {
-        let mut height = 0.0;
-        let mut row_index = 0;
-        let mut group_index = 0;
+        self.timeline_process_units(turn)
+            .iter()
+            .map(|unit| unit.estimated_height + TIMELINE_PROCESS_UNIT_GAP)
+            .sum()
+    }
+
+    /// The units a turn's process section paints, in order.
+    ///
+    /// Runs of tool activity collapse into one summary row and a command pairs
+    /// with the permission prompt that follows it, so the painted unit — not
+    /// the raw row — is what the estimator, the renderer and the windowed run
+    /// all have to agree on. They share this list rather than repeating the
+    /// walk.
+    fn timeline_process_units(&self, turn: &TimelineConversationTurn) -> Vec<TimelineProcessUnit> {
         let enhanced_command_display = self.ui_state.session.enhanced_command_execution_display;
+        let pairs_commands = enhanced_command_display && !self.rendering_child_agent_timeline();
         let process_activity_groups = timeline_process_activity_groups_for_display(
             turn,
             enhanced_command_display,
             self.ui_state.session.enhanced_file_operation_display,
         );
-
+        let mut units = Vec::new();
+        let mut row_index = 0;
+        let mut group_index = 0;
         while row_index < turn.process_rows.len() {
             while process_activity_groups
                 .get(group_index)
@@ -40385,9 +40410,15 @@ impl VibexWorkbench {
                         }
                     })
                     .unwrap_or(48.0);
-                height += self.estimated_timeline_row_height_projected(command_row, false)
-                    + permission_height
-                    + 12.0;
+                units.push(TimelineProcessUnit {
+                    rows: row_index..row_index + 2,
+                    id: command_row.id.clone(),
+                    revision: command_row.last_sequence.max(permission_row.last_sequence),
+                    estimated_height: self
+                        .estimated_timeline_row_height_projected(command_row, false)
+                        + permission_height,
+                    kind: TimelineProcessUnitKind::CommandPair,
+                });
                 row_index += 2;
                 continue;
             }
@@ -40397,18 +40428,131 @@ impl VibexWorkbench {
                     && group.end_row > group.start_row
             });
             if let Some(group) = group {
-                height += self.estimated_process_activity_group_height(turn, group) + 12.0;
+                let last_sequence = turn.process_rows[group.start_row..group.end_row]
+                    .iter()
+                    .map(|row| row.last_sequence)
+                    .max()
+                    .unwrap_or_default();
+                units.push(TimelineProcessUnit {
+                    rows: group.start_row..group.end_row,
+                    id: group.id.clone(),
+                    revision: last_sequence,
+                    estimated_height: self.estimated_process_activity_group_height(turn, group),
+                    kind: TimelineProcessUnitKind::Group(group.clone()),
+                });
                 row_index = group.end_row;
                 group_index += 1;
             } else {
-                height += self
-                    .estimated_timeline_row_height_projected(&turn.process_rows[row_index], false)
-                    + 12.0;
+                let row = &turn.process_rows[row_index];
+                units.push(TimelineProcessUnit {
+                    rows: row_index..row_index + 1,
+                    id: row.id.clone(),
+                    revision: row.last_sequence,
+                    estimated_height: self.estimated_timeline_row_height_projected(row, false),
+                    kind: TimelineProcessUnitKind::Row,
+                });
                 row_index += 1;
             }
         }
+        units
+    }
 
-        height
+    /// The height and origin of every unit, measured where it has been
+    /// measured and estimated where it has not.
+    fn timeline_process_run_layout(
+        &self,
+        units: &[TimelineProcessUnit],
+    ) -> (Arc<Vec<Pixels>>, Arc<Vec<Pixels>>) {
+        let mut sizes = Vec::with_capacity(units.len());
+        for unit in units {
+            let height = self
+                .timeline_process_unit_heights
+                .get(&unit.id)
+                .filter(|(revision, _)| *revision == unit.revision)
+                .map(|(_, height)| *height)
+                .unwrap_or(unit.estimated_height);
+            sizes.push(px(height.max(1.0)));
+        }
+        let mut origins = Vec::with_capacity(sizes.len());
+        let mut origin = px(0.0);
+        for (index, size) in sizes.iter().enumerate() {
+            origins.push(origin);
+            origin += *size;
+            if index + 1 < sizes.len() {
+                origin += px(TIMELINE_PROCESS_UNIT_GAP);
+            }
+        }
+        (Arc::new(sizes), Arc::new(origins))
+    }
+
+    /// Records what the windowed run measured, so the units it did not build
+    /// this frame keep a real height instead of an estimate.
+    fn record_timeline_process_unit_heights(
+        &mut self,
+        units: &[TimelineProcessUnit],
+        measurements: &[(usize, f32)],
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for (index, measured) in measurements {
+            let Some(unit) = units.get(*index) else {
+                continue;
+            };
+            if !measured.is_finite() || *measured <= 0.0 {
+                continue;
+            }
+            let measured = measured.ceil().max(1.0);
+            let current = self.timeline_process_unit_heights.get(&unit.id);
+            if current.is_some_and(|(revision, height)| {
+                *revision == unit.revision && (*height - measured).abs() < 1.0
+            }) {
+                continue;
+            }
+            self.timeline_process_unit_heights
+                .insert(unit.id.clone(), (unit.revision, measured));
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The unit holding the find bar's pending reveal, built even when it falls
+    /// outside the window so the match can still be scrolled to.
+    fn timeline_process_pinned_unit(
+        &self,
+        turn: &TimelineConversationTurn,
+        units: &[TimelineProcessUnit],
+    ) -> Option<usize> {
+        let pending = self.pending_session_search_reveal_item_id.as_deref()?;
+        units.iter().position(|unit| {
+            turn.process_rows[unit.rows.clone()]
+                .iter()
+                .any(|row| row.item_ids.iter().any(|id| id == pending))
+        })
+    }
+
+    /// Paints one unit of a turn's process section.
+    fn render_timeline_process_unit(
+        &mut self,
+        turn: &TimelineConversationTurn,
+        unit: &TimelineProcessUnit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = &turn.process_rows[unit.rows.clone()];
+        let element = match &unit.kind {
+            TimelineProcessUnitKind::CommandPair => {
+                self.render_command_execution_card(&rows[0], rows.get(1), cx)
+            }
+            TimelineProcessUnitKind::Group(group) => {
+                self.render_process_activity_group(group, rows, cx)
+            }
+            TimelineProcessUnitKind::Row => {
+                self.render_timeline_row(&rows[0], false, None, None, window, cx)
+            }
+        };
+        self.highlight_session_search_rows(rows, element, cx)
     }
 
     fn estimated_timeline_turn_height_projected(
@@ -48737,6 +48881,223 @@ impl Element for SidebarSessionRun {
         }
         for row in &mut layout.rows {
             row.paint(window, cx);
+        }
+    }
+}
+
+/// One painted unit of a turn's process section.
+///
+/// Runs of tool activity collapse into a single summary row and a command can
+/// pair with the permission prompt that follows it, so the unit — not the raw
+/// row — is what the renderer paints and what the windowed run culls.
+struct TimelineProcessUnit {
+    /// Rows this unit covers, as indices into `turn.process_rows`.
+    rows: Range<usize>,
+    /// Element id and height-table key.
+    id: String,
+    /// Content revision the measured height belongs to.
+    revision: i64,
+    /// Height the unit takes before it has been measured.
+    estimated_height: f32,
+    /// What the renderer paints for this unit.
+    kind: TimelineProcessUnitKind,
+}
+
+enum TimelineProcessUnitKind {
+    /// A single row painted on its own.
+    Row,
+    /// A collapsed run of tool activity, painted as one summary row.
+    Group(TimelineProcessActivityGroup),
+    /// A command and the permission prompt that follows it.
+    CommandPair,
+}
+
+/// Builds one unit of a [`TimelineProcessRun`] on demand.
+///
+/// Runs are built during prepaint, after the view's render has returned, so the
+/// builder may update the workbench to reach the unit's current state.
+type TimelineProcessUnitBuilder = Box<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
+
+/// One contiguous band of a turn's process rows.
+///
+/// The timeline virtualizes by turn, so one virtual row is a whole turn and an
+/// expanded turn used to build, lay out and paint every one of its process rows
+/// on every frame — a session that ran for hours is a single turn with hundreds
+/// of them, and a running turn keeps its process expanded. The run keeps the
+/// height its units occupy in the flow and builds only the ones the timeline
+/// viewport shows, placing each at its own origin. It is the same shape
+/// `SidebarSessionRun` uses for a folder's sessions and `MarkdownVirtualFlow`
+/// uses inside a single Markdown document.
+struct TimelineProcessRun {
+    /// Units this run stands for, in paint order.
+    units: Rc<Vec<TimelineProcessUnit>>,
+    /// Origin of each unit, relative to the run's own origin.
+    origins: Arc<Vec<Pixels>>,
+    /// The height the units occupy in the flow, gaps included.
+    total_height: Pixels,
+    /// Unit holding the pending find-in-conversation reveal, built even when it
+    /// falls outside the window so the match can still be scrolled to.
+    pinned_unit: Option<usize>,
+    /// The workbench, for recording what the run measured.
+    entity: WeakEntity<VibexWorkbench>,
+    /// Builds unit `index` on demand.
+    build_unit: TimelineProcessUnitBuilder,
+}
+
+impl TimelineProcessRun {
+    /// The units the content mask can see, widened by
+    /// [`TIMELINE_PROCESS_RUN_OVERSCAN_PX`].
+    fn visible_units(&self, bounds: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Range<usize> {
+        if bounds.size.width <= px(0.0) {
+            return 0..0;
+        }
+        timeline_process_visible_units(&self.origins, self.total_height, bounds, viewport)
+    }
+}
+
+/// The units of a process run the viewport shows, widened by
+/// [`TIMELINE_PROCESS_RUN_OVERSCAN_PX`].
+///
+/// Unit heights differ — a reasoning row is hundreds of pixels, a tool line is
+/// one — so the range comes from the cumulative origins rather than from
+/// arithmetic on a single stride. The origins are sorted, which keeps the two
+/// lookups logarithmic even for a turn holding hundreds of units.
+fn timeline_process_visible_units(
+    origins: &[Pixels],
+    total_height: Pixels,
+    bounds: Bounds<Pixels>,
+    viewport: Bounds<Pixels>,
+) -> Range<usize> {
+    let unit_count = origins.len();
+    if unit_count == 0 {
+        return 0..0;
+    }
+    let visible_top = viewport.top() - px(TIMELINE_PROCESS_RUN_OVERSCAN_PX);
+    let visible_bottom = viewport.bottom() + px(TIMELINE_PROCESS_RUN_OVERSCAN_PX);
+    let local_top = visible_top - bounds.top();
+    let first = if local_top < px(0.0) {
+        0
+    } else if local_top >= total_height {
+        unit_count
+    } else {
+        origins
+            .partition_point(|origin| *origin <= local_top)
+            .saturating_sub(1)
+    };
+    let end = origins[first..]
+        .partition_point(|origin| bounds.top() + *origin < visible_bottom)
+        .saturating_add(first)
+        .min(unit_count);
+    first..end.max(first)
+}
+
+/// The flow child a run reserves its height with, and the units it placed.
+struct TimelineProcessRunLayout {
+    spacer: AnyElement,
+    units: Vec<AnyElement>,
+}
+
+impl IntoElement for TimelineProcessRun {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TimelineProcessRun {
+    type RequestLayoutState = TimelineProcessRunLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // The units are placed by hand during prepaint, so the run only has to
+        // reserve the height they would have taken in the flow.
+        let mut spacer = div()
+            .w_full()
+            .min_w_0()
+            .h(self.total_height)
+            .flex_none()
+            .into_any_element();
+        let layout_id = spacer.request_layout(window, cx);
+        (
+            layout_id,
+            TimelineProcessRunLayout {
+                spacer,
+                units: Vec::new(),
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        layout.spacer.prepaint(window, cx);
+        layout.units.clear();
+        if bounds.size.width <= px(0.0) {
+            return;
+        }
+        let viewport = window.content_mask().bounds;
+        let available_space = size(
+            AvailableSpace::Definite(bounds.size.width),
+            AvailableSpace::MinContent,
+        );
+        let visible = self.visible_units(bounds, viewport);
+        let pinned = self
+            .pinned_unit
+            .filter(|index| !visible.contains(index))
+            .into_iter();
+        let mut measurements = Vec::new();
+        for index in visible.chain(pinned) {
+            let Some(origin) = self.origins.get(index).copied() else {
+                continue;
+            };
+            let mut unit = (self.build_unit)(index, window, cx);
+            let measured = unit.layout_as_root(available_space, window, cx);
+            unit.prepaint_at(bounds.origin + point(px(0.0), origin), window, cx);
+            measurements.push((index, f32::from(measured.height)));
+            layout.units.push(unit);
+        }
+        if !measurements.is_empty() {
+            let units = self.units.clone();
+            let _ = self.entity.update(cx, |this, cx| {
+                this.record_timeline_process_unit_heights(&units, &measurements, cx)
+            });
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        layout.spacer.paint(window, cx);
+        for unit in &mut layout.units {
+            unit.paint(window, cx);
         }
     }
 }
@@ -65851,10 +66212,10 @@ mod tests {
     fn pending_command_permissions_render_as_one_blocked_command_card() {
         let source = include_str!("app.rs");
         let process_rows = source
-            .split_once("    fn render_timeline_process_rows(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .split_once("    fn timeline_process_units(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_process_run_layout("))
             .map(|(body, _)| body)
-            .expect("timeline process renderer should remain inspectable");
+            .expect("timeline process unit walk should remain inspectable");
         assert!(process_rows.contains("Some(permission_row)"));
         assert!(process_rows.contains("row_index += 2"));
 
@@ -70634,10 +70995,10 @@ mod tests {
     fn command_display_preference_switches_between_cards_and_tool_activity_groups() {
         let source = include_str!("app.rs");
         let process_rows = source
-            .split_once("    fn render_timeline_process_rows(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .split_once("    fn timeline_process_units(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_process_run_layout("))
             .map(|(body, _)| body)
-            .expect("timeline process rendering should remain inspectable");
+            .expect("timeline process unit walk should remain inspectable");
         assert!(process_rows.contains("enhanced_command_execution_display"));
         assert!(process_rows.contains("timeline_process_activity_groups_for_display"));
 
@@ -70656,10 +71017,10 @@ mod tests {
     fn file_operation_display_preference_switches_between_cards_and_tool_activity_groups() {
         let source = include_str!("app.rs");
         let process_rows = source
-            .split_once("    fn render_timeline_process_rows(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .split_once("    fn timeline_process_units(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn timeline_process_run_layout("))
             .map(|(body, _)| body)
-            .expect("timeline process rendering should remain inspectable");
+            .expect("timeline process unit walk should remain inspectable");
         assert!(process_rows.contains("enhanced_file_operation_display"));
         assert!(process_rows.contains("timeline_process_activity_groups_for_display"));
 
@@ -73759,6 +74120,62 @@ mod tests {
             (reserved_height.get() - expected).abs() < 0.5,
             "flow and windowed runs must reserve the same height: {} vs {expected}",
             reserved_height.get()
+        );
+    }
+
+    #[test]
+    fn timeline_process_run_window_covers_only_the_units_the_viewport_shows() {
+        // A hundred units of 100px with the response column's 12px gap between
+        // them: unit origins step by 112.
+        let origins: Vec<Pixels> = (0..100).map(|index| px(index as f32 * 112.0)).collect();
+        let total_height = px(99.0 * 112.0 + 100.0);
+        let viewport = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(800.0), px(600.0)),
+        };
+        let at_top = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(800.0), total_height),
+        };
+        let visible = timeline_process_visible_units(&origins, total_height, at_top, viewport);
+        assert_eq!(visible.start, 0);
+        // The band is the viewport plus one overscan on each edge, not the run:
+        // 600 + 2 * 640 reaches into the twelfth unit.
+        assert!(
+            (11..=13).contains(&visible.len()),
+            "the band is the viewport plus overscan, got {visible:?}"
+        );
+
+        // A run scrolled far up builds the units around the viewport instead of
+        // rescanning from zero, and the band stays the same size.
+        let scrolled = Bounds {
+            origin: point(px(0.0), px(-5_600.0)),
+            size: at_top.size,
+        };
+        let visible = timeline_process_visible_units(&origins, total_height, scrolled, viewport);
+        assert!(visible.start >= 44 && visible.start <= 46, "{visible:?}");
+        // Away from the ends the band is the viewport plus both overscans —
+        // 1880px, or eighteen units of 112px — and never the whole run.
+        assert!(
+            (16..=19).contains(&visible.len()),
+            "the scrolled band stays viewport-sized, got {visible:?}"
+        );
+
+        // A run entirely below the viewport builds nothing, and so does one
+        // scrolled entirely past it.
+        let below = Bounds {
+            origin: point(px(0.0), px(40_000.0)),
+            size: at_top.size,
+        };
+        assert!(timeline_process_visible_units(&origins, total_height, below, viewport).is_empty());
+        let above = Bounds {
+            origin: point(px(0.0), px(-40_000.0)),
+            size: at_top.size,
+        };
+        assert!(timeline_process_visible_units(&origins, total_height, above, viewport).is_empty());
+        assert_eq!(
+            timeline_process_visible_units(&[], px(0.0), at_top, viewport),
+            0..0
         );
     }
 
