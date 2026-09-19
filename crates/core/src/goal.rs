@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Serialized names are the product vocabulary, not any single provider's:
 /// ACP adapters normalize `budgetLimited`/`usage_limited`/`budget limited`
 /// into these values before they reach a client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPhase {
     Active,
@@ -30,6 +30,7 @@ pub enum GoalPhase {
     Complete,
     /// The provider reported a status this build does not know. Kept distinct
     /// from the known phases so the UI can stay honest instead of guessing.
+    #[default]
     Unknown,
 }
 
@@ -76,12 +77,6 @@ impl GoalPhase {
             Self::Complete => "complete",
             Self::Unknown => "unknown",
         }
-    }
-}
-
-impl Default for GoalPhase {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 
