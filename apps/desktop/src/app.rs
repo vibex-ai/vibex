@@ -14122,6 +14122,15 @@ impl VibexWorkbench {
         let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
+        self.stash_agent_session_view_for(&session_id);
+    }
+
+    /// Parks the live view under `session_id`.
+    ///
+    /// The selected session is the usual caller, but a session group pane parks
+    /// the view it borrowed so the focused pane's view can be handed back.
+    fn stash_agent_session_view_for(&mut self, session_id: &VibexSessionId) {
+        let session_id = session_id.clone();
         if self.timeline.session_id.as_ref() != Some(&session_id)
             || !self.sessions.iter().any(|session| session.id == session_id)
         {
@@ -15032,6 +15041,46 @@ impl VibexWorkbench {
         )
     }
 
+    /// The lifecycle state of the session whose view is live.
+    ///
+    /// A session group pane renders another session's parked view while the
+    /// selection still names the focused pane, so the conversation projection
+    /// must read the view's session. When the focused pane is the one rendering
+    /// the two are the same session and this matches
+    /// [`Self::selected_agent_session_state`].
+    fn live_agent_session_state(&self) -> Option<AgentSessionState> {
+        let timeline_session_id = self.timeline.session_id.clone();
+        let turn_pending = self.live_turn_pending();
+        let state = if turn_pending {
+            Some(AgentSessionState::Running)
+        } else {
+            timeline_session_id
+                .as_ref()
+                .and_then(|session_id| {
+                    self.sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                })
+                .map(|session| session.state)
+        };
+        timeline_session_state_for_render(
+            timeline_session_id.as_ref(),
+            self.timeline.session_id.as_ref(),
+            self.agent_loading,
+            state,
+        )
+    }
+
+    /// Whether the live view's session has an Agent turn in flight.
+    fn live_turn_pending(&self) -> bool {
+        self.timeline
+            .session_id
+            .as_ref()
+            .map_or(self.agent_turn_pending, |session_id| {
+                self.session_turn_pending(session_id)
+            })
+    }
+
     fn conversation_turns(&self) -> Vec<TimelineConversationTurn> {
         if let Some(items) = self
             .pending_user_message_edit
@@ -15046,21 +15095,22 @@ impl VibexWorkbench {
             );
         }
         if let Some(items) = self
-            .selected_session_id
+            .timeline
+            .session_id
             .as_ref()
             .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
             .and_then(|message| message.projected_items(&self.timeline))
         {
             return timeline_conversation_turns_with_reasoning_mode(
                 &items,
-                self.selected_agent_session_state(),
-                self.agent_turn_pending,
+                self.live_agent_session_state(),
+                self.live_turn_pending(),
                 self.ui_state.session.reasoning_display_mode,
             );
         }
         self.timeline.conversation_turns_with_reasoning_mode(
-            self.selected_agent_session_state(),
-            self.agent_turn_pending,
+            self.live_agent_session_state(),
+            self.live_turn_pending(),
             self.ui_state.session.reasoning_display_mode,
         )
     }
@@ -15071,14 +15121,15 @@ impl VibexWorkbench {
             timeline_revision: self.timeline.revision,
             item_count: self.timeline.items.len(),
             end_sequence: self.timeline.authoritative_end_sequence,
-            session_state: self.selected_agent_session_state(),
-            agent_turn_pending: self.agent_turn_pending,
+            session_state: self.live_agent_session_state(),
+            agent_turn_pending: self.live_turn_pending(),
             pending_edit: self
                 .pending_user_message_edit
                 .as_ref()
                 .map(PendingUserMessageEdit::cache_key),
             optimistic_message: self
-                .selected_session_id
+                .timeline
+                .session_id
                 .as_ref()
                 .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
                 .map(OptimisticUserMessage::cache_key),
@@ -32267,6 +32318,18 @@ impl VibexWorkbench {
             .when(!focused, |this| {
                 this.border_1().border_color(cx.theme().border)
             })
+            .when(!focused, |this| {
+                // Capture phase so the click focuses the pane instead of
+                // reaching a control that belongs to the focused session.
+                this.capture_any_mouse_down(cx.listener({
+                    let group_id = group_id.to_string();
+                    let pane_id = pane_id.clone();
+                    move |this, _: &gpui::MouseDownEvent, _, cx| {
+                        this.focus_session_group_pane(&group_id, &pane_id, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener({
@@ -32337,20 +32400,82 @@ impl VibexWorkbench {
         if focused {
             return self.render_agent_workbench(window, cx);
         }
-        // A pane that is not focused still shows the session's live timeline.
-        // Its state lives in the parked session view, which the event pump keeps
-        // current, so the pane tracks the Agent without owning the composer.
-        let session = self
+        let Some(pane_session_id) = VibexSessionId::parse(session_id).ok() else {
+            return Empty.into_any_element();
+        };
+        let Some(session) = self
             .sessions
             .iter()
             .find(|session| session.id.as_str() == session_id)
-            .cloned();
-        let Some(session) = session else {
+            .cloned()
+        else {
             return Empty.into_any_element();
         };
+        // A pane that is not focused still renders the session's live
+        // conversation. The view is parked per session, so the pane borrows it
+        // for this frame and hands the focused pane's view back afterwards.
+        // A session that was never opened has no parked view yet, and the pane
+        // falls back to a live summary instead of an empty timeline.
+        let focused_session_id = self.selected_session_id.clone();
+        if !self
+            .agent_session_view_cache
+            .contains_key(pane_session_id.as_str())
+        {
+            return self.render_session_group_pane_summary(&session, cx);
+        }
+        // The approve/deny and elicitation handlers resolve against the focused
+        // session, so a pane that owes the user an answer must not offer the
+        // controls: it shows its summary and the user answers in the focused
+        // pane, where the request is unambiguous.
+        if self.parked_view_awaits_user(session_id) {
+            return self.render_session_group_pane_summary(&session, cx);
+        }
+        if let Some(focused_session_id) = focused_session_id.as_ref() {
+            self.stash_agent_session_view_for(focused_session_id);
+        }
+        if !self.restore_agent_session_view(&pane_session_id) {
+            if let Some(focused_session_id) = focused_session_id.as_ref() {
+                let _ = self.restore_agent_session_view(focused_session_id);
+            }
+            return self.render_session_group_pane_summary(&session, cx);
+        }
+        let element = self.render_agent_workbench_for(false, window, cx);
+        self.stash_agent_session_view_for(&pane_session_id);
+        if let Some(focused_session_id) = focused_session_id.as_ref() {
+            let _ = self.restore_agent_session_view(focused_session_id);
+        }
+        element
+    }
+
+    /// Whether a parked view holds a request the user must answer.
+    fn parked_view_awaits_user(&self, session_id: &str) -> bool {
+        let Some(entry) = self.agent_session_view_cache.get(session_id) else {
+            return false;
+        };
+        if entry.conversation_turns_summary.has_pending_permission {
+            return true;
+        }
+        entry.timeline.items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                TimelinePayload::ElicitationRequest(request)
+                    if request.status == vibex_core::ElicitationRequestStatus::Pending
+            )
+        })
+    }
+
+    /// What a group pane shows before its conversation has been materialized:
+    /// the session's identity, its live state and its most recent turns from
+    /// whatever the parked view already holds.
+    fn render_session_group_pane_summary(
+        &mut self,
+        session: &AgentSession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session_id = session.id.as_str().to_string();
         let turns = self
             .agent_session_view_cache
-            .get(session_id)
+            .get(&session_id)
             .map(|entry| entry.conversation_turns_cache.clone())
             .unwrap_or_default();
         let strings = self.strings();
@@ -32362,38 +32487,38 @@ impl VibexWorkbench {
             .min_w_0()
             .gap_2()
             .p_3()
-            .overflow_hidden();
-        body = body.child(
-            h_flex()
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .child(sidebar_agent_logo(&agent_id, true, cx))
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .font_medium()
-                        .child(session.title.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            sidebar_session_state_label(session.state, strings).unwrap_or_else(
-                                || match session.state {
-                                    AgentSessionState::Running => {
-                                        locale::text("Running", "运行中", "執行中")
-                                    }
-                                    _ => locale::text("Idle", "空闲", "閒置"),
-                                },
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(sidebar_agent_logo(&agent_id, true, cx))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(session.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                sidebar_session_state_label(session.state, strings).unwrap_or_else(
+                                    || match session.state {
+                                        AgentSessionState::Running => {
+                                            locale::text("Running", "运行中", "執行中")
+                                        }
+                                        _ => locale::text("Idle", "空闲", "閒置"),
+                                    },
+                                ),
                             ),
-                        ),
-                ),
-        );
+                    ),
+            );
         let preview = turns
             .iter()
             .rev()
@@ -38866,8 +38991,29 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.sync_selected_composer_draft(window, cx);
-        self.prune_elicitation_forms();
+        self.render_agent_workbench_for(true, window, cx)
+    }
+
+    /// Renders the session workbench for whatever view is live.
+    ///
+    /// `include_composer` is false for a session group pane that is not
+    /// focused: the pane shows the same live timeline as the focused one, but
+    /// the composer belongs to the focused pane alone, so the input, its
+    /// drafts and its suggestions stay untouched.
+    fn render_agent_workbench_for(
+        &mut self,
+        include_composer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if include_composer {
+            self.sync_selected_composer_draft(window, cx);
+            // Elicitation drafts are keyed by request id and shared across the
+            // workbench, so only the focused view may prune them. A pane that
+            // borrowed another session's timeline must not drop the answers the
+            // user is typing into the focused one.
+            self.prune_elicitation_forms();
+        }
         self.apply_pending_timeline_row_heights();
         // The virtual list pads itself with `py_4`; the scroll anchor needs the
         // same rem-based top inset to map offsets to rows.
@@ -39038,9 +39184,15 @@ impl VibexWorkbench {
                 )
             })
             .when_some(turn_preview_rail, |this, rail| this.child(rail));
-        let runtime_controls = self.render_runtime_controls(cx);
-        let conversation_find = self.render_conversation_find(cx);
-        let composer = self.render_composer(cx);
+        // The live view owns the session, not the selection: a group pane
+        // renders another session's runtime controls while the selection still
+        // names the focused pane.
+        let live_session_id = self.timeline.session_id.clone();
+        let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
+        let conversation_find = include_composer
+            .then(|| self.render_conversation_find(cx))
+            .flatten();
+        let composer = include_composer.then(|| self.render_composer(cx));
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
         let composer_fullscreen = if self.composer_terminal_mode {
@@ -39194,15 +39346,19 @@ impl VibexWorkbench {
                     .when_some(timeline_bottom_control, |this, control| this.child(control)),
             )
             .when_some(conversation_find, |this, find| this.child(find))
-            .child(composer)
+            .when_some(composer, |this, composer| this.child(composer))
             .into_any_element()
     }
 
-    fn render_runtime_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_runtime_controls(
+        &mut self,
+        session_id: Option<&VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(state) = self.runtime_selection.clone() else {
             return div().into_any_element();
         };
-        if self.selected_session_id.as_ref().is_some_and(|session_id| {
+        if session_id.is_some_and(|session_id| {
             self.optimistic_runtime_selections
                 .contains_key(session_id.as_str())
         }) {
