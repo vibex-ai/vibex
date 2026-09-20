@@ -477,7 +477,7 @@ fn push_root_children(
                     indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                 );
             }
-            SidebarOrganizationItem::Session(_) => {}
+            SidebarOrganizationItem::Session(_) | SidebarOrganizationItem::Group(_) => {}
         }
     }
 }
@@ -528,6 +528,9 @@ fn push_project_children(
         .filter(|session| session_matches(session, query))
         .map(|session| session.id.as_str().to_string())
         .collect::<Vec<_>>();
+    // Compact clients have no group row yet, so they list a group's members as
+    // ordinary sessions rather than hiding them behind a row they cannot draw.
+    let group_ids = Vec::new();
     let project_items = sidebar_project_items_for_workspace(
         organization,
         project_id,
@@ -535,6 +538,7 @@ fn push_project_children(
         true,
         !detailed_hierarchy,
         &session_ids,
+        &group_ids,
         &input.view.pinned_session_ids,
         parent_folder_id,
     );
@@ -590,7 +594,7 @@ fn push_project_children(
                     false,
                 );
             }
-            SidebarOrganizationItem::Project(_) => {}
+            SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Group(_) => {}
         }
     }
 
@@ -730,6 +734,7 @@ fn push_workspace_children(
     if depth > MAX_FOLDER_DEPTH {
         return;
     }
+    let group_ids = Vec::new();
     let workspace_items = sidebar_project_items_for_workspace(
         organization,
         project_id,
@@ -737,6 +742,7 @@ fn push_workspace_children(
         false,
         false,
         session_ids,
+        &group_ids,
         &input.view.pinned_session_ids,
         parent_folder_id,
     );
@@ -791,7 +797,7 @@ fn push_workspace_children(
                     indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
                 );
             }
-            SidebarOrganizationItem::Project(_) => {}
+            SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Group(_) => {}
         }
     }
 }

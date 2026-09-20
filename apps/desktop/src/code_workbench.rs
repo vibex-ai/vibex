@@ -2382,9 +2382,7 @@ impl CodeWorkbench {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let restored_commit = adopted_panel
-            .map(|panel| self.apply_panel_presentation(panel))
-            .flatten();
+        let restored_commit = adopted_panel.and_then(|panel| self.apply_panel_presentation(panel));
         self.load_tree(cx);
         // A restored expansion needs its own listing; the root load only walks
         // the first few levels.

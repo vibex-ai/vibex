@@ -443,7 +443,7 @@ pub use remote::{
     RemoteScheduledDeleteResponse, RemoteScheduledListRequest, RemoteScheduledListResponse,
     RemoteScheduledOperationKind, RemoteScheduledRequest, RemoteScheduledRunListRequest,
     RemoteScheduledRunListResponse, RemoteScheduledSetStatusRequest, RemoteScheduledTaskResponse,
-    RemoteScheduledUpdateRequest, RemoteServiceInfo, RemoteSidebarDropPosition,
+    RemoteScheduledUpdateRequest, RemoteServiceInfo, RemoteSessionGroup, RemoteSidebarDropPosition,
     RemoteSidebarFolder, RemoteSidebarHierarchyMode, RemoteSidebarItemKind, RemoteSidebarItemRef,
     RemoteSidebarNewSessionLocation, RemoteSidebarOrganizationMutateRequest,
     RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationRequest,

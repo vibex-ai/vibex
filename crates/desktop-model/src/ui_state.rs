@@ -121,12 +121,22 @@ pub enum WorkspaceStateScope {
     /// Every session keeps its own state and restores it when it is selected
     /// again.
     Session,
+    /// Every session of one session group shares the state. The group is a
+    /// single Worktree, so preview tabs and file-tree paths stay meaningful
+    /// across its panes; a session that belongs to no group keeps its
+    /// workspace's state.
+    Group,
 }
 
 impl WorkspaceStateScope {
     /// Whether the scope isolates each session.
     pub const fn is_session(self) -> bool {
         matches!(self, Self::Session)
+    }
+
+    /// Whether the scope shares state across one session group.
+    pub const fn is_group(self) -> bool {
+        matches!(self, Self::Group)
     }
 }
 
@@ -2429,24 +2439,26 @@ mod tests {
 
     #[test]
     fn normalization_drops_a_workspace_layout_with_both_panels_hidden() {
-        let mut state = DesktopUiStateV1::default();
-        state.workspace_layouts = BTreeMap::from([
-            (
-                "checkout-a".to_string(),
-                WorkspaceLayoutState {
-                    right_rail_visible: false,
-                    preview_visible: false,
-                    ..WorkspaceLayoutState::default()
-                },
-            ),
-            (
-                "checkout-b".to_string(),
-                WorkspaceLayoutState {
-                    preview_visible: true,
-                    ..WorkspaceLayoutState::default()
-                },
-            ),
-        ]);
+        let mut state = DesktopUiStateV1 {
+            workspace_layouts: BTreeMap::from([
+                (
+                    "checkout-a".to_string(),
+                    WorkspaceLayoutState {
+                        right_rail_visible: false,
+                        preview_visible: false,
+                        ..WorkspaceLayoutState::default()
+                    },
+                ),
+                (
+                    "checkout-b".to_string(),
+                    WorkspaceLayoutState {
+                        preview_visible: true,
+                        ..WorkspaceLayoutState::default()
+                    },
+                ),
+            ]),
+            ..DesktopUiStateV1::default()
+        };
 
         state.normalize().expect("state normalizes");
         assert_eq!(
@@ -2462,23 +2474,25 @@ mod tests {
 
     #[test]
     fn stale_cleanup_drops_workspace_layouts_of_gone_scopes() {
-        let mut state = DesktopUiStateV1::default();
-        state.workspace_layouts = BTreeMap::from([
-            (
-                "checkout-a".to_string(),
-                WorkspaceLayoutState {
-                    preview_visible: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "session-gone".to_string(),
-                WorkspaceLayoutState {
-                    right_rail_visible: true,
-                    ..Default::default()
-                },
-            ),
-        ]);
+        let mut state = DesktopUiStateV1 {
+            workspace_layouts: BTreeMap::from([
+                (
+                    "checkout-a".to_string(),
+                    WorkspaceLayoutState {
+                        preview_visible: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "session-gone".to_string(),
+                    WorkspaceLayoutState {
+                        right_rail_visible: true,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..DesktopUiStateV1::default()
+        };
 
         state.cleanup_stale_ids(&UiStateReferences {
             workspace_ids: BTreeSet::from(["checkout-a".to_string()]),

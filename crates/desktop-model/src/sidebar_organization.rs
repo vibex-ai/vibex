@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use vibex_core::AgentSession;
 
+use crate::{SESSION_GROUP_NAME_MAX_CHARS, SessionGroupUiState};
+
 const SIDEBAR_FOLDER_LIMIT: usize = 2_000;
+const SIDEBAR_GROUP_LIMIT: usize = 500;
 const SIDEBAR_ORGANIZATION_ITEM_LIMIT: usize = 5_000;
 const SIDEBAR_FOLDER_DEPTH_LIMIT: usize = 32;
 const SIDEBAR_ITEM_ID_MAX_CHARS: usize = 256;
@@ -18,13 +21,21 @@ pub enum SidebarOrganizationItem {
     Folder(String),
     Project(String),
     Session(String),
+    /// A session group row. Unlike a folder it carries a workspace of its own,
+    /// so it is a leaf in the organization tree: it may sit inside a folder but
+    /// nothing may sit inside it.
+    Group(String),
 }
 
 impl SidebarOrganizationItem {
     pub fn id(&self) -> &str {
         match self {
-            Self::Folder(id) | Self::Project(id) | Self::Session(id) => id,
+            Self::Folder(id) | Self::Project(id) | Self::Session(id) | Self::Group(id) => id,
         }
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self, Self::Group(_))
     }
 }
 
@@ -61,10 +72,17 @@ pub enum SidebarOrganizationScope {
 pub struct SidebarOrganizationState {
     #[serde(default)]
     pub folders: BTreeMap<String, SidebarFolderUiState>,
+    /// Session groups, keyed by group id. A group is authoritative for its own
+    /// membership and workspace layout, so it travels with the organization
+    /// tree that also owns its placement.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, SessionGroupUiState>,
     #[serde(default)]
     pub placements: Vec<SidebarOrganizationPlacement>,
     #[serde(default)]
     pub collapsed_folder_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_group_ids: BTreeSet<String>,
 }
 
 impl SidebarOrganizationState {
@@ -99,21 +117,44 @@ impl SidebarOrganizationState {
         }
         self.folders = folders;
 
+        let mut groups = BTreeMap::new();
+        for (id, mut group) in std::mem::take(&mut self.groups) {
+            if groups.len() >= SIDEBAR_GROUP_LIMIT {
+                break;
+            }
+            let Some(id) = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+                continue;
+            };
+            group.normalize();
+            if group.project_id.is_empty() || group.workspace_id.is_empty() {
+                continue;
+            }
+            groups.entry(id).or_insert(group);
+        }
+        self.groups = groups;
+
         let valid_folder_ids = self.folders.keys().cloned().collect::<BTreeSet<_>>();
+        let valid_group_ids = self.groups.keys().cloned().collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
         self.placements = std::mem::take(&mut self.placements)
             .into_iter()
-            .filter_map(|placement| normalize_placement(placement, &valid_folder_ids))
+            .filter_map(|placement| {
+                normalize_placement(placement, &valid_folder_ids, &valid_group_ids)
+            })
             .filter(|placement| seen.insert(placement.item.clone()))
             .take(SIDEBAR_ORGANIZATION_ITEM_LIMIT)
             .collect();
         self.ensure_folder_placements();
+        self.ensure_group_placements();
         self.enforce_placement_limit();
         self.repair_parents();
         self.enforce_one_auto_archive_folder_per_project();
         self.deduplicate_sibling_folder_names();
+        self.deduplicate_sibling_group_names();
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
+        self.collapsed_group_ids
+            .retain(|id| self.groups.contains_key(id));
     }
 
     pub fn reconcile(
@@ -134,13 +175,34 @@ impl SidebarOrganizationState {
                 .as_ref()
                 .is_none_or(|project_id| valid_project_ids.contains(project_id))
         });
+
+        // A group follows its project and its members. Losing the project drops
+        // the group; losing every member drops the group too, because a group
+        // with no sessions has no workspace to show. A deleted Worktree deletes
+        // its sessions, so this same pass dissolves the groups anchored to it.
+        self.groups
+            .retain(|_, group| valid_project_ids.contains(&group.project_id));
+        for group in self.groups.values_mut() {
+            let before = group.member_session_ids.len();
+            group
+                .member_session_ids
+                .retain(|session_id| session_projects.contains_key(session_id));
+            if group.member_session_ids.len() != before {
+                group.normalize();
+            }
+        }
+        self.groups.retain(|_, group| !group.is_empty());
+        let valid_group_ids = self.groups.keys().cloned().collect::<BTreeSet<_>>();
+
         let valid_folder_ids = self.folders.keys().cloned().collect::<BTreeSet<_>>();
         self.placements.retain(|placement| match &placement.item {
             SidebarOrganizationItem::Folder(id) => valid_folder_ids.contains(id),
             SidebarOrganizationItem::Project(id) => valid_project_ids.contains(id),
             SidebarOrganizationItem::Session(id) => session_projects.contains_key(id),
+            SidebarOrganizationItem::Group(id) => valid_group_ids.contains(id),
         });
         self.ensure_folder_placements();
+        self.ensure_group_placements();
         self.repair_parents();
 
         for placement in &mut self.placements {
@@ -159,6 +221,10 @@ impl SidebarOrganizationState {
                     SidebarOrganizationItem::Session(session_id) => session_projects
                         .get(session_id)
                         .is_some_and(|project_id| parent.project_id.as_ref() == Some(project_id)),
+                    SidebarOrganizationItem::Group(group_id) => self
+                        .groups
+                        .get(group_id)
+                        .is_some_and(|group| parent.project_id.as_ref() == Some(&group.project_id)),
                 }
             });
             if !valid_parent {
@@ -166,6 +232,7 @@ impl SidebarOrganizationState {
             }
         }
         self.deduplicate_sibling_folder_names();
+        self.deduplicate_sibling_group_names();
 
         let mut placed = self
             .placements
@@ -180,6 +247,45 @@ impl SidebarOrganizationState {
                     parent_folder_id: None,
                 });
             }
+        }
+        let mut new_groups = Vec::new();
+        for group_id in self.groups.keys() {
+            let item = SidebarOrganizationItem::Group(group_id.clone());
+            if placed.insert(item.clone()) {
+                new_groups.push(item);
+            }
+        }
+        for item in new_groups {
+            // A newly discovered group lands directly above its project's first
+            // root session, so a group the user just created is visible where
+            // the sessions it was built from already are.
+            let project_id = match &item {
+                SidebarOrganizationItem::Group(group_id) => self
+                    .groups
+                    .get(group_id)
+                    .map(|group| group.project_id.clone()),
+                _ => None,
+            };
+            let insertion_index = project_id
+                .as_ref()
+                .and_then(|project_id| {
+                    self.placements.iter().position(|placement| {
+                        placement.parent_folder_id.is_none()
+                            && matches!(
+                                &placement.item,
+                                SidebarOrganizationItem::Session(existing_id)
+                                    if session_projects.get(existing_id) == Some(project_id)
+                            )
+                    })
+                })
+                .unwrap_or(self.placements.len());
+            self.placements.insert(
+                insertion_index,
+                SidebarOrganizationPlacement {
+                    item,
+                    parent_folder_id: None,
+                },
+            );
         }
         let mut new_sessions = Vec::new();
         for (session_id, project_id) in ordered_session_projects {
@@ -218,6 +324,8 @@ impl SidebarOrganizationState {
         self.align_root_session_order(ordered_session_projects);
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
+        self.collapsed_group_ids
+            .retain(|id| self.groups.contains_key(id));
     }
 
     pub fn cleanup_references(
@@ -231,18 +339,37 @@ impl SidebarOrganizationState {
                 .as_ref()
                 .is_none_or(|project_id| project_ids.contains(project_id))
         });
+        self.groups
+            .retain(|_, group| project_ids.contains(&group.project_id));
+        for group in self.groups.values_mut() {
+            let before = group.member_session_ids.len();
+            group
+                .member_session_ids
+                .retain(|session_id| session_ids.contains(session_id));
+            if group.member_session_ids.len() != before {
+                group.normalize();
+            }
+        }
+        self.groups.retain(|_, group| !group.is_empty());
+        let valid_group_ids = self.groups.keys().cloned().collect::<BTreeSet<_>>();
+
         let valid_folder_ids = self.folders.keys().cloned().collect::<BTreeSet<_>>();
         self.placements.retain(|placement| match &placement.item {
             SidebarOrganizationItem::Folder(id) => valid_folder_ids.contains(id),
             SidebarOrganizationItem::Project(id) => project_ids.contains(id),
             SidebarOrganizationItem::Session(id) => session_ids.contains(id),
+            SidebarOrganizationItem::Group(id) => valid_group_ids.contains(id),
         });
         self.ensure_folder_placements();
+        self.ensure_group_placements();
         self.enforce_placement_limit();
         self.repair_parents();
         self.deduplicate_sibling_folder_names();
+        self.deduplicate_sibling_group_names();
         self.collapsed_folder_ids
             .retain(|id| self.folders.contains_key(id));
+        self.collapsed_group_ids
+            .retain(|id| self.groups.contains_key(id));
     }
 
     pub fn create_folder(
@@ -482,6 +609,426 @@ impl SidebarOrganizationState {
         self.folders.get(folder_id)
     }
 
+    // -- Session groups ---------------------------------------------------
+
+    pub fn group(&self, group_id: &str) -> Option<&SessionGroupUiState> {
+        self.groups.get(group_id)
+    }
+
+    pub fn group_mut(&mut self, group_id: &str) -> Option<&mut SessionGroupUiState> {
+        self.groups.get_mut(group_id)
+    }
+
+    /// The group that currently holds `session_id`. A session belongs to at
+    /// most one group.
+    pub fn group_of_session(&self, session_id: &str) -> Option<&str> {
+        self.groups
+            .iter()
+            .find(|(_, group)| group.contains(session_id))
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Every group of one project, in sidebar order. Compact clients list a
+    /// project's sessions at project level, so they need the project's groups
+    /// regardless of which Worktree each one is anchored to.
+    pub fn groups_for_project(&self, project_id: &str) -> Vec<(String, &SessionGroupUiState)> {
+        let order = self
+            .placements
+            .iter()
+            .filter_map(|placement| match &placement.item {
+                SidebarOrganizationItem::Group(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let entries = self
+            .groups
+            .iter()
+            .filter(|(_, group)| group.project_id == project_id);
+        crate::ordered_groups(entries, &order)
+    }
+
+    /// Groups anchored to one Worktree, in sidebar order.
+    pub fn groups_for_workspace(
+        &self,
+        project_id: &str,
+        workspace_id: &str,
+    ) -> Vec<(String, &SessionGroupUiState)> {
+        let order = self
+            .placements
+            .iter()
+            .filter_map(|placement| match &placement.item {
+                SidebarOrganizationItem::Group(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let entries = self.groups.iter().filter(|(_, group)| {
+            group.project_id == project_id && group.workspace_id == workspace_id
+        });
+        crate::ordered_groups(entries, &order)
+    }
+
+    /// The group scope, for placement and drop validation.
+    pub fn group_scope(&self, group_id: &str) -> Option<SidebarOrganizationScope> {
+        self.groups
+            .get(group_id)
+            .map(|group| SidebarOrganizationScope::Project(group.project_id.clone()))
+    }
+
+    /// Creates a group and places it. Members whose workspace does not match
+    /// are dropped: a group is always single-Worktree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_group(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        project_id: &str,
+        workspace_id: &str,
+        member_session_ids: &[String],
+        session_workspaces: &BTreeMap<String, String>,
+        parent_folder_id: Option<String>,
+    ) -> bool {
+        let id = id.into();
+        let name = name.into();
+        let Some(id) = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+            return false;
+        };
+        let Some(project_id) = bounded_text(project_id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+            return false;
+        };
+        let Some(workspace_id) = bounded_text(workspace_id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+            return false;
+        };
+        if self.groups.len() >= SIDEBAR_GROUP_LIMIT || self.groups.contains_key(&id) {
+            return false;
+        }
+        let parent_folder_id = match parent_folder_id {
+            Some(parent_id) => {
+                let Some(parent_id) = bounded_text(&parent_id, SIDEBAR_ITEM_ID_MAX_CHARS) else {
+                    return false;
+                };
+                let Some(parent) = self.folders.get(&parent_id) else {
+                    return false;
+                };
+                if parent.project_id.as_deref() != Some(project_id.as_str()) {
+                    return false;
+                }
+                Some(parent_id)
+            }
+            None => None,
+        };
+
+        let members = member_session_ids
+            .iter()
+            .filter(|session_id| {
+                session_workspaces
+                    .get(session_id.as_str())
+                    .is_some_and(|workspace| workspace == &workspace_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return false;
+        }
+
+        let mut group = SessionGroupUiState::new(name, project_id, workspace_id, members);
+        group.normalize();
+        self.groups.insert(id.clone(), group);
+
+        let insertion_index = parent_folder_id
+            .as_ref()
+            .and_then(|parent_id| {
+                self.placements.iter().position(|placement| {
+                    placement.item == SidebarOrganizationItem::Folder(parent_id.clone())
+                })
+            })
+            .map_or(0, |index| index + 1);
+        self.placements.insert(
+            insertion_index,
+            SidebarOrganizationPlacement {
+                item: SidebarOrganizationItem::Group(id),
+                parent_folder_id,
+            },
+        );
+        self.enforce_placement_limit();
+        true
+    }
+
+    /// Adds sessions to a group. Sessions from another Worktree are rejected.
+    pub fn add_sessions_to_group(
+        &mut self,
+        group_id: &str,
+        session_ids: &[String],
+        session_workspaces: &BTreeMap<String, String>,
+    ) -> bool {
+        let Some(workspace_id) = self
+            .groups
+            .get(group_id)
+            .map(|group| group.workspace_id.clone())
+        else {
+            return false;
+        };
+        let accepted = session_ids
+            .iter()
+            .filter(|session_id| {
+                // A session already in this group is fine to repeat; a session
+                // in another group is moved, because a session belongs to one
+                // group. A session from another Worktree is refused.
+                session_workspaces
+                    .get(session_id.as_str())
+                    .is_some_and(|workspace| workspace == &workspace_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            return false;
+        }
+        for session_id in &accepted {
+            if let Some(other_group_id) = self.group_of_session(session_id)
+                && other_group_id != group_id
+            {
+                let other_group_id = other_group_id.to_string();
+                self.remove_sessions_from_group(&other_group_id, std::slice::from_ref(session_id));
+            }
+        }
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        group.add_members(&accepted)
+    }
+
+    /// Removes sessions from a group. A group that loses every member is
+    /// dissolved, because a group with no sessions has no workspace.
+    pub fn remove_sessions_from_group(&mut self, group_id: &str, session_ids: &[String]) -> bool {
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        if !group.remove_members(session_ids) {
+            return false;
+        }
+        if group.is_empty() {
+            self.delete_group(group_id);
+        }
+        true
+    }
+
+    pub fn set_group_members(
+        &mut self,
+        group_id: &str,
+        session_ids: Vec<String>,
+        session_workspaces: &BTreeMap<String, String>,
+    ) -> bool {
+        let Some(workspace_id) = self
+            .groups
+            .get(group_id)
+            .map(|group| group.workspace_id.clone())
+        else {
+            return false;
+        };
+        let accepted = session_ids
+            .into_iter()
+            .filter(|session_id| {
+                session_workspaces
+                    .get(session_id.as_str())
+                    .is_some_and(|workspace| workspace == &workspace_id)
+            })
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            self.delete_group(group_id);
+            return true;
+        }
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        group.set_members(accepted)
+    }
+
+    pub fn rename_group(&mut self, group_id: &str, name: &str) -> bool {
+        let Some(name) = bounded_text(name, SESSION_GROUP_NAME_MAX_CHARS) else {
+            return false;
+        };
+        let Some(group) = self.groups.get(group_id) else {
+            return false;
+        };
+        if group.name == name {
+            return false;
+        }
+        let project_id = group.project_id.clone();
+        let workspace_id = group.workspace_id.clone();
+        let parent_folder_id =
+            self.parent_of(&SidebarOrganizationItem::Group(group_id.to_string()));
+        if !self.group_name_is_available_at(
+            Some(group_id),
+            &name,
+            &project_id,
+            &workspace_id,
+            parent_folder_id.as_deref(),
+        ) {
+            return false;
+        }
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        group.name = name;
+        true
+    }
+
+    /// Removes a group. The member sessions stay authoritative and simply
+    /// become ungrouped again.
+    pub fn delete_group(&mut self, group_id: &str) -> bool {
+        if self.groups.remove(group_id).is_none() {
+            return false;
+        }
+        self.collapsed_group_ids.remove(group_id);
+        self.placements.retain(|placement| {
+            placement.item != SidebarOrganizationItem::Group(group_id.to_string())
+        });
+        true
+    }
+
+    pub fn set_group_pinned(&mut self, group_id: &str, pinned: bool) -> bool {
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        if group.pinned == pinned {
+            return false;
+        }
+        group.pinned = pinned;
+        true
+    }
+
+    pub fn set_group_auto_continue(&mut self, group_id: &str, enabled: Option<bool>) -> bool {
+        let Some(group) = self.groups.get_mut(group_id) else {
+            return false;
+        };
+        if group.auto_continue == enabled {
+            return false;
+        }
+        group.auto_continue = enabled;
+        true
+    }
+
+    pub fn toggle_group_collapsed(&mut self, group_id: &str) -> Option<bool> {
+        if !self.groups.contains_key(group_id) {
+            return None;
+        }
+        if self.collapsed_group_ids.remove(group_id) {
+            Some(false)
+        } else {
+            self.collapsed_group_ids.insert(group_id.to_string());
+            Some(true)
+        }
+    }
+
+    pub fn group_is_collapsed(&self, group_id: &str) -> bool {
+        self.collapsed_group_ids.contains(group_id)
+    }
+
+    /// Every session that a group already shows. These render under their group
+    /// row, so a sibling list must not repeat them.
+    pub fn grouped_session_ids(&self) -> BTreeSet<String> {
+        self.groups
+            .values()
+            .flat_map(|group| group.member_session_ids.iter().cloned())
+            .collect()
+    }
+
+    pub fn group_is_pinned(&self, group_id: &str) -> bool {
+        self.groups.get(group_id).is_some_and(|group| group.pinned)
+    }
+
+    pub fn group_name_is_available_at(
+        &self,
+        excluded_group_id: Option<&str>,
+        name: &str,
+        project_id: &str,
+        workspace_id: &str,
+        parent_folder_id: Option<&str>,
+    ) -> bool {
+        let comparable_name = comparable_folder_name(name);
+        !self.groups.iter().any(|(candidate_id, group)| {
+            excluded_group_id != Some(candidate_id.as_str())
+                && group.project_id == project_id
+                && group.workspace_id == workspace_id
+                && self
+                    .parent_of(&SidebarOrganizationItem::Group(candidate_id.clone()))
+                    .as_deref()
+                    == parent_folder_id
+                && comparable_folder_name(&group.name) == comparable_name
+        })
+    }
+
+    /// The next free default name for a new group in one Worktree.
+    pub fn next_available_group_name(
+        &self,
+        project_id: &str,
+        workspace_id: &str,
+        stem: &str,
+    ) -> String {
+        let existing = self
+            .groups
+            .values()
+            .filter(|group| group.project_id == project_id && group.workspace_id == workspace_id)
+            .map(|group| group.name.as_str());
+        crate::next_available_group_name(existing, stem)
+    }
+
+    fn ensure_group_placements(&mut self) {
+        let mut placed = self
+            .placements
+            .iter()
+            .map(|placement| placement.item.clone())
+            .collect::<BTreeSet<_>>();
+        for group_id in self.groups.keys() {
+            let item = SidebarOrganizationItem::Group(group_id.clone());
+            if placed.insert(item.clone()) {
+                self.placements.push(SidebarOrganizationPlacement {
+                    item,
+                    parent_folder_id: None,
+                });
+            }
+        }
+    }
+
+    fn deduplicate_sibling_group_names(&mut self) {
+        let mut seen_ids = BTreeSet::new();
+        let mut group_ids = self
+            .placements
+            .iter()
+            .filter_map(|placement| match &placement.item {
+                SidebarOrganizationItem::Group(id) if seen_ids.insert(id.clone()) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        group_ids.extend(
+            self.groups
+                .keys()
+                .filter(|id| seen_ids.insert((*id).clone()))
+                .cloned(),
+        );
+
+        let mut used_names = BTreeMap::<(String, String, Option<String>), BTreeSet<String>>::new();
+        for group_id in group_ids {
+            let Some(group) = self.groups.get(&group_id) else {
+                continue;
+            };
+            let name = group.name.clone();
+            let scope = (group.project_id.clone(), group.workspace_id.clone());
+            let parent = self.parent_of(&SidebarOrganizationItem::Group(group_id.clone()));
+            let names = used_names.entry((scope.0, scope.1, parent)).or_default();
+            let unique_name = next_unique_folder_name(&name, |candidate| {
+                !names.contains(&comparable_folder_name(candidate))
+            });
+            names.insert(comparable_folder_name(&unique_name));
+            if unique_name != name
+                && let Some(group) = self.groups.get_mut(&group_id)
+            {
+                group.name = unique_name;
+            }
+        }
+    }
+
     pub fn set_folder_auto_archive_after_days(
         &mut self,
         folder_id: &str,
@@ -607,7 +1154,9 @@ impl SidebarOrganizationState {
             && self.placements.iter().any(|placement| {
                 matches!(
                     placement.item,
-                    SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Session(_)
+                    SidebarOrganizationItem::Project(_)
+                        | SidebarOrganizationItem::Session(_)
+                        | SidebarOrganizationItem::Group(_)
                 ) && placement
                     .parent_folder_id
                     .as_deref()
@@ -638,6 +1187,7 @@ impl SidebarOrganizationState {
                 .get(id)
                 .cloned()
                 .map(SidebarOrganizationScope::Project),
+            SidebarOrganizationItem::Group(id) => self.group_scope(id),
         }
     }
 
@@ -1225,6 +1775,7 @@ impl SidebarOrganizationState {
                             parent_scope.0.is_none() && parent_scope.1.is_none()
                         }
                         SidebarOrganizationItem::Session(_) => parent_scope.0.is_some(),
+                        SidebarOrganizationItem::Group(_) => parent_scope.0.is_some(),
                     });
             if !valid {
                 placement.parent_folder_id = None;
@@ -1270,7 +1821,8 @@ impl SidebarOrganizationState {
                 }
                 SidebarOrganizationItem::Folder(_)
                 | SidebarOrganizationItem::Project(_)
-                | SidebarOrganizationItem::Session(_) => None,
+                | SidebarOrganizationItem::Session(_)
+                | SidebarOrganizationItem::Group(_) => None,
             })
             .collect::<Vec<_>>();
         folder_ids.extend(
@@ -1328,6 +1880,7 @@ impl SidebarOrganizationState {
 fn normalize_placement(
     placement: SidebarOrganizationPlacement,
     valid_folder_ids: &BTreeSet<String>,
+    valid_group_ids: &BTreeSet<String>,
 ) -> Option<SidebarOrganizationPlacement> {
     let item = match placement.item {
         SidebarOrganizationItem::Folder(id) => {
@@ -1341,6 +1894,12 @@ fn normalize_placement(
         }
         SidebarOrganizationItem::Session(id) => {
             SidebarOrganizationItem::Session(bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS)?)
+        }
+        SidebarOrganizationItem::Group(id) => {
+            let id = bounded_text(&id, SIDEBAR_ITEM_ID_MAX_CHARS)?;
+            valid_group_ids
+                .contains(&id)
+                .then_some(SidebarOrganizationItem::Group(id))?
         }
     };
     let parent_folder_id = placement
@@ -1561,7 +2120,9 @@ mod tests {
                     parent_folder_id: None,
                 },
             ],
+            groups: BTreeMap::new(),
             collapsed_folder_ids: BTreeSet::new(),
+            collapsed_group_ids: BTreeSet::new(),
         };
 
         state.normalize();
@@ -2028,7 +2589,9 @@ mod tests {
                     parent_folder_id: None,
                 })
                 .collect(),
+            groups: BTreeMap::new(),
             collapsed_folder_ids: BTreeSet::new(),
+            collapsed_group_ids: BTreeSet::new(),
         };
 
         state.normalize();
@@ -2077,6 +2640,8 @@ mod tests {
                 },
             ],
             collapsed_folder_ids: BTreeSet::from(["a".into(), "missing".into()]),
+            groups: BTreeMap::new(),
+            collapsed_group_ids: BTreeSet::new(),
         };
 
         state.normalize();
@@ -2219,5 +2784,390 @@ mod tests {
                 SidebarOrganizationItem::Session(older.id.as_str().to_string()),
             ],
         );
+    }
+
+    fn group_workspaces() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("session-a".to_string(), "workspace-a".to_string()),
+            ("session-b".to_string(), "workspace-a".to_string()),
+            ("session-c".to_string(), "workspace-b".to_string()),
+        ])
+    }
+
+    fn group_members(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn a_group_is_created_with_a_placement_and_its_members() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        let group = state.group("group-1").expect("group should exist");
+        assert_eq!(
+            group.member_session_ids,
+            group_members(&["session-a", "session-b"])
+        );
+        assert_eq!(group.workspace_id, "workspace-a");
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            None
+        );
+        assert_eq!(state.group_of_session("session-a"), Some("group-1"));
+        assert_eq!(state.group_of_session("session-c"), None);
+    }
+
+    #[test]
+    fn a_group_refuses_members_from_another_worktree() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(!state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-c"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.group("group-1").is_none());
+    }
+
+    #[test]
+    fn adding_a_session_that_already_belongs_to_a_group_moves_it() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.create_group(
+            "group-2",
+            "会话组 2",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.add_sessions_to_group(
+            "group-2",
+            &group_members(&["session-a"]),
+            &group_workspaces()
+        ));
+        // A session belongs to exactly one group, so the move vacates group-1.
+        assert_eq!(state.group_of_session("session-a"), Some("group-2"));
+        assert!(state.group("group-1").is_none());
+        assert_eq!(
+            state
+                .group("group-2")
+                .expect("group-2 should remain")
+                .member_session_ids,
+            group_members(&["session-b", "session-a"])
+        );
+    }
+
+    #[test]
+    fn removing_the_last_member_dissolves_the_group_and_keeps_the_sessions() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.remove_sessions_from_group("group-1", &group_members(&["session-a"])));
+        assert!(state.group("group-1").is_some());
+        assert!(state.remove_sessions_from_group("group-1", &group_members(&["session-b"])));
+        // The group goes; the sessions stay authoritative and simply ungrouped.
+        assert!(state.group("group-1").is_none());
+        assert_eq!(state.group_of_session("session-a"), None);
+        assert!(!state
+            .placements
+            .iter()
+            .any(|placement| placement.item == SidebarOrganizationItem::Group("group-1".into())));
+    }
+
+    #[test]
+    fn deleting_a_group_keeps_its_sessions_placements() {
+        let mut state = SidebarOrganizationState::default();
+        state.placements.push(SidebarOrganizationPlacement {
+            item: SidebarOrganizationItem::Session("session-a".into()),
+            parent_folder_id: None,
+        });
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.delete_group("group-1"));
+        assert!(state.group("group-1").is_none());
+        assert!(state.placements.iter().any(
+            |placement| placement.item == SidebarOrganizationItem::Session("session-a".into())
+        ));
+    }
+
+    #[test]
+    fn reconcile_dissolves_a_group_whose_sessions_are_gone() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        // Both members disappeared — a deleted Worktree deletes its sessions.
+        state.reconcile(&["project-a".to_string()], &[]);
+        assert!(state.group("group-1").is_none());
+    }
+
+    #[test]
+    fn reconcile_prunes_missing_members_without_dropping_the_group() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        state.reconcile(
+            &["project-a".to_string()],
+            &[("session-b".to_string(), "project-a".to_string())],
+        );
+        let group = state.group("group-1").expect("group should survive");
+        assert_eq!(group.member_session_ids, group_members(&["session-b"]));
+    }
+
+    #[test]
+    fn cleanup_references_drops_groups_and_members_that_are_gone() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        state.cleanup_references(
+            &BTreeSet::from(["project-a".to_string()]),
+            &BTreeSet::from(["session-a".to_string()]),
+        );
+        let group = state.group("group-1").expect("group should survive");
+        assert_eq!(group.member_session_ids, group_members(&["session-a"]));
+        state.cleanup_references(&BTreeSet::new(), &BTreeSet::new());
+        assert!(state.group("group-1").is_none());
+    }
+
+    #[test]
+    fn a_group_can_sit_inside_a_folder_and_survives_deleting_the_folder() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_folder("folder-1", "Archive", Some("project-a".to_string()), None,));
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            Some("folder-1".to_string()),
+        ));
+        assert_eq!(
+            state.parent_of(&SidebarOrganizationItem::Group("group-1".into())),
+            Some("folder-1".to_string())
+        );
+        assert!(state.delete_folder("folder-1"));
+        // The folder's classification goes, but the group is not a folder child
+        // record: it becomes unplaced and is restored by the next projection.
+        assert!(state.group("group-1").is_some());
+    }
+
+    #[test]
+    fn group_names_are_unique_within_one_worktree() {
+        let mut state = SidebarOrganizationState::default();
+        assert_eq!(
+            state.next_available_group_name("project-a", "workspace-a", "会话组"),
+            "会话组 1"
+        );
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert_eq!(
+            state.next_available_group_name("project-a", "workspace-a", "会话组"),
+            "会话组 2"
+        );
+        // Another Worktree has its own ordinals.
+        assert_eq!(
+            state.next_available_group_name("project-a", "workspace-b", "会话组"),
+            "会话组 1"
+        );
+        assert!(!state.rename_group("group-1", "  "));
+        assert!(state.rename_group("group-1", "重构"));
+        assert_eq!(
+            state.group("group-1").map(|group| group.name.as_str()),
+            Some("重构")
+        );
+    }
+
+    #[test]
+    fn pinning_and_collapsing_a_group_are_independent_of_sessions() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(!state.group_is_pinned("group-1"));
+        assert!(state.set_group_pinned("group-1", true));
+        assert!(state.group_is_pinned("group-1"));
+        assert_eq!(state.toggle_group_collapsed("group-1"), Some(true));
+        assert!(state.group_is_collapsed("group-1"));
+        assert_eq!(state.toggle_group_collapsed("group-1"), Some(false));
+        assert_eq!(state.toggle_group_collapsed("missing"), None);
+    }
+
+    #[test]
+    fn a_group_carries_a_group_level_auto_continue() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert_eq!(
+            state.group("group-1").and_then(|group| group.auto_continue),
+            None
+        );
+        assert!(state.set_group_auto_continue("group-1", Some(true)));
+        assert_eq!(
+            state.group("group-1").and_then(|group| group.auto_continue),
+            Some(true)
+        );
+        assert!(!state.set_group_auto_continue("group-1", Some(true)));
+    }
+
+    #[test]
+    fn grouped_sessions_are_listed_once_under_their_group() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        let grouped = state.grouped_session_ids();
+        assert!(grouped.contains("session-a"));
+        assert!(grouped.contains("session-b"));
+        assert!(!grouped.contains("session-c"));
+    }
+
+    #[test]
+    fn deleting_a_group_makes_its_sessions_siblings_again() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        let project_id = "project-a".to_string();
+        let workspace_id = "workspace-a".to_string();
+        let group_ids = state
+            .groups_for_workspace(&project_id, &workspace_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        let items = crate::sidebar_project_items_for_workspace(
+            &state,
+            &project_id,
+            Some(&workspace_id),
+            false,
+            false,
+            &group_members(&["session-a", "session-b"]),
+            &group_ids,
+            &BTreeSet::new(),
+            None,
+        );
+        // While the group is listed, its members are not also siblings.
+        assert!(items.contains(&SidebarOrganizationItem::Group("group-1".into())));
+        assert!(!items.contains(&SidebarOrganizationItem::Session("session-a".into())));
+
+        assert!(state.delete_group("group-1"));
+        let items = crate::sidebar_project_items_for_workspace(
+            &state,
+            &project_id,
+            Some(&workspace_id),
+            false,
+            false,
+            &group_members(&["session-a", "session-b"]),
+            &[],
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(items.contains(&SidebarOrganizationItem::Session("session-a".into())));
+    }
+
+    #[test]
+    fn a_group_round_trips_through_serde() {
+        let mut state = SidebarOrganizationState::default();
+        assert!(state.create_group(
+            "group-1",
+            "会话组 1",
+            "project-a",
+            "workspace-a",
+            &group_members(&["session-a", "session-b"]),
+            &group_workspaces(),
+            None,
+        ));
+        assert!(state.set_group_pinned("group-1", true));
+        let encoded = serde_json::to_string(&state).expect("state should serialize");
+        let decoded: SidebarOrganizationState =
+            serde_json::from_str(&encoded).expect("state should deserialize");
+        assert_eq!(decoded.groups, state.groups);
+        assert_eq!(decoded.placements, state.placements);
     }
 }

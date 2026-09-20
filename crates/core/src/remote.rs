@@ -4330,6 +4330,9 @@ pub enum RemoteSidebarItemKind {
     Folder,
     Project,
     Session,
+    /// A session group row. A group is a leaf in the organization tree: it may
+    /// sit inside a folder, but nothing sits inside it.
+    Group,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -4362,6 +4365,27 @@ pub struct RemoteSidebarPlacement {
     pub parent_folder_id: Option<String>,
 }
 
+/// One session group as a compact client needs to draw its sidebar row.
+///
+/// The group's pane split tree stays on the Desktop: a compact client shows the
+/// stacked agent avatars, the name and the member list, and opens one session at
+/// a time. Sending the layout would describe a composition the client cannot
+/// render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSessionGroup {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub member_session_ids: Vec<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub auto_continue: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSidebarOrganizationSnapshot {
@@ -4369,9 +4393,13 @@ pub struct RemoteSidebarOrganizationSnapshot {
     /// stale snapshot from a current one without diffing the whole tree.
     pub revision: u64,
     pub folders: Vec<RemoteSidebarFolder>,
+    #[serde(default)]
+    pub groups: Vec<RemoteSessionGroup>,
     pub placements: Vec<RemoteSidebarPlacement>,
     #[serde(default)]
     pub collapsed_folder_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed_group_ids: Vec<String>,
     #[serde(default)]
     pub collapsed_project_ids: Vec<String>,
     #[serde(default)]
@@ -4510,6 +4538,41 @@ pub enum RemoteSidebarOrganizationMutation {
     },
     SetSessionAutoContinue {
         session_id: String,
+        enabled: bool,
+    },
+    /// Creates a group from existing sessions. Every member must belong to
+    /// `workspace_id`; the Desktop rejects members from another Worktree.
+    CreateGroup {
+        name: String,
+        project_id: String,
+        workspace_id: String,
+        member_session_ids: Vec<String>,
+        #[serde(default)]
+        parent_folder_id: Option<String>,
+    },
+    RenameGroup {
+        group_id: String,
+        name: String,
+    },
+    /// Dissolves a group. The member sessions stay; only the group row goes.
+    DeleteGroup {
+        group_id: String,
+    },
+    /// Replaces a group's membership. An empty list dissolves the group.
+    SetGroupMembers {
+        group_id: String,
+        session_ids: Vec<String>,
+    },
+    SetGroupCollapsed {
+        group_id: String,
+        collapsed: bool,
+    },
+    SetGroupPinned {
+        group_id: String,
+        pinned: bool,
+    },
+    SetGroupAutoContinue {
+        group_id: String,
         enabled: bool,
     },
     SetWorktreeTitle {

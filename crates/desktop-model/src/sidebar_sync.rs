@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use vibex_core::{
-    RemoteSidebarDropPosition, RemoteSidebarFolder, RemoteSidebarHierarchyMode,
+    RemoteSessionGroup, RemoteSidebarDropPosition, RemoteSidebarFolder, RemoteSidebarHierarchyMode,
     RemoteSidebarItemKind, RemoteSidebarItemRef, RemoteSidebarNewSessionLocation,
     RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot, RemoteSidebarPlacement,
     RemoteSidebarProjectAppearance,
@@ -92,6 +92,7 @@ fn item_to_remote(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
         SidebarOrganizationItem::Project(id) => (RemoteSidebarItemKind::Project, id),
         SidebarOrganizationItem::Session(id) => (RemoteSidebarItemKind::Session, id),
+        SidebarOrganizationItem::Group(id) => (RemoteSidebarItemKind::Group, id),
     };
     RemoteSidebarItemRef {
         kind,
@@ -104,6 +105,7 @@ pub fn item_from_remote(item: &RemoteSidebarItemRef) -> SidebarOrganizationItem 
         RemoteSidebarItemKind::Folder => SidebarOrganizationItem::Folder(item.id.clone()),
         RemoteSidebarItemKind::Project => SidebarOrganizationItem::Project(item.id.clone()),
         RemoteSidebarItemKind::Session => SidebarOrganizationItem::Session(item.id.clone()),
+        RemoteSidebarItemKind::Group => SidebarOrganizationItem::Group(item.id.clone()),
     }
 }
 
@@ -123,6 +125,20 @@ impl SidebarOrganizationView {
                     auto_archive_after_days: folder.auto_archive_after_days,
                 })
                 .collect(),
+            groups: self
+                .organization
+                .groups
+                .iter()
+                .map(|(id, group)| RemoteSessionGroup {
+                    id: id.clone(),
+                    name: group.name.clone(),
+                    project_id: group.project_id.clone(),
+                    workspace_id: group.workspace_id.clone(),
+                    member_session_ids: group.member_session_ids.clone(),
+                    pinned: group.pinned,
+                    auto_continue: group.auto_continue,
+                })
+                .collect(),
             placements: self
                 .organization
                 .placements
@@ -135,6 +151,12 @@ impl SidebarOrganizationView {
             collapsed_folder_ids: self
                 .organization
                 .collapsed_folder_ids
+                .iter()
+                .cloned()
+                .collect(),
+            collapsed_group_ids: self
+                .organization
+                .collapsed_group_ids
                 .iter()
                 .cloned()
                 .collect(),
@@ -210,6 +232,21 @@ impl SidebarOrganizationView {
                     )
                 })
                 .collect(),
+            groups: snapshot
+                .groups
+                .iter()
+                .map(|group| {
+                    (
+                        group.id.clone(),
+                        crate::SessionGroupUiState::new(
+                            group.name.clone(),
+                            group.project_id.clone(),
+                            group.workspace_id.clone(),
+                            group.member_session_ids.clone(),
+                        ),
+                    )
+                })
+                .collect(),
             placements: snapshot
                 .placements
                 .iter()
@@ -219,7 +256,14 @@ impl SidebarOrganizationView {
                 })
                 .collect(),
             collapsed_folder_ids: snapshot.collapsed_folder_ids.iter().cloned().collect(),
+            collapsed_group_ids: snapshot.collapsed_group_ids.iter().cloned().collect(),
         };
+        for group in &snapshot.groups {
+            if let Some(state) = organization.groups.get_mut(&group.id) {
+                state.pinned = group.pinned;
+                state.auto_continue = group.auto_continue;
+            }
+        }
         organization.normalize();
         Self {
             revision: snapshot.revision,
@@ -289,7 +333,9 @@ impl SidebarOrganizationView {
         &mut self,
         mutation: &RemoteSidebarOrganizationMutation,
         session_projects: &BTreeMap<String, String>,
+        session_workspaces: &BTreeMap<String, String>,
         new_folder_id: &str,
+        new_group_id: &str,
     ) -> Result<SidebarMutationOutcome, SidebarMutationRejection> {
         let outcome = match mutation {
             RemoteSidebarOrganizationMutation::MoveItems {
@@ -516,6 +562,118 @@ impl SidebarOrganizationView {
                 self.auto_continue_paused_session_ids.remove(session_id);
                 SidebarMutationEffect::NAVIGATION.into()
             }
+            RemoteSidebarOrganizationMutation::CreateGroup {
+                name,
+                project_id,
+                workspace_id,
+                member_session_ids,
+                parent_folder_id,
+            } => {
+                if !self.organization.create_group(
+                    new_group_id,
+                    name.trim(),
+                    project_id,
+                    workspace_id,
+                    member_session_ids,
+                    session_workspaces,
+                    parent_folder_id.clone(),
+                ) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                if let Some(parent_folder_id) = parent_folder_id {
+                    self.organization
+                        .collapsed_folder_ids
+                        .remove(parent_folder_id);
+                }
+                SidebarMutationEffect::ORGANIZATION.into()
+            }
+            RemoteSidebarOrganizationMutation::RenameGroup { group_id, name } => {
+                let name = name.trim();
+                let Some(group) = self.organization.groups.get(group_id) else {
+                    return Err(SidebarMutationRejection::Rejected);
+                };
+                if group.name == name {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                if !self.organization.rename_group(group_id, name) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                SidebarMutationEffect::ORGANIZATION.into()
+            }
+            RemoteSidebarOrganizationMutation::DeleteGroup { group_id } => {
+                if !self.organization.delete_group(group_id) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                SidebarMutationEffect::ORGANIZATION.into()
+            }
+            RemoteSidebarOrganizationMutation::SetGroupMembers {
+                group_id,
+                session_ids,
+            } => {
+                if !self.organization.groups.contains_key(group_id) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                if !self.organization.set_group_members(
+                    group_id,
+                    session_ids.clone(),
+                    session_workspaces,
+                ) {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                SidebarMutationEffect::ORGANIZATION.into()
+            }
+            RemoteSidebarOrganizationMutation::SetGroupCollapsed {
+                group_id,
+                collapsed,
+            } => {
+                if !self.organization.groups.contains_key(group_id) {
+                    return Err(SidebarMutationRejection::Rejected);
+                }
+                let changed = if *collapsed {
+                    self.organization
+                        .collapsed_group_ids
+                        .insert(group_id.clone())
+                } else {
+                    self.organization.collapsed_group_ids.remove(group_id)
+                };
+                if changed {
+                    SidebarMutationEffect::ORGANIZATION.into()
+                } else {
+                    SidebarMutationOutcome::AlreadyApplied
+                }
+            }
+            RemoteSidebarOrganizationMutation::SetGroupPinned { group_id, pinned } => {
+                if !self.organization.set_group_pinned(group_id, *pinned) {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                SidebarMutationEffect::NAVIGATION.into()
+            }
+            RemoteSidebarOrganizationMutation::SetGroupAutoContinue { group_id, enabled } => {
+                let Some(group) = self.organization.groups.get(group_id) else {
+                    return Err(SidebarMutationRejection::Rejected);
+                };
+                let members = group.member_session_ids.clone();
+                if !self
+                    .organization
+                    .set_group_auto_continue(group_id, Some(*enabled))
+                {
+                    return Ok(SidebarMutationOutcome::AlreadyApplied);
+                }
+                // The group flag fans out into the per-session overrides the
+                // runtime loop actually reads, so a compact client's toggle has
+                // the same effect as the Desktop's group menu.
+                for session_id in members {
+                    if *enabled {
+                        self.auto_continue_session_ids.insert(session_id.clone());
+                    } else {
+                        self.auto_continue_session_ids.remove(&session_id);
+                    }
+                    self.auto_continue_session_overrides
+                        .insert(session_id.clone(), *enabled);
+                    self.auto_continue_paused_session_ids.remove(&session_id);
+                }
+                SidebarMutationEffect::NAVIGATION.into()
+            }
             RemoteSidebarOrganizationMutation::SetWorktreeTitle {
                 workspace_id,
                 title,
@@ -652,6 +810,12 @@ pub fn sidebar_project_items(
     pinned_session_ids: &BTreeSet<String>,
     parent_folder_id: Option<&str>,
 ) -> Vec<SidebarOrganizationItem> {
+    let group_ids = organization
+        .groups
+        .iter()
+        .filter(|(_, group)| group.project_id == project_id)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
     sidebar_project_items_for_workspace(
         organization,
         project_id,
@@ -659,6 +823,7 @@ pub fn sidebar_project_items(
         true,
         true,
         session_ids,
+        &group_ids,
         pinned_session_ids,
         parent_folder_id,
     )
@@ -677,9 +842,33 @@ pub fn sidebar_project_items_for_workspace(
     include_legacy_project_folders: bool,
     include_all_workspace_folders: bool,
     session_ids: &[String],
+    group_ids: &[String],
     pinned_session_ids: &BTreeSet<String>,
     parent_folder_id: Option<&str>,
 ) -> Vec<SidebarOrganizationItem> {
+    // A session inside a group renders under its group row, so it is not also
+    // offered as a sibling here. A caller that lists no groups — a compact
+    // surface that has not implemented group rows — keeps the members visible
+    // as ordinary sessions instead of losing them.
+    let listed_group_ids = group_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let grouped_session_ids = if listed_group_ids.is_empty() {
+        BTreeSet::new()
+    } else {
+        organization
+            .grouped_session_ids()
+            .into_iter()
+            .filter(|session_id| {
+                organization
+                    .group_of_session(session_id)
+                    .is_some_and(|group_id| listed_group_ids.contains(group_id))
+            })
+            .collect()
+    };
+    let session_ids = session_ids
+        .iter()
+        .filter(|session_id| !grouped_session_ids.contains(session_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut available = organization
         .folders
         .iter()
@@ -698,10 +887,19 @@ pub fn sidebar_project_items_for_workspace(
             .iter()
             .map(|id| SidebarOrganizationItem::Session(id.clone())),
     );
-    let ordered = organization.ordered_children(parent_folder_id, &available);
-    let (pinned, rest): (Vec<_>, Vec<_>) = ordered.into_iter().partition(
-        |item| matches!(item, SidebarOrganizationItem::Session(id) if pinned_session_ids.contains(id)),
+    // A group is a leaf like a session, so it participates in the same sibling
+    // ordering and can sit inside a folder.
+    available.extend(
+        group_ids
+            .iter()
+            .map(|id| SidebarOrganizationItem::Group(id.clone())),
     );
+    let ordered = organization.ordered_children(parent_folder_id, &available);
+    let (pinned, rest): (Vec<_>, Vec<_>) = ordered.into_iter().partition(|item| match item {
+        SidebarOrganizationItem::Session(id) => pinned_session_ids.contains(id),
+        SidebarOrganizationItem::Group(id) => organization.group_is_pinned(id),
+        _ => false,
+    });
     pinned.into_iter().chain(rest).collect()
 }
 
@@ -732,6 +930,13 @@ mod tests {
         BTreeMap::from([
             ("session-a".to_string(), "project-1".to_string()),
             ("session-b".to_string(), "project-1".to_string()),
+        ])
+    }
+
+    fn session_workspaces() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("session-a".to_string(), "workspace-a".to_string()),
+            ("session-b".to_string(), "workspace-a".to_string()),
         ])
     }
 
@@ -819,6 +1024,7 @@ mod tests {
             false,
             false,
             &sessions,
+            &[],
             &BTreeSet::new(),
             None,
         );
@@ -857,6 +1063,8 @@ mod tests {
                     project_id: Some("project-1".to_string()),
                 },
                 &session_projects(),
+                &session_workspaces(),
+                "unused",
                 "unused",
             )
             .expect("moving a session into a project folder is legal");
@@ -890,6 +1098,8 @@ mod tests {
                 project_id: Some("project-1".to_string()),
             },
             &session_projects(),
+            &session_workspaces(),
+            "unused",
             "unused",
         );
         assert_eq!(outcome, Err(SidebarMutationRejection::Rejected));
@@ -917,6 +1127,8 @@ mod tests {
                 project_id: Some("project-1".to_string()),
             },
             &session_projects(),
+            &session_workspaces(),
+            "unused",
             "unused",
         );
         assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
@@ -933,6 +1145,8 @@ mod tests {
                 collapsed: true,
             },
             &session_projects(),
+            &session_workspaces(),
+            "unused",
             "unused",
         );
         assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
@@ -947,6 +1161,8 @@ mod tests {
                 mode: RemoteSidebarHierarchyMode::Compact,
             },
             &session_projects(),
+            &session_workspaces(),
+            "unused",
             "unused",
         );
         assert_eq!(outcome, Ok(SidebarMutationOutcome::AlreadyApplied));
@@ -962,6 +1178,8 @@ mod tests {
                     pinned: true,
                 },
                 &session_projects(),
+                &session_workspaces(),
+                "unused",
                 "unused",
             ),
             Err(SidebarMutationRejection::Rejected)
@@ -978,6 +1196,8 @@ mod tests {
                     collapsed: true,
                 },
                 &session_projects(),
+                &session_workspaces(),
+                "unused",
                 "unused",
             )
             .expect("collapsing a project is always legal");
@@ -1008,6 +1228,8 @@ mod tests {
                     position: RemoteSidebarDropPosition::After,
                 },
                 &session_projects(),
+                &session_workspaces(),
+                "unused",
                 "unused",
             )
             .expect("workspace reorder should be legal");

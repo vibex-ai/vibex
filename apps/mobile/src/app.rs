@@ -16555,6 +16555,7 @@ fn sidebar_item_ref(item: &SidebarOrganizationItem) -> RemoteSidebarItemRef {
         SidebarOrganizationItem::Folder(id) => (RemoteSidebarItemKind::Folder, id),
         SidebarOrganizationItem::Project(id) => (RemoteSidebarItemKind::Project, id),
         SidebarOrganizationItem::Session(id) => (RemoteSidebarItemKind::Session, id),
+        SidebarOrganizationItem::Group(id) => (RemoteSidebarItemKind::Group, id),
     };
     RemoteSidebarItemRef {
         kind,
