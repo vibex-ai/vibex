@@ -325,26 +325,95 @@ pub struct AppearanceUiState {
     pub theme_selection: ThemeSelection,
 }
 
+/// How the desktop runtime resolves the outbound route for its network work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkProxyMode {
+    /// Follow the operating system configuration and any proxy environment
+    /// variables inherited by the process.
+    #[default]
+    System,
+    /// Never use a proxy.
+    Direct,
+    /// Use [`NetworkProxyUiState::proxy_url`] and
+    /// [`NetworkProxyUiState::bypass`].
+    Custom,
+}
+
+/// Hosts a custom proxy must not be used for, unless the user replaces the
+/// list. `localhost`, the loopback addresses, and `<local>` keep the desktop's
+/// own runtime, relay, and preview traffic off the proxy by default.
+pub const DEFAULT_NETWORK_PROXY_BYPASS: &str = "localhost,127.0.0.1,::1,<local>";
+
 /// Local outbound network proxy preference for the desktop runtime.
 ///
 /// The URL is normalized and validated by the native runtime before it is
 /// applied to process environment or HTTP clients. Keeping this as a local
 /// UI preference avoids syncing device-specific network credentials remotely.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "NetworkProxyUiStateWire")]
 pub struct NetworkProxyUiState {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
+    pub mode: NetworkProxyMode,
+    /// Retained while another mode is selected, so switching back to Custom
+    /// does not lose the address the user configured.
     pub proxy_url: Option<String>,
+    pub bypass: String,
+}
+
+impl Default for NetworkProxyUiState {
+    fn default() -> Self {
+        Self {
+            mode: NetworkProxyMode::System,
+            proxy_url: None,
+            bypass: DEFAULT_NETWORK_PROXY_BYPASS.to_string(),
+        }
+    }
+}
+
+/// Persisted shape of [`NetworkProxyUiState`].
+///
+/// State written before proxy modes existed carried a single `enabled` toggle
+/// and no `bypass` list, so both are decoded here and folded into the current
+/// shape instead of silently dropping an enabled custom proxy.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxyUiStateWire {
+    #[serde(default)]
+    mode: Option<NetworkProxyMode>,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    bypass: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+impl From<NetworkProxyUiStateWire> for NetworkProxyUiState {
+    fn from(wire: NetworkProxyUiStateWire) -> Self {
+        let mode = wire.mode.unwrap_or({
+            if wire.enabled.unwrap_or(false) {
+                NetworkProxyMode::Custom
+            } else {
+                NetworkProxyMode::System
+            }
+        });
+        Self {
+            mode,
+            proxy_url: wire.proxy_url,
+            bypass: wire
+                .bypass
+                .unwrap_or_else(|| DEFAULT_NETWORK_PROXY_BYPASS.to_string()),
+        }
+    }
 }
 
 impl fmt::Debug for NetworkProxyUiState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NetworkProxyUiState")
-            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
             .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .field("bypass", &self.bypass)
             .finish()
     }
 }
@@ -1189,6 +1258,13 @@ impl DesktopUiStateV1 {
         self.appearance.interface_font.normalize(12);
         self.appearance.code_font.normalize(10);
         self.network_proxy.proxy_url = bounded_optional(self.network_proxy.proxy_url.take(), 2_048);
+        self.network_proxy.bypass = self
+            .network_proxy
+            .bypass
+            .trim()
+            .chars()
+            .take(2_048)
+            .collect();
         self.workbench.active_tab =
             bounded_required(&self.workbench.active_tab, 80).unwrap_or_else(|| "agent".to_string());
         self.workbench.selected_workspace_id =
@@ -2110,6 +2186,65 @@ mod tests {
 
         let restored: PreviewUiState = serde_json::from_value(encoded).unwrap();
         assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn proxy_mode_and_bypass_round_trip_through_json() {
+        let state = NetworkProxyUiState {
+            mode: NetworkProxyMode::Custom,
+            proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+            bypass: "localhost,127.0.0.1,::1,<local>".to_string(),
+        };
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["mode"], serde_json::json!("custom"));
+        assert_eq!(
+            encoded["proxyUrl"],
+            serde_json::json!("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(
+            encoded["bypass"],
+            serde_json::json!("localhost,127.0.0.1,::1,<local>")
+        );
+
+        let restored: NetworkProxyUiState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn legacy_proxy_toggle_decodes_into_a_mode() {
+        let enabled: NetworkProxyUiState = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "proxyUrl": "http://127.0.0.1:7890",
+        }))
+        .unwrap();
+        assert_eq!(enabled.mode, NetworkProxyMode::Custom);
+        assert_eq!(enabled.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(enabled.bypass, DEFAULT_NETWORK_PROXY_BYPASS);
+
+        let disabled: NetworkProxyUiState = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "proxyUrl": "http://127.0.0.1:7890",
+        }))
+        .unwrap();
+        assert_eq!(disabled.mode, NetworkProxyMode::System);
+        assert_eq!(disabled.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+
+        let absent: NetworkProxyUiState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(absent, NetworkProxyUiState::default());
+    }
+
+    #[test]
+    fn an_explicitly_empty_proxy_bypass_list_survives_a_round_trip() {
+        let state = NetworkProxyUiState {
+            bypass: String::new(),
+            ..NetworkProxyUiState::default()
+        };
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["bypass"], serde_json::json!(""));
+
+        let restored: NetworkProxyUiState = serde_json::from_value(encoded).unwrap();
+        assert!(restored.bypass.is_empty());
     }
 
     fn session_layout(tabs: &[(&str, i64)]) -> crate::PreviewState {

@@ -117,12 +117,13 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
-    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState,
-    EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey, GitWorkbenchMode, LocaleMode,
-    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
-    NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket, NewSessionSubmissionStage,
-    NewSessionWorkspaceState, PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT,
-    ReasoningDisplayMode, RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
+    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey,
+    GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS,
+    MessageSendKey, NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
+    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
+    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
     SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
     SidebarMutationOutcome, SidebarMutationRejection, SidebarOrganizationItem,
     SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
@@ -28271,43 +28272,49 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn set_network_proxy_url(&mut self, value: String, cx: &mut Context<Self>) {
-        let next = NetworkProxyUiState {
-            enabled: self.ui_state.network_proxy.enabled,
-            proxy_url: (!value.trim().is_empty()).then_some(value.trim().to_string()),
-        };
+    /// Apply a draft proxy configuration and keep the workbench's copy in step
+    /// with the normalized result the runtime accepted.
+    fn apply_network_proxy(&mut self, next: NetworkProxyUiState, cx: &mut Context<Self>) -> bool {
         match vibex_desktop_runtime::network_proxy::configure(&next) {
             Ok(normalized) => {
                 self.ui_state.network_proxy = normalized;
                 self.queue_ui_state();
+                true
             }
             Err(error) => {
                 self.queue_settings_operation_notice(
                     SettingsOperationNotice::error(localize_network_proxy_error(&error)),
                     cx,
                 );
+                false
             }
         }
+    }
+
+    fn set_network_proxy_mode(&mut self, mode: NetworkProxyMode, cx: &mut Context<Self>) {
+        let next = NetworkProxyUiState {
+            mode,
+            ..self.ui_state.network_proxy.clone()
+        };
+        self.apply_network_proxy(next, cx);
         cx.notify();
     }
 
-    fn set_network_proxy_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_network_proxy_url(&mut self, value: String, cx: &mut Context<Self>) {
         let next = NetworkProxyUiState {
-            enabled,
-            proxy_url: self.ui_state.network_proxy.proxy_url.clone(),
+            proxy_url: (!value.trim().is_empty()).then_some(value.trim().to_string()),
+            ..self.ui_state.network_proxy.clone()
         };
-        match vibex_desktop_runtime::network_proxy::configure(&next) {
-            Ok(normalized) => {
-                self.ui_state.network_proxy = normalized;
-                self.queue_ui_state();
-            }
-            Err(error) => {
-                self.queue_settings_operation_notice(
-                    SettingsOperationNotice::error(localize_network_proxy_error(&error)),
-                    cx,
-                );
-            }
-        }
+        self.apply_network_proxy(next, cx);
+        cx.notify();
+    }
+
+    fn set_network_proxy_bypass(&mut self, value: String, cx: &mut Context<Self>) {
+        let next = NetworkProxyUiState {
+            bypass: value,
+            ..self.ui_state.network_proxy.clone()
+        };
+        self.apply_network_proxy(next, cx);
         cx.notify();
     }
 
@@ -47698,10 +47705,10 @@ fn observe_preview_window_close<T: 'static>(
 
 fn localize_network_proxy_error(error: &str) -> String {
     match error {
-        "proxy address is required when the proxy is enabled" => locale::text(
-            "Enter a proxy address to enable the network proxy.",
-            "启用网络代理前请输入代理地址。",
-            "啟用網路代理前請輸入代理位址。",
+        "proxy address is required for a custom proxy" => locale::text(
+            "Enter a proxy address to use a custom proxy.",
+            "使用自定义代理前请输入代理地址。",
+            "使用自訂代理前請輸入代理位址。",
         )
         .to_string(),
         "proxy address is empty or too long"
@@ -47713,6 +47720,45 @@ fn localize_network_proxy_error(error: &str) -> String {
         )
         .to_string(),
         _ => error.to_string(),
+    }
+}
+
+/// Turn the connection test's stable failure code into the sentence the user
+/// reads. The codes are raised by `network_proxy::test_connection`; anything
+/// unrecognized is passed through unchanged so a new code is still visible.
+fn localize_network_proxy_test_error(error: &str) -> String {
+    match error {
+        "the connection test timed out" => locale::text(
+            "The proxy did not answer in time. Check the address and try again.",
+            "代理未在规定时间内响应，请检查地址后重试。",
+            "代理未在規定時間內回應，請檢查位址後重試。",
+        )
+        .to_string(),
+        "the proxy could not be reached" => locale::text(
+            "The proxy could not be reached. Check that it is running and the address is correct.",
+            "无法连接代理，请确认代理已启动且地址正确。",
+            "無法連線代理，請確認代理已啟動且位址正確。",
+        )
+        .to_string(),
+        "the proxy rejected the credentials" => locale::text(
+            "The proxy rejected the credentials in the address.",
+            "代理拒绝了地址中的凭据。",
+            "代理拒絕了位址中的認證資訊。",
+        )
+        .to_string(),
+        "the connection test returned an unexpected response" => locale::text(
+            "The proxy answered with an unexpected response.",
+            "代理返回了意外的响应。",
+            "代理傳回了意外的回應。",
+        )
+        .to_string(),
+        "the connection test failed" => locale::text(
+            "The connection test failed. Check the proxy and try again.",
+            "连接测试失败，请检查代理后重试。",
+            "連線測試失敗，請檢查代理後重試。",
+        )
+        .to_string(),
+        other => localize_network_proxy_error(other),
     }
 }
 
@@ -53825,7 +53871,23 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             strings.network_proxy,
             strings.network_proxy_description,
             &[
-                "proxy", "network", "http", "https", "socks", "代理", "网络", "網路",
+                "proxy",
+                "network",
+                "http",
+                "https",
+                "socks",
+                "direct",
+                "bypass",
+                "no_proxy",
+                "代理",
+                "网络",
+                "網路",
+                "直连",
+                "直連",
+                "自定义",
+                "自訂",
+                "绕过",
+                "繞過",
             ],
         ),
         settings_search_candidate(
@@ -55125,6 +55187,10 @@ struct FoundationSettings {
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
     proxy_input: Entity<InputState>,
+    proxy_bypass_input: Entity<InputState>,
+    /// The in-flight custom-proxy connection test, if any. Holding it keeps the
+    /// button in its loading state and blocks a second attempt.
+    proxy_test_task: Option<Task<()>>,
     search: Entity<InputState>,
     search_selected_index: usize,
     search_scroll: ScrollHandle,
@@ -55252,6 +55318,11 @@ impl FoundationSettings {
                 .default_value(ui_state.network_proxy.proxy_url.clone().unwrap_or_default())
                 .placeholder(strings.network_proxy_placeholder)
         });
+        let proxy_bypass_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(ui_state.network_proxy.bypass.clone())
+                .placeholder(DEFAULT_NETWORK_PROXY_BYPASS)
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(locale::text(
                 "Search settings",
@@ -55282,6 +55353,21 @@ impl FoundationSettings {
                         let value = proxy_input_for_commit.read(cx).value().to_string();
                         let _ = proxy_workbench.update(cx, |workbench, cx| {
                             workbench.set_network_proxy_url(value, cx);
+                        });
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+            let bypass_workbench = workbench.clone();
+            let bypass_input_for_commit = proxy_bypass_input.clone();
+            cx.subscribe(
+                &proxy_bypass_input,
+                move |_: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        let value = bypass_input_for_commit.read(cx).value().to_string();
+                        let _ = bypass_workbench.update(cx, |workbench, cx| {
+                            workbench.set_network_proxy_bypass(value, cx);
                         });
                         cx.notify();
                     }
@@ -55416,6 +55502,8 @@ impl FoundationSettings {
                 reasoning_display_modes,
                 terminal_shells,
                 proxy_input,
+                proxy_bypass_input,
+                proxy_test_task: None,
                 search,
                 search_selected_index: 0,
                 search_scroll: ScrollHandle::new(),
@@ -55999,6 +56087,10 @@ impl FoundationSettings {
                 cx,
             );
         });
+        self.proxy_bypass_input.update(cx, |input, cx| {
+            input.set_placeholder(DEFAULT_NETWORK_PROXY_BYPASS, window, cx);
+            input.set_value(network_proxy.bypass.clone(), window, cx);
+        });
         cx.notify();
     }
 
@@ -56108,10 +56200,53 @@ impl FoundationSettings {
         cx.notify();
     }
 
-    fn set_network_proxy_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_network_proxy_mode(&mut self, mode: NetworkProxyMode, cx: &mut Context<Self>) {
         let _ = self
             .workbench
-            .update(cx, |this, cx| this.set_network_proxy_enabled(enabled, cx));
+            .update(cx, |this, cx| this.set_network_proxy_mode(mode, cx));
+        cx.notify();
+    }
+
+    /// Reach the release feed through the configuration currently typed in the
+    /// two fields, without saving it. A failure is reported where every other
+    /// settings result is, so the running route is never disturbed by a test.
+    fn test_network_proxy(&mut self, cx: &mut Context<Self>) {
+        if self.proxy_test_task.is_some() {
+            return;
+        }
+        let draft = NetworkProxyUiState {
+            mode: NetworkProxyMode::Custom,
+            proxy_url: Some(self.proxy_input.read(cx).value().to_string()),
+            bypass: self.proxy_bypass_input.read(cx).value().to_string(),
+        };
+        let probe = cx.background_spawn(async move {
+            vibex_desktop_runtime::network_proxy::test_connection(&draft).await
+        });
+        let workbench = self.workbench.clone();
+        self.proxy_test_task = Some(cx.spawn(async move |entity, cx| {
+            let outcome = probe.await;
+            let notice = match outcome {
+                Ok(latency) => SettingsOperationNotice::success(format!(
+                    "{} ({} ms)",
+                    locale::text(
+                        "Proxy connection succeeded.",
+                        "代理连接成功。",
+                        "代理連線成功。",
+                    ),
+                    latency.as_millis()
+                )),
+                Err(error) => {
+                    SettingsOperationNotice::error(localize_network_proxy_test_error(&error))
+                }
+            };
+            let _ = workbench.update(cx, |workbench, cx| {
+                workbench.queue_settings_operation_notice(notice, cx);
+            });
+            let _ = entity.update(cx, |this, cx| {
+                this.proxy_test_task = None;
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -56844,54 +56979,83 @@ impl FoundationSettings {
             .checked(desktop_behavior.close_to_tray)
             .tooltip(strings.close_to_tray)
             .on_click(cx.listener(|this, enabled, _, cx| this.set_close_to_tray(*enabled, cx)));
+        let custom_proxy = network_proxy.mode == NetworkProxyMode::Custom;
         let proxy_value = self.proxy_input.read(cx).value().to_string();
-        let proxy_error = network_proxy.enabled.then(|| {
-            if proxy_value.trim().is_empty() {
-                strings.network_proxy_required
-            } else if vibex_desktop_runtime::network_proxy::normalize_proxy_url(&proxy_value)
-                .is_err()
-            {
-                strings.network_proxy_invalid
-            } else {
-                ""
-            }
-        });
-        let proxy_control = v_flex()
+        let proxy_error = custom_proxy
+            .then(|| {
+                if proxy_value.trim().is_empty() {
+                    strings.network_proxy_required
+                } else if vibex_desktop_runtime::network_proxy::normalize_proxy_url(&proxy_value)
+                    .is_err()
+                {
+                    strings.network_proxy_invalid
+                } else {
+                    ""
+                }
+            })
+            .filter(|error| !error.is_empty());
+        let proxy_mode_control = settings_segmented_control(
+            "network-proxy-mode",
+            vec![
+                settings_segmented_option(
+                    strings.system,
+                    network_proxy.mode == NetworkProxyMode::System,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_network_proxy_mode(NetworkProxyMode::System, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    strings.direct,
+                    network_proxy.mode == NetworkProxyMode::Direct,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_network_proxy_mode(NetworkProxyMode::Direct, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    strings.custom,
+                    custom_proxy,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_network_proxy_mode(NetworkProxyMode::Custom, cx)
+                    }),
+                ),
+            ],
+        );
+        let proxy_url_control = v_flex()
             .items_end()
             .gap_1()
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Switch::new("network-proxy-enabled")
-                            .small()
-                            .checked(network_proxy.enabled)
-                            .tooltip(strings.network_proxy_enabled)
-                            .on_click(cx.listener(|this, enabled, _, cx| {
-                                this.set_network_proxy_enabled(*enabled, cx)
-                            })),
-                    )
-                    .child(
-                        div().w(px(280.0)).child(
-                            Input::new(&self.proxy_input)
-                                .small()
-                                .h(px(28.0))
-                                .rounded(px(8.0)),
-                        ),
-                    ),
+                div().w(px(280.0)).child(
+                    Input::new(&self.proxy_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(strings.network_proxy_hint),
-            )
-            .when_some(
-                proxy_error.filter(|error| !error.is_empty()),
-                |this, error| {
-                    this.child(div().text_xs().text_color(cx.theme().danger).child(error))
-                },
-            );
+            .when_some(proxy_error, |this, error| {
+                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            });
+        let proxy_bypass_control = div().w(px(280.0)).child(
+            Input::new(&self.proxy_bypass_input)
+                .small()
+                .h(px(28.0))
+                .rounded(px(8.0)),
+        );
+        // The button is the only way to learn whether the typed configuration
+        // actually works, so it stays inert until there is an address to test
+        // and while a test is already running.
+        let proxy_test_running = self.proxy_test_task.is_some();
+        let proxy_test_control = Button::new("network-proxy-test")
+            .small()
+            .outline()
+            .h(px(28.0))
+            .label(if proxy_test_running {
+                strings.network_proxy_testing
+            } else {
+                strings.network_proxy_test
+            })
+            .loading(proxy_test_running)
+            .disabled(proxy_test_running || proxy_error.is_some())
+            .on_click(cx.listener(|this, _, _, cx| this.test_network_proxy(cx)));
         let startup_new_session =
             desktop_behavior.startup_destination == StartupDestination::NewSession;
         let startup_control = settings_segmented_control(
@@ -56978,16 +57142,42 @@ impl FoundationSettings {
                         ),
                     ],
                 ),
-                SettingsGroup::new(
-                    locale::text("Network", "网络", "網路"),
-                    vec![setting_row(
+                SettingsGroup::new(locale::text("Network", "网络", "網路"), {
+                    let mut rows = vec![setting_row(
                         strings.network_proxy,
                         strings.network_proxy_description,
-                        proxy_control,
+                        proxy_mode_control,
                         stacked,
                         cx,
-                    )],
-                ),
+                    )];
+                    // The address, bypass list, and test only describe a
+                    // custom proxy, so they appear with that mode instead of
+                    // sitting inert under System or Direct.
+                    if custom_proxy {
+                        rows.push(setting_row(
+                            strings.network_proxy_url,
+                            strings.network_proxy_url_description,
+                            proxy_url_control,
+                            stacked,
+                            cx,
+                        ));
+                        rows.push(setting_row(
+                            strings.network_proxy_bypass,
+                            strings.network_proxy_bypass_description,
+                            proxy_bypass_control,
+                            stacked,
+                            cx,
+                        ));
+                        rows.push(setting_row(
+                            strings.network_proxy_test,
+                            strings.network_proxy_test_description,
+                            proxy_test_control,
+                            stacked,
+                            cx,
+                        ));
+                    }
+                    rows
+                }),
                 SettingsGroup::new(
                     locale::text("Notifications & updates", "通知与更新", "通知與更新"),
                     vec![
@@ -72929,6 +73119,42 @@ mod tests {
         // hitbox after the HUD moves.
         cx.simulate_click(drop, Modifiers::none());
         assert_eq!(toggles.get(), 2);
+    }
+
+    #[test]
+    fn network_proxy_settings_offer_system_direct_and_custom_modes() {
+        let source = include_str!("app.rs");
+        let general = source
+            .split_once("    fn render_general_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_appearance_page("))
+            .map(|(body, _)| body)
+            .expect("general settings should remain inspectable");
+
+        // The mode picker replaces the old on/off switch, and every mode is
+        // reachable from it.
+        assert!(general.contains("\"network-proxy-mode\""));
+        assert!(general.contains("NetworkProxyMode::System"));
+        assert!(general.contains("NetworkProxyMode::Direct"));
+        assert!(general.contains("NetworkProxyMode::Custom"));
+        assert!(!general.contains("network-proxy-enabled"));
+
+        // The address, bypass list, and test belong to Custom only.
+        assert!(general.contains("if custom_proxy {"));
+        assert!(general.contains("strings.network_proxy_url"));
+        assert!(general.contains("strings.network_proxy_bypass"));
+        assert!(general.contains("strings.network_proxy_test"));
+        assert!(general.contains("network-proxy-test"));
+
+        let test = source
+            .split_once("    fn test_network_proxy(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_reduced_motion("))
+            .map(|(body, _)| body)
+            .expect("the connection test should remain inspectable");
+        // A test must probe the typed draft without applying it, and must not
+        // start a second run while one is in flight.
+        assert!(test.contains("self.proxy_test_task.is_some()"));
+        assert!(test.contains("test_connection(&draft)"));
+        assert!(!test.contains("configure("));
     }
 
     #[test]
