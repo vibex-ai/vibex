@@ -543,6 +543,10 @@ const COMMAND_PALETTE_SESSION_LIMIT: usize = 50;
 /// Session rows the palette shows before anything has been typed. An empty
 /// query is "where was I", not "list everything".
 const COMMAND_PALETTE_RECENT_SESSION_LIMIT: usize = 8;
+/// Agent rows the palette offers for a query. The supported catalog is small
+/// enough to list whole, so this only guards against a future catalog pushing
+/// the other groups out of the dialog.
+const COMMAND_PALETTE_AGENT_LIMIT: usize = 6;
 const COMMAND_PALETTE_SESSION_ROW_HEIGHT: f32 = 60.0;
 /// Result rows the indexing placeholder stands in for. The real count is only
 /// known once the index finishes, so the placeholder fills the dialog rather
@@ -5731,12 +5735,25 @@ enum SessionSearchIndexSignal {
 enum CommandPaletteEntry {
     /// A session, or one message inside it, that matched the query.
     Session(SessionSearchResult),
+    /// One supported Agent, confirmed by opening the Config Center on it.
+    Agent(CommandPaletteAgentCandidate),
     /// One settings entry, confirmed by opening Settings on its section.
     Setting(SettingsSearchCandidate),
     /// A quick action, named by its id in [`COMMAND_PALETTE_ACTIONS`], and
     /// whether it can run right now. The row dispatches its own Action, so
     /// confirming it only has to dismiss the palette.
     Action(&'static str, bool),
+}
+
+/// One Agent the palette can hand over to the Config Center.
+///
+/// The label follows the live catalog when the Agent is configured, so a
+/// renamed Agent is searchable under the name the user gave it, and falls back
+/// to Vibex's own label for an Agent that is not installed yet.
+#[derive(Clone)]
+struct CommandPaletteAgentCandidate {
+    agent_id: AgentId,
+    label: String,
 }
 
 /// A titled group of palette rows, in the order the `Command` receives them.
@@ -26077,6 +26094,9 @@ impl VibexWorkbench {
             Some(CommandPaletteEntry::Session(result)) => {
                 self.activate_command_palette_session(result, window, cx)
             }
+            Some(CommandPaletteEntry::Agent(candidate)) => {
+                self.activate_command_palette_agent(candidate, window, cx)
+            }
             Some(CommandPaletteEntry::Setting(candidate)) => {
                 self.activate_command_palette_setting(candidate, window, cx)
             }
@@ -26084,6 +26104,17 @@ impl VibexWorkbench {
             // only has to get out of its way.
             Some(CommandPaletteEntry::Action(..)) | None => self.close_command_palette(window, cx),
         }
+    }
+
+    /// Opens the Config Center on a matched Agent's configuration.
+    fn activate_command_palette_agent(
+        &mut self,
+        candidate: CommandPaletteAgentCandidate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_command_palette(window, cx);
+        self.open_agent_auth_management(candidate.agent_id, cx);
     }
 
     /// Opens a session result and jumps to the message it matched.
@@ -46588,6 +46619,25 @@ impl VibexWorkbench {
         let query_empty = query.is_empty();
         let mut sections = Vec::new();
 
+        // An Agent name is a catalog identity rather than a full-text hit, so
+        // when the query names one the jump into its Config Center leads the
+        // list: session matches are the only rows that could bury it, and a
+        // broad query can return dozens of them.
+        if !query_empty {
+            let agents = command_palette_agent_candidates(&self.agent_snapshots)
+                .into_iter()
+                .filter(|candidate| command_palette_agent_matches(candidate, query))
+                .take(COMMAND_PALETTE_AGENT_LIMIT)
+                .map(CommandPaletteEntry::Agent)
+                .collect::<Vec<_>>();
+            if !agents.is_empty() {
+                sections.push(CommandPaletteSection {
+                    heading: strings.command_palette_agents.into(),
+                    entries: agents,
+                });
+            }
+        }
+
         // An empty query is "where was I", so it lists a few recent sessions
         // rather than every session the index holds.
         let session_limit = if query_empty {
@@ -53997,6 +54047,61 @@ fn command_palette_action_icon(action: &'static str) -> Icon {
     }
 }
 
+/// Every Agent Vibex ships with, in catalog order, as palette candidates.
+///
+/// The Config Center lists the same set — installed or not — because an Agent
+/// that has not been added yet is exactly the one whose configuration the user
+/// needs to reach. A configured Agent contributes its live label so a rename
+/// is searchable, and `builtin_agent_definitions` supplies the rest.
+fn command_palette_agent_candidates(
+    live_agents: &[AgentSnapshotEntry],
+) -> Vec<CommandPaletteAgentCandidate> {
+    vibex_core::builtin_agent_definitions()
+        .into_iter()
+        .filter(|definition| vibex_core::is_user_visible_agent(&definition.id))
+        .map(|definition| CommandPaletteAgentCandidate {
+            label: live_agents
+                .iter()
+                .find(|agent| agent.id == definition.id)
+                .map(|agent| agent.label.clone())
+                .unwrap_or(definition.label),
+            agent_id: definition.id,
+        })
+        .collect()
+}
+
+/// Whether an Agent survives the palette's query.
+///
+/// Only in the direction the user types: the query has to sit inside the name
+/// or the stable id, so `claude` finds Claude Code and `claudecode` finds it
+/// too, while an unrelated sentence that happens to contain `pi` does not drag
+/// the Pi Agent into the results.
+fn command_palette_agent_matches(candidate: &CommandPaletteAgentCandidate, query: &str) -> bool {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    let compact_query = compact_agent_search_term(&query);
+    let agent_id = candidate.agent_id.as_str();
+    [candidate.label.as_str(), agent_id]
+        .into_iter()
+        .any(|term| {
+            let term = term.to_lowercase();
+            term.contains(&query)
+                || (!compact_query.is_empty()
+                    && compact_agent_search_term(&term).contains(&compact_query))
+        })
+}
+
+/// Lowercases and drops separators so `open code`, `open-code`, and `opencode`
+/// all collapse into the same search term.
+fn compact_agent_search_term(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect()
+}
+
 /// Whether a quick action survives the palette's query.
 ///
 /// The same rule the settings entries use: a case-insensitive substring over
@@ -54023,7 +54128,9 @@ fn command_palette_action_matches(action: &'static str, query: &str, strings: St
 fn command_palette_entry_enabled(entry: &CommandPaletteEntry) -> bool {
     match entry {
         CommandPaletteEntry::Action(_, enabled) => *enabled,
-        CommandPaletteEntry::Session(_) | CommandPaletteEntry::Setting(_) => true,
+        CommandPaletteEntry::Session(_)
+        | CommandPaletteEntry::Agent(_)
+        | CommandPaletteEntry::Setting(_) => true,
     }
 }
 
@@ -54057,10 +54164,10 @@ fn palette_match_highlight(cx: &App) -> HighlightStyle {
 
 /// One palette row.
 ///
-/// A session or a settings entry draws its own two-line layout, because what a
-/// row is and where it lives is what the user is choosing between. A quick
-/// action keeps the component's single-line menu geometry, which is also what
-/// lets the row show the keybinding its Action resolves to.
+/// A session, an Agent, or a settings entry draws its own two-line layout,
+/// because what a row is and where it lives is what the user is choosing
+/// between. A quick action keeps the component's single-line menu geometry,
+/// which is also what lets the row show the keybinding its Action resolves to.
 fn command_palette_row(
     entry: &CommandPaletteEntry,
     query: &str,
@@ -54133,6 +54240,59 @@ fn command_palette_row(
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(timestamp.clone()),
+                        )
+                        .into_any_element()
+                })
+        }
+        CommandPaletteEntry::Agent(candidate) => {
+            let agent_id = candidate.agent_id.as_str().to_string();
+            let title = candidate.label.clone();
+            let hint = strings.command_palette_agent_config_hint;
+            let query = query.to_string();
+            CommandItem::new()
+                .label(title.clone())
+                .keywords([agent_id.clone(), hint.to_string()])
+                .child(move |_window, cx| {
+                    let highlight = palette_match_highlight(cx);
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .gap_3()
+                        // Matches the other two-line rows, so every kind of
+                        // result ends on the same trailing spine.
+                        .pr(px(COMMAND_PALETTE_ROW_LANE))
+                        .child(
+                            div()
+                                .size(px(28.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .bg(cx.theme().muted.opacity(0.55))
+                                .child(agent_brand_icon(&agent_id, px(16.0), None)),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap(px(3.0))
+                                .child(div().min_w_0().truncate().text_sm().font_medium().child(
+                                    session_search_highlighted_text(
+                                        title.clone(),
+                                        &query,
+                                        highlight,
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(hint),
+                                ),
                         )
                         .into_any_element()
                 })
@@ -75339,6 +75499,127 @@ mod tests {
         // The index build must not hold one of the shared Tokio workers while
         // it projects a session into documents.
         assert!(refresh.contains("tokio::task::spawn_blocking"));
+    }
+
+    #[test]
+    fn command_palette_agent_candidates_cover_the_supported_catalog() {
+        let candidates = command_palette_agent_candidates(&[]);
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.agent_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.first().copied(), Some("claude"));
+        for expected in ["claude", "codex", "opencode", "gemini", "kimi"] {
+            assert!(ids.contains(&expected), "{expected} should be searchable");
+        }
+        // The palette offers the same Agents the Config Center lists, and none
+        // of the catalog entries Vibex keeps hidden.
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| vibex_core::is_user_visible_agent(&candidate.agent_id))
+        );
+        assert!(!ids.contains(&"goose"));
+    }
+
+    #[test]
+    fn command_palette_agent_labels_prefer_the_live_catalog() {
+        let mut codex = AgentSnapshotEntry::from_definition(
+            &vibex_core::builtin_agent_definitions()
+                .into_iter()
+                .find(|definition| definition.id.as_str() == "codex")
+                .expect("codex is a builtin Agent"),
+            None,
+            None,
+        );
+        codex.label = "Renamed Codex".to_string();
+        let candidates = command_palette_agent_candidates(&[codex]);
+        let label = |agent_id: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.agent_id.as_str() == agent_id)
+                .map(|candidate| candidate.label.as_str())
+        };
+
+        // A configured Agent is searchable under the name the user gave it...
+        assert_eq!(label("codex"), Some("Renamed Codex"));
+        // ...and an Agent with no live row keeps Vibex's own label.
+        assert_eq!(label("claude"), Some("Claude Code"));
+    }
+
+    #[test]
+    fn command_palette_agent_matching_follows_the_typed_name() {
+        let candidates = command_palette_agent_candidates(&[]);
+        let candidate = |agent_id: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.agent_id.as_str() == agent_id)
+                .expect("catalog Agent")
+        };
+
+        assert!(command_palette_agent_matches(candidate("codex"), "code"));
+        assert!(command_palette_agent_matches(candidate("codex"), "CODEX"));
+        assert!(command_palette_agent_matches(
+            candidate("opencode"),
+            "open code"
+        ));
+        assert!(command_palette_agent_matches(
+            candidate("opencode"),
+            "open-code"
+        ));
+        assert!(command_palette_agent_matches(
+            candidate("claude"),
+            "claudecode"
+        ));
+        assert!(!command_palette_agent_matches(candidate("codex"), "gemini"));
+        assert!(!command_palette_agent_matches(candidate("codex"), ""));
+        // The query has to sit inside the name: a sentence that merely contains
+        // a short id is not an Agent match.
+        assert!(!command_palette_agent_matches(
+            candidate("pi"),
+            "pick a file"
+        ));
+    }
+
+    #[test]
+    fn command_palette_offers_the_agent_config_center_shortcut() {
+        let source = include_str!("app.rs");
+        let sections = source
+            .split_once("    fn command_palette_sections(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_command_palette_overlay("))
+            .map(|(body, _)| body)
+            .expect("command palette sections should remain inspectable");
+
+        assert!(sections.contains("command_palette_agent_candidates(&self.agent_snapshots)"));
+        assert!(sections.contains("command_palette_agent_matches(candidate, query)"));
+        // Agents lead the groups a non-empty query produces, so a matching
+        // Agent is not buried under dozens of session rows.
+        let agents = sections
+            .find("strings.command_palette_agents")
+            .expect("agent group");
+        let sessions = sections
+            .find("strings.command_palette_sessions")
+            .expect("session group");
+        assert!(agents < sessions);
+
+        let activate = source
+            .split_once("    fn activate_command_palette_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens a session result"))
+            .map(|(body, _)| body)
+            .expect("agent activation should remain inspectable");
+        assert!(activate.contains("self.close_command_palette(window, cx);"));
+        assert!(activate.contains("self.open_agent_auth_management(candidate.agent_id, cx);"));
+
+        let row = source
+            .split_once("        CommandPaletteEntry::Agent(candidate) => {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n        CommandPaletteEntry::Setting(candidate) => {")
+            })
+            .map(|(body, _)| body)
+            .expect("agent palette row should remain inspectable");
+        assert!(row.contains("agent_brand_icon(&agent_id, px(16.0), None)"));
+        assert!(row.contains("strings.command_palette_agent_config_hint"));
     }
 
     #[test]
