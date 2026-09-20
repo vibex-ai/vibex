@@ -39,33 +39,33 @@ use vibex_core::{
     RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
     RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
-    RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteFileCopyResponse,
-    RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse, RemoteFileReadResponse,
-    RemoteFileRenameResponse, RemoteFileSearchResponse, RemoteFileTreeResponse,
-    RemoteFileWriteResponse, RemoteGitBlameResponse, RemoteGitBranchListResponse,
-    RemoteGitCommitDetailResponse, RemoteGitCommitResponse, RemoteGitDiffResponse,
-    RemoteGitHistoryResponse, RemoteGitRemoteActionResponse, RemoteGitStatusMutationResponse,
-    RemoteGitStatusResponse, RemoteGitWorktreeCreateResponse, RemoteGitWorktreeEligibilityResponse,
-    RemoteGitWorktreeMergePlanResponse, RemoteGitWorktreeOperationResponse,
-    RemoteGitWorktreePreflightResponse, RemoteGitWorktreeReadinessResponse,
-    RemoteGitWorktreeRenameBranchResponse, RemoteGitWorktreeSnapshotResponse,
-    RemoteHandshakeResponse, RemoteHealthState, RemoteHealthStatus, RemoteLiveEventChannel,
-    RemoteLiveEventEnvelope, RemoteOperationKind, RemotePairingCode, RemoteProtocolVersion,
-    RemoteProviderFailoverRecommendationListResponse, RemoteProviderHealthSummaryListResponse,
-    RemoteProviderInjectionPreviewResponse, RemoteProviderProfileListResponse,
-    RemoteProviderRequest, RemoteProviderRunHealthProbesResponse,
-    RemoteProviderUsageSummaryListResponse, RemoteRequestEnvelope, RemoteResponseEnvelope,
-    RemoteRevokeDeviceRequest, RemoteServiceInfo, RemoteSidebarOrganizationMutation,
-    RemoteSidebarOrganizationResponse, RemoteSidebarOrganizationSnapshot,
-    RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
-    RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
-    RemoteWorkbenchBrowseDirectoriesResponse, RemoteWorkbenchDeleteProjectResponse,
-    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesResponse,
-    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest,
-    RemoteWorkbenchTemporarySessionRootResponse, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession,
-    TerminalStatus, TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus,
-    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
+    RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
+    RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchResponse,
+    RemoteFileTreeResponse, RemoteFileWriteResponse, RemoteGitBlameResponse,
+    RemoteGitBranchListResponse, RemoteGitCommitDetailResponse, RemoteGitCommitResponse,
+    RemoteGitDiffResponse, RemoteGitHistoryResponse, RemoteGitRemoteActionResponse,
+    RemoteGitStatusMutationResponse, RemoteGitStatusResponse, RemoteGitWorktreeCreateResponse,
+    RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeMergePlanResponse,
+    RemoteGitWorktreeOperationResponse, RemoteGitWorktreePreflightResponse,
+    RemoteGitWorktreeReadinessResponse, RemoteGitWorktreeRenameBranchResponse,
+    RemoteGitWorktreeSnapshotResponse, RemoteHandshakeResponse, RemoteHealthState,
+    RemoteHealthStatus, RemoteLiveEventChannel, RemoteLiveEventEnvelope, RemoteOperationKind,
+    RemotePairingCode, RemoteProtocolVersion, RemoteProviderFailoverRecommendationListResponse,
+    RemoteProviderHealthSummaryListResponse, RemoteProviderInjectionPreviewResponse,
+    RemoteProviderProfileListResponse, RemoteProviderRequest,
+    RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
+    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRevokeDeviceRequest, RemoteServiceInfo,
+    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
+    RemoteSidebarOrganizationSnapshot, RemoteTerminalCreateResponse, RemoteTerminalKillResponse,
+    RemoteTerminalListResponse, RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse,
+    RemoteTerminalWriteResponse, RemoteWorkbenchBrowseDirectoriesResponse,
+    RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
+    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
+    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootResponse, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
+    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
+    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -1184,6 +1184,49 @@ impl RemoteTrustService {
         })
     }
 
+    /// The device record a completed pairing writes.
+    ///
+    /// A client presents one long-lived identity key for its whole lifetime,
+    /// so a phone that pairs again is the same client rather than a new one:
+    /// its existing row keeps its id and creation time, and the fresh pairing
+    /// replaces the grant it holds. Reusing the row keeps the trust store at
+    /// one entry per client and keeps every audit record attached to it. A
+    /// client that presents a new identity — a reinstall, or a client that
+    /// never sent one — still gets its own row.
+    fn paired_device(
+        conn: &DbConnection,
+        public_key: Option<&str>,
+        display_name: &str,
+        permission_level: RemoteDevicePermissionLevel,
+        now: i64,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let existing = public_key
+            .map(|key| RemoteDeviceRepository::find_by_public_key(conn, key))
+            .transpose()?
+            .flatten();
+        Ok(RemoteDeviceDetail {
+            device_id: existing
+                .as_ref()
+                .map_or_else(DeviceId::new, |record| record.detail.device_id.clone()),
+            display_name: display_name.to_string(),
+            public_key: public_key.map(str::to_string),
+            // Replacing a grant must invalidate anything cached against the
+            // old one, the same way a permission change does.
+            grant_revision: existing
+                .as_ref()
+                .map_or(1, |record| record.detail.grant_revision.saturating_add(1)),
+            permission_level,
+            status: RemoteDeviceStatus::Active,
+            paired_at_ms: Some(now),
+            last_seen_at_ms: Some(now),
+            revoked_at_ms: None,
+            created_at_ms: existing
+                .as_ref()
+                .map_or(now, |record| record.detail.created_at_ms),
+            updated_at_ms: now,
+        })
+    }
+
     pub fn claim_pairing_code(
         conn: &DbConnection,
         request: RemoteClaimPairingCodeRequest,
@@ -1256,19 +1299,13 @@ impl RemoteTrustService {
         }
 
         let auth_token = generate_secret("auth");
-        let device = RemoteDeviceDetail {
-            device_id: DeviceId::new(),
-            display_name: request.display_name.trim().to_string(),
-            public_key: request.public_key,
-            grant_revision: 1,
-            permission_level: pairing_record.pairing.permission_level,
-            status: RemoteDeviceStatus::Active,
-            paired_at_ms: Some(now),
-            last_seen_at_ms: Some(now),
-            revoked_at_ms: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-        };
+        let device = Self::paired_device(
+            conn,
+            request.public_key.as_deref(),
+            request.display_name.trim(),
+            pairing_record.pairing.permission_level,
+            now,
+        )?;
         let transaction = conn.unchecked_transaction().map_err(|_| {
             VibexError::storage(
                 "remote_pairing_transaction_failed",
@@ -1388,6 +1425,77 @@ impl RemoteTrustService {
             None,
         )?;
         Ok(revoked.detail)
+    }
+
+    /// Removes one trust-store record, revoking its grant when it is still
+    /// active.
+    ///
+    /// The record is what the desktop remembers about a client, so deleting an
+    /// active one would silently drop a live grant. The revoke therefore runs
+    /// first and in the same transaction, and the caller disconnects any live
+    /// connection. Audit rows are never deleted; they keep their history with
+    /// the device link cleared.
+    pub fn delete_device(
+        conn: &DbConnection,
+        request: RemoteDeleteDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let Some(record) = RemoteDeviceRepository::get(conn, &request.device_id)? else {
+            return Err(remote_error(
+                "remote_device_unknown",
+                "remote device is unknown",
+            ));
+        };
+        let reason = request
+            .reason
+            .as_deref()
+            .map(redact_summary)
+            .unwrap_or_else(|| "No reason provided".to_string());
+        let now = unix_timestamp_ms();
+        let transaction = conn.unchecked_transaction().map_err(|_| {
+            VibexError::storage(
+                "remote_device_delete_transaction_failed",
+                "failed to start remote device delete transaction",
+            )
+        })?;
+        if record.detail.status == RemoteDeviceStatus::Active {
+            RemoteDeviceRepository::revoke(&transaction, &request.device_id, now)?;
+            Self::insert_audit(
+                &transaction,
+                None,
+                RemoteAuditAction::DeviceRevoked,
+                RemoteAuditTargetKind::Device,
+                Some(request.device_id.as_str().to_string()),
+                RemoteAuditOutcome::Revoked,
+                format!(
+                    "Device '{}' revoked before its record was deleted: {reason}",
+                    record.detail.display_name
+                ),
+                None,
+                None,
+            )?;
+        }
+        RemoteDeviceRepository::delete(&transaction, &request.device_id)?;
+        Self::insert_audit(
+            &transaction,
+            None,
+            RemoteAuditAction::DeviceDeleted,
+            RemoteAuditTargetKind::Device,
+            Some(request.device_id.as_str().to_string()),
+            RemoteAuditOutcome::Revoked,
+            format!(
+                "Device '{}' record deleted: {reason}",
+                record.detail.display_name
+            ),
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| {
+            VibexError::storage(
+                "remote_device_delete_commit_failed",
+                "failed to commit remote device delete",
+            )
+        })?;
+        Ok(record.detail)
     }
 
     pub fn authorize_action(
@@ -7561,6 +7669,93 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(revoked.code, "remote_device_revoked");
+    }
+
+    #[test]
+    fn deleting_an_active_device_revokes_its_grant_before_removing_the_record() {
+        let mut conn = vibex_db::DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let created = RemoteTrustService::create_pairing_code(
+            &conn,
+            RemoteCreatePairingCodeRequest {
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                ttl_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+        let claimed = RemoteTrustService::claim_pairing_code(
+            &conn,
+            RemoteClaimPairingCodeRequest {
+                pairing_code: created.pairing_code,
+                display_name: "Vibex Mobile".to_string(),
+                public_key: Some("pubkey-delete".to_string()),
+            },
+        )
+        .unwrap();
+        let device_id = claimed.device.device_id.clone();
+
+        let deleted = RemoteTrustService::delete_device(
+            &conn,
+            RemoteDeleteDeviceRequest {
+                device_id: device_id.clone(),
+                reason: Some("cleaned up the device list".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted.device_id, device_id);
+        assert!(
+            RemoteDeviceRepository::get(&conn, &device_id)
+                .unwrap()
+                .is_none()
+        );
+        // The grant went with the record: the same token cannot re-authenticate
+        // against a row that no longer exists.
+        assert_eq!(
+            RemoteTrustService::authenticate(
+                &conn,
+                RemoteAuthProof {
+                    device_id: device_id.clone(),
+                    auth_token: claimed.auth_token,
+                },
+            )
+            .unwrap_err()
+            .code,
+            "remote_device_unknown"
+        );
+
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|record| record.action == RemoteAuditAction::DeviceRevoked)
+        );
+        let deletion = audits
+            .iter()
+            .find(|record| record.action == RemoteAuditAction::DeviceDeleted)
+            .expect("deleting a device should be audited");
+        assert_eq!(deletion.target_id.as_deref(), Some(device_id.as_str()));
+        assert!(deletion.redacted_summary.contains("Vibex Mobile"));
+
+        assert_eq!(
+            RemoteTrustService::delete_device(
+                &conn,
+                RemoteDeleteDeviceRequest {
+                    device_id,
+                    reason: None,
+                },
+            )
+            .unwrap_err()
+            .code,
+            "remote_device_unknown"
+        );
     }
 
     #[test]

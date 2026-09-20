@@ -94,6 +94,17 @@ impl fmt::Debug for LanPairingClaim {
 
 impl LanPairingSession {
     pub async fn start(origin: impl Into<String>, display_name: &str) -> BackendResult<Self> {
+        Self::start_with_identity(origin, display_name, None).await
+    }
+
+    /// Starts a session that presents `identity` when the client already has
+    /// one, so a re-pairing is recognised as the same client. A first pairing
+    /// passes `None` and mints a fresh identity.
+    pub async fn start_with_identity(
+        origin: impl Into<String>,
+        display_name: &str,
+        identity: Option<ClientDeviceIdentity>,
+    ) -> BackendResult<Self> {
         let origin = normalize_lan_https_origin(&origin.into())?;
         let display_name = validate_display_name(display_name)?;
         let client = lan_http_client()?;
@@ -103,7 +114,10 @@ impl LanPairingSession {
             http_json(client.get(endpoint_url(&origin, "/api/v2/info")?)).await?;
         validate_discovery(&discovery, &info, unix_timestamp_ms())?;
 
-        let identity = ClientDeviceIdentity::generate(DeviceId::new())?;
+        let identity = match identity {
+            Some(identity) => identity,
+            None => ClientDeviceIdentity::generate(DeviceId::new())?,
+        };
         let client_nonce = random_token()?;
         let request_secret = random_token()?;
         let request = RemoteLanPairingRequest {

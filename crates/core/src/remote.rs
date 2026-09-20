@@ -347,6 +347,20 @@ pub struct RemoteRevokeDeviceRequest {
     pub reason: Option<String>,
 }
 
+/// Drops one trust-store record.
+///
+/// The record is the desktop's memory of a client, not the client itself: a
+/// client that pairs again presents the same device identity and gets a fresh
+/// row. Deleting an active record therefore revokes its grant first, while
+/// deleting a revoked one only removes the row. Audit history is kept either
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeleteDeviceRequest {
+    pub device_id: DeviceId,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAuthContext {
@@ -404,6 +418,7 @@ pub enum RemoteAuditAction {
     DeviceAuthenticated,
     DeviceAuthFailed,
     DeviceRevoked,
+    DeviceDeleted,
     PermissionAllowed,
     PermissionDenied,
     MutationAllowed,

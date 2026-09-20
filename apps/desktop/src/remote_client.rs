@@ -181,11 +181,14 @@ pub async fn claim_server_pairing_code(
     allow_insecure_local_dev: bool,
 ) -> BackendResult<DesktopRemoteCredential> {
     let server_url = server_url.trim().trim_end_matches('/').to_string();
+    // The desktop keeps one credential per registered runtime rather than an
+    // install-wide identity, so this claim mints a fresh one.
     let bundle = vibex_remote_client::claim_pairing_code_with_identity(
         server_url,
         pairing_code,
         "Vibex Desktop".to_string(),
         allow_insecure_local_dev,
+        None,
     )
     .await?;
     DesktopRemoteCredential::from_parts(bundle, allow_insecure_local_dev, None)
@@ -209,6 +212,7 @@ pub async fn claim_server_pairing_link(
         link,
         "Vibex Desktop".to_string(),
         allow_insecure_local_dev,
+        None,
     )
     .await?;
     DesktopRemoteCredential::from_parts(

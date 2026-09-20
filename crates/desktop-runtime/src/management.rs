@@ -27,11 +27,12 @@ use vibex_core::{
     DiagnosticBundleRequest, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemotePairingOfferSummary,
-    RemoteRevokeDeviceRequest, ScheduledTask, ScheduledTaskAttentionListRequest,
-    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, VibexError, VibexResult,
+    RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest, RemoteDeviceDetail,
+    RemotePairingOfferSummary, RemoteRevokeDeviceRequest, ScheduledTask,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, VibexError, VibexResult,
 };
 use vibex_db::{
     AutomationGraphRepository, RemoteAuditRepository, RemoteDeviceRepository,
@@ -1224,6 +1225,23 @@ impl crate::RemoteHandle {
         let revoked = RemoteTrustService::revoke_device(&connection, request)?;
         self.gateway.disconnect_device(&device_id);
         Ok(revoked)
+    }
+
+    /// Forgets a paired client, revoking its grant first when it still holds
+    /// one. Disconnecting is unconditional because it is a no-op for a device
+    /// that is not connected.
+    pub fn delete_device(
+        &self,
+        request: RemoteDeleteDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let _claim = self
+            .mutation_guard
+            .claim(format!("remote:delete:{}", request.device_id))?;
+        let connection = migrated(&self.db_path)?;
+        let device_id = request.device_id.clone();
+        let deleted = RemoteTrustService::delete_device(&connection, request)?;
+        self.gateway.disconnect_device(&device_id);
+        Ok(deleted)
     }
 
     pub fn list_audit(

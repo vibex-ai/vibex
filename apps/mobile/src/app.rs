@@ -46,7 +46,8 @@ use vibex_markdown::{
     MarkdownInput, MarkdownLimits, MarkdownSurface, parse_markdown_with_limits, utf8_prefix,
 };
 use vibex_remote_client::{
-    RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend, ZeroConfigLanPairingSession,
+    ClientDeviceIdentity, RemoteConnectionState, RemoteLifecycleSignal, WebRemoteBackend,
+    ZeroConfigLanPairingSession,
 };
 use vibex_ui::{
     AgentEventDecision, AgentMutationTicket, AgentWorkflowController, AsyncPhase,
@@ -1453,6 +1454,22 @@ impl MobileApp {
         self.tasks.push(task);
     }
 
+    /// Stores a freshly claimed bundle together with the device identity it
+    /// presented.
+    ///
+    /// The desktop keys its trust store on that identity key, so remembering
+    /// it is what makes the next pairing of this phone update the entry it
+    /// already has instead of adding another device.
+    fn save_paired_bundle(&self, bundle: &MobileCredentialBundle) -> BackendResult<()> {
+        if let Ok(identity) = ClientDeviceIdentity::from_private_key_base64(
+            bundle.record.auth.device_id.clone(),
+            &bundle.identity_private_key,
+        ) {
+            self.storage.save_client_identity(&identity)?;
+        }
+        self.storage.save(bundle)
+    }
+
     fn install_bundle(
         &mut self,
         bundle: MobileCredentialBundle,
@@ -1910,6 +1927,7 @@ impl MobileApp {
         };
         let display_name = candidate.display_name.clone();
         let display_name_for_bundle = display_name.clone();
+        let identity = self.storage.load_client_identity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             if candidate.mode != LanDiscoveryMode::ZeroConfig {
                 return Err(BackendError::failed(
@@ -1941,11 +1959,12 @@ impl MobileApp {
                     ),
                 )
             })?;
-            ZeroConfigLanPairingSession::start(
+            ZeroConfigLanPairingSession::start_with_identity(
                 candidate.origin,
                 &server_id,
                 &server_key,
                 "Vibex Mobile",
+                identity,
             )
             .await
         });
@@ -2041,7 +2060,7 @@ impl MobileApp {
                         if !display_name.is_empty() {
                             bundle.display_name = Some(display_name.to_string());
                         }
-                        match this.storage.save(&bundle) {
+                        match this.save_paired_bundle(&bundle) {
                             Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => {
                                 this.nearby_pairing_state = NearbyPairingState::Failed {
@@ -2084,7 +2103,9 @@ impl MobileApp {
         }
         self.pairing_busy = true;
         self.error = None;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_link(link).await });
+        let identity = self.storage.load_client_identity();
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_link(link, identity).await });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -2093,7 +2114,7 @@ impl MobileApp {
                     Ok(Ok(MobilePairedRuntime {
                         bundle,
                         server_kind,
-                    })) => match this.storage.save(&bundle) {
+                    })) => match this.save_paired_bundle(&bundle) {
                         Ok(()) => {
                             this.install_bundle(bundle, server_kind, cx);
                         }
@@ -2148,8 +2169,9 @@ impl MobileApp {
         }
         self.pairing_busy = true;
         self.error = None;
+        let identity = self.storage.load_client_identity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            claim_server_pairing_code(server_url, pairing_code).await
+            claim_server_pairing_code(server_url, pairing_code, identity).await
         });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -2164,7 +2186,7 @@ impl MobileApp {
                             .push((InputField::PairingServerUrl, String::new()));
                         this.pending_input_writes
                             .push((InputField::PairingCode, String::new()));
-                        match this.storage.save(&bundle) {
+                        match this.save_paired_bundle(&bundle) {
                             Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => this.error = Some(error),
                         }
@@ -2213,8 +2235,12 @@ impl MobileApp {
         }
         self.pairing_busy = true;
         self.error = None;
+        let identity = self.storage.load_client_identity();
         let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { claim_pairing_code_link(link).await });
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { claim_pairing_code_link(link, identity).await },
+            );
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -2226,7 +2252,7 @@ impl MobileApp {
                     })) => {
                         this.pending_input_writes
                             .push((InputField::PairingLink, String::new()));
-                        match this.storage.save(&bundle) {
+                        match this.save_paired_bundle(&bundle) {
                             Ok(()) => this.install_bundle(bundle, server_kind, cx),
                             Err(error) => this.error = Some(error),
                         }

@@ -26,10 +26,11 @@ use qrcode::{Color as QrColor, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use vibex_core::{
-    DeviceId, RemoteAuditListRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemoteDevicePermissionLevel, RemoteDeviceStatus, RemoteLanPairingRequestState,
-    RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary, RemotePairingTransport,
-    RemoteRevokeDeviceRequest, RequestId, VibexError, VibexResult, unix_timestamp_ms,
+    DeviceId, RemoteAuditListRequest, RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest,
+    RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
+    RemoteLanPairingRequestState, RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary,
+    RemotePairingTransport, RemoteRevokeDeviceRequest, RequestId, VibexError, VibexResult,
+    unix_timestamp_ms,
 };
 use vibex_desktop_runtime::{
     DesktopRuntime, RemoteConnectivityController, RemoteConnectivityMethod,
@@ -132,6 +133,7 @@ enum RemoteAccessAction {
     RefreshDevices,
     SelectDevicePage(usize),
     RevokeDevice(String),
+    DeleteDevice(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -353,6 +355,7 @@ struct PairingViewState {
     audit_count: usize,
     audit_count_capped: bool,
     revoking_device: Option<String>,
+    deleting_device: Option<String>,
 }
 
 /// One light hint the Remote Access page has to show.
@@ -415,6 +418,7 @@ impl Default for PairingViewState {
             audit_count: 0,
             audit_count_capped: false,
             revoking_device: None,
+            deleting_device: None,
         }
     }
 }
@@ -461,6 +465,12 @@ impl PairingViewState {
     /// on a page that no longer holds rows.
     fn select_device_page(&mut self, page: usize) {
         self.device_page = page.clamp(1, self.device_page_count());
+    }
+
+    /// Whether a device mutation is in flight. The list locks every per-row
+    /// action while one runs, so a delete cannot race the revoke it depends on.
+    fn device_mutation_pending(&self) -> bool {
+        self.revoking_device.is_some() || self.deleting_device.is_some()
     }
 
     fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
@@ -604,6 +614,7 @@ pub(crate) struct RemoteAccessPairing {
     refresh_task: Option<Task<()>>,
     devices_task: Option<Task<()>>,
     revoke_task: Option<Task<()>>,
+    delete_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     offer_poll_task: Option<Task<()>>,
     lan_poll_task: Option<Task<()>>,
@@ -658,6 +669,7 @@ impl RemoteAccessPairing {
             refresh_task: None,
             devices_task: None,
             revoke_task: None,
+            delete_task: None,
             mutation_task: None,
             offer_poll_task: None,
             lan_poll_task: None,
@@ -687,6 +699,7 @@ impl RemoteAccessPairing {
                 cx.notify();
             }
             RemoteAccessAction::RevokeDevice(device_id) => self.revoke_device(device_id, cx),
+            RemoteAccessAction::DeleteDevice(device_id) => self.delete_device(device_id, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
                 self.state.select_connection_entry(entry);
                 cx.notify();
@@ -838,6 +851,133 @@ impl RemoteAccessPairing {
                 });
             },
         ));
+    }
+
+    /// Forgets one trust-store record.
+    ///
+    /// An active record still carries a live grant, so the runtime revokes it
+    /// and disconnects the client before the row goes away; a revoked record is
+    /// only removed. Audit history survives both.
+    fn delete_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let Ok(device_id_value) = DeviceId::parse(device_id.clone()) else {
+            self.state.devices_error = Some("remote_device_id_invalid".to_string());
+            cx.notify();
+            return;
+        };
+        let remote = self.remote.clone();
+        self.state.deleting_device = Some(device_id);
+        self.state.error_code = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            remote.delete_device(RemoteDeleteDeviceRequest {
+                device_id: device_id_value,
+                reason: Some("deleted from the mobile pairing dialog".to_string()),
+            })
+        });
+        self.delete_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.delete_task = None;
+                    this.state.deleting_device = None;
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
+                                "Device record deleted",
+                                "已删除设备记录",
+                                "已刪除裝置記錄",
+                            )));
+                            this.refresh_devices(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.state.notice = Some(RemoteAccessNotice::error(locale::text(
+                                "The device record could not be deleted",
+                                "删除设备记录失败",
+                                "刪除裝置記錄失敗",
+                            )));
+                            this.state.devices_error = Some(error.code);
+                        }
+                        Err(_) => {
+                            this.state.devices_error =
+                                Some("remote_device_delete_task_failed".to_string())
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn confirm_delete_device(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        revoked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        // Only the consequence the user cannot see from the row is worth
+        // stating: an active row still holds a grant that has to go first.
+        let description = match (locale::current_locale(), revoked) {
+            (locale::ResolvedLocale::En, true) => {
+                format!("\"{device_name}\" is removed from this list. Its audit history is kept.")
+            }
+            (locale::ResolvedLocale::En, false) => format!(
+                "\"{device_name}\" still holds access: deleting revokes the grant, disconnects it, and then removes it. Its audit history is kept."
+            ),
+            (locale::ResolvedLocale::ZhCn, true) => {
+                format!("“{device_name}”的记录将从列表中移除，审计记录会保留。")
+            }
+            (locale::ResolvedLocale::ZhCn, false) => format!(
+                "“{device_name}”仍持有访问授权：删除会先撤销授权并断开连接，然后移除记录。审计记录会保留。"
+            ),
+            (locale::ResolvedLocale::ZhTw, true) => {
+                format!("「{device_name}」的記錄將從清單中移除，稽核記錄會保留。")
+            }
+            (locale::ResolvedLocale::ZhTw, false) => format!(
+                "「{device_name}」仍持有存取授權：刪除會先撤銷授權並中斷連線，然後移除記錄。稽核記錄會保留。"
+            ),
+        };
+        let title = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Delete \"{device_name}\"?"),
+            locale::ResolvedLocale::ZhCn => format!("删除“{device_name}”？"),
+            locale::ResolvedLocale::ZhTw => format!("刪除「{device_name}」？"),
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let device_id = device_id.clone();
+            let description = description.clone();
+            let title = title.clone();
+            dialog
+                .title(title)
+                .child(description)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-device-delete")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-device-delete")
+                                    .danger()
+                                    .label(locale::text("Delete", "删除", "刪除")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.dispatch_action(
+                            RemoteAccessAction::DeleteDevice(device_id.clone()),
+                            cx,
+                        )
+                    });
+                    true
+                })
+        });
     }
 
     fn confirm_revoke_device(
@@ -1914,7 +2054,7 @@ impl RemoteAccessPairing {
             self.state.audit_count_capped,
         );
         let refresh_entity = cx.weak_entity();
-        let pending = self.state.revoking_device.is_some();
+        let pending = self.state.device_mutation_pending();
         let mut column = v_flex()
             .w_full()
             .min_w_0()
@@ -2071,8 +2211,9 @@ impl RemoteAccessPairing {
 
     fn render_device_row(&self, device: RemoteDeviceDetail, cx: &mut Context<Self>) -> AnyElement {
         let revoked = device.status == RemoteDeviceStatus::Revoked;
-        let pending = self.state.revoking_device.is_some();
+        let pending = self.state.device_mutation_pending();
         let revoking = self.state.revoking_device.as_deref() == Some(device.device_id.as_str());
+        let deleting = self.state.deleting_device.as_deref() == Some(device.device_id.as_str());
         let status_color = device_status_color(device.status, cx);
         let activity = device_activity_label(&device);
         let detail = format!(
@@ -2082,7 +2223,10 @@ impl RemoteAccessPairing {
         );
         let device_id = device.device_id.as_str().to_string();
         let device_name = device.display_name.clone();
+        let delete_device_id = device_id.clone();
+        let delete_device_name = device_name.clone();
         let entity = cx.weak_entity();
+        let delete_entity = entity.clone();
 
         h_flex()
             .w_full()
@@ -2095,39 +2239,49 @@ impl RemoteAccessPairing {
             .bg(cx.theme().background.opacity(0.6))
             .px_3()
             .py_2()
-            .when(revoked, |row| row.opacity(0.62))
-            .child(icon_tile(IconName::CircleUser, px(32.0), px(18.0), cx))
+            // The identity block is dimmed for a revoked row; the actions stay
+            // at full strength so the row's only remaining command still reads
+            // as available.
             .child(
-                v_flex()
+                h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1()
+                    .items_center()
+                    .gap_3()
+                    .when(revoked, |block| block.opacity(0.62))
+                    .child(icon_tile(IconName::CircleUser, px(32.0), px(18.0), cx))
                     .child(
-                        h_flex()
+                        v_flex()
                             .min_w_0()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(device.display_name.clone()),
+                                    )
+                                    .child(status_pill(
+                                        device_status_label(device.status),
+                                        status_color,
+                                    )),
+                            )
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(device.display_name.clone()),
-                            )
-                            .child(status_pill(
-                                device_status_label(device.status),
-                                status_color,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(detail),
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(detail),
+                            ),
                     ),
             )
             .when(!revoked, |row| {
@@ -2150,6 +2304,32 @@ impl RemoteAccessPairing {
                         }),
                 )
             })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "delete-device-{delete_device_id}"
+                )))
+                .small()
+                .ghost()
+                .label(locale::text("Delete", "删除", "刪除"))
+                .loading(deleting)
+                .disabled(pending)
+                .tooltip(locale::text(
+                    "Delete this device record",
+                    "删除该设备记录",
+                    "刪除該裝置記錄",
+                ))
+                .on_click(move |_, window, cx| {
+                    let _ = delete_entity.update(cx, |this, cx| {
+                        this.confirm_delete_device(
+                            delete_device_id.clone(),
+                            delete_device_name.clone(),
+                            revoked,
+                            window,
+                            cx,
+                        )
+                    });
+                }),
+            )
             .into_any_element()
     }
 
@@ -4943,6 +5123,8 @@ mod tests {
         assert!(device_row.contains("confirm_revoke_device("));
         assert!(device_row.contains(".danger()"));
         assert!(device_row.contains("revoke-device-"));
+        assert!(device_row.contains("confirm_delete_device("));
+        assert!(device_row.contains("delete-device-"));
 
         let renderer = source
             .split_once("impl Render for RemoteAccessPairing {")
@@ -4951,5 +5133,39 @@ mod tests {
             .expect("pairing renderer should remain inspectable");
         assert!(renderer.contains("RemoteAccessPage::Devices => self.render_devices_page(cx)"));
         assert!(renderer.contains("self.render_mode_tabs(cx)"));
+    }
+
+    /// Deleting a record is available in both states, and the confirmation
+    /// names the extra consequence an active row carries.
+    #[test]
+    fn deleting_a_device_record_covers_revoked_and_active_rows() {
+        let source = include_str!("remote_access_pairing.rs");
+        let confirmation = source
+            .split_once("    fn confirm_delete_device(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_revoke_device("))
+            .map(|(body, _)| body)
+            .expect("device delete confirmation should remain inspectable");
+        assert!(confirmation.contains("still holds access"));
+        assert!(confirmation.contains("revokes the grant"));
+        assert!(confirmation.contains("audit history is kept"));
+        assert!(confirmation.contains("RemoteAccessAction::DeleteDevice("));
+
+        let deletion = source
+            .split_once("    fn delete_device(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_device("))
+            .map(|(body, _)| body)
+            .expect("device deletion should remain inspectable");
+        assert!(deletion.contains("remote.delete_device(RemoteDeleteDeviceRequest {"));
+        assert!(deletion.contains("this.refresh_devices(cx);"));
+
+        // The row locks both commands while either one runs, so a delete can
+        // never race the revoke it depends on.
+        let state = source
+            .split_once("    fn device_mutation_pending(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn select_connection_entry("))
+            .map(|(body, _)| body)
+            .expect("device mutation state should remain inspectable");
+        assert!(state.contains("revoking_device.is_some()"));
+        assert!(state.contains("deleting_device.is_some()"));
     }
 }

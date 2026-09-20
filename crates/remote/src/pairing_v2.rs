@@ -3,11 +3,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore};
 use url::Url;
 use vibex_core::{
-    DeviceId, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditTargetKind,
-    RemoteCancelPairingOfferRequest, RemoteClaimPairingOfferRequest,
-    RemoteClaimPairingOfferResponse, RemoteCreatePairingOfferRequest,
-    RemoteCreatePairingOfferResponse, RemoteDeviceDetail, RemoteDeviceStatus,
-    RemotePairingCandidate, RemotePairingOffer, RemotePairingOfferSummary, RemotePairingTransport,
+    RemoteAuditAction, RemoteAuditOutcome, RemoteAuditTargetKind, RemoteCancelPairingOfferRequest,
+    RemoteClaimPairingOfferRequest, RemoteClaimPairingOfferResponse,
+    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemotePairingCandidate,
+    RemotePairingOffer, RemotePairingOfferSummary, RemotePairingTransport,
     RemoteProtocolVersionRange, RequestId, VibexError, VibexResult, remote_permissions_for_level,
     unix_timestamp_ms,
 };
@@ -258,19 +257,13 @@ impl RemoteTrustService {
         }
 
         let device_grant_token = secure_secret("grant");
-        let device = RemoteDeviceDetail {
-            device_id: DeviceId::new(),
-            display_name: display_name.to_string(),
-            public_key: Some(request.device_identity_public_key.clone()),
-            grant_revision: 1,
-            permission_level: record.summary.permission_level,
-            status: RemoteDeviceStatus::Active,
-            paired_at_ms: Some(now),
-            last_seen_at_ms: Some(now),
-            revoked_at_ms: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-        };
+        let device = RemoteTrustService::paired_device(
+            &transaction,
+            Some(request.device_identity_public_key.as_str()),
+            display_name,
+            record.summary.permission_level,
+            now,
+        )?;
         RemoteDeviceRepository::upsert(
             &transaction,
             &RemoteDeviceRecord {
@@ -454,8 +447,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use vibex_core::{
-        RemoteAuditListRequest, RemoteDevicePermissionLevel, RemotePairingCandidate,
-        RemotePairingTransport,
+        RemoteAuditListRequest, RemoteAuthProof, RemoteDevicePermissionLevel, RemoteDeviceStatus,
+        RemotePairingCandidate, RemotePairingTransport, RemoteRevokeDeviceRequest,
     };
     use vibex_db::{
         RemoteAuditRepository, RemoteDeviceRepository, apply_migrations, open_database,
@@ -661,6 +654,94 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
 
         let conn = open_database(&database_path).unwrap();
+        assert_eq!(RemoteDeviceRepository::list(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn re_pairing_the_same_identity_replaces_one_device_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = test_identity(&directory);
+        let mut conn = DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let first = RemoteTrustService::claim_pairing_offer(
+            &conn,
+            claim_request(&create_offer(&conn, &identity), 11, "claim-nonce-first"),
+        )
+        .unwrap();
+        assert_eq!(first.device.grant_revision, 1);
+        let first_created_at_ms = first.device.created_at_ms;
+
+        // The same phone pairs again: a new offer, the same long-lived device
+        // identity. The trust store keeps one row for the client.
+        let mut second_request =
+            claim_request(&create_offer(&conn, &identity), 11, "claim-nonce-second");
+        second_request.display_name = "Vibex Mobile".to_string();
+        let second = RemoteTrustService::claim_pairing_offer(&conn, second_request).unwrap();
+
+        assert_eq!(second.device.device_id, first.device.device_id);
+        assert_eq!(second.device.created_at_ms, first_created_at_ms);
+        assert_eq!(second.device.grant_revision, 2);
+        assert_eq!(second.device.display_name, "Vibex Mobile");
+        assert_ne!(second.device_grant_token, first.device_grant_token);
+
+        let devices = RemoteDeviceRepository::list(&conn).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].detail.device_id, first.device.device_id);
+        // The superseded grant no longer authenticates.
+        assert_eq!(
+            RemoteTrustService::authenticate(
+                &conn,
+                RemoteAuthProof {
+                    device_id: first.device.device_id.clone(),
+                    auth_token: first.device_grant_token,
+                },
+            )
+            .unwrap_err()
+            .code,
+            "remote_auth_invalid"
+        );
+        assert!(
+            RemoteTrustService::authenticate(
+                &conn,
+                RemoteAuthProof {
+                    device_id: second.device.device_id.clone(),
+                    auth_token: second.device_grant_token,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_revoked_client_that_pairs_again_returns_to_active_on_its_own_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = test_identity(&directory);
+        let mut conn = DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let paired = RemoteTrustService::claim_pairing_offer(
+            &conn,
+            claim_request(&create_offer(&conn, &identity), 12, "claim-nonce-revoke"),
+        )
+        .unwrap();
+        RemoteTrustService::revoke_device(
+            &conn,
+            RemoteRevokeDeviceRequest {
+                device_id: paired.device.device_id.clone(),
+                reason: Some("test revoke".to_string()),
+            },
+        )
+        .unwrap();
+
+        let re_paired = RemoteTrustService::claim_pairing_offer(
+            &conn,
+            claim_request(&create_offer(&conn, &identity), 12, "claim-nonce-again"),
+        )
+        .unwrap();
+        assert_eq!(re_paired.device.device_id, paired.device.device_id);
+        assert_eq!(re_paired.device.status, RemoteDeviceStatus::Active);
+        assert_eq!(re_paired.device.revoked_at_ms, None);
         assert_eq!(RemoteDeviceRepository::list(&conn).unwrap().len(), 1);
     }
 }

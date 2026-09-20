@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{AgentTimelineReasoningDisplayMode, RemoteServerKind};
+use vibex_remote_client::ClientDeviceIdentity;
 
 use crate::pairing::MobileCredentialBundle;
 
@@ -28,6 +29,12 @@ const MAX_TIMELINE_DISPLAY_SETTINGS_HOST_ID_BYTES: usize = 256;
 const APP_SETTINGS_FILE: &str = "app-settings.json";
 const APP_SETTINGS_SCHEMA_VERSION: &str = "vibex-native-mobile-app-settings.v1";
 const MAX_APP_SETTINGS_BYTES: u64 = 4 * 1024;
+/// The install-wide device identity a pairing presents. It is separate from
+/// the per-host credential bundles because it outlives any single pairing and
+/// is what lets the desktop recognise a re-pairing as the same client.
+const CLIENT_IDENTITY_FILE: &str = "client-identity.json";
+const CLIENT_IDENTITY_SCHEMA_VERSION: &str = "vibex-native-mobile-client-identity.v1";
+const MAX_CLIENT_IDENTITY_BYTES: u64 = 1024;
 /// Upper bound on stored preference strings; every value written by the
 /// settings UI is one of a fixed enum, so this only guards corruption.
 const MAX_APP_SETTINGS_VALUE_BYTES: usize = 32;
@@ -81,6 +88,13 @@ pub struct StoredHostEntry {
 
 fn server_kind_is_unknown(kind: &RemoteServerKind) -> bool {
     *kind == RemoteServerKind::Unknown
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredClientIdentity {
+    schema_version: String,
+    private_key: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -478,6 +492,70 @@ impl CredentialStorage {
         }
     }
 
+    pub fn client_identity_path(&self) -> PathBuf {
+        self.data_dir.join(CLIENT_IDENTITY_FILE)
+    }
+
+    /// The device identity this install presents when it pairs.
+    ///
+    /// One identity belongs to the phone, not to a single pairing: the desktop
+    /// keeps one trust-store entry per identity, so re-pairing with the stored
+    /// key updates that entry instead of adding another. The returned identity
+    /// carries a placeholder device id because the request only needs the
+    /// public key; the server-issued id is bound after the claim. A missing or
+    /// unreadable file reads as "no identity yet" so a corrupt payload cannot
+    /// block pairing.
+    pub fn load_client_identity(&self) -> Option<ClientDeviceIdentity> {
+        let path = self.client_identity_path();
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let identity = decode_client_identity(&bytes);
+                if identity.is_none() {
+                    let _ = fs::remove_file(&path);
+                }
+                identity
+            }
+            Err(_) => self.identity_from_stored_hosts(),
+        }
+    }
+
+    /// A phone that paired before the identity file existed still owns one: the
+    /// key inside its most recently used credential. Adopting it keeps the next
+    /// pairing on the entry the runtime already holds for this phone instead of
+    /// minting a new device.
+    fn identity_from_stored_hosts(&self) -> Option<ClientDeviceIdentity> {
+        let hosts = self.load_hosts().ok()?;
+        let newest = hosts
+            .iter()
+            .max_by_key(|entry| entry.last_connected_at_ms.unwrap_or(entry.added_at_ms))?;
+        ClientDeviceIdentity::from_private_key_base64(
+            newest.bundle.record.auth.device_id.clone(),
+            &newest.bundle.identity_private_key,
+        )
+        .ok()
+    }
+
+    /// Remembers the identity a completed pairing used, so the next pairing is
+    /// recognised as the same client.
+    pub fn save_client_identity(&self, identity: &ClientDeviceIdentity) -> BackendResult<()> {
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|_| storage_error("mobile_client_identity_write_failed"))?;
+        let stored = StoredClientIdentity {
+            schema_version: CLIENT_IDENTITY_SCHEMA_VERSION.to_string(),
+            private_key: identity.private_key_base64(),
+        };
+        let encoded = serde_json::to_vec(&stored)
+            .map_err(|_| storage_error("mobile_client_identity_encode_failed"))?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_CLIENT_IDENTITY_BYTES {
+            return Err(storage_error("mobile_client_identity_invalid"));
+        }
+        write_atomic(
+            &self.client_identity_path(),
+            &encoded,
+            "mobile_client_identity_write_failed",
+        )
+    }
+
     fn reject_invalid_app_settings(&self, path: &Path) -> BackendResult<AppSettings> {
         match fs::remove_file(path) {
             Ok(()) => Err(storage_error("mobile_app_settings_invalid")),
@@ -585,6 +663,23 @@ fn storage_error(code: &'static str) -> BackendError {
     BackendError::failed(code, "native mobile credential storage is unavailable")
 }
 
+/// Decodes the stored install identity, rejecting anything this build cannot
+/// trust as an X25519 key.
+fn decode_client_identity(bytes: &[u8]) -> Option<ClientDeviceIdentity> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CLIENT_IDENTITY_BYTES {
+        return None;
+    }
+    let stored: StoredClientIdentity = serde_json::from_slice(bytes).ok()?;
+    if stored.schema_version != CLIENT_IDENTITY_SCHEMA_VERSION {
+        return None;
+    }
+    ClientDeviceIdentity::from_private_key_base64(
+        vibex_core::DeviceId::new(),
+        stored.private_key.trim(),
+    )
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +724,85 @@ mod tests {
         assert_eq!(storage.load().unwrap().unwrap(), fixture);
         storage.clear().unwrap();
         assert!(storage.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn client_identity_round_trips_and_survives_a_corrupt_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        assert!(storage.load_client_identity().is_none());
+
+        let identity = ClientDeviceIdentity::generate(vibex_core::DeviceId::new()).unwrap();
+        storage.save_client_identity(&identity).unwrap();
+        let stored = storage
+            .load_client_identity()
+            .expect("a saved identity should load again");
+        // Only the key is stored: the device id is issued by each runtime.
+        assert_eq!(stored.public_key_base64(), identity.public_key_base64());
+        assert_ne!(stored.device_id(), identity.device_id());
+
+        // A corrupt payload reads as "no identity yet" instead of blocking the
+        // next pairing, and the unreadable file is dropped.
+        fs::write(storage.client_identity_path(), b"{").unwrap();
+        assert!(storage.load_client_identity().is_none());
+        assert!(!storage.client_identity_path().exists());
+    }
+
+    /// A phone that paired before the identity file existed adopts the key from
+    /// its most recently used credential, so its next pairing is recognised as
+    /// the client the runtime already knows.
+    #[test]
+    fn client_identity_falls_back_to_the_newest_stored_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::new(temp.path().to_path_buf());
+        let connected = fixture();
+        let mut added_only = fixture();
+        added_only.expected_server_id = "added-only-desktop".to_string();
+        storage
+            .save_stored_hosts(&[
+                StoredHostEntry {
+                    bundle: connected.clone(),
+                    name_override: None,
+                    added_at_ms: 1_700_000_000_000,
+                    last_connected_at_ms: Some(1_700_000_500_000),
+                    server_kind: RemoteServerKind::Desktop,
+                },
+                StoredHostEntry {
+                    bundle: added_only.clone(),
+                    name_override: None,
+                    added_at_ms: 1_700_000_100_000,
+                    last_connected_at_ms: None,
+                    server_kind: RemoteServerKind::Headless,
+                },
+            ])
+            .unwrap();
+
+        // A connection is the strongest signal; `added_at_ms` only breaks ties
+        // between credentials that were never used.
+        let adopted = storage
+            .load_client_identity()
+            .expect("a stored credential carries an identity");
+        assert_eq!(adopted.private_key_base64(), connected.identity_private_key);
+        // Reading it must not invent a file: the adoption is a fallback until
+        // the next pairing stores the identity explicitly.
+        assert!(!storage.client_identity_path().exists());
+
+        storage
+            .save_stored_hosts(&[StoredHostEntry {
+                bundle: added_only.clone(),
+                name_override: None,
+                added_at_ms: 1_700_000_100_000,
+                last_connected_at_ms: None,
+                server_kind: RemoteServerKind::Headless,
+            }])
+            .unwrap();
+        let adopted = storage
+            .load_client_identity()
+            .expect("a stored credential carries an identity");
+        assert_eq!(
+            adopted.private_key_base64(),
+            added_only.identity_private_key
+        );
     }
 
     #[test]

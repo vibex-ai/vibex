@@ -766,11 +766,15 @@ fn remote_http_client_for_claim(
     remote_http_client_for_url(url)
 }
 
-/// Complete a headless pairing-code claim with a fresh client identity and a
-/// durable credential record.  The identity is generated before the request,
-/// then rebound to the server-issued device id without changing its private
-/// key.  A server identity probe is required before returning so future
-/// connections can pin the authenticated server key.
+/// Complete a headless pairing-code claim with a durable credential record.
+///
+/// A client keeps one device identity for its whole lifetime: the identity is
+/// rebound to the server-issued device id without changing its private key, so
+/// a client that pairs again can present the key it already stored and be
+/// recognised as the same client instead of a new one. `previous_identity`
+/// carries that stored key; a first pairing passes `None` and mints one. A
+/// server identity probe is required before returning so future connections
+/// can pin the authenticated server key.
 pub struct PairingCodeClientBundle {
     pub response: RemoteClaimPairingCodeResponse,
     pub identity: ClientDeviceIdentity,
@@ -800,6 +804,7 @@ pub fn claim_pairing_code_with_identity(
     pairing_code: impl Into<String>,
     display_name: impl Into<String>,
     allow_insecure_local_dev: bool,
+    previous_identity: Option<ClientDeviceIdentity>,
 ) -> BackendFuture<'static, PairingCodeClientBundle> {
     let base_url = base_url.into();
     let pairing_code = pairing_code.into();
@@ -811,6 +816,7 @@ pub fn claim_pairing_code_with_identity(
             display_name,
             allow_insecure_local_dev,
             None,
+            previous_identity,
         )
         .await
     })
@@ -827,6 +833,7 @@ pub fn claim_pairing_code_link_with_identity(
     link: vibex_core::RemotePairingCodeLink,
     display_name: impl Into<String>,
     allow_insecure_local_dev: bool,
+    previous_identity: Option<ClientDeviceIdentity>,
 ) -> BackendFuture<'static, PairingCodeClientBundle> {
     let display_name = display_name.into();
     Box::pin(async move {
@@ -839,6 +846,7 @@ pub fn claim_pairing_code_link_with_identity(
             display_name,
             allow_insecure_local_dev,
             certificate,
+            previous_identity,
         )
         .await
     })
@@ -850,8 +858,12 @@ async fn complete_pairing_code_claim(
     display_name: String,
     allow_insecure_local_dev: bool,
     pinned_certificate_der: Option<Vec<u8>>,
+    previous_identity: Option<ClientDeviceIdentity>,
 ) -> BackendResult<PairingCodeClientBundle> {
-    let provisional = ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?;
+    let provisional = match previous_identity {
+        Some(identity) => identity,
+        None => ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?,
+    };
     let request = RemoteClaimPairingCodeRequest {
         pairing_code,
         display_name,

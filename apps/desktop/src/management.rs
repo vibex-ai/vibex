@@ -21064,6 +21064,7 @@ mod tests {
             .expect("pairing tests should remain inspectable");
         assert!(pairing_production.contains("fn render_devices_page("));
         assert!(pairing_production.contains("fn confirm_revoke_device("));
+        assert!(pairing_production.contains("fn confirm_delete_device("));
     }
 
     #[test]

@@ -241,6 +241,10 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
   `device_pairing`, read-only devices cannot create/cancel offers, and a malicious
   client route is replaced by server configuration without appearing in Debug or
   the resulting offer.
+- Re-pairing with the identity a client already presented keeps exactly one
+  device row and invalidates the superseded grant, while an unknown identity
+  creates its own row. Deleting a device revokes an active grant before the row
+  goes away and leaves the audit history readable.
 - Binding drift plus `cargo test -p vibex-core remote`, `cargo test -p vibex-db
   remote`, `cargo test -p vibex-remote`, and `cargo test -p
   vibex-desktop-runtime remote`.
@@ -947,6 +951,17 @@ Relay transports.
 First pairing uses QR code or one-time pairing code. Pairing must exchange
 device public keys and create a named device record.
 
+A client keeps one device identity for its whole lifetime, and the trust store
+keys a client on that identity key. A re-pairing presents the same key and
+reuses the row the client already has — same device id and creation time,
+replaced grant and permission level, cleared revocation, and a bumped
+`grant_revision` so cached responses and Relay permission contexts bound to the
+old grant cannot be replayed. A client that presents an unknown key, including
+a reinstall, still gets its own row. The phone stores that identity per install
+and falls back to the key inside its most recently used credential, so a phone
+that paired before the identity existed is still recognised on its next
+pairing.
+
 Device records need:
 
 - Device id and public key.
@@ -957,6 +972,12 @@ Device records need:
 - Audit log references.
 
 Revoked devices cannot reconnect even if they still know old Relay room data.
+
+A record can also be deleted, which is not the same as revoking it. Deleting an
+active record revokes its grant and disconnects the client first, so a live
+grant is never dropped silently; a revoked record is removed as it stands. Both
+actions are audited, and the audit `device_id` foreign key clears instead of
+cascading, so deleting a record never deletes its history.
 
 ## Transport Envelope
 

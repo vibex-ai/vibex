@@ -10201,6 +10201,33 @@ impl RemoteDeviceRepository {
         ))
     }
 
+    /// The row a client identity already holds, if any.
+    ///
+    /// A client keeps one long-lived device identity across pairings, so the
+    /// trust store keys a returning client on its identity key instead of
+    /// appending a second row for the same phone.
+    pub fn find_by_public_key(
+        conn: &Connection,
+        public_key: &str,
+    ) -> VibexResult<Option<RemoteDeviceRecord>> {
+        conn.query_row(
+            "
+            SELECT device_id, display_name, public_key, auth_secret_hash, grant_revision,
+                permission_level, status, paired_at_ms, last_seen_at_ms,
+                revoked_at_ms, created_at_ms, updated_at_ms
+            FROM remote_devices
+            WHERE public_key = ?1
+            ",
+            params![public_key],
+            map_remote_device_record,
+        )
+        .optional()
+        .map_err(storage_err(
+            "remote_device_identity_lookup_failed",
+            "failed to lookup remote device by identity",
+        ))
+    }
+
     pub fn list(conn: &Connection) -> VibexResult<Vec<RemoteDeviceRecord>> {
         let mut stmt = conn
             .prepare(
@@ -10272,6 +10299,27 @@ impl RemoteDeviceRepository {
                 "remote device was not found after revoke",
             )
         })
+    }
+
+    /// Removes a trust-store row.
+    ///
+    /// Audit rows keep their history: the `device_id` foreign key is
+    /// `ON DELETE SET NULL`, so the record loses its device link but not the
+    /// summary written when the action happened.
+    pub fn delete(conn: &Connection, device_id: &DeviceId) -> VibexResult<bool> {
+        let removed = conn
+            .execute(
+                "
+                DELETE FROM remote_devices
+                WHERE device_id = ?1
+                ",
+                params![device_id.as_str()],
+            )
+            .map_err(storage_err(
+                "remote_device_delete_failed",
+                "failed to delete remote device",
+            ))?;
+        Ok(removed > 0)
     }
 }
 
@@ -18167,6 +18215,88 @@ mod tests {
         .unwrap();
         assert_eq!(audits.len(), 1);
         assert!(!audits[0].redacted_summary.contains(raw_pairing_code));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn remote_device_identity_lookup_and_delete_keep_audit_history() {
+        let temp = temp_db_path("remote-delete");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let now = unix_timestamp_ms();
+        let identity_key = "identity-key-of-one-client";
+        let device_id = DeviceId::new();
+        RemoteDeviceRepository::upsert(
+            &conn,
+            &RemoteDeviceRecord {
+                detail: RemoteDeviceDetail {
+                    device_id: device_id.clone(),
+                    display_name: "Vibex Mobile".to_string(),
+                    public_key: Some(identity_key.to_string()),
+                    grant_revision: 1,
+                    permission_level: RemoteDevicePermissionLevel::FullControl,
+                    status: RemoteDeviceStatus::Active,
+                    paired_at_ms: Some(now),
+                    last_seen_at_ms: Some(now),
+                    revoked_at_ms: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                },
+                auth_secret_hash: "hash:auth-token".to_string(),
+            },
+        )
+        .unwrap();
+
+        let found = RemoteDeviceRepository::find_by_public_key(&conn, identity_key)
+            .unwrap()
+            .expect("identity lookup should find the paired client");
+        assert_eq!(found.detail.device_id, device_id);
+        assert!(
+            RemoteDeviceRepository::find_by_public_key(&conn, "another-client")
+                .unwrap()
+                .is_none()
+        );
+
+        RemoteAuditRepository::insert(
+            &conn,
+            &RemoteAuditRecord {
+                audit_id: RequestId::new(),
+                device_id: Some(device_id.clone()),
+                action: RemoteAuditAction::DeviceRevoked,
+                target_kind: RemoteAuditTargetKind::Device,
+                target_id: Some(device_id.to_string()),
+                outcome: RemoteAuditOutcome::Revoked,
+                redacted_summary: "Device 'Vibex Mobile' revoked".to_string(),
+                request_id: None,
+                correlation_id: None,
+                created_at_ms: now,
+            },
+        )
+        .unwrap();
+
+        assert!(RemoteDeviceRepository::delete(&conn, &device_id).unwrap());
+        assert!(
+            RemoteDeviceRepository::get(&conn, &device_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!RemoteDeviceRepository::delete(&conn, &device_id).unwrap());
+
+        // The audit row survives the deletion with its device link cleared, so
+        // the trust store can forget a client without rewriting history.
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].device_id, None);
+        assert!(audits[0].redacted_summary.contains("Vibex Mobile"));
 
         cleanup_db(temp);
     }

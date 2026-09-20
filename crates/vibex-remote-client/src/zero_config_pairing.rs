@@ -76,6 +76,26 @@ impl ZeroConfigLanPairingSession {
         expected_server_identity_public_key: &str,
         display_name: &str,
     ) -> BackendResult<Self> {
+        Self::start_with_identity(
+            origin,
+            expected_server_id,
+            expected_server_identity_public_key,
+            display_name,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a session that presents `identity` when the client already has
+    /// one, so a re-pairing is recognised as the same client. A first pairing
+    /// passes `None` and mints a fresh identity.
+    pub async fn start_with_identity(
+        origin: impl Into<String>,
+        expected_server_id: &str,
+        expected_server_identity_public_key: &str,
+        display_name: &str,
+        identity: Option<ClientDeviceIdentity>,
+    ) -> BackendResult<Self> {
         let origin = normalize_zero_config_lan_origin(&origin.into())?;
         let expected_server_id = expected_server_id.trim();
         let expected_server_identity_public_key = expected_server_identity_public_key.trim();
@@ -161,7 +181,10 @@ impl ZeroConfigLanPairingSession {
                 "zero-config LAN pairing encrypted session could not be established",
             )
         })?;
-        let identity = ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?;
+        let identity = match identity {
+            Some(identity) => identity,
+            None => ClientDeviceIdentity::generate(vibex_core::DeviceId::new())?,
+        };
         let client_nonce = random_token()?;
         let request_secret = random_token()?;
         let request = RemoteLanPairingRequest {

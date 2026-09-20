@@ -104,7 +104,7 @@ async fn pairing_link_pins_the_self_signed_certificate_end_to_end() {
     assert!(encoded.starts_with("vibex://pair#/code/"));
     let parsed = RemotePairingCodeLink::parse(&encoded).expect("parse pairing link");
 
-    let bundle = claim_pairing_code_link_with_identity(parsed, "Pinned smoke desktop", false)
+    let bundle = claim_pairing_code_link_with_identity(parsed, "Pinned smoke desktop", false, None)
         .await
         .expect("claim pairing link");
     assert_eq!(bundle.credential.server_url, runtime.url());
@@ -147,9 +147,64 @@ async fn claim_without_the_pin_cannot_trust_the_runtime() {
         runtime.mint_pairing_code(),
         "Unpinned smoke client",
         false,
+        None,
     )
     .await
     .expect_err("an unpinned client must not accept a self-signed runtime");
+}
+
+/// A client keeps one device identity, so pairing twice must update the row the
+/// runtime already holds for it instead of adding a second device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_pairing_with_the_stored_identity_updates_one_device_row() {
+    let runtime = start_pinned_runtime("identity-reuse").await;
+    let certificate = runtime.certificate();
+
+    let first = claim_pairing_code_link_with_identity(
+        RemotePairingCodeLink::new(
+            runtime.url(),
+            runtime.mint_pairing_code(),
+            Some(certificate.clone()),
+        )
+        .expect("build pairing link"),
+        "Vibex Mobile",
+        false,
+        None,
+    )
+    .await
+    .expect("first pairing");
+    let stored = ClientDeviceIdentity::from_private_key_base64(
+        first.credential.auth.device_id.clone(),
+        &first.identity.private_key_base64(),
+    )
+    .expect("bind the claimed identity");
+
+    let second = claim_pairing_code_link_with_identity(
+        RemotePairingCodeLink::new(
+            runtime.url(),
+            runtime.mint_pairing_code(),
+            Some(certificate),
+        )
+        .expect("build pairing link"),
+        "Vibex Mobile",
+        false,
+        Some(stored),
+    )
+    .await
+    .expect("second pairing");
+
+    assert_eq!(
+        second.credential.auth.device_id,
+        first.credential.auth.device_id
+    );
+    assert_eq!(
+        second.identity.public_key_base64(),
+        first.identity.public_key_base64()
+    );
+    let connection = open_database(&runtime.root.join("vibex.db")).expect("open database");
+    let devices = vibex_db::RemoteDeviceRepository::list(&connection).expect("list paired devices");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].detail.device_id, first.credential.auth.device_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -164,7 +219,7 @@ async fn claim_with_a_certificate_from_another_runtime_is_rejected() {
     )
     .expect("build pairing link");
 
-    claim_pairing_code_link_with_identity(link, "Mismatched smoke client", false)
+    claim_pairing_code_link_with_identity(link, "Mismatched smoke client", false, None)
         .await
         .expect_err("a certificate that did not come from this runtime must be refused");
 }

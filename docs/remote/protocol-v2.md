@@ -75,10 +75,15 @@ so it mints an operator-displayed one-time numeric pairing code:
   write a `pairing_code_rejected` audit record. A successful claim returns
   exactly one active device grant with the permission level chosen at code
   creation (`read-only`, `approve-only`, or `full-control`).
-- The claim body may carry a fresh client identity public key; the issued
+- The claim body carries the client's device identity public key; the issued
   device grant binds that key, so the client's private key never crosses the
   wire. Clients pin the `serverIdentityPublicKey` probed from `/api/v2/info`
   before persisting the credential, then speak the standard v2 hello proof.
+- A client keeps one device identity and presents it again when it re-pairs, so
+  the runtime replaces the grant on the record it already holds for that client
+  — same device id, superseded grant, bumped `grantRevision` — instead of
+  appending a second device. An unknown key, including a reinstall, still
+  creates its own record.
 - `vibex-server` prints the code on startup (and can mint more via
   `vibex-server pairing-code`); the native mobile client enters it under
   "Pair with a Cloud Server". Codes are single-use secrets with desktop-code
@@ -109,5 +114,8 @@ tailscale serve status
 ```
 
 Revoking a device updates durable state and immediately signals every active
-connection for that device with `device_revoked`. Runtime shutdown sends
-`server_shutdown`, drains the listener, and releases all sockets.
+connection for that device with `device_revoked`. Deleting a device record
+revokes an active grant and disconnects it first, so a live grant is never
+dropped silently; audit records are kept and lose only their device link.
+Runtime shutdown sends `server_shutdown`, drains the listener, and releases all
+sockets.

@@ -310,9 +310,14 @@ impl MobileCredentialBundle {
 /// and the one-time numeric code the operator printed at startup.  The code
 /// travels only inside the bounded HTTPS claim body and is single-use; the
 /// returned credential pins the server identity before it is persisted.
+///
+/// `previous_identity` is the install's stored device identity. Presenting it
+/// again lets the runtime update the entry it already has for this phone
+/// instead of adding another one.
 pub async fn claim_server_pairing_code(
     server_url: String,
     pairing_code: String,
+    previous_identity: Option<ClientDeviceIdentity>,
 ) -> BackendResult<MobilePairedRuntime> {
     let server_url = server_url.trim().trim_end_matches('/').to_string();
     let bundle = vibex_remote_client::claim_pairing_code_with_identity(
@@ -320,6 +325,7 @@ pub async fn claim_server_pairing_code(
         pairing_code,
         "Vibex Mobile".to_string(),
         cfg!(debug_assertions),
+        previous_identity,
     )
     .await?;
     let server_kind = bundle.server_kind;
@@ -351,7 +357,10 @@ pub async fn claim_server_pairing_code(
 /// trusts bundled public roots and never user or system stores, so a pinned
 /// certificate is the only way this client reaches a LAN runtime that has no
 /// public CA at all.
-pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobilePairedRuntime> {
+pub async fn claim_pairing_code_link(
+    link: String,
+    previous_identity: Option<ClientDeviceIdentity>,
+) -> BackendResult<MobilePairedRuntime> {
     let link = RemotePairingCodeLink::parse(&link)?;
     let server_url = link.normalized_server_url()?;
     let pinned_tls_certificate_der = link.tls_certificate_der.clone();
@@ -359,6 +368,7 @@ pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobilePaired
         link,
         "Vibex Mobile".to_string(),
         cfg!(debug_assertions),
+        previous_identity,
     )
     .await?;
     let server_kind = bundle.server_kind;
@@ -395,12 +405,20 @@ pub async fn claim_pairing_code_link(link: String) -> BackendResult<MobilePaired
     })
 }
 
-pub async fn claim_pairing_link(link: String) -> BackendResult<MobilePairedRuntime> {
+/// Claims a scanned or pasted pairing entry.
+///
+/// `previous_identity` is the install's stored device identity; presenting it
+/// again makes a re-pairing update the desktop's existing entry for this phone
+/// rather than appending a new device.
+pub async fn claim_pairing_link(
+    link: String,
+    previous_identity: Option<ClientDeviceIdentity>,
+) -> BackendResult<MobilePairedRuntime> {
     // A `vibex-server` connection string is a different entry point than the
     // desktop-advertised pairing offer, but it reaches the phone through the
     // same scanner, so both shapes are accepted here.
     if is_pairing_code_link(&link) {
-        return claim_pairing_code_link(link).await;
+        return claim_pairing_code_link(link, previous_identity).await;
     }
     let now_ms = vibex_core::unix_timestamp_ms();
     let offer = parse_pairing_offer_fragment(&link, now_ms)?;
@@ -412,7 +430,10 @@ pub async fn claim_pairing_link(link: String) -> BackendResult<MobilePairedRunti
         transport: Some(transport),
     };
     let route = select_pairing_claim_route(&offer, &hint)?;
-    let provisional_identity = ClientDeviceIdentity::generate(DeviceId::new())?;
+    let provisional_identity = match previous_identity {
+        Some(identity) => identity,
+        None => ClientDeviceIdentity::generate(DeviceId::new())?,
+    };
     let request = pairing_claim_request(
         &offer,
         "Vibex Mobile",
