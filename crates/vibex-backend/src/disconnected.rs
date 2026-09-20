@@ -38,6 +38,11 @@ use vibex_core::{
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
     McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
     McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse,
     OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
     PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
     ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
@@ -832,6 +837,27 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn search_skill_market(
+        &self,
+        _request: SkillMarketSearchRequest,
+    ) -> BackendFuture<'_, SkillMarketSearchResponse> {
+        disconnected_future!()
+    }
+
+    fn skill_market_document(
+        &self,
+        _request: SkillMarketDocumentRequest,
+    ) -> BackendFuture<'_, SkillMarketDocument> {
+        disconnected_future!()
+    }
+
+    fn install_skill_market_entry(
+        &self,
+        _request: MutationRequest<SkillMarketInstallRequest>,
+    ) -> BackendFuture<'_, SkillMarketInstallResult> {
+        disconnected_future!()
+    }
+
     fn prompts(&self) -> BackendFuture<'_, Vec<Prompt>> {
         disconnected_future!()
     }
@@ -1279,6 +1305,38 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: McpServerValidateRequest,
     ) -> BackendFuture<'_, McpServerValidationResult> {
+        disconnected_future!()
+    }
+
+    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse> {
+        disconnected_future!()
+    }
+
+    fn set_market_sources(
+        &self,
+        _request: MutationRequest<MarketSourceSetRequest>,
+    ) -> BackendFuture<'_, MarketSourceListResponse> {
+        disconnected_future!()
+    }
+
+    fn search_mcp_market(
+        &self,
+        _request: McpMarketSearchRequest,
+    ) -> BackendFuture<'_, McpMarketSearchResponse> {
+        disconnected_future!()
+    }
+
+    fn mcp_market_entry(
+        &self,
+        _request: McpMarketEntryRequest,
+    ) -> BackendFuture<'_, McpMarketEntry> {
+        disconnected_future!()
+    }
+
+    fn install_mcp_market_entry(
+        &self,
+        _request: MutationRequest<McpMarketInstallRequest>,
+    ) -> BackendFuture<'_, McpMarketInstallResult> {
         disconnected_future!()
     }
 }

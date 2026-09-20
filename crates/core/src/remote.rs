@@ -74,6 +74,12 @@ use crate::provider::{
     SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest, SkillImportResult,
     SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
 };
+use crate::market::{
+    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse,
+    SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketInstallRequest,
+    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse,
+};
 use crate::provider_projection::{
     AgentModelProviderBinding, AgentProviderProjectionCapability,
     AgentProviderProjectionCapabilityRequest, AgentProviderProjectionPreview,
@@ -2232,6 +2238,14 @@ pub enum RemoteProviderOperationKind {
     SkillDiscover,
     SkillImport,
     SkillValidate,
+    MarketSourceList,
+    MarketSourceSet,
+    McpMarketSearch,
+    McpMarketEntry,
+    McpMarketInstall,
+    SkillMarketSearch,
+    SkillMarketDocument,
+    SkillMarketInstall,
     PromptList,
     PromptCreate,
     PromptUpdate,
@@ -2900,6 +2914,109 @@ pub struct RemoteProviderSkillValidateResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMarketSourceListRequest {
+    pub auth: RemoteAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMarketSourceListResponse {
+    pub sources: MarketSourceListResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMarketSourceSetRequest {
+    pub auth: RemoteAuthProof,
+    pub request: MarketSourceSetRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMarketSourceSetResponse {
+    pub sources: MarketSourceListResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketSearchRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpMarketSearchRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketSearchResponse {
+    pub result: McpMarketSearchResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketEntryRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpMarketEntryRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketEntryResponse {
+    pub entry: McpMarketEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketInstallRequest {
+    pub auth: RemoteAuthProof,
+    pub request: McpMarketInstallRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderMcpMarketInstallResponse {
+    pub result: McpMarketInstallResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketSearchRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillMarketSearchRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketSearchResponse {
+    pub result: SkillMarketSearchResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketDocumentRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillMarketDocumentRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketDocumentResponse {
+    pub document: SkillMarketDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketInstallRequest {
+    pub auth: RemoteAuthProof,
+    pub request: SkillMarketInstallRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderSkillMarketInstallResponse {
+    pub result: SkillMarketInstallResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteProviderPromptListRequest {
     pub auth: RemoteAuthProof,
 }
@@ -3497,6 +3614,14 @@ pub enum RemoteProviderRequest {
     SkillDiscover(RemoteProviderSkillDiscoverRequest),
     SkillImport(RemoteProviderSkillImportRequest),
     SkillValidate(RemoteProviderSkillValidateRequest),
+    MarketSourceList(RemoteProviderMarketSourceListRequest),
+    MarketSourceSet(RemoteProviderMarketSourceSetRequest),
+    McpMarketSearch(RemoteProviderMcpMarketSearchRequest),
+    McpMarketEntry(RemoteProviderMcpMarketEntryRequest),
+    McpMarketInstall(RemoteProviderMcpMarketInstallRequest),
+    SkillMarketSearch(RemoteProviderSkillMarketSearchRequest),
+    SkillMarketDocument(RemoteProviderSkillMarketDocumentRequest),
+    SkillMarketInstall(RemoteProviderSkillMarketInstallRequest),
     PromptList(RemoteProviderPromptListRequest),
     PromptCreate(RemoteProviderPromptCreateRequest),
     PromptUpdate(RemoteProviderPromptUpdateRequest),
@@ -3543,6 +3668,9 @@ impl RemoteProviderRequest {
                 | Self::CheckManagedAgentUpdate(_)
                 | Self::UninstallManagedAgent(_)
                 | Self::DeleteAgentAuthCatalog(_)
+                | Self::MarketSourceSet(_)
+                | Self::McpMarketInstall(_)
+                | Self::SkillMarketInstall(_)
         )
     }
 
@@ -3682,6 +3810,14 @@ impl RemoteProviderRequest {
             Self::SkillDiscover(_) => RemoteProviderOperationKind::SkillDiscover,
             Self::SkillImport(_) => RemoteProviderOperationKind::SkillImport,
             Self::SkillValidate(_) => RemoteProviderOperationKind::SkillValidate,
+            Self::MarketSourceList(_) => RemoteProviderOperationKind::MarketSourceList,
+            Self::MarketSourceSet(_) => RemoteProviderOperationKind::MarketSourceSet,
+            Self::McpMarketSearch(_) => RemoteProviderOperationKind::McpMarketSearch,
+            Self::McpMarketEntry(_) => RemoteProviderOperationKind::McpMarketEntry,
+            Self::McpMarketInstall(_) => RemoteProviderOperationKind::McpMarketInstall,
+            Self::SkillMarketSearch(_) => RemoteProviderOperationKind::SkillMarketSearch,
+            Self::SkillMarketDocument(_) => RemoteProviderOperationKind::SkillMarketDocument,
+            Self::SkillMarketInstall(_) => RemoteProviderOperationKind::SkillMarketInstall,
             Self::PromptList(_) => RemoteProviderOperationKind::PromptList,
             Self::PromptCreate(_) => RemoteProviderOperationKind::PromptCreate,
             Self::PromptUpdate(_) => RemoteProviderOperationKind::PromptUpdate,

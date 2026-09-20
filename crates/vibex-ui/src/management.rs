@@ -1838,6 +1838,40 @@ mod tests {
             error_future()
         }
 
+        fn market_sources(
+            &self,
+        ) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
+            error_future()
+        }
+
+        fn set_market_sources(
+            &self,
+            _request: MutationRequest<vibex_core::MarketSourceSetRequest>,
+        ) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
+            error_future()
+        }
+
+        fn search_mcp_market(
+            &self,
+            _request: vibex_core::McpMarketSearchRequest,
+        ) -> BackendFuture<'_, vibex_core::McpMarketSearchResponse> {
+            error_future()
+        }
+
+        fn mcp_market_entry(
+            &self,
+            _request: vibex_core::McpMarketEntryRequest,
+        ) -> BackendFuture<'_, vibex_core::McpMarketEntry> {
+            error_future()
+        }
+
+        fn install_mcp_market_entry(
+            &self,
+            _request: MutationRequest<vibex_core::McpMarketInstallRequest>,
+        ) -> BackendFuture<'_, vibex_core::McpMarketInstallResult> {
+            error_future()
+        }
+
         fn skills(&self) -> BackendFuture<'_, Vec<vibex_core::Skill>> {
             error_future()
         }
@@ -1895,6 +1929,27 @@ mod tests {
             &self,
             _request: vibex_core::SkillValidateRequest,
         ) -> BackendFuture<'_, vibex_core::SkillValidationResult> {
+            error_future()
+        }
+
+        fn search_skill_market(
+            &self,
+            _request: vibex_core::SkillMarketSearchRequest,
+        ) -> BackendFuture<'_, vibex_core::SkillMarketSearchResponse> {
+            error_future()
+        }
+
+        fn skill_market_document(
+            &self,
+            _request: vibex_core::SkillMarketDocumentRequest,
+        ) -> BackendFuture<'_, vibex_core::SkillMarketDocument> {
+            error_future()
+        }
+
+        fn install_skill_market_entry(
+            &self,
+            _request: MutationRequest<vibex_core::SkillMarketInstallRequest>,
+        ) -> BackendFuture<'_, vibex_core::SkillMarketInstallResult> {
             error_future()
         }
 

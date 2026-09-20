@@ -29,6 +29,11 @@ use vibex_core::{
     McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
     McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
     McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse,
     ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
     Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
@@ -475,6 +480,28 @@ pub trait ManagementBackend: BackendBound {
         request: McpServerValidateRequest,
     ) -> BackendFuture<'_, McpServerValidationResult>;
 
+    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse>;
+
+    fn set_market_sources(
+        &self,
+        request: MutationRequest<MarketSourceSetRequest>,
+    ) -> BackendFuture<'_, MarketSourceListResponse>;
+
+    fn search_mcp_market(
+        &self,
+        request: McpMarketSearchRequest,
+    ) -> BackendFuture<'_, McpMarketSearchResponse>;
+
+    fn mcp_market_entry(
+        &self,
+        request: McpMarketEntryRequest,
+    ) -> BackendFuture<'_, McpMarketEntry>;
+
+    fn install_mcp_market_entry(
+        &self,
+        request: MutationRequest<McpMarketInstallRequest>,
+    ) -> BackendFuture<'_, McpMarketInstallResult>;
+
     fn skills(&self) -> BackendFuture<'_, Vec<Skill>>;
 
     fn create_skill(
@@ -513,6 +540,21 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: SkillValidateRequest,
     ) -> BackendFuture<'_, SkillValidationResult>;
+
+    fn search_skill_market(
+        &self,
+        request: SkillMarketSearchRequest,
+    ) -> BackendFuture<'_, SkillMarketSearchResponse>;
+
+    fn skill_market_document(
+        &self,
+        request: SkillMarketDocumentRequest,
+    ) -> BackendFuture<'_, SkillMarketDocument>;
+
+    fn install_skill_market_entry(
+        &self,
+        request: MutationRequest<SkillMarketInstallRequest>,
+    ) -> BackendFuture<'_, SkillMarketInstallResult>;
 
     fn prompts(&self) -> BackendFuture<'_, Vec<Prompt>>;
 

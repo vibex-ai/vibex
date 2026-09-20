@@ -3317,6 +3317,139 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderSkillValidateResponse { result: value })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::MarketSourceList(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let sources = run_market_blocking(move || service.market_sources())?;
+            serde_json::to_value(vibex_core::RemoteProviderMarketSourceListResponse { sources })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::MarketSourceSet(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let sources =
+                run_market_blocking(move || service.set_market_sources(request.request));
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "market_source_set".to_string(),
+                "Market sources updated from a paired device",
+                sources.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let sources = sources?;
+            serde_json::to_value(vibex_core::RemoteProviderMarketSourceSetResponse { sources })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::McpMarketSearch(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = run_market_blocking(move || service.search_mcp_market(request.request))?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMarketSearchResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::McpMarketEntry(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let entry = run_market_blocking(move || service.mcp_market_entry(request.request))?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMarketEntryResponse { entry })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::McpMarketInstall(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = run_market_blocking(move || {
+                service.install_mcp_market_entry(request.request)
+            });
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "mcp_market_install".to_string(),
+                "MCP server installed from the market on a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteProviderMcpMarketInstallResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillMarketSearch(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result =
+                run_market_blocking(move || service.search_skill_market(request.request))?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillMarketSearchResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillMarketDocument(request) => {
+            authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::ReadProviderSettings,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let document =
+                run_market_blocking(move || service.skill_market_document(request.request))?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillMarketDocumentResponse { document })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::SkillMarketInstall(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = run_market_blocking(move || {
+                service.install_skill_market_entry(request.request)
+            });
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "skill_market_install".to_string(),
+                "Skill installed from the market on a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(vibex_core::RemoteProviderSkillMarketInstallResponse { result })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::PromptList(request) => {
             authorize_provider_action(
                 runtime,
@@ -6680,6 +6813,28 @@ fn terminal_session_should_restore(session: &TerminalSession) -> bool {
 
 fn terminal_session_visible(session: &TerminalSession) -> bool {
     session.status == TerminalStatus::Running
+}
+
+/// Run a blocking market operation without stalling the async dispatcher.
+///
+/// Market reads and installs perform network and file I/O with a deadline of
+/// several seconds. The Provider dispatch is async, so running that inline would
+/// hold one worker for the whole deadline and delay every other request sharing
+/// it. `block_in_place` hands the worker's remaining tasks to another thread
+/// first; on a runtime that cannot do that, the operation still runs, just
+/// inline.
+fn run_market_blocking<T, F>(operation: F) -> VibexResult<T>
+where
+    F: FnOnce() -> VibexResult<T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(operation)
+        }
+        _ => operation(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

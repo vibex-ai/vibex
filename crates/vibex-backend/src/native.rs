@@ -46,7 +46,12 @@ use vibex_core::{
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
+    McpServerValidationResult, MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry,
+    McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse,
+    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
     PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderConfiguredModel,
     ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
@@ -2465,6 +2470,99 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .market_sources()
+                .map_err(Into::into)
+        })
+    }
+
+    fn set_market_sources(
+        &self,
+        request: MutationRequest<MarketSourceSetRequest>,
+    ) -> BackendFuture<'_, MarketSourceListResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .set_market_sources(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn search_mcp_market(
+        &self,
+        request: McpMarketSearchRequest,
+    ) -> BackendFuture<'_, McpMarketSearchResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            // A catalog fetch is blocking I/O; running it on the async worker
+            // would stall every other task sharing the thread.
+            tokio::task::spawn_blocking(move || service.search_mcp_market(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_search_task_failed",
+                        "the market search task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn mcp_market_entry(
+        &self,
+        request: McpMarketEntryRequest,
+    ) -> BackendFuture<'_, McpMarketEntry> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.mcp_market_entry(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_entry_task_failed",
+                        "the market entry task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn install_mcp_market_entry(
+        &self,
+        request: MutationRequest<McpMarketInstallRequest>,
+    ) -> BackendFuture<'_, McpMarketInstallResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || {
+                service.install_mcp_market_entry(request.payload)
+            })
+            .await
+            .map_err(|_| {
+                BackendError::failed(
+                    "market_install_task_failed",
+                    "the market install task did not complete",
+                )
+            })?
+            .map_err(Into::into)
+        })
+    }
+
     fn skills(&self) -> BackendFuture<'_, Vec<Skill>> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
@@ -2605,6 +2703,68 @@ impl ManagementBackend for NativeBackend {
                 .management()
                 .validate_skill(request)
                 .map_err(Into::into)
+        })
+    }
+
+    fn search_skill_market(
+        &self,
+        request: SkillMarketSearchRequest,
+    ) -> BackendFuture<'_, SkillMarketSearchResponse> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.search_skill_market(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_search_task_failed",
+                        "the market search task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn skill_market_document(
+        &self,
+        request: SkillMarketDocumentRequest,
+    ) -> BackendFuture<'_, SkillMarketDocument> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || service.skill_market_document(request))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_document_task_failed",
+                        "the market document task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
+    fn install_skill_market_entry(
+        &self,
+        request: MutationRequest<SkillMarketInstallRequest>,
+    ) -> BackendFuture<'_, SkillMarketInstallResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let service = runtime.management().providers().management();
+            tokio::task::spawn_blocking(move || {
+                service.install_skill_market_entry(request.payload)
+            })
+            .await
+            .map_err(|_| {
+                BackendError::failed(
+                    "market_install_task_failed",
+                    "the market install task did not complete",
+                )
+            })?
+            .map_err(Into::into)
         })
     }
 

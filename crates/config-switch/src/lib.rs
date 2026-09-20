@@ -75,6 +75,7 @@ use vibex_db::{
     SkillRepository, apply_migrations, open_database,
 };
 
+mod market;
 mod native_export;
 mod native_import;
 mod native_surface;

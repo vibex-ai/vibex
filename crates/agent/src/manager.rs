@@ -2609,6 +2609,14 @@ impl AgentManager {
             ContextBridgeTurnBehavior::PreservePending => None,
         };
         SessionRepository::claim_running_turn(&conn, &session.id, session.state)?;
+        // Turn admission is the authoritative `idle`/`error` -> `running`
+        // transition, but it appends no timeline item of its own. Publish the
+        // snapshot so every client drops the pre-turn state (a failed session's
+        // error dot, for example) as soon as the turn exists, instead of waiting
+        // for the first provider event to refresh it.
+        if let Some(running) = SessionRepository::get(&conn, &session.id)? {
+            self.publish_root_session_update(&conn, running);
+        }
 
         let user_item = if display.display_user_message {
             let appended_user = match self.append_timeline_item(
@@ -2886,6 +2894,12 @@ impl AgentManager {
                 execution_attribution.as_ref(),
             );
             return Err(err);
+        }
+        // The turn boundary is the matching `running` -> `idle`/`needs_input`
+        // transition for the admission publish above, and it is equally
+        // invisible to clients that only follow session snapshots.
+        if let Some(settled) = SessionRepository::get(&conn, &session.id)? {
+            self.publish_root_session_update(&conn, settled);
         }
         if turn_completed
             && next_state == AgentSessionState::Idle
@@ -5577,6 +5591,10 @@ mod tests {
         title: Mutex<String>,
     }
 
+    /// A provider that completes every turn with one final Agent message, so a
+    /// test can drive a whole `send_message` through the real coordinator.
+    struct CompletingTurnProvider;
+
     struct FailingContinueRuntimeBackend {
         materialize_calls: AtomicUsize,
     }
@@ -5889,6 +5907,59 @@ mod tests {
                 events: vec![ProviderEvent::session_title(
                     self.title.lock().unwrap().clone(),
                 )],
+                binding_update: None,
+                completed: true,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for CompletingTurnProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Acp
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::conservative(ProviderKind::Acp, "completing-turn-test")
+        }
+
+        async fn create_session(
+            &self,
+            _request: ProviderCreateRequest,
+        ) -> VibexResult<ProviderSessionHandle> {
+            unreachable!("the test harness owns runtime materialization")
+        }
+
+        async fn resume_session(
+            &self,
+            binding: ProviderBinding,
+        ) -> VibexResult<ProviderSessionHandle> {
+            Ok(ProviderSessionHandle {
+                binding,
+                capabilities: self.capabilities(),
+            })
+        }
+
+        async fn prepare_turn_execution(
+            &self,
+            _handle: &ProviderSessionHandle,
+            request: &ProviderTurnRequest,
+        ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+            Ok(request.execution_identity.clone())
+        }
+
+        async fn send_turn(
+            &self,
+            _handle: ProviderSessionHandle,
+            request: ProviderTurnRequest,
+        ) -> VibexResult<ProviderTurnResult> {
+            Ok(ProviderTurnResult {
+                events: vec![ProviderEvent::agent(TimelinePayload::AgentMessage(
+                    vibex_core::AgentMessagePayload {
+                        text: format!("completed: {}", request.text),
+                        is_final: true,
+                    },
+                ))],
                 binding_update: None,
                 completed: true,
             })
@@ -7582,6 +7653,75 @@ mod tests {
         );
 
         drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn turn_boundaries_publish_the_running_and_settled_session_snapshots() {
+        let db_path = temp_db_path("turn-boundary-session-snapshots");
+        let workspace_root = temp_workspace_path("turn-boundary-session-snapshots");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = crate::test_support::TestRuntimeHarness::new(
+            &db_path,
+            AgentId::parse("codex").unwrap(),
+            Arc::new(CompletingTurnProvider),
+        );
+        let selection = manager
+            .resolve_initial_runtime_selection(None, ProviderKind::Codex, None, None)
+            .unwrap();
+        let session = manager
+            .create_session(CreateAgentSessionRequest {
+                session_id: None,
+                defer_runtime_materialization: false,
+                runtime: selection.clone(),
+                workspace_root: workspace_root.to_string_lossy().to_string(),
+                workspace_mode: WorkspaceMode::CurrentCheckout,
+                title: Some("Turn boundary snapshots".to_string()),
+                safety: Some(AgentSessionSafety::workspace_write_ask_on_risk()),
+            })
+            .await
+            .unwrap();
+
+        // A session that failed and is asked to work again starts from `error`,
+        // exactly like a retry after an interrupted turn.
+        let conn = manager.open_migrated().unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Error).unwrap();
+        drop(conn);
+
+        let mut session_updates = manager.subscribe_session_updates();
+        manager
+            .send_message(SendAgentMessageRequest {
+                session_id: session.id.clone(),
+                message_idempotency_key: "turn-boundary-session-snapshots".to_string(),
+                desired_runtime: selection.clone(),
+                text: "retry after failure".to_string(),
+                attachments: Vec::new(),
+                reasoning_effort: selection.reasoning_effort.clone(),
+                correlation_id: None,
+                delivery: UserMessageDelivery::Prompt,
+            })
+            .await
+            .unwrap();
+
+        let published_states = std::iter::from_fn(|| session_updates.try_recv().ok())
+            .filter(|update| update.id == session.id)
+            .map(|update| update.state)
+            .collect::<Vec<_>>();
+        // Neither boundary appends a timeline item of its own, so a client that
+        // only follows session snapshots would otherwise keep showing the
+        // previous turn's state for the whole turn and past its end.
+        assert_eq!(
+            published_states.first(),
+            Some(&AgentSessionState::Running),
+            "turn admission must publish the running snapshot: {published_states:?}"
+        );
+        assert_eq!(
+            published_states.last(),
+            Some(&AgentSessionState::Idle),
+            "the turn boundary must publish the settled snapshot: {published_states:?}"
+        );
+
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
     }

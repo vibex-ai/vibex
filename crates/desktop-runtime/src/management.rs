@@ -562,6 +562,38 @@ impl ProviderManagementFacade {
         self.service.validate_mcp_server(request)
     }
 
+    pub fn market_sources(&self) -> VibexResult<vibex_core::MarketSourceListResponse> {
+        self.service.market_sources()
+    }
+
+    pub fn set_market_sources(
+        &self,
+        request: vibex_core::MarketSourceSetRequest,
+    ) -> VibexResult<vibex_core::MarketSourceListResponse> {
+        self.service.set_market_sources(request)
+    }
+
+    pub fn search_mcp_market(
+        &self,
+        request: vibex_core::McpMarketSearchRequest,
+    ) -> VibexResult<vibex_core::McpMarketSearchResponse> {
+        self.service.search_mcp_market(request)
+    }
+
+    pub fn mcp_market_entry(
+        &self,
+        request: vibex_core::McpMarketEntryRequest,
+    ) -> VibexResult<vibex_core::McpMarketEntry> {
+        self.service.mcp_market_entry(request)
+    }
+
+    pub fn install_mcp_market_entry(
+        &self,
+        request: vibex_core::McpMarketInstallRequest,
+    ) -> VibexResult<vibex_core::McpMarketInstallResult> {
+        self.service.install_mcp_market_entry(request)
+    }
+
     pub fn list_skills(&self) -> VibexResult<Vec<vibex_core::Skill>> {
         self.service.list_skills()
     }
@@ -646,6 +678,27 @@ impl ProviderManagementFacade {
         request: vibex_core::SkillValidateRequest,
     ) -> VibexResult<vibex_core::SkillValidationResult> {
         self.service.validate_skill(request)
+    }
+
+    pub fn search_skill_market(
+        &self,
+        request: vibex_core::SkillMarketSearchRequest,
+    ) -> VibexResult<vibex_core::SkillMarketSearchResponse> {
+        self.service.search_skill_market(request)
+    }
+
+    pub fn skill_market_document(
+        &self,
+        request: vibex_core::SkillMarketDocumentRequest,
+    ) -> VibexResult<vibex_core::SkillMarketDocument> {
+        self.service.skill_market_document(request)
+    }
+
+    pub fn install_skill_market_entry(
+        &self,
+        request: vibex_core::SkillMarketInstallRequest,
+    ) -> VibexResult<vibex_core::SkillMarketInstallResult> {
+        self.service.install_skill_market_entry(request)
     }
 
     pub fn list_prompts(&self) -> VibexResult<Vec<vibex_core::Prompt>> {

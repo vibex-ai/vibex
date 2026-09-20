@@ -20,6 +20,7 @@ pub mod git;
 pub mod goal;
 pub mod ids;
 pub mod local_history;
+pub mod market;
 pub mod pairing_code_link;
 pub mod permission;
 pub mod provider;
@@ -251,6 +252,7 @@ pub use provider::{
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillStatus, SkillSummary, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult, SkillValidationStatus,
 };
+pub use market::*;
 pub use provider_projection::*;
 pub use recovery::*;
 pub use relay::{
@@ -433,6 +435,14 @@ pub use remote::{
     RemoteProviderSkillListRequest, RemoteProviderSkillListResponse,
     RemoteProviderSkillUpdateRequest, RemoteProviderSkillUpdateResponse,
     RemoteProviderSkillValidateRequest, RemoteProviderSkillValidateResponse,
+    RemoteProviderMarketSourceListRequest, RemoteProviderMarketSourceListResponse,
+    RemoteProviderMarketSourceSetRequest, RemoteProviderMarketSourceSetResponse,
+    RemoteProviderMcpMarketSearchRequest, RemoteProviderMcpMarketSearchResponse,
+    RemoteProviderMcpMarketEntryRequest, RemoteProviderMcpMarketEntryResponse,
+    RemoteProviderMcpMarketInstallRequest, RemoteProviderMcpMarketInstallResponse,
+    RemoteProviderSkillMarketSearchRequest, RemoteProviderSkillMarketSearchResponse,
+    RemoteProviderSkillMarketDocumentRequest, RemoteProviderSkillMarketDocumentResponse,
+    RemoteProviderSkillMarketInstallRequest, RemoteProviderSkillMarketInstallResponse,
     RemoteProviderUpdateAcpProfileConfigRequest, RemoteProviderUpdateAcpProfileConfigResponse,
     RemoteProviderUsageSummaryListRequest, RemoteProviderUsageSummaryListResponse,
     RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRestoreDeviceRequest,

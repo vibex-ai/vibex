@@ -34349,25 +34349,35 @@ impl VibexWorkbench {
                     | WorktreeLifecycleDisplayState::Discarding
             )
         });
+        let session_belongs_to_workspace = |session: &AgentSession| {
+            session.workspace_id == workspace.id
+                || (session.project_id == workspace.project_id
+                    && session.workspace_root == workspace.root_path
+                    && session.workspace_mode == workspace.mode)
+        };
         let has_unread_completion = self.sessions.iter().any(|session| {
             session.deleted_at_ms.is_none()
                 && self
                     .unread_agent_completion_session_ids
                     .contains(session.id.as_str())
-                && (session.workspace_id == workspace.id
-                    || (session.project_id == workspace.project_id
-                        && session.workspace_root == workspace.root_path
-                        && session.workspace_mode == workspace.mode))
+                && session_belongs_to_workspace(session)
         });
         let awaiting_user = self.sessions.iter().any(|session| {
             session.deleted_at_ms.is_none()
                 && self
                     .pending_user_request_ids
                     .contains_key(session.id.as_str())
-                && (session.workspace_id == workspace.id
-                    || (session.project_id == workspace.project_id
-                        && session.workspace_root == workspace.root_path
-                        && session.workspace_mode == workspace.mode))
+                && session_belongs_to_workspace(session)
+        });
+        // A locally dispatched turn keeps the workspace busy while its runtime
+        // is still being prepared, even though the authoritative summary has
+        // not counted the session as running yet.
+        let turn_pending = self.sessions.iter().any(|session| {
+            session.deleted_at_ms.is_none()
+                && self
+                    .pending_agent_turn_session_ids
+                    .contains(session.id.as_str())
+                && session_belongs_to_workspace(session)
         });
         let workspace_status = sidebar_workspace_status(
             projection.agent_summary,
@@ -34375,6 +34385,7 @@ impl VibexWorkbench {
             lifecycle_error,
             has_unread_completion,
             awaiting_user,
+            turn_pending,
         );
         let status_indicator = match workspace_status {
             SidebarWorkspaceStatus::Running => Spinner::new()
@@ -55218,13 +55229,18 @@ fn sidebar_workspace_status(
     lifecycle_error: bool,
     has_unread_completion: bool,
     awaiting_user: bool,
+    turn_pending: bool,
 ) -> SidebarWorkspaceStatus {
     // A workspace holding a session that cannot move without the user is more
     // actionable than one that is merely busy, so the call to action wins over
     // the progress spinner.
     if awaiting_user || summary.needs_input > 0 {
         SidebarWorkspaceStatus::NeedsInput
-    } else if summary.running > 0 || lifecycle_running {
+    } else if summary.running > 0 || lifecycle_running || turn_pending {
+        // `turn_pending` covers the window where the local dispatch is
+        // optimistic and the summary still counts the session's previous
+        // (possibly failed) state, so the workspace row agrees with the
+        // session row it aggregates.
         SidebarWorkspaceStatus::Running
     } else if lifecycle_error || summary.failed > 0 {
         SidebarWorkspaceStatus::Error
@@ -55265,16 +55281,18 @@ fn sidebar_session_status_indicator(
 /// the authority reports `Running`. That optimism must not hide a session the
 /// authority already parked on the user: the Agent is not working, it is
 /// waiting for an answer.
+///
+/// A stale `Error` snapshot is a different case. A session that failed and was
+/// then asked to work again keeps the failed state until the authority admits
+/// the new turn, and the submission can spend a long time preparing its runtime
+/// first. The rest of the surface (the Composer's generation status and the
+/// live timeline turn) already treats the local dispatch as running, so the row
+/// must not contradict them with a failure dot that no longer applies.
 fn sidebar_session_display_state(
     persisted_state: AgentSessionState,
     locally_pending: bool,
 ) -> AgentSessionState {
-    if locally_pending
-        && !matches!(
-            persisted_state,
-            AgentSessionState::NeedsInput | AgentSessionState::Error
-        )
-    {
+    if locally_pending && persisted_state != AgentSessionState::NeedsInput {
         AgentSessionState::Running
     } else {
         persisted_state
@@ -64250,11 +64268,11 @@ mod tests {
     fn workspace_status_prioritizes_running_errors_and_unread_completions() {
         let complete = vibex_desktop_model::WorkspaceAgentSummary::default();
         assert_eq!(
-            sidebar_workspace_status(complete, false, false, false, false),
+            sidebar_workspace_status(complete, false, false, false, false, false),
             SidebarWorkspaceStatus::Complete
         );
         assert_eq!(
-            sidebar_workspace_status(complete, false, false, true, false),
+            sidebar_workspace_status(complete, false, false, true, false, false),
             SidebarWorkspaceStatus::UnreadCompletion
         );
         assert_eq!(
@@ -64266,6 +64284,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             ),
             SidebarWorkspaceStatus::NeedsInput
@@ -64280,6 +64299,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
             ),
             SidebarWorkspaceStatus::Error
         );
@@ -64293,11 +64313,28 @@ mod tests {
                 true,
                 true,
                 false,
+                false,
             ),
             SidebarWorkspaceStatus::Running
         );
         assert_eq!(
-            sidebar_workspace_status(complete, true, true, true, false),
+            sidebar_workspace_status(complete, true, true, true, false, false),
+            SidebarWorkspaceStatus::Running
+        );
+        // A locally dispatched turn is running work the authoritative summary
+        // has not counted yet, so it outranks the previous turn's failure.
+        assert_eq!(
+            sidebar_workspace_status(
+                vibex_desktop_model::WorkspaceAgentSummary {
+                    failed: 1,
+                    ..complete
+                },
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
             SidebarWorkspaceStatus::Running
         );
         // A live approval or input request is a call to action, so it outranks
@@ -64312,11 +64349,16 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
             ),
             SidebarWorkspaceStatus::NeedsInput
         );
         assert_eq!(
-            sidebar_workspace_status(complete, true, true, false, true),
+            sidebar_workspace_status(complete, true, true, false, true, false),
+            SidebarWorkspaceStatus::NeedsInput
+        );
+        assert_eq!(
+            sidebar_workspace_status(complete, false, false, false, true, true),
             SidebarWorkspaceStatus::NeedsInput
         );
     }
@@ -69985,9 +70027,13 @@ mod tests {
             sidebar_session_display_state(AgentSessionState::NeedsInput, true),
             AgentSessionState::NeedsInput
         );
+        // A failed session that is asked to work again stops reading as failed
+        // as soon as the local dispatch exists: the failure belongs to the
+        // previous turn, and the replacement turn can spend a while preparing
+        // its runtime before the authority reports `Running`.
         assert_eq!(
             sidebar_session_display_state(AgentSessionState::Error, true),
-            AgentSessionState::Error
+            AgentSessionState::Running
         );
     }
 
