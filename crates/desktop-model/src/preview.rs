@@ -181,6 +181,14 @@ impl Default for PreviewState {
 }
 
 impl PreviewState {
+    /// Whether the layout carries no tabs at all.
+    ///
+    /// An empty layout is indistinguishable from a session that never opened a
+    /// preview, so callers park and persist only non-empty layouts.
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
     pub fn normalize(&mut self) {
         let mut tabs = BTreeMap::new();
         for (_, mut tab) in std::mem::take(&mut self.tabs) {

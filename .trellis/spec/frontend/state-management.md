@@ -848,6 +848,155 @@ const previewTabs = normalizePreviewTabsRecord(persisted.previewTabs);
 const previewRoot = normalizePreviewRootRecord(persisted.previewRoot, previewTabs);
 ```
 
+## Scenario: Desktop Per-Session Preview Layouts
+
+### 1. Scope / Trigger
+
+- Trigger: changing which preview tabs survive a switch between Agent sessions,
+  adding or reading `PreviewUiState.session_layouts`, or changing preview
+  ownership in the GPUI workbench.
+- The React/Zustand scenario above is pre-cutover history. This section is the
+  current Rust contract, and it deliberately differs on one point: switching the
+  *session* parks that session's tabs instead of clearing them.
+
+### 2. Signatures
+
+```rust
+PreviewUiState {
+    layout: PreviewState,
+    session_layouts: BTreeMap<String, PreviewState>, // parked, keyed by session id
+    ..
+}
+
+CodeWorkbenchPersistedState {
+    preview: PreviewState,
+    preview_layouts: BTreeMap<String, PreviewState>,
+    ..
+}
+
+CodeWorkbench::sync_workspace(
+    backend: BackendFacade,
+    workspace_id: WorkspaceId,
+    root: PathBuf,
+    preview_owner: Option<String>,
+    cx: &mut Context<Self>,
+)
+
+CodeWorkbench::restore_persisted_state(
+    preview: PreviewState,
+    preview_owner: Option<String>,
+    parked_previews: BTreeMap<String, PreviewState>,
+    recovery: EditorRecoverySnapshot,
+    workspace_id: Option<String>,
+    ..
+)
+```
+
+### 3. Contracts
+
+- The preview surface has exactly one owner: the selected Agent session id.
+  `None` means no session is selected and nothing owns the live layout.
+- `layout` / `CodeWorkbench::preview` is the live layout of the owner.
+  `session_layouts` / `parked_previews` holds the other sessions' layouts and
+  never contains the owner's key.
+- A session switch parks the live layout under the outgoing owner and adopts the
+  parked layout of the incoming owner. No tab is closed by the switch, and
+  selecting the previous session again restores exactly its tabs and panes.
+- `sync_workspace` compares the owner even when the workspace is unchanged,
+  because two sessions can share one workspace and still keep separate layouts.
+- A workspace change with no owner still clears the live layout and does not
+  park it, so workspace-relative paths can never render against another
+  workspace.
+- A layout opened while no session owned the preview belongs to the workspace on
+  screen. When a session of that same workspace takes ownership and has nothing
+  parked of its own, it adopts that layout, so opening a file before a session
+  exists does not close it afterwards. A parked session layout always wins over
+  the unowned preview.
+- The startup restore installs the persisted selected session's layout as the
+  live one, so re-entering that workspace must not park and re-adopt it.
+- Parking clears `fullscreen_tab_id`: fullscreen belongs to the panel, not to a
+  session's layout.
+- Every tab-keyed surface (scroll handles, diff and commit list state, reveal
+  requests, preview errors) is cleared when the owner changes.
+  `schedule_restore_hydration` then re-reads the adopted layout's files, diffs,
+  commits, and terminal surfaces.
+- A hydration pass queued before an owner change must be discarded
+  (`preview_layout_generation`) instead of opening the previous session's files
+  in the new session's preview.
+- Empty layouts are neither parked nor persisted. Parked layouts are bounded to
+  `SESSION_PREVIEW_LAYOUT_LIMIT`, evicting the layouts whose newest tab is
+  oldest first.
+- A parked layout remembers the workspace its relative paths belong to. A file
+  rename or delete updates the live layout and the parked layouts of the current
+  workspace only, so an identically named path in another workspace is never
+  rewritten. The association is in-memory; a restored layout records it again
+  the next time it is parked.
+- Persisting the workbench writes the live layout under its owner plus every
+  parked layout, so a restart restores each session's tabs.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Persisted state without `sessionLayouts` | Decode with an empty map |
+| Parked key that is blank, or a layout with no tabs | Dropped during normalization |
+| Parked layout with unpinned temporary tabs | Temporary tabs dropped on persist, as for the live layout |
+| More parked layouts than `SESSION_PREVIEW_LAYOUT_LIMIT` | Drop the layouts whose newest tab timestamp is oldest |
+| Parked layout references a deleted session | `cleanup_stale_ids` drops the layout |
+| Parked layout references a deleted terminal | `cleanup_stale_ids` drops that terminal tab and re-normalizes the layout |
+| No selected session, workspace changes | Clear the live layout; park nothing |
+| Owner unchanged but the workspace changed | Keep the parked layout for the next switch back and show an empty preview |
+| File renamed or deleted in the current workspace | Update the live layout and the parked layouts of that workspace only |
+
+### 5. Good/Base/Bad Cases
+
+- Good: session A keeps three preview tabs, selecting session B shows only B's
+  tabs, and selecting A again restores A's three tabs in their panes.
+- Good: two sessions of one workspace keep separate preview layouts; a restart
+  restores both.
+- Good: a file opened while no session is selected is still open after the first
+  session of that workspace is selected.
+- Base: a session that never opened a preview shows the empty preview state, and
+  the panel visibility is unchanged by the switch.
+- Bad: resetting `preview` on every session switch, writing the live layout under
+  its owner key *and* the parked map, letting a queued hydration pass open the
+  previous session's files, carrying an unowned layout into another workspace,
+  or letting an unowned preview overwrite a session's parked layout.
+
+### 6. Tests Required
+
+- `cargo test -p vibex-desktop-model --locked` covers JSON round-trip, legacy
+  decode without `sessionLayouts`, normalization of empty/blank/over-limit
+  layouts, and stale session/terminal cleanup.
+- `cargo test -p vibex-desktop --locked --lib preview_layout` covers park/adopt
+  across owners, persisted state carrying every layout, and an unowned layout
+  never being parked.
+- `cargo test -p vibex-desktop --locked --lib parked_layouts` covers rename and
+  delete staying inside the parked layouts of the current workspace.
+- `cargo fmt --all -- --check` before commit.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// Every session switch closes the previous session's tabs.
+self.preview = PreviewState::default();
+```
+
+#### Correct
+
+```rust
+let owner_changed = self.preview_owner != preview_owner;
+self.park_live_preview_layout();
+self.preview_owner = preview_owner;
+self.preview = if owner_changed {
+    self.take_parked_preview_layout()
+} else {
+    PreviewState::default()
+};
+```
+
 ## Scenario: Seamless Runtime UI And Durable Composer Recovery
 
 ### 1. Scope / Trigger

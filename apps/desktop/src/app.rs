@@ -7720,6 +7720,11 @@ impl VibexWorkbench {
             NavigationHistory::new(self.current_workbench_route(), WORKBENCH_NAVIGATION_LIMIT);
         self.appearance_reload_pending = true;
         let preview = self.ui_state.preview.layout.clone();
+        let parked_previews = self.ui_state.preview.session_layouts.clone();
+        let preview_owner = self
+            .selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
         let recovery = self.ui_state.preview.editor_recovery.clone();
         let editor_soft_wrap = self.ui_state.preview.editor_soft_wrap;
         let editor_show_whitespaces = self.ui_state.preview.editor_show_whitespaces;
@@ -7733,6 +7738,8 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.restore_persisted_state(
                 preview,
+                preview_owner,
+                parked_previews,
                 recovery,
                 workspace_id,
                 code_font_family,
@@ -11734,11 +11741,13 @@ impl VibexWorkbench {
     fn activate_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
         self.ui_state.workbench.selected_workspace_id = Some(workspace.id.as_str().to_string());
         if let Some(backend) = self.backend.clone() {
+            let preview_owner = self.preview_owner_for_workspace(&workspace.id);
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     workspace.id,
                     std::path::PathBuf::from(workspace.root_path),
+                    preview_owner,
                     cx,
                 )
             });
@@ -14154,11 +14163,13 @@ impl VibexWorkbench {
         ) {
             self.ui_state.workbench.selected_workspace_id =
                 Some(session.workspace_id.as_str().to_string());
+            let preview_owner = session.id.as_str().to_string();
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     session.workspace_id,
                     std::path::PathBuf::from(session.workspace_root),
+                    Some(preview_owner),
                     cx,
                 )
             });
@@ -26161,6 +26172,21 @@ impl VibexWorkbench {
         self.sessions.iter().find(|session| &session.id == selected)
     }
 
+    /// The Agent session that owns the workbench preview while `workspace_id`
+    /// is the focused workspace.
+    ///
+    /// Only the selected session of the focused workspace owns the preview.
+    /// Activating any other workspace leaves the owner empty, so relative
+    /// preview paths from one workspace can never render against another.
+    fn preview_owner_for_workspace(
+        &self,
+        workspace_id: &vibex_core::WorkspaceId,
+    ) -> Option<String> {
+        self.selected_session()
+            .filter(|session| &session.workspace_id == workspace_id)
+            .map(|session| session.id.as_str().to_string())
+    }
+
     fn session_agent_id(&self, session_id: &VibexSessionId) -> Option<AgentId> {
         self.sessions
             .iter()
@@ -26305,6 +26331,7 @@ impl VibexWorkbench {
             return;
         }
         self.ui_state.preview.layout = state.preview;
+        self.ui_state.preview.session_layouts = state.preview_layouts;
         if let Some(recovery) = state.recovery {
             self.ui_state.preview.editor_recovery = recovery;
         }
@@ -28240,6 +28267,10 @@ impl VibexWorkbench {
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let code_font_size = snapshot.appearance.code_font.size;
         let preview = snapshot.preview.layout.clone();
+        let parked_previews = snapshot.preview.session_layouts.clone();
+        let preview_owner = selected_session_id
+            .as_ref()
+            .map(|session_id| session_id.as_str().to_string());
         let recovery = snapshot.preview.editor_recovery.clone();
         let editor_soft_wrap = snapshot.preview.editor_soft_wrap;
         let editor_show_whitespaces = snapshot.preview.editor_show_whitespaces;
@@ -28280,6 +28311,8 @@ impl VibexWorkbench {
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.restore_persisted_state(
                 preview,
+                preview_owner,
+                parked_previews,
                 recovery,
                 workspace_id,
                 code_font_family.clone(),
@@ -39204,11 +39237,13 @@ impl VibexWorkbench {
         let review_ready = if let Some(backend) = self.backend.clone() {
             let workspace_id = session.workspace_id.clone();
             self.ui_state.workbench.selected_workspace_id = Some(workspace_id.as_str().to_string());
+            let preview_owner = session.id.as_str().to_string();
             let review_ready = self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     workspace_id.clone(),
                     std::path::PathBuf::from(session.workspace_root),
+                    Some(preview_owner),
                     cx,
                 );
                 if !workbench.workspace_is_active(&workspace_id) {

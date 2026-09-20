@@ -25,6 +25,10 @@ pub const KEYBOARD_SHORTCUT_OVERRIDE_LIMIT: usize = 64;
 /// Starred project directories offered as quick locations by the directory
 /// picker. Small on purpose: the rail is a shortcut, not a history.
 pub const PROJECT_DIRECTORY_FAVORITE_LIMIT: usize = 12;
+/// Agent sessions whose multi-tab preview layout is remembered while another
+/// session is selected. Bounded so a long session history cannot grow the
+/// UI-state file without limit.
+pub const SESSION_PREVIEW_LAYOUT_LIMIT: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum UiStateError {
@@ -698,6 +702,11 @@ pub struct PreviewUiState {
     pub split_sizes: Vec<f32>,
     #[serde(default)]
     pub layout: crate::PreviewState,
+    /// Multi-tab preview layouts parked for Agent sessions that are not the
+    /// selected one. `layout` stays the live layout of the selected session, so
+    /// switching sessions moves tabs between the two instead of closing them.
+    #[serde(default)]
+    pub session_layouts: BTreeMap<String, crate::PreviewState>,
     #[serde(default)]
     pub editor_recovery: crate::EditorRecoverySnapshot,
     #[serde(default)]
@@ -717,6 +726,7 @@ impl Default for PreviewUiState {
             pinned_tab_ids: Vec::new(),
             split_sizes: vec![1.0],
             layout: crate::PreviewState::default(),
+            session_layouts: BTreeMap::new(),
             editor_recovery: crate::EditorRecoverySnapshot::default(),
             editor_soft_wrap: false,
             editor_show_whitespaces: false,
@@ -1127,6 +1137,7 @@ impl DesktopUiStateV1 {
         self.preview.split_sizes =
             normalize_split_sizes(std::mem::take(&mut self.preview.split_sizes));
         self.preview.layout.normalize();
+        normalize_preview_layouts(&mut self.preview.session_layouts, None);
         let mut recovery = crate::EditorBufferRegistry::default();
         recovery.restore_recovery(std::mem::take(&mut self.preview.editor_recovery));
         self.preview.editor_recovery = recovery.recovery_snapshot();
@@ -1278,6 +1289,13 @@ impl DesktopUiStateV1 {
             !matches!(&tab.target, crate::PreviewTarget::Terminal { terminal_id } if !references.terminal_ids.contains(terminal_id))
         });
         self.preview.layout.normalize();
+        self.preview
+            .session_layouts
+            .retain(|session_id, _| references.session_ids.contains(session_id));
+        normalize_preview_layouts(
+            &mut self.preview.session_layouts,
+            Some(&references.terminal_ids),
+        );
         self.preview
             .pinned_tab_ids
             .retain(|id| self.preview.layout.tabs.contains_key(id));
@@ -1668,6 +1686,48 @@ fn normalize_set(ids: &mut BTreeSet<String>, limit: usize) {
     *ids = values.into_iter().collect();
 }
 
+/// Normalize the multi-tab preview layouts parked for unselected sessions.
+///
+/// `terminal_ids` is `None` while loading persisted state, where the
+/// authoritative terminal list is not known yet, and `Some` during stale-id
+/// cleanup so a parked layout cannot keep a tab for a terminal that is gone.
+fn normalize_preview_layouts(
+    layouts: &mut BTreeMap<String, crate::PreviewState>,
+    terminal_ids: Option<&BTreeSet<String>>,
+) {
+    let mut normalized = std::mem::take(layouts)
+        .into_iter()
+        .filter_map(|(session_id, mut layout)| {
+            let session_id = bounded_required(&session_id, 256)?;
+            if let Some(terminal_ids) = terminal_ids {
+                layout.tabs.retain(|_, tab| {
+                    !matches!(&tab.target, crate::PreviewTarget::Terminal { terminal_id } if !terminal_ids.contains(terminal_id))
+                });
+            }
+            layout.normalize();
+            (!layout.is_empty()).then_some((session_id, layout))
+        })
+        .collect::<Vec<_>>();
+    if normalized.len() > SESSION_PREVIEW_LAYOUT_LIMIT {
+        // Keep the sessions that opened a preview tab most recently: those are
+        // the layouts a user is most likely to come back to.
+        normalized.sort_by(|left, right| {
+            newest_preview_tab_ms(&right.1).cmp(&newest_preview_tab_ms(&left.1))
+        });
+        normalized.truncate(SESSION_PREVIEW_LAYOUT_LIMIT);
+    }
+    *layouts = normalized.into_iter().collect();
+}
+
+fn newest_preview_tab_ms(layout: &crate::PreviewState) -> i64 {
+    layout
+        .tabs
+        .values()
+        .map(|tab| tab.created_at_ms)
+        .max()
+        .unwrap_or(i64::MIN)
+}
+
 fn normalize_runtime_selection(selection: &mut SessionRuntimeSelection) -> bool {
     if let vibex_core::RuntimeModelSelection::Explicit { model_id } = &mut selection.model {
         let Some(normalized) = bounded_runtime_value(model_id, 512) else {
@@ -1929,6 +1989,149 @@ mod tests {
 
         let restored: PreviewUiState = serde_json::from_value(encoded).unwrap();
         assert_eq!(restored, state);
+    }
+
+    fn session_layout(tabs: &[(&str, i64)]) -> crate::PreviewState {
+        let mut layout = crate::PreviewState::default();
+        for (path, created_at_ms) in tabs {
+            layout
+                .open(
+                    crate::PreviewTarget::File {
+                        path: (*path).to_string(),
+                    },
+                    None,
+                    *created_at_ms,
+                )
+                .expect("fixture tab opens");
+        }
+        layout
+    }
+
+    #[test]
+    fn session_preview_layouts_round_trip_through_json() {
+        let state = PreviewUiState {
+            session_layouts: BTreeMap::from([(
+                "session-a".to_string(),
+                session_layout(&[("README.md", 10)]),
+            )]),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded["sessionLayouts"]["session-a"].is_object());
+
+        let restored: PreviewUiState = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn legacy_preview_state_without_session_layouts_still_decodes() {
+        let mut legacy = serde_json::to_value(PreviewUiState::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("sessionLayouts");
+
+        let restored: PreviewUiState = serde_json::from_value(legacy).unwrap();
+        assert!(restored.session_layouts.is_empty());
+    }
+
+    #[test]
+    fn normalization_drops_empty_and_malformed_session_preview_layouts() {
+        let mut state = DesktopUiStateV1::default();
+        state.preview.session_layouts = BTreeMap::from([
+            (
+                "session-a".to_string(),
+                session_layout(&[("README.md", 10)]),
+            ),
+            ("session-empty".to_string(), crate::PreviewState::default()),
+            ("   ".to_string(), session_layout(&[("docs/notes.md", 20)])),
+            ("session-temporary".to_string(), {
+                let mut layout = crate::PreviewState::default();
+                layout
+                    .preview_file("scratch.rs", None, 30)
+                    .expect("temporary tab opens");
+                layout
+            }),
+        ]);
+
+        state.normalize().expect("state normalizes");
+        assert_eq!(
+            state
+                .preview
+                .session_layouts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["session-a".to_string()]
+        );
+        assert!(
+            state.preview.session_layouts["session-a"]
+                .tabs
+                .contains_key("file:README.md")
+        );
+    }
+
+    #[test]
+    fn normalization_keeps_the_most_recent_session_preview_layouts() {
+        let mut state = DesktopUiStateV1::default();
+        state.preview.session_layouts = (0..SESSION_PREVIEW_LAYOUT_LIMIT + 2)
+            .map(|index| {
+                (
+                    format!("session-{index:03}"),
+                    session_layout(&[("README.md", index as i64)]),
+                )
+            })
+            .collect();
+
+        state.normalize().expect("state normalizes");
+        assert_eq!(
+            state.preview.session_layouts.len(),
+            SESSION_PREVIEW_LAYOUT_LIMIT
+        );
+        assert!(!state.preview.session_layouts.contains_key("session-000"));
+        assert!(
+            state
+                .preview
+                .session_layouts
+                .contains_key(&format!("session-{:03}", SESSION_PREVIEW_LAYOUT_LIMIT + 1))
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_drops_unknown_session_and_terminal_preview_tabs() {
+        let mut live = session_layout(&[("README.md", 10)]);
+        live.open(
+            crate::PreviewTarget::Terminal {
+                terminal_id: "terminal-1".to_string(),
+            },
+            None,
+            20,
+        )
+        .expect("terminal tab opens");
+        let mut state = DesktopUiStateV1::default();
+        state.preview.session_layouts = BTreeMap::from([
+            ("session-a".to_string(), live),
+            (
+                "session-gone".to_string(),
+                session_layout(&[("docs/notes.md", 30)]),
+            ),
+        ]);
+
+        state.cleanup_stale_ids(&UiStateReferences {
+            session_ids: BTreeSet::from(["session-a".to_string()]),
+            ..UiStateReferences::default()
+        });
+
+        assert_eq!(
+            state
+                .preview
+                .session_layouts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["session-a".to_string()]
+        );
+        let layout = &state.preview.session_layouts["session-a"];
+        assert!(layout.tabs.contains_key("file:README.md"));
+        assert!(!layout.tabs.contains_key("terminal:terminal-1"));
     }
 
     #[test]
