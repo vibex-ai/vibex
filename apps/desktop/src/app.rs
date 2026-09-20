@@ -39616,6 +39616,30 @@ impl VibexWorkbench {
             })
     }
 
+    /// The durable resolution that settled `request_id`, if the session kept one.
+    ///
+    /// A resolution is its own timeline item rather than a rewrite of the
+    /// request, so a settled row has to read the answers back from here. The
+    /// scan runs backwards and only for settled elicitation rows — a handful per
+    /// session — which keeps it off the hot path for ordinary rows.
+    fn elicitation_resolution_for_request(
+        &self,
+        request_id: &str,
+    ) -> Option<vibex_core::ElicitationResolution> {
+        self.active_timeline()
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.payload {
+                TimelinePayload::ElicitationResolution(resolution)
+                    if resolution.request_id.as_str() == request_id =>
+                {
+                    Some(resolution.clone())
+                }
+                _ => None,
+            })
+    }
+
     fn render_child_agent_status_badge(status: vibex_core::ToolCallStatus, cx: &App) -> AnyElement {
         let (label, color) = match status {
             vibex_core::ToolCallStatus::Started => ("Starting", cx.theme().warning),
@@ -40742,6 +40766,9 @@ impl VibexWorkbench {
                 let Some(vibex_core::TimelinePayload::ElicitationRequest(request)) = payload else {
                     return 48.0;
                 };
+                if !elicitation_request_is_pending(row, request) {
+                    return self.estimated_settled_elicitation_height(row, request);
+                }
                 let mut height =
                     88.0 + (estimated_wrapped_lines(&request.message, 64) as f32) * 20.0 + 44.0;
                 for field in &request.fields {
@@ -40852,6 +40879,49 @@ impl VibexWorkbench {
                 height
             }
         }
+    }
+
+    /// First-layout height for a settled elicitation row: the two-line summary
+    /// while closed, the question plus one row per recorded answer once open.
+    fn estimated_settled_elicitation_height(
+        &self,
+        row: &TimelineRow,
+        request: &ElicitationRequest,
+    ) -> f32 {
+        let expanded = self
+            .timeline_command_expansion
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
+        let resolution = self.elicitation_resolution_for_request(request.id.as_str());
+        let answers = elicitation_answer_summaries(request, resolution.as_ref());
+        if !expanded {
+            let mut height = 24.0;
+            if !request.message.trim().is_empty() {
+                height += 20.0;
+            }
+            if !answers.is_empty() {
+                height += 20.0;
+            }
+            return height;
+        }
+        let mut height = 24.0 + (estimated_wrapped_lines(&request.message, 64) as f32) * 20.0;
+        if request
+            .description
+            .as_deref()
+            .is_some_and(|description| !description.trim().is_empty())
+        {
+            height += 20.0;
+        }
+        if !answers.is_empty() {
+            // Section rule + one label/value pair per recorded answer.
+            height += 8.0 + answers.len() as f32 * 40.0;
+        } else if elicitation_resolution_status(request, resolution.as_ref()).0
+            != Some(ElicitationResolutionAction::Accept)
+        {
+            height += 20.0;
+        }
+        height
     }
 
     fn estimated_process_activity_group_height(
@@ -41662,6 +41732,31 @@ impl VibexWorkbench {
     ) {
         let expanded = self.reasoning_row_expanded(&row_id);
         self.reasoning_expansion.insert(row_id, !expanded);
+        if let Some(turn_id) = turn_id {
+            self.invalidate_timeline_turn_measurement(&turn_id);
+        }
+        self.rebuild_timeline_sizes();
+        cx.notify();
+    }
+
+    /// Open or close the recorded answers under a settled elicitation row.
+    ///
+    /// Shares [`Self::timeline_command_expansion`] with the other timeline
+    /// disclosures, so the turn's layout signature already invalidates when this
+    /// row changes shape.
+    fn toggle_elicitation_expansion(
+        &mut self,
+        row_id: String,
+        turn_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let expanded = self
+            .timeline_command_expansion
+            .get(&row_id)
+            .copied()
+            .unwrap_or(false);
+        self.timeline_command_expansion
+            .insert(row_id.clone(), !expanded);
         if let Some(turn_id) = turn_id {
             self.invalidate_timeline_turn_measurement(&turn_id);
         }
@@ -43541,27 +43636,13 @@ impl VibexWorkbench {
         let Some(request) = self.elicitation_request_for_row(row) else {
             return self.render_fallback_process_row(row, cx);
         };
-        let pending = row.pending_permission
-            && row.turn_pending_permission
-            && request.status == vibex_core::ElicitationRequestStatus::Pending;
+        let pending = elicitation_request_is_pending(row, &request);
         let title = request
             .title
             .clone()
             .unwrap_or_else(|| locale::text("Input requested", "需要输入", "需要輸入").to_string());
         if !pending {
-            return h_flex()
-                .id(row.id.clone())
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(Icon::new(IconName::Check).size(px(14.0)))
-                .child(title)
-                .child("·")
-                .child(locale::text("Resolved", "已完成", "已完成"))
-                .into_any_element();
+            return self.render_settled_elicitation_row(row, &request, cx);
         }
         self.ensure_elicitation_form(&request, window, cx);
         let request_id = request.id.to_string();
@@ -43654,6 +43735,285 @@ impl VibexWorkbench {
                             })),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// A settled elicitation reads as history, not as a form.
+    ///
+    /// The collapsed row keeps the question and the recorded answer on the
+    /// timeline so the exchange is legible without opening anything; the full
+    /// question, its description, and every field answer sit one click away
+    /// behind the row's disclosure control.
+    fn render_settled_elicitation_row(
+        &mut self,
+        row: &TimelineRow,
+        request: &ElicitationRequest,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let resolution = self.elicitation_resolution_for_request(request.id.as_str());
+        let (action, status_label) = elicitation_resolution_status(request, resolution.as_ref());
+        let status_color = match action {
+            Some(ElicitationResolutionAction::Accept) => cx.theme().success,
+            Some(ElicitationResolutionAction::Decline) => cx.theme().danger,
+            _ => cx.theme().muted_foreground,
+        };
+        // The icon repeats what the status label already says; it is never the
+        // only carrier of the outcome.
+        let status_icon = match action {
+            Some(ElicitationResolutionAction::Accept) => IconName::CircleCheck,
+            Some(ElicitationResolutionAction::Decline) => IconName::CircleX,
+            Some(ElicitationResolutionAction::Cancel) => IconName::Dash,
+            None => IconName::Info,
+        };
+        let title = request
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| locale::text("Input requested", "需要输入", "需要輸入").to_string());
+        let question = request.message.trim().to_string();
+        let description = request
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty() && *description != question)
+            .map(str::to_string);
+        let answers = elicitation_answer_summaries(request, resolution.as_ref());
+        let expanded = self
+            .timeline_command_expansion
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
+        let hover_key = motion::hover_key("elicitation-summary", &row.id);
+        let background = hover_blend(
+            &hover_key,
+            cx.theme().transparent,
+            cx.theme().muted.opacity(0.42),
+        );
+        let disclosure_label = if expanded {
+            locale::text("Collapse input details", "收起输入详情", "收起輸入詳情")
+        } else {
+            locale::text("Expand input details", "展开输入详情", "展開輸入詳情")
+        };
+        let click_row_id = row.id.clone();
+        let click_turn_id = row.turn_id.clone();
+        let key_row_id = row.id.clone();
+        let key_turn_id = row.turn_id.clone();
+
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .child(
+                Icon::new(status_icon)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(status_color),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .font_medium()
+                    .text_color(cx.theme().foreground)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(status_color)
+                    .child(status_label),
+            )
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(14.0))
+                .flex_none()
+                .text_color(cx.theme().muted_foreground),
+            );
+
+        // Closed: the question and the recorded answer stay readable in place.
+        let preview = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .pl_5()
+            .when(!question.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(question.clone()),
+                )
+            })
+            .when(!answers.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(elicitation_answer_preview_text(&answers)),
+                )
+            });
+
+        // Open: the untruncated question plus one row per recorded answer.
+        let details = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .pl_5()
+            .when(!question.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_sm()
+                        .line_height(gpui::relative(1.5))
+                        .text_color(cx.theme().foreground)
+                        .child(question.clone()),
+                )
+            })
+            .when_some(description, |this, description| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .line_height(gpui::relative(1.5))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                )
+            })
+            .when(!answers.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.72))
+                        .pt_2()
+                        .children(answers.iter().map(|answer| {
+                            // Field title above its value, mirroring the form
+                            // the answer was filled in. A fixed label column
+                            // would wrap the longer prompt-style titles this
+                            // product sends.
+                            v_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(answer.label.clone()),
+                                )
+                                .child(if answer.choices.is_empty() {
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .line_height(gpui::relative(1.5))
+                                        .text_color(cx.theme().foreground)
+                                        .child(answer.value.clone())
+                                        .into_any_element()
+                                } else {
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(answer.choices.iter().map(|choice| {
+                                            Tag::secondary()
+                                                .xsmall()
+                                                .rounded_full()
+                                                .child(choice.clone())
+                                        }))
+                                        .into_any_element()
+                                })
+                        })),
+                )
+            })
+            .when(
+                answers.is_empty() && action != Some(ElicitationResolutionAction::Accept),
+                |this| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "No input was recorded",
+                                "未记录任何输入",
+                                "未記錄任何輸入",
+                            )),
+                    )
+                },
+            );
+
+        let mut disclosure = v_flex()
+            .id(SharedString::from(format!(
+                "elicitation-summary:{}",
+                row.id
+            )))
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .rounded_md()
+            .py_1()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(disclosure_label)
+            .aria_expanded(expanded)
+            .tooltip(move |window, cx| Tooltip::new(disclosure_label).build(window, cx))
+            .cursor_pointer()
+            .bg(background)
+            .on_hover(hover_listener(hover_key))
+            .focus_visible(|style| {
+                style.shadow(vec![
+                    BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
+                ])
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_elicitation_expansion(click_row_id.clone(), click_turn_id.clone(), cx)
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                    this.toggle_elicitation_expansion(key_row_id.clone(), key_turn_id.clone(), cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(header);
+        if !expanded {
+            disclosure = disclosure.child(preview);
+        }
+
+        v_flex()
+            .id(row.id.clone())
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(disclosure)
+            .when(expanded, |this| this.child(details))
             .into_any_element()
     }
 
@@ -48374,6 +48734,155 @@ fn permission_request_is_pending(
     row.pending_permission
         && row.turn_pending_permission
         && request.status == vibex_core::PermissionRequestStatus::Pending
+}
+
+fn elicitation_request_is_pending(row: &TimelineRow, request: &ElicitationRequest) -> bool {
+    row.pending_permission
+        && row.turn_pending_permission
+        && request.status == vibex_core::ElicitationRequestStatus::Pending
+}
+
+/// One settled answer, ready to paint.
+struct ElicitationAnswerSummary {
+    label: String,
+    /// Human-readable value for the collapsed one-line preview.
+    value: String,
+    /// Chosen option titles, when the field offered a fixed option set. Option
+    /// answers paint as chips so a choice stays scannable next to free text.
+    choices: Vec<String>,
+}
+
+fn elicitation_field_options(kind: &ElicitationFieldKind) -> &[vibex_core::ElicitationOption] {
+    match kind {
+        ElicitationFieldKind::Text { options, .. }
+        | ElicitationFieldKind::MultiSelect { options, .. } => options,
+        ElicitationFieldKind::Number { .. }
+        | ElicitationFieldKind::Integer { .. }
+        | ElicitationFieldKind::Boolean { .. }
+        | ElicitationFieldKind::Unsupported { .. } => &[],
+    }
+}
+
+/// The fields a settled request actually recorded answers for, in form order.
+///
+/// Optional fields the user left empty have no answer entry, and a declined or
+/// cancelled request has none at all — the caller decides how to say so.
+fn elicitation_answer_summaries(
+    request: &ElicitationRequest,
+    resolution: Option<&vibex_core::ElicitationResolution>,
+) -> Vec<ElicitationAnswerSummary> {
+    let Some(resolution) = resolution else {
+        return Vec::new();
+    };
+    request
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let answer = resolution.answers.get(&field.id)?;
+            Some(elicitation_answer_summary(field, answer))
+        })
+        .collect()
+}
+
+fn elicitation_answer_summary(
+    field: &ElicitationField,
+    answer: &vibex_core::ElicitationAnswerValue,
+) -> ElicitationAnswerSummary {
+    let options = elicitation_field_options(&field.kind);
+    let option_title = |value: &str| {
+        options
+            .iter()
+            .find(|option| option.value == value)
+            .map(|option| option.title.clone())
+            .unwrap_or_else(|| value.to_string())
+    };
+    let (value, choices) = match answer {
+        vibex_core::ElicitationAnswerValue::String(value) => {
+            let title = option_title(value);
+            let choices = if options.is_empty() {
+                Vec::new()
+            } else {
+                vec![title.clone()]
+            };
+            (title, choices)
+        }
+        vibex_core::ElicitationAnswerValue::Integer(value) => (value.to_string(), Vec::new()),
+        vibex_core::ElicitationAnswerValue::Number(value) => (value.clone(), Vec::new()),
+        vibex_core::ElicitationAnswerValue::Boolean(value) => (
+            if *value {
+                locale::text("Yes", "是", "是")
+            } else {
+                locale::text("No", "否", "否")
+            }
+            .to_string(),
+            Vec::new(),
+        ),
+        vibex_core::ElicitationAnswerValue::StringArray(values) => {
+            let titles = values
+                .iter()
+                .map(|value| option_title(value))
+                .collect::<Vec<_>>();
+            if titles.is_empty() {
+                (locale::text("None", "未选择", "未選擇").to_string(), titles)
+            } else {
+                (titles.join(locale::text(", ", "、", "、")), titles)
+            }
+        }
+    };
+    let value = if value.trim().is_empty() {
+        "—".to_string()
+    } else {
+        value
+    };
+    ElicitationAnswerSummary {
+        label: field.title.clone(),
+        value,
+        choices,
+    }
+}
+
+fn elicitation_answer_preview_text(answers: &[ElicitationAnswerSummary]) -> String {
+    answers
+        .iter()
+        .map(|answer| format!("{}: {}", answer.label, answer.value))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The settled state of an elicitation as the timeline reports it: the durable
+/// resolution action when the session kept one, otherwise the request status.
+fn elicitation_resolution_status(
+    request: &ElicitationRequest,
+    resolution: Option<&vibex_core::ElicitationResolution>,
+) -> (Option<ElicitationResolutionAction>, &'static str) {
+    match resolution.map(|resolution| resolution.action) {
+        Some(action) => (Some(action), elicitation_resolution_action_label(action)),
+        None => match request.status {
+            vibex_core::ElicitationRequestStatus::Accepted => (
+                Some(ElicitationResolutionAction::Accept),
+                elicitation_resolution_action_label(ElicitationResolutionAction::Accept),
+            ),
+            vibex_core::ElicitationRequestStatus::Declined => (
+                Some(ElicitationResolutionAction::Decline),
+                elicitation_resolution_action_label(ElicitationResolutionAction::Decline),
+            ),
+            vibex_core::ElicitationRequestStatus::Cancelled => (
+                Some(ElicitationResolutionAction::Cancel),
+                elicitation_resolution_action_label(ElicitationResolutionAction::Cancel),
+            ),
+            vibex_core::ElicitationRequestStatus::Pending => {
+                (None, locale::text("Resolved", "已完成", "已完成"))
+            }
+        },
+    }
+}
+
+fn elicitation_resolution_action_label(action: ElicitationResolutionAction) -> &'static str {
+    match action {
+        ElicitationResolutionAction::Accept => locale::text("Submitted", "已提交", "已提交"),
+        ElicitationResolutionAction::Decline => locale::text("Declined", "已拒绝", "已拒絕"),
+        ElicitationResolutionAction::Cancel => locale::text("Cancelled", "已取消", "已取消"),
+    }
 }
 
 fn permission_request_status_label(
@@ -67809,6 +68318,112 @@ mod tests {
         ] {
             assert!(!projection_debug.contains(internal_value));
         }
+    }
+
+    #[test]
+    fn settled_elicitation_rows_keep_the_question_and_the_recorded_answers() {
+        let request = ElicitationRequest {
+            id: RequestId::new(),
+            session_id: VibexSessionId::parse("session_elicitation_summary").unwrap(),
+            provider_request_id: None,
+            tool_call_id: None,
+            message: "Which state model should the right rail use?".into(),
+            title: Some("Right rail state".into()),
+            description: None,
+            fields: vec![
+                ElicitationField {
+                    id: "approach".into(),
+                    title: "Approach".into(),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: vec![
+                            vibex_core::ElicitationOption {
+                                value: "global".into(),
+                                title: "Global GPUI state".into(),
+                                description: None,
+                            },
+                            vibex_core::ElicitationOption {
+                                value: "local".into(),
+                                title: "Local entity state".into(),
+                                description: None,
+                            },
+                        ],
+                    },
+                },
+                ElicitationField {
+                    id: "notes".into(),
+                    title: "Notes".into(),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Text {
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                        format: None,
+                        default: None,
+                        options: Vec::new(),
+                    },
+                },
+            ],
+            status: vibex_core::ElicitationRequestStatus::Accepted,
+            requested_at_ms: 1,
+        };
+        let resolution = vibex_core::ElicitationResolution {
+            request_id: request.id.clone(),
+            session_id: request.session_id.clone(),
+            action: ElicitationResolutionAction::Accept,
+            answers: std::collections::BTreeMap::from([
+                (
+                    "approach".into(),
+                    vibex_core::ElicitationAnswerValue::String("global".into()),
+                ),
+                (
+                    "notes".into(),
+                    vibex_core::ElicitationAnswerValue::String("Keep the row compact".into()),
+                ),
+            ]),
+            responder_device_id: None,
+            resolved_at_ms: 2,
+        };
+
+        let answers = elicitation_answer_summaries(&request, Some(&resolution));
+        assert_eq!(answers.len(), 2);
+        // Option values resolve to the label the form actually showed.
+        assert_eq!(answers[0].value, "Global GPUI state");
+        assert_eq!(answers[0].choices, vec!["Global GPUI state".to_string()]);
+        assert_eq!(answers[1].value, "Keep the row compact");
+        assert!(answers[1].choices.is_empty());
+        assert_eq!(
+            elicitation_answer_preview_text(&answers),
+            "Approach: Global GPUI state · Notes: Keep the row compact"
+        );
+        assert_eq!(
+            elicitation_resolution_status(&request, Some(&resolution)),
+            (
+                Some(ElicitationResolutionAction::Accept),
+                elicitation_resolution_action_label(ElicitationResolutionAction::Accept)
+            )
+        );
+
+        // A declined request records no answers, so the row must say so rather
+        // than paint an empty answer list.
+        let declined = vibex_core::ElicitationResolution {
+            action: ElicitationResolutionAction::Decline,
+            answers: std::collections::BTreeMap::new(),
+            ..resolution
+        };
+        assert!(elicitation_answer_summaries(&request, Some(&declined)).is_empty());
+        assert_eq!(
+            elicitation_resolution_status(&request, Some(&declined)).0,
+            Some(ElicitationResolutionAction::Decline)
+        );
+        assert!(elicitation_answer_summaries(&request, None).is_empty());
     }
 
     #[test]
