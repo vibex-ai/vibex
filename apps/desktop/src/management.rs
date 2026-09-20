@@ -7720,9 +7720,8 @@ impl ManagementCenter {
         self.mcp_market_install_agents = self.market_default_agents();
         let center = cx.entity();
         let dialog_center = center.clone();
-        let dialog_content = cx.new(|cx| {
-            ManagementMarketDialog::new(center.clone(), ManagementMarketKind::Mcp, cx)
-        });
+        let dialog_content =
+            cx.new(|cx| ManagementMarketDialog::new(center.clone(), ManagementMarketKind::Mcp, cx));
         let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 720.0);
         let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
         window.open_dialog(cx, move |dialog, _, _| {
@@ -7944,9 +7943,8 @@ impl ManagementCenter {
         self.skill_market_install_agents = self.market_default_agents();
         let center = cx.entity();
         let dialog_center = center.clone();
-        let dialog_content = cx.new(|cx| {
-            ManagementMarketDialog::new(center.clone(), ManagementMarketKind::Skill, cx)
-        });
+        let dialog_content = cx
+            .new(|cx| ManagementMarketDialog::new(center.clone(), ManagementMarketKind::Skill, cx));
         let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(360.0, 720.0);
         let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(320.0, 640.0);
         window.open_dialog(cx, move |dialog, _, _| {
@@ -8004,7 +8002,8 @@ impl ManagementCenter {
                         this.skill_market_failures = response.failed_sources;
                     }
                     Ok(Err(error)) => {
-                        this.skill_market_error = Some(format!("{}: {}", error.code, error.message));
+                        this.skill_market_error =
+                            Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => this.skill_market_error = Some(format!("{error}")),
                 }
@@ -8047,7 +8046,8 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(document)) => this.skill_market_document = Some(document),
                     Ok(Err(error)) => {
-                        this.skill_market_error = Some(format!("{}: {}", error.code, error.message));
+                        this.skill_market_error =
+                            Some(format!("{}: {}", error.code, error.message));
                     }
                     Err(error) => this.skill_market_error = Some(format!("{error}")),
                 }
@@ -10410,9 +10410,9 @@ impl ManagementCenter {
                         "浏览 MCP 市场",
                         "瀏覽 MCP 市場",
                     ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_mcp_market_dialog(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_mcp_market_dialog(window, cx)),
+                    ),
             );
         if servers.is_empty() {
             if self.loading && self.snapshot.mcp_servers.is_empty() {
@@ -10575,38 +10575,39 @@ impl ManagementCenter {
             .cloned()
             .collect::<Vec<_>>();
         let resource_count = skills.len();
-        let mut rows = v_flex()
-            .w_full()
-            .gap(px(6.0))
-            .child(management_resource_sidebar_header(
-                management_skills_title(),
-                resource_count,
-                cx,
-            ))
-            .child(
-                Button::new("management-skill-new")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .label(management_locale_text("New Skill", "新建技能", "新建技能"))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_skill_editor(None, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("management-skill-market")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .label(management_locale_text(
-                        "Browse Skill market",
-                        "浏览技能市场",
-                        "瀏覽技能市場",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_skill_market_dialog(window, cx)
-                    })),
-            );
+        let mut rows =
+            v_flex()
+                .w_full()
+                .gap(px(6.0))
+                .child(management_resource_sidebar_header(
+                    management_skills_title(),
+                    resource_count,
+                    cx,
+                ))
+                .child(
+                    Button::new("management-skill-new")
+                        .small()
+                        .ghost()
+                        .w_full()
+                        .label(management_locale_text("New Skill", "新建技能", "新建技能"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_skill_editor(None, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("management-skill-market")
+                        .small()
+                        .ghost()
+                        .w_full()
+                        .label(management_locale_text(
+                            "Browse Skill market",
+                            "浏览技能市场",
+                            "瀏覽技能市場",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_skill_market_dialog(window, cx)
+                        })),
+                );
         if skills.is_empty() {
             if self.loading && self.snapshot.skills.is_empty() {
                 // Same as the MCP list: no loading gate of its own, so it would
@@ -18443,26 +18444,28 @@ impl Render for ManagementMarketDialog {
                             .checked(checked)
                             .accessibility_label(SharedString::from(agent.label.clone()))
                             .disabled(pending)
-                            .on_click(cx.listener(move |_, checked, _, cx| {
-                                let center = toggle_center.clone();
-                                let checked = *checked;
-                                center.update(cx, |center, cx| {
-                                    let set = match market_kind {
-                                        ManagementMarketKind::Mcp => {
-                                            &mut center.mcp_market_install_agents
+                            .on_click(cx.listener(
+                                move |_, checked, _, cx| {
+                                    let center = toggle_center.clone();
+                                    let checked = *checked;
+                                    center.update(cx, |center, cx| {
+                                        let set = match market_kind {
+                                            ManagementMarketKind::Mcp => {
+                                                &mut center.mcp_market_install_agents
+                                            }
+                                            ManagementMarketKind::Skill => {
+                                                &mut center.skill_market_install_agents
+                                            }
+                                        };
+                                        if checked {
+                                            set.insert(toggle_id.clone());
+                                        } else {
+                                            set.remove(&toggle_id);
                                         }
-                                        ManagementMarketKind::Skill => {
-                                            &mut center.skill_market_install_agents
-                                        }
-                                    };
-                                    if checked {
-                                        set.insert(toggle_id.clone());
-                                    } else {
-                                        set.remove(&toggle_id);
-                                    }
-                                    cx.notify();
-                                });
-                            })),
+                                        cx.notify();
+                                    });
+                                },
+                            )),
                         )
                         .child(div().text_sm().child(agent.label.clone())),
                 );
@@ -18476,47 +18479,47 @@ impl Render for ManagementMarketDialog {
                     .child(agent_rows),
             );
 
-            if let Some(target) = &mcp_target {
-                if !target.env.is_empty() {
-                    let inputs = center.read(cx).mcp_market_install_env.clone();
-                    let mut env_rows = v_flex().w_full().gap_1();
-                    for requirement in &target.env {
-                        let mut row = h_flex().w_full().gap_2();
-                        if let Some(input) = inputs.get(&requirement.name) {
-                            row = row.child(
-                                div()
-                                    .w(px(180.0))
-                                    .flex_none()
-                                    .text_sm()
-                                    .child(requirement.name.clone()),
-                            );
-                            row = row.child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(Input::new(input).small().w_full()),
-                            );
-                        }
-                        env_rows = env_rows.child(row);
+            if let Some(target) = &mcp_target
+                && !target.env.is_empty()
+            {
+                let inputs = center.read(cx).mcp_market_install_env.clone();
+                let mut env_rows = v_flex().w_full().gap_1();
+                for requirement in &target.env {
+                    let mut row = h_flex().w_full().gap_2();
+                    if let Some(input) = inputs.get(&requirement.name) {
+                        row = row.child(
+                            div()
+                                .w(px(180.0))
+                                .flex_none()
+                                .text_sm()
+                                .child(requirement.name.clone()),
+                        );
+                        row = row.child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .child(Input::new(input).small().w_full()),
+                        );
                     }
-                    form = form.child(
-                        v_flex()
-                            .w_full()
-                            .flex_none()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Environment variables",
-                                        "环境变量",
-                                        "環境變數",
-                                    )),
-                            )
-                            .child(env_rows),
-                    );
+                    env_rows = env_rows.child(row);
                 }
+                form = form.child(
+                    v_flex()
+                        .w_full()
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Environment variables",
+                                    "环境变量",
+                                    "環境變數",
+                                )),
+                        )
+                        .child(env_rows),
+                );
             }
 
             if skill_target.is_some() {
@@ -18567,16 +18570,14 @@ impl Render for ManagementMarketDialog {
                                 .child(document.body.clone()),
                         );
                     if document.too_large {
-                        preview = preview.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(management_locale_text(
+                        preview =
+                            preview.child(div().text_sm().text_color(cx.theme().danger).child(
+                                management_locale_text(
                                     "This document is too large to install",
                                     "该文档过大，无法安装",
                                     "該文件過大，無法安裝",
-                                )),
-                        );
+                                ),
+                            ));
                     }
                     form = form.child(preview);
                 }
@@ -18586,9 +18587,9 @@ impl Render for ManagementMarketDialog {
             let cancel_center = center.clone();
             let can_install = match kind {
                 ManagementMarketKind::Mcp => mcp_target.is_some(),
-                ManagementMarketKind::Skill => {
-                    document.as_ref().is_some_and(|document| !document.too_large)
-                }
+                ManagementMarketKind::Skill => document
+                    .as_ref()
+                    .is_some_and(|document| !document.too_large),
             };
             form = form.child(
                 h_flex()
@@ -18729,13 +18730,15 @@ impl Render for ManagementMarketDialog {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |_, _, window, cx| {
-                                let center = pick_center.clone();
-                                let pick = pick.clone();
-                                center.update(cx, |center, cx| {
-                                    center.begin_mcp_market_install(pick, window, cx)
-                                });
-                            })),
+                            .on_click(cx.listener(
+                                move |_, _, window, cx| {
+                                    let center = pick_center.clone();
+                                    let pick = pick.clone();
+                                    center.update(cx, |center, cx| {
+                                        center.begin_mcp_market_install(pick, window, cx)
+                                    });
+                                },
+                            )),
                         ),
                 );
             }
@@ -18796,13 +18799,15 @@ impl Render for ManagementMarketDialog {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                let center = pick_center.clone();
-                                let pick = pick.clone();
-                                center.update(cx, |center, cx| {
-                                    center.begin_skill_market_install(pick, cx)
-                                });
-                            })),
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    let center = pick_center.clone();
+                                    let pick = pick.clone();
+                                    center.update(cx, |center, cx| {
+                                        center.begin_skill_market_install(pick, cx)
+                                    });
+                                },
+                            )),
                         ),
                 );
             }

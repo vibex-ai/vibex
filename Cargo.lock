@@ -3185,8 +3185,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-base"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ddc2b526ef9a1ee1e02e974df22682ce94cbba25e3adb6b894ac36be009fe82"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3222,8 +3223,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-component"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f277b9885206dcad32652714cf50e813dbcaa968e2aec5fa7f4a5d916b92363"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3290,8 +3292,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-component-macros"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3e98517401b8c41e359a302f55dd997d00dccd137f8915dd13ef7099f035ee7"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -3301,8 +3304,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-fps"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c99f4062dc30b795f95e079810471cd8945fab85e129fcf5709670f9c3f52d"
 dependencies = [
  "core-graphics 0.24.0",
  "gpui-pre",
@@ -3318,8 +3322,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-assets"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558ab91ac64ba4fd56cd722fdebcbbd253d6bd49514dbf04ab7c772176be61fd"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -3597,7 +3602,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-mobile"
 version = "0.1.0"
-source = "git+https://github.com/longbridge/gpui-mobile?rev=4e4668d316325b04c9c051e7d0609f876eb5b1fe#4e4668d316325b04c9c051e7d0609f876eb5b1fe"
+source = "git+https://github.com/longbridge/gpui-mobile?rev=f70603903854751a5589242d4eadcd031823a75a#f70603903854751a5589242d4eadcd031823a75a"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -10036,6 +10041,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "semver 1.0.28",
+ "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
@@ -10097,6 +10103,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "futures-channel",
+ "gpui-base",
  "gpui-component",
  "gpui-fps",
  "gpui-kit-assets",

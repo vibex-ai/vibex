@@ -120,7 +120,7 @@ height lives in one constant.
 
 ### GPUI Button hover ownership
 
-The locked `gpui-component` `Button` renderer owns the enabled/unselected hover
+The kit's `gpui-component` `Button` renderer owns the enabled/unselected hover
 style. Do not call GPUI's generic `InteractiveElement::hover` directly on a
 `Button`: the caller populates the base element's hover slot, then `Button::render`
 tries to populate the same slot and GPUI panics with `hover style already set`.

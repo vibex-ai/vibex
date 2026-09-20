@@ -42,16 +42,13 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    ManagementSnapshotPayload, MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry,
+    McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
-    McpServerValidationResult, MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry,
-    McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse,
-    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
+    McpServerValidationResult, MessageSubmissionState, OpenWorkspaceRequest, ProjectId, Prompt,
     PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
     PromptValidationResult, ProviderCapabilitySummary, ProviderConfiguredModel,
     ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
@@ -73,7 +70,9 @@ use vibex_core::{
     ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
     SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
     SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
-    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillImportRequest, SkillImportResult, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult, SteerAgentMessageRequest, SteerAgentMessageResult,
     TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot,
     TerminalStatus, TerminalWriteRequest, TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
@@ -2549,17 +2548,15 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
             let service = runtime.management().providers().management();
-            tokio::task::spawn_blocking(move || {
-                service.install_mcp_market_entry(request.payload)
-            })
-            .await
-            .map_err(|_| {
-                BackendError::failed(
-                    "market_install_task_failed",
-                    "the market install task did not complete",
-                )
-            })?
-            .map_err(Into::into)
+            tokio::task::spawn_blocking(move || service.install_mcp_market_entry(request.payload))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_install_task_failed",
+                        "the market install task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
         })
     }
 
@@ -2754,17 +2751,15 @@ impl ManagementBackend for NativeBackend {
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
             let service = runtime.management().providers().management();
-            tokio::task::spawn_blocking(move || {
-                service.install_skill_market_entry(request.payload)
-            })
-            .await
-            .map_err(|_| {
-                BackendError::failed(
-                    "market_install_task_failed",
-                    "the market install task did not complete",
-                )
-            })?
-            .map_err(Into::into)
+            tokio::task::spawn_blocking(move || service.install_skill_market_entry(request.payload))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "market_install_task_failed",
+                        "the market install task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
         })
     }
 

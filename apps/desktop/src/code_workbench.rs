@@ -31,7 +31,9 @@ use gpui_component::{
     },
     h_flex,
     input::{
-        Editor, EditorState, Input, InputEvent, InputState, Position, Textarea, TextareaState,
+        Editor, EditorState, Input, InputEvent, InputGroup, InputGroupAddon,
+        InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState, Position,
+        Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
@@ -10550,8 +10552,11 @@ impl CodeRightRail {
         let query_present = !self.file_search_input.read(cx).value().is_empty();
         let mode = self.file_search_mode;
         let options = self.file_search_options;
-        // The inline search options ride the field's `suffix` slot, so the kit
-        // `Input` owns the border, background and focus ring.
+        // The field and its inline search options are one `InputGroup`: the
+        // group draws the border, background and focus ring around the whole
+        // frame, and its addon buttons take the kit's compact in-field
+        // presentation instead of the toolbar treatment they would get as
+        // standalone `Button`s.
         let trailing = h_flex()
             .min_w_0()
             .gap_1()
@@ -10565,11 +10570,9 @@ impl CodeRightRail {
             })
             .when(query_present, |this| {
                 this.child(
-                    Button::new("clear-file-search")
-                        .xsmall()
-                        .ghost()
-                        .compact()
+                    InputGroupButton::new("clear-file-search")
                         .icon(IconName::Close)
+                        .accessibility_label(locale::text("Clear search", "清除搜索", "清除搜尋"))
                         .tooltip(locale::text("Clear search", "清除搜索", "清除搜尋"))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.clear_file_search(window, cx)),
@@ -10578,10 +10581,7 @@ impl CodeRightRail {
             })
             .when(mode == FileSearchMode::Content, |this| {
                 this.child(
-                    Button::new("file-search-case-sensitive")
-                        .xsmall()
-                        .ghost()
-                        .compact()
+                    InputGroupButton::new("file-search-case-sensitive")
                         .label("Aa")
                         .selected(options.case_sensitive)
                         .tooltip(locale::text("Match case", "区分大小写", "區分大小寫"))
@@ -10590,10 +10590,7 @@ impl CodeRightRail {
                         })),
                 )
                 .child(
-                    Button::new("file-search-whole-word")
-                        .xsmall()
-                        .ghost()
-                        .compact()
+                    InputGroupButton::new("file-search-whole-word")
                         .label("ab")
                         .selected(options.whole_word)
                         .tooltip(locale::text("Match whole word", "匹配整个词", "符合整個詞"))
@@ -10602,10 +10599,7 @@ impl CodeRightRail {
                         })),
                 )
                 .child(
-                    Button::new("file-search-regex")
-                        .xsmall()
-                        .ghost()
-                        .compact()
+                    InputGroupButton::new("file-search-regex")
                         .label(".*")
                         .selected(options.regex)
                         .tooltip(locale::text(
@@ -10619,10 +10613,7 @@ impl CodeRightRail {
                 )
             })
             .child(
-                Button::new("toggle-file-search-mode")
-                    .xsmall()
-                    .ghost()
-                    .compact()
+                InputGroupButton::new("toggle-file-search-mode")
                     .label(mode.title())
                     .tooltip(mode.toggle_label())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_file_search_mode(cx))),
@@ -10634,14 +10625,29 @@ impl CodeRightRail {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Input::new(&self.file_search_input)
+                InputGroup::new("file-search-field")
                     .w_full()
-                    .prefix(
-                        Icon::new(IconName::Search)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
+                    .input(
+                        InputGroupInput::new(&self.file_search_input).aria_label(locale::text(
+                            "Search files",
+                            "搜索文件",
+                            "搜尋檔案",
+                        )),
                     )
-                    .suffix(trailing),
+                    .addon(
+                        InputGroupAddon::new("file-search-leading")
+                            .align(InputGroupAddonAlignment::InlineStart)
+                            .child(
+                                Icon::new(IconName::Search)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                    .addon(
+                        InputGroupAddon::new("file-search-options")
+                            .align(InputGroupAddonAlignment::InlineEnd)
+                            .child(trailing),
+                    ),
             )
             .into_any_element()
     }

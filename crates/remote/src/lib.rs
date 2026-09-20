@@ -3337,8 +3337,7 @@ async fn dispatch_provider_request(
                 Some(request_id.clone()),
                 correlation_id.clone(),
             )?;
-            let sources =
-                run_market_blocking(move || service.set_market_sources(request.request));
+            let sources = run_market_blocking(move || service.set_market_sources(request.request));
             audit_provider_mutation(
                 runtime,
                 &auth,
@@ -3384,9 +3383,8 @@ async fn dispatch_provider_request(
                 Some(request_id.clone()),
                 correlation_id.clone(),
             )?;
-            let result = run_market_blocking(move || {
-                service.install_mcp_market_entry(request.request)
-            });
+            let result =
+                run_market_blocking(move || service.install_mcp_market_entry(request.request));
             audit_provider_mutation(
                 runtime,
                 &auth,
@@ -3408,8 +3406,7 @@ async fn dispatch_provider_request(
                 Some(request_id),
                 correlation_id,
             )?;
-            let result =
-                run_market_blocking(move || service.search_skill_market(request.request))?;
+            let result = run_market_blocking(move || service.search_skill_market(request.request))?;
             serde_json::to_value(vibex_core::RemoteProviderSkillMarketSearchResponse { result })
                 .map_err(remote_payload_encode_error)
         }
@@ -3434,9 +3431,8 @@ async fn dispatch_provider_request(
                 Some(request_id.clone()),
                 correlation_id.clone(),
             )?;
-            let result = run_market_blocking(move || {
-                service.install_skill_market_entry(request.request)
-            });
+            let result =
+                run_market_blocking(move || service.install_skill_market_entry(request.request));
             audit_provider_mutation(
                 runtime,
                 &auth,
@@ -6828,9 +6824,7 @@ where
     F: FnOnce() -> VibexResult<T>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(operation)
         }
         _ => operation(),

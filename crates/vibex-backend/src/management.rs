@@ -24,20 +24,18 @@ use vibex_core::{
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
     CustomAgentCreateRequest, CustomAgentDeleteRequest, DiagnosticExportOutcome,
     DiagnosticExportPayload, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
-    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload, McpServer,
-    McpServerAgentMatrix, McpServerAgentMatrixListRequest, McpServerCreateRequest,
-    McpServerDeleteRequest, McpServerDiscoverRequest, McpServerDiscoveryResponse,
-    McpServerImportRequest, McpServerImportResult, McpServerSetAgentMatrixRequest,
-    McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
+    HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
     MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileUpdateRequest,
-    Prompt, PromptCreateRequest, PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest,
-    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
+    McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
+    McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
+    McpServerValidationResult, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileUpdateRequest, Prompt, PromptCreateRequest, PromptDeleteRequest,
+    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderCredentialSecretMutationRequest, ProviderHealthSummary,
+    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -52,7 +50,9 @@ use vibex_core::{
     ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
     ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
     SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
-    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillImportRequest, SkillImportResult, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult,
 };
 
@@ -492,10 +492,8 @@ pub trait ManagementBackend: BackendBound {
         request: McpMarketSearchRequest,
     ) -> BackendFuture<'_, McpMarketSearchResponse>;
 
-    fn mcp_market_entry(
-        &self,
-        request: McpMarketEntryRequest,
-    ) -> BackendFuture<'_, McpMarketEntry>;
+    fn mcp_market_entry(&self, request: McpMarketEntryRequest)
+    -> BackendFuture<'_, McpMarketEntry>;
 
     fn install_mcp_market_entry(
         &self,

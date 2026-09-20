@@ -50,7 +50,9 @@ impl MarketSourceKind {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// Parses the wire name. Named `parse` rather than `from_str` so it
+    /// cannot be mistaken for the `std::str::FromStr` trait method.
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "mcp_registry" => Some(Self::McpRegistry),
             "mcp_catalog" => Some(Self::McpCatalog),
@@ -116,7 +118,9 @@ impl McpMarketCategory {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// Parses the wire name. Named `parse` rather than `from_str` so it
+    /// cannot be mistaken for the `std::str::FromStr` trait method.
+    pub fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|category| category.as_str() == value)
@@ -152,7 +156,9 @@ impl SkillMarketCategory {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// Parses the wire name. Named `parse` rather than `from_str` so it
+    /// cannot be mistaken for the `std::str::FromStr` trait method.
+    pub fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|category| category.as_str() == value)

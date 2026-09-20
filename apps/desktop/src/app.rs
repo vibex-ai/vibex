@@ -34,11 +34,11 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
-    TitleBar, VirtualListScrollHandle, WindowExt as _,
+    ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
     animation::EffectTransition as Transition,
     avatar::{Avatar, AvatarGroup},
     bubble::{Bubble, BubbleContent, BubbleReactions},
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     collapsible::Collapsible,
     command::{Command, CommandGroup, CommandItem, CommandState},
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -231,9 +231,11 @@ struct DesktopRemoteClient {
 enum RuntimeManagerStage {
     List,
     Detail,
+    /// Pairing a new runtime, filled in inside the panel rather than a dialog.
+    Add,
 }
 
-/// Which pairing entry the add-runtime dialog is collecting.
+/// Which pairing entry the add-runtime form is collecting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RuntimeAddTab {
     #[default]
@@ -370,7 +372,12 @@ const TITLE_BAR_SESSION_MENU_WIDTH: f32 = 220.0;
 const RUNTIME_MANAGER_PANEL_WIDTH: f32 = 360.0;
 const RUNTIME_MANAGER_PANEL_MAX_HEIGHT: f32 = 420.0;
 const RUNTIME_MANAGER_ROW_HEIGHT: f32 = 46.0;
-const RUNTIME_ADD_DIALOG_WIDTH: f32 = 420.0;
+/// Every row reserves this lane for the active check, so the status labels
+/// beside it keep one right edge whether or not a row is the active one.
+const RUNTIME_MANAGER_CHECK_LANE_WIDTH: f32 = 16.0;
+/// Every row also reserves the detail lane. Only remotes have a detail stage,
+/// but holding the lane open keeps the status column unbroken across rows.
+const RUNTIME_MANAGER_DETAIL_LANE_WIDTH: f32 = 28.0;
 const RUNTIME_DETAIL_LABEL_WIDTH: f32 = 76.0;
 /// The runtime stack glyph. `Boxes` is not part of gpui-component's
 /// compatibility enum, so the panel resolves it from the app asset bundle,
@@ -6014,6 +6021,10 @@ pub struct VibexWorkbench {
     shared_management: Option<ManagementWorkflowController>,
     runtime_status: RuntimeStatus,
     runtime_note: Option<String>,
+    /// A failed write of `remote-runtimes.json`. Kept apart from
+    /// [`Self::runtime_note`] because it is the one runtime failure no row or
+    /// detail stage can show, and the panel has to say it in its own voice.
+    runtime_registry_error: Option<String>,
     ui_state: DesktopUiStateV1,
     ui_writer: Option<ThrottledUiStateWriter>,
     persistence_note: Option<String>,
@@ -6075,11 +6086,16 @@ pub struct VibexWorkbench {
     runtime_manager_stage: RuntimeManagerStage,
     /// The runtime whose detail stage is showing, or whose rename is running.
     runtime_manager_target: Option<String>,
+    /// The panel's three scroll regions. They keep separate offsets because the
+    /// list, one runtime's detail, and the pairing form are different readings,
+    /// and carrying one offset into another lands mid-page.
+    runtime_manager_list_scroll: ScrollHandle,
+    runtime_manager_detail_scroll: ScrollHandle,
+    runtime_manager_add_scroll: ScrollHandle,
     runtime_rename_input: Entity<InputState>,
     runtime_rename_active: bool,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
-    runtime_add_open: bool,
     runtime_add_tab: RuntimeAddTab,
     runtime_add_server_url_input: Entity<InputState>,
     runtime_add_code_input: Entity<InputState>,
@@ -6999,6 +7015,7 @@ impl VibexWorkbench {
             shared_management: None,
             runtime_status: RuntimeStatus::Starting,
             runtime_note: None,
+            runtime_registry_error: None,
             ui_state,
             ui_writer,
             persistence_note,
@@ -7043,10 +7060,12 @@ impl VibexWorkbench {
             runtime_manager_open: false,
             runtime_manager_stage: RuntimeManagerStage::List,
             runtime_manager_target: None,
+            runtime_manager_list_scroll: ScrollHandle::new(),
+            runtime_manager_detail_scroll: ScrollHandle::new(),
+            runtime_manager_add_scroll: ScrollHandle::new(),
             runtime_rename_input,
             runtime_rename_active: false,
             runtime_switch_pending: None,
-            runtime_add_open: false,
             runtime_add_tab: RuntimeAddTab::default(),
             runtime_add_server_url_input,
             runtime_add_code_input,
@@ -8715,7 +8734,7 @@ impl VibexWorkbench {
                     Ok(Ok(credential)) => {
                         let id = this.register_runtime(credential);
                         this.persist_runtime_registry(cx);
-                        this.runtime_add_open = false;
+                        this.runtime_manager_stage = RuntimeManagerStage::List;
                         this.switch_to_runtime(id, cx);
                     }
                     Ok(Err(error)) => this.finish_runtime_add_failure(error, cx),
@@ -8732,7 +8751,7 @@ impl VibexWorkbench {
         }));
     }
 
-    /// A failed pairing keeps the dialog open with its inputs intact so the
+    /// A failed pairing keeps the form on screen with its inputs intact so the
     /// operator can correct the address or the code.
     fn finish_runtime_add_failure(&mut self, error: BackendError, cx: &mut Context<Self>) {
         self.runtime_note = Some(format!("{} — {}", error.code, error.message));
@@ -8770,6 +8789,10 @@ impl VibexWorkbench {
         self.runtime_manager_target = None;
         self.runtime_rename_active = false;
         self.runtime_remove_pending = None;
+        self.runtime_manager_list_scroll
+            .set_offset(point(px(0.0), px(0.0)));
+        self.runtime_manager_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -8778,17 +8801,22 @@ impl VibexWorkbench {
         self.runtime_rename_active = false;
         self.runtime_remove_pending = None;
         self.runtime_manager_target = Some(id);
+        // A detail always opens at its top; the previous runtime's offset would
+        // otherwise land in the middle of an unrelated reading.
+        self.runtime_manager_detail_scroll
+            .set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
     /// Escape walks back one stage at a time: an editor or a confirmation
-    /// closes first, then the detail stage, and only then the panel.
+    /// closes first, then the pairing form or a detail stage, and only then the
+    /// panel.
     fn runtime_manager_dismiss_one_level(&mut self, cx: &mut Context<Self>) {
         if self.runtime_rename_active {
             self.runtime_rename_active = false;
         } else if self.runtime_remove_pending.is_some() {
             self.runtime_remove_pending = None;
-        } else if self.runtime_manager_stage == RuntimeManagerStage::Detail {
+        } else if self.runtime_manager_stage != RuntimeManagerStage::List {
             self.runtime_manager_stage = RuntimeManagerStage::List;
             self.runtime_manager_target = None;
         } else {
@@ -8826,9 +8854,12 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Swaps the panel's body to the pairing form. The form lives in the panel
+    /// rather than in a dialog, so pairing never stacks a second surface over
+    /// the manager that launched it.
     fn open_runtime_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.runtime_manager_open = false;
-        self.runtime_add_open = true;
+        self.runtime_manager_stage = RuntimeManagerStage::Add;
+        self.runtime_manager_target = None;
         self.runtime_add_tab = RuntimeAddTab::default();
         self.runtime_note = None;
         self.clear_runtime_add_inputs(window, cx);
@@ -8839,8 +8870,10 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Leaves the pairing form for the list. The panel itself stays open: the
+    /// add stage is one level inside it, not a separate surface.
     fn close_runtime_add(&mut self, cx: &mut Context<Self>) {
-        self.runtime_add_open = false;
+        self.runtime_manager_stage = RuntimeManagerStage::List;
         self.runtime_add_busy = false;
         cx.notify();
     }
@@ -9206,21 +9239,28 @@ impl VibexWorkbench {
         let Some(store) = self.runtime_registry_store.clone() else {
             return;
         };
-        if let Err(error) = store.save(&self.runtime_registry) {
-            tracing::warn!(
-                target: "vibex_desktop",
-                error_code = %error.code,
-                "The runtime registry could not be persisted"
-            );
-            self.runtime_note = Some(
-                locale::text(
-                    "The runtime list could not be saved",
-                    "运行时列表保存失败",
-                    "執行階段清單儲存失敗",
-                )
-                .to_string(),
-            );
-            cx.notify();
+        match store.save(&self.runtime_registry) {
+            Ok(()) => {
+                if self.runtime_registry_error.take().is_some() {
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "vibex_desktop",
+                    error_code = %error.code,
+                    "The runtime registry could not be persisted"
+                );
+                self.runtime_registry_error = Some(
+                    locale::text(
+                        "The runtime list could not be saved",
+                        "运行时列表保存失败",
+                        "執行階段清單儲存失敗",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+            }
         }
     }
 
@@ -9349,6 +9389,7 @@ impl VibexWorkbench {
         let panel = match self.runtime_manager_stage {
             RuntimeManagerStage::List => self.render_runtime_manager_list(cx),
             RuntimeManagerStage::Detail => self.render_runtime_manager_detail(cx),
+            RuntimeManagerStage::Add => self.render_runtime_manager_add(cx),
         };
         v_flex()
             .id("runtime-manager-content")
@@ -9357,13 +9398,11 @@ impl VibexWorkbench {
             .max_h(px(RUNTIME_MANAGER_PANEL_MAX_HEIGHT))
             .min_h_0()
             .overflow_hidden()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(cx.theme().border.opacity(0.70))
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .shadow_lg()
-            .p(px(6.0))
+            // The panel is one more anchored popup, so it wears the framework's
+            // popover surface rather than a local border-and-shadow pair that
+            // drifts from every Select and menu in the app.
+            .popover_style(cx)
+            .p_2()
             .child(panel)
             .into_any_element()
     }
@@ -9377,7 +9416,7 @@ impl VibexWorkbench {
         rows.push(self.render_runtime_row(
             LOCAL_RUNTIME_ID,
             &self.local_runtime_label(),
-            &self.local_runtime_meta(cx),
+            &self.local_runtime_meta(),
             active_id == LOCAL_RUNTIME_ID,
             self.runtime_state(RuntimeTarget::Local),
             switching.is_none(),
@@ -9385,41 +9424,16 @@ impl VibexWorkbench {
             cx,
         ));
 
-        if remotes.is_empty() {
-            rows.push(
-                EmptyState::new()
-                    .flex_none()
-                    .items_start()
-                    .text_left()
-                    .gap_1()
-                    .px_2()
-                    .py_3()
-                    .header(
-                        EmptyHeader::new()
-                            .items_start()
-                            .max_w_full()
-                            .title(EmptyTitle::new().child(locale::text(
-                                "No remote runtimes yet",
-                                "还没有远程运行时",
-                                "還沒有遠端執行階段",
-                            )))
-                            .description(
-                                EmptyDescription::new().text_xs().child(locale::text(
-                                    "Run vibex-server on a host and pair with it to drive that machine from here.",
-                                    "在服务器上运行 vibex-server 并与之配对，就能从这里驱动那台机器。",
-                                    "在伺服器上執行 vibex-server 並與之配對，就能從這裡驅動那台機器。",
-                                )),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        } else {
+        // No empty-state copy when no remote is paired yet: the panel is a
+        // popover with one obvious next step, and the add button below already
+        // names it in words.
+        if !remotes.is_empty() {
             rows.push(divider_lane(cx).into_any_element());
             for runtime in remotes {
                 let id = runtime.id.clone();
                 let is_active = active_id == id;
                 let state = self.runtime_state(RuntimeTarget::Remote(runtime.id.as_str()));
-                let meta = self.remote_runtime_meta(&runtime, is_active, state);
+                let meta = self.remote_runtime_meta(&runtime);
                 let label = runtime.display_label();
                 let pending = switching.as_deref() == Some(id.as_str());
                 rows.push(self.render_runtime_row(
@@ -9435,55 +9449,71 @@ impl VibexWorkbench {
             }
         }
 
-        let mut body = v_flex()
+        // Plain scroll overflow plus an explicitly tracked handle. The panel is
+        // content-sized — it grows with its rows and only caps at
+        // `RUNTIME_MANAGER_PANEL_MAX_HEIGHT` — and `overflow_y_scrollbar()`
+        // wraps the element in a `Scrollable` whose root is `size_full()`. A
+        // percentage height against this auto-height column resolves to zero,
+        // so the whole list collapsed to nothing and the rows painted outside
+        // the panel, under the add button. Plain overflow lets the body size to
+        // its rows, shrink when the cap is hit, and scroll.
+        let body = v_flex()
+            .id("runtime-manager-list-scroll")
+            .relative()
             .w_full()
             .min_h_0()
-            .overflow_y_scrollbar()
-            .children(rows);
-        if let Some(note) = self.runtime_note.clone() {
-            body = body.child(
-                div()
-                    .px_2()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .whitespace_normal()
-                    .child(note),
-            );
-        }
+            .track_scroll(&self.runtime_manager_list_scroll)
+            .overflow_y_scroll()
+            .children(rows)
+            // Last child, so the overlay paints over the rows rather than under
+            // them, the way `Scrollable` orders its own scroll area.
+            .vertical_scrollbar(&self.runtime_manager_list_scroll);
 
         v_flex()
             .w_full()
             .min_h_0()
             .child(
+                // The panel names itself once, at a title's size. It carries no
+                // header action: the command that adds a runtime is the
+                // panel's own footer button, where it can say what it does in
+                // words instead of hiding behind a plus.
                 div()
+                    .w_full()
                     .flex_none()
+                    .truncate()
                     .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text("Runtimes", "运行时", "執行階段")),
+                    .pt_1()
+                    .pb_2()
+                    .text_lg()
+                    .font_medium()
+                    .child(locale::text(
+                        "Manage runtimes",
+                        "管理运行时",
+                        "管理執行階段",
+                    )),
             )
             .child(body)
-            .child(divider_lane(cx))
+            .when_some(self.runtime_registry_error.clone(), |this, error| {
+                this.child(runtime_registry_error_strip(&error, cx))
+            })
             .child(
-                Button::new("runtime-manager-add")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .h(px(32.0))
-                    .flex_none()
-                    .px_2()
-                    .justify_start()
-                    .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-                    .disabled(self.runtime_switch_pending.is_some())
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Icon::new(IconName::Plus).size(px(14.0)))
-                            .child(locale::text("Add runtime…", "添加运行时…", "新增執行階段…")),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.open_runtime_add(window, cx))),
+                div().w_full().flex_none().pt_3().child(
+                    Button::new("runtime-manager-add")
+                        .w_full()
+                        // The component's own icon + label pair, so the mark is
+                        // sized by the button's frame and the label doubles as
+                        // the accessible name.
+                        .icon(IconName::Plus)
+                        .label(locale::text(
+                            "Add runtime service",
+                            "添加运行时服务",
+                            "新增執行階段服務",
+                        ))
+                        .disabled(self.runtime_switch_pending.is_some())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_runtime_add(window, cx)),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -9503,29 +9533,40 @@ impl VibexWorkbench {
         let switch_id = id.to_string();
         let detail_id = id.to_string();
         let dot = runtime_state_color(state, cx);
+        // The row's surface belongs to the whole row — the switch target and
+        // the detail lane together — so hover and selection span exactly the
+        // panel's content width, the same as the add button beneath it. Both
+        // targets therefore paint no background of their own: a ghost button
+        // would wash only its own half and leave the row looking cut in two.
+        let row_surface = ButtonCustomVariant::new(cx)
+            .foreground(cx.theme().secondary_foreground)
+            .active(cx.theme().secondary_active);
         let row = Button::new(SharedString::from(format!("runtime-row-{id}")))
             .small()
-            .ghost()
+            .custom(row_surface)
             .flex_1()
             .min_w_0()
-            .flex_none()
             .h(px(RUNTIME_MANAGER_ROW_HEIGHT))
             .px_2()
-            .justify_start()
-            .rounded(gpui_component::button::ButtonRounded::Size(px(6.0)))
-            .selected(selected)
+            .rounded(cx.theme().radius)
             .disabled(!enabled)
             .child(
                 h_flex()
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .child(div().flex_none().size(px(8.0)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(8.0))
+                            .rounded_full_style(cx)
+                            .bg(dot),
+                    )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(1.0))
+                            .gap_0p5()
                             .child(
                                 div()
                                     .min_w_0()
@@ -9534,14 +9575,16 @@ impl VibexWorkbench {
                                     .when(selected, |this| this.font_medium())
                                     .child(label.to_string()),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(meta.to_string()),
-                            ),
+                            .when(!meta.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(meta.to_string()),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -9550,13 +9593,19 @@ impl VibexWorkbench {
                             .text_color(runtime_state_text_color(state, cx))
                             .child(runtime_state_label(state)),
                     )
-                    .when(selected, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .child(Icon::new(IconName::Check).size(px(14.0))),
-                        )
-                    }),
+                    // The check lane is reserved on every row, so the status
+                    // labels keep one right edge whether or not a row is the
+                    // active one.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(RUNTIME_MANAGER_CHECK_LANE_WIDTH))
+                            .flex()
+                            .justify_end()
+                            .when(selected, |this| {
+                                this.child(Icon::new(IconName::Check).size(px(14.0)))
+                            }),
+                    ),
             )
             .on_click(
                 cx.listener(move |this, _, _, cx| this.switch_to_runtime(switch_id.clone(), cx)),
@@ -9565,25 +9614,38 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .gap_1()
+            .rounded(cx.theme().radius)
+            .when(!selected, |this| {
+                this.hover(|this| this.bg(cx.theme().list_hover))
+            })
+            .when(selected, |this| this.bg(cx.theme().secondary_active))
             .child(row)
-            .when(detail_available, |this| {
+            .child(if detail_available {
                 // A two-target row, matching the title bar's session heading
                 // plus its actions menu: the body switches, the trailing lane
                 // inspects without changing the authority.
-                this.child(
-                    Button::new(SharedString::from(format!("runtime-detail-{id}")))
-                        .small()
-                        .ghost()
-                        .compact()
-                        .size(px(28.0))
-                        .px_0()
-                        .flex_none()
-                        .tooltip(locale::text("Details", "详情", "詳細資料"))
-                        .child(Icon::new(IconName::ChevronRight).size(px(14.0)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_runtime_detail(detail_id.clone(), cx)
-                        })),
-                )
+                Button::new(SharedString::from(format!("runtime-detail-{id}")))
+                    .small()
+                    .custom(row_surface)
+                    .compact()
+                    .size(px(RUNTIME_MANAGER_DETAIL_LANE_WIDTH))
+                    .px_0()
+                    .flex_none()
+                    .tooltip(locale::text("Details", "详情", "詳細資料"))
+                    .accessibility_label(locale::text("Details", "详情", "詳細資料"))
+                    .child(Icon::new(IconName::ChevronRight).size(px(14.0)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_runtime_detail(detail_id.clone(), cx)
+                    }))
+                    .into_any_element()
+            } else {
+                // The embedded runtime has nothing to inspect, but its lane is
+                // still held open: every row's status label and check must land
+                // on the same right edge, or the column breaks in half.
+                div()
+                    .flex_none()
+                    .w(px(RUNTIME_MANAGER_DETAIL_LANE_WIDTH))
+                    .into_any_element()
             })
             .into_any_element()
     }
@@ -9778,6 +9840,9 @@ impl VibexWorkbench {
                 h_flex()
                     .flex_none()
                     .gap_1()
+                    .px_2()
+                    .pt_1()
+                    .pb_2()
                     .child(
                         Button::new("runtime-detail-back")
                             .small()
@@ -9786,6 +9851,7 @@ impl VibexWorkbench {
                             .size(px(24.0))
                             .px_0()
                             .tooltip(locale::text("Back", "返回", "返回"))
+                            .accessibility_label(locale::text("Back", "返回", "返回"))
                             .child(Icon::new(IconName::ChevronLeft).size(px(14.0)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.runtime_manager_stage = RuntimeManagerStage::List;
@@ -9799,12 +9865,21 @@ impl VibexWorkbench {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_sm()
+                            .text_lg()
                             .font_medium()
                             .child(label),
                     ),
             )
-            .child(v_flex().min_h_0().overflow_y_scrollbar().children(rows))
+            .child(
+                v_flex()
+                    .id("runtime-manager-detail-scroll")
+                    .relative()
+                    .min_h_0()
+                    .track_scroll(&self.runtime_manager_detail_scroll)
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .vertical_scrollbar(&self.runtime_manager_detail_scroll),
+            )
             .child(divider_lane(cx))
             .child(actions)
             .into_any_element()
@@ -9870,10 +9945,13 @@ impl VibexWorkbench {
 
     /// The add-runtime dialog. It reuses the pairing claim path the manager
     /// calls, so there is exactly one implementation of pairing.
-    fn render_runtime_add_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The pairing form, as the panel's third stage. It is the same surface the
+    /// list and a runtime's detail share, so pairing fills in where it was
+    /// launched instead of opening a dialog over the manager.
+    fn render_runtime_manager_add(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.runtime_add_busy;
         let code_tab = self.runtime_add_tab == RuntimeAddTab::Code;
-        let mut body = v_flex().w_full().gap_3().child(
+        let mut fields = v_flex().w_full().gap_2().child(
             TabBar::new("runtime-add-tabs")
                 .small()
                 .selected_index(if code_tab { 0 } else { 1 })
@@ -9890,7 +9968,7 @@ impl VibexWorkbench {
                 .child(Tab::new().label(locale::text("Connection string", "连接串", "連接串"))),
         );
         if code_tab {
-            body = body
+            fields = fields
                 .child(
                     v_flex()
                         .gap_1()
@@ -9930,7 +10008,7 @@ impl VibexWorkbench {
                     cx,
                 ));
         } else {
-            body = body
+            fields = fields
                 .child(
                     v_flex()
                         .gap_1()
@@ -9938,11 +10016,7 @@ impl VibexWorkbench {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(locale::text(
-                                    "Connection string",
-                                    "连接串",
-                                    "連接串",
-                                )),
+                                .child(locale::text("Connection string", "连接串", "連接串")),
                         )
                         .child(Input::new(&self.runtime_add_link_input).small().h(px(28.0))),
                 )
@@ -9956,7 +10030,7 @@ impl VibexWorkbench {
                 ));
         }
         if let Some(note) = self.runtime_note.clone() {
-            body = body.child(
+            fields = fields.child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().danger)
@@ -9965,32 +10039,69 @@ impl VibexWorkbench {
             );
         }
 
+        // Same scroll discipline as the other two stages: plain overflow plus
+        // an explicitly tracked handle, because the panel's height is
+        // content-sized.
+        let fields = v_flex()
+            .id("runtime-manager-add-scroll")
+            .relative()
+            .w_full()
+            .min_h_0()
+            .track_scroll(&self.runtime_manager_add_scroll)
+            .overflow_y_scroll()
+            .px_2()
+            .child(fields)
+            .vertical_scrollbar(&self.runtime_manager_add_scroll);
+
         v_flex()
-            .id("runtime-add-dialog")
-            .w(px(RUNTIME_ADD_DIALOG_WIDTH))
-            .gap_3()
-            .child(body)
+            .w_full()
+            .min_h_0()
             .child(
                 h_flex()
                     .w_full()
-                    .justify_end()
+                    .flex_none()
                     .gap_1()
+                    .px_2()
+                    .pt_1()
+                    .pb_2()
                     .child(
-                        Button::new("runtime-add-cancel")
+                        Button::new("runtime-add-back")
                             .small()
                             .ghost()
-                            .label(locale::text("Cancel", "取消", "取消"))
+                            .compact()
+                            .size(px(24.0))
+                            .px_0()
+                            .tooltip(locale::text("Back", "返回", "返回"))
+                            .accessibility_label(locale::text("Back", "返回", "返回"))
                             .disabled(busy)
+                            .child(Icon::new(IconName::ChevronLeft).size(px(14.0)))
                             .on_click(cx.listener(|this, _, _, cx| this.close_runtime_add(cx))),
                     )
                     .child(
-                        Button::new("runtime-add-submit")
-                            .small()
-                            .label(locale::text("Pair", "配对", "配對"))
-                            .disabled(busy)
-                            .loading(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit_runtime_add(cx))),
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_lg()
+                            .font_medium()
+                            .child(locale::text(
+                                "Add runtime service",
+                                "添加运行时服务",
+                                "新增執行階段服務",
+                            )),
                     ),
+            )
+            .child(fields)
+            .child(
+                // No horizontal inset: the submit plate lines up with the
+                // list's add button, which is the same plate in the same panel.
+                div().w_full().flex_none().pt_3().child(
+                    Button::new("runtime-add-submit")
+                        .w_full()
+                        .label(locale::text("Pair", "配对", "配對"))
+                        .disabled(busy)
+                        .loading(busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_runtime_add(cx))),
+                ),
             )
             .into_any_element()
     }
@@ -10009,30 +10120,22 @@ impl VibexWorkbench {
         locale::text("This device", "本机", "本機").to_string()
     }
 
-    fn local_runtime_meta(&self, _cx: &App) -> String {
-        let host = self
-            .config
+    /// A row's second line carries identity only. The live state belongs to the
+    /// row's status lane and the last connection to the detail stage, so
+    /// repeating either here would say the same thing twice in one row.
+    fn local_runtime_meta(&self) -> String {
+        self.config
             .as_ref()
             .and_then(|config| config.home_dir.file_name())
             .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let state = self.runtime_state(RuntimeTarget::Local);
-        if host.is_empty() {
-            return runtime_state_label(state).to_string();
-        }
-        format!("{host} · {}", runtime_state_label(state))
+            .unwrap_or_default()
     }
 
-    fn remote_runtime_meta(
-        &self,
-        runtime: &RegisteredRuntime,
-        is_active: bool,
-        state: RuntimeStatePresentation,
-    ) -> String {
+    fn remote_runtime_meta(&self, runtime: &RegisteredRuntime) -> String {
         let address = runtime.credential.record.server_url.clone();
-        if is_active {
-            return format!("{address} · {}", runtime_state_label(state));
-        }
+        // A failed pairing is the one runtime fact with no other home on the
+        // row: the status lane says `Not connected` either way, so the reason
+        // has to ride the identity line or be lost until the detail stage.
         if self
             .runtime_connect_errors
             .contains_key(runtime.id.as_str())
@@ -10042,17 +10145,7 @@ impl VibexWorkbench {
                 locale::text("last attempt failed", "上次连接失败", "上次連線失敗")
             );
         }
-        match runtime.last_connected_at_ms {
-            Some(at) => format!(
-                "{address} · {} {}",
-                locale::text("last connected", "上次连接", "上次連線"),
-                relative_time_label(at)
-            ),
-            None => format!(
-                "{address} · {}",
-                locale::text("not connected", "未连接", "未連線")
-            ),
-        }
+        address
     }
 
     /// The active runtime's user-visible state, with a label that never relies
@@ -62256,9 +62349,6 @@ impl Render for VibexWorkbench {
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
-        let runtime_add_dialog = self
-            .runtime_add_open
-            .then(|| runtime_add_dialog_overlay(self.render_runtime_add_dialog(cx), cx));
         // The developer HUD hangs below the title bar so it never covers the
         // window controls, and sits under every modal layer so an open dialog
         // stays readable. Its own insets place it rather than the overlay's
@@ -62333,10 +62423,7 @@ impl Render for VibexWorkbench {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.runtime_add_open && event.keystroke.key == "escape" {
-                    this.close_runtime_add(cx);
-                    cx.stop_propagation();
-                } else if this.runtime_manager_open && event.keystroke.key == "escape" {
+                if this.runtime_manager_open && event.keystroke.key == "escape" {
                     this.runtime_manager_dismiss_one_level(cx);
                     cx.stop_propagation();
                 } else if this.conversation_find_open && event.keystroke.key == "escape" {
@@ -62426,7 +62513,6 @@ impl Render for VibexWorkbench {
                 this.child(preview)
             })
             .when_some(command_palette_overlay, |this, overlay| this.child(overlay))
-            .when_some(runtime_add_dialog, |this, overlay| this.child(overlay))
             .when_some(startup_loading, |this, overlay| this.child(overlay))
     }
 }
@@ -63068,6 +63154,32 @@ fn divider_lane(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// A failed registry write is the one panel-level failure with no row to show
+/// it, so it gets its own strip instead of the shared transient note that the
+/// rows already restate.
+fn runtime_registry_error_strip(message: &str, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_none()
+        .gap_2()
+        .mt_1()
+        .px_2()
+        .py_1()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().danger.opacity(0.10))
+        .text_xs()
+        .text_color(cx.theme().danger)
+        .child(Icon::new(IconName::TriangleAlert).size(px(14.0)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(message.to_string()),
+        )
+        .into_any_element()
+}
+
 /// A label/value pair in the runtime detail stage. Labels share one lane so
 /// the values form a single readable column.
 fn runtime_detail_row(label: &'static str, value: String, cx: &App) -> AnyElement {
@@ -63124,33 +63236,6 @@ pub(crate) fn relative_time_label(at_ms: i64) -> String {
     }
     let days = hours / 24;
     format!("{days} {}", locale::text("d ago", "天前", "天前"))
-}
-
-/// The add-runtime dialog layer. It sits above the shell but below the GPUI
-/// dialog layer, so a confirmation can still stack on top correctly.
-fn runtime_add_dialog_overlay(content: AnyElement, cx: &App) -> AnyElement {
-    div()
-        .id("runtime-add-overlay")
-        .absolute()
-        .inset_0()
-        .occlude()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(cx.theme().background.opacity(0.55))
-        .child(
-            v_flex()
-                .w(px(RUNTIME_ADD_DIALOG_WIDTH + 40.0))
-                .rounded(px(14.0))
-                .border_1()
-                .border_color(cx.theme().border.opacity(0.70))
-                .bg(cx.theme().popover)
-                .text_color(cx.theme().popover_foreground)
-                .shadow_lg()
-                .p_4()
-                .child(content),
-        )
-        .into_any_element()
 }
 
 fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
@@ -72417,7 +72502,9 @@ mod tests {
             *input_slot_for_view.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerTokenGeometryProbe {
                 input,
-                width: px(360.0),
+                // Wide enough that the sample line cannot wrap, whatever font
+                // the test machine resolves, so one chip means one token.
+                width: px(640.0),
             });
             gpui_component::Root::new(probe, window, cx)
         });
@@ -77052,6 +77139,83 @@ mod tests {
             trigger.contains(".on_open_change("),
             "the panel's open state must be recorded from the popover callback"
         );
+    }
+
+    /// The panel is content-sized: it grows with its rows and only caps at
+    /// `RUNTIME_MANAGER_PANEL_MAX_HEIGHT`. `overflow_y_scrollbar()` wraps the
+    /// element in a `Scrollable` whose root is `size_full()`, and a percentage
+    /// height against that auto-height column resolves to zero — the list
+    /// contributed no height at all, so the rows laid out *outside* the panel,
+    /// clipped, with the add button painted over the first one. The panel
+    /// looked empty. Plain overflow plus an explicitly tracked handle keeps the
+    /// body content-sized and still scrolls once the cap is hit.
+    #[test]
+    fn the_runtime_manager_scrolls_without_the_size_full_wrapper() {
+        let source = include_str!("app.rs");
+        for (open, close, handle) in [
+            (
+                "    fn render_runtime_manager_list(",
+                "\n    fn render_runtime_row(",
+                "runtime_manager_list_scroll",
+            ),
+            (
+                "    fn render_runtime_manager_detail(",
+                "\n    /// Removal is the one irreversible action here",
+                "runtime_manager_detail_scroll",
+            ),
+            (
+                "    fn render_runtime_manager_add(",
+                "\n    /// `locale::text` needs a `'static` string",
+                "runtime_manager_add_scroll",
+            ),
+        ] {
+            let body = source
+                .split_once(open)
+                .and_then(|(_, tail)| tail.split_once(close))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{open} should remain inspectable"));
+            assert!(
+                !body.contains(".overflow_y_scrollbar()"),
+                "{open} must not size its scroll region through `Scrollable`"
+            );
+            assert!(
+                body.contains(&format!(".track_scroll(&self.{handle})")),
+                "{open} must drive its own scroll handle"
+            );
+            assert!(
+                body.contains(&format!(".vertical_scrollbar(&self.{handle})")),
+                "{open} must keep a scrollbar on the region it scrolls"
+            );
+        }
+    }
+
+    /// A runtime's state belongs to its row's status lane. The identity line
+    /// used to append it as well, so every row said "Ready" twice: once beside
+    /// the name and once in the trailing lane, with the dot saying it a third
+    /// time. Identity is the host or the address, and nothing else.
+    #[test]
+    fn a_runtime_row_states_its_status_once() {
+        let source = include_str!("app.rs");
+        for (open, close) in [
+            (
+                "    fn local_runtime_meta(",
+                "\n    fn remote_runtime_meta(",
+            ),
+            (
+                "    fn remote_runtime_meta(",
+                "\n    /// The active runtime's user-visible state",
+            ),
+        ] {
+            let meta = source
+                .split_once(open)
+                .and_then(|(_, tail)| tail.split_once(close))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{open} should remain inspectable"));
+            assert!(
+                !meta.contains("runtime_state_label"),
+                "{open} must leave the status to the row's status lane"
+            );
+        }
     }
 
     #[test]

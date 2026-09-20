@@ -172,6 +172,7 @@ pub use local_history::{
     LocalHistoryScanResult, LocalHistoryScanSession, LocalHistorySelection,
     LocalHistorySessionSummary, LocalHistorySource, LocalHistoryTimelineEntry,
 };
+pub use market::*;
 pub use pairing_code_link::{
     MAX_PAIRING_CODE_CERTIFICATE_BYTES, MAX_PAIRING_CODE_CHARS, MAX_PAIRING_CODE_LINK_BYTES,
     PAIRING_CODE_FRAGMENT_PREFIX, PAIRING_CODE_LINK_HOST, PAIRING_CODE_LINK_PREFIX,
@@ -252,7 +253,6 @@ pub use provider::{
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillStatus, SkillSummary, SkillUpdateRequest,
     SkillValidateRequest, SkillValidationResult, SkillValidationStatus,
 };
-pub use market::*;
 pub use provider_projection::*;
 pub use recovery::*;
 pub use relay::{
@@ -405,12 +405,17 @@ pub use remote::{
     RemoteProviderListAgentCatalogResponse, RemoteProviderListNativeExportsRequest,
     RemoteProviderListNativeExportsResponse, RemoteProviderManagementSnapshot,
     RemoteProviderManagementSnapshotRequest, RemoteProviderManagementSnapshotResponse,
+    RemoteProviderMarketSourceListRequest, RemoteProviderMarketSourceListResponse,
+    RemoteProviderMarketSourceSetRequest, RemoteProviderMarketSourceSetResponse,
     RemoteProviderMcpAgentMatrixListRequest, RemoteProviderMcpAgentMatrixListResponse,
     RemoteProviderMcpAgentMatrixSetRequest, RemoteProviderMcpCreateRequest,
     RemoteProviderMcpDeleteRequest, RemoteProviderMcpDeleteResponse,
     RemoteProviderMcpDiscoverRequest, RemoteProviderMcpDiscoverResponse,
     RemoteProviderMcpImportRequest, RemoteProviderMcpImportResponse, RemoteProviderMcpListRequest,
-    RemoteProviderMcpListResponse, RemoteProviderMcpMutationResponse,
+    RemoteProviderMcpListResponse, RemoteProviderMcpMarketEntryRequest,
+    RemoteProviderMcpMarketEntryResponse, RemoteProviderMcpMarketInstallRequest,
+    RemoteProviderMcpMarketInstallResponse, RemoteProviderMcpMarketSearchRequest,
+    RemoteProviderMcpMarketSearchResponse, RemoteProviderMcpMutationResponse,
     RemoteProviderMcpUpdateRequest, RemoteProviderMcpValidateRequest,
     RemoteProviderMcpValidateResponse, RemoteProviderOperationKind,
     RemoteProviderPreviewNativeExportRequest, RemoteProviderPreviewNativeExportResponse,
@@ -433,16 +438,11 @@ pub use remote::{
     RemoteProviderSkillDiscoverRequest, RemoteProviderSkillDiscoverResponse,
     RemoteProviderSkillImportRequest, RemoteProviderSkillImportResponse,
     RemoteProviderSkillListRequest, RemoteProviderSkillListResponse,
-    RemoteProviderSkillUpdateRequest, RemoteProviderSkillUpdateResponse,
-    RemoteProviderSkillValidateRequest, RemoteProviderSkillValidateResponse,
-    RemoteProviderMarketSourceListRequest, RemoteProviderMarketSourceListResponse,
-    RemoteProviderMarketSourceSetRequest, RemoteProviderMarketSourceSetResponse,
-    RemoteProviderMcpMarketSearchRequest, RemoteProviderMcpMarketSearchResponse,
-    RemoteProviderMcpMarketEntryRequest, RemoteProviderMcpMarketEntryResponse,
-    RemoteProviderMcpMarketInstallRequest, RemoteProviderMcpMarketInstallResponse,
-    RemoteProviderSkillMarketSearchRequest, RemoteProviderSkillMarketSearchResponse,
     RemoteProviderSkillMarketDocumentRequest, RemoteProviderSkillMarketDocumentResponse,
     RemoteProviderSkillMarketInstallRequest, RemoteProviderSkillMarketInstallResponse,
+    RemoteProviderSkillMarketSearchRequest, RemoteProviderSkillMarketSearchResponse,
+    RemoteProviderSkillUpdateRequest, RemoteProviderSkillUpdateResponse,
+    RemoteProviderSkillValidateRequest, RemoteProviderSkillValidateResponse,
     RemoteProviderUpdateAcpProfileConfigRequest, RemoteProviderUpdateAcpProfileConfigResponse,
     RemoteProviderUsageSummaryListRequest, RemoteProviderUsageSummaryListResponse,
     RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRestoreDeviceRequest,

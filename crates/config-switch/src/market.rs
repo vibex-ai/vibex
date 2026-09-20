@@ -42,9 +42,9 @@ use vibex_core::{
     MarketSourceKind, MarketSourceListResponse, MarketSourceSetRequest, McpMarketCategory,
     McpMarketEntry, McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult,
     McpMarketSearchRequest, McpMarketSearchResponse, McpServerCreateRequest, McpServerEnvEntry,
-    McpServerScopeKind, McpServerStatus, McpServerTransportKind,
-    SkillCreateRequest, SkillMarketCategory, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketEntry, SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    McpServerScopeKind, McpServerStatus, McpServerTransportKind, SkillCreateRequest,
+    SkillMarketCategory, SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
     SkillMarketSearchResponse, SkillScopeKind, SkillSourceKind, SkillStatus, VibexError,
     VibexResult,
 };
@@ -134,7 +134,7 @@ fn sanitize_market_sources(value: serde_json::Value) -> Vec<MarketSource> {
         let kind = object
             .get("kind")
             .and_then(serde_json::Value::as_str)
-            .and_then(MarketSourceKind::from_str);
+            .and_then(MarketSourceKind::parse);
         let (Some(id), Some(name), Some(url), Some(kind)) = (id, name, url, kind) else {
             continue;
         };
@@ -157,10 +157,7 @@ fn market_source_url_is_allowed(kind: MarketSourceKind, url: &str) -> bool {
     if url.starts_with("builtin://") {
         return kind == MarketSourceKind::SkillCatalog;
     }
-    match market_url_policy(url) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    market_url_policy(url).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +202,10 @@ fn is_public_ip(ip: IpAddr) -> bool {
 /// a suffix check.
 fn market_url_policy(raw: &str) -> Result<reqwest::Url, VibexError> {
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| {
-        VibexError::validation("market_source_url_invalid", "market source URL does not parse")
+        VibexError::validation(
+            "market_source_url_invalid",
+            "market source URL does not parse",
+        )
     })?;
     if url.scheme() != "https" {
         return Err(VibexError::validation(
@@ -314,13 +314,13 @@ fn fetch_market_bytes(
             )
             .with_diagnostic("host", url.host_str().unwrap_or_default()));
         }
-        if let Some(length) = response.content_length() {
-            if length > limit {
-                return Err(VibexError::provider(
-                    "market_source_too_large",
-                    "market source response exceeded the size limit",
-                ));
-            }
+        if let Some(length) = response.content_length()
+            && length > limit
+        {
+            return Err(VibexError::provider(
+                "market_source_too_large",
+                "market source response exceeded the size limit",
+            ));
         }
         let host = url.host_str().unwrap_or_default().to_string();
         let mut body = Vec::new();
@@ -431,13 +431,18 @@ impl ProviderConfigService {
         let encoded = serde_json::to_vec_pretty(&payload).map_err(|error| {
             VibexError::storage("market_sources_encode_failed", error.to_string())
         })?;
-        std::fs::write(&path, encoded)
-            .map_err(|error| VibexError::storage("market_sources_write_failed", error.to_string()))?;
+        std::fs::write(&path, encoded).map_err(|error| {
+            VibexError::storage("market_sources_write_failed", error.to_string())
+        })?;
         self.market_sources()
     }
 
     /// Every source a search should visit, restricted to the requested kind.
-    fn market_sources_for_kind(&self, requested: &[String], mcp: bool) -> VibexResult<Vec<MarketSource>> {
+    fn market_sources_for_kind(
+        &self,
+        requested: &[String],
+        mcp: bool,
+    ) -> VibexResult<Vec<MarketSource>> {
         let all = self.market_sources()?.sources;
         let mut selected: Vec<MarketSource> = all
             .into_iter()
@@ -735,8 +740,8 @@ fn search_mcp_registry(
         url.push_str("&search=");
         url.push_str(&urlencode(query));
     }
-    let response: RegistryListResponse = fetch_market_json(client, &url)
-        .map_err(|error| source_failure(source, &error, None))?;
+    let response: RegistryListResponse =
+        fetch_market_json(client, &url).map_err(|error| source_failure(source, &error, None))?;
     let has_more = response
         .metadata
         .as_ref()
@@ -858,7 +863,7 @@ fn parse_mcp_catalog(source: &MarketSource, body: &[u8]) -> Vec<McpMarketEntry> 
                 categories: record
                     .categories
                     .iter()
-                    .filter_map(|value| McpMarketCategory::from_str(value))
+                    .filter_map(|value| McpMarketCategory::parse(value))
                     .collect(),
                 transport,
                 command: record.command,
@@ -940,7 +945,7 @@ fn parse_skill_catalog(source: &MarketSource, body: &[u8]) -> Vec<SkillMarketEnt
                 categories: record
                     .categories
                     .iter()
-                    .filter_map(|value| SkillMarketCategory::from_str(value))
+                    .filter_map(|value| SkillMarketCategory::parse(value))
                     .collect(),
                 document_url: document_url.to_string(),
                 verified: record.verified,
@@ -1114,8 +1119,10 @@ fn scan_skill_repository(
         .filter(|entry| is_scannable_skill_path(&entry.path))
         .filter_map(|entry| {
             let id = skill_id_from_path(&entry.path);
-            let document_url =
-                format!("https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{}", entry.path);
+            let document_url = format!(
+                "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{}",
+                entry.path
+            );
             if market_url_policy(&document_url).is_err() {
                 return None;
             }
@@ -1173,15 +1180,15 @@ fn split_skill_document(text: &str) -> (Option<String>, Option<String>, String) 
             continue;
         }
         match key.trim() {
-            "name" | "display_name" | "title" if name.is_none() => {
-                name = Some(value.to_string())
-            }
+            "name" | "display_name" | "title" if name.is_none() => name = Some(value.to_string()),
             "description" if description.is_none() => description = Some(value.to_string()),
             _ => {}
         }
     }
     let body_start = end + "\n---".len();
-    let body = rest[body_start..].trim_start_matches(['\n', '\r']).to_string();
+    let body = rest[body_start..]
+        .trim_start_matches(['\n', '\r'])
+        .to_string();
     (name, description, body)
 }
 
@@ -1189,7 +1196,11 @@ fn skill_document_from_text(entry_id: &str, text: &str) -> SkillMarketDocument {
     let (name, description, body) = split_skill_document(text);
     // Measure the document the create path would actually persist, so the limit
     // reflects stored bytes rather than the fetched ones.
-    let rendered = render_skill_document(name.as_deref().unwrap_or(entry_id), description.as_deref(), &body);
+    let rendered = render_skill_document(
+        name.as_deref().unwrap_or(entry_id),
+        description.as_deref(),
+        &body,
+    );
     let bytes = rendered.len() as u64;
     SkillMarketDocument {
         entry_id: entry_id.to_string(),
@@ -1204,7 +1215,10 @@ fn skill_document_from_text(entry_id: &str, text: &str) -> SkillMarketDocument {
 fn render_skill_document(name: &str, description: Option<&str>, body: &str) -> String {
     let mut out = format!("---\nname: {}\n", name.replace('\n', " "));
     if let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) {
-        out.push_str(&format!("description: {}\n", description.replace('\n', " ")));
+        out.push_str(&format!(
+            "description: {}\n",
+            description.replace('\n', " ")
+        ));
     }
     out.push_str("---\n\n");
     out.push_str(body.trim());
@@ -1333,7 +1347,8 @@ impl ProviderConfigService {
     /// Install calls this rather than trusting a client-supplied template, so a
     /// crafted request cannot introduce a server the catalog never published.
     pub fn mcp_market_entry(&self, request: McpMarketEntryRequest) -> VibexResult<McpMarketEntry> {
-        let sources = self.market_sources_for_kind(std::slice::from_ref(&request.source_id), true)?;
+        let sources =
+            self.market_sources_for_kind(std::slice::from_ref(&request.source_id), true)?;
         let source = sources
             .iter()
             .find(|source| source.id == request.source_id)
@@ -1343,14 +1358,17 @@ impl ProviderConfigService {
             })?;
         let client = market_http_client()?;
         let mut entries = match source.kind {
-            MarketSourceKind::McpRegistry => search_mcp_registry(&client, source, None, 100)
-                .map_err(|failure| {
-                    VibexError::provider(failure.code, failure.message)
-                        .with_diagnostic("sourceId", failure.source_id)
-                })?
-                .0,
+            MarketSourceKind::McpRegistry => {
+                search_mcp_registry(&client, source, None, 100)
+                    .map_err(|failure| {
+                        VibexError::provider(failure.code, failure.message)
+                            .with_diagnostic("sourceId", failure.source_id)
+                    })?
+                    .0
+            }
             MarketSourceKind::McpCatalog => {
-                let (body, _) = fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
+                let (body, _) =
+                    fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
                 parse_mcp_catalog(source, &body)
             }
             _ => Vec::new(),
@@ -1385,11 +1403,8 @@ impl ProviderConfigService {
                     .with_diagnostic("entryId", request.entry_id.clone())
             })?;
         let client = market_http_client()?;
-        let (body, _) = fetch_market_bytes(
-            &client,
-            &entry.document_url,
-            MAX_SKILL_DOCUMENT_FETCH_BYTES,
-        )?;
+        let (body, _) =
+            fetch_market_bytes(&client, &entry.document_url, MAX_SKILL_DOCUMENT_FETCH_BYTES)?;
         let text = String::from_utf8(body).map_err(|_| {
             VibexError::provider(
                 "market_skill_document_not_utf8",
@@ -1829,10 +1844,19 @@ mod tests {
     #[test]
     fn transport_gate_excludes_sse_for_codex_and_deepseek() {
         let codex = AgentId::parse("codex").unwrap();
-        assert!(!agent_can_host_transport(&codex, McpServerTransportKind::Sse));
-        assert!(agent_can_host_transport(&codex, McpServerTransportKind::Stdio));
+        assert!(!agent_can_host_transport(
+            &codex,
+            McpServerTransportKind::Sse
+        ));
+        assert!(agent_can_host_transport(
+            &codex,
+            McpServerTransportKind::Stdio
+        ));
         let claude = AgentId::parse("claude").unwrap();
-        assert!(agent_can_host_transport(&claude, McpServerTransportKind::Sse));
+        assert!(agent_can_host_transport(
+            &claude,
+            McpServerTransportKind::Sse
+        ));
     }
 
     #[test]

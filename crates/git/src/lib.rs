@@ -1722,28 +1722,58 @@ fn status_numstat(root: &Path) -> VibexResult<HashMap<String, (u32, u32)>> {
     Ok(stats)
 }
 
-fn merge_status_numstat(stats: &mut HashMap<String, (u32, u32)>, output: &str) {
-    // `-z` records are NUL separated as `additions\tdeletions\tpath` (renames
-    // add a second NUL-separated field with the original path).
+/// One record of `git diff --numstat -z`.
+///
+/// A plain record is `additions\tdeletions\tpath`. A rename or copy record
+/// stops after the second tab and carries its two paths as separate
+/// NUL-separated fields, source first: `additions\tdeletions\t\0source\0dest`.
+/// `path` is therefore the destination, which is the path `git status` also
+/// reports for the change.
+struct NumstatRecord<'a> {
+    additions: &'a str,
+    deletions: &'a str,
+    path: &'a str,
+    original_path: Option<&'a str>,
+}
+
+fn parse_numstat_records(output: &str) -> Vec<NumstatRecord<'_>> {
     let mut records = output.split('\0');
-    while let Some(counts) = records.next() {
-        if counts.is_empty() {
+    let mut parsed = Vec::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
             continue;
         }
-        let mut fields = counts.split('\t');
-        let (Some(additions), Some(deletions)) = (fields.next(), fields.next()) else {
+        let mut fields = record.split('\t');
+        let (Some(additions), Some(deletions), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
-        let Some(path) = fields.next() else {
-            continue;
+        let (path, original_path) = if path.is_empty() {
+            // Rename/copy: the inline path is empty and the two real paths
+            // follow as their own NUL-separated fields.
+            let (Some(source), Some(destination)) = (records.next(), records.next()) else {
+                continue;
+            };
+            (destination, Some(source))
+        } else {
+            (path, None)
         };
-        // Consume the rename/copy source path so the next record starts clean.
-        if fields.next().is_none() {
-            records.next();
-        }
-        let entry = stats.entry(path.to_string()).or_insert((0, 0));
-        entry.0 += parse_numstat_count(additions);
-        entry.1 += parse_numstat_count(deletions);
+        parsed.push(NumstatRecord {
+            additions,
+            deletions,
+            path,
+            original_path,
+        });
+    }
+    parsed
+}
+
+fn merge_status_numstat(stats: &mut HashMap<String, (u32, u32)>, output: &str) {
+    for record in parse_numstat_records(output) {
+        let entry = stats.entry(record.path.to_string()).or_insert((0, 0));
+        entry.0 += parse_numstat_count(record.additions);
+        entry.1 += parse_numstat_count(record.deletions);
     }
 }
 
@@ -2237,10 +2267,13 @@ fn commit_file_changes(root: &Path, commit_hash: &str) -> VibexResult<Vec<GitCom
     let numstat = run_git_owned(
         root,
         &[
+            "-c".to_string(),
+            "core.quotePath=false".to_string(),
             "diff-tree".to_string(),
             "--root".to_string(),
             "--no-commit-id".to_string(),
             "--numstat".to_string(),
+            "-z".to_string(),
             "-r".to_string(),
             "-M".to_string(),
             commit_hash.to_string(),
@@ -2249,10 +2282,13 @@ fn commit_file_changes(root: &Path, commit_hash: &str) -> VibexResult<Vec<GitCom
     let name_status = run_git_owned(
         root,
         &[
+            "-c".to_string(),
+            "core.quotePath=false".to_string(),
             "diff-tree".to_string(),
             "--root".to_string(),
             "--no-commit-id".to_string(),
             "--name-status".to_string(),
+            "-z".to_string(),
             "-r".to_string(),
             "-M".to_string(),
             commit_hash.to_string(),
@@ -2263,23 +2299,24 @@ fn commit_file_changes(root: &Path, commit_hash: &str) -> VibexResult<Vec<GitCom
 }
 
 fn parse_name_status(output: &str) -> HashMap<String, (GitChangeKind, Option<String>)> {
+    // `-z` records: `M\0path\0` for a plain change, `R075\0source\0dest\0` for
+    // a rename or copy.
     let mut out = HashMap::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let code = parts[0];
-        let (path, original_path) = if code.starts_with('R') || code.starts_with('C') {
-            if parts.len() >= 3 {
-                (parts[2].to_string(), Some(parts[1].to_string()))
-            } else {
-                (parts[1].to_string(), None)
-            }
+    let mut records = output.split('\0').filter(|record| !record.is_empty());
+    while let Some(status) = records.next() {
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let (original_path, path) = if renamed {
+            let (Some(source), Some(destination)) = (records.next(), records.next()) else {
+                break;
+            };
+            (Some(source.to_string()), destination)
         } else {
-            (parts[1].to_string(), None)
+            let Some(path) = records.next() else {
+                break;
+            };
+            (None, path)
         };
-        out.insert(path, (status_code_kind(code), original_path));
+        out.insert(path.to_string(), (status_code_kind(status), original_path));
     }
     out
 }
@@ -2288,29 +2325,23 @@ fn parse_numstat(
     output: &str,
     status_by_path: &HashMap<String, (GitChangeKind, Option<String>)>,
 ) -> Vec<GitCommitFileChange> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 3 {
-                return None;
-            }
-            let (path, original_path) = if parts.len() >= 4 {
-                (parts[3].to_string(), Some(parts[2].to_string()))
-            } else {
-                (parts[2].to_string(), None)
-            };
+    parse_numstat_records(output)
+        .into_iter()
+        .map(|record| {
             let (kind, status_original_path) = status_by_path
-                .get(&path)
+                .get(record.path)
                 .cloned()
                 .unwrap_or((GitChangeKind::Modified, None));
-            Some(GitCommitFileChange {
-                path,
-                original_path: original_path.or(status_original_path),
+            GitCommitFileChange {
+                path: record.path.to_string(),
+                original_path: record
+                    .original_path
+                    .map(str::to_string)
+                    .or(status_original_path),
                 kind,
-                additions: parse_numstat_count(parts[0]),
-                deletions: parse_numstat_count(parts[1]),
-            })
+                additions: parse_numstat_count(record.additions),
+                deletions: parse_numstat_count(record.deletions),
+            }
         })
         .collect()
 }
@@ -3039,6 +3070,88 @@ mod tests {
         assert!(paths.contains(&"b c.txt"));
         assert!(!paths.iter().any(|path| path.contains('"')));
         assert!(!paths.iter().any(|path| path.ends_with('/')));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_keeps_line_counts_for_every_changed_file() {
+        let root = temp_repo("status-line-counts");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "a.txt", &numbered_lines(20), "initial");
+        for file in ["b.txt", "c.txt", "d.txt"] {
+            std::fs::write(root.join(file), "1\n2\n3\n").unwrap();
+        }
+        run_raw(&root, &["add", "-A"]).unwrap();
+        run_raw(&root, &["commit", "-m", "seed"]).unwrap();
+
+        // Four modified files in a row: a parser that drops every other
+        // numstat record leaves half of them at +0 -0.
+        std::fs::write(root.join("a.txt"), numbered_lines_edited(20, 10)).unwrap();
+        std::fs::write(root.join("b.txt"), "1\n2\n3\n4\n").unwrap();
+        std::fs::write(root.join("c.txt"), "1\nchanged\n3\n").unwrap();
+        std::fs::write(root.join("d.txt"), "1\n2\n3\n4\n").unwrap();
+
+        let summary = status(WorkspaceId::new(), &root).unwrap();
+        let counts = |summary: &GitStatusSummary, path: &str| {
+            let change = summary
+                .changes
+                .iter()
+                .find(|change| change.path == path)
+                .unwrap_or_else(|| panic!("{path} is reported by git status"));
+            (change.additions, change.deletions)
+        };
+        assert_eq!(counts(&summary, "a.txt"), (1, 1));
+        assert_eq!(counts(&summary, "b.txt"), (1, 0));
+        assert_eq!(counts(&summary, "c.txt"), (1, 1));
+        assert_eq!(counts(&summary, "d.txt"), (1, 0));
+
+        // Stage everything, then rename a nearly identical file so git
+        // reports it as a rename: its counts belong to the destination path.
+        run_raw(&root, &["add", "-A"]).unwrap();
+        run_raw(&root, &["mv", "a.txt", "renamed.txt"]).unwrap();
+
+        let summary = status(WorkspaceId::new(), &root).unwrap();
+        let renamed = summary
+            .changes
+            .iter()
+            .find(|change| change.path == "renamed.txt")
+            .expect("renamed file is reported");
+        assert_eq!(renamed.kind, GitChangeKind::Renamed);
+        assert_eq!(renamed.original_path.as_deref(), Some("a.txt"));
+        assert_eq!((renamed.additions, renamed.deletions), (1, 1));
+        assert_eq!(counts(&summary, "b.txt"), (1, 0));
+        assert_eq!(counts(&summary, "c.txt"), (1, 1));
+        assert_eq!(counts(&summary, "d.txt"), (1, 0));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_detail_reports_renamed_files_with_counts() {
+        let root = temp_repo("commit-detail-rename");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo_with_commit(&root, "old_name.txt", &numbered_lines(20), "base");
+        run_raw(&root, &["mv", "old_name.txt", "new_name.txt"]).unwrap();
+        std::fs::write(root.join("new_name.txt"), numbered_lines_edited(20, 10)).unwrap();
+        run_raw(&root, &["add", "-A"]).unwrap();
+        run_raw(&root, &["commit", "-m", "rename"]).unwrap();
+
+        let detail = commit_detail(
+            &root,
+            &GitCommitDetailRequest {
+                workspace_id: WorkspaceId::new(),
+                commit_hash: resolve_head(&root).unwrap(),
+                include_patch: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(detail.files.len(), 1);
+        let file = &detail.files[0];
+        assert_eq!(file.path, "new_name.txt");
+        assert_eq!(file.original_path.as_deref(), Some("old_name.txt"));
+        assert_eq!(file.kind, GitChangeKind::Renamed);
+        assert_eq!((file.additions, file.deletions), (1, 1));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4193,6 +4306,22 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn numbered_lines(count: usize) -> String {
+        (1..=count).map(|line| format!("line {line}\n")).collect()
+    }
+
+    fn numbered_lines_edited(count: usize, edited: usize) -> String {
+        (1..=count)
+            .map(|line| {
+                if line == edited {
+                    format!("line {line} changed\n")
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect()
     }
 
     fn init_repo_with_commit(root: &Path, file: &str, content: &str, message: &str) {

@@ -1838,9 +1838,7 @@ mod tests {
             error_future()
         }
 
-        fn market_sources(
-            &self,
-        ) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
+        fn market_sources(&self) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
             error_future()
         }
 

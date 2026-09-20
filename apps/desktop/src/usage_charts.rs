@@ -12,6 +12,7 @@ use gpui::{
     AnyElement, App, Bounds, Corners, ElementId, Hsla, IntoElement, Pixels, Point, SharedString,
     TextAlign, Window, point, px, size,
 };
+use gpui_base::{Spring, spring};
 use gpui_component::{
     ActiveTheme as _,
     plot::{
@@ -19,7 +20,7 @@ use gpui_component::{
         label::TEXT_GAP,
         scale::{Scale, ScaleBand, ScaleLinear},
         shape::{Bar, Stack, StackSeries},
-        tooltip::{CrossLine, Tooltip, TooltipState},
+        tooltip::{CrossLine, PlotHover, Tooltip, TooltipState},
     },
 };
 
@@ -37,6 +38,45 @@ const MIN_TOKEN_AXIS_MAXIMUM: u64 = 1_000;
 /// Hairline radius shared by every column segment, matching the rest of the
 /// workbench's data marks.
 const SEGMENT_RADIUS: f32 = 1.0;
+
+/// Where a chart's hover highlight is this frame.
+///
+/// `center` is the x the highlight band has reached, which trails the hovered
+/// column while it travels. The band's fade is not tracked here: the tooltip
+/// that draws it already reads the hover's focus from the plot's own hover
+/// memory, so it eases in and out without being handed the value.
+#[derive(Clone, Copy)]
+struct ChartHover {
+    center: Pixels,
+}
+
+/// The spring a chart's highlight band follows the hovered column with.
+///
+/// The kit's own pointer spring: the fast motion tier as a critically damped
+/// response, with a sub-pixel tolerance so the band rests once nothing visible
+/// moves. `gpui-base` adopts the target without animating when the system asks
+/// for reduced motion, so this needs no separate guard.
+fn pointer_spring(cx: &App) -> Spring {
+    Spring::new(cx.theme().motion_tokens().duration_fast).with_epsilon(0.1)
+}
+
+/// Sample the highlight band's position for one hovered column.
+///
+/// `id` keys the spring within the plot's element scope. The first hovered
+/// frame adopts the column instead of travelling from wherever the last hover
+/// ended, which is what keeps a re-entry from sweeping the band across the
+/// chart.
+fn track_hover_band(
+    id: (&'static str, &'static str),
+    hover: &PlotHover,
+    window: &mut Window,
+    cx: &mut App,
+) -> ChartHover {
+    let policy = pointer_spring(cx).with_travel(!hover.is_entering());
+    ChartHover {
+        center: spring(id, hover.state().cross_line.x, policy, window, cx),
+    }
+}
 
 /// One column of the trend chart: its band label plus one value slot per
 /// enabled series. `None` marks a metric the adapters did not report for this
@@ -84,6 +124,8 @@ pub(crate) struct TrendChart {
     series: Vec<TrendChartSeries>,
     stacked: Vec<StackSeries<TrendChartBucket>>,
     axis_maximum: u64,
+    /// The highlight band's position this frame, sampled by `Plot::hover`.
+    hover: Option<ChartHover>,
 }
 
 impl TrendChart {
@@ -112,6 +154,7 @@ impl TrendChart {
             series,
             stacked,
             axis_maximum: nice_axis_upper(stack_maximum, MIN_TOKEN_AXIS_MAXIMUM),
+            hover: None,
         }
     }
 
@@ -250,6 +293,11 @@ impl Plot for TrendChart {
         Some("usage-trend-chart".into())
     }
 
+    fn hover(&mut self, hover: Option<&PlotHover>, window: &mut Window, cx: &mut App) {
+        self.hover =
+            hover.map(|hover| track_hover_band(("usage-trend-chart", "band"), hover, window, cx));
+    }
+
     fn tooltip_state(
         &self,
         position: Point<Pixels>,
@@ -290,10 +338,16 @@ impl Plot for TrendChart {
             band_width,
             ..
         } = self.layout(bounds);
+        // The band is centered where the hover spring has reached rather than
+        // snapped to the column, so it slides between buckets instead of
+        // jumping. Before the first sample it stays on the hovered column.
+        let center = self.hover.map_or(state.cross_line, |hover| {
+            point(hover.center, state.cross_line.y)
+        });
         let mut tooltip = Tooltip::new(cursor, bounds.size)
             .gap(px(8.0))
             .cross_line(
-                CrossLine::new(state.cross_line)
+                CrossLine::new(center)
                     .span(0.0, plot_height)
                     .band(px(band_width)),
             )
@@ -359,6 +413,8 @@ pub(crate) struct ModelChart {
     categories: Vec<ModelChartCategory>,
     stacked: Vec<StackSeries<ModelChartDay>>,
     metric_label: SharedString,
+    /// The highlight band's position this frame, sampled by `Plot::hover`.
+    hover: Option<ChartHover>,
 }
 
 impl ModelChart {
@@ -375,6 +431,7 @@ impl ModelChart {
             categories,
             stacked,
             metric_label: metric_label.into(),
+            hover: None,
         }
     }
 
@@ -480,6 +537,11 @@ impl Plot for ModelChart {
         Some("usage-model-chart".into())
     }
 
+    fn hover(&mut self, hover: Option<&PlotHover>, window: &mut Window, cx: &mut App) {
+        self.hover =
+            hover.map(|hover| track_hover_band(("usage-model-chart", "band"), hover, window, cx));
+    }
+
     fn tooltip_state(
         &self,
         position: Point<Pixels>,
@@ -518,10 +580,14 @@ impl Plot for ModelChart {
             band_width,
             ..
         } = self.layout(bounds);
+        // The band follows the hover spring, as on the trend chart.
+        let center = self.hover.map_or(state.cross_line, |hover| {
+            point(hover.center, state.cross_line.y)
+        });
         let mut tooltip = Tooltip::new(cursor, bounds.size)
             .gap(px(8.0))
             .cross_line(
-                CrossLine::new(state.cross_line)
+                CrossLine::new(center)
                     .span(0.0, plot_height)
                     .band(px(band_width)),
             )

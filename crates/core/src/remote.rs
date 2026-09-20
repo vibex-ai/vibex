@@ -49,6 +49,13 @@ use crate::ids::{
     AgentAuthContextId, AgentRuntimeProbeId, CorrelationId, DeviceId, EventId, RequestId,
     RuntimeProcessId, TerminalId, VibexSessionId,
 };
+use crate::market::{
+    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
+    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse,
+};
 use crate::provider::{
     AcpProviderCatalogListResponse, AcpProviderConfig, AcpProviderProfileUpdateRequest,
     AgentModelProviderProfile, AgentModelProviderProfileCreateRequest,
@@ -73,12 +80,6 @@ use crate::provider::{
     SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
     SkillDiscoverRequest, SkillDiscoveryResponse, SkillImportRequest, SkillImportResult,
     SkillSetAgentMatrixRequest, SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
-};
-use crate::market::{
-    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
-    McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest, McpMarketSearchResponse,
-    SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketInstallRequest,
-    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse,
 };
 use crate::provider_projection::{
     AgentModelProviderBinding, AgentProviderProjectionCapability,

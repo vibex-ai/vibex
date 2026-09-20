@@ -5,15 +5,15 @@ repository does not maintain copied, patched, or shimmed third-party source tree
 beyond two reviewed exceptions: the small first-party `gpui-tokio` bridge and the
 vendored Android IME host.
 
-## Scenario: Published gpui-pre With A Git-Pinned gpui-kit Family
+## Scenario: Published gpui-pre And gpui-kit With A Git-Pinned gpui-pre-mobile
 
 ### 1. Scope / Trigger
 
 - Trigger: changing `Cargo.lock`, bumping the `gpui-pre` family, bumping the
-  pinned gpui-kit family, bumping `gpui-pre-mobile`, or changing a third-party
+  gpui-kit family, bumping `gpui-pre-mobile`, or changing a third-party
   license decision.
 - GPUI arrives from three sources: the published `gpui-pre` family on crates.io
-  (zed snapshots), the gpui-kit crates pinned to a Git revision, and
+  (zed snapshots), the published gpui-kit crates on crates.io, and
   `gpui-pre-mobile` pinned to a Git revision for the Android/iOS platform layer.
   Glue with no published equivalent lives in this workspace.
 
@@ -25,9 +25,10 @@ vendored Android IME host.
 gpui = { package = "gpui-pre", version = "=0.3.5" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
-gpui-fps = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
-gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "<pinned-gpui-kit-rev>" }
+gpui-component = "0.6.4"
+gpui-fps = "0.6.4"
+gpui-kit-assets = "0.6.4"
+gpui-base = "0.6.4"
 ```
 
 ```toml
@@ -62,11 +63,21 @@ pnpm check:mobile-native              native mobile crate and project contract
 - The vendored Android IME host is the only copied third-party source tree. Its
   Java package (`dev.gpui.mobile`) and class names are referenced by
   `#[no_mangle]` JNI exports, so renaming or relocating it breaks the keyboard.
-- The gpui-kit family is pinned to a Git revision so unreleased component work is
-  usable without waiting for crates.io. Do not vendor or patch it locally.
-- Reproducibility is the combination of the crates.io pins, the two Git revision
-  pins, and the root `Cargo.lock`. A bump reviews and commits the lockfile and the
+- The gpui-kit family resolves from crates.io on caret requirements, so a patch
+  release is picked up by `cargo update` within the reviewed lockfile. Move a
+  pin only with a reviewed dependency-source change; do not vendor or patch the
+  family locally. `gpui-base` is a direct dependency because `Plot::hover`
+  implementations sample its motion layer (`Spring`, `spring`), which
+  `gpui-component` does not re-export; it must resolve to the same version the
+  component crate uses, or their shared types would not unify.
+- Reproducibility is the combination of the crates.io pins, the one Git revision
+  pin, and the root `Cargo.lock`. A bump reviews and commits the lockfile and the
   regenerated license outputs together.
+- A gpui-kit bump is not complete until the kit surfaces Vibex bridges are
+  re-verified: `crates/vibex-ui`'s `component_palette` test fails when the kit
+  adds or removes a color token the bridge does not map, and
+  `scripts/check-mobile-native.mjs` carries the reviewed `gpui-pre-mobile`
+  revision, so both move in the same change as the manifest.
 - No other tracked `vendor/` tree, Git submodule, local third-party path patch,
   compatibility shim, or copied upstream source is approved.
 - Use crates.io packages unmodified unless the user explicitly approves a new
@@ -82,7 +93,10 @@ pnpm check:mobile-native              native mobile crate and project contract
 | --- | --- |
 | A `[patch.crates-io]` entry redirects `gpui-pre*` to a path | Reject the change: the tree must not carry a renamed GPUI fork. |
 | `cargo metadata` resolves two `gpui-pre` versions | Reject: every GPUI consumer must share one version. |
+| `gpui-base` resolves to a different version than `gpui-component` | Reject: the motion types a `Plot::hover` implementation passes would not unify with the kit's. |
 | `apps/mobile` resolves a `vendor/zed` path dependency | `pnpm check:mobile-native` fails. |
+| The `gpui-pre-mobile` revision in `apps/mobile/Cargo.toml` moves without `scripts/check-mobile-native.mjs` | `pnpm check:mobile-native` fails; the reviewed revision and the checker move together. |
+| A gpui-kit bump adds or removes a color token the palette bridge does not map | `cargo test -p vibex-ui` fails on `the_bridge_covers_every_framework_token`. |
 | The vendored `GpuiInputActivity` package or class name changes | `pnpm check:mobile-native` fails; the JNI export would no longer match. |
 | An unapproved or missing SPDX selection enters the graph | `pnpm check:licenses` fails; do not silently broaden the policy. |
 | A font or icon asset moves between trees | Update the policy `assetInputs`/`fontInputs` count and tree hash in the same change. |
@@ -90,11 +104,11 @@ pnpm check:mobile-native              native mobile crate and project contract
 
 ### 5. Good / Base / Bad Cases
 
-- Good: bump `gpui-pre` to a published version, regenerate `Cargo.lock`, review the
-  resolved graph, regenerate licenses, then run `pnpm check:rust`,
+- Good: bump the gpui-kit family to a published version, regenerate `Cargo.lock`,
+  review the resolved graph, regenerate licenses, then run `pnpm check:rust`,
   `pnpm check:mobile-native`, and `pnpm check:licenses`.
 - Base: ordinary development uses `--locked`; neither the crates.io pins nor the
-  Git revision pins move automatically.
+  Git revision pin move automatically.
 - Base: a non-GPUI dependency changes the root lock without moving any pin; no
   source-policy review is needed.
 - Bad: fork zed again and publish it under the `gpui-pre` name so the version
@@ -109,6 +123,8 @@ pnpm check:mobile-native              native mobile crate and project contract
   one `gpui-pre` version in the graph.
 - `pnpm check:mobile-native` verifies the mobile manifest pins, the platform
   facade, and the vendored IME host.
+- `cargo test -p vibex-ui` proves the palette bridge still covers every color
+  token the resolved gpui-kit version defines.
 - `pnpm check:rust` accepts an empty reviewed future-incompatibility allowlist and
   rejects every unlisted package or stale exception.
 - `pnpm check:licenses` verifies asset/font provenance, the SBOM, the full Cargo
@@ -131,6 +147,7 @@ This reintroduces a renamed GPUI fork and a vendored component tree.
 ```toml
 gpui = { package = "gpui-pre", version = "=0.3.5" }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
+gpui-component = "0.6.4"
 ```
 
 ## Scenario: Redistributed Native Runtime With A Bounded Package Transform

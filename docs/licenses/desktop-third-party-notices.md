@@ -308,11 +308,11 @@ This inventory records source and license provenance. The corresponding license 
 | gpu-allocator | 0.28.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | gpu-descriptor | 0.3.2 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | gpu-descriptor-types | 0.2.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| gpui-base | 0.6.1 | git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135 | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-component | 0.6.1 | git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135 | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-component-macros | 0.6.1 | git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135 | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-fps | 0.6.1 | git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135 | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-kit-assets | 0.6.1 | git+https://github.com/longbridge/gpui-kit?rev=fb26e617da3add2ce2ac92a2ccc1a64bc8343135#fb26e617da3add2ce2ac92a2ccc1a64bc8343135 | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-base | 0.6.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-component | 0.6.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-component-macros | 0.6.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-fps | 0.6.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
+| gpui-kit-assets | 0.6.4 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre | 0.3.5 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-apple | 0.3.5 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-collections | 0.3.5 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
