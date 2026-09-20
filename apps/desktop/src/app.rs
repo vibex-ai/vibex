@@ -20207,7 +20207,7 @@ impl VibexWorkbench {
         let options = WindowOptions {
             window_bounds: Some(window_bounds),
             titlebar: Some(TitlebarOptions {
-                title: Some(locale::text("Preview", "预览", "預覽").into()),
+                title: Some(locale::text("Editor", "编辑器", "編輯器").into()),
                 ..Default::default()
             }),
             app_id: release_application_id().ok().map(str::to_string),
@@ -69963,9 +69963,7 @@ mod tests {
             *input_slot_for_view.borrow_mut() = Some(input.clone());
             let probe = cx.new(|_| ComposerTokenGeometryProbe {
                 input,
-                // Wide enough that the sample line cannot wrap, whatever font
-                // the test machine resolves, so one chip means one token.
-                width: px(640.0),
+                width: px(360.0),
             });
             gpui_component::Root::new(probe, window, cx)
         });

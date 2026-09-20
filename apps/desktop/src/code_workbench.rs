@@ -7744,6 +7744,7 @@ impl CodeWorkbench {
                 .clone();
             let view_scroll = scroll.clone();
             let markdown_entity = cx.weak_entity();
+            let locate_path = path.clone();
             let markdown_view =
                 MarkdownView::from_document(format!("markdown-preview:{path}"), document)
                     .images(images)
@@ -7774,36 +7775,41 @@ impl CodeWorkbench {
                                 .flex_1()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_medium()
-                                        .child(
-                                            Path::new(&path)
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .unwrap_or(path.as_str())
-                                                .to_string(),
-                                        ),
+                                    div().min_w_0().truncate().text_xs().font_medium().child(
+                                        Path::new(&path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or(path.as_str())
+                                            .to_string(),
+                                    ),
                                 )
                                 .child(preview_badge(locale::text("Preview", "预览", "預覽"), cx)),
                         )
                         .child(
-                            Button::new(format!("edit-markdown:{path}"))
-                                .small()
-                                .ghost()
-                                .compact()
-                                .icon(Icon::default().path("icons/vibex/pencil.svg"))
-                                .tooltip(locale::text(
-                                    "Edit Markdown source",
-                                    "编辑 Markdown 源文件",
-                                    "編輯 Markdown 原始檔",
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_markdown_source(edit_path.clone(), cx)
-                                })),
+                            h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new(format!("edit-markdown:{path}"))
+                                        .small()
+                                        .ghost()
+                                        .compact()
+                                        .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                        .tooltip(locale::text(
+                                            "Edit Markdown source",
+                                            "编辑 Markdown 源文件",
+                                            "編輯 Markdown 原始檔",
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_markdown_source(edit_path.clone(), cx)
+                                        })),
+                                )
+                                .child(reveal_in_files_button(
+                                    format!("markdown-reveal:{path}"),
+                                    locate_path,
+                                    cx,
+                                )),
                         ),
                 )
                 .when(!workspace_links.is_empty(), |this| {
@@ -7850,6 +7856,7 @@ impl CodeWorkbench {
             let buffer = self.editors.buffers.get(&path).cloned();
             let save_path = path.clone();
             let markdown_path = path.clone();
+            let reveal_path = path.clone();
             let editable = buffer.as_ref().is_some_and(|buffer| buffer.editable());
             let dirty = buffer.as_ref().is_some_and(|buffer| buffer.dirty);
             let pending_save = buffer
@@ -8077,7 +8084,12 @@ impl CodeWorkbench {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let _ = this.save_editor(save_path.clone(), cx);
                                         })),
-                                ),
+                                )
+                                .child(reveal_in_files_button(
+                                    format!("editor-reveal:{path}"),
+                                    reveal_path,
+                                    cx,
+                                )),
                         ),
                 )
                 .child(
@@ -8314,6 +8326,8 @@ impl CodeWorkbench {
             .to_string();
         let edit_path = path.clone();
         let edit_tab_id = tab_id.to_string();
+        let locate_path = path.clone();
+        let locate_tab_id = tab_id.to_string();
         v_flex()
             .size_full()
             .min_h_0()
@@ -8334,12 +8348,31 @@ impl CodeWorkbench {
                             .min_w_0()
                             .flex_1()
                             .child(
-                                div()
+                                // The staged/unstaged badge names the document,
+                                // so it reads with the title on the information
+                                // side; the action side stays buttons only.
+                                h_flex()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(title),
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .child(title),
+                                    )
+                                    .child(preview_badge(
+                                        if key.staged {
+                                            locale::text("staged", "已暂存", "已暫存")
+                                        } else {
+                                            locale::text("unstaged", "未暂存", "未暫存")
+                                        },
+                                        cx,
+                                    ))
+                                    .when(truncated, |this| {
+                                        this.child(preview_destructive_badge("truncated", cx))
+                                    }),
                             )
                             .child(
                                 div()
@@ -8373,17 +8406,11 @@ impl CodeWorkbench {
                                         this.open_file(edit_path.clone(), false, window, cx)
                                     })),
                             )
-                            .child(preview_badge(
-                                if key.staged {
-                                    locale::text("staged", "已暂存", "已暫存")
-                                } else {
-                                    locale::text("unstaged", "未暂存", "未暫存")
-                                },
+                            .child(reveal_in_files_button(
+                                format!("git-diff-reveal:{locate_tab_id}"),
+                                locate_path,
                                 cx,
-                            ))
-                            .when(truncated, |this| {
-                                this.child(preview_destructive_badge("truncated", cx))
-                            }),
+                            )),
                     ),
             )
             .child(
@@ -8480,17 +8507,17 @@ impl CodeWorkbench {
             )
         };
         // `git show --pretty=%B` returns the whole message, so its first line
-        // repeats the subject the header already draws. Drop it, or the
-        // three-line preview would spend a third of its budget on a duplicate.
+        // repeats the subject the header already draws. Drop it, or the body
+        // would open on a duplicate of the title above it.
         let body_lines = detail
             .body
             .as_deref()
             .filter(|body| !body.is_empty())
             .map(|body| commit_body_content_lines(body, &detail.summary.subject))
             .unwrap_or_default();
-        let body_can_expand = commit_body_can_expand(&body_lines);
+        // The message body starts folded: the header already carries the
+        // subject, and the diff is what the tab is for.
         let body_expanded = self.commit_body_expanded.contains(&hash);
-        let body_preview_lines = commit_body_preview_lines(&body_lines, body_expanded);
         let body_toggle_hash = hash.clone();
         let body_key_hash = hash.clone();
         let file_count_label = commit_file_count_label(detail.files.len());
@@ -8549,78 +8576,65 @@ impl CodeWorkbench {
                                 .mt_2()
                                 .min_w_0()
                                 .gap_1()
-                                .when(body_can_expand, |this| {
-                                    this.cursor_pointer()
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .role(Role::Button)
-                                        .aria_expanded(body_expanded)
-                                        .aria_label(locale::text(
-                                            "Commit message",
-                                            "提交信息",
-                                            "提交資訊",
-                                        ))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.toggle_commit_body(&body_toggle_hash, cx);
-                                        }))
-                                        .on_key_down(cx.listener(
-                                            move |this, event: &KeyDownEvent, _, cx| {
-                                                if event.keystroke.key != "enter"
-                                                    && event.keystroke.key != "space"
-                                                {
-                                                    return;
-                                                }
-                                                this.toggle_commit_body(&body_key_hash, cx);
-                                                cx.stop_propagation();
-                                            },
-                                        ))
+                                .cursor_pointer()
+                                .focusable()
+                                .tab_stop(true)
+                                .role(Role::Button)
+                                .aria_expanded(body_expanded)
+                                .aria_label(locale::text("Commit message", "提交信息", "提交資訊"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_commit_body(&body_toggle_hash, cx);
+                                }))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, _, cx| {
+                                        if event.keystroke.key != "enter"
+                                            && event.keystroke.key != "space"
+                                        {
+                                            return;
+                                        }
+                                        this.toggle_commit_body(&body_key_hash, cx);
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                                .when(body_expanded, |this| {
+                                    this.child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_normal()
+                                            .line_height(gpui::relative(1.5))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .children(body_lines.into_iter().map(|line| {
+                                                div().min_w_0().whitespace_normal().child(
+                                                    if line.is_empty() {
+                                                        " ".to_string()
+                                                    } else {
+                                                        line
+                                                    },
+                                                )
+                                            })),
+                                    )
                                 })
                                 .child(
-                                    div()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_normal()
-                                        // The projection drops logical lines
-                                        // past the third; the cap is what
-                                        // clips a single long line that wraps
-                                        // to more rendered rows than that.
-                                        .when(!body_expanded, |this| {
-                                            this.max_h(commit_body_preview_max_height())
-                                        })
-                                        .line_height(gpui::relative(1.5))
+                                    h_flex()
+                                        .gap_1()
                                         .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .children(body_preview_lines.into_iter().map(|line| {
-                                            div().min_w_0().whitespace_normal().child(
-                                                if line.is_empty() {
-                                                    " ".to_string()
-                                                } else {
-                                                    line
-                                                },
-                                            )
-                                        })),
-                                )
-                                .when(body_can_expand, |this| {
-                                    this.child(
-                                        h_flex()
-                                            .gap_1()
-                                            .text_xs()
-                                            .text_color(cx.theme().primary)
-                                            .child(
-                                                Icon::new(if body_expanded {
-                                                    IconName::ChevronUp
-                                                } else {
-                                                    IconName::ChevronDown
-                                                })
-                                                .size(px(12.0)),
-                                            )
-                                            .child(if body_expanded {
-                                                locale::text("Collapse", "收起", "收起")
+                                        .text_color(cx.theme().primary)
+                                        .child(
+                                            Icon::new(if body_expanded {
+                                                IconName::ChevronUp
                                             } else {
-                                                locale::text("Expand", "展开", "展開")
-                                            }),
-                                    )
-                                }),
+                                                IconName::ChevronDown
+                                            })
+                                            .size(px(12.0)),
+                                        )
+                                        .child(if body_expanded {
+                                            locale::text("Collapse", "收起", "收起")
+                                        } else {
+                                            locale::text("Expand", "展开", "展開")
+                                        }),
+                                ),
                         )
                     })
                     .child(
@@ -8994,7 +9008,7 @@ impl Render for CodeWorkbench {
                             .truncate()
                             .text_sm()
                             .font_medium()
-                            .child(locale::text("Preview", "预览", "預覽")),
+                            .child(locale::text("Editor", "编辑器", "編輯器")),
                     )
                     .child(
                         h_flex()
@@ -15664,6 +15678,33 @@ fn format_editor_bytes(bytes: u64) -> String {
     }
 }
 
+/// The "locate the file" control every preview header carries on its action
+/// side: it opens the right rail on the selected session's Files tree and
+/// selects the path there.
+fn reveal_in_files_button(id: String, path: String, cx: &Context<CodeWorkbench>) -> AnyElement {
+    Button::new(id)
+        .small()
+        .ghost()
+        .compact()
+        .w(px(20.0))
+        .h(px(20.0))
+        .p_0()
+        .tooltip(locale::text("Reveal in Files", "定位文件", "定位檔案"))
+        .child(
+            Icon::default()
+                .path("icons/vibex/crosshair.svg")
+                .size(px(14.0)),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.reveal_file_in_right_rail(path.clone(), cx);
+            // The control sits inside rows that carry their own click target
+            // (the commit file header toggles its patch), so a locate click
+            // must not also flip that row.
+            cx.stop_propagation();
+        }))
+        .into_any_element()
+}
+
 fn preview_badge(label: impl Into<SharedString>, cx: &Context<CodeWorkbench>) -> AnyElement {
     h_flex()
         .h(px(20.0))
@@ -15711,16 +15752,6 @@ fn render_truncated_alert(truncated: bool, _cx: &Context<CodeWorkbench>) -> AnyE
     .into_any_element()
 }
 
-/// The commit header keeps a three-line summary of the message body; a long
-/// body otherwise fills the pane before the patch starts.
-const COMMIT_BODY_COLLAPSED_LINES: usize = 3;
-/// A body line longer than this is expected to wrap at ordinary preview
-/// widths, so the collapsed preview is worth offering even for short bodies.
-const COMMIT_BODY_LONG_LINE_CHARS: usize = 96;
-/// The body renders at `text_xs` (0.75rem) with a 1.5 line height, so one
-/// rendered row is 1.125rem tall.
-const COMMIT_BODY_FONT_REMS: f32 = 0.75;
-const COMMIT_BODY_LINE_HEIGHT: f32 = 1.5;
 /// File rows carry a click target and a disclosure chevron, so they stand
 /// taller than a diff line.
 const COMMIT_FILE_ROW_HEIGHT: f32 = 36.0;
@@ -15728,26 +15759,9 @@ const COMMIT_FILE_ROW_HEIGHT: f32 = 36.0;
 /// additions and deletions are readable while scanning the gutter.
 const DIFF_CHANGE_RAIL_WIDTH: f32 = 3.0;
 
-/// The logical lines the header renders for the body: everything when the
-/// reader expanded it, otherwise the leading lines of the summary.
-///
-/// The projection is explicit because gpui's `line_clamp` gives every
-/// newline-separated line its own budget, so a commit body — which is one
-/// logical line per paragraph — would render in full under a clamp.
-fn commit_body_preview_lines(body_lines: &[String], expanded: bool) -> Vec<String> {
-    if expanded {
-        return body_lines.to_vec();
-    }
-    body_lines
-        .iter()
-        .take(COMMIT_BODY_COLLAPSED_LINES)
-        .cloned()
-        .collect()
-}
-
 /// The body lines worth drawing: the message without its subject line and
-/// without the blank separator git leaves between the two. A preview that
-/// opened on a blank line would spend a third of its budget on nothing.
+/// without the blank separator git leaves between the two. A folded body that
+/// opened on a blank line would waste its first row on nothing.
 fn commit_body_content_lines(body: &str, subject: &str) -> Vec<String> {
     let subject = subject.trim();
     body.split('\n')
@@ -15755,25 +15769,6 @@ fn commit_body_content_lines(body: &str, subject: &str) -> Vec<String> {
         .skip_while(|line| line.trim() == subject)
         .skip_while(|line| line.trim().is_empty())
         .collect()
-}
-
-/// The collapsed body's height cap, in rems so accessibility text scaling
-/// keeps working. The projection drops logical lines past the third; this cap
-/// is what clips one soft-wrapped line to the same three rendered rows.
-fn commit_body_preview_max_height() -> gpui::Rems {
-    gpui::rems(COMMIT_BODY_FONT_REMS * COMMIT_BODY_LINE_HEIGHT * COMMIT_BODY_COLLAPSED_LINES as f32)
-}
-
-/// Whether the collapsed three-line body would hide anything.
-///
-/// A long logical line may also wrap past three rendered rows, which the cap
-/// clips without the projection dropping a line, so a line past the wrap
-/// threshold counts as hidden content too.
-fn commit_body_can_expand(body_lines: &[String]) -> bool {
-    body_lines.len() > COMMIT_BODY_COLLAPSED_LINES
-        || body_lines
-            .iter()
-            .any(|line| line.chars().count() > COMMIT_BODY_LONG_LINE_CHARS)
 }
 
 fn commit_file_count_label(file_count: usize) -> String {
@@ -15859,6 +15854,7 @@ fn render_commit_patch_row(
             let click_path = path.clone();
             let key_hash = hash.clone();
             let key_path = path.clone();
+            let reveal_path = path.clone();
             h_flex()
                 .id(format!("commit-file:{hash}:{file_index}"))
                 .h(px(file_row_height))
@@ -15916,20 +15912,31 @@ fn render_commit_patch_row(
                 .child(
                     h_flex()
                         .flex_none()
+                        .items_center()
                         .gap_2()
-                        .font_family(code_font_family)
-                        .text_size(cx.theme().mono_font_size)
-                        .font_weight(code_font_weight(cx))
                         .child(
-                            div()
-                                .text_color(cx.theme().success)
-                                .child(format!("+{additions}")),
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .font_family(code_font_family)
+                                .text_size(cx.theme().mono_font_size)
+                                .font_weight(code_font_weight(cx))
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().success)
+                                        .child(format!("+{additions}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().danger)
+                                        .child(format!("-{deletions}")),
+                                ),
                         )
-                        .child(
-                            div()
-                                .text_color(cx.theme().danger)
-                                .child(format!("-{deletions}")),
-                        ),
+                        .child(reveal_in_files_button(
+                            format!("commit-file-reveal:{hash}:{file_index}"),
+                            reveal_path,
+                            cx,
+                        )),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.git.toggle_commit_file(&click_hash, &click_path) {
@@ -17890,29 +17897,134 @@ mod tests {
         assert!(header.contains("toggle_commit_wrap_lines"));
         assert!(header.contains("toggle_all_commit_files"));
 
-        // The message body is a three-line summary until the reader expands it.
-        // The projection is explicit because gpui's `line_clamp` budgets each
-        // newline-separated line separately, which would render the body whole.
-        assert!(header.contains("commit_body_can_expand(&body_lines)"));
-        assert!(header.contains("commit_body_preview_lines(&body_lines, body_expanded)"));
-        assert!(header.contains("max_h(commit_body_preview_max_height())"));
+        // The message body starts folded; the toggle that opens it is always
+        // offered for a commit that carries a body.
+        assert!(header.contains(".when(!body_lines.is_empty(), |this| {"));
+        assert!(header.contains(".when(body_expanded, |this| {"));
+        assert!(header.contains("body_lines.into_iter()"));
+        assert!(!header.contains("commit_body_preview_lines"));
+        assert!(!header.contains("commit_body_preview_max_height"));
         assert!(!header.contains("line_clamp"));
     }
 
     #[test]
-    fn commit_body_preview_shows_three_logical_lines_until_expanded() {
-        let lines = (0..8)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            commit_body_preview_lines(&lines, false),
-            vec!["line 0", "line 1", "line 2"]
-        );
-        assert_eq!(commit_body_preview_lines(&lines, true), lines);
+    fn commit_body_stays_folded_until_the_reader_expands_it() {
+        let source = include_str!("code_workbench.rs");
+        let header = source
+            .split_once("fn render_commit_content")
+            .and_then(|(_, tail)| tail.split_once("fn toggle_commit_body"))
+            .map(|(header, _)| header)
+            .expect("the commit header should remain inspectable");
+        let body = header
+            .split_once(".when(!body_lines.is_empty(), |this| {")
+            .map(|(_, body)| body)
+            .expect("the commit body block should remain inspectable");
 
-        // A body at or under the limit is never clipped in either mode.
-        let short = vec!["one".to_string(), "two".to_string()];
-        assert_eq!(commit_body_preview_lines(&short, false), short);
+        // Every message line renders behind the expansion flag, and the
+        // toggle row that flips it sits outside that gate.
+        let gate = body
+            .find(".when(body_expanded, |this| {")
+            .expect("the body content should be gated on the expansion flag");
+        let lines = body
+            .find("body_lines.into_iter()")
+            .expect("the expanded body should render every logical line");
+        assert!(gate < lines);
+        assert!(body.contains("locale::text(\"Expand\", \"展开\", \"展開\")"));
+        assert!(body.contains("locale::text(\"Collapse\", \"收起\", \"收起\")"));
+    }
+
+    #[test]
+    fn preview_headers_put_status_badges_before_their_action_buttons() {
+        let source = include_str!("code_workbench.rs");
+        let diff = source
+            .split_once("fn render_diff_content(")
+            .and_then(|(_, tail)| tail.split_once("fn render_commit_content("))
+            .map(|(header, _)| header)
+            .expect("the diff header should remain inspectable");
+
+        // The staged/unstaged badge names the document, so it rides the
+        // information side after the title; the action side stays buttons.
+        let title = diff
+            .find(".child(title),")
+            .expect("the diff header should keep its title");
+        let badge = diff
+            .find("if key.staged {")
+            .expect("the diff header should keep its staged badge");
+        let open = diff
+            .find("Button::new(format!(\"git-diff-edit:")
+            .expect("the diff header should keep its open button");
+        let locate = diff
+            .find("format!(\"git-diff-reveal:")
+            .expect("the diff header should offer a locate button");
+        assert!(title < badge && badge < open && open < locate);
+        assert!(diff.contains("preview_destructive_badge(\"truncated\", cx)"));
+    }
+
+    #[test]
+    fn file_editor_headers_offer_locate_in_the_action_group() {
+        let source = include_str!("code_workbench.rs");
+        let markdown = source
+            .split_once("let markdown_entity = cx.weak_entity();")
+            .and_then(|(_, tail)| {
+                tail.split_once("if let Some(binding) = self.editor_bindings.get(&path).cloned() {")
+            })
+            .map(|(header, _)| header)
+            .expect("the markdown preview header should remain inspectable");
+        let badge = markdown
+            .find("preview_badge(locale::text(\"Preview\", \"预览\", \"預覽\"), cx)")
+            .expect("the markdown header should keep its preview badge");
+        let edit = markdown
+            .find("format!(\"edit-markdown:{path}\")")
+            .expect("the markdown header should keep its edit button");
+        let locate = markdown
+            .find("format!(\"markdown-reveal:{path}\")")
+            .expect("the markdown header should offer a locate button");
+        assert!(badge < edit && edit < locate);
+        // The badge hugs the file name instead of being pushed to the far end
+        // of the information side by a stretched name.
+        let name = markdown
+            .split_once(".font_medium()")
+            .and_then(|(head, _)| head.rsplit_once(".child("))
+            .map(|(_, name)| name)
+            .expect("the markdown file name should remain inspectable");
+        assert!(!name.contains(".flex_1()"));
+
+        let editor = source
+            .split_once("if let Some(binding) = self.editor_bindings.get(&path).cloned() {")
+            .and_then(|(_, tail)| tail.split_once("match self.presentations.get(&path)"))
+            .map(|(header, _)| header)
+            .expect("the editor header should remain inspectable");
+        let save = editor
+            .find("format!(\"save-editor:{path}\")")
+            .expect("the editor should keep its save button");
+        let locate = editor
+            .find("format!(\"editor-reveal:{path}\")")
+            .expect("the editor should offer a locate button");
+        assert!(save < locate);
+    }
+
+    #[test]
+    fn commit_file_rows_offer_locate_after_their_line_stats() {
+        let source = include_str!("code_workbench.rs");
+        let row = source
+            .split_once("fn render_commit_patch_row(")
+            .and_then(|(_, tail)| tail.split_once("GitCommitPatchRow::Diff(row)"))
+            .map(|(row, _)| row)
+            .expect("the commit file row should remain inspectable");
+
+        let additions = row
+            .find("format!(\"+{additions}\")")
+            .expect("the row should keep its addition count");
+        let deletions = row
+            .find("format!(\"-{deletions}\")")
+            .expect("the row should keep its deletion count");
+        let locate = row
+            .find("format!(\"commit-file-reveal:{hash}:{file_index}\")")
+            .expect("the row should offer a locate button");
+        assert!(additions < deletions && deletions < locate);
+        // The row toggles its own patch on click, so locating must not also
+        // flip it.
+        assert!(row.contains("cx.stop_propagation()"));
     }
 
     #[test]
@@ -17930,13 +18042,6 @@ mod tests {
             vec!["Just the body."]
         );
         assert!(commit_body_content_lines("only a subject", "only a subject").is_empty());
-    }
-
-    #[test]
-    fn commit_body_collapsed_cap_covers_exactly_three_rendered_rows() {
-        // text_xs is 0.75rem at a 1.5 line height, so three rows are 3.375rem.
-        let cap = commit_body_preview_max_height();
-        assert!((cap.0 - 3.375).abs() < 1e-6, "cap was {}", cap.0);
     }
 
     #[test]
@@ -17961,20 +18066,6 @@ mod tests {
             .map(|(side, _)| side)
             .expect("the split diff side should remain inspectable");
         assert!(split.contains(".child(diff_change_rail(kind, cx))"));
-    }
-
-    #[test]
-    fn commit_body_expands_only_when_the_three_line_summary_would_clip() {
-        let short = vec!["one".to_string(), "two".to_string()];
-        assert!(!commit_body_can_expand(&short));
-
-        let long = (0..4)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>();
-        assert!(commit_body_can_expand(&long));
-
-        let wrapped = vec!["x".repeat(COMMIT_BODY_LONG_LINE_CHARS + 1)];
-        assert!(commit_body_can_expand(&wrapped));
     }
 
     #[test]
