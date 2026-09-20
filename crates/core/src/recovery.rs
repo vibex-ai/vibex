@@ -92,6 +92,35 @@ pub enum BackupRestoreOutcomeStatus {
     RestoredMigrated,
 }
 
+/// Stages an import of the release-candidate channel home into the channel
+/// home that is currently authoritative.
+///
+/// The import is a file-level move inside the authority's own data directory,
+/// so it is offered by the local authority only. It is staged first and applied
+/// by the next runtime start, because a live runtime already holds the
+/// database the import replaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RcImportPayload {
+    /// Empty means "the authority's own RC home next to the active home".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_home: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RcImportOutcome {
+    /// RC home the import was read from, as resolved by the authority.
+    pub source_home: String,
+    /// Schema version the RC database was at when it was staged.
+    pub source_schema_version: i64,
+    /// Schema version the staged copy reached after migration.
+    pub target_schema_version: i64,
+    /// True when the authority must restart before the import is visible:
+    /// staging validates the data but never replaces a live runtime's files.
+    pub restart_required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupRestoreOutcome {

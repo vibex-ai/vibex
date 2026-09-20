@@ -57,8 +57,8 @@ use vibex_core::{
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
     ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderUsageListRequest,
-    ProviderUsageSummary, RemoteAuditListRequest, RemoteAuditRecord,
-    RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
+    ProviderUsageSummary, RcImportOutcome, RcImportPayload, RemoteAuditListRequest,
+    RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemoteProviderManagementSnapshot, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
     ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
@@ -3321,6 +3321,18 @@ impl ManagementBackend for NativeBackend {
             request.validate()?;
             runtime.ensure_accepting_actions()?;
             Ok(runtime.management().backup_restore(request.payload)?)
+        })
+    }
+
+    fn rc_import(
+        &self,
+        request: MutationRequest<RcImportPayload>,
+    ) -> BackendFuture<'_, RcImportOutcome> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.management().rc_import(request.payload)?)
         })
     }
 

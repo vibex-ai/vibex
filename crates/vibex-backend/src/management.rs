@@ -40,17 +40,18 @@ use vibex_core::{
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RelayPeerId,
-    RelayRoomId, RemoteProviderManagementSnapshot, ScheduledTaskAttentionListRequest,
-    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
-    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
-    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix,
-    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
-    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest,
-    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RcImportOutcome,
+    RcImportPayload, RelayPeerId, RelayRoomId, RemoteProviderManagementSnapshot,
+    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
+    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
+    ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
+    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
+    SkillImportRequest, SkillImportResult, SkillSetAgentMatrixRequest, SkillUpdateRequest,
+    SkillValidateRequest, SkillValidationResult,
 };
 
-use crate::{BackendBound, BackendFuture, MutationRequest};
+use crate::{BackendBound, BackendError, BackendFuture, MutationRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +308,25 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: MutationRequest<BackupRestorePayload>,
     ) -> BackendFuture<'_, BackupRestoreOutcome>;
+
+    /// Stages an import of the RC channel home into the active home.
+    ///
+    /// Only the local authority can answer this: the import moves files inside
+    /// the authority's own data directory and must run before the runtime that
+    /// owns them opens its database. A client that reaches the authority over
+    /// the wire inherits the unsupported default below.
+    fn rc_import(
+        &self,
+        request: MutationRequest<RcImportPayload>,
+    ) -> BackendFuture<'_, RcImportOutcome> {
+        let _ = request;
+        Box::pin(async {
+            Err(BackendError::unsupported(
+                "management",
+                "RC data can only be imported by the local authority",
+            ))
+        })
+    }
 
     fn run_capability_probes(
         &self,

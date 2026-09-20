@@ -1920,6 +1920,18 @@ approved deviation ids, in order -> [
   change that identity. Stable GPUI uses the stable app id only from an artifact
   explicitly built with the `stable` channel and the `desktop-stable`
   copied home. The Tauri stable home remains a separate rollback source.
+- Channel isolation means a stable install starts empty; moving RC work forward
+  is an explicit one-time import, never a silent home adoption. The import is
+  staged (`stage_rc_import`) and applied by the next runtime start
+  (`apply_pending_rc_import`), because a live runtime already holds the database
+  being replaced. Staging snapshots the RC database with `VACUUM INTO`, migrates
+  and verifies the snapshot inside the target home, and leaves the target
+  untouched on failure; applying moves the replaced artifacts into a rollback
+  directory and restores them when any step fails. The RC home is never
+  modified or deleted, so its managed worktrees keep resolving. Only the local
+  authority offers the operation (`ManagementBackend::rc_import` defaults to
+  unsupported), and the one-time first-launch prompt is recorded as declined or
+  imported so it is never raised twice.
 - Local package scripts invoke `build-channel.mjs` with the matching
   Preview/RC/Stable argument before the matching `cargo packager` config; do not
   rely on POSIX-only inline env syntax or a previously cached binary. The current

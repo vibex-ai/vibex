@@ -48,8 +48,8 @@ use vibex_core::{
     ProviderNativeImportPreview, ProviderNativeImportPreviewRequest, ProviderProfile,
     ProviderProfileId, ProviderProfileSummary, ProviderRunCapabilityProbesRequest,
     ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary,
-    RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
+    ProviderRunHealthProbesResult, ProviderUsageListRequest, ProviderUsageSummary, RcImportOutcome,
+    RcImportPayload, RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
     RemotePairingOfferSummary, RemoteProviderManagementSnapshot, RemoteRevokeDeviceRequest,
@@ -1134,6 +1134,13 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<BackupRestorePayload>,
     ) -> BackendFuture<'_, BackupRestoreOutcome> {
+        disconnected_future!()
+    }
+
+    fn rc_import(
+        &self,
+        _request: MutationRequest<RcImportPayload>,
+    ) -> BackendFuture<'_, RcImportOutcome> {
         disconnected_future!()
     }
 

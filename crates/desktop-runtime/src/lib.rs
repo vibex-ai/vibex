@@ -12,6 +12,7 @@ mod home_lock;
 mod lan_pairing;
 mod management;
 pub mod network_proxy;
+mod rc_import;
 mod relay;
 mod remote_connectivity;
 mod sidebar_organization;
@@ -93,6 +94,12 @@ pub use lan_pairing::{
 pub use management::{
     BackupProgress, ExternalOpenUrl, ManagementMutationGuard, ProviderManagementFacade,
     validate_external_open_url,
+};
+pub use rc_import::{
+    RC_IMPORT_DIRECTORY, RcImportApply, RcImportPromptDecision, RcImportSource, RcImportStage,
+    apply_pending_rc_import, discard_pending_rc_import, rc_import_pending,
+    rc_import_prompt_answered, rc_import_source, rc_import_source_home,
+    record_rc_import_prompt_decision, stage_rc_import,
 };
 pub use relay::{
     RelayClientConnectionState, RelayClientRuntime, RelayClientSettings, RelayClientSettingsUpdate,
@@ -1954,6 +1961,37 @@ impl ManagementHandle {
         self.home_dir.join(format!("backup-{safe_suffix}"))
     }
 
+    /// Stages an import of this machine's RC home into the active home.
+    ///
+    /// The active home is still serving its own database, so the import is
+    /// validated and staged here and applied by the next runtime start. A
+    /// failure changes nothing: the target keeps its data.
+    pub fn rc_import(
+        &self,
+        payload: vibex_core::RcImportPayload,
+    ) -> VibexResult<vibex_core::RcImportOutcome> {
+        let source_home = match payload.source_home {
+            Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => match self.home_dir.parent() {
+                Some(base_home) => rc_import::rc_import_source_home(base_home),
+                None => {
+                    return Err(VibexError::validation(
+                        "rc_import_base_home_missing",
+                        "the active home has no parent directory to resolve RC data from",
+                    )
+                    .with_diagnostic("homeDir", self.home_dir.display().to_string()));
+                }
+            },
+        };
+        let staged = rc_import::stage_rc_import(&source_home, &self.home_dir)?;
+        Ok(vibex_core::RcImportOutcome {
+            source_home: staged.source_home.display().to_string(),
+            source_schema_version: staged.source_schema_version,
+            target_schema_version: staged.target_schema_version,
+            restart_required: true,
+        })
+    }
+
     pub fn providers(&self) -> ProviderHandle {
         self.providers.clone()
     }
@@ -2150,6 +2188,21 @@ impl DesktopRuntime {
                 Ok(None)
             }
         })?;
+        // A staged RC import replaces this home's database and the artifacts
+        // beside it, so it is applied exactly here: after the home lock proves
+        // no other runtime owns the home, and before any subsystem opens the
+        // database. A failure has already restored the previous data, so the
+        // runtime still boots with what the user had.
+        match rc_import::apply_pending_rc_import(&config.home_dir) {
+            Ok(Some(applied)) => eprintln!(
+                "vibex-rc-import: applied source_home={} schema={} rollback={}",
+                applied.source_home,
+                applied.applied_schema_version,
+                applied.rollback_directory.display()
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("vibex-rc-import: apply-failed code={}", error.code),
+        }
         let observability = Arc::new(RuntimeObservability::new());
         let (provider_change_sender, provider_change_receiver) = mpsc::unbounded_channel();
         let provider_change_listener = Arc::new(DesktopProviderProfileChangeListener {
@@ -3634,6 +3687,38 @@ mod tests {
         assert_eq!(merged.cached_read_tokens, Some(300));
         assert_eq!(merged.context_window_used_tokens, Some(1_100));
         assert_eq!(merged.context_window_size_tokens, Some(200_000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_applies_a_staged_rc_import_before_it_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path();
+        let source_home = base.join(RC_HOME_DIRECTORY);
+        std::fs::create_dir_all(&source_home).unwrap();
+        {
+            let mut connection = open_database(&source_home.join("vibex.db")).unwrap();
+            apply_migrations(&mut connection).unwrap();
+            WorkspaceRepository::ensure(
+                &connection,
+                source_home.join("rc-workspace"),
+                WorkspaceMode::CurrentCheckout,
+            )
+            .unwrap();
+        }
+        let target_home = base.join(RELEASE_STABLE_HOME_DIRECTORY);
+        std::fs::create_dir_all(&target_home).unwrap();
+        stage_rc_import(&source_home, &target_home).unwrap();
+        assert!(rc_import_pending(&target_home));
+
+        let runtime = DesktopRuntime::start(DesktopRuntimeConfig::isolated_test(&target_home))
+            .await
+            .unwrap();
+        assert!(!rc_import_pending(&target_home));
+        let connection = open_database(&runtime.config.database_path).unwrap();
+        let workspaces = WorkspaceRepository::list(&connection).unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert!(workspaces[0].1.root_path.ends_with("rc-workspace"));
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]

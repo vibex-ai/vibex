@@ -100,19 +100,19 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
     MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
     PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, ProviderProfileSummary, RenameAgentSessionRequest, ReplaceUserMessagePayload,
-    RequestId, ResolvePermissionRequest, RuntimeAuthSource, RuntimeAuthSourceAvailability,
-    RuntimeAuthSourceKind, RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole,
-    RuntimeModelSelection, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeature, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SessionRuntimeSelectionStatus,
-    SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest, SteerMessageOutcome,
-    TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus, TerminalSwitchShellRequest,
-    TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
-    VibexSessionId, WorkspaceMode, WorkspaceRecord, agent_session_turn_requires_continuation,
-    latest_timeline_turn_ended_normally, managed_worktree_name_slug, normalize_agent_session_title,
-    unix_timestamp_ms,
+    PromptId, ProviderProfileSummary, RcImportPayload, RenameAgentSessionRequest,
+    ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
+    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
+    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
+    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
+    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
+    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
+    UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
+    managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
@@ -145,7 +145,7 @@ use vibex_desktop_model::{
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
-    DesktopRuntimeFacade, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
+    DesktopRuntimeFacade, DesktopRuntimeMode, PREVIEW_APP_ID, ProviderConfigChangePhase, RC_APP_ID,
     STABLE_DESKTOP_APP_ID, SidebarOrganizationRequest, StorageCleanupKind, StorageCleanupReport,
     validate_external_open_url,
 };
@@ -5955,6 +5955,8 @@ pub struct VibexWorkbench {
     update_auto_download_version: Option<String>,
     update_status_task: Option<Task<()>>,
     update_action_task: Option<Task<()>>,
+    /// The staged RC-data import that the settings page requested.
+    rc_import_task: Option<Task<()>>,
     timeline_command_expansion: BTreeMap<String, bool>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
@@ -6924,6 +6926,7 @@ impl VibexWorkbench {
             update_auto_download_version: None,
             update_status_task: None,
             update_action_task: None,
+            rc_import_task: None,
             timeline_command_expansion: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
@@ -7246,7 +7249,17 @@ impl VibexWorkbench {
         };
         this.schedule_startup_loading_indicator(cx);
         this.start_sidebar_auto_archive_schedule(cx);
-        this.begin_runtime_start(cx);
+        // The stable shell asks once about RC data sitting next to its own
+        // home. The answer decides the first runtime start, so it is deferred
+        // to the first frame where the window it renders in exists.
+        let workbench = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let _ = workbench.update(cx, |this, cx| {
+                if !this.begin_rc_import_prompt(window, cx) {
+                    this.begin_runtime_start(cx);
+                }
+            });
+        });
         this.bind_to_window(window, cx);
         this.quit_subscription = Some(cx.on_app_quit(|this, cx| {
             let code_workbench_state = this.code_workbench.read(cx).persisted_state_for_exit();
@@ -7365,6 +7378,304 @@ impl VibexWorkbench {
             self.begin_active_remote_start(runtime, cx);
             return;
         }
+        self.boot_local_runtime(cx);
+    }
+
+    /// Offers the one-time RC data import on a stable install's first launch.
+    ///
+    /// Returns true when the runtime boot waits for the user's answer. The
+    /// prompt is raised only when this shell is about to become the local
+    /// stable authority, RC data still sits next to the active home, and the
+    /// user never answered before. The dialog cannot be dismissed by the
+    /// overlay or Esc, so the boot always has an answer to act on.
+    fn begin_rc_import_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(config) = self.config.clone() else {
+            return false;
+        };
+        if config.mode != DesktopRuntimeMode::ReleaseStable {
+            return false;
+        }
+        if self.boot_remote_runtime().is_some() {
+            return false;
+        }
+        // Only a first launch: once this home owns a database the user has
+        // already worked here, and RC data installed afterwards must not be
+        // offered as a replacement for it.
+        if config.database_path.is_file() {
+            return false;
+        }
+        if vibex_desktop_runtime::rc_import_prompt_answered(&config.home_dir) {
+            return false;
+        }
+        let Some(base_home) = config.home_dir.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let Some(source) = vibex_desktop_runtime::rc_import_source(&base_home) else {
+            return false;
+        };
+
+        let entity = cx.weak_entity();
+        let source_home = source.home;
+        let target_home = config.home_dir;
+        window.open_dialog(cx, move |dialog, _, _| {
+            let accept_entity = entity.clone();
+            let decline_entity = entity.clone();
+            let source_home = source_home.clone();
+            let target_home = target_home.clone();
+            let import_source = source_home.clone();
+            let import_target = target_home.clone();
+            dialog
+                .title(locale::text(
+                    "RC data detected",
+                    "检测到 RC 版本数据",
+                    "偵測到 RC 版本資料",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(locale::text(
+                            "Data from the RC version was found next to this install. Importing brings its workspaces, sessions and Provider configuration into the official version. RC and the official release can use different database schemas, so the import can fail; when it does, the current data is restored and nothing is imported.",
+                            "在本版本旁边检测到 RC 版本的数据。导入后，RC 版本的工作区、会话与 Provider 配置会出现在正式版本中。RC 与正式版本的数据库结构可能不一致，导入存在失败风险；导入失败时会恢复当前数据，不会导入任何内容。",
+                            "在本版本旁邊偵測到 RC 版本的資料。匯入後，RC 版本的工作區、會話與 Provider 設定會出現在正式版本中。RC 與正式版本的資料庫結構可能不一致，匯入存在失敗風險；匯入失敗時會還原目前資料，不會匯入任何內容。",
+                        ))
+                        .child(settings_value_chip(source_home.display().to_string())),
+                )
+                .overlay_closable(false)
+                .keyboard(false)
+                .close_button(false)
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("decline-rc-import")
+                                .outline()
+                                .label(locale::text("Not now", "暂不导入", "暫不匯入")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("accept-rc-import")
+                                .primary()
+                                .label(locale::text("Import data", "导入数据", "匯入資料")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = accept_entity.update(cx, |this, cx| {
+                        this.import_rc_data_from_prompt(&import_source, &import_target, cx)
+                    });
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = decline_entity.update(cx, |this, cx| {
+                        this.decline_rc_import_prompt(&source_home, &target_home, cx)
+                    });
+                    true
+                })
+        });
+        true
+    }
+
+    /// Imports the detected RC data and then boots the runtime.
+    ///
+    /// The import runs here, before the runtime exists, so the staged database
+    /// can be applied in the same launch instead of costing a restart. It stays
+    /// on a background task because snapshotting a large database would
+    /// otherwise freeze the window the dialog just closed.
+    fn import_rc_data_from_prompt(
+        &mut self,
+        source_home: &Path,
+        target_home: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rc_import_task.is_some() {
+            return;
+        }
+        let source_home = source_home.to_path_buf();
+        let target_home = target_home.to_path_buf();
+        let runner = gpui_tokio::Tokio::spawn(cx, {
+            let source_home = source_home.clone();
+            let target_home = target_home.clone();
+            async move {
+                vibex_desktop_runtime::stage_rc_import(&source_home, &target_home).and_then(|_| {
+                    vibex_desktop_runtime::apply_pending_rc_import(&target_home).map(|_| ())
+                })
+            }
+        });
+        self.rc_import_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.rc_import_task = None;
+                    match outcome {
+                        Ok(Ok(())) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::success(
+                                locale::text(
+                                    "RC data imported",
+                                    "RC 版本数据已导入",
+                                    "RC 版本資料已匯入",
+                                )
+                                .to_string(),
+                            ),
+                            cx,
+                        ),
+                        Ok(Err(error)) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            )),
+                            cx,
+                        ),
+                        Err(error) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "RC import task stopped unexpectedly: {error}"
+                            )),
+                            cx,
+                        ),
+                    }
+                    this.begin_runtime_start(cx);
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Remembers that the user declined, then boots the runtime.
+    fn decline_rc_import_prompt(
+        &mut self,
+        source_home: &Path,
+        target_home: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = vibex_desktop_runtime::record_rc_import_prompt_decision(
+            target_home,
+            vibex_desktop_runtime::RcImportPromptDecision::Declined,
+            source_home,
+        ) {
+            eprintln!(
+                "vibex-rc-import: prompt-decision-failed code={}",
+                error.code
+            );
+        }
+        self.begin_runtime_start(cx);
+    }
+
+    /// Stages an RC data import from the settings page and restarts the
+    /// embedded runtime so the staged database is applied.
+    fn begin_rc_import(&mut self, cx: &mut Context<Self>) {
+        if self.rc_import_task.is_some() {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            self.queue_settings_operation_notice(
+                SettingsOperationNotice::error(
+                    locale::text(
+                        "The local runtime must be running to import RC data",
+                        "需要本地运行时正在运行才能导入 RC 版本数据",
+                        "需要本機執行階段正在執行才能匯入 RC 版本資料",
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+        let active_locale = locale::current_locale();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .rc_import(MutationRequest::new(RcImportPayload::default()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.rc_import_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.rc_import_task = None;
+                    match outcome {
+                        Ok(Ok(outcome)) => {
+                            let message = match active_locale {
+                                locale::ResolvedLocale::En => format!(
+                                    "RC data staged from {}; restarting the runtime",
+                                    outcome.source_home
+                                ),
+                                locale::ResolvedLocale::ZhCn => {
+                                    format!(
+                                        "已从 {} 暂存 RC 数据，正在重启运行时",
+                                        outcome.source_home
+                                    )
+                                }
+                                locale::ResolvedLocale::ZhTw => {
+                                    format!(
+                                        "已從 {} 暫存 RC 資料，正在重新啟動執行階段",
+                                        outcome.source_home
+                                    )
+                                }
+                            };
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::success(message),
+                                cx,
+                            );
+                            if outcome.restart_required {
+                                this.restart_local_runtime_for_rc_import(cx);
+                            }
+                        }
+                        // A staged import that is still waiting needs no second
+                        // snapshot: restarting is exactly what applies it.
+                        Ok(Err(error)) if error.code == "rc_import_already_pending" => {
+                            this.queue_settings_operation_notice(
+                                SettingsOperationNotice::success(
+                                    locale::text(
+                                        "An RC import is already staged; restarting the runtime",
+                                        "RC 数据已暂存，正在重启运行时",
+                                        "RC 資料已暫存，正在重新啟動執行階段",
+                                    )
+                                    .to_string(),
+                                ),
+                                cx,
+                            );
+                            this.restart_local_runtime_for_rc_import(cx);
+                        }
+                        Ok(Err(error)) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            )),
+                            cx,
+                        ),
+                        Err(error) => this.queue_settings_operation_notice(
+                            SettingsOperationNotice::error(format!(
+                                "RC import task stopped unexpectedly: {error}"
+                            )),
+                            cx,
+                        ),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Restarts the embedded runtime so the staged RC import is applied.
+    ///
+    /// `apply_pending_rc_import` runs inside the next runtime start, after the
+    /// home lock is held and before any database is opened, so the shell only
+    /// retires the current runtime and boots again.
+    fn restart_local_runtime_for_rc_import(&mut self, cx: &mut Context<Self>) {
+        if self.runtime.is_none() {
+            self.queue_settings_operation_notice(
+                SettingsOperationNotice::error(
+                    locale::text(
+                        "Restart the machine that holds this data to finish the import",
+                        "请在保存这份数据的机器上重启 Vibex 以完成导入",
+                        "請在保存這份資料的機器上重新啟動 Vibex 以完成匯入",
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
+        self.retire_local_runtime(cx);
         self.boot_local_runtime(cx);
     }
 
@@ -55764,6 +56075,49 @@ impl FoundationSettings {
         });
     }
 
+    /// Confirms the one-time import of the RC channel's data.
+    ///
+    /// RC and the official release may sit on different database schemas, so
+    /// the risk is stated before anything is staged. A staging failure leaves
+    /// the current data untouched, and the runtime restart that follows applies
+    /// the staged database only after validating it.
+    fn confirm_rc_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workbench = self.workbench.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let workbench = workbench.clone();
+            dialog
+                .title(locale::text(
+                    "Import RC data?",
+                    "从 RC 版本导入数据？",
+                    "從 RC 版本匯入資料？",
+                ))
+                .child(
+                    div().flex().flex_col().gap_2().child(locale::text(
+                        "The RC version's workspaces, sessions and Provider configuration replace the current data. RC and the official release can use different database schemas, so the import can fail; when it does, the current data is restored and nothing is imported. Vibex restarts its runtime to finish.",
+                        "RC 版本的工作区、会话与 Provider 配置会替换当前数据。RC 与正式版本的数据库结构可能不一致，导入存在失败风险；导入失败时会恢复当前数据，不会导入任何内容。完成后 Vibex 会重启运行时。",
+                        "RC 版本的工作區、會話與 Provider 設定會取代目前資料。RC 與正式版本的資料庫結構可能不一致，匯入存在失敗風險；匯入失敗時會還原目前資料，不會匯入任何內容。完成後 Vibex 會重新啟動執行階段。",
+                    )),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("cancel-rc-import")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-rc-import")
+                                .primary()
+                                .label(locale::text("Import", "导入", "匯入")),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = workbench.update(cx, |workbench, cx| workbench.begin_rc_import(cx));
+                    true
+                })
+        });
+    }
+
     /// Announces a settings operation result through the workbench's
     /// notification layer.
     ///
@@ -58664,6 +59018,27 @@ impl FoundationSettings {
                                     }
                                     let _ = &this;
                                     cx.notify();
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text(
+                                "Import RC data",
+                                "从 RC 版本导入数据",
+                                "從 RC 版本匯入資料",
+                            ),
+                            locale::text(
+                                "Bring the RC version's workspaces, sessions and Provider configuration into this version. The current data is kept when the import fails.",
+                                "把 RC 版本的工作区、会话与 Provider 配置导入当前版本。导入失败时保留当前数据。",
+                                "把 RC 版本的工作區、會話與 Provider 設定匯入目前版本。匯入失敗時保留目前資料。",
+                            ),
+                            Button::new("import-rc-data")
+                                .small()
+                                .outline()
+                                .label(locale::text("Import", "导入", "匯入"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_rc_import(window, cx)
                                 })),
                             stacked,
                             cx,
@@ -73060,6 +73435,105 @@ mod tests {
         );
         assert!(cleanup.contains("workbench.load_agent_overview(cx)"));
         assert!(cleanup.contains("workbench.load_agent_session_terminals("));
+    }
+
+    #[test]
+    fn rc_import_offers_a_confirmed_local_migration() {
+        let source = include_str!("app.rs");
+        let data_page = source
+            .split_once("    fn render_data_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_about_page("))
+            .map(|(body, _)| body)
+            .expect("data settings page should remain inspectable");
+        assert!(data_page.contains("Button::new(\"import-rc-data\")"));
+        assert!(data_page.contains("this.confirm_rc_import(window, cx)"));
+
+        let confirmation = source
+            .split_once("    fn confirm_rc_import(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Announces a settings operation result")
+            })
+            .map(|(body, _)| body)
+            .expect("RC import confirmation should remain inspectable");
+        assert!(confirmation.contains("window.open_dialog"));
+        assert!(confirmation.contains("DialogAction::new()"));
+        assert!(confirmation.contains("DialogClose::new()"));
+        assert!(confirmation.contains("workbench.begin_rc_import(cx)"));
+        // The dialog has to state the schema risk before anything is staged.
+        assert!(confirmation.contains("different database schemas"));
+        assert!(confirmation.contains("the current data is restored"));
+
+        let staging = source
+            .split_once("    fn begin_rc_import(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn restart_local_runtime_for_rc_import("))
+            .map(|(body, _)| body)
+            .expect("RC import staging should remain inspectable");
+        assert!(staging.contains(".rc_import(MutationRequest::new(RcImportPayload::default()))"));
+        assert!(staging.contains("this.rc_import_task = None"));
+        assert!(staging.contains("this.restart_local_runtime_for_rc_import(cx)"));
+
+        let restart = source
+            .split_once("    fn restart_local_runtime_for_rc_import(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn boot_remote_runtime("))
+            .map(|(body, _)| body)
+            .expect("RC import restart should remain inspectable");
+        // The staged database is applied by the next runtime start, so the
+        // shell retires the current runtime instead of swapping files under it.
+        assert!(restart.contains("self.retire_local_runtime(cx)"));
+        assert!(restart.contains("self.boot_local_runtime(cx)"));
+    }
+
+    #[test]
+    fn rc_import_prompt_is_one_time_and_stable_only() {
+        let source = include_str!("app.rs");
+        let prompt = source
+            .split_once("    fn begin_rc_import_prompt(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Imports the detected RC data"))
+            .map(|(body, _)| body)
+            .expect("RC import prompt should remain inspectable");
+        // Only the packaged stable shell, only as the local authority, only on
+        // a first launch, only while RC data exists, and only before the user
+        // answered.
+        assert!(prompt.contains("DesktopRuntimeMode::ReleaseStable"));
+        assert!(prompt.contains("self.boot_remote_runtime().is_some()"));
+        assert!(prompt.contains("config.database_path.is_file()"));
+        assert!(prompt.contains("rc_import_prompt_answered(&config.home_dir)"));
+        assert!(prompt.contains("rc_import_source(&base_home)"));
+        // A dismissal must still answer, or the deferred boot would never run.
+        assert!(prompt.contains(".overlay_closable(false)"));
+        assert!(prompt.contains(".keyboard(false)"));
+        assert!(prompt.contains("this.decline_rc_import_prompt("));
+
+        let decline = source
+            .split_once("    fn decline_rc_import_prompt(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Stages an RC data import from the settings page")
+            })
+            .map(|(body, _)| body)
+            .expect("RC import decline should remain inspectable");
+        assert!(decline.contains("record_rc_import_prompt_decision("));
+        assert!(decline.contains("RcImportPromptDecision::Declined"));
+        assert!(decline.contains("self.begin_runtime_start(cx)"));
+
+        let accept = source
+            .split_once("    fn import_rc_data_from_prompt(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Remembers that the user declined"))
+            .map(|(body, _)| body)
+            .expect("RC import acceptance should remain inspectable");
+        assert!(accept.contains("stage_rc_import(&source_home, &target_home)"));
+        assert!(accept.contains("apply_pending_rc_import(&target_home)"));
+        assert!(accept.contains("this.begin_runtime_start(cx)"));
+
+        // The first launch consults the prompt before it starts the runtime,
+        // deferred so the dialog's window already exists.
+        let startup = source
+            .split_once("        this.start_sidebar_auto_archive_schedule(cx);")
+            .and_then(|(_, tail)| tail.split_once("        this.bind_to_window(window, cx);"))
+            .map(|(body, _)| body)
+            .expect("the workbench startup sequence should remain inspectable");
+        assert!(startup.contains("window.defer(cx"));
+        assert!(startup.contains("if !this.begin_rc_import_prompt(window, cx)"));
+        assert!(startup.contains("this.begin_runtime_start(cx);"));
     }
 
     #[test]
