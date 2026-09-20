@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, Context, Entity, IntoElement, KeyDownEvent, Render,
@@ -29,8 +29,8 @@ use vibex_core::{
     DeviceId, RemoteAuditListRequest, RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteLanPairingRequestState, RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary,
-    RemotePairingTransport, RemoteRevokeDeviceRequest, RequestId, VibexError, VibexResult,
-    unix_timestamp_ms,
+    RemotePairingTransport, RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId,
+    VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_desktop_runtime::{
     DesktopRuntime, RemoteConnectivityController, RemoteConnectivityMethod,
@@ -51,6 +51,10 @@ const DEVICE_AUDIT_COUNT_LIMIT: u32 = 500;
 /// Paired devices one page holds. The trust store has no paged read, so the
 /// dialog loads the registry once and windows it here.
 const DEVICE_PAGE_SIZE: usize = 6;
+/// How often the device list re-reads which devices are connected. Presence is
+/// a live fact that changes without any trust-store write, so the list polls it
+/// while it is open rather than showing the state it saw when the dialog opened.
+const DEVICE_PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAccessMutation {
@@ -133,6 +137,7 @@ enum RemoteAccessAction {
     RefreshDevices,
     SelectDevicePage(usize),
     RevokeDevice(String),
+    RestoreDevice(String),
     DeleteDevice(String),
 }
 
@@ -355,7 +360,11 @@ struct PairingViewState {
     audit_count: usize,
     audit_count_capped: bool,
     revoking_device: Option<String>,
+    restoring_device: Option<String>,
     deleting_device: Option<String>,
+    /// Device ids with a live connection, refreshed by the presence poll while
+    /// the device list is open.
+    connected_devices: BTreeSet<String>,
 }
 
 /// One light hint the Remote Access page has to show.
@@ -418,7 +427,9 @@ impl Default for PairingViewState {
             audit_count: 0,
             audit_count_capped: false,
             revoking_device: None,
+            restoring_device: None,
             deleting_device: None,
+            connected_devices: BTreeSet::new(),
         }
     }
 }
@@ -470,7 +481,9 @@ impl PairingViewState {
     /// Whether a device mutation is in flight. The list locks every per-row
     /// action while one runs, so a delete cannot race the revoke it depends on.
     fn device_mutation_pending(&self) -> bool {
-        self.revoking_device.is_some() || self.deleting_device.is_some()
+        self.revoking_device.is_some()
+            || self.restoring_device.is_some()
+            || self.deleting_device.is_some()
     }
 
     fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
@@ -614,7 +627,9 @@ pub(crate) struct RemoteAccessPairing {
     refresh_task: Option<Task<()>>,
     devices_task: Option<Task<()>>,
     revoke_task: Option<Task<()>>,
+    restore_task: Option<Task<()>>,
     delete_task: Option<Task<()>>,
+    presence_poll_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     offer_poll_task: Option<Task<()>>,
     lan_poll_task: Option<Task<()>>,
@@ -669,7 +684,9 @@ impl RemoteAccessPairing {
             refresh_task: None,
             devices_task: None,
             revoke_task: None,
+            restore_task: None,
             delete_task: None,
+            presence_poll_task: None,
             mutation_task: None,
             offer_poll_task: None,
             lan_poll_task: None,
@@ -683,14 +700,20 @@ impl RemoteAccessPairing {
             RemoteAccessAction::Refresh => self.refresh(cx),
             RemoteAccessAction::ShowSetup => {
                 self.state.show_setup();
+                self.stop_presence_poll();
                 cx.notify();
             }
             RemoteAccessAction::ShowPairing => {
                 self.state.show_pairing();
+                self.stop_presence_poll();
                 cx.notify();
             }
             RemoteAccessAction::ShowDevices => {
                 self.state.show_devices();
+                // The list may have been opened after the device connected, and
+                // presence is not part of the stored registry.
+                self.refresh_devices(cx);
+                self.schedule_presence_poll(cx);
                 cx.notify();
             }
             RemoteAccessAction::RefreshDevices => self.refresh_devices(cx),
@@ -699,6 +722,7 @@ impl RemoteAccessPairing {
                 cx.notify();
             }
             RemoteAccessAction::RevokeDevice(device_id) => self.revoke_device(device_id, cx),
+            RemoteAccessAction::RestoreDevice(device_id) => self.restore_device(device_id, cx),
             RemoteAccessAction::DeleteDevice(device_id) => self.delete_device(device_id, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
                 self.state.select_connection_entry(entry);
@@ -774,7 +798,8 @@ impl RemoteAccessPairing {
                 })
                 .map(|records| records.len())
                 .unwrap_or_default();
-            (devices, audit_count)
+            let connected = remote.connected_device_ids();
+            (devices, audit_count, connected)
         });
         self.devices_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -782,17 +807,18 @@ impl RemoteAccessPairing {
                 let _ = entity.update(cx, |this, cx| {
                     this.devices_task = None;
                     match outcome {
-                        Ok((Ok(devices), audit_count)) => {
+                        Ok((Ok(devices), audit_count, connected)) => {
                             this.state.devices = devices;
                             this.state.audit_count = audit_count;
                             this.state.audit_count_capped =
                                 audit_count >= DEVICE_AUDIT_COUNT_LIMIT as usize;
+                            this.state.connected_devices = connected_device_keys(connected);
                             this.state.devices_loaded = true;
                             this.state.devices_error = None;
                             // A revoke can empty the page the pager was on.
                             this.state.select_device_page(this.state.device_page);
                         }
-                        Ok((Err(error), _)) => this.state.devices_error = Some(error.code),
+                        Ok((Err(error), _, _)) => this.state.devices_error = Some(error.code),
                         Err(_) => {
                             this.state.devices_error =
                                 Some("remote_device_list_task_failed".to_string())
@@ -802,6 +828,48 @@ impl RemoteAccessPairing {
                 });
             },
         ));
+    }
+
+    /// Refreshes only the presence set while the device list stays open.
+    ///
+    /// Presence is a connection-registry fact, not a stored one, so it is read
+    /// on a timer instead of being written to the trust store. The loop stops
+    /// with the dialog: [`Self::dismiss`] drops the task, and the page guard
+    /// keeps a task that already woke from rescheduling.
+    fn schedule_presence_poll(&mut self, cx: &mut Context<Self>) {
+        if self.state.page != RemoteAccessPage::Devices {
+            return;
+        }
+        let remote = self.remote.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::time::sleep(DEVICE_PRESENCE_POLL_INTERVAL).await;
+            remote.connected_device_ids()
+        });
+        self.presence_poll_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.presence_poll_task = None;
+                    if let Ok(connected) = outcome {
+                        let connected = connected_device_keys(connected);
+                        if connected != this.state.connected_devices {
+                            this.state.connected_devices = connected;
+                            cx.notify();
+                        }
+                    }
+                    this.schedule_presence_poll(cx);
+                });
+            },
+        ));
+    }
+
+    /// Stops the presence loop by dropping its task.
+    ///
+    /// The device list owns the only reason to poll, so leaving the page — or
+    /// closing the dialog — drops the pending timer instead of letting it
+    /// reschedule.
+    fn stop_presence_poll(&mut self) {
+        self.presence_poll_task = None;
     }
 
     fn revoke_device(&mut self, device_id: String, cx: &mut Context<Self>) {
@@ -845,6 +913,59 @@ impl RemoteAccessPairing {
                         Err(_) => {
                             this.state.devices_error =
                                 Some("remote_device_revoke_task_failed".to_string())
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Returns a revoked device to service.
+    ///
+    /// The grant it was paired with is kept, so the phone reconnects with the
+    /// credential it already holds instead of pairing again.
+    fn restore_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let Ok(device_id_value) = DeviceId::parse(device_id.clone()) else {
+            self.state.devices_error = Some("remote_device_id_invalid".to_string());
+            cx.notify();
+            return;
+        };
+        let remote = self.remote.clone();
+        self.state.restoring_device = Some(device_id);
+        self.state.error_code = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            remote.restore_device(RemoteRestoreDeviceRequest {
+                device_id: device_id_value,
+                reason: Some("restored from the mobile pairing dialog".to_string()),
+            })
+        });
+        self.restore_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.restore_task = None;
+                    this.state.restoring_device = None;
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
+                                "Device access restored",
+                                "已恢复设备访问权限",
+                                "已恢復裝置存取權限",
+                            )));
+                            this.refresh_devices(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.state.notice = Some(RemoteAccessNotice::error(locale::text(
+                                "The device access could not be restored",
+                                "恢复设备访问权限失败",
+                                "恢復裝置存取權限失敗",
+                            )));
+                            this.state.devices_error = Some(error.code);
+                        }
+                        Err(_) => {
+                            this.state.devices_error =
+                                Some("remote_device_restore_task_failed".to_string())
                         }
                     }
                     cx.notify();
@@ -972,6 +1093,71 @@ impl RemoteAccessPairing {
                     let _ = entity.update(cx, |this, cx| {
                         this.dispatch_action(
                             RemoteAccessAction::DeleteDevice(device_id.clone()),
+                            cx,
+                        )
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Puts a revoked device back in service.
+    ///
+    /// Restoring is the deliberate undo of a revocation, so it is confirmed the
+    /// same way: the decision-critical fact is that the phone does not have to
+    /// pair again.
+    fn confirm_restore_device(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let description = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!(
+                "\"{device_name}\" can connect again with the credential it already holds, without pairing again."
+            ),
+            locale::ResolvedLocale::ZhCn => {
+                format!("“{device_name}”无需重新配对，用已有凭据即可再次连接。")
+            }
+            locale::ResolvedLocale::ZhTw => {
+                format!("「{device_name}」無需重新配對，用已有憑證即可再次連線。")
+            }
+        };
+        let title = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Restore access for \"{device_name}\"?"),
+            locale::ResolvedLocale::ZhCn => format!("恢复“{device_name}”的访问权限？"),
+            locale::ResolvedLocale::ZhTw => format!("恢復「{device_name}」的存取權限？"),
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone();
+            let device_id = device_id.clone();
+            let description = description.clone();
+            let title = title.clone();
+            dialog
+                .title(title)
+                .child(description)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-device-restore")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-device-restore")
+                                    .label(locale::text("Restore", "恢复", "恢復")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.dispatch_action(
+                            RemoteAccessAction::RestoreDevice(device_id.clone()),
                             cx,
                         )
                     });
@@ -1750,6 +1936,7 @@ impl RemoteAccessPairing {
         self.clear_offer();
         self.clear_lan_window();
         self.clear_zero_config_window();
+        self.stop_presence_poll();
         if let Some(offer_id) = offer_id {
             let controller = self.controller.clone();
             gpui_tokio::Tokio::spawn(cx, async move {
@@ -2213,19 +2400,36 @@ impl RemoteAccessPairing {
         let revoked = device.status == RemoteDeviceStatus::Revoked;
         let pending = self.state.device_mutation_pending();
         let revoking = self.state.revoking_device.as_deref() == Some(device.device_id.as_str());
+        let restoring = self.state.restoring_device.as_deref() == Some(device.device_id.as_str());
         let deleting = self.state.deleting_device.as_deref() == Some(device.device_id.as_str());
         let status_color = device_status_color(device.status, cx);
-        let activity = device_activity_label(&device);
+        let device_key = device.device_id.as_str().to_string();
+        // Presence is a live connection, so it replaces the stored last-seen
+        // sentence rather than sitting beside a stale one.
+        let online = !revoked && self.state.connected_devices.contains(&device_key);
+        let activity = if online {
+            locale::text("Online now", "在线", "線上").to_string()
+        } else {
+            device_activity_label(&device)
+        };
         let detail = format!(
             "{} · {}",
             permission_label(device.permission_level),
             activity
         );
-        let device_id = device.device_id.as_str().to_string();
+        let detail_color = if online {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
+        let device_id = device_key;
         let device_name = device.display_name.clone();
+        let restore_device_id = device_id.clone();
+        let restore_device_name = device_name.clone();
         let delete_device_id = device_id.clone();
         let delete_device_name = device_name.clone();
         let entity = cx.weak_entity();
+        let restore_entity = entity.clone();
         let delete_entity = entity.clone();
 
         h_flex()
@@ -2275,12 +2479,27 @@ impl RemoteAccessPairing {
                                     )),
                             )
                             .child(
-                                div()
+                                h_flex()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(detail),
+                                    .items_center()
+                                    .gap_1()
+                                    .when(online, |line| {
+                                        line.child(
+                                            div()
+                                                .size(px(6.0))
+                                                .flex_none()
+                                                .rounded_full()
+                                                .bg(detail_color),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(detail_color)
+                                            .child(detail),
+                                    ),
                             ),
                     ),
             )
@@ -2302,6 +2521,27 @@ impl RemoteAccessPairing {
                                 )
                             });
                         }),
+                )
+            })
+            .when(revoked, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "restore-device-{restore_device_id}"
+                    )))
+                    .small()
+                    .label(locale::text("Restore", "恢复", "恢復"))
+                    .loading(restoring)
+                    .disabled(pending)
+                    .on_click(move |_, window, cx| {
+                        let _ = restore_entity.update(cx, |this, cx| {
+                            this.confirm_restore_device(
+                                restore_device_id.clone(),
+                                restore_device_name.clone(),
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
                 )
             })
             .child(
@@ -4301,6 +4541,17 @@ fn permission_description(permission: RemoteDevicePermissionLevel) -> &'static s
     }
 }
 
+/// The presence set the device list compares against.
+///
+/// Device ids are compared as their stored text so the set can be held without
+/// cloning a [`DeviceId`] per row on every poll.
+fn connected_device_keys(device_ids: Vec<DeviceId>) -> BTreeSet<String> {
+    device_ids
+        .into_iter()
+        .map(|device_id| device_id.as_str().to_string())
+        .collect()
+}
+
 fn device_status_label(status: RemoteDeviceStatus) -> &'static str {
     match status {
         RemoteDeviceStatus::Pending => locale::text("Pending", "待确认", "待確認"),
@@ -5167,5 +5418,55 @@ mod tests {
             .expect("device mutation state should remain inspectable");
         assert!(state.contains("revoking_device.is_some()"));
         assert!(state.contains("deleting_device.is_some()"));
+        assert!(state.contains("restoring_device.is_some()"));
+    }
+
+    /// Restoring is offered exactly where a record is revoked, and the presence
+    /// poll follows the device page instead of the whole dialog.
+    #[test]
+    fn revoked_devices_offer_restore_and_presence_follows_the_device_page() {
+        let source = include_str!("remote_access_pairing.rs");
+
+        let row = source
+            .split_once("    fn render_device_row(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_connection_list("))
+            .map(|(body, _)| body)
+            .expect("device row should remain inspectable");
+        assert!(row.contains("confirm_restore_device("));
+        assert!(row.contains("restore-device-"));
+        assert!(row.contains("connected_devices.contains("));
+        // Presence replaces the stored sentence rather than contradicting it.
+        assert!(row.contains("device_activity_label(&device)"));
+
+        let restore = source
+            .split_once("    fn confirm_restore_device(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_revoke_device("))
+            .map(|(body, _)| body)
+            .expect("device restore confirmation should remain inspectable");
+        assert!(restore.contains("RemoteAccessAction::RestoreDevice("));
+        assert!(restore.contains("without pairing again"));
+
+        let restoration = source
+            .split_once("    fn restore_device(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_restore_device("))
+            .map(|(body, _)| body)
+            .expect("device restore should remain inspectable");
+        assert!(restoration.contains("remote.restore_device(RemoteRestoreDeviceRequest {"));
+        assert!(restoration.contains("this.refresh_devices(cx);"));
+
+        let dispatcher = source
+            .split_once("    fn dispatch_action(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn refresh("))
+            .map(|(body, _)| body)
+            .expect("action dispatcher should remain inspectable");
+        assert!(dispatcher.contains("self.schedule_presence_poll(cx);"));
+        assert!(dispatcher.contains("self.stop_presence_poll();"));
+
+        let dismiss = source
+            .split_once("    fn dismiss(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn "))
+            .map(|(body, _)| body)
+            .expect("dialog dismissal should remain inspectable");
+        assert!(dismiss.contains("self.stop_presence_poll();"));
     }
 }

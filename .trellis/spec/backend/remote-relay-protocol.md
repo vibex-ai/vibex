@@ -245,6 +245,9 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
   device row and invalidates the superseded grant, while an unknown identity
   creates its own row. Deleting a device revokes an active grant before the row
   goes away and leaves the audit history readable.
+- Restoring a revoked device reinstates the grant it already holds and refuses
+  an active one; the connection registry reports each connected device once,
+  even when it holds several sockets.
 - Binding drift plus `cargo test -p vibex-core remote`, `cargo test -p vibex-db
   remote`, `cargo test -p vibex-remote`, and `cargo test -p
   vibex-desktop-runtime remote`.
@@ -972,12 +975,22 @@ Device records need:
 - Audit log references.
 
 Revoked devices cannot reconnect even if they still know old Relay room data.
+Revoking is reversible: a revoked record can be restored, and it returns to
+service with the grant it already holds, so a client that kept its credential
+reconnects without pairing again. Only a revoked record restores — an active one
+is refused rather than silently re-versioned — and the restore moves
+`grant_revision` so nothing negotiated before the revocation is reused. Both
+directions are audited.
 
 A record can also be deleted, which is not the same as revoking it. Deleting an
 active record revokes its grant and disconnects the client first, so a live
 grant is never dropped silently; a revoked record is removed as it stands. Both
 actions are audited, and the audit `device_id` foreign key clears instead of
 cascading, so deleting a record never deletes its history.
+
+Presence is not stored. The device list reads which device ids currently hold a
+live connection from the Gateway connection registry, so "online" cannot drift
+from the sockets that exist and no write is needed to display it.
 
 ## Transport Envelope
 

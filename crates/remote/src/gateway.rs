@@ -2140,6 +2140,15 @@ impl RemoteGateway {
         );
     }
 
+    /// Device ids that hold a live connection right now.
+    ///
+    /// Presence lives in the connection registry rather than the trust store,
+    /// so a device list can show what is connected without writing anything to
+    /// the database.
+    pub fn connected_device_ids(&self) -> Vec<DeviceId> {
+        self.inner.registry.connected_device_ids()
+    }
+
     fn ensure_session_epoch(&self) -> u64 {
         let current = self.inner.session_epoch.load(Ordering::Acquire);
         if current != 0 {
@@ -2526,6 +2535,21 @@ impl ConnectionRegistry {
                 let _ = connection.disconnect.send(Some(reason.clone()));
             }
         }
+    }
+
+    /// Device ids with at least one live connection, deduplicated and in a
+    /// stable order so a device list does not reshuffle between reads.
+    fn connected_device_ids(&self) -> Vec<DeviceId> {
+        let Ok(connections) = self.connections.lock() else {
+            return Vec::new();
+        };
+        let mut device_ids = connections
+            .values()
+            .map(|connection| connection.device_id.clone())
+            .collect::<Vec<_>>();
+        device_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        device_ids.dedup();
+        device_ids
     }
 
     fn active_count(&self) -> usize {
@@ -6993,6 +7017,41 @@ mod tests {
             !debugged.contains(&claimed.auth_token),
             "the issued auth token must not appear in derived debug output"
         );
+    }
+
+    /// Presence comes from the connection registry, so one device with several
+    /// sockets is still one connected device, and a closed socket is gone.
+    #[test]
+    fn connection_registry_reports_each_connected_device_once() {
+        let registry = ConnectionRegistry::default();
+        assert!(registry.connected_device_ids().is_empty());
+
+        let first = DeviceId::new();
+        let second = DeviceId::new();
+        let first_socket = RequestId::new();
+        let second_socket = RequestId::new();
+        let other_socket = RequestId::new();
+        registry
+            .register(first_socket.clone(), first.clone(), 8)
+            .unwrap();
+        registry
+            .register(second_socket.clone(), first.clone(), 8)
+            .unwrap();
+        registry
+            .register(other_socket.clone(), second.clone(), 8)
+            .unwrap();
+
+        let mut expected = vec![first.clone(), second.clone()];
+        expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(registry.connected_device_ids(), expected);
+
+        // Closing one of a device's two sockets keeps it connected.
+        registry.unregister(&second_socket);
+        assert_eq!(registry.connected_device_ids(), expected);
+
+        registry.unregister(&first_socket);
+        registry.unregister(&other_socket);
+        assert!(registry.connected_device_ids().is_empty());
     }
 
     fn pair_test_device(

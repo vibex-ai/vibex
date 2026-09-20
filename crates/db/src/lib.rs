@@ -10301,6 +10301,42 @@ impl RemoteDeviceRepository {
         })
     }
 
+    /// Puts a revoked device back in service.
+    ///
+    /// The grant token is untouched, so a client that still holds the
+    /// credential it was paired with can connect again without pairing a second
+    /// time. The revision moves so anything cached or negotiated against the
+    /// pre-revocation grant is not silently reused.
+    pub fn restore(
+        conn: &Connection,
+        device_id: &DeviceId,
+        restored_at_ms: i64,
+    ) -> VibexResult<RemoteDeviceRecord> {
+        conn.execute(
+            "
+            UPDATE remote_devices
+            SET status = ?2, revoked_at_ms = NULL,
+                grant_revision = grant_revision + 1, updated_at_ms = ?3
+            WHERE device_id = ?1
+            ",
+            params![
+                device_id.as_str(),
+                enum_to_db(&RemoteDeviceStatus::Active)?,
+                restored_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "remote_device_restore_failed",
+            "failed to restore remote device",
+        ))?;
+        Self::get(conn, device_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "remote_device_missing_after_restore",
+                "remote device was not found after restore",
+            )
+        })
+    }
+
     /// Removes a trust-store row.
     ///
     /// Audit rows keep their history: the `device_id` foreign key is
@@ -18188,6 +18224,18 @@ mod tests {
 
         let revoked = RemoteDeviceRepository::revoke(&conn, &device_id, now + 3).unwrap();
         assert_eq!(revoked.detail.status, RemoteDeviceStatus::Revoked);
+
+        let restored = RemoteDeviceRepository::restore(&conn, &device_id, now + 4).unwrap();
+        assert_eq!(restored.detail.status, RemoteDeviceStatus::Active);
+        assert_eq!(restored.detail.revoked_at_ms, None);
+        assert_eq!(restored.detail.updated_at_ms, now + 4);
+        // The grant token survives a revoke/restore cycle; only the revision
+        // moves, so cached work against the old grant cannot be replayed.
+        assert_eq!(restored.auth_secret_hash, auth_hash);
+        assert_eq!(
+            restored.detail.grant_revision,
+            revoked.detail.grant_revision + 1
+        );
 
         RemoteAuditRepository::insert(
             &conn,

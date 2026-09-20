@@ -114,8 +114,11 @@ tailscale serve status
 ```
 
 Revoking a device updates durable state and immediately signals every active
-connection for that device with `device_revoked`. Deleting a device record
-revokes an active grant and disconnects it first, so a live grant is never
-dropped silently; audit records are kept and lose only their device link.
-Runtime shutdown sends `server_shutdown`, drains the listener, and releases all
-sockets.
+connection for that device with `device_revoked`. Revoking is reversible: a
+restored device returns to service with the grant it already holds, so a client
+that kept its credential reconnects without pairing again, and only a revoked
+record can be restored. Deleting a device record revokes an active grant and
+disconnects it first, so a live grant is never dropped silently; audit records
+are kept and lose only their device link. Which devices are online right now is
+read from the Gateway connection registry rather than stored. Runtime shutdown
+sends `server_shutdown`, drains the listener, and releases all sockets.

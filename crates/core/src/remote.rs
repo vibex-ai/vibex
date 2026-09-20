@@ -361,6 +361,18 @@ pub struct RemoteDeleteDeviceRequest {
     pub reason: Option<String>,
 }
 
+/// Returns a revoked device to service.
+///
+/// The stored grant is kept, so a client that still holds the credential it was
+/// paired with reconnects without pairing again. Restoring is the deliberate
+/// undo of a revocation, and it is audited like one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRestoreDeviceRequest {
+    pub device_id: DeviceId,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAuthContext {
@@ -418,6 +430,7 @@ pub enum RemoteAuditAction {
     DeviceAuthenticated,
     DeviceAuthFailed,
     DeviceRevoked,
+    DeviceRestored,
     DeviceDeleted,
     PermissionAllowed,
     PermissionDenied,

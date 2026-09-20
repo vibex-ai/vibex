@@ -23,13 +23,13 @@ use vibex_core::{
     AutomationGraph, AutomationGraphCreateRequest, AutomationGraphDefinitionUpdateRequest,
     AutomationGraphId, AutomationGraphListRequest, AutomationGraphUpdateRequest, AutomationRun,
     AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
-    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest, DiagnosticBundle,
-    DiagnosticBundleRequest, RemoteAuditListRequest, RemoteAuditRecord,
+    AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest, DeviceId,
+    DiagnosticBundle, DiagnosticBundleRequest, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteRevokeDeviceRequest, ScheduledTask,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    RemotePairingOfferSummary, RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest,
+    ScheduledTask, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
     ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
     ScheduledTaskUpdateRequest, VibexError, VibexResult,
@@ -1242,6 +1242,24 @@ impl crate::RemoteHandle {
         let deleted = RemoteTrustService::delete_device(&connection, request)?;
         self.gateway.disconnect_device(&device_id);
         Ok(deleted)
+    }
+
+    /// Returns a revoked device to service with the grant it already holds.
+    pub fn restore_device(
+        &self,
+        request: RemoteRestoreDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let _claim = self
+            .mutation_guard
+            .claim(format!("remote:restore:{}", request.device_id))?;
+        let connection = migrated(&self.db_path)?;
+        RemoteTrustService::restore_device(&connection, request)
+    }
+
+    /// Device ids that hold a live connection right now, for the device list's
+    /// presence indicator.
+    pub fn connected_device_ids(&self) -> Vec<DeviceId> {
+        self.gateway.connected_device_ids()
     }
 
     pub fn list_audit(

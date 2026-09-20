@@ -55,17 +55,18 @@ use vibex_core::{
     RemoteProviderHealthSummaryListResponse, RemoteProviderInjectionPreviewResponse,
     RemoteProviderProfileListResponse, RemoteProviderRequest,
     RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
-    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRevokeDeviceRequest, RemoteServiceInfo,
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
-    RemoteSidebarOrganizationSnapshot, RemoteTerminalCreateResponse, RemoteTerminalKillResponse,
-    RemoteTerminalListResponse, RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteResponse, RemoteWorkbenchBrowseDirectoriesResponse,
-    RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
-    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
-    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootResponse, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
-    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
-    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRestoreDeviceRequest,
+    RemoteRevokeDeviceRequest, RemoteServiceInfo, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationResponse, RemoteSidebarOrganizationSnapshot,
+    RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
+    RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
+    RemoteWorkbenchBrowseDirectoriesResponse, RemoteWorkbenchDeleteProjectResponse,
+    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesResponse,
+    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest,
+    RemoteWorkbenchTemporarySessionRootResponse, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession,
+    TerminalStatus, TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus,
+    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
@@ -1496,6 +1497,65 @@ impl RemoteTrustService {
             )
         })?;
         Ok(record.detail)
+    }
+
+    /// Returns a revoked device to service.
+    ///
+    /// The grant it was paired with is kept, so a client that still holds that
+    /// credential reconnects without pairing again — which is exactly what an
+    /// operator restoring a device expects. Only a revoked record can be
+    /// restored: an active one is already in service, and restoring it would
+    /// silently move its grant revision.
+    pub fn restore_device(
+        conn: &DbConnection,
+        request: RemoteRestoreDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let Some(record) = RemoteDeviceRepository::get(conn, &request.device_id)? else {
+            return Err(remote_error(
+                "remote_device_unknown",
+                "remote device is unknown",
+            ));
+        };
+        if record.detail.status != RemoteDeviceStatus::Revoked {
+            return Err(remote_error(
+                "remote_device_not_revoked",
+                "remote device access is not revoked",
+            ));
+        }
+        let reason = request
+            .reason
+            .as_deref()
+            .map(redact_summary)
+            .unwrap_or_else(|| "No reason provided".to_string());
+        let now = unix_timestamp_ms();
+        let transaction = conn.unchecked_transaction().map_err(|_| {
+            VibexError::storage(
+                "remote_device_restore_transaction_failed",
+                "failed to start remote device restore transaction",
+            )
+        })?;
+        let restored = RemoteDeviceRepository::restore(&transaction, &request.device_id, now)?;
+        Self::insert_audit(
+            &transaction,
+            Some(restored.detail.device_id.clone()),
+            RemoteAuditAction::DeviceRestored,
+            RemoteAuditTargetKind::Device,
+            Some(restored.detail.device_id.as_str().to_string()),
+            RemoteAuditOutcome::Allowed,
+            format!(
+                "Device '{}' access restored: {reason}",
+                restored.detail.display_name
+            ),
+            None,
+            None,
+        )?;
+        transaction.commit().map_err(|_| {
+            VibexError::storage(
+                "remote_device_restore_commit_failed",
+                "failed to commit remote device restore",
+            )
+        })?;
+        Ok(restored.detail)
     }
 
     pub fn authorize_action(
@@ -7756,6 +7816,100 @@ mod tests {
             .code,
             "remote_device_unknown"
         );
+    }
+
+    #[test]
+    fn restoring_a_revoked_device_reinstates_the_grant_it_already_holds() {
+        let mut conn = vibex_db::DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let created = RemoteTrustService::create_pairing_code(
+            &conn,
+            RemoteCreatePairingCodeRequest {
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                ttl_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+        let claimed = RemoteTrustService::claim_pairing_code(
+            &conn,
+            RemoteClaimPairingCodeRequest {
+                pairing_code: created.pairing_code,
+                display_name: "Vibex Mobile".to_string(),
+                public_key: Some("pubkey-restore".to_string()),
+            },
+        )
+        .unwrap();
+        let device_id = claimed.device.device_id.clone();
+        RemoteTrustService::revoke_device(
+            &conn,
+            RemoteRevokeDeviceRequest {
+                device_id: device_id.clone(),
+                reason: Some("test revoke".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            RemoteDeviceRepository::get(&conn, &device_id)
+                .unwrap()
+                .unwrap()
+                .detail
+                .status,
+            RemoteDeviceStatus::Revoked
+        );
+
+        // Restoring keeps the stored grant, so the credential the phone already
+        // holds authenticates again without a second pairing.
+        let restored = RemoteTrustService::restore_device(
+            &conn,
+            RemoteRestoreDeviceRequest {
+                device_id: device_id.clone(),
+                reason: Some("restored after review".to_string()),
+            },
+        )
+        .expect("a revoked device restores");
+        assert_eq!(restored.status, RemoteDeviceStatus::Active);
+        assert_eq!(restored.revoked_at_ms, None);
+        assert_eq!(restored.grant_revision, claimed.device.grant_revision + 1);
+        assert!(
+            RemoteTrustService::authenticate(
+                &conn,
+                RemoteAuthProof {
+                    device_id: device_id.clone(),
+                    auth_token: claimed.auth_token,
+                },
+            )
+            .is_ok()
+        );
+
+        // Restoring an active device is not a second revoke undo: it must be
+        // refused rather than silently moving the revision again.
+        assert_eq!(
+            RemoteTrustService::restore_device(
+                &conn,
+                RemoteRestoreDeviceRequest {
+                    device_id,
+                    reason: None,
+                },
+            )
+            .unwrap_err()
+            .code,
+            "remote_device_not_revoked"
+        );
+
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        let restoration = audits
+            .iter()
+            .find(|record| record.action == RemoteAuditAction::DeviceRestored)
+            .expect("restoring a device should be audited");
+        assert!(restoration.redacted_summary.contains("Vibex Mobile"));
     }
 
     #[test]
