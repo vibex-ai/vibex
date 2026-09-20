@@ -262,6 +262,107 @@ impl ComposerSuggestionSelection {
     }
 }
 
+/// A `/command`, `@file` or `$skill` token found in composer text.
+///
+/// The trigger character is part of the range, so a renderer can treat the
+/// whole token as one unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerToken {
+    pub kind: ComposerTriggerKind,
+    /// UTF-8 byte range of the token in the text it was scanned from.
+    pub byte_range: Range<usize>,
+}
+
+/// Characters that end a token. `\r` is deliberately absent: the trigger scan
+/// treats a carriage return as token text, and a renderer must agree with it.
+const COMPOSER_TOKEN_SEPARATORS: [char; 4] = [' ', '\n', '\t', '\u{200b}'];
+
+/// Punctuation a token may be followed by in prose but never ends with. A
+/// mention written as "ask @src/main.rs." highlights the mention, not the
+/// sentence's full stop.
+const COMPOSER_TOKEN_TRAILING_PUNCTUATION: [char; 9] =
+    ['.', ',', ';', ':', '!', '?', ')', ']', '}'];
+
+fn composer_token_kind(character: char) -> Option<ComposerTriggerKind> {
+    match character {
+        '/' => Some(ComposerTriggerKind::Command),
+        '@' => Some(ComposerTriggerKind::File),
+        '$' => Some(ComposerTriggerKind::Skill),
+        _ => None,
+    }
+}
+
+fn composer_token_trigger(kind: ComposerTriggerKind) -> char {
+    match kind {
+        ComposerTriggerKind::Command => '/',
+        ComposerTriggerKind::File => '@',
+        ComposerTriggerKind::Skill => '$',
+    }
+}
+
+fn is_composer_token_separator(character: char) -> bool {
+    COMPOSER_TOKEN_SEPARATORS.contains(&character)
+}
+
+/// The byte range a token occupies once its trailing punctuation is dropped.
+///
+/// `None` when nothing follows the trigger character: a bare `/`, `@` or `$`
+/// opens the suggestion menu at the caret, but highlighting it would mark
+/// every slash in prose.
+fn composer_token_range(text: &str, trigger: usize, end: usize) -> Option<Range<usize>> {
+    let mut trimmed = end;
+    while trimmed > trigger + 1 {
+        let character = text[trigger..trimmed].chars().next_back()?;
+        if !COMPOSER_TOKEN_TRAILING_PUNCTUATION.contains(&character) {
+            break;
+        }
+        trimmed -= character.len_utf8();
+    }
+    (trimmed > trigger + 1).then_some(trigger..trimmed)
+}
+
+/// Every `/`, `@` or `$` token in `text`, in document order.
+///
+/// A token starts at a trigger character that opens the text or follows
+/// whitespace and ends at the next whitespace, which are the same boundaries
+/// [`composer_trigger_at`] reports for the caret. A body that repeats its own
+/// trigger (`/a/b`) is not a token, matching the rule that keeps such text from
+/// opening the suggestion menu at all.
+pub fn composer_tokens(text: &str) -> Vec<ComposerToken> {
+    let mut tokens = Vec::new();
+    let mut open: Option<(usize, ComposerTriggerKind, bool)> = None;
+    let mut previous: Option<char> = None;
+    for (index, character) in text.char_indices() {
+        match open {
+            Some((trigger, kind, repeated)) => {
+                if character == composer_token_trigger(kind) {
+                    open = Some((trigger, kind, true));
+                } else if is_composer_token_separator(character) {
+                    if !repeated
+                        && let Some(byte_range) = composer_token_range(text, trigger, index)
+                    {
+                        tokens.push(ComposerToken { kind, byte_range });
+                    }
+                    open = None;
+                }
+            }
+            None => {
+                if previous.is_none_or(is_composer_token_separator) {
+                    open = composer_token_kind(character).map(|kind| (index, kind, false));
+                }
+            }
+        }
+        previous = Some(character);
+    }
+    if let Some((trigger, kind, repeated)) = open
+        && !repeated
+        && let Some(byte_range) = composer_token_range(text, trigger, text.len())
+    {
+        tokens.push(ComposerToken { kind, byte_range });
+    }
+    tokens
+}
+
 pub fn composer_trigger_at(text: &str, caret_character: usize) -> Option<ComposerTrigger> {
     let characters = text.chars().collect::<Vec<_>>();
     if caret_character > characters.len() {
@@ -368,6 +469,78 @@ mod tests {
 
         let text = "before\r@src";
         assert!(composer_trigger_at(text, text.chars().count()).is_none());
+    }
+
+    #[test]
+    fn tokens_cover_every_trigger_kind_in_document_order() {
+        let text = "/goal @.agents $gpui-kit";
+        let tokens = composer_tokens(text);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| (token.kind, &text[token.byte_range.clone()]))
+                .collect::<Vec<_>>(),
+            vec![
+                (ComposerTriggerKind::Command, "/goal"),
+                (ComposerTriggerKind::File, "@.agents"),
+                (ComposerTriggerKind::Skill, "$gpui-kit"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokens_use_character_boundaries_for_unicode_text() {
+        let text = "修复 @src/文件 的 $技能";
+        let tokens = composer_tokens(text);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| &text[token.byte_range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["@src/文件", "$技能"]
+        );
+    }
+
+    #[test]
+    fn tokens_require_a_boundary_and_a_body() {
+        // A trigger inside a word is not a token, and neither is a bare marker.
+        assert!(composer_tokens("user@example.com").is_empty());
+        assert!(composer_tokens("and/or").is_empty());
+        assert!(composer_tokens("costs $ 5").is_empty());
+        assert!(composer_tokens("/ @ $").is_empty());
+        assert!(composer_tokens("").is_empty());
+        // A newline, a tab and a zero-width space all open a token.
+        assert_eq!(composer_tokens("a\n@src\t$skill\u{200b}/goal").len(), 3);
+    }
+
+    #[test]
+    fn tokens_reject_a_repeated_trigger_and_drop_trailing_punctuation() {
+        assert!(composer_tokens("/review/now").is_empty());
+        assert!(composer_tokens("@src/@test").is_empty());
+        let text = "ask @src/main.rs, then";
+        let tokens = composer_tokens(text);
+        assert_eq!(
+            &text[tokens[0].byte_range.clone()],
+            "@src/main.rs",
+            "the sentence's comma stays outside the token"
+        );
+        // Only whitespace opens a token, which is where the suggestion menu
+        // opens too: a marker glued to a bracket is text, not a trigger.
+        assert!(composer_tokens("(@src/main.rs)").is_empty());
+        let text = "( @src/main.rs )";
+        assert_eq!(
+            &text[composer_tokens(text)[0].byte_range.clone()],
+            "@src/main.rs"
+        );
+    }
+
+    #[test]
+    fn tokens_stop_at_whitespace_and_at_the_end_of_the_text() {
+        let text = "run /goal now @src/lib.rs";
+        let tokens = composer_tokens(text);
+        assert_eq!(&text[tokens[0].byte_range.clone()], "/goal");
+        assert_eq!(&text[tokens[1].byte_range.clone()], "@src/lib.rs");
+        assert_eq!(tokens[1].byte_range.end, text.len());
     }
 
     #[test]

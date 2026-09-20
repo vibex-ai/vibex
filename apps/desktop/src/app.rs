@@ -28,8 +28,8 @@ use gpui::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, Task, TitlebarOptions, Unbind, WeakEntity, Window, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions,
-    deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
-    size,
+    canvas, deferred, div, fill, img, linear_color_stop, linear_gradient, point, prelude::*, px,
+    relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -116,30 +116,31 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
-    ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
-    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
-    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey,
-    GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS,
-    MessageSendKey, NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
-    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
-    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
-    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
-    SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionUiState, SidebarHierarchyMode,
-    SidebarMutationOutcome, SidebarMutationRejection, SidebarOrganizationItem,
-    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
-    SidebarUiState, SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
-    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
-    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
-    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
-    move_strings_relative, ordered_agent_ids, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerToken,
+    ComposerTrigger, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS,
+    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode,
+    FpsMonitorPlacement, GitSelectionKey, GitWorkbenchMode, LocaleMode,
+    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
+    NetworkProxyMode, NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket,
+    NewSessionSubmissionStage, NewSessionWorkspaceState, PreviewWindowMode,
+    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
+    RuntimeCascadeProjection, RuntimeModelFavorite, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS,
+    SessionContentWidthMode, SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome,
+    SidebarMutationRejection, SidebarOrganizationItem, SidebarOrganizationScope,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
+    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
+    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order, composer_tokens,
+    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
@@ -1146,6 +1147,117 @@ fn reveal_composer_cursor_after_layout(input: Entity<TextareaState>, window: &mu
             });
         });
     });
+}
+
+/// How strongly a `/`, `@` or `$` token is tinted inside the composer.
+///
+/// The tint is the text colour itself, so the glyphs keep their exact colour
+/// and only the surface behind them changes. That is what lets one quad over
+/// the text read as a chip under it, and it keeps the contrast between the
+/// chip and the composer surface the same in every theme: the fill is derived
+/// from the ink, not from a surface token a theme may set equal to the
+/// composer's own background.
+const COMPOSER_TOKEN_CHIP_OPACITY: f32 = 0.14;
+/// Rounding of that tint, at the small end of the scale: a token belongs to
+/// the text line, not to the control family around it.
+const COMPOSER_TOKEN_CHIP_RADIUS: f32 = 4.0;
+
+/// Paint the highlight over every `/`, `@` or `$` token a composer shows.
+///
+/// Tokens are ranges inside one editable text rather than elements of their
+/// own: the caret has to move into a token and edit it like any other
+/// character, so the highlight cannot own the glyphs it marks. The textarea is
+/// the only thing that knows where a byte range landed, and it records that
+/// while it paints — which is why this runs from an element that follows the
+/// textarea in the child list and paints over it, rather than from one that
+/// paints under it and would read the previous frame's positions.
+fn paint_composer_token_chips(input: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
+    let chip = cx.theme().foreground.opacity(COMPOSER_TOKEN_CHIP_OPACITY);
+    let chips = {
+        let state = input.read(cx);
+        // The input's own frame, not the slot around it: a scrolled composer
+        // must not paint a chip into the space its text has scrolled out of.
+        composer_token_chip_bounds(state, state.input_bounds())
+    };
+    for bounds in chips {
+        window.paint_quad(fill(bounds, chip).corner_radii(px(COMPOSER_TOKEN_CHIP_RADIUS)));
+    }
+}
+
+/// The element that paints a composer's token highlight.
+///
+/// It must stay after the textarea in the child list: see
+/// [`paint_composer_token_chips`].
+fn composer_token_highlight(input: &Entity<TextareaState>) -> impl IntoElement {
+    let input = input.clone();
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, cx| paint_composer_token_chips(&input, window, cx),
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// The box each `/`, `@` or `$` token occupies, clipped to what is visible.
+fn composer_token_chip_bounds(state: &TextareaState, clip: Bounds<Pixels>) -> Vec<Bounds<Pixels>> {
+    let Some(line_height) = state.line_height() else {
+        return Vec::new();
+    };
+    let text = state.text().to_string();
+    composer_tokens(&text)
+        .iter()
+        .flat_map(|token| composer_token_line_bounds(state, &text, token, line_height))
+        .map(|bounds| bounds.intersect(&clip))
+        .filter(|bounds| bounds.size.width > px(0.0) && bounds.size.height > px(0.0))
+        .collect()
+}
+
+/// One box per visual line a token occupies.
+///
+/// `range_to_bounds` answers with a single box spanning a range's first and
+/// last glyph, which would cover everything between them once a long token
+/// wraps. The longest prefix that still fits on one line is measured first,
+/// then the rest of the token from where that prefix ended, so a wrapped
+/// mention is highlighted on each of its lines instead of boxed across them.
+fn composer_token_line_bounds(
+    state: &TextareaState,
+    text: &str,
+    token: &ComposerToken,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let Some(token_bounds) = state.range_to_bounds(&token.byte_range) else {
+        // Scrolled out of view: nothing to paint, and no per-line work to do.
+        return Vec::new();
+    };
+    if token_bounds.size.height <= line_height + px(0.5) {
+        return vec![token_bounds];
+    }
+    let token_text = &text[token.byte_range.clone()];
+    let single_line = |start: usize, end: usize| {
+        state
+            .range_to_bounds(&(token.byte_range.start + start..token.byte_range.start + end))
+            .filter(|bounds| bounds.size.height <= line_height + px(0.5))
+    };
+    let mut boundaries: Vec<usize> = token_text.char_indices().map(|(index, _)| index).collect();
+    boundaries.push(token_text.len());
+    let mut bounds = Vec::new();
+    let mut first = 0;
+    while first + 1 < boundaries.len() {
+        let (mut low, mut high) = (first + 1, boundaries.len() - 1);
+        let mut last = first + 1;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            if single_line(boundaries[first], boundaries[middle]).is_some() {
+                last = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+        bounds.extend(single_line(boundaries[first], boundaries[last]));
+        first = last;
+    }
+    bounds
 }
 
 fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
@@ -36025,6 +36137,7 @@ impl VibexWorkbench {
                                             .pb_2()
                                             .child(
                                                 div()
+                                                    .relative()
                                                     .flex_1()
                                                     .min_w_0()
                                                     .h_full()
@@ -36165,7 +36278,10 @@ impl VibexWorkbench {
                                                         Textarea::new(&self.new_session_input)
                                                             .appearance(false)
                                                             .h_full(),
-                                                    ),
+                                                    )
+                                                    .child(composer_token_highlight(
+                                                        &self.new_session_input,
+                                                    )),
                                             )
                                     )
                             .child(
@@ -46193,6 +46309,7 @@ impl VibexWorkbench {
                                     .pb_1()
                                     .child(
                                         div()
+                                            .relative()
                                             .min_w_0()
                                             .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                             .flex_1()
@@ -46330,7 +46447,8 @@ impl VibexWorkbench {
                                                     .when(self.composer_expanded, |this| {
                                                         this.h_full()
                                                     }),
-                                            ),
+                                            )
+                                            .child(composer_token_highlight(&self.composer_input)),
                                     )
                                     .child(
                                         v_flex()
@@ -63236,6 +63354,46 @@ mod tests {
         }
     }
 
+    /// Lays a composer textarea out at a chosen size, so the boxes the token
+    /// highlight derives from a real layout can be measured.
+    struct ComposerTokenGeometryProbe {
+        input: Entity<TextareaState>,
+        width: Pixels,
+    }
+
+    impl Render for ComposerTokenGeometryProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(self.width)
+                .h(px(240.0))
+                .child(Textarea::new(&self.input).appearance(false).size_full())
+        }
+    }
+
+    /// The chips a composer would paint for `text`, next to the boxes the
+    /// tokens themselves occupy in the same layout.
+    fn composer_token_geometry(
+        window: &mut Window,
+        cx: &mut App,
+        input: &Entity<TextareaState>,
+        text: &str,
+    ) -> (Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>, Pixels) {
+        input.update(cx, |input, cx| input.set_value(text, window, cx));
+        // The input records its layout while it paints, so a frame has to be
+        // drawn before any byte range has a position.
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+        let state = input.read(cx);
+        let laid_out = state.text().to_string();
+        let expected = composer_tokens(&laid_out)
+            .iter()
+            .filter_map(|token| state.range_to_bounds(&token.byte_range))
+            .collect();
+        let chips = composer_token_chip_bounds(state, state.input_bounds());
+        let line_height = state.line_height().expect("a drawn input has a line");
+        (chips, expected, line_height)
+    }
+
     /// Mirrors the active composer's height chain (workbench → composer root →
     /// surface → input row → input slot → textarea) so the fullscreen input's
     /// editable height can be measured without booting the whole workbench.
@@ -69793,6 +69951,99 @@ mod tests {
                 "the pasted-text cursor should be inside the laid-out viewport"
             );
         });
+    }
+
+    #[gpui::test]
+    fn composer_token_chips_cover_the_tokens_and_not_the_words(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot = Rc::new(RefCell::new(None));
+        let input_slot_for_view = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
+            *input_slot_for_view.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerTokenGeometryProbe {
+                input,
+                // Wide enough that the sample line cannot wrap, whatever font
+                // the test machine resolves, so one chip means one token.
+                width: px(640.0),
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the root view");
+
+        let (chips, tokens, _) = cx.update(|window, cx| {
+            composer_token_geometry(window, cx, &input, "run /goal @.agents $gpui-tool now")
+        });
+        assert_eq!(
+            chips.len(),
+            3,
+            "one chip per token, and none over the plain words"
+        );
+        assert_eq!(
+            chips, tokens,
+            "a chip is exactly the box of the token it marks"
+        );
+        assert!(
+            chips
+                .windows(2)
+                .all(|pair| pair[0].right() < pair[1].left()),
+            "tokens are highlighted in reading order: {chips:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn composer_token_chips_split_a_wrapped_token_by_line(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot = Rc::new(RefCell::new(None));
+        let input_slot_for_view = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 12));
+            *input_slot_for_view.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerTokenGeometryProbe {
+                input,
+                width: px(160.0),
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the root view");
+
+        let mention = format!("@{}", "long/".repeat(12));
+        let (chips, tokens, line_height) = cx.update(|window, cx| {
+            composer_token_geometry(window, cx, &input, &format!("see {mention} please"))
+        });
+        assert_eq!(tokens.len(), 1, "the wrapped mention is still one token");
+        assert!(
+            tokens[0].size.height > line_height * 1.5,
+            "the token really does span several lines: {tokens:?}"
+        );
+        assert!(
+            chips.len() > 1,
+            "a wrapped token is highlighted on every line it occupies: {chips:?}"
+        );
+        assert!(
+            chips
+                .iter()
+                .all(|chip| chip.size.height <= line_height + px(0.5)),
+            "no chip may cover the text between the token's two ends: {chips:?}"
+        );
+        assert!(
+            chips.windows(2).all(|pair| pair[0].top() < pair[1].top()),
+            "the line boxes stack in reading order: {chips:?}"
+        );
+        assert_eq!(
+            (
+                chips.first().map(|chip| chip.left()),
+                chips.last().map(|chip| chip.bottom())
+            ),
+            (Some(tokens[0].left()), Some(tokens[0].bottom())),
+            "the split boxes start and end with the token itself"
+        );
     }
 
     #[test]
