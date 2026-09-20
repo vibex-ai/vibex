@@ -1141,6 +1141,10 @@ pub struct CodeWorkbench {
     preview_revealed_tab_ids: BTreeMap<String, String>,
     pending_file_search_reveal: Option<FileSearchReveal>,
     pending_file_search_directory_reveal: Option<String>,
+    /// A file the Files tree should select once its ancestors are expanded and
+    /// loaded. The tree loads lazily, so a nested path can only be revealed
+    /// after each directory on the way down has landed.
+    pending_file_tree_reveal: Option<String>,
     preview_tab_drop_target: Option<PreviewTabDropTarget>,
     preview_pane_drop_target: Option<PreviewPaneDropTarget>,
     goto_line: Option<GotoLineOverlay>,
@@ -1303,6 +1307,7 @@ impl CodeWorkbench {
             preview_revealed_tab_ids: BTreeMap::new(),
             pending_file_search_reveal: None,
             pending_file_search_directory_reveal: None,
+            pending_file_tree_reveal: None,
             preview_tab_drop_target: None,
             preview_pane_drop_target: None,
             goto_line: None,
@@ -2004,6 +2009,7 @@ impl CodeWorkbench {
         self.preview_revealed_tab_ids.clear();
         self.pending_file_search_reveal = None;
         self.pending_file_search_directory_reveal = None;
+        self.pending_file_tree_reveal = None;
         self.preview_diff_lists.clear();
         self.preview_commit_lists.clear();
         self.preview_commit_focus_requests.clear();
@@ -2874,6 +2880,7 @@ impl CodeWorkbench {
                     &failed_subtrees,
                 ) {
                     this.reconcile_file_selection();
+                    this.continue_file_tree_reveal(cx);
                     cx.notify();
                 }
             });
@@ -2920,6 +2927,7 @@ impl CodeWorkbench {
                         {
                             this.reconcile_file_selection();
                             this.continue_file_search_directory_reveal(cx);
+                            this.continue_file_tree_reveal(cx);
                         }
                         this.note = None;
                     }
@@ -5488,17 +5496,73 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    /// Selects `path` in the Files tree and opens the right rail on it.
+    ///
+    /// A nested file only becomes selectable once every directory above it is
+    /// expanded and loaded, so the request is parked and walked down the chain
+    /// the same way the file-search reveal does.
     fn reveal_file_in_right_rail(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(path) = normalized_relative_path(&path) else {
             return;
         };
         self.selected_file_path = Some(path.clone());
-        self.file_tree.select(&path, false, false);
+        self.pending_file_tree_reveal = Some(path);
+        self.continue_file_tree_reveal(cx);
         self.persist(cx);
         if let Some(parent) = self.parent.clone() {
             cx.defer(move |cx| {
                 let _ = parent.update(cx, |parent, cx| parent.reveal_file_in_right_rail(cx));
             });
+        }
+        cx.notify();
+    }
+
+    /// Advances a parked Files-tree reveal as far as the loaded tree allows.
+    ///
+    /// Runs again from the tree load completion, so each missing ancestor is
+    /// fetched in turn until the file can be selected or the tree proves it
+    /// does not contain it.
+    fn continue_file_tree_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_file_tree_reveal.clone() else {
+            return;
+        };
+        // The chain is the file's parent directories, prefixed with the empty
+        // root path so a collapsed root is opened too. Feeding the file path
+        // itself to `set_chain_expanded` would fail: the last entry is not a
+        // directory, and one bad entry rejects the whole chain.
+        let mut path_chain = vec![String::new()];
+        path_chain.extend(relative_directory_path_chain(relative_parent_path(&path)));
+        let loaded_chain = path_chain
+            .iter()
+            .take_while(|candidate| self.file_tree.contains_path(candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.file_tree.contains_path(&path) {
+            self.file_tree.set_chain_expanded(&path_chain, true);
+            self.file_tree.clear_selected_directory();
+            self.file_tree.select(&path, false, false);
+            if let Some(index) = self.file_tree.visible_row_position(&path) {
+                self.file_scroll
+                    .scroll_to_item(index, gpui::ScrollStrategy::Center);
+            }
+            self.pending_file_tree_reveal = None;
+            cx.notify();
+            return;
+        }
+        if !loaded_chain.is_empty() {
+            self.file_tree.set_chain_expanded(&loaded_chain, true);
+        }
+        let base = loaded_chain.last().cloned().unwrap_or_default();
+        match self.file_tree.load_state(&base) {
+            FileTreeLoadState::Loaded => {
+                // The deepest directory that exists is already loaded and the
+                // file is still missing, so the workspace does not have it.
+                self.pending_file_tree_reveal = None;
+            }
+            FileTreeLoadState::Loading => {}
+            FileTreeLoadState::Unloaded | FileTreeLoadState::Error { .. } => {
+                self.load_tree_path(base, cx);
+            }
         }
         cx.notify();
     }
@@ -18454,5 +18518,163 @@ mod tests {
             vec!["git:unstaged:src/lib.rs"]
         );
         assert_eq!(parked_tabs("session-elsewhere", cx), vec!["file:README.md"]);
+    }
+
+    #[gpui::test]
+    fn reveal_opens_the_ancestors_of_a_nested_file_before_selecting_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workbench, cx) = fixture_workbench(cx);
+        // `assets` is loaded but collapsed, so its child is not a visible row
+        // even though the node exists.
+        workbench.update(cx, |this, cx| {
+            this.file_tree
+                .set_chain_expanded(&["assets".to_string()], false);
+            this.reveal_file_in_right_rail("assets/workbench.png".to_string(), cx);
+        });
+
+        workbench.read_with(cx, |this, _| {
+            assert!(this.pending_file_tree_reveal.is_none());
+            assert!(this.file_tree.is_expanded("assets"));
+            assert!(
+                this.file_tree
+                    .selected_paths()
+                    .contains("assets/workbench.png")
+            );
+            assert!(
+                this.file_tree
+                    .visible_row_position("assets/workbench.png")
+                    .is_some()
+            );
+            assert_eq!(
+                this.selected_file_path.as_deref(),
+                Some("assets/workbench.png")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_waits_for_the_directories_of_a_deeper_file_to_load(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        workbench.update(cx, |this, cx| {
+            this.reveal_file_in_right_rail("src/nested/deep/file.rs".to_string(), cx);
+        });
+
+        workbench.read_with(cx, |this, _| {
+            // The file is not in the loaded tree, so the request parks and the
+            // part of the chain the tree already knows opens instead.
+            assert_eq!(
+                this.pending_file_tree_reveal.as_deref(),
+                Some("src/nested/deep/file.rs")
+            );
+            assert!(this.file_tree.is_expanded("src"));
+            assert!(
+                !this
+                    .file_tree
+                    .selected_paths()
+                    .contains("src/nested/deep/file.rs")
+            );
+            assert_eq!(
+                this.selected_file_path.as_deref(),
+                Some("src/nested/deep/file.rs")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_selects_a_deep_file_once_its_directory_loads(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        workbench.update(cx, |this, cx| {
+            this.reveal_file_in_right_rail("src/nested/file.rs".to_string(), cx);
+        });
+
+        // Each load completion retries the parked reveal: first the parent
+        // listing lands the nested directory, then its own listing lands the
+        // file, and only then can the tree select it.
+        let workspace_id = workbench.read_with(cx, |this, _| {
+            this.workspace
+                .as_ref()
+                .expect("fixture workspace")
+                .id
+                .clone()
+        });
+        let entry = |path: &str, name: &str, parent: &str, kind| FileTreeEntry {
+            workspace_id: workspace_id.clone(),
+            path: path.to_string(),
+            name: name.to_string(),
+            parent_path: Some(parent.to_string()),
+            kind,
+            size_bytes: None,
+            modified_at_ms: Some(1),
+            hidden: false,
+            ignored: false,
+        };
+        let load_directory = |workbench: &Entity<CodeWorkbench>,
+                              base: &str,
+                              entries: Vec<FileTreeEntry>,
+                              cx: &mut gpui::VisualTestContext| {
+            workbench.update(cx, |this, cx| {
+                let ticket = this.file_tree.begin_load(base);
+                assert!(
+                    this.file_tree
+                        .apply_entries(&workspace_id, ticket, base, entries)
+                );
+                this.continue_file_tree_reveal(cx);
+            });
+        };
+        load_directory(
+            &workbench,
+            "src",
+            vec![entry(
+                "src/nested",
+                "nested",
+                "src",
+                FileEntryKind::Directory,
+            )],
+            cx,
+        );
+        load_directory(
+            &workbench,
+            "src/nested",
+            vec![entry(
+                "src/nested/file.rs",
+                "file.rs",
+                "src/nested",
+                FileEntryKind::File,
+            )],
+            cx,
+        );
+
+        workbench.read_with(cx, |this, _| {
+            assert!(this.pending_file_tree_reveal.is_none());
+            assert!(this.file_tree.is_expanded("src/nested"));
+            assert!(
+                this.file_tree
+                    .selected_paths()
+                    .contains("src/nested/file.rs")
+            );
+            assert!(
+                this.file_tree
+                    .visible_row_position("src/nested/file.rs")
+                    .is_some()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reveal_uncollapses_the_root_for_a_top_level_file(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        workbench.update(cx, |this, cx| {
+            this.file_tree.toggle_expanded("");
+            assert!(!this.file_tree.is_expanded(""));
+            this.reveal_file_in_right_rail("README.md".to_string(), cx);
+        });
+
+        workbench.read_with(cx, |this, _| {
+            assert!(this.pending_file_tree_reveal.is_none());
+            assert!(this.file_tree.is_expanded(""));
+            assert!(this.file_tree.selected_paths().contains("README.md"));
+            assert!(this.file_tree.visible_row_position("README.md").is_some());
+        });
     }
 }
