@@ -600,6 +600,35 @@ impl FileTreeProjection {
         true
     }
 
+    /// Replace the expanded directories and the selected directory segment.
+    ///
+    /// A restore may run before the workspace entries are loaded. Paths that
+    /// are not directories of the current tree are pruned by the next refresh,
+    /// so a restore never invents rows that the workspace does not have.
+    pub fn restore_navigation_state(
+        &mut self,
+        expanded_paths: impl IntoIterator<Item = String>,
+        selected_directory_path: Option<String>,
+    ) -> bool {
+        let expanded_paths = expanded_paths
+            .into_iter()
+            .map(|path| normalize_relative_path(&path))
+            .filter(|path| !path.is_empty())
+            .collect::<BTreeSet<_>>();
+        let selected_directory_path = selected_directory_path
+            .map(|path| normalize_relative_path(&path))
+            .filter(|path| !path.is_empty());
+        if self.expanded_paths == expanded_paths
+            && self.selected_directory_path == selected_directory_path
+        {
+            return false;
+        }
+        self.expanded_paths = expanded_paths;
+        self.selected_directory_path = selected_directory_path;
+        self.rebuild_visible_rows();
+        true
+    }
+
     pub fn select_directory_segment(&mut self, path: &str, path_chain: &[String]) -> bool {
         let path = normalize_relative_path(path);
         let normalized_chain = path_chain
@@ -1346,6 +1375,59 @@ mod tests {
         assert!(tree.toggle_expanded("src"));
         assert_eq!(tree.visible_row_count(), 4);
         assert_eq!(tree.visible_window(2, 1, 0)[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn restoring_navigation_state_survives_a_later_load_and_prunes_unknown_paths() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+
+        // A restore can run before the workspace entries arrive.
+        assert!(tree.restore_navigation_state(
+            ["src".to_string(), "gone".to_string()],
+            Some("src".to_string()),
+        ));
+        assert!(tree.is_expanded("src"));
+        assert!(tree.is_expanded("gone"));
+        assert_eq!(tree.selected_directory_path(), Some("src"));
+
+        let generation = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            generation,
+            "",
+            vec![
+                entry(&workspace_id, "src", FileEntryKind::Directory),
+                entry(&workspace_id, "README.md", FileEntryKind::File),
+            ],
+        ));
+
+        // The refresh prunes what the workspace does not have.
+        let refresh = tree.begin_refresh();
+        assert!(tree.apply_refresh_entries(
+            &workspace_id,
+            refresh,
+            vec![
+                entry(&workspace_id, "src", FileEntryKind::Directory),
+                entry(&workspace_id, "README.md", FileEntryKind::File),
+            ],
+            &[],
+        ));
+        assert!(tree.is_expanded("src"));
+        assert!(!tree.is_expanded("gone"));
+        assert_eq!(tree.selected_directory_path(), Some("src"));
+    }
+
+    #[test]
+    fn restoring_navigation_state_reports_no_change_for_the_same_state() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+        assert!(tree.restore_navigation_state(["src".to_string()], None));
+        assert!(!tree.restore_navigation_state(["src".to_string()], None));
+        assert!(tree.restore_navigation_state(Vec::new(), None));
+        assert!(tree.expanded_directory_paths().is_empty());
     }
 
     #[test]

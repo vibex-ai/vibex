@@ -69,11 +69,12 @@ use vibex_desktop_model::{
     EditorBufferAvailability, EditorBufferRegistry, EditorExternalState, EditorRecoverySnapshot,
     FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind, FileMutationKind, FileTreeLoadState,
     FileTreeProjection, GitCommitPatchRow, GitMutationKind, GitPathSelectionState, GitQueryKind,
-    GitSelectionKey, GitTreeRow, GitTreeRowKind, GitWorkbenchMode, GitWorkbenchState,
-    ImageCacheKey, PendingFileMutation, PreviewCloseDisposition, PreviewPane, PreviewSplitNode,
-    PreviewSplitPosition, PreviewState, PreviewTab, PreviewTarget, UnifiedDiffLineKind,
-    WorktreeLifecycleDisplayState, WorktreeLifecycleView, clamp_editor_autosave_delay_ms,
-    content_preview_kind, content_preview_kind_for_path, file_icon_descriptor, mutation_scope,
+    GitSelectionKey, GitTreeRow, GitTreeRowKind, GitWorkbenchMode, GitWorkbenchPresentation,
+    GitWorkbenchState, ImageCacheKey, PendingFileMutation, PreviewCloseDisposition, PreviewPane,
+    PreviewSplitNode, PreviewSplitPosition, PreviewState, PreviewTab, PreviewTarget,
+    UnifiedDiffLineKind, WorktreeLifecycleDisplayState, WorktreeLifecycleView,
+    clamp_editor_autosave_delay_ms, content_preview_kind, content_preview_kind_for_path,
+    file_icon_descriptor, mutation_scope,
 };
 use vibex_desktop_runtime::validate_external_open_url;
 use vibex_markdown::{
@@ -385,17 +386,55 @@ struct PendingWorkspace {
     backend: BackendFacade,
     id: WorkspaceId,
     root: PathBuf,
-    preview_owner: Option<String>,
+    state_owner: Option<String>,
 }
 
-/// A multi-tab preview layout parked for a session that is not selected.
-#[derive(Clone)]
-struct ParkedPreviewLayout {
+/// Presentation state of the right-hand integrated panel for one workspace
+/// state scope.
+///
+/// It holds what the panel is showing and what it has selected, not the loaded
+/// status, history, or diffs: those are read for the workspace on screen and
+/// stay shared by every scope looking at it.
+#[derive(Clone, Default)]
+struct PanelPresentationState {
+    selected_file_path: Option<String>,
+    selected_git_path: Option<String>,
+    selected_terminal_id: Option<String>,
+    git: GitWorkbenchPresentation,
+    file_tree_expanded_paths: BTreeSet<String>,
+    file_tree_selected_directory: Option<String>,
+    file_scroll: Option<(f32, f32)>,
+    git_scroll: Option<(f32, f32)>,
+    preview_tab_scrolls: BTreeMap<String, ScrollHandle>,
+    markdown_scrolls: BTreeMap<String, ScrollHandle>,
+}
+
+impl PanelPresentationState {
+    /// Whether the panel carries anything a scope would notice on return.
+    fn is_empty(&self) -> bool {
+        self.selected_file_path.is_none()
+            && self.selected_git_path.is_none()
+            && self.selected_terminal_id.is_none()
+            && self.git == GitWorkbenchPresentation::default()
+            && self.file_tree_expanded_paths.is_empty()
+            && self.file_tree_selected_directory.is_none()
+            && self.file_scroll.is_none()
+            && self.git_scroll.is_none()
+            && self.preview_tab_scrolls.is_empty()
+            && self.markdown_scrolls.is_empty()
+    }
+}
+
+/// The right-hand column parked for a workspace state scope that is not
+/// selected: the multi-tab preview and the integrated panel that shows it.
+#[derive(Clone, Default)]
+struct ParkedStateLayout {
     /// Workspace the layout's relative paths belong to. `None` for a layout
-    /// restored from persistence, which stores layouts only; adopting and
+    /// restored from persistence, which stores previews only; adopting and
     /// parking it again records the workspace.
     workspace_id: Option<String>,
-    layout: PreviewState,
+    preview: PreviewState,
+    panel: PanelPresentationState,
 }
 
 #[derive(Clone)]
@@ -1025,12 +1064,12 @@ pub struct CodeWorkbench {
     /// Agent session that owns the live `preview` layout. `None` means the
     /// workbench is not showing a session: the layout then belongs to the
     /// workspace on screen and is not parked under anyone's key.
-    preview_owner: Option<String>,
+    state_owner: Option<String>,
     /// Multi-tab preview layouts parked for the sessions that are not
     /// selected. Parking keeps a session's tabs when another session's
     /// workspace takes over the preview surface, and never contains
     /// `preview_owner`'s key.
-    parked_previews: BTreeMap<String, ParkedPreviewLayout>,
+    parked_states: BTreeMap<String, ParkedStateLayout>,
     /// Bumped whenever the preview surface changes owner, so a queued
     /// hydration pass cannot read the previous session's tabs into the new one.
     preview_layout_generation: u64,
@@ -1199,8 +1238,8 @@ impl CodeWorkbench {
             file_tree: FileTreeProjection::default(),
             git: GitWorkbenchState::default(),
             preview,
-            preview_owner: None,
-            parked_previews: BTreeMap::new(),
+            state_owner: None,
+            parked_states: BTreeMap::new(),
             preview_layout_generation: 0,
             preview_panel_fullscreen: false,
             preview_detached: false,
@@ -1711,11 +1750,11 @@ impl CodeWorkbench {
         preview.fullscreen_tab_id = None;
         preview.normalize();
         let mut preview_layouts = self
-            .parked_previews
+            .parked_states
             .iter()
-            .map(|(owner, parked)| (owner.clone(), parked.layout.clone()))
+            .map(|(owner, parked)| (owner.clone(), parked.preview.clone()))
             .collect::<BTreeMap<_, _>>();
-        if let Some(owner) = self.preview_owner.as_ref()
+        if let Some(owner) = self.state_owner.as_ref()
             && !preview.is_empty()
         {
             preview_layouts.insert(owner.clone(), preview.clone());
@@ -1893,7 +1932,7 @@ impl CodeWorkbench {
     pub fn restore_persisted_state(
         &mut self,
         mut preview: PreviewState,
-        preview_owner: Option<String>,
+        state_owner: Option<String>,
         mut parked_previews: BTreeMap<String, PreviewState>,
         recovery: EditorRecoverySnapshot,
         workspace_id: Option<String>,
@@ -1913,21 +1952,22 @@ impl CodeWorkbench {
         preview.fullscreen_tab_id = None;
         let mut editors = EditorBufferRegistry::default();
         editors.restore_recovery(recovery);
-        if let Some(owner) = preview_owner.as_ref() {
+        if let Some(owner) = state_owner.as_ref() {
             // `preview` is the owner's live layout; the parked map must never
             // hold a second copy of it.
             parked_previews.remove(owner);
         }
         self.preview = preview;
-        self.preview_owner = preview_owner;
-        self.parked_previews = parked_previews
+        self.state_owner = state_owner;
+        self.parked_states = parked_previews
             .into_iter()
-            .map(|(owner, layout)| {
+            .map(|(owner, preview)| {
                 (
                     owner,
-                    ParkedPreviewLayout {
+                    ParkedStateLayout {
                         workspace_id: None,
-                        layout,
+                        preview,
+                        panel: PanelPresentationState::default(),
                     },
                 )
             })
@@ -1957,13 +1997,10 @@ impl CodeWorkbench {
 
     /// Drop every surface keyed by a preview tab id.
     ///
-    /// Tab-keyed caches, scroll handles, and reveal requests belong to the
-    /// layout that is on screen. Swapping layouts must clear them so an adopted
-    /// layout re-reads its own files, diffs, commits, and terminals instead of
-    /// showing the previous layout's state.
+    /// Tab-keyed caches and reveal requests belong to the layout that is on
+    /// screen. Swapping scopes must clear them so an adopted layout re-reads
+    /// its own diffs and commits instead of showing the previous one's state.
     fn reset_preview_surface_state(&mut self) {
-        self.preview_tab_scrolls.clear();
-        self.markdown_scrolls.clear();
         self.preview_revealed_tab_ids.clear();
         self.pending_file_search_reveal = None;
         self.pending_file_search_directory_reveal = None;
@@ -1973,41 +2010,108 @@ impl CodeWorkbench {
         self.git_preview_errors.clear();
     }
 
-    /// Park the live layout under its owner, or drop it when no session owns it.
-    fn park_live_preview_layout(&mut self) {
-        let Some(owner) = self.preview_owner.take() else {
-            self.preview = PreviewState::default();
-            return;
-        };
-        let mut layout = std::mem::take(&mut self.preview);
-        // Fullscreen is a view state of the panel, not of the parked layout.
-        layout.fullscreen_tab_id = None;
-        if !layout.is_empty() {
-            let workspace_id = self
-                .workspace
-                .as_ref()
-                .map(|workspace| workspace.id.as_str().to_string());
-            self.parked_previews.insert(
-                owner,
-                ParkedPreviewLayout {
-                    workspace_id,
-                    layout,
-                },
-            );
+    /// Snapshot the integrated panel for the scope that is leaving the screen.
+    fn capture_panel_presentation(&mut self) -> PanelPresentationState {
+        PanelPresentationState {
+            selected_file_path: self.selected_file_path.clone(),
+            selected_git_path: self.selected_git_path.clone(),
+            selected_terminal_id: self.selected_terminal_id.clone(),
+            git: self.git.presentation_snapshot(),
+            file_tree_expanded_paths: self
+                .file_tree
+                .expanded_directory_paths()
+                .into_iter()
+                .collect(),
+            file_tree_selected_directory: self
+                .file_tree
+                .selected_directory_path()
+                .map(str::to_string),
+            file_scroll: scroll_offset(&self.file_scroll),
+            git_scroll: scroll_offset(&self.git_scroll),
+            preview_tab_scrolls: std::mem::take(&mut self.preview_tab_scrolls),
+            markdown_scrolls: std::mem::take(&mut self.markdown_scrolls),
         }
     }
 
-    /// Take the layout parked for the current owner, or start empty.
-    fn take_parked_preview_layout(&mut self) -> PreviewState {
-        self.preview_owner
+    /// Install a parked integrated panel.
+    ///
+    /// Returns the commit whose detail has to be re-read for the restored
+    /// selection. Everything else is presentation state the loaded workspace
+    /// data reconciles with on its next refresh.
+    fn apply_panel_presentation(&mut self, panel: PanelPresentationState) -> Option<String> {
+        self.selected_file_path = panel.selected_file_path;
+        self.selected_git_path = panel.selected_git_path;
+        self.selected_terminal_id = panel.selected_terminal_id;
+        self.git.restore_presentation(panel.git);
+        self.file_tree.restore_navigation_state(
+            panel.file_tree_expanded_paths,
+            panel.file_tree_selected_directory,
+        );
+        if let Some((x, y)) = panel.file_scroll {
+            set_scroll_offset(&self.file_scroll, x, y);
+        }
+        if let Some((x, y)) = panel.git_scroll {
+            set_scroll_offset(&self.git_scroll, x, y);
+        }
+        self.preview_tab_scrolls = panel.preview_tab_scrolls;
+        self.markdown_scrolls = panel.markdown_scrolls;
+        self.git
+            .presentation_snapshot()
+            .selected_commit_hash
+            .filter(|hash| !self.git.commit_patch_ready(hash))
+    }
+
+    /// Park the live right-hand column under its scope, or drop it when no
+    /// session owns it.
+    fn park_state_layout(&mut self) {
+        let Some(owner) = self.state_owner.take() else {
+            self.preview = PreviewState::default();
+            self.reset_panel_presentation();
+            return;
+        };
+        let mut preview = std::mem::take(&mut self.preview);
+        // Fullscreen is a view state of the panel, not of the parked layout.
+        preview.fullscreen_tab_id = None;
+        let panel = self.capture_panel_presentation();
+        if preview.is_empty() && panel.is_empty() {
+            return;
+        }
+        let workspace_id = self
+            .workspace
             .as_ref()
-            .and_then(|owner| self.parked_previews.remove(owner))
-            .map(|parked| parked.layout)
+            .map(|workspace| workspace.id.as_str().to_string());
+        self.parked_states.insert(
+            owner,
+            ParkedStateLayout {
+                workspace_id,
+                preview,
+                panel,
+            },
+        );
+    }
+
+    /// Take the right-hand column parked for the current scope, or start empty.
+    fn take_parked_state_layout(&mut self) -> ParkedStateLayout {
+        self.state_owner
+            .as_ref()
+            .and_then(|owner| self.parked_states.remove(owner))
             .unwrap_or_default()
     }
 
+    /// Return the integrated panel to a fresh workspace's defaults.
+    fn reset_panel_presentation(&mut self) {
+        self.selected_file_path = None;
+        self.selected_git_path = None;
+        self.selected_terminal_id = None;
+        self.git
+            .restore_presentation(GitWorkbenchPresentation::default());
+        self.file_tree.restore_navigation_state(Vec::new(), None);
+        self.preview_tab_scrolls.clear();
+        self.markdown_scrolls.clear();
+    }
+
     /// Apply a file rename or delete to the parked layouts of the current
-    /// workspace, so a parked session's tabs keep naming real files without
+    /// workspace, so a parked scope's tabs keep naming real files without
     /// touching the identically named paths of another workspace.
     fn update_parked_previews_of_current_workspace(
         &mut self,
@@ -2020,37 +2124,63 @@ impl CodeWorkbench {
         else {
             return;
         };
-        for parked in self.parked_previews.values_mut() {
+        for parked in self.parked_states.values_mut() {
             if parked.workspace_id.as_deref() == Some(workspace_id.as_str()) {
-                update(&mut parked.layout);
+                update(&mut parked.preview);
             }
         }
     }
 
-    /// Hand the preview surface to `owner`, keeping the tabs of both sessions.
-    fn switch_preview_owner(&mut self, owner: Option<String>, cx: &mut Context<Self>) {
-        if self.preview_owner == owner {
+    /// Hand the right-hand column to `owner`, keeping the tabs and panel of
+    /// both scopes.
+    fn switch_state_owner(&mut self, owner: Option<String>, cx: &mut Context<Self>) {
+        if self.state_owner == owner {
             return;
         }
         // A layout opened while no session owned the preview belongs to the
         // workspace on screen. An incoming session of that same workspace
         // adopts it when it has nothing parked of its own, so opening a file
         // before a session exists does not close it afterwards.
-        let unowned = (self.preview_owner.is_none() && owner.is_some())
-            .then(|| std::mem::take(&mut self.preview))
-            .filter(|layout| !layout.is_empty());
-        self.park_live_preview_layout();
-        self.preview_owner = owner;
-        self.preview = self.take_parked_preview_layout();
-        if self.preview.is_empty()
-            && let Some(mut unowned) = unowned
-        {
-            unowned.fullscreen_tab_id = None;
-            self.preview = unowned;
+        let unowned = (self.state_owner.is_none() && owner.is_some()).then(|| {
+            (
+                std::mem::take(&mut self.preview),
+                self.capture_panel_presentation(),
+            )
+        });
+        self.park_state_layout();
+        self.state_owner = owner;
+        let parked = self.take_parked_state_layout();
+        self.preview = parked.preview;
+        let mut panel = parked.panel;
+        if let Some((mut unowned_preview, unowned_panel)) = unowned {
+            if self.preview.is_empty() && !unowned_preview.is_empty() {
+                unowned_preview.fullscreen_tab_id = None;
+                self.preview = unowned_preview;
+            }
+            if panel.is_empty() {
+                panel = unowned_panel;
+            }
         }
         self.preview_layout_generation = self.preview_layout_generation.wrapping_add(1);
         self.reset_preview_surface_state();
+        let commit = self.apply_panel_presentation(panel);
+        if let Some(hash) = commit {
+            self.load_commit_detail(hash, cx);
+        }
         self.restore_hydration_scheduled = false;
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Re-key the right-hand column after the workspace state scope setting
+    /// changed.
+    ///
+    /// Every parked column was keyed by the previous scope, so none of them can
+    /// be matched to a scope under the new one. The live column stays on screen
+    /// and becomes the selected session's state under the new key.
+    pub(crate) fn reset_state_scopes(&mut self, owner: Option<String>, cx: &mut Context<Self>) {
+        self.parked_states.clear();
+        self.state_owner = owner;
         self.persist(cx);
         cx.notify();
     }
@@ -2060,7 +2190,7 @@ impl CodeWorkbench {
         backend: BackendFacade,
         workspace_id: WorkspaceId,
         root: PathBuf,
-        preview_owner: Option<String>,
+        state_owner: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -2070,8 +2200,8 @@ impl CodeWorkbench {
         {
             self.backend = Some(backend);
             // Two sessions can share one workspace, so a session switch must
-            // move the preview layout even when the workspace does not move.
-            self.switch_preview_owner(preview_owner, cx);
+            // move the right-hand column even when the workspace does not move.
+            self.switch_state_owner(state_owner, cx);
             return;
         }
         if self.editors.dirty_paths().next().is_some() && self.workspace.is_some() {
@@ -2079,7 +2209,7 @@ impl CodeWorkbench {
                 backend,
                 id: workspace_id,
                 root,
-                preview_owner,
+                state_owner,
             });
             self.error = Some(
                 "Workspace switch is waiting because one or more editor buffers are dirty"
@@ -2088,7 +2218,7 @@ impl CodeWorkbench {
             cx.notify();
             return;
         }
-        self.apply_workspace(backend, workspace_id, root, preview_owner, cx);
+        self.apply_workspace(backend, workspace_id, root, state_owner, cx);
     }
 
     /// Installs the raw-terminal rendering transport.
@@ -2143,7 +2273,7 @@ impl CodeWorkbench {
             pending.backend,
             pending.id,
             pending.root,
-            pending.preview_owner,
+            pending.state_owner,
             cx,
         );
     }
@@ -2153,29 +2283,34 @@ impl CodeWorkbench {
         backend: BackendFacade,
         workspace_id: WorkspaceId,
         root: PathBuf,
-        preview_owner: Option<String>,
+        state_owner: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.persist(cx);
-        // The startup restore already installed the selected session's layout,
-        // so re-entering its workspace must not park and re-adopt it.
+        // The startup restore already installed the selected scope's layout, so
+        // re-entering its workspace must not park and re-adopt it.
         let preserve_restored = self.workspace.is_none()
             && self.restored_workspace_id.as_deref() == Some(workspace_id.as_str())
-            && self.preview_owner == preview_owner;
+            && self.state_owner == state_owner;
+        // The adopted panel is installed after the workspace resets below, so
+        // the incoming scope's expanded directories and Git view survive them.
+        let mut adopted_panel = None;
         if !preserve_restored {
-            // The outgoing session keeps its tabs: park them before the
+            // The outgoing scope keeps its tabs and panel: park them before the
             // teardown below drops every surface they depend on, then adopt the
-            // incoming session's parked layout. A workspace that changes under
-            // the same owner keeps its parked layout for the next switch back
+            // incoming scope's parked column. A workspace that changes under the
+            // same scope keeps its parked column for the next switch back
             // instead of rendering it against the new workspace.
-            let owner_changed = self.preview_owner != preview_owner;
-            self.park_live_preview_layout();
-            self.preview_owner = preview_owner;
-            self.preview = if owner_changed {
-                self.take_parked_preview_layout()
+            let owner_changed = self.state_owner != state_owner;
+            self.park_state_layout();
+            self.state_owner = state_owner;
+            let parked = if owner_changed {
+                self.take_parked_state_layout()
             } else {
-                PreviewState::default()
+                ParkedStateLayout::default()
             };
+            self.preview = parked.preview;
+            adopted_panel = Some(parked.panel);
             self.preview_layout_generation = self.preview_layout_generation.wrapping_add(1);
             self.set_preview_panel_fullscreen(false, cx);
             self.editors = EditorBufferRegistry::default();
@@ -2231,8 +2366,29 @@ impl CodeWorkbench {
         self.git.reset_workspace(workspace_id);
         self.error = None;
         self.note = Some("Workspace files and Git state are loading".to_string());
+        let restored_expanded_paths = adopted_panel
+            .as_ref()
+            .map(|panel| {
+                panel
+                    .file_tree_expanded_paths
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let restored_commit = adopted_panel
+            .map(|panel| self.apply_panel_presentation(panel))
+            .flatten();
         self.load_tree(cx);
+        // A restored expansion needs its own listing; the root load only walks
+        // the first few levels.
+        for path in restored_expanded_paths {
+            self.load_tree_path(path, cx);
+        }
         self.refresh_git(cx);
+        if let Some(hash) = restored_commit {
+            self.load_commit_detail(hash, cx);
+        }
         self.load_workspace_terminals(backend, cx);
         self.start_workspace_polling(cx);
         self.persist(cx);
@@ -16361,6 +16517,25 @@ fn preview_target_references_path(target: &PreviewTarget, path: &str) -> bool {
     }
 }
 
+/// Read a uniform list's scroll offset as logical pixels.
+fn scroll_offset(handle: &UniformListScrollHandle) -> Option<(f32, f32)> {
+    let offset = handle.0.borrow().base_handle.offset();
+    let (x, y) = (f32::from(offset.x), f32::from(offset.y));
+    (x != 0.0 || y != 0.0).then_some((x, y))
+}
+
+/// Restore a uniform list's scroll offset.
+///
+/// A list that has not been laid out yet clamps the offset, which is the
+/// expected outcome when a scope is adopted together with its workspace.
+fn set_scroll_offset(handle: &UniformListScrollHandle, x: f32, y: f32) {
+    handle
+        .0
+        .borrow()
+        .base_handle
+        .set_offset(point(px(x), px(y)));
+}
+
 fn worktree_lifecycle_state_label(state: WorktreeLifecycleDisplayState) -> &'static str {
     match state {
         WorktreeLifecycleDisplayState::Working => locale::text("Working", "开发中", "開發中"),
@@ -17995,14 +18170,14 @@ mod tests {
         workbench: &Entity<CodeWorkbench>,
         cx: &mut gpui::VisualTestContext,
     ) -> Vec<String> {
-        workbench.read_with(cx, |this, _| this.parked_previews.keys().cloned().collect())
+        workbench.read_with(cx, |this, _| this.parked_states.keys().cloned().collect())
     }
 
     #[gpui::test]
     fn preview_layouts_follow_the_owning_session(cx: &mut gpui::TestAppContext) {
         let (workbench, cx) = fixture_workbench(cx);
         workbench.update(cx, |this, _| {
-            this.preview_owner = Some("session-a".to_string());
+            this.state_owner = Some("session-a".to_string());
         });
         assert_eq!(
             preview_tab_ids(&workbench, cx),
@@ -18010,13 +18185,13 @@ mod tests {
         );
 
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-b".to_string()), cx);
+            this.switch_state_owner(Some("session-b".to_string()), cx);
         });
         assert!(preview_tab_ids(&workbench, cx).is_empty());
         assert_eq!(parked_owners(&workbench, cx), vec!["session-a".to_string()]);
         assert_eq!(
-            workbench.read_with(cx, |this, _| this.parked_previews["session-a"]
-                .layout
+            workbench.read_with(cx, |this, _| this.parked_states["session-a"]
+                .preview
                 .tabs
                 .keys()
                 .cloned()
@@ -18026,7 +18201,7 @@ mod tests {
 
         open_preview_tab(&workbench, "README.md", cx);
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-a".to_string()), cx);
+            this.switch_state_owner(Some("session-a".to_string()), cx);
         });
         assert_eq!(
             preview_tab_ids(&workbench, cx),
@@ -18034,8 +18209,8 @@ mod tests {
         );
         assert_eq!(parked_owners(&workbench, cx), vec!["session-b".to_string()]);
         assert_eq!(
-            workbench.read_with(cx, |this, _| this.parked_previews["session-b"]
-                .layout
+            workbench.read_with(cx, |this, _| this.parked_states["session-b"]
+                .preview
                 .tabs
                 .keys()
                 .cloned()
@@ -18048,10 +18223,10 @@ mod tests {
     fn persisted_preview_state_carries_every_session_layout(cx: &mut gpui::TestAppContext) {
         let (workbench, cx) = fixture_workbench(cx);
         workbench.update(cx, |this, _| {
-            this.preview_owner = Some("session-a".to_string());
+            this.state_owner = Some("session-a".to_string());
         });
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-b".to_string()), cx);
+            this.switch_state_owner(Some("session-b".to_string()), cx);
         });
         open_preview_tab(&workbench, "README.md", cx);
 
@@ -18086,11 +18261,11 @@ mod tests {
         let (workbench, cx) = fixture_workbench(cx);
         assert!(!preview_tab_ids(&workbench, cx).is_empty());
         workbench.update(cx, |this, _| {
-            assert!(this.preview_owner.is_none());
-            this.park_live_preview_layout();
+            assert!(this.state_owner.is_none());
+            this.park_state_layout();
         });
         assert!(preview_tab_ids(&workbench, cx).is_empty());
-        assert!(workbench.read_with(cx, |this, _| this.parked_previews.is_empty()));
+        assert!(workbench.read_with(cx, |this, _| this.parked_states.is_empty()));
     }
 
     #[gpui::test]
@@ -18099,7 +18274,7 @@ mod tests {
     ) {
         let (workbench, cx) = fixture_workbench(cx);
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-a".to_string()), cx);
+            this.switch_state_owner(Some("session-a".to_string()), cx);
         });
         assert_eq!(
             preview_tab_ids(&workbench, cx),
@@ -18112,16 +18287,16 @@ mod tests {
     fn a_parked_session_layout_wins_over_an_unowned_preview(cx: &mut gpui::TestAppContext) {
         let (workbench, cx) = fixture_workbench(cx);
         workbench.update(cx, |this, _| {
-            this.preview_owner = Some("session-b".to_string());
+            this.state_owner = Some("session-b".to_string());
         });
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(None, cx);
+            this.switch_state_owner(None, cx);
         });
         assert!(preview_tab_ids(&workbench, cx).is_empty());
 
         open_preview_tab(&workbench, "README.md", cx);
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-b".to_string()), cx);
+            this.switch_state_owner(Some("session-b".to_string()), cx);
         });
         assert_eq!(
             preview_tab_ids(&workbench, cx),
@@ -18133,17 +18308,17 @@ mod tests {
     fn parked_layouts_follow_file_mutations_of_their_own_workspace(cx: &mut gpui::TestAppContext) {
         let (workbench, cx) = fixture_workbench(cx);
         workbench.update(cx, |this, _| {
-            this.preview_owner = Some("session-a".to_string());
+            this.state_owner = Some("session-a".to_string());
         });
         workbench.update(cx, |this, cx| {
-            this.switch_preview_owner(Some("session-b".to_string()), cx);
+            this.switch_state_owner(Some("session-b".to_string()), cx);
         });
         workbench.update(cx, |this, _| {
-            this.parked_previews.insert(
+            this.parked_states.insert(
                 "session-elsewhere".to_string(),
-                ParkedPreviewLayout {
+                ParkedStateLayout {
                     workspace_id: Some("workspace-elsewhere".to_string()),
-                    layout: {
+                    preview: {
                         let mut layout = PreviewState::default();
                         layout.open(
                             PreviewTarget::File {
@@ -18154,6 +18329,7 @@ mod tests {
                         );
                         layout
                     },
+                    panel: PanelPresentationState::default(),
                 },
             );
             this.update_parked_previews_of_current_workspace(|layout| {
@@ -18163,8 +18339,8 @@ mod tests {
 
         let parked_tabs = |owner: &str, cx: &mut gpui::VisualTestContext| {
             workbench.read_with(cx, |this, _| {
-                this.parked_previews[owner]
-                    .layout
+                this.parked_states[owner]
+                    .preview
                     .tabs
                     .keys()
                     .cloned()

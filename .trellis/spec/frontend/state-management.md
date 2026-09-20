@@ -848,23 +848,39 @@ const previewTabs = normalizePreviewTabsRecord(persisted.previewTabs);
 const previewRoot = normalizePreviewRootRecord(persisted.previewRoot, previewTabs);
 ```
 
-## Scenario: Desktop Per-Session Preview Layouts
+## Scenario: Desktop Workspace State Scope
 
 ### 1. Scope / Trigger
 
-- Trigger: changing which preview tabs survive a switch between Agent sessions,
-  adding or reading `PreviewUiState.session_layouts`, or changing preview
-  ownership in the GPUI workbench.
+- Trigger: changing what a session restores when it is selected — the right
+  rail, the integrated panel, the multi-tab preview — or adding or reading
+  `WorkbenchUiState.workspace_state_scope`, `WorkspaceLayoutState`, or
+  `PreviewUiState.layout_scopes`.
 - The React/Zustand scenario above is pre-cutover history. This section is the
-  current Rust contract, and it deliberately differs on one point: switching the
-  *session* parks that session's tabs instead of clearing them.
+  current Rust contract: switching a scope parks its column instead of clearing
+  it, and the setting decides what a scope is.
 
 ### 2. Signatures
 
 ```rust
+WorkspaceStateScope { Project, Session } // WorkbenchUiState.workspace_state_scope
+
+WorkspaceLayoutState {
+    right_rail_visible: bool,
+    right_rail_width: f32,
+    right_rail_activity_id: Option<String>,
+    preview_visible: bool,
+    preview_width: f32,
+}
+
+DesktopUiStateV1 {
+    workspace_layouts: BTreeMap<String, WorkspaceLayoutState>, // parked, by scope key
+    preview: PreviewUiState,
+    ..
+}
 PreviewUiState {
     layout: PreviewState,
-    session_layouts: BTreeMap<String, PreviewState>, // parked, keyed by session id
+    layout_scopes: BTreeMap<String, PreviewState>, // parked, by scope key
     ..
 }
 
@@ -874,105 +890,107 @@ CodeWorkbenchPersistedState {
     ..
 }
 
-CodeWorkbench::sync_workspace(
-    backend: BackendFacade,
-    workspace_id: WorkspaceId,
-    root: PathBuf,
-    preview_owner: Option<String>,
-    cx: &mut Context<Self>,
-)
+CodeWorkbench::sync_workspace(backend, workspace_id, root, state_owner: Option<String>, cx)
+CodeWorkbench::restore_persisted_state(preview, state_owner, parked_previews, recovery, workspace_id, ..)
+CodeWorkbench::reset_state_scopes(state_owner: Option<String>, cx)
 
-CodeWorkbench::restore_persisted_state(
-    preview: PreviewState,
-    preview_owner: Option<String>,
-    parked_previews: BTreeMap<String, PreviewState>,
-    recovery: EditorRecoverySnapshot,
-    workspace_id: Option<String>,
-    ..
-)
+VibexWorkbench::workspace_state_owner(session: &AgentSession) -> String
+VibexWorkbench::switch_workspace_layout_owner(owner: Option<String>, cx)
+VibexWorkbench::set_workspace_state_scope(scope: WorkspaceStateScope, cx)
 ```
 
 ### 3. Contracts
 
-- The preview surface has exactly one owner: the selected Agent session id.
-  `None` means no session is selected and nothing owns the live layout.
-- `layout` / `CodeWorkbench::preview` is the live layout of the owner.
-  `session_layouts` / `parked_previews` holds the other sessions' layouts and
-  never contains the owner's key.
-- A session switch parks the live layout under the outgoing owner and adopts the
-  parked layout of the incoming owner. No tab is closed by the switch, and
-  selecting the previous session again restores exactly its tabs and panes.
+- One key scopes the whole right-hand column. In `Project` scope the key is the
+  session's project checkout (`AgentSession::workspace_id`); in `Session` scope
+  it is the session id. `None` means no session owns the column, and a
+  workspace change then resets it instead of parking it.
+- Project scope is per checkout, not per project. Preview tabs, expanded
+  directories, and Git filters are relative to the checkout root, so a different
+  worktree of the same project keeps its own column while the sessions of one
+  checkout share it.
+- Scoped state is: right rail visibility, width, and selected activity; preview
+  panel visibility and width; the multi-tab preview layout; and the integrated
+  panel presentation — selected file, Git, and terminal, the Git view mode and
+  history filter, the Git change selection and expanded trees, the file-tree
+  expansions and selected directory, and the file/Git list scroll offsets.
+- The live values stay in the fields that already own them
+  (`ui_state.workbench.right_rail_visible`, `ui_state.right_rail.selected_activity_id`,
+  `ui_state.preview.layout`, `CodeWorkbench::preview`, ...). The parked maps hold
+  the other scopes; `layout_scopes` never contains the live owner's key.
+- Switching scope parks the live column under the outgoing key and adopts the
+  incoming one. No tab is closed and no selection is dropped by the switch.
 - `sync_workspace` compares the owner even when the workspace is unchanged,
-  because two sessions can share one workspace and still keep separate layouts.
-- A workspace change with no owner still clears the live layout and does not
-  park it, so workspace-relative paths can never render against another
-  workspace.
-- A layout opened while no session owned the preview belongs to the workspace on
-  screen. When a session of that same workspace takes ownership and has nothing
-  parked of its own, it adopts that layout, so opening a file before a session
-  exists does not close it afterwards. A parked session layout always wins over
-  the unowned preview.
-- The startup restore installs the persisted selected session's layout as the
-  live one, so re-entering that workspace must not park and re-adopt it.
-- Parking clears `fullscreen_tab_id`: fullscreen belongs to the panel, not to a
-  session's layout.
-- Every tab-keyed surface (scroll handles, diff and commit list state, reveal
-  requests, preview errors) is cleared when the owner changes.
-  `schedule_restore_hydration` then re-reads the adopted layout's files, diffs,
-  commits, and terminal surfaces.
-- A hydration pass queued before an owner change must be discarded
-  (`preview_layout_generation`) instead of opening the previous session's files
-  in the new session's preview.
-- Empty layouts are neither parked nor persisted. Parked layouts are bounded to
-  `SESSION_PREVIEW_LAYOUT_LIMIT`, evicting the layouts whose newest tab is
-  oldest first.
-- A parked layout remembers the workspace its relative paths belong to. A file
-  rename or delete updates the live layout and the parked layouts of the current
-  workspace only, so an identically named path in another workspace is never
-  rewritten. The association is in-memory; a restored layout records it again
-  the next time it is parked.
-- Persisting the workbench writes the live layout under its owner plus every
-  parked layout, so a restart restores each session's tabs.
+  because two sessions can share one workspace and still switch scope.
+- A column opened while no session owned it belongs to the workspace on screen:
+  the first session of that workspace adopts it when it has nothing parked of
+  its own, and a parked scope always wins over it.
+- The startup restore installs the persisted column under the key the state was
+  saved with. Project scope falls back to the persisted selected workspace
+  because the session list is still empty on the first frame.
+- Changing the setting re-keys. Parked columns were keyed by the previous scope,
+  so none of them can be matched under the new one and they are dropped; the
+  live column stays on screen and becomes the selected session's state.
+- Parking clears `fullscreen_tab_id`: fullscreen is panel view state, not scope
+  state.
+- Loaded status, history, diffs, and file entries are **not** scoped. They belong
+  to the workspace on screen and every scope looking at it shares them; a
+  restored expanded directory only triggers its own listing load.
+- Tab-keyed surfaces (diff and commit list state, reveal requests, preview
+  errors) are cleared on every scope change. `schedule_restore_hydration`
+  re-reads the adopted layout's files, diffs, commits, and terminals, and a
+  hydration pass queued for a previous scope is discarded
+  (`preview_layout_generation`) instead of opening the previous scope's files.
+- An empty scope is not parked: a preview with no tabs and a panel with nothing
+  selected, expanded, or scrolled is dropped, and a right-hand column with both
+  panels hidden is dropped. Parked maps are bounded to `SCOPED_LAYOUT_LIMIT`.
+- A parked preview remembers its workspace, so a file rename or delete updates
+  the live preview and the parked previews of the current workspace only. The
+  association is in-memory; a restored layout records it again when it is next
+  parked.
+- Persisting writes the live preview under its owner plus every parked preview,
+  and every parked right-hand column, so a restart restores each scope.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Persisted state without `sessionLayouts` | Decode with an empty map |
-| Parked key that is blank, or a layout with no tabs | Dropped during normalization |
-| Parked layout with unpinned temporary tabs | Temporary tabs dropped on persist, as for the live layout |
-| More parked layouts than `SESSION_PREVIEW_LAYOUT_LIMIT` | Drop the layouts whose newest tab timestamp is oldest |
-| Parked layout references a deleted session | `cleanup_stale_ids` drops the layout |
-| Parked layout references a deleted terminal | `cleanup_stale_ids` drops that terminal tab and re-normalizes the layout |
-| No selected session, workspace changes | Clear the live layout; park nothing |
-| Owner unchanged but the workspace changed | Keep the parked layout for the next switch back and show an empty preview |
-| File renamed or deleted in the current workspace | Update the live layout and the parked layouts of that workspace only |
+| Persisted state without `layoutScopes` or `workspaceLayouts` | Decode with empty maps |
+| Parked key that is blank, a preview with no tabs, or a column with both panels hidden | Dropped during normalization |
+| Parked preview with unpinned temporary tabs | Temporary tabs dropped on persist, as for the live layout |
+| More parked layouts than `SCOPED_LAYOUT_LIMIT` | Drop the layouts whose newest tab is oldest |
+| Parked preview references a deleted session or workspace | `cleanup_stale_ids` drops the layout |
+| Parked preview references a deleted terminal | That terminal tab is dropped and the layout re-normalized |
+| Parked column references a deleted session or workspace | `cleanup_stale_ids` drops the column |
+| No selected session, workspace changes | Clear the live column; park nothing |
+| Owner unchanged but the workspace changed | Keep the parked column for the next switch back and show an empty one |
+| The scope setting changes | Drop every parked column, keep the live one under the new key |
+| File renamed or deleted in the current workspace | Update the live preview and the parked previews of that workspace only |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: session A keeps three preview tabs, selecting session B shows only B's
-  tabs, and selecting A again restores A's three tabs in their panes.
-- Good: two sessions of one workspace keep separate preview layouts; a restart
-  restores both.
+- Good: with Per project, two sessions of one checkout share the rail, the panel
+  selection, and the preview tabs; with Per session, each session restores its
+  own.
+- Good: expanded directories, Git history filters, and list scroll offsets come
+  back with the session that set them.
 - Good: a file opened while no session is selected is still open after the first
   session of that workspace is selected.
-- Base: a session that never opened a preview shows the empty preview state, and
-  the panel visibility is unchanged by the switch.
-- Bad: resetting `preview` on every session switch, writing the live layout under
-  its owner key *and* the parked map, letting a queued hydration pass open the
-  previous session's files, carrying an unowned layout into another workspace,
-  or letting an unowned preview overwrite a session's parked layout.
+- Base: a session that never opened the column shows the empty preview state and
+  the default panels.
+- Bad: resetting the column on every session switch; scoping loaded status,
+  history, or diffs so two sessions of one workspace disagree about the
+  workspace; re-keying parked columns silently when the setting changes; or
+  carrying a column into another checkout.
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-desktop-model --locked` covers JSON round-trip, legacy
-  decode without `sessionLayouts`, normalization of empty/blank/over-limit
-  layouts, and stale session/terminal cleanup.
+- `cargo test -p vibex-desktop-model --locked` covers the scope enum, layout
+  scope JSON round-trip and legacy decode, normalization and limits, and stale
+  session/workspace/terminal cleanup.
 - `cargo test -p vibex-desktop --locked --lib preview_layout` covers park/adopt
-  across owners, persisted state carrying every layout, and an unowned layout
-  never being parked.
-- `cargo test -p vibex-desktop --locked --lib parked_layouts` covers rename and
-  delete staying inside the parked layouts of the current workspace.
+  across scopes, persisted state carrying every layout, unowned adoption, and
+  rename and delete staying inside the parked previews of the current workspace.
 - `cargo fmt --all -- --check` before commit.
 
 ### 7. Wrong vs Correct
@@ -980,21 +998,19 @@ CodeWorkbench::restore_persisted_state(
 #### Wrong
 
 ```rust
-// Every session switch closes the previous session's tabs.
+// Every session switch closes the previous scope's column.
 self.preview = PreviewState::default();
+self.ui_state.workbench.right_rail_visible = false;
 ```
 
 #### Correct
 
 ```rust
-let owner_changed = self.preview_owner != preview_owner;
-self.park_live_preview_layout();
-self.preview_owner = preview_owner;
-self.preview = if owner_changed {
-    self.take_parked_preview_layout()
-} else {
-    PreviewState::default()
-};
+self.park_state_layout();
+self.state_owner = state_owner;
+let parked = self.take_parked_state_layout();
+self.preview = parked.preview;
+self.apply_panel_presentation(parked.panel);
 ```
 
 ## Scenario: Seamless Runtime UI And Durable Composer Recovery

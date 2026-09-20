@@ -28,7 +28,7 @@ pub const PROJECT_DIRECTORY_FAVORITE_LIMIT: usize = 12;
 /// Agent sessions whose multi-tab preview layout is remembered while another
 /// session is selected. Bounded so a long session history cannot grow the
 /// UI-state file without limit.
-pub const SESSION_PREVIEW_LAYOUT_LIMIT: usize = 64;
+pub const SCOPED_LAYOUT_LIMIT: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum UiStateError {
@@ -100,6 +100,33 @@ pub enum PreviewWindowMode {
 impl PreviewWindowMode {
     pub const fn is_window(self) -> bool {
         matches!(self, Self::Window)
+    }
+}
+
+/// Which key scopes the workbench state a session restores.
+///
+/// The right rail, the integrated panel, and the multi-tab preview are all
+/// presentation state that belongs to a place, not to the runtime: the same
+/// files, Git changes, and terminals can be looked at from several sessions.
+/// This setting decides whether looking at them from another session continues
+/// where the previous one left off or starts a separate view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStateScope {
+    /// Every session of one project checkout shares the state. Sessions in
+    /// another worktree of the same project keep their own, because preview
+    /// tabs and file-tree paths are relative to the checkout root.
+    #[default]
+    Project,
+    /// Every session keeps its own state and restores it when it is selected
+    /// again.
+    Session,
+}
+
+impl WorkspaceStateScope {
+    /// Whether the scope isolates each session.
+    pub const fn is_session(self) -> bool {
+        matches!(self, Self::Session)
     }
 }
 
@@ -362,6 +389,8 @@ pub struct WorkbenchUiState {
     #[serde(default)]
     pub preview_window_mode: PreviewWindowMode,
     #[serde(default)]
+    pub workspace_state_scope: WorkspaceStateScope,
+    #[serde(default)]
     pub default_new_session_location: NewSessionLocation,
     /// Directories starred in the project-directory picker, most recently
     /// starred first. The picker offers them as quick locations beside the
@@ -388,6 +417,7 @@ impl Default for WorkbenchUiState {
             remember_layout: default_remember_layout(),
             show_git_change_count: default_show_git_change_count(),
             preview_window_mode: PreviewWindowMode::default(),
+            workspace_state_scope: WorkspaceStateScope::default(),
             default_new_session_location: NewSessionLocation::CurrentCheckout,
             favorite_project_directories: Vec::new(),
         }
@@ -702,11 +732,11 @@ pub struct PreviewUiState {
     pub split_sizes: Vec<f32>,
     #[serde(default)]
     pub layout: crate::PreviewState,
-    /// Multi-tab preview layouts parked for Agent sessions that are not the
-    /// selected one. `layout` stays the live layout of the selected session, so
-    /// switching sessions moves tabs between the two instead of closing them.
+    /// Multi-tab preview layouts parked for the workspace state scopes that are
+    /// not on screen. `layout` stays the live layout of the selected scope, so
+    /// switching scopes moves tabs between the two instead of closing them.
     #[serde(default)]
-    pub session_layouts: BTreeMap<String, crate::PreviewState>,
+    pub layout_scopes: BTreeMap<String, crate::PreviewState>,
     #[serde(default)]
     pub editor_recovery: crate::EditorRecoverySnapshot,
     #[serde(default)]
@@ -726,7 +756,7 @@ impl Default for PreviewUiState {
             pinned_tab_ids: Vec::new(),
             split_sizes: vec![1.0],
             layout: crate::PreviewState::default(),
-            session_layouts: BTreeMap::new(),
+            layout_scopes: BTreeMap::new(),
             editor_recovery: crate::EditorRecoverySnapshot::default(),
             editor_soft_wrap: false,
             editor_show_whitespaces: false,
@@ -734,6 +764,56 @@ impl Default for PreviewUiState {
             editor_autosave_delay_ms: DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
         }
     }
+}
+
+/// Workbench panel presentation parked for one workspace state scope.
+///
+/// The right rail and the multi-tab preview panel are two halves of the same
+/// right-hand column, so they are parked together under the scope key the
+/// setting selects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLayoutState {
+    #[serde(default)]
+    pub right_rail_visible: bool,
+    #[serde(default = "default_right_rail_width")]
+    pub right_rail_width: f32,
+    #[serde(default)]
+    pub right_rail_activity_id: Option<String>,
+    #[serde(default)]
+    pub preview_visible: bool,
+    #[serde(default = "default_preview_width")]
+    pub preview_width: f32,
+}
+
+impl WorkspaceLayoutState {
+    /// Whether the column carries anything a scope would notice on return.
+    ///
+    /// A scope with both panels hidden looks the same as one that was never
+    /// opened, so it is not worth parking.
+    pub fn is_empty(&self) -> bool {
+        !self.right_rail_visible && !self.preview_visible
+    }
+}
+
+impl Default for WorkspaceLayoutState {
+    fn default() -> Self {
+        Self {
+            right_rail_visible: false,
+            right_rail_width: default_right_rail_width(),
+            right_rail_activity_id: None,
+            preview_visible: false,
+            preview_width: default_preview_width(),
+        }
+    }
+}
+
+const fn default_right_rail_width() -> f32 {
+    336.0
+}
+
+const fn default_preview_width() -> f32 {
+    520.0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1036,6 +1116,11 @@ pub struct DesktopUiStateV1 {
     pub workbench: WorkbenchUiState,
     pub sidebar: SidebarUiState,
     pub preview: PreviewUiState,
+    /// Right-hand column presentation parked for the workspace state scopes
+    /// that are not on screen, keyed by the scope owner (a project checkout or
+    /// a session, depending on `workbench.workspace_state_scope`).
+    #[serde(default)]
+    pub workspace_layouts: BTreeMap<String, WorkspaceLayoutState>,
     pub terminal: TerminalUiState,
     #[serde(default)]
     pub terminal_preferences: TerminalPreferencesUiState,
@@ -1071,6 +1156,7 @@ impl Default for DesktopUiStateV1 {
             workbench: WorkbenchUiState::default(),
             sidebar: SidebarUiState::default(),
             preview: PreviewUiState::default(),
+            workspace_layouts: BTreeMap::new(),
             terminal: TerminalUiState::default(),
             terminal_preferences: TerminalPreferencesUiState::default(),
             right_rail: RightRailUiState::default(),
@@ -1137,7 +1223,8 @@ impl DesktopUiStateV1 {
         self.preview.split_sizes =
             normalize_split_sizes(std::mem::take(&mut self.preview.split_sizes));
         self.preview.layout.normalize();
-        normalize_preview_layouts(&mut self.preview.session_layouts, None);
+        normalize_preview_layouts(&mut self.preview.layout_scopes, None);
+        normalize_workspace_layouts(&mut self.workspace_layouts);
         let mut recovery = crate::EditorBufferRegistry::default();
         recovery.restore_recovery(std::mem::take(&mut self.preview.editor_recovery));
         self.preview.editor_recovery = recovery.recovery_snapshot();
@@ -1289,16 +1376,23 @@ impl DesktopUiStateV1 {
             !matches!(&tab.target, crate::PreviewTarget::Terminal { terminal_id } if !references.terminal_ids.contains(terminal_id))
         });
         self.preview.layout.normalize();
-        self.preview
-            .session_layouts
-            .retain(|session_id, _| references.session_ids.contains(session_id));
+        self.preview.layout_scopes.retain(|owner, _| {
+            references.workspace_ids.contains(owner) || references.session_ids.contains(owner)
+        });
         normalize_preview_layouts(
-            &mut self.preview.session_layouts,
+            &mut self.preview.layout_scopes,
             Some(&references.terminal_ids),
         );
         self.preview
             .pinned_tab_ids
             .retain(|id| self.preview.layout.tabs.contains_key(id));
+        // A parked right-hand column belongs to a project checkout in project
+        // scope and to a session in session scope, so it survives while either
+        // reference still exists.
+        self.workspace_layouts.retain(|owner, _| {
+            references.workspace_ids.contains(owner) || references.session_ids.contains(owner)
+        });
+        normalize_workspace_layouts(&mut self.workspace_layouts);
         if self
             .terminal
             .selected_terminal_id
@@ -1686,7 +1780,8 @@ fn normalize_set(ids: &mut BTreeSet<String>, limit: usize) {
     *ids = values.into_iter().collect();
 }
 
-/// Normalize the multi-tab preview layouts parked for unselected sessions.
+/// Normalize the multi-tab preview layouts parked for the scopes that are not
+/// on screen.
 ///
 /// `terminal_ids` is `None` while loading persisted state, where the
 /// authoritative terminal list is not known yet, and `Some` during stale-id
@@ -1697,24 +1792,24 @@ fn normalize_preview_layouts(
 ) {
     let mut normalized = std::mem::take(layouts)
         .into_iter()
-        .filter_map(|(session_id, mut layout)| {
-            let session_id = bounded_required(&session_id, 256)?;
+        .filter_map(|(owner, mut layout)| {
+            let owner = bounded_required(&owner, 256)?;
             if let Some(terminal_ids) = terminal_ids {
                 layout.tabs.retain(|_, tab| {
                     !matches!(&tab.target, crate::PreviewTarget::Terminal { terminal_id } if !terminal_ids.contains(terminal_id))
                 });
             }
             layout.normalize();
-            (!layout.is_empty()).then_some((session_id, layout))
+            (!layout.is_empty()).then_some((owner, layout))
         })
         .collect::<Vec<_>>();
-    if normalized.len() > SESSION_PREVIEW_LAYOUT_LIMIT {
-        // Keep the sessions that opened a preview tab most recently: those are
+    if normalized.len() > SCOPED_LAYOUT_LIMIT {
+        // Keep the scopes that opened a preview tab most recently: those are
         // the layouts a user is most likely to come back to.
         normalized.sort_by(|left, right| {
             newest_preview_tab_ms(&right.1).cmp(&newest_preview_tab_ms(&left.1))
         });
-        normalized.truncate(SESSION_PREVIEW_LAYOUT_LIMIT);
+        normalized.truncate(SCOPED_LAYOUT_LIMIT);
     }
     *layouts = normalized.into_iter().collect();
 }
@@ -1726,6 +1821,32 @@ fn newest_preview_tab_ms(layout: &crate::PreviewState) -> i64 {
         .map(|tab| tab.created_at_ms)
         .max()
         .unwrap_or(i64::MIN)
+}
+
+/// Normalize the parked right-hand column layouts.
+///
+/// An entry that carries no panel at all is dropped: it would be
+/// indistinguishable from a scope that has never been opened, and dropping it
+/// keeps a long session history from growing the file.
+fn normalize_workspace_layouts(layouts: &mut BTreeMap<String, WorkspaceLayoutState>) {
+    *layouts = std::mem::take(layouts)
+        .into_iter()
+        .filter_map(|(owner, mut layout)| {
+            let owner = bounded_required(&owner, 256)?;
+            layout.right_rail_width = bounded_f32(
+                layout.right_rail_width,
+                256.0,
+                480.0,
+                default_right_rail_width(),
+            );
+            layout.preview_width =
+                bounded_f32(layout.preview_width, 360.0, 900.0, default_preview_width());
+            layout.right_rail_activity_id =
+                bounded_optional(layout.right_rail_activity_id.take(), 256);
+            (layout.preview_visible || layout.right_rail_visible).then_some((owner, layout))
+        })
+        .take(SCOPED_LAYOUT_LIMIT)
+        .collect();
 }
 
 fn normalize_runtime_selection(selection: &mut SessionRuntimeSelection) -> bool {
@@ -2010,7 +2131,7 @@ mod tests {
     #[test]
     fn session_preview_layouts_round_trip_through_json() {
         let state = PreviewUiState {
-            session_layouts: BTreeMap::from([(
+            layout_scopes: BTreeMap::from([(
                 "session-a".to_string(),
                 session_layout(&[("README.md", 10)]),
             )]),
@@ -2018,25 +2139,25 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(&state).unwrap();
-        assert!(encoded["sessionLayouts"]["session-a"].is_object());
+        assert!(encoded["layoutScopes"]["session-a"].is_object());
 
         let restored: PreviewUiState = serde_json::from_value(encoded).unwrap();
         assert_eq!(restored, state);
     }
 
     #[test]
-    fn legacy_preview_state_without_session_layouts_still_decodes() {
+    fn legacy_preview_state_without_scoped_layouts_still_decodes() {
         let mut legacy = serde_json::to_value(PreviewUiState::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("sessionLayouts");
+        legacy.as_object_mut().unwrap().remove("layoutScopes");
 
         let restored: PreviewUiState = serde_json::from_value(legacy).unwrap();
-        assert!(restored.session_layouts.is_empty());
+        assert!(restored.layout_scopes.is_empty());
     }
 
     #[test]
     fn normalization_drops_empty_and_malformed_session_preview_layouts() {
         let mut state = DesktopUiStateV1::default();
-        state.preview.session_layouts = BTreeMap::from([
+        state.preview.layout_scopes = BTreeMap::from([
             (
                 "session-a".to_string(),
                 session_layout(&[("README.md", 10)]),
@@ -2056,14 +2177,14 @@ mod tests {
         assert_eq!(
             state
                 .preview
-                .session_layouts
+                .layout_scopes
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
             vec!["session-a".to_string()]
         );
         assert!(
-            state.preview.session_layouts["session-a"]
+            state.preview.layout_scopes["session-a"]
                 .tabs
                 .contains_key("file:README.md")
         );
@@ -2072,7 +2193,7 @@ mod tests {
     #[test]
     fn normalization_keeps_the_most_recent_session_preview_layouts() {
         let mut state = DesktopUiStateV1::default();
-        state.preview.session_layouts = (0..SESSION_PREVIEW_LAYOUT_LIMIT + 2)
+        state.preview.layout_scopes = (0..SCOPED_LAYOUT_LIMIT + 2)
             .map(|index| {
                 (
                     format!("session-{index:03}"),
@@ -2082,16 +2203,13 @@ mod tests {
             .collect();
 
         state.normalize().expect("state normalizes");
-        assert_eq!(
-            state.preview.session_layouts.len(),
-            SESSION_PREVIEW_LAYOUT_LIMIT
-        );
-        assert!(!state.preview.session_layouts.contains_key("session-000"));
+        assert_eq!(state.preview.layout_scopes.len(), SCOPED_LAYOUT_LIMIT);
+        assert!(!state.preview.layout_scopes.contains_key("session-000"));
         assert!(
             state
                 .preview
-                .session_layouts
-                .contains_key(&format!("session-{:03}", SESSION_PREVIEW_LAYOUT_LIMIT + 1))
+                .layout_scopes
+                .contains_key(&format!("session-{:03}", SCOPED_LAYOUT_LIMIT + 1))
         );
     }
 
@@ -2107,7 +2225,7 @@ mod tests {
         )
         .expect("terminal tab opens");
         let mut state = DesktopUiStateV1::default();
-        state.preview.session_layouts = BTreeMap::from([
+        state.preview.layout_scopes = BTreeMap::from([
             ("session-a".to_string(), live),
             (
                 "session-gone".to_string(),
@@ -2123,15 +2241,119 @@ mod tests {
         assert_eq!(
             state
                 .preview
-                .session_layouts
+                .layout_scopes
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
             vec!["session-a".to_string()]
         );
-        let layout = &state.preview.session_layouts["session-a"];
+        let layout = &state.preview.layout_scopes["session-a"];
         assert!(layout.tabs.contains_key("file:README.md"));
         assert!(!layout.tabs.contains_key("terminal:terminal-1"));
+    }
+
+    #[test]
+    fn workspace_layout_state_round_trips_and_normalizes() {
+        let mut state = DesktopUiStateV1::default();
+        state.workbench.workspace_state_scope = WorkspaceStateScope::Session;
+        state.workspace_layouts = BTreeMap::from([(
+            "session-a".to_string(),
+            WorkspaceLayoutState {
+                right_rail_visible: true,
+                right_rail_width: 9_000.0,
+                right_rail_activity_id: Some("  rail_plugin_system_git  ".to_string()),
+                preview_visible: true,
+                preview_width: 1.0,
+            },
+        )]);
+
+        state.normalize().expect("state normalizes");
+        let layout = &state.workspace_layouts["session-a"];
+        assert!(layout.right_rail_visible);
+        assert_eq!(layout.right_rail_width, 480.0);
+        assert_eq!(
+            layout.right_rail_activity_id.as_deref(),
+            Some("rail_plugin_system_git")
+        );
+        assert!(layout.preview_visible);
+        assert_eq!(layout.preview_width, 360.0);
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            encoded["workbench"]["workspaceStateScope"],
+            serde_json::json!("session")
+        );
+        assert!(encoded["workspaceLayouts"]["session-a"].is_object());
+        let restored: DesktopUiStateV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            restored.workbench.workspace_state_scope,
+            WorkspaceStateScope::Session
+        );
+        assert_eq!(restored.workspace_layouts, state.workspace_layouts);
+    }
+
+    #[test]
+    fn normalization_drops_a_workspace_layout_with_both_panels_hidden() {
+        let mut state = DesktopUiStateV1::default();
+        state.workspace_layouts = BTreeMap::from([
+            (
+                "checkout-a".to_string(),
+                WorkspaceLayoutState {
+                    right_rail_visible: false,
+                    preview_visible: false,
+                    ..WorkspaceLayoutState::default()
+                },
+            ),
+            (
+                "checkout-b".to_string(),
+                WorkspaceLayoutState {
+                    preview_visible: true,
+                    ..WorkspaceLayoutState::default()
+                },
+            ),
+        ]);
+
+        state.normalize().expect("state normalizes");
+        assert_eq!(
+            state.workspace_layouts.keys().cloned().collect::<Vec<_>>(),
+            vec!["checkout-b".to_string()]
+        );
+        // Sharing one column per project checkout is the default.
+        assert_eq!(
+            DesktopUiStateV1::default().workbench.workspace_state_scope,
+            WorkspaceStateScope::Project
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_drops_workspace_layouts_of_gone_scopes() {
+        let mut state = DesktopUiStateV1::default();
+        state.workspace_layouts = BTreeMap::from([
+            (
+                "checkout-a".to_string(),
+                WorkspaceLayoutState {
+                    preview_visible: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "session-gone".to_string(),
+                WorkspaceLayoutState {
+                    right_rail_visible: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        state.cleanup_stale_ids(&UiStateReferences {
+            workspace_ids: BTreeSet::from(["checkout-a".to_string()]),
+            ..UiStateReferences::default()
+        });
+
+        assert_eq!(
+            state.workspace_layouts.keys().cloned().collect::<Vec<_>>(),
+            vec!["checkout-a".to_string()]
+        );
     }
 
     #[test]

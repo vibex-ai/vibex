@@ -131,14 +131,14 @@ use vibex_desktop_model::{
     ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
     TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
     TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorktreeLifecycleDisplayState, active_collaborations,
-    clamp_editor_autosave_delay_ms, complete_string_order, composer_trigger_at,
-    current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
-    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
-    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
-    sidebar_project_items, sidebar_project_items_for_workspace,
-    sidebar_project_projections_with_workspace_order, sidebar_root_items,
-    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
+    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
+    complete_string_order, composer_trigger_at, current_active_goal, current_agent_plan,
+    custom_worktree_path_is_absolute, has_managed_child_agent_delegations, move_string_relative,
+    move_strings_relative, ordered_agent_ids, parse_unified_diff,
+    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
+    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
+    sidebar_root_items, timeline_agent_message_count_after_sequence, timeline_conversation_turns,
     timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
@@ -1432,6 +1432,7 @@ fn clear_remembered_workbench_layout(state: &mut DesktopUiStateV1) {
         editor_recovery,
         ..vibex_desktop_model::PreviewUiState::default()
     };
+    state.workspace_layouts.clear();
     state.terminal = vibex_desktop_model::TerminalUiState::default();
     state.right_rail = vibex_desktop_model::RightRailUiState::default();
     state.composer.terminal_ids.clear();
@@ -5886,6 +5887,9 @@ pub struct VibexWorkbench {
     code_files_surface_visible: bool,
     code_git_surface_visible: bool,
     right_rail_mode: RightRailMode,
+    /// Scope whose right-hand column is on screen, keyed the same way as
+    /// `ui_state.workspace_layouts`.
+    workspace_layout_owner: Option<String>,
     git_pending_commit_count: u32,
     code_right_rail: Entity<CodeRightRail>,
     management_view: Entity<ManagementCenter>,
@@ -6829,6 +6833,7 @@ impl VibexWorkbench {
             code_files_surface_visible: false,
             code_git_surface_visible: false,
             right_rail_mode: restored_right_rail_mode,
+            workspace_layout_owner: None,
             git_pending_commit_count: 0,
             code_right_rail,
             management_view,
@@ -7720,11 +7725,9 @@ impl VibexWorkbench {
             NavigationHistory::new(self.current_workbench_route(), WORKBENCH_NAVIGATION_LIMIT);
         self.appearance_reload_pending = true;
         let preview = self.ui_state.preview.layout.clone();
-        let parked_previews = self.ui_state.preview.session_layouts.clone();
-        let preview_owner = self
-            .selected_session_id
-            .as_ref()
-            .map(|session_id| session_id.as_str().to_string());
+        let parked_previews = self.ui_state.preview.layout_scopes.clone();
+        let preview_owner = self.restored_workspace_state_owner();
+        self.workspace_layout_owner = preview_owner.clone();
         let recovery = self.ui_state.preview.editor_recovery.clone();
         let editor_soft_wrap = self.ui_state.preview.editor_soft_wrap;
         let editor_show_whitespaces = self.ui_state.preview.editor_show_whitespaces;
@@ -11740,14 +11743,15 @@ impl VibexWorkbench {
 
     fn activate_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
         self.ui_state.workbench.selected_workspace_id = Some(workspace.id.as_str().to_string());
+        let state_owner = self.workspace_state_owner_for_workspace(&workspace.id);
+        self.switch_workspace_layout_owner(state_owner.clone(), cx);
         if let Some(backend) = self.backend.clone() {
-            let preview_owner = self.preview_owner_for_workspace(&workspace.id);
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     workspace.id,
                     std::path::PathBuf::from(workspace.root_path),
-                    preview_owner,
+                    state_owner,
                     cx,
                 )
             });
@@ -14154,6 +14158,14 @@ impl VibexWorkbench {
         if record_history && navigation_changed {
             self.sync_current_navigation_entry();
         }
+        let state_owner = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| self.workspace_state_owner(session));
+        if let Some(owner) = state_owner.clone() {
+            self.switch_workspace_layout_owner(Some(owner), cx);
+        }
         if let (Some(backend), Some(session)) = (
             self.backend.clone(),
             self.sessions
@@ -14163,13 +14175,12 @@ impl VibexWorkbench {
         ) {
             self.ui_state.workbench.selected_workspace_id =
                 Some(session.workspace_id.as_str().to_string());
-            let preview_owner = session.id.as_str().to_string();
             self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     session.workspace_id,
                     std::path::PathBuf::from(session.workspace_root),
-                    Some(preview_owner),
+                    state_owner,
                     cx,
                 )
             });
@@ -26172,19 +26183,131 @@ impl VibexWorkbench {
         self.sessions.iter().find(|session| &session.id == selected)
     }
 
-    /// The Agent session that owns the workbench preview while `workspace_id`
-    /// is the focused workspace.
+    /// The workspace state key the persisted UI state was written under.
     ///
-    /// Only the selected session of the focused workspace owns the preview.
-    /// Activating any other workspace leaves the owner empty, so relative
-    /// preview paths from one workspace can never render against another.
-    fn preview_owner_for_workspace(
+    /// The session list is not loaded yet on the first frame, so project scope
+    /// falls back to the workspace the state was saved with.
+    fn restored_workspace_state_owner(&self) -> Option<String> {
+        if self.ui_state.workbench.workspace_state_scope.is_session() {
+            return self
+                .selected_session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string());
+        }
+        self.selected_session()
+            .map(|session| session.workspace_id.as_str().to_string())
+            .or_else(|| self.ui_state.workbench.selected_workspace_id.clone())
+    }
+
+    /// The key that scopes the workbench state `session` restores.
+    ///
+    /// In project scope the key is the session's project checkout, so every
+    /// session looking at the same files shares one right-hand column; in
+    /// session scope the key is the session itself.
+    fn workspace_state_owner(&self, session: &AgentSession) -> String {
+        if self.ui_state.workbench.workspace_state_scope.is_session() {
+            session.id.as_str().to_string()
+        } else {
+            session.workspace_id.as_str().to_string()
+        }
+    }
+
+    /// The workspace state key for a workspace that is being activated.
+    ///
+    /// Only the selected session of that workspace owns the state. Activating
+    /// any other workspace leaves the key empty, so relative paths from one
+    /// workspace can never render against another.
+    fn workspace_state_owner_for_workspace(
         &self,
         workspace_id: &vibex_core::WorkspaceId,
     ) -> Option<String> {
         self.selected_session()
             .filter(|session| &session.workspace_id == workspace_id)
-            .map(|session| session.id.as_str().to_string())
+            .map(|session| self.workspace_state_owner(session))
+    }
+
+    /// The right-hand column as it is on screen now.
+    fn current_workspace_layout(&self) -> WorkspaceLayoutState {
+        WorkspaceLayoutState {
+            right_rail_visible: self.ui_state.workbench.right_rail_visible,
+            right_rail_width: self.ui_state.workbench.right_rail_width,
+            right_rail_activity_id: self.ui_state.right_rail.selected_activity_id.clone(),
+            preview_visible: self.ui_state.workbench.preview_visible,
+            preview_width: self.ui_state.workbench.preview_width,
+        }
+    }
+
+    /// Park the right-hand column of the scope that is on screen and install
+    /// the one parked for `owner`.
+    ///
+    /// The rail and the multi-tab preview are two halves of the same column, so
+    /// they move together: switching sessions in project scope keeps both, and
+    /// in session scope restores what that session last had open.
+    fn switch_workspace_layout_owner(&mut self, owner: Option<String>, cx: &mut Context<Self>) {
+        if self.workspace_layout_owner == owner {
+            return;
+        }
+        // A column opened while no session owned it belongs to the workspace on
+        // screen: the first session of that workspace inherits it when it has
+        // nothing parked of its own, and a parked column always wins.
+        let unowned = (self.workspace_layout_owner.is_none() && owner.is_some())
+            .then(|| self.current_workspace_layout())
+            .filter(|layout| !layout.is_empty());
+        if let Some(previous) = self.workspace_layout_owner.take() {
+            let layout = self.current_workspace_layout();
+            if !layout.is_empty() {
+                self.ui_state.workspace_layouts.insert(previous, layout);
+            }
+        }
+        self.workspace_layout_owner = owner.clone();
+        let parked = owner.and_then(|owner| self.ui_state.workspace_layouts.remove(&owner));
+        self.apply_workspace_layout(parked.or(unowned).unwrap_or_default(), cx);
+        self.queue_ui_state();
+    }
+
+    /// Install a parked right-hand column without parking the current one.
+    fn apply_workspace_layout(&mut self, layout: WorkspaceLayoutState, cx: &mut Context<Self>) {
+        self.ui_state.workbench.right_rail_visible = layout.right_rail_visible;
+        self.ui_state.workbench.right_rail_width = layout.right_rail_width;
+        self.ui_state.workbench.preview_visible = layout.preview_visible;
+        self.ui_state.workbench.preview_width = layout.preview_width;
+        let mode = right_rail_mode_from_activity_id(layout.right_rail_activity_id.as_deref());
+        self.right_rail_mode = mode;
+        self.ui_state.right_rail.selected_activity_id = layout.right_rail_activity_id;
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.right_rail_mode = mode;
+            cx.notify();
+        });
+        self.code_right_rail
+            .update(cx, |right_rail, cx| right_rail.set_mode(mode, cx));
+        self.set_code_preview_visible(layout.preview_visible, cx);
+        // A docked panel is governed by its visibility flag; a narrow window
+        // shows the same choice as an overlay instead.
+        self.right_rail_overlay_open =
+            !self.last_visibility.right_rail_docked && layout.right_rail_visible;
+        self.preview_overlay_open = !self.last_visibility.preview_docked && layout.preview_visible;
+        cx.notify();
+    }
+
+    /// Switch the setting that decides how much of the right-hand column is
+    /// shared between sessions.
+    fn set_workspace_state_scope(&mut self, scope: WorkspaceStateScope, cx: &mut Context<Self>) {
+        if self.ui_state.workbench.workspace_state_scope == scope {
+            return;
+        }
+        self.ui_state.workbench.workspace_state_scope = scope;
+        // Every parked column was keyed by the previous scope, so none of them
+        // can be matched to a scope under the new one. The live column stays on
+        // screen and becomes the selected session's state under the new key.
+        self.ui_state.workspace_layouts.clear();
+        self.workspace_layout_owner = self
+            .selected_session()
+            .map(|session| self.workspace_state_owner(session));
+        let owner = self.workspace_layout_owner.clone();
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.reset_state_scopes(owner, cx));
+        self.queue_ui_state();
+        cx.notify();
     }
 
     fn session_agent_id(&self, session_id: &VibexSessionId) -> Option<AgentId> {
@@ -26331,7 +26454,7 @@ impl VibexWorkbench {
             return;
         }
         self.ui_state.preview.layout = state.preview;
-        self.ui_state.preview.session_layouts = state.preview_layouts;
+        self.ui_state.preview.layout_scopes = state.preview_layouts;
         if let Some(recovery) = state.recovery {
             self.ui_state.preview.editor_recovery = recovery;
         }
@@ -28267,10 +28390,15 @@ impl VibexWorkbench {
             .unwrap_or_else(|| crate::platform::default_code_font_family().to_string());
         let code_font_size = snapshot.appearance.code_font.size;
         let preview = snapshot.preview.layout.clone();
-        let parked_previews = snapshot.preview.session_layouts.clone();
-        let preview_owner = selected_session_id
-            .as_ref()
-            .map(|session_id| session_id.as_str().to_string());
+        let parked_previews = snapshot.preview.layout_scopes.clone();
+        let preview_owner = if snapshot.workbench.workspace_state_scope.is_session() {
+            selected_session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str().to_string())
+        } else {
+            snapshot.workbench.selected_workspace_id.clone()
+        };
+        self.workspace_layout_owner = preview_owner.clone();
         let recovery = snapshot.preview.editor_recovery.clone();
         let editor_soft_wrap = snapshot.preview.editor_soft_wrap;
         let editor_show_whitespaces = snapshot.preview.editor_show_whitespaces;
@@ -39237,13 +39365,14 @@ impl VibexWorkbench {
         let review_ready = if let Some(backend) = self.backend.clone() {
             let workspace_id = session.workspace_id.clone();
             self.ui_state.workbench.selected_workspace_id = Some(workspace_id.as_str().to_string());
-            let preview_owner = session.id.as_str().to_string();
+            let state_owner = self.workspace_state_owner(&session);
+            self.switch_workspace_layout_owner(Some(state_owner.clone()), cx);
             let review_ready = self.code_workbench.update(cx, |workbench, cx| {
                 workbench.sync_workspace(
                     backend,
                     workspace_id.clone(),
                     std::path::PathBuf::from(session.workspace_root),
-                    Some(preview_owner),
+                    Some(state_owner),
                     cx,
                 );
                 if !workbench.workspace_is_active(&workspace_id) {
@@ -53493,6 +53622,25 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Workbench,
+            locale::text("Workspace state", "工作区状态", "工作區狀態"),
+            locale::text(
+                "Choose whether sessions of one project checkout share the right rail, the integrated panel, and the multi-tab preview.",
+                "选择同一项目检出下的会话共享右侧栏、集成面板和多标签预览，还是每个会话各自保存。",
+                "選擇同一專案簽出下的會話共享右側欄、整合面板與多分頁預覽，或每個會話各自儲存。",
+            ),
+            &[
+                "workspace state",
+                "scope",
+                "right rail",
+                "preview",
+                "工作区状态",
+                "工作區狀態",
+                "会话",
+                "會話",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Workbench,
             locale::text("Reset workbench layout", "重置工作台布局", "重設工作台版面"),
             locale::text(
                 "Restore default panel visibility and sizes without deleting sessions.",
@@ -55391,6 +55539,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_workspace_state_scope(&mut self, scope: WorkspaceStateScope, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_workspace_state_scope(scope, cx));
+        cx.notify();
+    }
+
     fn set_default_new_session_location(
         &mut self,
         location: NewSessionLocation,
@@ -56858,6 +57013,29 @@ impl FoundationSettings {
             .workbench
             .read_with(cx, |this, _| this.ui_state.workbench.preview_window_mode)
             .unwrap_or_default();
+        let workspace_scope = self
+            .workbench
+            .read_with(cx, |this, _| this.ui_state.workbench.workspace_state_scope)
+            .unwrap_or_default();
+        let workspace_scope_control = settings_segmented_control(
+            "workspace-state-scope",
+            vec![
+                settings_segmented_option(
+                    locale::text("Per project", "按项目", "按專案"),
+                    workspace_scope == WorkspaceStateScope::Project,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_workspace_state_scope(WorkspaceStateScope::Project, cx)
+                    }),
+                ),
+                settings_segmented_option(
+                    locale::text("Per session", "按会话", "按會話"),
+                    workspace_scope.is_session(),
+                    cx.listener(|this, _, _, cx| {
+                        this.set_workspace_state_scope(WorkspaceStateScope::Session, cx)
+                    }),
+                ),
+            ],
+        );
         let preview_window_control = settings_segmented_control(
             "preview-window-mode",
             vec![
@@ -57091,6 +57269,17 @@ impl FoundationSettings {
                             "選擇多分頁預覽在主視窗內嵌開啟，或彈出為獨立視窗。",
                         ),
                         preview_window_control,
+                        stacked,
+                        cx,
+                    ),
+                    setting_row(
+                        locale::text("Workspace state", "工作区状态", "工作區狀態"),
+                        locale::text(
+                            "Sessions in the same project checkout share the right rail, the integrated panel, and the multi-tab preview. Per session keeps them apart and restores each session's own column.",
+                            "同一项目检出下的会话共享右侧栏、集成面板和多标签预览；按会话则为每个会话单独保存，切换会话时恢复。",
+                            "同一專案簽出下的會話共享右側欄、整合面板與多分頁預覽；按會話則為每個會話單獨儲存，切換會話時還原。",
+                        ),
+                        workspace_scope_control,
                         stacked,
                         cx,
                     ),

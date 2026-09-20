@@ -131,6 +131,22 @@ pub struct GitHistoryFilter {
     pub authored_before_ms: Option<i64>,
 }
 
+/// Presentation state of the Git panel that belongs to a workspace state
+/// scope.
+///
+/// It holds what the panel is showing and what it has selected, not the loaded
+/// status, history, or diffs: those are read for the workspace on screen and
+/// stay shared by every scope looking at it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GitWorkbenchPresentation {
+    pub mode: GitWorkbenchMode,
+    pub history_filter: GitHistoryFilter,
+    pub selected_changes: BTreeSet<GitSelectionKey>,
+    pub expanded_change_directories: BTreeSet<String>,
+    pub expanded_commit_directories: BTreeSet<String>,
+    pub selected_commit_hash: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitDiffDocument {
     pub path: String,
@@ -1000,6 +1016,46 @@ impl GitWorkbenchState {
         self.clear_commit_tree();
         self.invalidate_queries();
         self.touch_presentation();
+    }
+
+    pub fn presentation_snapshot(&self) -> GitWorkbenchPresentation {
+        GitWorkbenchPresentation {
+            mode: self.mode,
+            history_filter: self.history_filter.clone(),
+            selected_changes: self.selected_changes.clone(),
+            expanded_change_directories: self.expanded_change_directories.clone(),
+            expanded_commit_directories: self.expanded_commit_directories.clone(),
+            selected_commit_hash: self.selected_commit_hash.clone(),
+        }
+    }
+
+    /// Restore a parked presentation.
+    ///
+    /// The loaded history is dropped only when the filter actually changes, so
+    /// adopting a scope that shares this workspace's view keeps the rows that
+    /// are already on screen. The caller reloads a restored commit selection,
+    /// which this method only records.
+    pub fn restore_presentation(&mut self, presentation: GitWorkbenchPresentation) -> bool {
+        if self.presentation_snapshot() == presentation {
+            return false;
+        }
+        if self.history_filter != presentation.history_filter {
+            self.set_history_filter(presentation.history_filter);
+        }
+        self.set_mode(presentation.mode);
+        self.selected_changes = presentation.selected_changes;
+        self.expanded_change_directories = presentation.expanded_change_directories;
+        self.expanded_commit_directories = presentation.expanded_commit_directories;
+        self.selected_commit_hash = presentation.selected_commit_hash;
+        if self
+            .selected_commit_hash
+            .as_ref()
+            .is_some_and(|hash| self.commit_documents.contains_key(hash))
+        {
+            self.sync_selected_commit_detail();
+        }
+        self.touch_presentation();
+        true
     }
 
     pub fn select_commit(&mut self, hash: impl Into<String>) {
@@ -1935,6 +1991,47 @@ mod tests {
             patch: patch.map(str::to_string),
             patch_truncated: false,
         }
+    }
+
+    #[test]
+    fn a_parked_presentation_restores_mode_filter_selection_and_expansions() {
+        let workspace_id = WorkspaceId::new();
+        let mut state = GitWorkbenchState::default();
+        state.reset_workspace(workspace_id.clone());
+        let ticket = state.begin_query(GitQueryKind::Status, "status").unwrap();
+        state.apply_status(&ticket, status(&workspace_id));
+        state.set_mode(GitWorkbenchMode::History);
+        state.set_history_filter(GitHistoryFilter {
+            ref_name: Some("main".into()),
+            query: Some("fix".into()),
+            ..GitHistoryFilter::default()
+        });
+        state.select_change(
+            GitSelectionKey {
+                path: "src/lib.rs".into(),
+                staged: true,
+            },
+            false,
+        );
+        state.toggle_change_directories(&["src".to_string()]);
+        state.select_commit("abc1234");
+        let parked = state.presentation_snapshot();
+
+        // Another scope shares the workspace and leaves a different view.
+        state.set_mode(GitWorkbenchMode::Changes);
+        state.set_history_filter(GitHistoryFilter::default());
+        state.selected_changes.clear();
+        state.toggle_change_directories(&["src".to_string()]);
+        state.clear_commit_selection();
+
+        assert!(state.restore_presentation(parked.clone()));
+        assert_eq!(state.presentation_snapshot(), parked);
+        assert_eq!(state.mode, GitWorkbenchMode::History);
+        assert_eq!(state.history_filter.query.as_deref(), Some("fix"));
+        assert_eq!(state.selected_paths(true), vec!["src/lib.rs".to_string()]);
+        assert_eq!(state.selected_commit_hash.as_deref(), Some("abc1234"));
+        // Restoring the same view again is a no-op.
+        assert!(!state.restore_presentation(parked));
     }
 
     #[test]
