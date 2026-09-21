@@ -53,20 +53,20 @@ use vibex_core::{
     RcImportPayload, RemoteAuditListRequest, RemoteAuditRecord, RemoteCancelPairingOfferRequest,
     RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteProviderManagementSnapshot, RemoteRevokeDeviceRequest,
-    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
-    ResolvePermissionRequest, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix, SkillAgentMatrixListRequest,
-    SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest, SkillDiscoveryResponse,
-    SkillImportRequest, SkillImportResult, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse, SkillSetAgentMatrixRequest, SkillUpdateRequest,
-    SkillValidateRequest, SkillValidationResult, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest, TimelineItem,
-    TimelinePage, VibexSessionId, WorkspaceId,
+    RemotePairingOfferSummary, RemoteProviderManagementSnapshot, RemoteRenameDeviceRequest,
+    RemoteRevokeDeviceRequest, RenameAgentSessionRequest, ReplaceUserMessagePayload,
+    ResolveElicitationRequest, ResolvePermissionRequest, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, Skill, SkillAgentMatrix,
+    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
+    SkillDiscoveryResponse, SkillImportRequest, SkillImportResult, SkillMarketDocument,
+    SkillMarketDocumentRequest, SkillMarketInstallRequest, SkillMarketInstallResult,
+    SkillMarketSearchRequest, SkillMarketSearchResponse, SkillSetAgentMatrixRequest,
+    SkillUpdateRequest, SkillValidateRequest, SkillValidationResult, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalWriteRequest,
+    TimelineItem, TimelinePage, VibexSessionId, WorkspaceId,
 };
 
 use crate::{
@@ -1351,6 +1351,17 @@ impl DeviceBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<RemoteRevokeDeviceRequest>,
     ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        disconnected_future!()
+    }
+
+    fn rename_device(
+        &self,
+        _request: MutationRequest<RemoteRenameDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        disconnected_future!()
+    }
+
+    fn rename_runtime(&self, _request: MutationRequest<String>) -> BackendFuture<'_, String> {
         disconnected_future!()
     }
 

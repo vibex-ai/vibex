@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     CorrelationId, DeviceId, ErrorCategory, EventId, RemoteActionClass, RemoteAuthProof,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteOperationKind,
-    RemoteRevokeDeviceRequest, RequestId, VibexError, unix_timestamp_ms,
+    RemoteRenameDeviceRequest, RemoteRenameRuntimeRequest, RemoteRevokeDeviceRequest, RequestId,
+    VibexError, unix_timestamp_ms,
 };
 
 macro_rules! impl_unknown_safe_enum {
@@ -29,6 +30,25 @@ macro_rules! impl_unknown_safe_enum {
 
 pub const REMOTE_PROTOCOL_V2_MAJOR: u16 = 2;
 pub const REMOTE_PROTOCOL_V2_MINOR: u16 = 0;
+/// Upper bound on a runtime or device display name. It is short enough for a
+/// picker row and long enough for a hostname or a phone model.
+pub const REMOTE_DISPLAY_NAME_MAX_CHARS: usize = 64;
+
+/// Normalizes an operator-supplied runtime or device name.
+///
+/// A name is trimmed and bounded; an empty result, an over-long one, or one
+/// carrying control characters is rejected rather than truncated, so a rename
+/// never silently stores something other than what was typed.
+pub fn normalize_remote_display_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > REMOTE_DISPLAY_NAME_MAX_CHARS
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
 pub const REMOTE_V2_BINARY_MAGIC: [u8; 4] = *b"VBX2";
 pub const REMOTE_V2_MAX_BINARY_HEADER_BYTES: usize = 64 * 1024;
 pub const REMOTE_V2_MAX_BINARY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -293,6 +313,17 @@ pub struct RemoteServerInfoV2 {
     /// runtime without a kind rather than guessing one.
     #[serde(default)]
     pub server_kind: RemoteServerKind,
+    /// The name the runtime publishes for itself. It defaults to the machine's
+    /// device name and is the authority for every client's runtime label, so a
+    /// rename reaches every connected client. Absent from a runtime that
+    /// predates the field; clients then fall back to the route authority.
+    #[serde(default)]
+    pub server_display_name: String,
+    /// The name this runtime holds for the authenticated client device. It is
+    /// how a phone learns the name an operator set for it in the runtime's
+    /// paired-device list. Absent from a runtime that predates the field.
+    #[serde(default)]
+    pub device_display_name: String,
     pub session_epoch: u64,
     pub connection_id: RequestId,
     pub server_time_ms: i64,
@@ -317,6 +348,8 @@ impl fmt::Debug for RemoteServerInfoV2 {
             .field("capabilities", &self.capabilities)
             .field("enabled_features", &self.enabled_features)
             .field("device_permissions", &self.device_permissions)
+            .field("server_display_name", &self.server_display_name)
+            .field("device_display_name", &self.device_display_name)
             .field("session_epoch", &self.session_epoch)
             .field("connection_id", &self.connection_id)
             .field("server_time_ms", &self.server_time_ms)
@@ -1177,6 +1210,8 @@ pub enum RemoteDeviceOperationKind {
     CancelPairingOffer,
     ListDevices,
     RevokeDevice,
+    RenameDevice,
+    RenameRuntime,
     ListAudit,
     ExportDiagnostics,
     BackupCreate,
@@ -1276,12 +1311,89 @@ impl fmt::Debug for RemoteDeviceRevokeRequest {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceRenameRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteRenameDeviceRequest,
+}
+
+impl fmt::Debug for RemoteDeviceRenameRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceRenameRequest")
+            .field("auth", &self.auth)
+            .field("device_id", &self.request.device_id)
+            .field("has_display_name", &!self.request.display_name.is_empty())
+            .finish()
+    }
+}
+
+/// Renames the runtime itself.
+///
+/// The runtime is the authority for its own name, so this is how a client makes
+/// a rename visible to every other client instead of only to itself.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeviceRenameRuntimeRequest {
+    pub auth: RemoteAuthProof,
+    pub request: RemoteRenameRuntimeRequest,
+}
+
+impl fmt::Debug for RemoteDeviceRenameRuntimeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDeviceRenameRuntimeRequest")
+            .field("auth", &self.auth)
+            .field("has_display_name", &!self.request.display_name.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRuntimeRenameResponse {
+    pub display_name: String,
+}
+
+impl fmt::Debug for RemoteRuntimeRenameResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteRuntimeRenameResponse")
+            .field("has_display_name", &!self.display_name.is_empty())
+            .finish()
+    }
+}
+
+/// The runtime renamed itself. Every subscribed client applies it, so one
+/// rename reaches every client of that runtime.
+///
+/// `deny_unknown_fields` keeps the two identity-change payloads distinguishable
+/// on the shared device channel: a device rename carries an extra id and must
+/// not decode as a runtime rename.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteRuntimeRenamed {
+    pub display_name: String,
+}
+
+/// A paired device was renamed by the runtime operator. The device itself is
+/// the only client that acts on it, and only when the id is its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteDeviceRenamed {
+    pub device_id: DeviceId,
+    pub display_name: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteDeviceRequest {
     CreatePairingOffer(RemoteDeviceCreatePairingOfferRequest),
     CancelPairingOffer(RemoteDeviceCancelPairingOfferRequest),
     ListDevices(RemoteDeviceListRequest),
     RevokeDevice(RemoteDeviceRevokeRequest),
+    RenameDevice(RemoteDeviceRenameRequest),
+    RenameRuntime(RemoteDeviceRenameRuntimeRequest),
     ListAudit(RemoteDeviceAuditListRequest),
     ExportDiagnostics(RemoteDeviceDiagnosticsExportRequest),
     BackupCreate(RemoteDeviceBackupCreateRequest),
@@ -1368,6 +1480,8 @@ impl RemoteDeviceRequest {
             Self::CancelPairingOffer(_) => RemoteDeviceOperationKind::CancelPairingOffer,
             Self::ListDevices(_) => RemoteDeviceOperationKind::ListDevices,
             Self::RevokeDevice(_) => RemoteDeviceOperationKind::RevokeDevice,
+            Self::RenameDevice(_) => RemoteDeviceOperationKind::RenameDevice,
+            Self::RenameRuntime(_) => RemoteDeviceOperationKind::RenameRuntime,
             Self::ListAudit(_) => RemoteDeviceOperationKind::ListAudit,
             Self::ExportDiagnostics(_) => RemoteDeviceOperationKind::ExportDiagnostics,
             Self::BackupCreate(_) => RemoteDeviceOperationKind::BackupCreate,
@@ -1871,6 +1985,109 @@ mod tests {
             assert!(!debug.contains("device-auth-token-sentinel"));
             assert!(!debug.contains("private-route.invalid"));
             assert!(!debug.contains("private-revoke-reason-sentinel"));
+        }
+    }
+
+    #[test]
+    fn display_names_are_trimmed_bounded_and_free_of_control_characters() {
+        assert_eq!(
+            normalize_remote_display_name("  dev  "),
+            Some("dev".to_string())
+        );
+        assert_eq!(normalize_remote_display_name("   "), None);
+        assert_eq!(normalize_remote_display_name("dev\nbox"), None);
+        assert_eq!(
+            normalize_remote_display_name(&"x".repeat(REMOTE_DISPLAY_NAME_MAX_CHARS)),
+            Some("x".repeat(REMOTE_DISPLAY_NAME_MAX_CHARS))
+        );
+        assert_eq!(
+            normalize_remote_display_name(&"x".repeat(REMOTE_DISPLAY_NAME_MAX_CHARS + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn server_info_without_published_names_still_decodes() {
+        // A runtime that predates the fields sends neither key; the client
+        // falls back to its route authority instead of failing the handshake.
+        let encoded = serde_json::json!({
+            "serverId": "server-a",
+            "serverIdentityPublicKey": "server-public-a",
+            "desktopVersion": "0.1.0-rc.5",
+            "protocolRange": { "min": { "major": 2, "minor": 0 }, "max": { "major": 2, "minor": 0 } },
+            "selectedProtocol": { "major": 2, "minor": 0 },
+            "serverEphemeralPublicKey": "ephemeral-a",
+            "sessionKeyConfirmation": "confirmation-a",
+            "sessionEpoch": 3,
+            "connectionId": "request_connection_a",
+            "serverTimeMs": 7
+        });
+        let info: RemoteServerInfoV2 = serde_json::from_value(encoded).unwrap();
+        assert!(info.server_display_name.is_empty());
+        assert!(info.device_display_name.is_empty());
+        assert_eq!(info.server_kind, RemoteServerKind::Unknown);
+    }
+
+    #[test]
+    fn identity_change_payloads_do_not_decode_as_each_other() {
+        let runtime = RemoteRuntimeRenamed {
+            display_name: "dev".to_string(),
+        };
+        let device = RemoteDeviceRenamed {
+            device_id: DeviceId::parse("device_phone").unwrap(),
+            display_name: "Pixel".to_string(),
+        };
+        // Both ride the device channel, so the runtime payload has to reject
+        // the device payload's extra id rather than decode it as its own.
+        assert!(
+            serde_json::from_value::<RemoteRuntimeRenamed>(serde_json::to_value(&device).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<RemoteRuntimeRenamed>(serde_json::to_value(&runtime).unwrap())
+                .unwrap(),
+            runtime
+        );
+        assert_eq!(
+            serde_json::from_value::<RemoteDeviceRenamed>(serde_json::to_value(&device).unwrap())
+                .unwrap(),
+            device
+        );
+    }
+
+    #[test]
+    fn device_rename_requests_round_trip_and_report_their_kind() {
+        let auth = RemoteAuthProof {
+            device_id: DeviceId::parse("device_admin").unwrap(),
+            auth_token: "device-auth-token".to_string(),
+        };
+        let rename_device = RemoteDeviceRequest::RenameDevice(RemoteDeviceRenameRequest {
+            auth: auth.clone(),
+            request: RemoteRenameDeviceRequest {
+                device_id: DeviceId::parse("device_phone").unwrap(),
+                display_name: "Pixel".to_string(),
+            },
+        });
+        let rename_runtime = RemoteDeviceRequest::RenameRuntime(RemoteDeviceRenameRuntimeRequest {
+            auth,
+            request: RemoteRenameRuntimeRequest {
+                display_name: "dev".to_string(),
+            },
+        });
+        assert_eq!(
+            rename_device.operation_kind(),
+            RemoteDeviceOperationKind::RenameDevice
+        );
+        assert_eq!(
+            rename_runtime.operation_kind(),
+            RemoteDeviceOperationKind::RenameRuntime
+        );
+        for request in [rename_device, rename_runtime] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                serde_json::from_value::<RemoteDeviceRequest>(encoded).unwrap(),
+                request
+            );
         }
     }
 }

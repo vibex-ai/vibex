@@ -82,8 +82,7 @@ use vibex_app_update::{
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
-    BackendOperation, BackendProjection, BackendResult, DeviceBackend, MutationRequest,
-    NativeBackend,
+    BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
 };
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -2940,6 +2939,11 @@ fn map_backend_event(event: BackendEvent) -> Option<DesktopEvent> {
         BackendEvent::ProjectionInvalidated(BackendProjection::Usage) => {
             Some(DesktopEvent::UsageInvalidated)
         }
+        BackendEvent::RuntimeRenamed(_) | BackendEvent::DeviceRenamed(_) => {
+            // Identity changes are applied by the remote event pump, which owns
+            // the runtime registry, rather than by a desktop event.
+            None
+        }
         BackendEvent::ProjectionInvalidated(_) | BackendEvent::Notification(_) => None,
         BackendEvent::Lagged {
             stream,
@@ -2974,6 +2978,8 @@ enum RuntimeUiSignal {
     /// the transport keeps retrying, so the drain loop stays alive and the UI
     /// only shows a reconnect note.
     RemoteReconnecting,
+    /// The runtime this shell drives published a new name.
+    RuntimeRenamed(String),
     Shutdown,
 }
 
@@ -9208,10 +9214,95 @@ impl VibexWorkbench {
         };
         let name = self.runtime_rename_input.read(cx).value().to_string();
         self.runtime_rename_active = false;
+        if id == LOCAL_RUNTIME_ID {
+            self.rename_local_runtime(name, cx);
+            cx.notify();
+            return;
+        }
+        let active_remote = self
+            .remote_client
+            .as_ref()
+            .filter(|client| client.runtime_id == id)
+            .map(|client| client.backend.facade().device().clone());
+        if let Some(device) = active_remote {
+            self.rename_remote_runtime(id, name, device, cx);
+            cx.notify();
+            return;
+        }
         if self.runtime_registry.rename(&id, &name) {
             self.persist_runtime_registry(cx);
         }
         cx.notify();
+    }
+
+    /// Renames the embedded runtime and keeps its list label in step.
+    fn rename_local_runtime(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let remote = runtime.management().remote();
+        let requested = name.trim().to_string();
+        let runner =
+            gpui_tokio::Tokio::spawn(cx, async move { remote.rename_runtime(requested.trim()) });
+        self.runtime_rename_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_rename_task = None;
+                    match outcome {
+                        Ok(Ok(name)) => this.local_runtime_name = Some(name),
+                        Ok(Err(error)) => this.runtime_note = Some(error.message),
+                        Err(_) => {
+                            this.runtime_note = Some("The runtime rename task failed".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Renames a remote runtime through its authority, so every client of that
+    /// runtime — not only this shell — renders the new name.
+    fn rename_remote_runtime(
+        &mut self,
+        id: String,
+        name: String,
+        device: Arc<dyn vibex_backend::DeviceBackend>,
+        cx: &mut Context<Self>,
+    ) {
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            device
+                .rename_runtime(MutationRequest::new(name.trim().to_string()))
+                .await
+        });
+        self.runtime_rename_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_rename_task = None;
+                    match outcome {
+                        Ok(Ok(name)) => {
+                            if let Some(runtime) = this.runtime_registry.remote_mut(&id) {
+                                // An authoritative rename replaces any local
+                                // pet name, because the runtime's own name is
+                                // what every client of it now shows.
+                                let cleared = runtime.display_name.take().is_some();
+                                let named = runtime.observe_server_display_name(&name);
+                                if cleared || named {
+                                    this.persist_runtime_registry(cx);
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => this.runtime_note = Some(error.message),
+                        Err(_) => {
+                            this.runtime_note = Some("The runtime rename task failed".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     /// Swaps the panel's body to the pairing form. The form lives in the panel
@@ -9311,15 +9402,16 @@ impl VibexWorkbench {
         self.runtime_connect_errors.remove(&runtime_id);
         // The handshake repeats what the claim learned, so a runtime that was
         // upgraded or re-hosted since it was paired corrects itself here.
-        if let Some(kind) = client
-            .backend
-            .transport()
-            .server_info()
-            .map(|info| info.server_kind)
-            && let Some(runtime) = self.runtime_registry.remote_mut(&runtime_id)
-            && runtime.observe_server_kind(kind)
-        {
-            self.persist_runtime_registry(cx);
+        if let Some(info) = client.backend.transport().server_info() {
+            let kind = info.server_kind;
+            let display_name = info.server_display_name.clone();
+            if let Some(runtime) = self.runtime_registry.remote_mut(&runtime_id) {
+                let kind_changed = runtime.observe_server_kind(kind);
+                let name_changed = runtime.observe_server_display_name(&display_name);
+                if kind_changed || name_changed {
+                    self.persist_runtime_registry(cx);
+                }
+            }
         }
         let backend = client.backend.clone();
         let sidebar_authority = remote_authority_key(&client.credential);
@@ -9504,10 +9596,35 @@ impl VibexWorkbench {
         });
         self.backend = Some(facade);
         self.attach_update_status(runtime.clone(), cx);
-        self.attach_event_stream(runtime, cx);
+        self.attach_event_stream(runtime.clone(), cx);
+        self.load_local_runtime_name(runtime, cx);
         self.load_agent_overview(cx);
         self.finish_startup_loading(cx);
         cx.notify();
+    }
+
+    /// Reads the embedded runtime's published name off the UI thread.
+    ///
+    /// The name lives with the authority (a rename is durable), so it is read
+    /// once when the runtime is installed rather than assumed from the config.
+    fn load_local_runtime_name(&mut self, runtime: Arc<DesktopRuntime>, cx: &mut Context<Self>) {
+        let remote = runtime.management().remote();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move { remote.runtime_display_name() });
+        self.local_runtime_name_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.local_runtime_name_task = None;
+                    if let Ok(Ok(name)) = outcome {
+                        let name = name.trim().to_string();
+                        if !name.is_empty() && this.local_runtime_name.as_deref() != Some(&name) {
+                            this.local_runtime_name = Some(name);
+                            cx.notify();
+                        }
+                    }
+                });
+            },
+        ));
     }
 
     /// Stops every workbench attachment to the embedded runtime but leaves the
@@ -10636,6 +10753,23 @@ impl VibexWorkbench {
                         // Desktop notifications surface from the authoritative
                         // timeline events; no separate push intent is needed.
                     }
+                    Ok(Some(BackendEvent::RuntimeRenamed(renamed))) => {
+                        // The authority published a new name for the runtime
+                        // this shell is driving, so the runtime list follows it
+                        // without a reconnect.
+                        if signal_tx
+                            .send(RuntimeUiSignal::RuntimeRenamed(renamed.display_name))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Some(BackendEvent::DeviceRenamed(_))) => {
+                        // A device rename names the device, not the runtime.
+                        // This shell's own device name is not a runtime-list
+                        // fact, so there is nothing to re-render here.
+                    }
                     Ok(Some(event)) => {
                         let Some(desktop_event) = map_backend_event(event) else {
                             continue;
@@ -10698,6 +10832,44 @@ impl VibexWorkbench {
         ));
     }
 
+    /// Applies a rename the runtime published while this shell was driving it.
+    ///
+    /// The embedded runtime owns the name directly; a remote runtime is
+    /// recorded on its registry entry, which is also what a later reconnect
+    /// reads back from the handshake.
+    fn apply_runtime_rename(&mut self, display_name: &str, cx: &mut Context<Self>) -> bool {
+        if self.remote_client.is_none() {
+            let Some(name) = vibex_core::normalize_remote_display_name(display_name) else {
+                return false;
+            };
+            if self.local_runtime_name.as_deref() == Some(name.as_str()) {
+                return false;
+            }
+            self.local_runtime_name = Some(name);
+            return true;
+        }
+        let Some(id) = self
+            .remote_client
+            .as_ref()
+            .map(|client| client.runtime_id.clone())
+        else {
+            return false;
+        };
+        let Some(runtime) = self.runtime_registry.remote_mut(&id) else {
+            return false;
+        };
+        // The runtime's own rename replaces a local pet name for the same
+        // reason the confirming client clears it: one name, published by the
+        // runtime, is what every client shows.
+        let cleared = runtime.display_name.take().is_some();
+        let named = runtime.observe_server_display_name(display_name);
+        if !cleared && !named {
+            return false;
+        }
+        self.persist_runtime_registry(cx);
+        true
+    }
+
     fn apply_runtime_ui_signals(
         &mut self,
         signals: Vec<RuntimeUiSignal>,
@@ -10733,6 +10905,12 @@ impl VibexWorkbench {
                     self.runtime_note =
                         Some("Remote runtime connection lost; reconnecting…".to_string());
                     dirty = true;
+                }
+                RuntimeUiSignal::RuntimeRenamed(display_name) => {
+                    if !timeline_events.is_empty() {
+                        self.apply_live_timeline_batch(std::mem::take(&mut timeline_events), cx);
+                    }
+                    dirty |= self.apply_runtime_rename(&display_name, cx);
                 }
             }
         }

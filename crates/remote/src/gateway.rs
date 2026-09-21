@@ -624,6 +624,21 @@ impl GatewayDomainEvents {
         generation: u64,
         correlation_id: Option<CorrelationId>,
     ) -> VibexResult<()> {
+        self.publish_with_payload(channel, generation, correlation_id, None)
+    }
+
+    /// Publishes one domain event, optionally carrying a typed payload.
+    ///
+    /// A payload is how an identity change reaches connected clients with the
+    /// new value in hand: the event is the wake-up, and the payload is the
+    /// fact, so a client never has to guess or reconnect to learn a rename.
+    fn publish_with_payload(
+        &self,
+        channel: &str,
+        generation: u64,
+        correlation_id: Option<CorrelationId>,
+        payload: Option<serde_json::Value>,
+    ) -> VibexResult<()> {
         let sequence = {
             let mut sequences = self.sequences.lock().map_err(|_| gateway_state_error())?;
             let sequence = sequences
@@ -638,7 +653,7 @@ impl GatewayDomainEvents {
             generation,
             sequence,
             correlation_id,
-            payload: None,
+            payload,
             emitted_at_ms: unix_timestamp_ms(),
         });
         Ok(())
@@ -843,10 +858,17 @@ impl RemoteGateway {
             relay_candidate: None,
         })?;
         let offer_id = response.offer.summary.offer_id.clone();
+        // A LAN advertisement carries the name the phone shows for this
+        // runtime, so it publishes the same renamed name the handshake does.
+        let config = self.current_config();
+        let display_name = {
+            let connection = open_migrated_database(&self.inner.db_path)?;
+            gateway_server_display_name_for(&config, &connection)
+        };
         match self.inner.lan_pairing.start(
             response.offer,
             &direct_origin,
-            &self.current_config().service.service_name,
+            &display_name,
             unix_timestamp_ms(),
         ) {
             Ok(snapshot) => Ok(snapshot),
@@ -1057,10 +1079,15 @@ impl RemoteGateway {
             Err(error) => return Err(error),
         };
         let offer_id = offer.offer.summary.offer_id.clone();
+        let config = self.current_config();
+        let display_name = {
+            let connection = open_migrated_database(&self.inner.db_path)?;
+            gateway_server_display_name_for(&config, &connection)
+        };
         let snapshot = match self.inner.zero_config_lan_pairing.start_zero_config(
             offer.offer,
             bound_addr.port(),
-            &self.current_config().service.service_name,
+            &display_name,
             unix_timestamp_ms(),
         ) {
             Ok(snapshot) => snapshot,
@@ -1512,6 +1539,8 @@ impl RemoteGateway {
             enabled_features: gateway_features(&state),
             device_permissions: remote_permissions_for_level(auth.permission_level),
             server_kind: state.config.server_kind,
+            server_display_name: gateway_server_display_name(&state, &connection),
+            device_display_name: auth.display_name.clone(),
             session_epoch: context.session_epoch,
             connection_id: RequestId::new(),
             server_time_ms: unix_timestamp_ms(),
@@ -2798,6 +2827,12 @@ fn encrypted_zero_config_response<T: serde::Serialize>(
 }
 
 async fn gateway_info(State(state): State<GatewayState>) -> Response {
+    // A pairing client probes this before it holds a grant, so the published
+    // name has to be readable without authentication. It is a display name and
+    // never a secret.
+    let server_display_name = open_migrated_database(&state.db_path)
+        .map(|connection| gateway_server_display_name(&state, &connection))
+        .unwrap_or_else(|_| state.config.service.service_name.clone());
     Json(serde_json::json!({
         "serverId": state.identity.server_id(),
         "serverIdentityPublicKey": state.identity.public_key_base64(),
@@ -2811,6 +2846,7 @@ async fn gateway_info(State(state): State<GatewayState>) -> Response {
         "wsTicketPath": "/api/v2/ws-ticket",
         "deploymentMode": state.config.deployment_mode.wire_name(),
         "serverKind": state.config.server_kind.wire_name(),
+        "serverDisplayName": server_display_name,
         "tlsPolicy": state.config.tls_policy.wire_name(),
         "sessionEpoch": state.session_epoch,
         "enabledFeatures": gateway_features(&state),
@@ -3163,6 +3199,11 @@ async fn run_v2_socket(socket: WebSocket, state: GatewayState, ticket: WsTicketR
         }
     };
     let subscriptions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    // The runtime's published name is read at handshake time, so a rename made
+    // while this socket was connecting is what the client renders.
+    let server_display_name = open_migrated_database(&state.db_path)
+        .map(|connection| gateway_server_display_name(&state, &connection))
+        .unwrap_or_else(|_| state.config.service.service_name.clone());
     let server_info = RemoteServerInfoV2 {
         server_id: state.identity.server_id().to_string(),
         server_identity_public_key: state.identity.public_key_base64(),
@@ -3175,6 +3216,8 @@ async fn run_v2_socket(socket: WebSocket, state: GatewayState, ticket: WsTicketR
         enabled_features: gateway_features(&state),
         device_permissions: remote_permissions_for_level(ticket.auth.permission_level),
         server_kind: state.config.server_kind,
+        server_display_name,
+        device_display_name: ticket.auth.display_name.clone(),
         session_epoch: state.session_epoch,
         connection_id: connection_id.clone(),
         server_time_ms: unix_timestamp_ms(),
@@ -4527,6 +4570,14 @@ async fn process_device_management_rpc(
             request.auth.clone(),
             RemoteActionClass::MutateDeviceManagement,
         ),
+        RemoteDeviceRequest::RenameDevice(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
+        RemoteDeviceRequest::RenameRuntime(request) => (
+            request.auth.clone(),
+            RemoteActionClass::MutateDeviceManagement,
+        ),
         RemoteDeviceRequest::ListAudit(request) => (
             request.auth.clone(),
             RemoteActionClass::ReadDeviceManagement,
@@ -4635,6 +4686,55 @@ async fn process_device_management_rpc(
             );
             serde_json::to_value(detail)
         }
+        RemoteDeviceRequest::RenameDevice(request) => {
+            let device_id = request.request.device_id.clone();
+            let mut detail = RemoteTrustService::rename_device(&connection, request.request)?;
+            detail.public_key = None;
+            // The renamed device is the only client that acts on this, and it
+            // matches on its own id; every other client can ignore it.
+            state.domain_events.publish_with_payload(
+                "device",
+                state.session_epoch,
+                correlation_id.clone(),
+                Some(
+                    serde_json::to_value(vibex_core::RemoteDeviceRenamed {
+                        device_id,
+                        display_name: detail.display_name.clone(),
+                    })
+                    .map_err(|_| {
+                        VibexError::validation(
+                            "remote_device_payload_encode_failed",
+                            "remote device management response could not be encoded",
+                        )
+                    })?,
+                ),
+            )?;
+            serde_json::to_value(detail)
+        }
+        RemoteDeviceRequest::RenameRuntime(request) => {
+            RemoteTrustService::rename_runtime(&connection, &request.request.display_name)?;
+            let display_name = gateway_server_display_name(state, &connection);
+            // Every connected client of this runtime renders the published
+            // name, so the rename is broadcast rather than answered only to
+            // the client that asked for it.
+            state.domain_events.publish_with_payload(
+                "device",
+                state.session_epoch,
+                correlation_id.clone(),
+                Some(
+                    serde_json::to_value(vibex_core::RemoteRuntimeRenamed {
+                        display_name: display_name.clone(),
+                    })
+                    .map_err(|_| {
+                        VibexError::validation(
+                            "remote_device_payload_encode_failed",
+                            "remote device management response could not be encoded",
+                        )
+                    })?,
+                ),
+            )?;
+            serde_json::to_value(vibex_core::RemoteRuntimeRenameResponse { display_name })
+        }
     }
     .map_err(|_| {
         VibexError::validation(
@@ -4657,6 +4757,26 @@ async fn process_device_management_rpc(
 
 /// Recovery runs on the authority, whose handles the gateway cannot reach, so
 /// the runtime installs the source on the dispatcher.
+/// The name this runtime publishes to every client.
+///
+/// An operator rename wins; otherwise the deployment's configured service name
+/// is used, which the desktop and headless entry points default to the
+/// machine's device name.
+fn gateway_server_display_name(
+    state: &GatewayState,
+    connection: &vibex_db::DbConnection,
+) -> String {
+    gateway_server_display_name_for(&state.config, connection)
+}
+
+fn gateway_server_display_name_for(
+    config: &RemoteGatewayConfig,
+    connection: &vibex_db::DbConnection,
+) -> String {
+    RemoteTrustService::runtime_display_name(connection, &config.service.service_name)
+        .unwrap_or_else(|_| config.service.service_name.clone())
+}
+
 fn recovery_source(state: &GatewayState) -> VibexResult<Arc<dyn RemoteRecoverySource>> {
     state.dispatcher.recovery_source().cloned().ok_or_else(|| {
         VibexError::capability(
@@ -6361,6 +6481,163 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&body).contains("\"serverKind\":\"desktop\""),
             "a desktop-hosted runtime must say so"
+        );
+    }
+
+    /// The runtime's published name defaults to the deployment's configured
+    /// service name and follows an operator rename, so the unauthenticated
+    /// claim probe reports exactly what the handshake later will.
+    #[tokio::test]
+    async fn info_endpoint_reports_the_published_runtime_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = RemoteGatewayConfig::loopback_enabled("127.0.0.1:1428");
+        config.service.service_name = "dev".to_string();
+        let gateway = test_gateway(&directory, config);
+        let router = gateway.router().unwrap();
+
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/v2/info")
+                    .header(HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"serverDisplayName\":\"dev\""),
+            "the claim must see the runtime's own name"
+        );
+
+        // The rename is written by the authority, which is what the RPC handler
+        // does; the probe reads the same row.
+        let connection = open_migrated_database(&directory.path().join("gateway.db")).unwrap();
+        RemoteTrustService::rename_runtime(&connection, "workstation").unwrap();
+        drop(connection);
+
+        let response = router
+            .oneshot(
+                HttpRequest::get("/api/v2/info")
+                    .header(HOST, "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"serverDisplayName\":\"workstation\""),
+            "a renamed runtime publishes the stored name"
+        );
+    }
+
+    /// A rename is stored with the authority and broadcast with the new name in
+    /// the payload, so every connected client applies it without reconnecting.
+    #[tokio::test]
+    async fn runtime_and_device_renames_are_authoritative_and_broadcast() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = test_gateway(
+            &directory,
+            RemoteGatewayConfig::loopback_enabled("127.0.0.1:0"),
+        );
+        let database_path = directory.path().join("gateway.db");
+        let admin = pair_test_device(
+            &database_path,
+            RemoteDevicePermissionLevel::FullControl,
+            None,
+        );
+        let target = pair_test_device(
+            &database_path,
+            RemoteDevicePermissionLevel::ReadOnly,
+            Some("device-public-key-rename".to_string()),
+        );
+        let state = gateway_state_for_test(&gateway);
+        let mut domain_events = state.domain_events.subscribe();
+
+        let rename_runtime = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::RenameRuntime(
+                    vibex_core::RemoteDeviceRenameRuntimeRequest {
+                        auth: admin.clone(),
+                        request: vibex_core::RemoteRenameRuntimeRequest {
+                            display_name: "  dev  ".to_string(),
+                        },
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        let response = process_rpc_inner(&state, &admin, rename_runtime)
+            .await
+            .unwrap();
+        let renamed: vibex_core::RemoteRuntimeRenameResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(renamed.display_name, "dev");
+        let event = domain_events.try_recv().unwrap();
+        assert_eq!(event.channel, "device");
+        let published: vibex_core::RemoteRuntimeRenamed =
+            serde_json::from_value(event.payload.expect("a rename carries its name")).unwrap();
+        assert_eq!(published.display_name, "dev");
+
+        let rename_device = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::RenameDevice(
+                    vibex_core::RemoteDeviceRenameRequest {
+                        auth: admin.clone(),
+                        request: vibex_core::RemoteRenameDeviceRequest {
+                            device_id: target.device_id.clone(),
+                            display_name: "Alice's phone".to_string(),
+                        },
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        let response = process_rpc_inner(&state, &admin, rename_device)
+            .await
+            .unwrap();
+        let detail: vibex_core::RemoteDeviceDetail =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(detail.display_name, "Alice's phone");
+        // A device-management read never returns the identity key.
+        assert!(detail.public_key.is_none());
+        let event = domain_events.try_recv().unwrap();
+        assert_eq!(event.channel, "device");
+        let published: vibex_core::RemoteDeviceRenamed =
+            serde_json::from_value(event.payload.expect("a rename carries its name")).unwrap();
+        assert_eq!(published.device_id, target.device_id);
+        assert_eq!(published.display_name, "Alice's phone");
+
+        // A read-only grant cannot rename anything, including itself.
+        let denied = process_rpc_inner(
+            &state,
+            &target,
+            RemoteRpcRequestV2::new(
+                RemoteOperationKind::DeviceManagement,
+                Some(
+                    serde_json::to_value(RemoteDeviceRequest::RenameRuntime(
+                        vibex_core::RemoteDeviceRenameRuntimeRequest {
+                            auth: target.clone(),
+                            request: vibex_core::RemoteRenameRuntimeRequest {
+                                display_name: "hijacked".to_string(),
+                            },
+                        },
+                    ))
+                    .unwrap(),
+                ),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code, "remote_permission_denied");
+        let connection = open_migrated_database(&database_path).unwrap();
+        assert_eq!(
+            RemoteTrustService::runtime_display_name(&connection, "fallback").unwrap(),
+            "dev"
         );
     }
 

@@ -353,6 +353,27 @@ pub struct RemoteRevokeDeviceRequest {
     pub reason: Option<String>,
 }
 
+/// Renames a paired device in the runtime's trust store.
+///
+/// The runtime owns the name, so the device's own surfaces read it back from
+/// the runtime instead of keeping a second copy that could drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRenameDeviceRequest {
+    pub device_id: DeviceId,
+    pub display_name: String,
+}
+
+/// Renames the runtime itself.
+///
+/// Every client of this runtime renders the published name, so this is the one
+/// rename that reaches all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRenameRuntimeRequest {
+    pub display_name: String,
+}
+
 /// Drops one trust-store record.
 ///
 /// The record is the desktop's memory of a client, not the client itself: a
@@ -438,6 +459,8 @@ pub enum RemoteAuditAction {
     DeviceRevoked,
     DeviceRestored,
     DeviceDeleted,
+    DeviceRenamed,
+    RuntimeRenamed,
     PermissionAllowed,
     PermissionDenied,
     MutationAllowed,

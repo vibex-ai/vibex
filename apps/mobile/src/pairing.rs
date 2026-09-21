@@ -323,12 +323,13 @@ pub async fn claim_server_pairing_code(
     let bundle = vibex_remote_client::claim_pairing_code_with_identity(
         server_url.clone(),
         pairing_code,
-        "Vibex Mobile".to_string(),
+        crate::device::device_display_name(),
         cfg!(debug_assertions),
         previous_identity,
     )
     .await?;
     let server_kind = bundle.server_kind;
+    let published_name = published_display_name(&bundle.server_display_name);
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
         record: bundle.credential,
@@ -336,7 +337,7 @@ pub async fn claim_server_pairing_code(
         expected_server_id: bundle.server_id,
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: cfg!(debug_assertions),
-        display_name: None,
+        display_name: published_name,
         route: Some(MobileRemoteRouteBundle {
             local_network: None,
             direct_candidates: vec![server_url],
@@ -366,12 +367,13 @@ pub async fn claim_pairing_code_link(
     let pinned_tls_certificate_der = link.tls_certificate_der.clone();
     let bundle = vibex_remote_client::claim_pairing_code_link_with_identity(
         link,
-        "Vibex Mobile".to_string(),
+        crate::device::device_display_name(),
         cfg!(debug_assertions),
         previous_identity,
     )
     .await?;
     let server_kind = bundle.server_kind;
+    let published_name = published_display_name(&bundle.server_display_name);
     let bundle = MobileCredentialBundle {
         schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
         record: bundle.credential,
@@ -379,7 +381,7 @@ pub async fn claim_pairing_code_link(
         expected_server_id: bundle.server_id,
         client_type: RemoteClientType::Mobile,
         allow_insecure_local_dev: cfg!(debug_assertions),
-        display_name: None,
+        display_name: published_name,
         route: Some(MobileRemoteRouteBundle {
             local_network: pinned_tls_certificate_der
                 .clone()
@@ -436,7 +438,7 @@ pub async fn claim_pairing_link(
     };
     let request = pairing_claim_request(
         &offer,
-        "Vibex Mobile",
+        &crate::device::device_display_name(),
         provisional_identity.public_key_base64(),
         RequestId::new().into_string(),
     )?;
@@ -573,6 +575,14 @@ pub async fn claim_zero_config_lan_pairing(
     bundle.validate()?;
     // No kind is available before the first connect on this route either.
     Ok(MobilePairedRuntime::unknown(bundle))
+}
+
+/// The runtime's published name, kept only when it is a usable label.
+///
+/// A claim against a runtime that predates the field reports an empty name, so
+/// the phone falls back to its route authority rather than storing a blank.
+fn published_display_name(value: &str) -> Option<String> {
+    vibex_core::normalize_remote_display_name(value)
 }
 
 /// True when the scanned or pasted entry is a `vibex-server` connection

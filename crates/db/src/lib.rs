@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 55;
+pub const CURRENT_SCHEMA_VERSION: i64 = 56;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -10337,6 +10337,37 @@ impl RemoteDeviceRepository {
         })
     }
 
+    /// Renames one trust-store record.
+    ///
+    /// The name is metadata the runtime owns: the grant, its revision, and the
+    /// device's status are untouched, so a rename never disturbs a live
+    /// connection.
+    pub fn rename(
+        conn: &Connection,
+        device_id: &DeviceId,
+        display_name: &str,
+        renamed_at_ms: i64,
+    ) -> VibexResult<RemoteDeviceRecord> {
+        conn.execute(
+            "
+            UPDATE remote_devices
+            SET display_name = ?2, updated_at_ms = ?3
+            WHERE device_id = ?1
+            ",
+            params![device_id.as_str(), display_name, renamed_at_ms],
+        )
+        .map_err(storage_err(
+            "remote_device_rename_failed",
+            "failed to rename remote device",
+        ))?;
+        Self::get(conn, device_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "remote_device_missing_after_rename",
+                "remote device was not found after rename",
+            )
+        })
+    }
+
     /// Removes a trust-store row.
     ///
     /// Audit rows keep their history: the `device_id` foreign key is
@@ -10555,6 +10586,47 @@ impl RemoteAuditRepository {
     }
 }
 
+/// The runtime's own published name.
+///
+/// One row per database, so the store is a get-or-default read and an upsert
+/// write. The name is not a secret and is published to every client handshake;
+/// the row only exists once an operator has renamed the runtime.
+pub struct RuntimeIdentityRepository;
+
+impl RuntimeIdentityRepository {
+    pub fn display_name(conn: &Connection) -> VibexResult<Option<String>> {
+        conn.query_row(
+            "SELECT display_name FROM runtime_identity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_err(
+            "runtime_identity_lookup_failed",
+            "failed to read the runtime display name",
+        ))
+    }
+
+    /// Stores the runtime's published name, replacing any previous one.
+    pub fn set_display_name(conn: &Connection, display_name: &str, now_ms: i64) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO runtime_identity (singleton, display_name, updated_at_ms)
+            VALUES (1, ?1, ?2)
+            ON CONFLICT(singleton) DO UPDATE SET
+                display_name = excluded.display_name,
+                updated_at_ms = excluded.updated_at_ms
+            ",
+            params![display_name, now_ms],
+        )
+        .map_err(storage_err(
+            "runtime_identity_write_failed",
+            "failed to store the runtime display name",
+        ))?;
+        Ok(())
+    }
+}
+
 pub fn default_database_path() -> VibexResult<PathBuf> {
     if let Ok(value) = std::env::var("VIBEX_DB_PATH") {
         let path = PathBuf::from(value);
@@ -10673,6 +10745,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_session_title_lock(conn, &mut applied)?;
     apply_local_history_import_index(conn, &mut applied)?;
     apply_skill_body_column(conn, &mut applied)?;
+    apply_runtime_identity(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10749,6 +10822,43 @@ fn apply_skill_body_column(conn: &mut Connection, applied: &mut Vec<String>) -> 
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record Skill body migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Stores the runtime's own published name.
+///
+/// The name is runtime identity, not client state: it has to survive a restart
+/// and be readable by every client handshake, so it lives in the authority's
+/// database beside the device trust store. A single row keyed by a constant is
+/// enough — there is exactly one runtime per database.
+fn apply_runtime_identity(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 56;
+    const NAME: &str = "runtime_identity";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS runtime_identity (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            display_name TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the runtime identity table",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the runtime identity migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -14119,7 +14229,8 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
-                "55:skill_body"
+                "55:skill_body",
+                "56:runtime_identity"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14259,6 +14370,7 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
+                "56:runtime_identity",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14378,7 +14490,8 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
-                "55:skill_body"
+                "55:skill_body",
+                "56:runtime_identity"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -14536,7 +14649,8 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
-                "55:skill_body"
+                "55:skill_body",
+                "56:runtime_identity"
             ]
         );
         assert_eq!(
@@ -15951,7 +16065,8 @@ mod tests {
                 "52:agent_delegations",
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
-                "55:skill_body"
+                "55:skill_body",
+                "56:runtime_identity"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -18263,6 +18378,75 @@ mod tests {
         .unwrap();
         assert_eq!(audits.len(), 1);
         assert!(!audits[0].redacted_summary.contains(raw_pairing_code));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn remote_device_rename_keeps_the_grant_and_runtime_identity_round_trips() {
+        let temp = temp_db_path("remote-rename");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let now = unix_timestamp_ms();
+        let device_id = DeviceId::new();
+        RemoteDeviceRepository::upsert(
+            &conn,
+            &RemoteDeviceRecord {
+                detail: RemoteDeviceDetail {
+                    device_id: device_id.clone(),
+                    display_name: "Vibex Mobile".to_string(),
+                    public_key: Some("identity-key".to_string()),
+                    grant_revision: 4,
+                    permission_level: RemoteDevicePermissionLevel::FullControl,
+                    status: RemoteDeviceStatus::Active,
+                    paired_at_ms: Some(now),
+                    last_seen_at_ms: Some(now),
+                    revoked_at_ms: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                },
+                auth_secret_hash: "hash:auth-token".to_string(),
+            },
+        )
+        .unwrap();
+
+        let renamed =
+            RemoteDeviceRepository::rename(&conn, &device_id, "Pixel 8", now + 1).unwrap();
+        assert_eq!(renamed.detail.display_name, "Pixel 8");
+        // A rename is metadata only: the grant and its revision must survive it,
+        // or a live device would be forced to pair again.
+        assert_eq!(renamed.detail.grant_revision, 4);
+        assert_eq!(
+            renamed.detail.permission_level,
+            RemoteDevicePermissionLevel::FullControl
+        );
+        assert_eq!(renamed.detail.status, RemoteDeviceStatus::Active);
+        assert_eq!(
+            RemoteDeviceRepository::get(&conn, &device_id)
+                .unwrap()
+                .unwrap()
+                .detail
+                .display_name,
+            "Pixel 8"
+        );
+
+        // The runtime's own name is a singleton row: unset until an operator
+        // renames it, and replaced rather than appended afterwards.
+        assert_eq!(
+            RuntimeIdentityRepository::display_name(&conn).unwrap(),
+            None
+        );
+        RuntimeIdentityRepository::set_display_name(&conn, "dev", now).unwrap();
+        assert_eq!(
+            RuntimeIdentityRepository::display_name(&conn).unwrap(),
+            Some("dev".to_string())
+        );
+        RuntimeIdentityRepository::set_display_name(&conn, "workstation", now + 1).unwrap();
+        assert_eq!(
+            RuntimeIdentityRepository::display_name(&conn).unwrap(),
+            Some("workstation".to_string())
+        );
 
         cleanup_db(temp);
     }

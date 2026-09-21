@@ -29,8 +29,8 @@ use vibex_core::{
     DeviceId, RemoteAuditListRequest, RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest,
     RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteLanPairingRequestState, RemoteLanPairingWindowSnapshot, RemotePairingOfferSummary,
-    RemotePairingTransport, RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RequestId,
-    VibexError, VibexResult, unix_timestamp_ms,
+    RemotePairingTransport, RemoteRenameDeviceRequest, RemoteRestoreDeviceRequest,
+    RemoteRevokeDeviceRequest, RequestId, VibexError, VibexResult, unix_timestamp_ms,
 };
 use vibex_desktop_runtime::{
     DesktopRuntime, RemoteConnectivityController, RemoteConnectivityMethod,
@@ -142,6 +142,10 @@ enum RemoteAccessAction {
     RevokeDevice(String),
     RestoreDevice(String),
     DeleteDevice(String),
+    RenameDevice {
+        device_id: String,
+        display_name: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -365,6 +369,7 @@ struct PairingViewState {
     revoking_device: Option<String>,
     restoring_device: Option<String>,
     deleting_device: Option<String>,
+    renaming_device: Option<String>,
     /// Device ids with a live connection, refreshed by the presence poll while
     /// the device list is open.
     connected_devices: BTreeSet<String>,
@@ -432,6 +437,7 @@ impl Default for PairingViewState {
             revoking_device: None,
             restoring_device: None,
             deleting_device: None,
+            renaming_device: None,
             connected_devices: BTreeSet::new(),
         }
     }
@@ -487,6 +493,7 @@ impl PairingViewState {
         self.revoking_device.is_some()
             || self.restoring_device.is_some()
             || self.deleting_device.is_some()
+            || self.renaming_device.is_some()
     }
 
     fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
@@ -632,6 +639,7 @@ pub(crate) struct RemoteAccessPairing {
     revoke_task: Option<Task<()>>,
     restore_task: Option<Task<()>>,
     delete_task: Option<Task<()>>,
+    rename_task: Option<Task<()>>,
     presence_poll_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     offer_poll_task: Option<Task<()>>,
@@ -689,6 +697,7 @@ impl RemoteAccessPairing {
             revoke_task: None,
             restore_task: None,
             delete_task: None,
+            rename_task: None,
             presence_poll_task: None,
             mutation_task: None,
             offer_poll_task: None,
@@ -727,6 +736,10 @@ impl RemoteAccessPairing {
             RemoteAccessAction::RevokeDevice(device_id) => self.revoke_device(device_id, cx),
             RemoteAccessAction::RestoreDevice(device_id) => self.restore_device(device_id, cx),
             RemoteAccessAction::DeleteDevice(device_id) => self.delete_device(device_id, cx),
+            RemoteAccessAction::RenameDevice {
+                device_id,
+                display_name,
+            } => self.rename_device(device_id, display_name, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
                 self.state.select_connection_entry(entry);
                 cx.notify();
@@ -1029,6 +1042,138 @@ impl RemoteAccessPairing {
                 });
             },
         ));
+    }
+
+    /// Renames one paired device in the runtime trust store.
+    ///
+    /// The runtime owns the name, so the rename is stored with the authority
+    /// and the device reads it back from its next handshake instead of keeping
+    /// a second copy that could drift.
+    fn rename_device(&mut self, device_id: String, display_name: String, cx: &mut Context<Self>) {
+        let Ok(device_id_value) = DeviceId::parse(device_id.clone()) else {
+            self.state.devices_error = Some("remote_device_id_invalid".to_string());
+            cx.notify();
+            return;
+        };
+        let remote = self.remote.clone();
+        self.state.renaming_device = Some(device_id);
+        self.state.error_code = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            remote.rename_device(RemoteRenameDeviceRequest {
+                device_id: device_id_value,
+                display_name,
+            })
+        });
+        self.rename_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.rename_task = None;
+                    this.state.renaming_device = None;
+                    match outcome {
+                        Ok(Ok(_)) => {
+                            this.state.notice = Some(RemoteAccessNotice::success(locale::text(
+                                "Device renamed",
+                                "已重命名设备",
+                                "已重新命名裝置",
+                            )));
+                            this.refresh_devices(cx);
+                        }
+                        Ok(Err(error)) => {
+                            this.state.notice = Some(RemoteAccessNotice::error(locale::text(
+                                "The device could not be renamed",
+                                "重命名设备失败",
+                                "重新命名裝置失敗",
+                            )));
+                            this.state.devices_error = Some(error.code);
+                        }
+                        Err(_) => {
+                            this.state.devices_error =
+                                Some("remote_device_rename_task_failed".to_string())
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Opens the rename dialog with the device's current name selected.
+    fn confirm_rename_device(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let title = match locale::current_locale() {
+            locale::ResolvedLocale::En => format!("Rename \"{device_name}\"?"),
+            locale::ResolvedLocale::ZhCn => format!("重命名“{device_name}”？"),
+            locale::ResolvedLocale::ZhTw => format!("重新命名「{device_name}」？"),
+        };
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(device_name.clone()));
+            input.update(cx, |input, cx| {
+                input.set_selected_range(0..device_name.len(), cx);
+                input.focus(window, cx);
+            });
+            let device_input = input.clone();
+            let device_id = device_id.clone();
+            let entity = entity.clone();
+            dialog
+                .title(title.clone())
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().text_sm().child(locale::text(
+                            "Device name",
+                            "设备名称",
+                            "裝置名稱",
+                        )))
+                        .child(Input::new(&input)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locale::text(
+                            "The runtime stores this name and publishes it to the device.",
+                            "该名称保存在运行时上，并会同步到对应设备。",
+                            "此名稱儲存在執行階段上，並會同步到對應裝置。",
+                        )),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("cancel-device-rename")
+                                    .outline()
+                                    .label(locale::text("Cancel", "取消", "取消")),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("confirm-device-rename")
+                                    .label(locale::text("Save", "保存", "儲存")),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let display_name = device_input.read(cx).value().trim().to_string();
+                    let _ = entity.update(cx, |this, cx| {
+                        this.dispatch_action(
+                            RemoteAccessAction::RenameDevice {
+                                device_id: device_id.clone(),
+                                display_name,
+                            },
+                            cx,
+                        )
+                    });
+                    true
+                })
+        });
     }
 
     fn confirm_delete_device(
@@ -2405,6 +2550,7 @@ impl RemoteAccessPairing {
         let revoking = self.state.revoking_device.as_deref() == Some(device.device_id.as_str());
         let restoring = self.state.restoring_device.as_deref() == Some(device.device_id.as_str());
         let deleting = self.state.deleting_device.as_deref() == Some(device.device_id.as_str());
+        let renaming = self.state.renaming_device.as_deref() == Some(device.device_id.as_str());
         let status_color = device_status_color(device.status, cx);
         let device_key = device.device_id.as_str().to_string();
         // Presence is a live connection, so it replaces the stored last-seen
@@ -2431,9 +2577,12 @@ impl RemoteAccessPairing {
         let restore_device_name = device_name.clone();
         let delete_device_id = device_id.clone();
         let delete_device_name = device_name.clone();
+        let rename_device_id = device_id.clone();
+        let rename_device_name = device_name.clone();
         let entity = cx.weak_entity();
         let restore_entity = entity.clone();
         let delete_entity = entity.clone();
+        let rename_entity = entity.clone();
 
         h_flex()
             .w_full()
@@ -2547,6 +2696,31 @@ impl RemoteAccessPairing {
                     }),
                 )
             })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "rename-device-{rename_device_id}"
+                )))
+                .small()
+                .ghost()
+                .label(locale::text("Rename", "重命名", "重新命名"))
+                .loading(renaming)
+                .disabled(pending)
+                .tooltip(locale::text(
+                    "Rename this device",
+                    "重命名该设备",
+                    "重新命名該裝置",
+                ))
+                .on_click(move |_, window, cx| {
+                    let _ = rename_entity.update(cx, |this, cx| {
+                        this.confirm_rename_device(
+                            rename_device_id.clone(),
+                            rename_device_name.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                }),
+            )
             .child(
                 Button::new(SharedString::from(format!(
                     "delete-device-{delete_device_id}"

@@ -2033,6 +2033,17 @@ mod tests {
             error_future()
         }
 
+        fn rename_device(
+            &self,
+            _request: MutationRequest<vibex_core::RemoteRenameDeviceRequest>,
+        ) -> BackendFuture<'_, RemoteDeviceDetail> {
+            error_future()
+        }
+
+        fn rename_runtime(&self, _request: MutationRequest<String>) -> BackendFuture<'_, String> {
+            error_future()
+        }
+
         fn audit_records(
             &self,
             _request: RemoteAuditListRequest,

@@ -64,6 +64,13 @@ pub enum BackendEvent {
     Notification(AgentNotificationIntent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
+    /// The authoritative runtime renamed itself. Every client of that runtime
+    /// renders the new name, so the payload carries it rather than making each
+    /// client reconnect to learn it.
+    RuntimeRenamed(vibex_core::RemoteRuntimeRenamed),
+    /// The runtime renamed this client's own device. Only the device whose id
+    /// matches acts on it.
+    DeviceRenamed(vibex_core::RemoteDeviceRenamed),
     ProjectionInvalidated(BackendProjection),
     Lagged {
         stream: BackendEventStream,

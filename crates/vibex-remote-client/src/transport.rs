@@ -459,6 +459,10 @@ pub struct RemoteGatewayInfo {
     /// Absent from a runtime that predates the field.
     #[serde(default)]
     pub server_kind: vibex_core::RemoteServerKind,
+    /// The name the runtime publishes for itself, defaulting to its device
+    /// name. Absent from a runtime that predates the field.
+    #[serde(default)]
+    pub server_display_name: String,
     pub tls_policy: String,
     pub session_epoch: u64,
     #[serde(default)]
@@ -786,6 +790,10 @@ pub struct PairingCodeClientBundle {
     /// What the peer called itself during the claim. `Unknown` for a peer that
     /// predates the field, which clients render without a kind.
     pub server_kind: vibex_core::RemoteServerKind,
+    /// The name the peer published during the claim, empty for a peer that
+    /// predates the field. It is the runtime's own device name unless an
+    /// operator renamed it.
+    pub server_display_name: String,
 }
 
 impl fmt::Debug for PairingCodeClientBundle {
@@ -919,6 +927,7 @@ async fn complete_pairing_code_claim(
         credential,
         server_id: info.server_id,
         server_kind: info.server_kind,
+        server_display_name: info.server_display_name,
     })
 }
 
@@ -5887,6 +5896,7 @@ mod tests {
             ws_ticket_path: "/api/v2/ws-ticket".to_string(),
             deployment_mode: "lan".to_string(),
             server_kind: vibex_core::RemoteServerKind::Desktop,
+            server_display_name: "dev".to_string(),
             tls_policy: "trusted_https_proxy".to_string(),
             session_epoch: 1,
             enabled_features: vec![],

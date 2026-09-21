@@ -90,7 +90,10 @@ impl DesktopRemoteCredential {
             identity_private_key: bundle.identity.private_key_base64(),
             expected_server_id: bundle.server_id,
             allow_insecure_local_dev,
-            display_name: None,
+            // The name the runtime published during the claim, so a freshly
+            // paired runtime is listed by its own name before the first
+            // handshake confirms it.
+            display_name: vibex_core::normalize_remote_display_name(&bundle.server_display_name),
             server_kind: bundle.server_kind,
             pinned_tls_certificate_der,
         };
@@ -265,6 +268,21 @@ impl RegisteredRuntime {
             return false;
         }
         self.credential.server_kind = kind;
+        true
+    }
+
+    /// Records the name the runtime published at the last handshake or rename
+    /// event. Returns whether anything changed, so the caller only persists a
+    /// real update. A peer that does not answer with a name must not erase one
+    /// that was learned earlier.
+    pub fn observe_server_display_name(&mut self, display_name: &str) -> bool {
+        let Some(display_name) = vibex_core::normalize_remote_display_name(display_name) else {
+            return false;
+        };
+        if self.credential.display_name.as_deref() == Some(display_name.as_str()) {
+            return false;
+        }
+        self.credential.display_name = Some(display_name);
         true
     }
 
@@ -806,6 +824,54 @@ mod tests {
         assert_eq!(
             registry.remote(&a).map(RegisteredRuntime::display_label),
             Some("vibex.example.com".to_string())
+        );
+    }
+
+    /// The runtime's own name is what the list falls back to, and a peer that
+    /// stops reporting one must not erase a name already learned.
+    #[test]
+    fn a_published_runtime_name_is_observed_and_never_erased_by_an_empty_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DesktopRuntimeRegistryStore::new(dir.path());
+        let mut registry = DesktopRuntimeRegistry::default();
+        let id = registry.upsert(second_record("server-name"), 1_000);
+        assert_eq!(
+            registry.remote(&id).map(RegisteredRuntime::display_label),
+            Some("vibex.example.com".to_string()),
+            "without a published name the address is the label"
+        );
+
+        let runtime = registry.remote_mut(&id).expect("runtime");
+        assert!(runtime.observe_server_display_name("  dev  "));
+        assert!(
+            !runtime.observe_server_display_name("dev"),
+            "an unchanged name is not a new observation"
+        );
+        assert_eq!(runtime.display_label(), "dev");
+        store.save(&registry).expect("save");
+        assert_eq!(
+            store
+                .load()
+                .and_then(|loaded| loaded.remote(&id).map(RegisteredRuntime::display_label)),
+            Some("dev".to_string()),
+            "the published name is persisted with the registry"
+        );
+
+        let runtime = registry.remote_mut(&id).expect("runtime");
+        assert!(!runtime.observe_server_display_name(""));
+        assert!(!runtime.observe_server_display_name("   "));
+        assert_eq!(
+            runtime.display_label(),
+            "dev",
+            "a peer that reports no name must not erase one"
+        );
+
+        // The operator's local rename still wins over the published name, so a
+        // pet name survives a reconnect.
+        assert!(registry.rename(&id, "my dev box"));
+        assert_eq!(
+            registry.remote(&id).map(RegisteredRuntime::display_label),
+            Some("my dev box".to_string())
         );
     }
 

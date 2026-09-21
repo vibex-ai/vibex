@@ -2184,6 +2184,7 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
+                "56:runtime_identity",
             ]
         );
         assert_eq!(

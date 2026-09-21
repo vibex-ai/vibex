@@ -61,9 +61,9 @@ use vibex_core::{
     ProviderUsageSummary, RcImportOutcome, RcImportPayload, RemoteAuditListRequest,
     RemoteAuditRecord, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeviceDetail,
-    RemoteProviderManagementSnapshot, RemoteRevokeDeviceRequest, RenameAgentSessionRequest,
-    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
-    ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
+    RemoteProviderManagementSnapshot, RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
+    ResolvePermissionRequest, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
     ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
     ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
     ScheduledTaskUpdateRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
@@ -3544,6 +3544,35 @@ impl DeviceBackend for NativeBackend {
                 .management()
                 .remote()
                 .revoke_device(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn rename_device(
+        &self,
+        request: MutationRequest<RemoteRenameDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .remote()
+                .rename_device(request.payload)
+                .map_err(Into::into)
+        })
+    }
+
+    fn rename_runtime(&self, request: MutationRequest<String>) -> BackendFuture<'_, String> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .remote()
+                .rename_runtime(request.payload.trim())
                 .map_err(Into::into)
         })
     }

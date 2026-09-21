@@ -1265,6 +1265,12 @@ impl AgentWorkflowController {
                 self.state.runtime_selection.resolve(event.state);
                 AgentEventDecision::Applied
             }
+            BackendEvent::RuntimeRenamed(_) | BackendEvent::DeviceRenamed(_) => {
+                // Runtime identity is not session state. The shells own the
+                // runtime list and apply a rename before this controller sees
+                // it; a controller that still receives one ignores it.
+                AgentEventDecision::IgnoredStale
+            }
             BackendEvent::ProjectionInvalidated(_) => AgentEventDecision::IgnoredStale,
             BackendEvent::Lagged { refetch, .. } => {
                 if refetch.session_id.is_some()

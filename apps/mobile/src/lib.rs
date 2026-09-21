@@ -6,6 +6,7 @@
 mod app;
 mod assets;
 mod background_connection;
+mod device;
 mod discovery;
 mod lifecycle;
 mod locale;

@@ -472,6 +472,10 @@ struct MobileHostEntry {
     /// What the peer reported itself to be, from the pairing claim or the last
     /// successful connect. `Unknown` until one of those says otherwise.
     server_kind: RemoteServerKind,
+    /// The name this runtime holds for this phone, as reported by its handshake
+    /// or a live rename. It is not persisted: the runtime is the authority, so
+    /// a stale local copy would only be wrong after the next rename.
+    device_display_name: Option<String>,
 }
 
 impl MobileHostEntry {
@@ -484,6 +488,7 @@ impl MobileHostEntry {
             added_at_ms: unix_timestamp_ms(),
             last_connected_at_ms: None,
             server_kind,
+            device_display_name: None,
         }
     }
 
@@ -496,6 +501,7 @@ impl MobileHostEntry {
             added_at_ms: stored.added_at_ms,
             last_connected_at_ms: stored.last_connected_at_ms,
             server_kind: stored.server_kind,
+            device_display_name: None,
         }
     }
 
@@ -518,6 +524,32 @@ impl MobileHostEntry {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| self.label.clone())
+    }
+
+    /// Applies what the runtime published about itself and about this phone.
+    ///
+    /// The runtime owns both names, so they are copied into the credential the
+    /// hosts file already stores rather than into a second schema. Returns
+    /// whether the persisted part changed, so the caller only writes a real
+    /// update.
+    fn observe_runtime_identity(
+        &mut self,
+        server_display_name: &str,
+        device_display_name: &str,
+    ) -> bool {
+        let mut persisted_changed = false;
+        if let Some(name) = vibex_core::normalize_remote_display_name(server_display_name)
+            && self.bundle.display_name.as_deref() != Some(name.as_str())
+        {
+            self.bundle.display_name = Some(name);
+            // The cached label is derived from the bundle, so it moves with it.
+            self.label = self.bundle.host_label();
+            persisted_changed = true;
+        }
+        if let Some(name) = vibex_core::normalize_remote_display_name(device_display_name) {
+            self.device_display_name = Some(name);
+        }
+        persisted_changed
     }
 }
 
@@ -893,6 +925,8 @@ pub struct MobileApp {
     app_backgrounded: bool,
     event_consumer_task: Option<Task<()>>,
     resume_recovery_task: Option<Task<()>>,
+    /// An in-flight authoritative runtime rename.
+    host_rename_task: Option<Task<()>>,
     pending_notification_action: Option<notifications::NotificationAction>,
     tasks: Vec<Task<()>>,
     /// Ordered by recency: the front is the screen the back key closes first.
@@ -1214,6 +1248,7 @@ impl MobileApp {
             app_backgrounded: crate::lifecycle::is_backgrounded(),
             event_consumer_task: None,
             resume_recovery_task: None,
+            host_rename_task: None,
             pending_notification_action: None,
             battery_allowlist_ok: power::is_ignoring_battery_optimizations(),
             _battery_allowlist_subscription: battery_allowlist_subscription,
@@ -1594,20 +1629,29 @@ impl MobileApp {
 
     /// Stamps the active runtime as successfully connected and persists it, so
     /// the other runtimes can show when each was last reached. The same hook
-    /// refreshes what kind of runtime the peer is: the transport keeps the
-    /// `RemoteServerInfoV2` from the handshake that just completed, which is
-    /// the peer's own answer rather than an inference.
+    /// refreshes what kind of runtime the peer is and what names it publishes:
+    /// the transport keeps the `RemoteServerInfoV2` from the handshake that just
+    /// completed, which is the peer's own answer rather than an inference.
     fn record_active_host_connected(&mut self, backend: &WebRemoteBackend) {
         let Some(host_id) = self.active_host_id.clone() else {
             return;
         };
-        let observed_kind = backend
-            .transport()
-            .server_info()
+        let server_info = backend.transport().server_info();
+        let observed_kind = server_info
+            .as_ref()
             .map(|info| info.server_kind)
             // A peer that predates the field reports `Unknown`; keep whatever
             // was already stored instead of downgrading it.
             .filter(|kind| *kind != RemoteServerKind::Unknown);
+        let published_names = server_info
+            .as_ref()
+            .map(|info| {
+                (
+                    info.server_display_name.clone(),
+                    info.device_display_name.clone(),
+                )
+            })
+            .unwrap_or_default();
         let mut changed = false;
         if let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) {
             entry.last_connected_at_ms = Some(unix_timestamp_ms());
@@ -1617,10 +1661,52 @@ impl MobileApp {
             {
                 entry.server_kind = observed_kind;
             }
+            changed |= entry.observe_runtime_identity(&published_names.0, &published_names.1);
         }
         if changed {
             self.persist_known_hosts();
         }
+    }
+
+    /// Applies a runtime rename that arrived while this phone was connected.
+    ///
+    /// The runtime is the authority for its own name, so the payload is stored
+    /// exactly as the handshake would have reported it. Returns whether the
+    /// list needs a repaint.
+    fn apply_runtime_renamed(&mut self, display_name: &str) -> bool {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return false;
+        };
+        let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) else {
+            return false;
+        };
+        // A local pet name gives way to the name the runtime itself published,
+        // so every client of that runtime shows the same thing.
+        let cleared = entry.name_override.take().is_some();
+        let named = entry.observe_runtime_identity(display_name, "");
+        if !cleared && !named {
+            return false;
+        }
+        self.persist_known_hosts();
+        true
+    }
+
+    /// Applies a device rename when the renamed device is this phone.
+    ///
+    /// Every connected device receives the event, so the id is what decides
+    /// whether it is this phone's own name.
+    fn apply_device_renamed(&mut self, renamed: &vibex_core::RemoteDeviceRenamed) -> bool {
+        let Some(host_id) = self.active_host_id.clone() else {
+            return false;
+        };
+        let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) else {
+            return false;
+        };
+        if entry.bundle.record.auth.device_id != renamed.device_id {
+            return false;
+        }
+        entry.observe_runtime_identity("", &renamed.display_name);
+        true
     }
 
     fn connect_backend(&mut self, backend: Arc<WebRemoteBackend>, cx: &mut Context<Self>) {
@@ -1733,6 +1819,17 @@ impl MobileApp {
                 ) {
                     notifications::present(notification);
                 }
+            }
+            // Identity changes belong to the runtime list, not to a session, so
+            // they are applied here and never reach the session controller.
+            match &event {
+                BackendEvent::RuntimeRenamed(renamed) => {
+                    needs_repaint |= self.apply_runtime_renamed(&renamed.display_name);
+                }
+                BackendEvent::DeviceRenamed(renamed) => {
+                    needs_repaint |= self.apply_device_renamed(renamed);
+                }
+                _ => {}
             }
 
             let rebuild_timeline = matches!(
@@ -1963,7 +2060,7 @@ impl MobileApp {
                 candidate.origin,
                 &server_id,
                 &server_key,
-                "Vibex Mobile",
+                &crate::device::device_display_name(),
                 identity,
             )
             .await
@@ -4595,8 +4692,12 @@ impl MobileApp {
         self.show_host_overlay(host_id, MobileOverlay::HostRemove, window, cx);
     }
 
-    /// Applies the rename sheet. An empty field clears the override, falling
-    /// back to the label derived from the credential.
+    /// Applies the rename sheet.
+    ///
+    /// The runtime owns the name, so a connected runtime is renamed through its
+    /// authority: the new name is what every other client of that runtime then
+    /// shows. An empty field clears the phone's local override instead, and a
+    /// runtime this phone is not connected to keeps a local-only name.
     fn submit_host_rename(
         &mut self,
         _: &MouseUpEvent,
@@ -4614,14 +4715,67 @@ impl MobileApp {
             .chars()
             .take(HOST_NAME_MAX_CHARS)
             .collect::<String>();
-        let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) else {
-            self.dismiss_overlay(Some(window), cx);
-            return;
-        };
-        entry.name_override = if name.is_empty() { None } else { Some(name) };
-        self.persist_known_hosts();
+        let active = self.active_host_id.as_deref() == Some(host_id.as_str());
+        let device = active
+            .then(|| {
+                self.backend
+                    .as_ref()
+                    .map(|backend| backend.facade().device().clone())
+            })
+            .flatten();
+        if let Some(device) = device.filter(|_| !name.is_empty()) {
+            self.rename_connected_host(host_id, name, device, cx);
+        } else if let Some(entry) = self.known_hosts.iter_mut().find(|host| host.id == host_id) {
+            entry.name_override = if name.is_empty() { None } else { Some(name) };
+            self.persist_known_hosts();
+        }
         crate::platform::hide_keyboard();
         self.dismiss_overlay(Some(window), cx);
+    }
+
+    /// Renames the connected runtime through its authority and stores the
+    /// confirmed name locally, so the list is right even before the broadcast
+    /// event lands.
+    fn rename_connected_host(
+        &mut self,
+        host_id: String,
+        name: String,
+        device: Arc<dyn vibex_backend::DeviceBackend>,
+        cx: &mut Context<Self>,
+    ) {
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            device.rename_runtime(MutationRequest::new(name)).await
+        });
+        self.host_rename_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.host_rename_task = None;
+                    match outcome {
+                        Ok(Ok(name)) => {
+                            if let Some(entry) =
+                                this.known_hosts.iter_mut().find(|host| host.id == host_id)
+                            {
+                                // The runtime's name replaces a local pet name:
+                                // one name, published by the runtime, is what
+                                // every client of it shows.
+                                entry.name_override = None;
+                                entry.observe_runtime_identity(&name, "");
+                            }
+                            this.persist_known_hosts();
+                        }
+                        Ok(Err(error)) => this.error = Some(error),
+                        Err(_) => {
+                            this.error = Some(BackendError::failed(
+                                "mobile_host_rename_failed",
+                                "the runtime rename task failed",
+                            ))
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     /// The runtime that should take over when the active one is removed: the
@@ -13718,6 +13872,13 @@ impl MobileApp {
                         false,
                         true,
                     ))
+                    .when_some(host.device_display_name.clone(), |body, device_name| {
+                        // The runtime names this phone, and an operator rename
+                        // in its paired-device list is what this shows. It is
+                        // read from the last handshake, so it appears once the
+                        // runtime has been reached in this session.
+                        body.child(host_detail_field("Device name", &device_name, false, false))
+                    })
                     .when_some(added, |body, added| {
                         body.child(host_detail_field("Added", &added, false, false))
                     })
@@ -19047,6 +19208,32 @@ mod tests {
             display_name: Some(display_name.to_string()),
             route: None,
         }
+    }
+
+    /// The runtime is the authority for both names it publishes: the name it
+    /// goes by and the name it holds for this phone. The published runtime name
+    /// replaces the one captured at pairing, and a peer that reports neither
+    /// must not erase what is already known.
+    #[test]
+    fn observing_a_runtime_identity_updates_the_host_entry() {
+        let bundle = host_bundle("studio-desktop", "studio.local");
+        let mut entry = MobileHostEntry::from_bundle(&bundle, RemoteServerKind::Unknown);
+        assert_eq!(entry.display_label(), "studio.local");
+
+        assert!(entry.observe_runtime_identity("dev", "Pixel 8"));
+        assert_eq!(entry.display_label(), "dev");
+        assert_eq!(entry.bundle.display_name.as_deref(), Some("dev"));
+        assert_eq!(entry.device_display_name.as_deref(), Some("Pixel 8"));
+
+        // The runtime name is unchanged and the device name is not published in
+        // this report, so neither is a new persisted fact.
+        assert!(!entry.observe_runtime_identity("dev", ""));
+        assert_eq!(entry.device_display_name.as_deref(), Some("Pixel 8"));
+
+        // An older peer reports no names at all: the entry keeps the label it
+        // derived from its credential.
+        assert!(!entry.observe_runtime_identity("", ""));
+        assert_eq!(entry.display_label(), "dev");
     }
 
     /// Every runtime surface reads its name through `active_host_label`, so the

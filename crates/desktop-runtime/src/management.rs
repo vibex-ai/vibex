@@ -28,11 +28,11 @@ use vibex_core::{
     RemoteCancelPairingOfferRequest, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteCreatePairingOfferRequest,
     RemoteCreatePairingOfferResponse, RemoteDeleteDeviceRequest, RemoteDeviceDetail,
-    RemotePairingOfferSummary, RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest,
-    ScheduledTask, ScheduledTaskAttentionListRequest, ScheduledTaskAttentionSummary,
-    ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord, ScheduledTaskCreateRequest,
-    ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun, ScheduledTaskRunListRequest,
-    ScheduledTaskUpdateRequest, VibexError, VibexResult,
+    RemotePairingOfferSummary, RemoteRenameDeviceRequest, RemoteRestoreDeviceRequest,
+    RemoteRevokeDeviceRequest, ScheduledTask, ScheduledTaskAttentionListRequest,
+    ScheduledTaskAttentionSummary, ScheduledTaskAuditListRequest, ScheduledTaskAuditRecord,
+    ScheduledTaskCreateRequest, ScheduledTaskId, ScheduledTaskListRequest, ScheduledTaskRun,
+    ScheduledTaskRunListRequest, ScheduledTaskUpdateRequest, VibexError, VibexResult,
 };
 use vibex_db::{
     AutomationGraphRepository, RemoteAuditRepository, RemoteDeviceRepository,
@@ -1289,6 +1289,38 @@ impl crate::RemoteHandle {
             .claim(format!("remote:restore:{}", request.device_id))?;
         let connection = migrated(&self.db_path)?;
         RemoteTrustService::restore_device(&connection, request)
+    }
+
+    /// Renames a paired device in this runtime's trust store.
+    ///
+    /// The runtime is the authority for the name, so the renamed device reads it
+    /// back from the handshake rather than keeping a second copy.
+    pub fn rename_device(
+        &self,
+        request: RemoteRenameDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let _claim = self
+            .mutation_guard
+            .claim(format!("remote:rename-device:{}", request.device_id))?;
+        let connection = migrated(&self.db_path)?;
+        RemoteTrustService::rename_device(&connection, request)
+    }
+
+    /// Renames this runtime.
+    ///
+    /// The new name is stored with the authority and published to every client,
+    /// so this is the desktop-hosted runtime's half of the rename contract.
+    pub fn rename_runtime(&self, display_name: &str) -> VibexResult<String> {
+        let _claim = self.mutation_guard.claim("remote:rename-runtime")?;
+        let connection = migrated(&self.db_path)?;
+        RemoteTrustService::rename_runtime(&connection, display_name)?;
+        RemoteTrustService::runtime_display_name(&connection, &self.config.service_name)
+    }
+
+    /// The name this runtime currently publishes.
+    pub fn runtime_display_name(&self) -> VibexResult<String> {
+        let connection = migrated(&self.db_path)?;
+        RemoteTrustService::runtime_display_name(&connection, &self.config.service_name)
     }
 
     /// Device ids that hold a live connection right now, for the device list's

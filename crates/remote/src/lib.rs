@@ -55,24 +55,24 @@ use vibex_core::{
     RemoteProviderHealthSummaryListResponse, RemoteProviderInjectionPreviewResponse,
     RemoteProviderProfileListResponse, RemoteProviderRequest,
     RemoteProviderRunHealthProbesResponse, RemoteProviderUsageSummaryListResponse,
-    RemoteRequestEnvelope, RemoteResponseEnvelope, RemoteRestoreDeviceRequest,
-    RemoteRevokeDeviceRequest, RemoteServiceInfo, RemoteSidebarOrganizationMutation,
-    RemoteSidebarOrganizationResponse, RemoteSidebarOrganizationSnapshot,
-    RemoteTerminalCreateResponse, RemoteTerminalKillResponse, RemoteTerminalListResponse,
-    RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse, RemoteTerminalWriteResponse,
-    RemoteWorkbenchBrowseDirectoriesResponse, RemoteWorkbenchDeleteProjectResponse,
-    RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesResponse,
-    RemoteWorkbenchOpenWorkspaceResponse, RemoteWorkbenchRequest,
-    RemoteWorkbenchTemporarySessionRootResponse, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeLeaseRole, SessionRuntimeOptionCatalog, TerminalSession,
-    TerminalStatus, TimelineLiveEvent, VibexError, VibexResult, WorkspaceAggregateStatus,
-    WorkspaceId, WorkspaceMode, unix_timestamp_ms,
+    RemoteRenameDeviceRequest, RemoteRequestEnvelope, RemoteResponseEnvelope,
+    RemoteRestoreDeviceRequest, RemoteRevokeDeviceRequest, RemoteServiceInfo,
+    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationResponse,
+    RemoteSidebarOrganizationSnapshot, RemoteTerminalCreateResponse, RemoteTerminalKillResponse,
+    RemoteTerminalListResponse, RemoteTerminalResizeResponse, RemoteTerminalSnapshotResponse,
+    RemoteTerminalWriteResponse, RemoteWorkbenchBrowseDirectoriesResponse,
+    RemoteWorkbenchDeleteProjectResponse, RemoteWorkbenchDeleteWorkspaceResponse,
+    RemoteWorkbenchListWorkspacesResponse, RemoteWorkbenchOpenWorkspaceResponse,
+    RemoteWorkbenchRequest, RemoteWorkbenchTemporarySessionRootResponse, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeLeaseRole,
+    SessionRuntimeOptionCatalog, TerminalSession, TerminalStatus, TimelineLiveEvent, VibexError,
+    VibexResult, WorkspaceAggregateStatus, WorkspaceId, WorkspaceMode, unix_timestamp_ms,
 };
 use vibex_db::{
     DbConnection, GitSnapshotRepository, RecentFileRepository, RemoteAuditRepository,
     RemoteDeviceRecord, RemoteDeviceRepository, RemotePairingCodeRecord,
-    RemotePairingCodeRepository, SessionRepository, TerminalSessionRepository, WorkspaceRepository,
-    apply_migrations, open_database,
+    RemotePairingCodeRepository, RuntimeIdentityRepository, SessionRepository,
+    TerminalSessionRepository, WorkspaceRepository, apply_migrations, open_database,
 };
 use vibex_fs::WorkspaceFileService;
 use vibex_terminal::TerminalManager;
@@ -1558,6 +1558,77 @@ impl RemoteTrustService {
         Ok(restored.detail)
     }
 
+    /// Renames one paired device in the trust store.
+    ///
+    /// The name is what the device list and the device's own "name on this
+    /// runtime" surface show, so the runtime stays the single authority for it.
+    /// The grant, status, and revision are untouched; the rename is audited.
+    pub fn rename_device(
+        conn: &DbConnection,
+        request: RemoteRenameDeviceRequest,
+    ) -> VibexResult<RemoteDeviceDetail> {
+        let display_name = normalized_display_name(&request.display_name)?;
+        let Some(record) = RemoteDeviceRepository::get(conn, &request.device_id)? else {
+            return Err(remote_error(
+                "remote_device_unknown",
+                "remote device is unknown",
+            ));
+        };
+        let previous_name = record.detail.display_name.clone();
+        if previous_name == display_name {
+            return Ok(record.detail);
+        }
+        let renamed = RemoteDeviceRepository::rename(
+            conn,
+            &request.device_id,
+            &display_name,
+            unix_timestamp_ms(),
+        )?;
+        Self::insert_audit(
+            conn,
+            Some(renamed.detail.device_id.clone()),
+            RemoteAuditAction::DeviceRenamed,
+            RemoteAuditTargetKind::Device,
+            Some(renamed.detail.device_id.as_str().to_string()),
+            RemoteAuditOutcome::Allowed,
+            format!("Device renamed from '{previous_name}' to '{display_name}'"),
+            None,
+            None,
+        )?;
+        Ok(renamed.detail)
+    }
+
+    /// Renames the runtime itself.
+    ///
+    /// Every client renders the published name from its handshake, so storing
+    /// it here is what makes one rename visible to all of them. The name is
+    /// audited like any other device-management mutation.
+    pub fn rename_runtime(conn: &DbConnection, display_name: &str) -> VibexResult<String> {
+        let display_name = normalized_display_name(display_name)?;
+        RuntimeIdentityRepository::set_display_name(conn, &display_name, unix_timestamp_ms())?;
+        Self::insert_audit(
+            conn,
+            None,
+            RemoteAuditAction::RuntimeRenamed,
+            RemoteAuditTargetKind::System,
+            Some("runtime".to_string()),
+            RemoteAuditOutcome::Allowed,
+            format!("Runtime renamed to '{display_name}'"),
+            None,
+            None,
+        )?;
+        Ok(display_name)
+    }
+
+    /// The runtime's published name, falling back to the name the deployment
+    /// configured when no operator has renamed it.
+    pub fn runtime_display_name(conn: &DbConnection, fallback: &str) -> VibexResult<String> {
+        if let Some(stored) = RuntimeIdentityRepository::display_name(conn)? {
+            return Ok(stored);
+        }
+        Ok(normalized_display_name(fallback).unwrap_or_else(|_| fallback.trim().to_string()))
+    }
+
     pub fn authorize_action(
         conn: &DbConnection,
         auth: &RemoteAuthContext,
@@ -1744,6 +1815,19 @@ fn redact_summary(summary: &str) -> String {
 
 fn remote_error(code: &'static str, message: &'static str) -> VibexError {
     VibexError::new(ErrorCategory::Remote, code, message)
+}
+
+/// Validates an operator-supplied runtime or device name.
+///
+/// The same bound is applied by the wire helper and by the store, so a name
+/// that reached the database can always be replayed to a client.
+fn normalized_display_name(value: &str) -> VibexResult<String> {
+    vibex_core::normalize_remote_display_name(value).ok_or_else(|| {
+        VibexError::validation(
+            "remote_display_name_invalid",
+            "display name must be non-empty, bounded, and free of control characters",
+        )
+    })
 }
 
 fn safe_remote_agent_auth_error(error: VibexError, message: &'static str) -> VibexError {
@@ -8013,6 +8097,144 @@ mod tests {
             .find(|record| record.action == RemoteAuditAction::DeviceRestored)
             .expect("restoring a device should be audited");
         assert!(restoration.redacted_summary.contains("Vibex Mobile"));
+    }
+
+    #[test]
+    fn renaming_a_device_keeps_its_grant_and_is_audited() {
+        let mut conn = vibex_db::DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let created = RemoteTrustService::create_pairing_code(
+            &conn,
+            RemoteCreatePairingCodeRequest {
+                permission_level: RemoteDevicePermissionLevel::FullControl,
+                ttl_ms: Some(60_000),
+            },
+        )
+        .unwrap();
+        let claimed = RemoteTrustService::claim_pairing_code(
+            &conn,
+            RemoteClaimPairingCodeRequest {
+                pairing_code: created.pairing_code,
+                display_name: "Pixel 8".to_string(),
+                public_key: Some("pubkey-rename".to_string()),
+            },
+        )
+        .unwrap();
+        let device_id = claimed.device.device_id.clone();
+
+        let renamed = RemoteTrustService::rename_device(
+            &conn,
+            RemoteRenameDeviceRequest {
+                device_id: device_id.clone(),
+                display_name: "  Alice's phone  ".to_string(),
+            },
+        )
+        .expect("a paired device renames");
+        assert_eq!(renamed.display_name, "Alice's phone");
+        // The grant the phone already holds must keep authenticating, or a
+        // rename would silently force it to pair again.
+        assert_eq!(renamed.grant_revision, claimed.device.grant_revision);
+        assert!(
+            RemoteTrustService::authenticate(
+                &conn,
+                RemoteAuthProof {
+                    device_id: device_id.clone(),
+                    auth_token: claimed.auth_token,
+                },
+            )
+            .is_ok()
+        );
+
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: Some(device_id.clone()),
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        let rename = audits
+            .iter()
+            .find(|record| record.action == RemoteAuditAction::DeviceRenamed)
+            .expect("renaming a device should be audited");
+        assert!(rename.redacted_summary.contains("Alice's phone"));
+
+        for display_name in ["   ", &"x".repeat(200), "dev\nbox"] {
+            assert_eq!(
+                RemoteTrustService::rename_device(
+                    &conn,
+                    RemoteRenameDeviceRequest {
+                        device_id: device_id.clone(),
+                        display_name: display_name.to_string(),
+                    },
+                )
+                .unwrap_err()
+                .code,
+                "remote_display_name_invalid"
+            );
+        }
+        assert_eq!(
+            RemoteTrustService::rename_device(
+                &conn,
+                RemoteRenameDeviceRequest {
+                    device_id: DeviceId::new(),
+                    display_name: "ghost".to_string(),
+                },
+            )
+            .unwrap_err()
+            .code,
+            "remote_device_unknown"
+        );
+    }
+
+    #[test]
+    fn renaming_the_runtime_publishes_the_stored_name_and_is_audited() {
+        let mut conn = vibex_db::DbConnection::open_in_memory().unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        // Until an operator renames it, the deployment's configured name is
+        // what clients render.
+        assert_eq!(
+            RemoteTrustService::runtime_display_name(&conn, "dev").unwrap(),
+            "dev"
+        );
+        assert_eq!(
+            RemoteTrustService::rename_runtime(&conn, "  workstation  ").unwrap(),
+            "workstation"
+        );
+        assert_eq!(
+            RemoteTrustService::runtime_display_name(&conn, "dev").unwrap(),
+            "workstation"
+        );
+
+        for display_name in ["", "   ", "dev\nbox", &"x".repeat(200)] {
+            assert_eq!(
+                RemoteTrustService::rename_runtime(&conn, display_name)
+                    .unwrap_err()
+                    .code,
+                "remote_display_name_invalid"
+            );
+        }
+        // A rejected rename leaves the stored name alone.
+        assert_eq!(
+            RemoteTrustService::runtime_display_name(&conn, "dev").unwrap(),
+            "workstation"
+        );
+
+        let audits = RemoteAuditRepository::list(
+            &conn,
+            &RemoteAuditListRequest {
+                device_id: None,
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        let rename = audits
+            .iter()
+            .find(|record| record.action == RemoteAuditAction::RuntimeRenamed)
+            .expect("renaming the runtime should be audited");
+        assert!(rename.redacted_summary.contains("workstation"));
     }
 
     #[test]

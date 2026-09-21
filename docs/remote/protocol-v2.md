@@ -122,3 +122,29 @@ disconnects it first, so a live grant is never dropped silently; audit records
 are kept and lose only their device link. Which devices are online right now is
 read from the Gateway connection registry rather than stored. Runtime shutdown
 sends `server_shutdown`, drains the listener, and releases all sockets.
+
+## Runtime And Device Names
+
+The runtime is the authority for the names its clients render, so a rename made
+once is what every client of that runtime shows.
+
+- The runtime publishes its own name as `serverDisplayName` in `/api/v2/info`
+  and `server_display_name` in `server_info`. It defaults to the machine's device
+  name and follows an operator rename; a runtime that predates the field sends
+  neither key, and clients then fall back to the route authority. The same name
+  is what a LAN pairing advertisement publishes.
+- `server_info` also carries `device_display_name`: the name this runtime holds
+  for the authenticated client, so a device can show the name an operator set for
+  it.
+- `device_management` gains `rename_device` (one paired device's display name)
+  and `rename_runtime` (the runtime's own name). Both require the
+  `mutate_device_management` action, are bounded to
+  `REMOTE_DISPLAY_NAME_MAX_CHARS`, reject empty and control-character names, and
+  are audited (`device_renamed`, `runtime_renamed`). A device rename leaves the
+  grant, its revision, and the device status untouched, so a live device never
+  has to pair again.
+- Both renames publish a `device` domain event whose payload carries the new
+  name — `RemoteRuntimeRenamed` or `RemoteDeviceRenamed`. A connected client
+  applies it directly instead of reconnecting or refetching a projection; a
+  device rename names its target, and only that device applies it.
+

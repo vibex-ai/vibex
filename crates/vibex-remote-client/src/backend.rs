@@ -103,11 +103,11 @@ use vibex_core::{
     RemotePairingOfferSummary, RemoteProviderHealthSummaryListRequest,
     RemoteProviderHealthSummaryListResponse, RemoteProviderManagementSnapshot,
     RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
-    RemoteProviderRunHealthProbesResponse, RemoteRevokeDeviceRequest, RemoteTerminalCreateRequest,
-    RemoteTerminalCreateResponse, RemoteTerminalKillRequest, RemoteTerminalKillResponse,
-    RemoteTerminalListRequest, RemoteTerminalListResponse, RemoteTerminalResizeRequest,
-    RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest, RemoteTerminalSnapshotResponse,
-    RemoteTerminalWriteRequest, RemoteTerminalWriteResponse,
+    RemoteProviderRunHealthProbesResponse, RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest,
+    RemoteTerminalCreateRequest, RemoteTerminalCreateResponse, RemoteTerminalKillRequest,
+    RemoteTerminalKillResponse, RemoteTerminalListRequest, RemoteTerminalListResponse,
+    RemoteTerminalResizeRequest, RemoteTerminalResizeResponse, RemoteTerminalSnapshotRequest,
+    RemoteTerminalSnapshotResponse, RemoteTerminalWriteRequest, RemoteTerminalWriteResponse,
     RemoteWorkbenchBrowseDirectoriesRequest, RemoteWorkbenchBrowseDirectoriesResponse,
     RemoteWorkbenchDeleteProjectRequest, RemoteWorkbenchDeleteWorkspaceRequest,
     RemoteWorkbenchDeleteWorkspaceResponse, RemoteWorkbenchListWorkspacesRequest,
@@ -715,9 +715,25 @@ fn map_remote_event(event: RemoteInboundEvent) -> BackendEvent {
             return BackendEvent::Notification(notification);
         }
         if channel == "runtime"
-            && let Ok(runtime) = serde_json::from_value::<vibex_core::RuntimeSessionEvent>(payload)
+            && let Ok(runtime) =
+                serde_json::from_value::<vibex_core::RuntimeSessionEvent>(payload.clone())
         {
             return BackendEvent::Runtime(runtime);
+        }
+        // An identity change rides the device channel with the new name in the
+        // payload, so a connected client applies the rename without
+        // reconnecting or refetching a projection.
+        if channel == "device"
+            && let Ok(renamed) =
+                serde_json::from_value::<vibex_core::RemoteRuntimeRenamed>(payload.clone())
+        {
+            return BackendEvent::RuntimeRenamed(renamed);
+        }
+        if channel == "device"
+            && let Ok(renamed) =
+                serde_json::from_value::<vibex_core::RemoteDeviceRenamed>(payload.clone())
+        {
+            return BackendEvent::DeviceRenamed(renamed);
         }
     }
     if let Some(projection) = projection_for_domain(channel) {
@@ -6034,6 +6050,57 @@ impl DeviceBackend for WebRemoteBackend {
         })
     }
 
+    fn rename_device(
+        &self,
+        request: MutationRequest<RemoteRenameDeviceRequest>,
+    ) -> BackendFuture<'_, RemoteDeviceDetail> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::RenameDevice(vibex_core::RemoteDeviceRenameRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            decode(value)
+        })
+    }
+
+    fn rename_runtime(&self, request: MutationRequest<String>) -> BackendFuture<'_, String> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteDeviceRequest::RenameRuntime(vibex_core::RemoteDeviceRenameRuntimeRequest {
+                    auth: this.auth(),
+                    request: vibex_core::RemoteRenameRuntimeRequest {
+                        display_name: request.payload,
+                    },
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::DeviceManagement,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteRuntimeRenameResponse>(value)?.display_name)
+        })
+    }
+
     fn audit_records(
         &self,
         request: RemoteAuditListRequest,
@@ -6739,6 +6806,8 @@ mod tests {
     fn full_control_server_info(enabled_features: &[&str]) -> vibex_core::RemoteServerInfoV2 {
         vibex_core::RemoteServerInfoV2 {
             server_kind: vibex_core::RemoteServerKind::Desktop,
+            server_display_name: "dev".to_string(),
+            device_display_name: "Vibex Mobile".to_string(),
             server_id: "server_test".to_string(),
             server_identity_public_key: "public".to_string(),
             desktop_version: "test".to_string(),

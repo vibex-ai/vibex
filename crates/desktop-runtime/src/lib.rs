@@ -295,7 +295,7 @@ impl DesktopRuntimeConfig {
             enabled: environment_bool("VIBEX_GATEWAY_ENABLED").unwrap_or(true),
             bind_addr,
             service_name: environment_string("VIBEX_SERVICE_NAME")
-                .unwrap_or_else(|| "Vibex Headless Runtime".to_string()),
+                .unwrap_or_else(|| default_device_display_name("Vibex Headless Runtime")),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         remote_gateway.deployment_mode = deployment_mode;
@@ -407,9 +407,17 @@ impl DesktopRuntimeConfig {
     /// A gateway config for a desktop-hosted embedded runtime. Paired clients
     /// see "desktop", which is what lets an operator tell this runtime apart
     /// from a headless `vibex-server` over the same wire contract.
+    ///
+    /// The published service name defaults to this machine's device name, so a
+    /// client renders "dev" instead of a bare address; an operator rename is
+    /// stored by the runtime and overrides it.
     fn desktop_gateway() -> RemoteGatewayConfig {
         RemoteGatewayConfig {
             server_kind: vibex_core::RemoteServerKind::Desktop,
+            service: RemoteServiceConfig {
+                service_name: default_device_display_name("Vibex Desktop"),
+                ..RemoteServiceConfig::default()
+            },
             ..RemoteGatewayConfig::default()
         }
     }
@@ -590,6 +598,34 @@ fn environment_string(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The machine's own device name, used as the default runtime and client name.
+///
+/// A runtime that publishes "dev" is far easier to pick out of a host list than
+/// one that publishes its address, so the device name is the default and an
+/// operator rename overrides it. A machine that cannot report one falls back to
+/// `fallback` rather than failing.
+pub fn default_device_display_name(fallback: &str) -> String {
+    sysinfo::System::host_name()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .and_then(|name| vibex_core::normalize_remote_display_name(&name))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    use super::*;
+
+    /// The default is the machine's own name, and it is always a usable label:
+    /// a host that reports nothing still gets the caller's fallback.
+    #[test]
+    fn the_default_device_name_is_bounded_and_never_empty() {
+        let name = default_device_display_name("Vibex Desktop");
+        assert!(!name.trim().is_empty());
+        assert!(vibex_core::normalize_remote_display_name(&name).is_some());
+        assert_eq!(default_device_display_name("Vibex Desktop"), name);
+    }
+}
 fn environment_list(name: &str) -> Option<Vec<String>> {
     let values = environment_string(name)?
         .split(',')

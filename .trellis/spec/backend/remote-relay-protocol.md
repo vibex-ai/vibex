@@ -162,10 +162,14 @@ RemoteAttachRequestV2 { attachment_id, kind, resource_id, scope_id,
 RemoteGateway::start/stop/restart/status/disconnect_device
 RemoteGatewayPairingRoutes { direct_candidates, relay_candidate }
 RemoteTrustService::create/cancel/claim_pairing_offer
+RemoteTrustService::rename_device/rename_runtime/runtime_display_name
+RemoteServerInfoV2 { server_display_name, device_display_name }
+GET /api/v2/info -> serverDisplayName
 POST /api/v2/pairing/claim
 POST /api/v2/ws-ticket
 GET /ws/v2
 SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
+SQLite migration v56 = runtime_identity(display_name)
 ```
 
 ### 3. Contracts
@@ -200,6 +204,17 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
   separately authorized, and audited without retaining bytes.
 - Revoke signals every active device connection immediately. Stop/restart drains
   listeners and connections and advances `session_epoch`.
+- The runtime owns the names clients render. Its published name defaults to the
+  machine's device name, an operator rename is stored in `runtime_identity` and
+  overrides it, and `/api/v2/info`, `server_info`, and a LAN pairing
+  advertisement all publish the same resolved name. `server_info` also carries
+  the name the runtime holds for the authenticated device. `rename_device` and
+  `rename_runtime` require `mutate_device_management`, validate through
+  `normalize_remote_display_name`, leave the device grant and its revision
+  untouched, are audited, and broadcast a `device` domain event whose payload is
+  `RemoteRuntimeRenamed` / `RemoteDeviceRenamed` so connected clients apply the
+  name without reconnecting. A device rename event names its target; only that
+  device acts on it.
 
 ### 4. Validation & Error Matrix
 
@@ -213,6 +228,8 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
 | Pairing offer is expired, canceled, tampered, replayed, or loses a concurrent claim | Return the stable `remote_pairing_offer_*` error and create no orphan device. |
 | Pairing routes are empty, use the wrong transport kind, exceed eight Direct candidates, or advertise Direct while the listener is disabled | Reject with `remote_pairing_routes_unavailable`, `remote_pairing_*_candidate_invalid`, `remote_pairing_candidates_too_many`, or `remote_pairing_direct_gateway_disabled`; create no offer. |
 | Mutation omits a required idempotency key or exceeds the per-connection RPC limit | Return `remote_idempotency_key_required` or `remote_rpc_concurrency_limit`; keep the socket alive. |
+| A rename is empty, over `REMOTE_DISPLAY_NAME_MAX_CHARS`, or contains control characters | Return `remote_display_name_invalid` and store nothing. |
+| A rename arrives from a read-only or approve-only grant | Return `remote_permission_denied`; the stored name is unchanged. |
 | Live Terminal scope differs from its workspace or binary generation is stale | Return `remote_terminal_scope_mismatch` or `remote_binary_generation_stale`; write zero bytes. |
 
 ### 5. Good / Base / Bad Cases
@@ -248,6 +265,10 @@ SQLite migration v29 = pairing-offer fields + remote_devices.grant_revision
 - Restoring a revoked device reinstates the grant it already holds and refuses
   an active one; the connection registry reports each connected device once,
   even when it holds several sockets.
+- Renaming a device keeps its grant, revision, and status and is audited;
+  renaming the runtime stores one replaceable row; both reject invalid names and
+  broadcast the new name in the `device` event payload; `/api/v2/info` reports
+  the renamed runtime name; a read-only grant is refused.
 - Binding drift plus `cargo test -p vibex-core remote`, `cargo test -p vibex-db
   remote`, `cargo test -p vibex-remote`, and `cargo test -p
   vibex-desktop-runtime remote`.
