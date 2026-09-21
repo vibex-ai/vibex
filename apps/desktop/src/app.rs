@@ -4545,6 +4545,26 @@ impl OptimisticUserMessage {
     }
 }
 
+/// The optimistic first message a live view may project ahead of the authority.
+///
+/// The borrowed view knows which session it belongs to before that session's
+/// authoritative timeline binds the id, which is exactly the window a brand-new
+/// session renders in: the id is optimistic, no item exists yet, and the turn is
+/// already pending. Keying the lookup on `timeline.session_id` alone dropped the
+/// user's own message there and left an item-less pending turn on screen, so the
+/// view's session is the fallback key.
+///
+/// `projected_items` still refuses to project into a timeline that belongs to a
+/// different session, so this cannot leak one session's message into another.
+fn optimistic_user_message_for_view<'a>(
+    timeline: &TimelineModel,
+    messages: &'a BTreeMap<String, OptimisticUserMessage>,
+    view_session_id: Option<&VibexSessionId>,
+) -> Option<&'a OptimisticUserMessage> {
+    let session_id = timeline.session_id.as_ref().or(view_session_id)?;
+    messages.get(session_id.as_str())
+}
+
 fn agent_answer_actions(has_timestamp: bool) -> impl Iterator<Item = AgentAnswerAction> {
     AGENT_ANSWER_ACTION_ORDER
         .into_iter()
@@ -15585,12 +15605,12 @@ impl VibexWorkbench {
                 self.ui_state.session.reasoning_display_mode,
             );
         }
-        if let Some(items) = self
-            .timeline
-            .session_id
-            .as_ref()
-            .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
-            .and_then(|message| message.projected_items(&self.timeline))
+        if let Some(items) = optimistic_user_message_for_view(
+            &self.timeline,
+            &self.optimistic_user_messages,
+            self.view_session_id.as_ref(),
+        )
+        .and_then(|message| message.projected_items(&self.timeline))
         {
             return timeline_conversation_turns_with_reasoning_mode(
                 &items,
@@ -15618,12 +15638,12 @@ impl VibexWorkbench {
                 .pending_user_message_edit
                 .as_ref()
                 .map(PendingUserMessageEdit::cache_key),
-            optimistic_message: self
-                .timeline
-                .session_id
-                .as_ref()
-                .and_then(|session_id| self.optimistic_user_messages.get(session_id.as_str()))
-                .map(OptimisticUserMessage::cache_key),
+            optimistic_message: optimistic_user_message_for_view(
+                &self.timeline,
+                &self.optimistic_user_messages,
+                self.view_session_id.as_ref(),
+            )
+            .map(OptimisticUserMessage::cache_key),
             reasoning_display_mode: self.ui_state.session.reasoning_display_mode,
         }
     }
@@ -78561,6 +78581,57 @@ mod tests {
                 .as_ref()
                 .map(|row| row.body.as_str()),
             Some("first prompt")
+        );
+    }
+
+    #[test]
+    fn a_pending_new_session_projects_its_message_before_the_timeline_binds_the_session() {
+        let session_id = VibexSessionId::parse("session_pending_creation").unwrap();
+        let submitted_at_ms = 1_789_981_200_000;
+        let messages = BTreeMap::from([(
+            session_id.as_str().to_string(),
+            OptimisticUserMessage {
+                session_id: session_id.clone(),
+                item_id: TimelineItemId::new(),
+                after_sequence: 0,
+                submitted_at_ms,
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+        )]);
+        // The borrowed view has no authoritative timeline yet: this is the
+        // window a brand-new session renders in.
+        let timeline = TimelineModel::default();
+        assert!(timeline.session_id.is_none());
+
+        let projected = optimistic_user_message_for_view(&timeline, &messages, Some(&session_id))
+            .and_then(|message| message.projected_items(&timeline))
+            .expect("a pending new session must project its first message");
+        let turns = timeline_conversation_turns(&projected, Some(AgentSessionState::Running), true);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_row.as_ref().map(|row| row.body.trim()),
+            Some("hi")
+        );
+        assert!(!turns[0].complete);
+        assert_eq!(turns[0].started_at_ms, submitted_at_ms);
+
+        // Without the view's session there is no key to look the message up.
+        assert!(optimistic_user_message_for_view(&timeline, &messages, None).is_none());
+
+        // A timeline already bound to another session wins the lookup and never
+        // receives this session's optimistic row.
+        let mut bound_elsewhere = TimelineModel::default();
+        bound_elsewhere
+            .replace_authoritative(VibexSessionId::parse("session_other").unwrap(), Vec::new());
+        assert!(
+            optimistic_user_message_for_view(&bound_elsewhere, &messages, Some(&session_id))
+                .is_none()
+        );
+        assert!(
+            messages[&session_id.as_str().to_string()]
+                .projected_items(&bound_elsewhere)
+                .is_none()
         );
     }
 

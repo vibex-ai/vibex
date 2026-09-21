@@ -5,7 +5,7 @@ use vibex_core::{
     AgentDelegationId, AgentMessagePhase, AgentSession, AgentSessionState,
     ElicitationRequestStatus, GoalAction, GoalChangeKind, GoalSnapshot, PermissionRequestStatus,
     PlanStepPayload, PlanStepStatus, RetryPhase, TimelineItem, TimelineItemKind, TimelinePayload,
-    ToolCallStatus, VibexSessionId,
+    ToolCallStatus, VibexSessionId, unix_timestamp_ms,
 };
 
 use crate::{ReasoningDisplayMode, SidebarState};
@@ -473,6 +473,19 @@ fn accumulated_streaming_reasoning(items: &[&TimelineItem]) -> Option<String> {
     (!accumulated.trim_end().is_empty()).then(|| accumulated.to_string())
 }
 
+/// The wall-clock anchor a projected turn counts its "worked for" time from.
+///
+/// Timeline items carry the authoritative start. A turn without a usable one —
+/// the synthesized pending turn before its first item lands, or an item that
+/// never got a timestamp — anchors to the moment the projection is built.
+/// Keeping the epoch (`0`) here made a brand-new session flash a pending header
+/// reading "worked for 497217h", which is just the current time minus 1970.
+fn turn_started_at_ms(timestamp_ms: Option<i64>) -> i64 {
+    timestamp_ms
+        .filter(|timestamp_ms| *timestamp_ms > 0)
+        .unwrap_or_else(unix_timestamp_ms)
+}
+
 pub fn timeline_conversation_turns(
     items: &[TimelineItem],
     session_state: Option<AgentSessionState>,
@@ -629,12 +642,16 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
             let process_activity_groups_with_commands_and_file_operations =
                 timeline_process_activity_groups_with_commands_and_file_operations(&turn_rows);
             let live_status = (!complete && !superseded).then_some(live_status).flatten();
-            let started_at_ms = turn
-                .user_item
-                .as_ref()
-                .map(|item| item.timestamp_ms)
-                .or_else(|| turn.response_items.first().map(|item| item.timestamp_ms))
-                .unwrap_or_default();
+            // A turn starts at its user item, and a continuation at its first
+            // response item. A legacy item may carry no timestamp at all, so
+            // take the first one that can actually anchor the header.
+            let started_at_ms = turn_started_at_ms(
+                [turn.user_item, turn.response_items.first().copied()]
+                    .into_iter()
+                    .flatten()
+                    .map(|item| item.timestamp_ms)
+                    .find(|timestamp_ms| *timestamp_ms > 0),
+            );
             let ended_at_ms = if complete {
                 turn.response_items
                     .last()
@@ -694,7 +711,9 @@ pub fn timeline_conversation_turns_with_reasoning_mode(
             failed: false,
             pending_permission: false,
             item_count: 0,
-            started_at_ms: last_item.map(|item| item.timestamp_ms).unwrap_or_default(),
+            // The pending turn owns no items, so it has no item timestamp to
+            // start from until its first response arrives.
+            started_at_ms: turn_started_at_ms(last_item.map(|item| item.timestamp_ms)),
             ended_at_ms: None,
         });
     }
@@ -1776,6 +1795,61 @@ mod tests {
             Some(original_file.path.as_str())
         );
         assert_eq!(projected_file.body, original_file.summary);
+    }
+
+    #[test]
+    fn synthesized_pending_turn_counts_from_now_not_from_the_unix_epoch() {
+        let before = unix_timestamp_ms();
+
+        // A brand-new session is running before any item lands. The pending
+        // header must count from the projection, not from 1970.
+        let pending = timeline_conversation_turns(&[], Some(AgentSessionState::Running), true);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "turn:pending:empty");
+        assert!(!pending[0].complete);
+        assert!(
+            pending[0].started_at_ms >= before,
+            "an item-less pending turn must start when it is projected"
+        );
+
+        // An item without a usable timestamp cannot anchor the header either.
+        let mut untimed = item(
+            1,
+            None,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "hi".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        );
+        untimed.timestamp_ms = 0;
+        let turns = timeline_conversation_turns(
+            std::slice::from_ref(&untimed),
+            Some(AgentSessionState::Running),
+            false,
+        );
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].started_at_ms >= before,
+            "an untimed item must not anchor the turn to the Unix epoch"
+        );
+
+        // A real timestamp still wins.
+        let timed = item(
+            7,
+            None,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "hi".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        );
+        let turns = timeline_conversation_turns(
+            std::slice::from_ref(&timed),
+            Some(AgentSessionState::Running),
+            false,
+        );
+        assert_eq!(turns[0].started_at_ms, 7);
     }
 
     #[test]
