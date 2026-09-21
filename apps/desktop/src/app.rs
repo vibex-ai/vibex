@@ -80292,7 +80292,9 @@ mod tests {
             .find("this.focus_session_group_pane(&group_id, &pane_id, cx);")
             .expect("a non-focused pane should focus on mouse down");
         let after = &pane[focus_on_down..];
-        let handler_end = after.find("}))").expect("the capture handler should close");
+        let handler_end = after
+            .find("}))")
+            .expect("the capture handler should close");
         assert!(!after[..handler_end].contains("cx.stop_propagation()"));
     }
 
