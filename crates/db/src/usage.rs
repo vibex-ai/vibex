@@ -1824,43 +1824,52 @@ mod tests {
 
     #[test]
     fn legacy_rows_are_repaired_from_the_raw_reading_for_known_adapters() {
-        let path = temp_db("legacy-repair");
-        let mut conn = open_database(&path).unwrap();
-        apply_migrations(&mut conn).unwrap();
-        let execution = seeded(&conn, "legacy-repair").dispatched_at(2_000);
-        AgentUsageRepository::apply_observation(
-            &mut conn,
-            &observation(
-                execution.clone(),
-                1,
-                5_000,
-                AgentUsageCounterOrigin::KnownZero,
-            ),
-        )
-        .unwrap();
-
-        // Rewrite the row the way the pre-fix code stored it for an adapter now
-        // known to report per-request readings: the turn's usage cancelled out.
-        conn.execute(
-            "
-            UPDATE agent_turn_usage_facts
-            SET agent_id = 'codex',
-                counter_scope = 'session',
-                total_delta = NULL,
-                input_delta = NULL
-            WHERE usage_execution_id = ?1
-            ",
-            params![execution.usage_execution_id.as_str()],
-        )
-        .unwrap();
-
-        let fact = AgentUsageRepository::get_fact(&conn, &execution.usage_execution_id)
-            .unwrap()
+        // Every adapter registered as an absolute per-turn or per-request
+        // reading, paired with the scope that registration resolves to.
+        for (agent_id, expected_scope) in [
+            ("codex", AgentUsageCounterScope::Request),
+            ("deepseek-harness", AgentUsageCounterScope::Turn),
+        ] {
+            let name = format!("legacy-repair-{agent_id}");
+            let path = temp_db(&name);
+            let mut conn = open_database(&path).unwrap();
+            apply_migrations(&mut conn).unwrap();
+            let execution = seeded(&conn, &name).dispatched_at(2_000);
+            AgentUsageRepository::apply_observation(
+                &mut conn,
+                &observation(
+                    execution.clone(),
+                    1,
+                    5_000,
+                    AgentUsageCounterOrigin::KnownZero,
+                ),
+            )
             .unwrap();
-        assert_eq!(fact.counter_scope, AgentUsageCounterScope::Request);
-        assert_eq!(fact.delta.total_tokens, fact.cumulative_after.total_tokens);
-        assert_eq!(fact.delta.input_tokens, fact.cumulative_after.input_tokens);
-        cleanup(&path);
+
+            // Rewrite the row the way the pre-fix code stored it for an adapter
+            // now known to report absolute readings: the turn's usage cancelled
+            // out against the stream checkpoint.
+            conn.execute(
+                "
+                UPDATE agent_turn_usage_facts
+                SET agent_id = ?2,
+                    counter_scope = 'session',
+                    total_delta = NULL,
+                    input_delta = NULL
+                WHERE usage_execution_id = ?1
+                ",
+                params![execution.usage_execution_id.as_str(), agent_id],
+            )
+            .unwrap();
+
+            let fact = AgentUsageRepository::get_fact(&conn, &execution.usage_execution_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.counter_scope, expected_scope);
+            assert_eq!(fact.delta.total_tokens, fact.cumulative_after.total_tokens);
+            assert_eq!(fact.delta.input_tokens, fact.cumulative_after.input_tokens);
+            cleanup(&path);
+        }
     }
 
     #[test]

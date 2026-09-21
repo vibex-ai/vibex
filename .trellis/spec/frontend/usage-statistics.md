@@ -78,6 +78,11 @@ session entry is a standard `gpui_component::button::Button` wrapped with
   tooltip. Keep exact values and coverage in table cell tooltips and table
   coverage cells; do not render a page-level partial-reporting banner. `None`
   displays as Unknown/Not reported, never `0`.
+- The requests metric names the figure it shows, because turns and API requests
+  differ by orders of magnitude on agentic adapters. Show API requests only while
+  `AgentUsageAggregate::api_requests_are_complete()` holds for the aggregate;
+  otherwise show the turn count, which every adapter reports. A per-request sum
+  covering only some of the turns must never be presented as the request count.
 - Trend mode is a green stacked column chart with a left K-unit Token axis. Its
   clickable legend controls Total, Input, Output, and Cache locally; Requests is
   not a trend series. Total is mutually exclusive with the detail stack because

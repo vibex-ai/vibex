@@ -20871,6 +20871,13 @@ mod tests {
         assert_eq!(codex.counter_scope, AgentUsageCounterScope::Request);
         assert!(codex.usage_update_is_request_total);
 
+        // deepseek-harness-acp sums the prompt window its `beginPrompt()` reset
+        // and forwards each completed message's own total through
+        // `usage_update.used`.
+        let harness = agent_usage_reporting_contract(&AgentId::parse("deepseek-harness").unwrap());
+        assert_eq!(harness.counter_scope, AgentUsageCounterScope::Turn);
+        assert!(harness.usage_update_is_request_total);
+
         // zcode-acp-server forwards the backend's per-turn usage object on the
         // prompt result (no `_meta.dev.vibex/usageScope` declaration), while its
         // `usage_update.used` stays context occupancy.

@@ -728,7 +728,13 @@ fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggre
     let total_requests = facts.len() as u64;
     // Turns are always countable; API requests only when an adapter reports
     // them. A turn that reports none contributes nothing rather than one, so a
-    // mixed selection never presents a turn count as a request count.
+    // mixed selection never presents a turn count as a request count. The
+    // contributing turn count travels with the sum so consumers can tell a
+    // complete per-request reading from one that covers part of the selection.
+    let api_requests_reported_turns = facts
+        .iter()
+        .filter(|projection| projection.fact.api_requests.is_some())
+        .count() as u64;
     let api_requests = facts
         .iter()
         .filter_map(|projection| projection.fact.api_requests)
@@ -810,6 +816,7 @@ fn aggregate(facts: &[&AgentUsageFactProjection]) -> VibexResult<AgentUsageAggre
     Ok(AgentUsageAggregate {
         requests: total_requests,
         api_requests,
+        api_requests_reported_turns,
         total_tokens,
         input_tokens,
         output_tokens,
@@ -2003,6 +2010,8 @@ mod tests {
             .unwrap();
         assert_eq!(statistics.totals.requests, 1);
         assert_eq!(statistics.totals.api_requests, Some(3));
+        assert_eq!(statistics.totals.api_requests_reported_turns, 1);
+        assert!(statistics.totals.api_requests_are_complete());
         assert_eq!(statistics.totals.total_tokens.value, Some(180_000));
         assert_eq!(statistics.totals.input_tokens.value, Some(5_000));
         assert_eq!(
@@ -2017,5 +2026,111 @@ mod tests {
             statistics.totals.cache_hit_rate.coverage,
             AgentUsageMetricCoverage::Partial
         );
+    }
+
+    #[test]
+    fn turn_scoped_per_request_totals_keep_the_turn_reading_for_the_breakdown() {
+        // deepseek-harness-acp emits one `usage_update` per API request, each
+        // carrying that request's own total, and the prompt result repeats the
+        // turn's sum of the same per-request readings.
+        let (_directory, service, session) = seeded_service();
+        let stream = stream(
+            &service,
+            &session,
+            session.agent_id.as_str(),
+            ProviderProfileId::new(),
+            "harness-model",
+        );
+        let execution = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(execution.clone()))
+            .unwrap();
+
+        for (index, request_total) in [40_000_u64, 60_000, 80_000].into_iter().enumerate() {
+            let mut sample = observation(execution.clone(), index as u64 + 1, 0, 0, 0, 0);
+            sample.source = AgentUsageObservationSource::RequestSample;
+            sample.counter_scope = AgentUsageCounterScope::Turn;
+            sample.cumulative = AgentUsageTokenValues {
+                total_tokens: Some(request_total),
+                ..AgentUsageTokenValues::default()
+            };
+            service
+                .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(sample))
+                .unwrap();
+        }
+
+        // The prompt result restates the whole turn, so its breakdown covers
+        // every request rather than the last one.
+        let mut turn_end = observation(execution, 4, 60_000, 6_000, 114_000, 180_000);
+        turn_end.counter_scope = AgentUsageCounterScope::Turn;
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(turn_end))
+            .unwrap();
+
+        let statistics = service
+            .query_statistics_at(fixed_request(AgentUsageRange::Today), dispatched_at(12))
+            .unwrap();
+        assert_eq!(statistics.totals.requests, 1);
+        assert_eq!(statistics.totals.api_requests, Some(3));
+        assert!(statistics.totals.api_requests_are_complete());
+        assert_eq!(statistics.totals.total_tokens.value, Some(180_000));
+        assert_eq!(statistics.totals.input_tokens.value, Some(60_000));
+        assert_eq!(statistics.totals.output_tokens.value, Some(6_000));
+        assert_eq!(statistics.totals.cached_tokens.value, Some(114_000));
+        // A turn-scoped reading covers the whole turn, so the per-request
+        // breakdown is not a floor under it.
+        assert_eq!(
+            statistics.totals.input_tokens.coverage,
+            AgentUsageMetricCoverage::Complete
+        );
+    }
+
+    #[test]
+    fn per_request_coverage_travels_with_the_api_request_sum() {
+        let (_directory, service, session) = seeded_service();
+        let stream = stream(
+            &service,
+            &session,
+            session.agent_id.as_str(),
+            ProviderProfileId::new(),
+            "mixed-model",
+        );
+
+        // One turn from an adapter that reports each API request's own total.
+        let sampled = execution(&service, &session, &stream, 9);
+        service
+            .apply_telemetry_event(dispatched_event(sampled.clone()))
+            .unwrap();
+        for (index, request_total) in [40_000_u64, 60_000].into_iter().enumerate() {
+            let mut sample = observation(sampled.clone(), index as u64 + 1, 0, 0, 0, 0);
+            sample.source = AgentUsageObservationSource::RequestSample;
+            sample.counter_scope = AgentUsageCounterScope::Request;
+            sample.cumulative = AgentUsageTokenValues {
+                total_tokens: Some(request_total),
+                ..AgentUsageTokenValues::default()
+            };
+            service
+                .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(sample))
+                .unwrap();
+        }
+
+        // A second turn from an adapter with no per-request signal at all.
+        let unsampled = execution(&service, &session, &stream, 10);
+        service
+            .apply_telemetry_event(dispatched_event(unsampled.clone()))
+            .unwrap();
+        service
+            .apply_telemetry_event(AgentUsageTelemetryEvent::Observation(observation(
+                unsampled, 3, 500, 100, 0, 600,
+            )))
+            .unwrap();
+
+        let statistics = service
+            .query_statistics_at(fixed_request(AgentUsageRange::Today), dispatched_at(12))
+            .unwrap();
+        assert_eq!(statistics.totals.requests, 2);
+        assert_eq!(statistics.totals.api_requests, Some(2));
+        assert_eq!(statistics.totals.api_requests_reported_turns, 1);
+        assert!(!statistics.totals.api_requests_are_complete());
     }
 }

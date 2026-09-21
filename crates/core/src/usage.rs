@@ -130,6 +130,8 @@ pub enum AgentUsageObservationSource {
 /// - `codex-acp` forwards Codex's `last_token_usage` and never its
 ///   `total_token_usage`, so its numbers cover a single
 ///   [`Request`](Self::Request) — the last one of the turn.
+/// - `deepseek-harness-acp` accumulates a prompt window and resets it when the
+///   next prompt starts, so its prompt result is [`Turn`](Self::Turn)-scoped.
 ///
 /// Only [`Session`](Self::Session) counters may be differenced against a
 /// checkpoint. The others are absolute per-turn readings: differencing them
@@ -196,6 +198,16 @@ pub fn agent_usage_reporting_contract(agent_id: &AgentId) -> AgentUsageReporting
         // response emits that request's own total.
         "codex" => AgentUsageReportingContract {
             counter_scope: AgentUsageCounterScope::Request,
+            usage_update_is_request_total: true,
+        },
+        // deepseek-harness-acp: `promptUsage()` returns the window
+        // `beginPrompt()` reset at the start of the prompt, so the prompt result
+        // sums every API request of the turn. Its `usage_update.used` is
+        // `input + cachedRead + cachedWrite + output` for the message that just
+        // completed — one request's own total, emitted once per request — which
+        // is both that request's total and the turn's only per-request signal.
+        "deepseek-harness" => AgentUsageReportingContract {
+            counter_scope: AgentUsageCounterScope::Turn,
             usage_update_is_request_total: true,
         },
         // zcode-acp-server (>=0.33.0): `turnResult()` forwards the backend's
@@ -520,6 +532,11 @@ pub struct AgentUsageAggregate {
     /// Absent when no turn in the aggregate carries a per-request signal.
     #[serde(default)]
     pub api_requests: Option<u64>,
+    /// How many of [`Self::requests`] contributed to [`Self::api_requests`].
+    /// Fewer than all of them means the sum describes only part of the work
+    /// behind the aggregate.
+    #[serde(default)]
+    pub api_requests_reported_turns: u64,
     pub total_tokens: AgentUsageMetricValue,
     pub input_tokens: AgentUsageMetricValue,
     pub output_tokens: AgentUsageMetricValue,
@@ -529,6 +546,19 @@ pub struct AgentUsageAggregate {
     pub cache_hit_rate: AgentUsageCacheHitRate,
     pub coverage: AgentUsageCoverageSummary,
     pub last_activity_at_ms: Option<i64>,
+}
+
+impl AgentUsageAggregate {
+    /// Whether [`Self::api_requests`] counts every turn in this aggregate.
+    ///
+    /// Adapters disagree on whether they report per-request totals at all, so a
+    /// mixed selection can carry a per-request sum that covers only the turns of
+    /// the adapters that do. Presenting that sum as the aggregate's request
+    /// count would understate the work behind the remaining turns; only a sum
+    /// covering every turn may stand in for [`Self::requests`].
+    pub fn api_requests_are_complete(&self) -> bool {
+        self.requests > 0 && self.api_requests_reported_turns == self.requests
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +707,7 @@ mod tests {
             totals: AgentUsageAggregate {
                 requests: 0,
                 api_requests: None,
+                api_requests_reported_turns: 0,
                 total_tokens: metric.clone(),
                 input_tokens: metric.clone(),
                 output_tokens: metric.clone(),
@@ -703,5 +734,42 @@ mod tests {
         serialized.as_object_mut().unwrap().remove("annual");
         let decoded: AgentUsageStatistics = serde_json::from_value(serialized).unwrap();
         assert!(decoded.annual.is_none());
+    }
+
+    #[test]
+    fn api_requests_stand_in_for_requests_only_when_every_turn_reported_them() {
+        let mut aggregate = AgentUsageAggregate {
+            requests: 4,
+            api_requests: Some(9),
+            api_requests_reported_turns: 4,
+            total_tokens: AgentUsageMetricValue::unknown(4),
+            input_tokens: AgentUsageMetricValue::unknown(4),
+            output_tokens: AgentUsageMetricValue::unknown(4),
+            cached_tokens: AgentUsageMetricValue::unknown(4),
+            thought_tokens: AgentUsageMetricValue::unknown(4),
+            cached_write_tokens: AgentUsageMetricValue::unknown(4),
+            cache_hit_rate: AgentUsageCacheHitRate {
+                basis_points: None,
+                cached_read_tokens: 0,
+                denominator_tokens: 0,
+                eligible_requests: 0,
+                total_requests: 4,
+                coverage: AgentUsageMetricCoverage::Unknown,
+            },
+            coverage: AgentUsageCoverageSummary::default(),
+            last_activity_at_ms: None,
+        };
+        assert!(aggregate.api_requests_are_complete());
+
+        // One turn from an adapter without a per-request signal leaves the sum
+        // describing the other turns only.
+        aggregate.api_requests_reported_turns = 3;
+        assert!(!aggregate.api_requests_are_complete());
+
+        // No turns at all is never a complete per-request reading.
+        aggregate.requests = 0;
+        aggregate.api_requests = None;
+        aggregate.api_requests_reported_turns = 0;
+        assert!(!aggregate.api_requests_are_complete());
     }
 }

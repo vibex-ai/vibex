@@ -705,6 +705,22 @@ impl UsageView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = summary_columns(viewport_width);
+        // Turns and API requests differ by two orders of magnitude on agentic
+        // adapters, so the tile names whichever it shows. A per-request sum
+        // covering only the turns of the adapters that report one would
+        // understate the work behind the rest, so the turn count stands in for
+        // it until every turn in the selection reported API requests.
+        let (request_label, request_value) = if aggregate.api_requests_are_complete() {
+            (
+                locale::text("API requests", "API 请求数", "API 請求數"),
+                aggregate.api_requests.unwrap_or(aggregate.requests),
+            )
+        } else {
+            (
+                locale::text("Turns", "对话轮次", "對話輪次"),
+                aggregate.requests,
+            )
+        };
         div()
             .grid()
             .grid_cols(columns)
@@ -720,14 +736,9 @@ impl UsageView {
                 ),
                 summary_metric(
                     "requests",
-                    // Turns and API requests differ by two orders of magnitude
-                    // on agentic adapters, so the tile names whichever it shows.
-                    match aggregate.api_requests {
-                        Some(_) => locale::text("API requests", "API 请求数", "API 請求數"),
-                        None => locale::text("Turns", "对话轮次", "對話輪次"),
-                    },
+                    request_label,
                     IconName::Inbox,
-                    format_compact_number(aggregate.api_requests.unwrap_or(aggregate.requests)),
+                    format_compact_number(request_value),
                     false,
                     cx,
                 ),
@@ -1502,11 +1513,13 @@ fn metric_coverage_label(coverage: AgentUsageMetricCoverage) -> &'static str {
 
 fn trend_value(aggregate: &AgentUsageAggregate, metric: AgentUsageTrendMetric) -> Option<u64> {
     match metric {
-        // Same rule as the summary tile: API requests when the adapters report
+        // Same rule as the summary tile: API requests when every turn reports
         // them, turns otherwise.
-        AgentUsageTrendMetric::Requests => {
-            Some(aggregate.api_requests.unwrap_or(aggregate.requests))
-        }
+        AgentUsageTrendMetric::Requests => Some(if aggregate.api_requests_are_complete() {
+            aggregate.api_requests.unwrap_or(aggregate.requests)
+        } else {
+            aggregate.requests
+        }),
         AgentUsageTrendMetric::TotalTokens => {
             token_trend_value(aggregate.requests, aggregate.total_tokens.value)
         }
@@ -2783,6 +2796,7 @@ mod tests {
         AgentUsageAggregate {
             requests,
             api_requests: Some(requests),
+            api_requests_reported_turns: requests,
             total_tokens: usage_metric(requests * 100, requests),
             input_tokens: usage_metric(requests * 60, requests),
             output_tokens: usage_metric(requests * 40, requests),
@@ -3162,6 +3176,25 @@ mod tests {
         assert!(detail.contains('2'));
         assert!(detail.contains('3'));
         assert!(detail.contains("input + output"));
+    }
+
+    #[test]
+    fn requests_trend_uses_api_requests_only_when_every_turn_reported_them() {
+        let complete = usage_aggregate(3);
+        assert_eq!(
+            trend_value(&complete, AgentUsageTrendMetric::Requests),
+            Some(3)
+        );
+
+        // One turn from an adapter without a per-request signal: the partial
+        // per-request sum must not stand in for the turn count.
+        let mut partial = usage_aggregate(3);
+        partial.api_requests = Some(7);
+        partial.api_requests_reported_turns = 1;
+        assert_eq!(
+            trend_value(&partial, AgentUsageTrendMetric::Requests),
+            Some(3)
+        );
     }
 
     #[test]

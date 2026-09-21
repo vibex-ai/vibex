@@ -126,6 +126,19 @@ session_runtime_bindings(
 - ACP token counters are cumulative within a durable runtime binding lineage.
   Every numerical field is independent and optional. A missing field is unknown;
   only an explicitly reported `0` is zero.
+- The schema default is not what every shipped adapter implements.
+  `agent_usage_reporting_contract()` in `crates/core` records, per Agent, whether
+  the counters are session-cumulative or an absolute turn/request reading, and
+  whether each `usage_update` carries one request's own total. Entries are added
+  only after reading the adapter's shipped source; an unregistered adapter keeps
+  the session contract. Differencing a turn- or request-scoped reading against
+  the stream checkpoint cancels out the turn's usage, so a missing entry
+  undercounts every turn whose reading grew.
+- `AgentUsageCounterScope` is persisted on each fact. A fact stored under the
+  session contract while the Agent is later registered as turn- or
+  request-scoped is re-derived on read from `cumulative_*_after`
+  (`reproject_legacy_delta`), so registering an adapter repairs its history
+  without a migration.
 - All token and context values must fit SQLite's signed integer range before
   persistence. Context-window gauges never contribute to token totals.
 - A `UsageExecutionId` is stable for one actual prompt execution. Durable message
@@ -198,6 +211,12 @@ session_runtime_bindings(
   fallback. Sort by the selected metric/direction, then case-folded label, then id.
 - Requests equal the number of dispatched execution facts, including failed and
   interrupted facts.
+- API requests are the per-request totals those facts carry, summed. Adapters
+  disagree on whether they report any, so an aggregate also carries how many of
+  its turns contributed one. A sum covering fewer turns than the aggregate has
+  is a partial reading of the work behind them, not the aggregate's request
+  count; `AgentUsageAggregate::api_requests_are_complete()` is that test and
+  every consumer that presents the sum in place of Requests must apply it.
 - Total Token uses a reported `total_delta` when present. It may derive a value
   from `input_delta + output_delta` only when both are present and must expose
   derived/partial coverage. Never add thought, cache read, or cache write to a
@@ -263,6 +282,11 @@ session_runtime_bindings(
   dimension, deterministic sorting, partial/derived coverage, cache-hit
   eligibility, empty data, row caps, overflow handling, the fixed 365-day annual
   window, range independence, and daily model projections.
+- Contract tests assert the registered counter scope and per-request signal of
+  every adapter whose reporting was read from source, so a table entry cannot
+  silently drift from the adapter it describes.
+- Query tests cover a per-request sum that covers only some of the aggregate's
+  turns and assert `api_requests_are_complete()` is false there.
 - One integration test runs fake ACP cumulative events through adapter,
   `DesktopRuntime`, SQLite, the typed query service, and the GPUI view model.
 
