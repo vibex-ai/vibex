@@ -2355,7 +2355,7 @@ impl RightRailActivity {
 
     fn icon(self) -> Icon {
         match self {
-            Self::Editor => Icon::default().path("icons/vibex/file-code.svg"),
+            Self::Editor => Icon::default().path("icons/vibex/sidebar-right.svg"),
             Self::Files => right_rail_mode_icon(RightRailMode::Files),
             Self::Git => right_rail_mode_icon(RightRailMode::Git),
             Self::Terminal => Icon::new(IconName::SquareTerminal),
@@ -31045,11 +31045,9 @@ impl VibexWorkbench {
         } else {
             strings.expand_sidebar
         };
-        let sidebar_toggle_icon = if sidebar_selected {
-            IconName::PanelLeftClose
-        } else {
-            IconName::PanelLeftOpen
-        };
+        // One glyph in both states: the rail beside it already shows whether the
+        // sidebar is open, and the tooltip names the action.
+        let sidebar_toggle_icon = Icon::default().path("icons/vibex/sidebar-left.svg");
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
         let is_web = cfg!(target_family = "wasm");
@@ -31176,7 +31174,7 @@ impl VibexWorkbench {
                                                     .px_0()
                                                     .tooltip(sidebar_tooltip)
                                                     .child(
-                                                        Icon::new(sidebar_toggle_icon)
+                                                        sidebar_toggle_icon
                                                             .size(px(TITLE_BAR_CONTROL_ICON_SIZE)),
                                                     )
                                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -68440,9 +68438,10 @@ mod tests {
         );
     }
 
-    /// The editor button carries an editor icon rather than the product mark.
+    /// The editor button carries the right-hand panel glyph rather than the
+    /// product mark.
     #[test]
-    fn the_editor_activity_carries_an_editor_icon() {
+    fn the_editor_activity_carries_the_right_panel_glyph() {
         let source = include_str!("app.rs");
         let icons = source
             .split_once("    fn icon(self) -> Icon {")
@@ -68450,8 +68449,23 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the activity icons should remain inspectable");
 
-        assert!(icons.contains("icons/vibex/file-code.svg"));
+        assert!(icons.contains("icons/vibex/sidebar-right.svg"));
         assert!(!icons.contains("vibex-mark.svg"));
+    }
+
+    /// The two panel toggles carry mirrored glyphs: the sidebar's own on the
+    /// title bar, the editor's on the right rail.
+    #[test]
+    fn the_panel_toggles_carry_their_sidebar_glyphs() {
+        let source = include_str!("app.rs");
+        let title_bar = source
+            .split_once("    fn render_title_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_title_session_menu("))
+            .map(|(body, _)| body)
+            .expect("the title bar should remain inspectable");
+
+        assert!(title_bar.contains("icons/vibex/sidebar-left.svg"));
+        assert!(!title_bar.contains("PanelLeftClose"));
     }
 
     /// The bar keeps the order the reader dragged it into, and a button the

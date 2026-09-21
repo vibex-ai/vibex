@@ -513,6 +513,20 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/sidebar-left.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/sidebar-left.svg"
+        )),
+    ),
+    (
+        "icons/vibex/sidebar-right.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/sidebar-right.svg"
+        )),
+    ),
+    (
         "icons/vibex/cpu.svg",
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/cpu.svg")),
     ),
@@ -2285,6 +2299,31 @@ mod tests {
             checked > 10,
             "the scan found only {checked} icon paths; it is probably not reading the app source"
         );
+    }
+
+    /// The panel glyphs take their color from the theme. A literal fill or
+    /// stroke would look right in one theme and disappear in the other.
+    #[test]
+    fn the_panel_glyphs_follow_the_active_theme() {
+        let assets = VibexAssets;
+        for path in [
+            "icons/vibex/sidebar-left.svg",
+            "icons/vibex/sidebar-right.svg",
+        ] {
+            let bytes = assets
+                .load(path)
+                .expect("asset lookup should not fail")
+                .expect("the panel glyph should be bundled");
+            let svg = std::str::from_utf8(&bytes).expect("the panel glyph should be UTF-8");
+            assert!(
+                svg.contains("stroke=\"currentColor\""),
+                "{path} should stroke with currentColor"
+            );
+            assert!(
+                !svg.contains("fill=\"#") && !svg.contains("stroke=\"#"),
+                "{path} should not carry a literal color"
+            );
+        }
     }
 
     #[test]
