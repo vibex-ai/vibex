@@ -443,6 +443,20 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        "icons/vibex/chevrons-left.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/chevrons-left.svg"
+        )),
+    ),
+    (
+        "icons/vibex/book-open.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/book-open.svg"
+        )),
+    ),
+    (
         "icons/vibex/chevrons-down-up.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

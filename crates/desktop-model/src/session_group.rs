@@ -212,6 +212,10 @@ impl SessionGroupLayout {
     /// panes are re-filled in tree order.
     fn reconcile_members(&mut self, members: &[String], preferred_first_pane_id: &str) {
         let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
+        // A pane the user opened on purpose starts empty and must survive
+        // normalization; only panes that *became* empty because their sessions
+        // left the group are dropped.
+        let already_empty = self.empty_pane_ids();
         self.for_each_pane_mut(&mut |pane| pane.normalize(&member_set));
 
         // Sessions the layout forgot are appended to the first pane in member
@@ -238,7 +242,7 @@ impl SessionGroupLayout {
             }
         }
 
-        self.prune_empty_panes();
+        self.prune_empty_panes_preserving(&already_empty);
         if !self.has_any_pane() {
             *self = Self::Pane {
                 pane: SessionGroupPane::new(preferred_first_pane_id),
@@ -258,8 +262,28 @@ impl SessionGroupLayout {
         }
     }
 
+    /// The ids of every pane that currently holds no session.
+    fn empty_pane_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        self.for_each_pane(&mut |pane| {
+            if pane.is_empty() {
+                ids.insert(pane.id.clone());
+            }
+        });
+        ids
+    }
+
     /// Removes panes that hold no sessions and collapses single-child splits.
     fn prune_empty_panes(&mut self) {
+        self.prune_empty_panes_preserving(&BTreeSet::new());
+    }
+
+    /// Like [`Self::prune_empty_panes`], but keeps the panes in `keep`.
+    ///
+    /// `keep` names the panes that were already empty before the operation, so
+    /// a pane the user deliberately opened is not mistaken for one whose
+    /// sessions left the group.
+    fn prune_empty_panes_preserving(&mut self, keep: &BTreeSet<String>) {
         match self {
             Self::Pane { .. } => {}
             Self::Split { children, .. } => {
@@ -267,7 +291,7 @@ impl SessionGroupLayout {
                     child.prune_empty_panes();
                 }
                 children.retain(|child| match child {
-                    Self::Pane { pane } => !pane.is_empty(),
+                    Self::Pane { pane } => !pane.is_empty() || keep.contains(&pane.id),
                     Self::Split { .. } => true,
                 });
                 // A split that lost every child is itself empty.
@@ -349,6 +373,12 @@ impl SessionGroupLayout {
 
     /// Splits `pane_id` in `direction`, moving `session_id` into the new pane.
     ///
+    /// The session may live in `pane_id` or in any other pane; the new pane is
+    /// always spliced next to `pane_id`, which is what lets a workspace grow
+    /// past two panes. Splitting a pane that holds nothing but `session_id`
+    /// would leave it empty, so the caller opens an empty pane instead — see
+    /// [`Self::split_open_pane`].
+    ///
     /// Returns the new pane id, or `None` when the layout cannot split further.
     pub fn split_with_session(
         &mut self,
@@ -366,18 +396,20 @@ impl SessionGroupLayout {
         if new_pane_id.is_empty() || self.contains_pane(&new_pane_id) {
             return None;
         }
-        let target = self.find_pane_mut(pane_id)?;
-        if !target.session_ids.iter().any(|id| id == session_id) {
+        if !self.contains_pane(pane_id) || self.find_pane(pane_id)?.is_empty() {
             return None;
         }
-        // A pane holding exactly the moved session would become empty; the
-        // caller is asking for a no-op move, not a split.
-        if target.session_ids.len() < 2 {
+        let source_pane_id = self.pane_containing_session(session_id)?;
+        if source_pane_id == pane_id && self.find_pane(pane_id)?.session_ids.len() < 2 {
             return None;
         }
-        target.session_ids.retain(|id| id != session_id);
-        if target.active_session_id.as_deref() == Some(session_id) {
-            target.active_session_id = target.session_ids.first().cloned();
+        let already_empty = self.empty_pane_ids();
+        {
+            let source = self.find_pane_mut(&source_pane_id)?;
+            source.session_ids.retain(|id| id != session_id);
+            if source.active_session_id.as_deref() == Some(session_id) {
+                source.active_session_id = source.session_ids.first().cloned();
+            }
         }
 
         let mut moved = SessionGroupPane::new(new_pane_id.clone());
@@ -387,6 +419,40 @@ impl SessionGroupLayout {
         let split_id = new_split_id.into();
 
         if !self.splice_split(pane_id, &split_id, direction, moved_node, position) {
+            return None;
+        }
+        self.prune_empty_panes_preserving(&already_empty);
+        self.normalize_sizes();
+        Some(new_pane_id)
+    }
+
+    /// Splits `pane_id` in `direction`, opening a new empty pane beside it.
+    ///
+    /// An empty pane is a drop target: the reader moves a tab into it, or drops
+    /// a sidebar session on it. It is kept across normalization so the split
+    /// survives the next membership change.
+    pub fn split_open_pane(
+        &mut self,
+        pane_id: &str,
+        direction: SplitDirection,
+        new_pane_id: impl Into<String>,
+        new_split_id: impl Into<String>,
+        position: SessionGroupSplitPosition,
+    ) -> Option<String> {
+        if self.pane_count() >= SESSION_GROUP_PANE_LIMIT {
+            return None;
+        }
+        let new_pane_id = new_pane_id.into();
+        if new_pane_id.is_empty() || self.contains_pane(&new_pane_id) {
+            return None;
+        }
+        if !self.contains_pane(pane_id) {
+            return None;
+        }
+        let opened = Self::Pane {
+            pane: SessionGroupPane::new(new_pane_id.clone()),
+        };
+        if !self.splice_split(pane_id, &new_split_id.into(), direction, opened, position) {
             return None;
         }
         self.normalize_sizes();
@@ -441,6 +507,10 @@ impl SessionGroupLayout {
         if !self.contains_pane(target_pane_id) {
             return false;
         }
+        // Panes that were already empty stay: the reader opened them on
+        // purpose. The source pane, which is about to lose its last session,
+        // does not.
+        let already_empty = self.empty_pane_ids();
         let Some(source) = self.find_pane_mut(&source_pane_id) else {
             return false;
         };
@@ -455,7 +525,7 @@ impl SessionGroupLayout {
             target.session_ids.push(session_id.to_string());
         }
         target.active_session_id = Some(session_id.to_string());
-        self.prune_empty_panes();
+        self.prune_empty_panes_preserving(&already_empty);
         self.normalize_sizes();
         true
     }
@@ -1007,6 +1077,149 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    /// A workspace grows past two panes by splitting any pane again, which is
+    /// what makes a group behave like a tab panel instead of a fixed pair.
+    #[test]
+    fn a_workspace_grows_past_two_panes() {
+        let mut group = SessionGroupUiState::new(
+            "会话组 1",
+            "project",
+            "workspace",
+            members(&["a", "b", "c", "d"]),
+        );
+        group
+            .layout
+            .split_with_session(
+                SESSION_GROUP_MAIN_PANE_ID,
+                "b",
+                SplitDirection::Horizontal,
+                "pane-2",
+                "split-1",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("first split");
+        // The pane that kept the other sessions splits again, so the workspace
+        // reaches three panes without ever merging anything back.
+        group
+            .layout
+            .split_with_session(
+                SESSION_GROUP_MAIN_PANE_ID,
+                "c",
+                SplitDirection::Horizontal,
+                "pane-3",
+                "split-2",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("second split");
+        // A pane holding one tab has nothing to leave behind, so it opens an
+        // empty pane instead; that is the path a one-tab pane grows by.
+        group
+            .layout
+            .split_open_pane(
+                "pane-2",
+                SplitDirection::Vertical,
+                "pane-4",
+                "split-3",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("third split");
+        assert_eq!(group.layout.pane_count(), 4);
+        assert_eq!(group.layout.ordered_session_ids().len(), 4);
+        for session_id in ["a", "b", "c", "d"] {
+            assert!(
+                group.layout.pane_containing_session(session_id).is_some(),
+                "{session_id} should still live in exactly one pane"
+            );
+        }
+    }
+
+    /// Splitting with a session that lives in another pane moves it next to the
+    /// target, which is how a drag from one pane (or the sidebar) creates a new
+    /// pane instead of doing nothing.
+    #[test]
+    fn a_session_from_another_pane_splits_next_to_the_target() {
+        let mut group = SessionGroupUiState::new(
+            "会话组 1",
+            "project",
+            "workspace",
+            members(&["a", "b", "c"]),
+        );
+        group
+            .layout
+            .split_with_session(
+                SESSION_GROUP_MAIN_PANE_ID,
+                "c",
+                SplitDirection::Horizontal,
+                "pane-2",
+                "split-1",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("first split");
+        // "a" lives in the main pane; splitting pane-2 with it must still work.
+        let opened = group
+            .layout
+            .split_with_session(
+                "pane-2",
+                "a",
+                SplitDirection::Vertical,
+                "pane-3",
+                "split-2",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("cross-pane split");
+        assert_eq!(opened, "pane-3");
+        assert_eq!(
+            group.layout.pane_containing_session("a").as_deref(),
+            Some("pane-3")
+        );
+        assert_eq!(group.layout.pane_count(), 3);
+        assert_eq!(group.layout.ordered_session_ids().len(), 3);
+    }
+
+    /// A pane opened on purpose starts empty and has to survive normalization,
+    /// or the split the reader just made would disappear on the next edit.
+    #[test]
+    fn an_opened_empty_pane_survives_normalization() {
+        let mut group =
+            SessionGroupUiState::new("会话组 1", "project", "workspace", members(&["a"]));
+        let opened = group
+            .layout
+            .split_open_pane(
+                SESSION_GROUP_MAIN_PANE_ID,
+                SplitDirection::Horizontal,
+                "pane-2",
+                "split-1",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("opening a pane should succeed");
+        assert_eq!(opened, "pane-2");
+        assert_eq!(group.layout.pane_count(), 2);
+        assert!(
+            group
+                .layout
+                .find_pane("pane-2")
+                .is_some_and(|pane| pane.is_empty())
+        );
+
+        // Any later membership change normalizes the group; the empty pane stays.
+        assert!(group.add_members(&members(&["b"])));
+        assert_eq!(group.layout.pane_count(), 2);
+        assert!(
+            group
+                .layout
+                .find_pane("pane-2")
+                .is_some_and(|pane| pane.is_empty())
+        );
+
+        // Filling it makes it an ordinary pane holding that session.
+        assert!(group.layout.move_session_to_pane("b", "pane-2"));
+        assert_eq!(
+            group.layout.pane_containing_session("b").as_deref(),
+            Some("pane-2")
+        );
+        assert_eq!(group.layout.pane_count(), 2);
     }
 
     #[test]

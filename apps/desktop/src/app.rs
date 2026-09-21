@@ -432,8 +432,6 @@ const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 13.0;
 const SESSION_GROUP_AVATAR_SIZE: f32 = 16.0;
 /// How far consecutive avatars overlap.
 const SESSION_GROUP_AVATAR_OVERLAP: f32 = 6.0;
-/// How many recent turns a non-focused group pane previews.
-const SESSION_GROUP_PANE_PREVIEW_TURNS: usize = 4;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -1612,15 +1610,28 @@ fn touch_session_view_lru(lru: &mut VecDeque<String>, key: &str) {
     lru.push_back(key.to_string());
 }
 
-fn insert_bounded_session_view<T>(
+/// The bound one session-view store keeps: how many views, and how many bytes.
+struct SessionViewBudget {
+    limit: usize,
+    max_bytes: usize,
+}
+
+/// Stores a session view, evicting least-recently-used entries that are not
+/// pinned.
+///
+/// The bound is a memory guard for sessions nobody is looking at. A pinned view
+/// (the selected session, or any session a group workspace is showing) is never
+/// evicted, because dropping it would blank a pane that is on screen.
+fn insert_bounded_session_view_with_pins<T>(
     cache: &mut BTreeMap<String, T>,
     lru: &mut VecDeque<String>,
     key: String,
     entry: T,
-    limit: usize,
-    max_bytes: usize,
+    budget: SessionViewBudget,
     weight: impl Fn(&T) -> usize,
+    pinned: &BTreeSet<String>,
 ) {
+    let SessionViewBudget { limit, max_bytes } = budget;
     let entry_bytes = weight(&entry);
     cache.remove(&key);
     lru.retain(|cached| cached != &key);
@@ -1633,12 +1644,15 @@ fn insert_bounded_session_view<T>(
         .values()
         .map(&weight)
         .fold(0_usize, usize::saturating_add);
-    while lru.len() > limit || total_bytes > max_bytes {
-        let Some(evicted) = lru.pop_front() else {
-            cache.clear();
-            break;
-        };
-        if let Some(entry) = cache.remove(&evicted) {
+    let mut index = 0;
+    while (lru.len() > limit || total_bytes > max_bytes) && index < lru.len() {
+        let candidate = lru[index].clone();
+        if pinned.contains(&candidate) || candidate == key {
+            index += 1;
+            continue;
+        }
+        lru.remove(index);
+        if let Some(entry) = cache.remove(&candidate) {
             total_bytes = total_bytes.saturating_sub(weight(&entry));
         }
     }
@@ -3052,24 +3066,71 @@ struct PendingPermissionRevealTarget {
     item_id: String,
 }
 
-struct AgentSessionViewCacheEntry {
-    estimated_resident_bytes: usize,
+/// Every piece of state that belongs to one session's conversation view.
+///
+/// A session view is a *complete*, independently owned unit: the timeline and
+/// its derived caches, the scroll and measurement state, the runtime selection,
+/// the streaming bookkeeping and the reader's expansion choices. Nothing that
+/// one session's view needs is allowed to live outside this struct, because
+/// anything left outside is shared with every other session and is therefore
+/// clobbered as soon as two views are on screen at once.
+///
+/// A group workspace keeps one live view per pane, and every session that is
+/// selected, grouped or opened as a child Agent keeps its own view. Views are
+/// stored in [`VibexWorkbench::session_views`]; `VibexWorkbench::view` holds the
+/// one that is currently borrowed for rendering or mutation, and
+/// `VibexWorkbench::view_session_id` names it. Rendering a group pane borrows
+/// that pane's view, renders it, and hands it back — the state never leaves the
+/// store, so no pane can observe or destroy another pane's view.
+///
+/// `VibexWorkbench` derefs to `SessionView`, so `self.timeline` (and every
+/// other field below) resolves to the currently borrowed view. That keeps the
+/// ~600 existing field accesses honest: they always mean "the view being
+/// rendered", which is exactly what the renderer wants.
+pub struct SessionView {
     timeline: TimelineModel,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
     token_usage: Option<AgentTokenUsage>,
+    agent_generation_stats: Option<AgentGenerationStats>,
+    agent_loading: bool,
+    agent_error: Option<String>,
+    agent_turn_pending: bool,
+    pending_user_message_edit: Option<PendingUserMessageEdit>,
+    inline_user_message_edit: Option<InlineUserMessageEdit>,
+    turn_preview_rail_visible: bool,
+    turn_preview_active_index: Option<usize>,
+    timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
     timeline_scroll: VirtualListScrollHandle,
+    timeline_scroll_to_latest_pending: bool,
+    timeline_scroll_anchor_pending: bool,
+    timeline_list_padding_top_px: f32,
+    timeline_scroll_wheel_idle_task: Option<Task<()>>,
+    timeline_bottom_control_visible: bool,
+    timeline_bottom_control_mounted: bool,
+    timeline_bottom_control_close_task: Option<Task<()>>,
+    timeline_duration_tick_task: Option<Task<()>>,
+    timeline_scrollbar_interaction_active: bool,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     timeline_measured_turn_heights: BTreeMap<String, f32>,
     timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
+    timeline_streaming_shrink_candidates: BTreeMap<String, StreamingShrinkCandidate>,
+    timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
     timeline_process_unit_heights: BTreeMap<String, (i64, f32)>,
+    timeline_layout_width: Option<f32>,
+    timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
+    timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
+    timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
+    timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
+    timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
+    timeline_turn_file_changes: BTreeMap<String, (i64, Rc<TurnFileChangesSummary>)>,
     conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
+    conversation_turns_render_cache: Rc<RefCell<Rc<Vec<Rc<TimelineConversationTurn>>>>>,
     conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
     conversation_turns_summary: ConversationTurnsSummary,
     streaming_row_state: Option<StreamingRowStateCache>,
-    timeline_layout_width: Option<f32>,
     content_width: SessionContentWidthMode,
     collapsed_timeline_rows: BTreeSet<String>,
     reasoning_expansion: BTreeMap<String, bool>,
@@ -3078,7 +3139,86 @@ struct AgentSessionViewCacheEntry {
     timeline_file_changes_expansion: BTreeMap<String, bool>,
 }
 
-impl AgentSessionViewCacheEntry {
+impl SessionView {
+    fn new(content_width: SessionContentWidthMode) -> Self {
+        Self {
+            timeline: TimelineModel::default(),
+            runtime_selection: None,
+            token_usage: None,
+            agent_generation_stats: None,
+            agent_loading: true,
+            agent_error: None,
+            agent_turn_pending: false,
+            pending_user_message_edit: None,
+            inline_user_message_edit: None,
+            turn_preview_rail_visible: false,
+            turn_preview_active_index: None,
+            timeline_item_index: RefCell::new(TimelineItemIndex::default()),
+            timeline_follow: TimelineFollowState::default(),
+            timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_scroll_to_latest_pending: false,
+            timeline_scroll_anchor_pending: false,
+            timeline_list_padding_top_px: AGENT_TIMELINE_LIST_PADDING_TOP_PX,
+            timeline_scroll_wheel_idle_task: None,
+            timeline_bottom_control_visible: false,
+            timeline_bottom_control_mounted: false,
+            timeline_bottom_control_close_task: None,
+            timeline_duration_tick_task: None,
+            timeline_scrollbar_interaction_active: false,
+            timeline_row_sizes: Rc::new(Vec::new()),
+            timeline_measured_turn_heights: BTreeMap::new(),
+            timeline_measured_turn_layout_signatures: BTreeMap::new(),
+            timeline_streaming_shrink_candidates: BTreeMap::new(),
+            timeline_pending_turn_heights: BTreeMap::new(),
+            timeline_estimated_turn_heights: BTreeMap::new(),
+            timeline_turn_layout_signature_cache: BTreeMap::new(),
+            timeline_process_unit_heights: BTreeMap::new(),
+            timeline_layout_width: None,
+            timeline_markdown_sources: BTreeMap::new(),
+            timeline_reasoning_summaries: BTreeMap::new(),
+            timeline_tool_card_projections: BTreeMap::new(),
+            timeline_file_diff_previews: BTreeMap::new(),
+            timeline_file_diff_scrolls: BTreeMap::new(),
+            timeline_turn_file_changes: BTreeMap::new(),
+            conversation_turns_cache: Rc::new(Vec::new()),
+            conversation_turns_render_cache: Rc::new(RefCell::new(Rc::new(Vec::new()))),
+            conversation_turns_cache_key: None,
+            conversation_turns_summary: ConversationTurnsSummary::default(),
+            streaming_row_state: None,
+            content_width,
+            collapsed_timeline_rows: BTreeSet::new(),
+            reasoning_expansion: BTreeMap::new(),
+            timeline_process_expansion: BTreeMap::new(),
+            timeline_command_expansion: BTreeMap::new(),
+            timeline_file_changes_expansion: BTreeMap::new(),
+        }
+    }
+
+    /// Forgets every derived projection so the next render rebuilds it from
+    /// `timeline`. Used when a view adopts a new authoritative timeline.
+    fn invalidate_render_caches(&mut self) {
+        self.timeline_row_sizes = Rc::new(Vec::new());
+        self.timeline_measured_turn_heights.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
+        self.timeline_estimated_turn_heights.clear();
+        self.timeline_turn_layout_signature_cache.clear();
+        self.timeline_process_unit_heights.clear();
+        self.timeline_pending_turn_heights.clear();
+        self.conversation_turns_cache = Rc::new(Vec::new());
+        self.conversation_turns_cache_key = None;
+        self.conversation_turns_summary = ConversationTurnsSummary::default();
+        self.streaming_row_state = None;
+        *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
+        self.timeline_streaming_shrink_candidates.clear();
+        self.timeline_markdown_sources.clear();
+        self.timeline_reasoning_summaries.clear();
+        self.timeline_tool_card_projections.clear();
+        self.timeline_file_diff_previews.clear();
+        self.timeline_file_diff_scrolls.clear();
+        self.timeline_turn_file_changes.clear();
+        self.timeline_item_index.get_mut().invalidate();
+    }
+
     fn calculate_estimated_resident_bytes(&self) -> usize {
         timeline_items_resident_bytes(&self.timeline.items)
             .saturating_add(
@@ -6083,7 +6223,6 @@ pub struct VibexWorkbench {
     update_action_task: Option<Task<()>>,
     /// The staged RC-data import that the settings page requested.
     rc_import_task: Option<Task<()>>,
-    timeline_command_expansion: BTreeMap<String, bool>,
     elicitation_inputs: BTreeMap<String, Entity<InputState>>,
     elicitation_drafts: BTreeMap<String, ElicitationFormDraft>,
     composer_submission_locators: Vec<ComposerSubmissionLocator>,
@@ -6306,7 +6445,25 @@ pub struct VibexWorkbench {
     navigation_history: NavigationHistory,
     runtime_client_id: RuntimeClientId,
     session_generation: u64,
-    timeline: TimelineModel,
+    /// The session view currently borrowed for rendering or mutation.
+    ///
+    /// `VibexWorkbench` derefs to this struct, so every `self.timeline`,
+    /// `self.agent_loading`, … access below resolves to the borrowed view.
+    view: SessionView,
+    /// The session `view` belongs to, when it is known.
+    view_session_id: Option<VibexSessionId>,
+    /// One persistent, complete view per session, keyed by session id.
+    ///
+    /// This is the multi-view store: the selected session, every group member
+    /// and every open child Agent each own an entry here, and entries stay put
+    /// while another view is borrowed. Rendering a group pane swaps that pane's
+    /// entry into `view` and hands it back afterwards, so no pane can lose,
+    /// truncate or overwrite another pane's conversation.
+    session_views: BTreeMap<String, SessionView>,
+    /// Least-recently-used order for [`Self::session_views`]. Pinned views are
+    /// never evicted, so a group member cannot lose its timeline while it is on
+    /// screen.
+    session_view_lru: VecDeque<String>,
     child_agent_timelines: BTreeMap<String, ChildAgentTimelineState>,
     child_agent_expanded_delegations: BTreeSet<String>,
     child_agent_tabs: Vec<VibexSessionId>,
@@ -6314,56 +6471,17 @@ pub struct VibexWorkbench {
     child_agent_panel_active: bool,
     child_agent_timeline_scroll: ScrollHandle,
     child_agent_render_session: Option<VibexSessionId>,
-    timeline_item_index: RefCell<TimelineItemIndex>,
-    timeline_follow: TimelineFollowState,
-    timeline_scroll: VirtualListScrollHandle,
-    timeline_scroll_to_latest_pending: bool,
-    timeline_scroll_anchor_pending: bool,
-    timeline_list_padding_top_px: f32,
-    timeline_scroll_wheel_idle_task: Option<Task<()>>,
-    timeline_bottom_control_visible: bool,
-    timeline_bottom_control_mounted: bool,
-    timeline_bottom_control_close_task: Option<Task<()>>,
-    timeline_duration_tick_task: Option<Task<()>>,
-    timeline_scrollbar_interaction_active: bool,
-    timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
-    timeline_measured_turn_heights: BTreeMap<String, f32>,
-    timeline_measured_turn_layout_signatures: BTreeMap<String, u64>,
-    timeline_streaming_shrink_candidates: BTreeMap<String, StreamingShrinkCandidate>,
-    timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
-    timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
-    timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
-    timeline_process_unit_heights: BTreeMap<String, (i64, f32)>,
-    timeline_layout_width: Option<f32>,
-    timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
-    timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
-    timeline_tool_card_projections: BTreeMap<String, (i64, Rc<ToolCardProjection>)>,
-    timeline_file_diff_previews: BTreeMap<String, (i64, Rc<AgentFileDiffPreview>)>,
-    timeline_file_diff_scrolls: BTreeMap<String, gpui::ScrollHandle>,
-    timeline_turn_file_changes: BTreeMap<String, (i64, Rc<TurnFileChangesSummary>)>,
-    conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>,
-    conversation_turns_render_cache: Rc<RefCell<Rc<Vec<Rc<TimelineConversationTurn>>>>>,
-    conversation_turns_cache_key: Option<ConversationTurnsCacheKey>,
-    conversation_turns_summary: ConversationTurnsSummary,
-    streaming_row_state: Option<StreamingRowStateCache>,
     agent_streaming_surface_visible: Arc<AtomicBool>,
-    turn_preview_rail_visible: bool,
-    turn_preview_active_index: Option<usize>,
-    agent_session_view_cache: BTreeMap<String, AgentSessionViewCacheEntry>,
-    agent_session_view_lru: VecDeque<String>,
     runtime_catalog: Option<SessionRuntimeOptionCatalog>,
     runtime_provider_profiles: Vec<ProviderProfileSummary>,
-    runtime_selection: Option<AgentSessionRuntimeSelectionState>,
     optimistic_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
     runtime_selection_requests_in_flight: BTreeSet<String>,
     runtime_selection_initializations_in_flight: BTreeSet<String>,
     runtime_selection_uninitialized_sessions: BTreeSet<String>,
     runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
-    token_usage: Option<AgentTokenUsage>,
     remote_token_usage_in_flight: Option<VibexSessionId>,
     remote_token_usage_task: Option<Task<()>>,
-    agent_generation_stats: Option<AgentGenerationStats>,
     composer_runtime_menu_open: bool,
     composer_runtime_menu_view: ComposerRuntimeMenuView,
     composer_runtime_menu_agent_id: Option<AgentId>,
@@ -6396,10 +6514,6 @@ pub struct VibexWorkbench {
     suggestion_request_serial: u64,
     composer_command_entry: Option<AgentCommandEntry>,
     new_session_command_entry: Option<AgentCommandEntry>,
-    collapsed_timeline_rows: BTreeSet<String>,
-    timeline_process_expansion: BTreeMap<String, bool>,
-    reasoning_expansion: BTreeMap<String, bool>,
-    timeline_file_changes_expansion: BTreeMap<String, bool>,
     composer_attachments: Vec<InlineComposerAttachment>,
     composer_attachment_serial: u64,
     composer_queue: Vec<ComposerQueueMessage>,
@@ -6434,13 +6548,10 @@ pub struct VibexWorkbench {
     composer_terminal_drop_target: Option<ComposerTerminalDropTarget>,
     composer_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
     active_composer_terminal_surface_id: Option<String>,
-    inline_user_message_edit: Option<InlineUserMessageEdit>,
-    pending_user_message_edit: Option<PendingUserMessageEdit>,
     optimistic_user_messages: BTreeMap<String, OptimisticUserMessage>,
     startup_loading: bool,
     startup_loading_indicator_visible: bool,
     startup_loading_started_at: Instant,
-    agent_loading: bool,
     agent_action_pending: bool,
     fork_session_pending: bool,
     pending_agent_turn_session_ids: BTreeSet<String>,
@@ -6454,7 +6565,6 @@ pub struct VibexWorkbench {
     /// looks like it is still making progress.
     pending_user_request_ids: BTreeMap<String, BTreeSet<String>>,
     notification_suppressed_session_ids: BTreeSet<String>,
-    agent_turn_pending: bool,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
     auto_continue_paused_session_ids: BTreeSet<String>,
@@ -6464,7 +6574,6 @@ pub struct VibexWorkbench {
     auto_continue_probe_tasks: BTreeMap<String, AutoContinueProbeTask>,
     auto_continue_countdowns: BTreeMap<String, AutoContinueCountdown>,
     auto_continue_countdown_tasks: BTreeMap<String, Task<()>>,
-    agent_error: Option<String>,
     last_visibility: WorkbenchVisibility,
     boot_task: Option<Task<()>>,
     event_task: Option<Task<()>>,
@@ -6500,6 +6609,31 @@ pub struct VibexWorkbench {
     appearance_subscription: Option<Subscription>,
     quit_subscription: Option<Subscription>,
     _agent_subscriptions: Vec<Subscription>,
+}
+
+/// Field access on the workbench resolves to the borrowed session view.
+///
+/// A session group renders one live conversation per pane, so the renderer
+/// cannot read "the" timeline: it has to read *this pane's* timeline. Every
+/// view-scoped field lives on [`SessionView`], and the renderer borrows the
+/// pane's view before it paints. `Deref` is what lets the several hundred
+/// existing `self.timeline` / `self.agent_loading` / … accesses keep working
+/// unchanged while their meaning becomes "the view currently being rendered".
+///
+/// Only genuinely application-scoped state (the session list, the sidebar, the
+/// runtime handles, tasks) stays on `VibexWorkbench` itself.
+impl std::ops::Deref for VibexWorkbench {
+    type Target = SessionView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for VibexWorkbench {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.view
+    }
 }
 
 impl VibexWorkbench {
@@ -7024,6 +7158,9 @@ impl VibexWorkbench {
         );
         let agent_streaming_surface_visible =
             Arc::new(AtomicBool::new(ui_state.workbench.active_tab == "agent"));
+        // The view store is built from the persisted content width before
+        // `ui_state` moves into the workbench.
+        let initial_content_width = ui_state.session.content_width;
         let mut new_session_workspace = NewSessionWorkspaceState::default();
         new_session_workspace.clear(
             RequestId::new().to_string(),
@@ -7080,7 +7217,6 @@ impl VibexWorkbench {
             update_status_task: None,
             update_action_task: None,
             rc_import_task: None,
-            timeline_command_expansion: BTreeMap::new(),
             elicitation_inputs: BTreeMap::new(),
             elicitation_drafts: BTreeMap::new(),
             composer_submission_locators: Vec::new(),
@@ -7236,7 +7372,10 @@ impl VibexWorkbench {
             navigation_history,
             runtime_client_id: RuntimeClientId::new(),
             session_generation: 0,
-            timeline: TimelineModel::default(),
+            view: SessionView::new(initial_content_width),
+            view_session_id: None,
+            session_views: BTreeMap::new(),
+            session_view_lru: VecDeque::new(),
             child_agent_timelines: BTreeMap::new(),
             child_agent_expanded_delegations: BTreeSet::new(),
             child_agent_tabs: Vec::new(),
@@ -7244,56 +7383,17 @@ impl VibexWorkbench {
             child_agent_panel_active: false,
             child_agent_timeline_scroll: ScrollHandle::new(),
             child_agent_render_session: None,
-            timeline_item_index: RefCell::new(TimelineItemIndex::default()),
-            timeline_follow: TimelineFollowState::default(),
-            timeline_scroll: VirtualListScrollHandle::new(),
-            timeline_scroll_to_latest_pending: false,
-            timeline_scroll_anchor_pending: false,
-            timeline_list_padding_top_px: AGENT_TIMELINE_LIST_PADDING_TOP_PX,
-            timeline_scroll_wheel_idle_task: None,
-            timeline_bottom_control_visible: false,
-            timeline_bottom_control_mounted: false,
-            timeline_bottom_control_close_task: None,
-            timeline_duration_tick_task: None,
-            timeline_scrollbar_interaction_active: false,
-            timeline_row_sizes: Rc::new(Vec::new()),
-            timeline_measured_turn_heights: BTreeMap::new(),
-            timeline_measured_turn_layout_signatures: BTreeMap::new(),
-            timeline_streaming_shrink_candidates: BTreeMap::new(),
-            timeline_pending_turn_heights: BTreeMap::new(),
-            timeline_estimated_turn_heights: BTreeMap::new(),
-            timeline_turn_layout_signature_cache: BTreeMap::new(),
-            timeline_process_unit_heights: BTreeMap::new(),
-            timeline_layout_width: None,
-            timeline_markdown_sources: BTreeMap::new(),
-            timeline_reasoning_summaries: BTreeMap::new(),
-            timeline_tool_card_projections: BTreeMap::new(),
-            timeline_file_diff_previews: BTreeMap::new(),
-            timeline_file_diff_scrolls: BTreeMap::new(),
-            timeline_turn_file_changes: BTreeMap::new(),
-            conversation_turns_cache: Rc::new(Vec::new()),
-            conversation_turns_render_cache: Rc::new(RefCell::new(Rc::new(Vec::new()))),
-            conversation_turns_cache_key: None,
-            conversation_turns_summary: ConversationTurnsSummary::default(),
-            streaming_row_state: None,
             agent_streaming_surface_visible,
-            turn_preview_rail_visible: false,
-            turn_preview_active_index: None,
-            agent_session_view_cache: BTreeMap::new(),
-            agent_session_view_lru: VecDeque::new(),
             runtime_catalog: None,
             runtime_provider_profiles: Vec::new(),
-            runtime_selection: None,
             optimistic_runtime_selections: BTreeMap::new(),
             runtime_selection_requests_in_flight: BTreeSet::new(),
             runtime_selection_initializations_in_flight: BTreeSet::new(),
             runtime_selection_uninitialized_sessions: BTreeSet::new(),
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
-            token_usage: None,
             remote_token_usage_in_flight: None,
             remote_token_usage_task: None,
-            agent_generation_stats: None,
             composer_runtime_menu_open: false,
             composer_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
             composer_runtime_menu_agent_id: None,
@@ -7320,10 +7420,6 @@ impl VibexWorkbench {
             suggestion_request_serial: 0,
             composer_command_entry: None,
             new_session_command_entry: None,
-            collapsed_timeline_rows: BTreeSet::new(),
-            timeline_process_expansion: BTreeMap::new(),
-            reasoning_expansion: BTreeMap::new(),
-            timeline_file_changes_expansion: BTreeMap::new(),
             composer_attachments: Vec::new(),
             composer_attachment_serial: 0,
             composer_queue: Vec::new(),
@@ -7353,20 +7449,16 @@ impl VibexWorkbench {
             composer_terminal_drop_target: None,
             composer_terminal_surfaces: BTreeMap::new(),
             active_composer_terminal_surface_id: None,
-            inline_user_message_edit: None,
-            pending_user_message_edit: None,
             optimistic_user_messages: BTreeMap::new(),
             startup_loading: true,
             startup_loading_indicator_visible: false,
             startup_loading_started_at: Instant::now(),
-            agent_loading: true,
             agent_action_pending: false,
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
-            agent_turn_pending: false,
             auto_continue_default_project_ids,
             auto_continue_session_ids,
             auto_continue_paused_session_ids,
@@ -7376,7 +7468,6 @@ impl VibexWorkbench {
             auto_continue_probe_tasks: BTreeMap::new(),
             auto_continue_countdowns: BTreeMap::new(),
             auto_continue_countdown_tasks: BTreeMap::new(),
-            agent_error: None,
             last_visibility: WorkbenchVisibility::resolve(DEFAULT_WIDTH, DEFAULT_HEIGHT),
             boot_task: None,
             event_task: None,
@@ -13947,6 +14038,7 @@ impl VibexWorkbench {
         {
             return;
         }
+        self.release_group_session_views(std::slice::from_ref(&session_id.to_string()));
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         cx.notify();
@@ -14049,9 +14141,17 @@ impl VibexWorkbench {
     /// Dissolves a group. The member sessions stay authoritative and simply
     /// become ungrouped again.
     fn dissolve_session_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        let members = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(group_id)
+            .map(|group| group.member_session_ids.clone())
+            .unwrap_or_default();
         if !self.ui_state.sidebar.organization.delete_group(group_id) {
             return;
         }
+        self.release_group_session_views(&members);
         self.clear_sidebar_context_menu_target(cx);
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
@@ -14314,87 +14414,185 @@ impl VibexWorkbench {
         });
     }
 
-    fn stash_current_agent_session_view(&mut self) {
-        let Some(session_id) = self.selected_session_id.clone() else {
-            return;
-        };
-        self.stash_agent_session_view_for(&session_id);
+    /// Makes `session_id`'s view the borrowed one.
+    ///
+    /// Every session that is on screen owns a persistent entry in
+    /// [`Self::session_views`]. Borrowing moves that entry into `self.view` and
+    /// puts the previously borrowed entry back where it came from, so a view is
+    /// never copied, merged or dropped by a switch: it is the same allocation
+    /// before and after. That is what makes several panes independent — the
+    /// state of a pane that is not being rendered simply stays in the store.
+    ///
+    /// Returns whether the session already had a view. A `false` answer means
+    /// the caller is looking at a fresh, still-empty view and should load one.
+    fn borrow_session_view(&mut self, session_id: &VibexSessionId) -> bool {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            return self.timeline.session_id.as_ref() == Some(session_id);
+        }
+        let key = session_id.as_str().to_string();
+        let previous_key = self.view_session_id.take();
+        let previous = std::mem::replace(
+            &mut self.view,
+            SessionView::new(self.ui_state.session.content_width),
+        );
+        if let Some(previous_key) = previous_key {
+            let previous_key = previous_key.as_str().to_string();
+            self.store_session_view(previous_key, previous);
+        }
+        self.view_session_id = Some(session_id.clone());
+        match self.session_views.remove(&key) {
+            Some(entry) => {
+                self.session_view_lru.retain(|cached| cached != &key);
+                self.view = entry;
+                self.timeline.session_id.as_ref() == Some(session_id)
+            }
+            None => false,
+        }
     }
 
-    /// Parks the live view under `session_id`.
-    ///
-    /// The selected session is the usual caller, but a session group pane parks
-    /// the view it borrowed so the focused pane's view can be handed back.
-    fn stash_agent_session_view_for(&mut self, session_id: &VibexSessionId) {
-        let session_id = session_id.clone();
-        if self.timeline.session_id.as_ref() != Some(&session_id)
-            || !self.sessions.iter().any(|session| session.id == session_id)
-        {
-            return;
+    /// Whether `session_id` already owns a view, borrowed or stored.
+    fn session_view_exists(&self, session_id: &VibexSessionId) -> bool {
+        self.view_session_id.as_ref() == Some(session_id)
+            || self.session_views.contains_key(session_id.as_str())
+    }
+
+    /// The authoritative end sequence of a session's view, whichever view is
+    /// currently borrowed.
+    fn session_view_end_sequence(&self, session_id: &VibexSessionId) -> Option<i64> {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            return self.timeline.authoritative_end_sequence;
         }
-        // Snapshot the reader's logical position before the view is parked, so
-        // the switch back can keep the same conversation content under the
-        // viewport even if the row extents were rebuilt in the meantime. This
-        // reads the row table that was actually painted: pending height
-        // corrections are only measured, not yet applied.
-        self.capture_timeline_scroll_anchor();
-        self.apply_pending_timeline_row_heights();
-        *self.conversation_turns_render_cache.borrow_mut() = Rc::new(Vec::new());
-        let mut entry = AgentSessionViewCacheEntry {
-            estimated_resident_bytes: 0,
-            timeline: std::mem::take(&mut self.timeline),
-            runtime_selection: self.runtime_selection.take(),
-            token_usage: self.token_usage.take(),
-            timeline_follow: std::mem::take(&mut self.timeline_follow),
-            timeline_scroll: std::mem::replace(
-                &mut self.timeline_scroll,
-                VirtualListScrollHandle::new(),
-            ),
-            timeline_row_sizes: std::mem::replace(
-                &mut self.timeline_row_sizes,
-                Rc::new(Vec::new()),
-            ),
-            timeline_measured_turn_heights: std::mem::take(
-                &mut self.timeline_measured_turn_heights,
-            ),
-            timeline_measured_turn_layout_signatures: std::mem::take(
-                &mut self.timeline_measured_turn_layout_signatures,
-            ),
-            timeline_estimated_turn_heights: std::mem::take(
-                &mut self.timeline_estimated_turn_heights,
-            ),
-            timeline_turn_layout_signature_cache: std::mem::take(
-                &mut self.timeline_turn_layout_signature_cache,
-            ),
-            timeline_process_unit_heights: std::mem::take(&mut self.timeline_process_unit_heights),
-            conversation_turns_cache: std::mem::replace(
-                &mut self.conversation_turns_cache,
-                Rc::new(Vec::new()),
-            ),
-            conversation_turns_cache_key: self.conversation_turns_cache_key.take(),
-            conversation_turns_summary: std::mem::take(&mut self.conversation_turns_summary),
-            streaming_row_state: self.streaming_row_state.take(),
-            timeline_layout_width: self.timeline_layout_width,
-            content_width: self.ui_state.session.content_width,
-            collapsed_timeline_rows: std::mem::take(&mut self.collapsed_timeline_rows),
-            reasoning_expansion: std::mem::take(&mut self.reasoning_expansion),
-            timeline_process_expansion: std::mem::take(&mut self.timeline_process_expansion),
-            timeline_command_expansion: std::mem::take(&mut self.timeline_command_expansion),
-            timeline_file_changes_expansion: std::mem::take(
-                &mut self.timeline_file_changes_expansion,
-            ),
-        };
-        entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
-        // Shrink candidates are transient paint bookkeeping, not view state: a
-        // restored extent must earn its next reclaim from fresh measurements.
-        self.timeline_streaming_shrink_candidates.clear();
-        self.timeline_markdown_sources.clear();
-        self.timeline_reasoning_summaries.clear();
-        self.timeline_tool_card_projections.clear();
-        self.timeline_file_diff_previews.clear();
-        self.timeline_file_diff_scrolls.clear();
-        self.timeline_turn_file_changes.clear();
-        self.store_agent_session_view(session_id, entry);
+        self.session_views
+            .get(session_id.as_str())
+            .and_then(|view| view.timeline.authoritative_end_sequence)
+    }
+
+    /// Makes sure `session_id` has a view, without caring whether it is the one
+    /// currently borrowed.
+    ///
+    /// A group pane calls this before it renders: the pane owns its session's
+    /// view for the whole time the session is a member, whether or not the
+    /// session is the one the sidebar selected.
+    fn ensure_session_view(&mut self, session_id: &VibexSessionId) -> bool {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            return true;
+        }
+        let key = session_id.as_str().to_string();
+        if self.session_views.contains_key(&key) {
+            return true;
+        }
+        self.store_session_view(key, SessionView::new(self.ui_state.session.content_width));
+        false
+    }
+
+    /// Stores a view under its session id, bounded by the shared view budget.
+    ///
+    /// Group members are pinned, so a pane never loses the conversation it is
+    /// showing to an unrelated session's memory pressure.
+    fn store_session_view(&mut self, key: String, entry: SessionView) {
+        let pinned = self.pinned_session_view_ids();
+        insert_bounded_session_view_with_pins(
+            &mut self.session_views,
+            &mut self.session_view_lru,
+            key,
+            entry,
+            SessionViewBudget {
+                limit: AGENT_SESSION_VIEW_CACHE_LIMIT,
+                max_bytes: AGENT_SESSION_VIEW_CACHE_BYTES,
+            },
+            |entry| entry.calculate_estimated_resident_bytes(),
+            &pinned,
+        );
+    }
+
+    /// Sessions whose view must survive eviction: the selected session and
+    /// every session a group workspace is currently showing.
+    fn pinned_session_view_ids(&self) -> BTreeSet<String> {
+        let mut pinned = BTreeSet::new();
+        if let Some(selected) = self.selected_session_id.as_ref() {
+            pinned.insert(selected.as_str().to_string());
+        }
+        if let Some(live) = self.view_session_id.as_ref() {
+            pinned.insert(live.as_str().to_string());
+        }
+        pinned.extend(self.ui_state.sidebar.organization.grouped_session_ids());
+        pinned
+    }
+
+    /// Drops a session's stored view. The borrowed view is left alone; callers
+    /// that need it gone borrow another session first.
+    fn forget_session_view(&mut self, session_id: &str) {
+        self.session_views.remove(session_id);
+        self.session_view_lru.retain(|cached| cached != session_id);
+    }
+
+    /// Borrows `session_id`'s view, runs `body`, and hands the view back.
+    ///
+    /// This is the only way render code may touch another session's view. The
+    /// closure receives `&mut Self` with the target view borrowed, so it can use
+    /// the ordinary `self.timeline` / `self.conversation_turns_cache` accesses.
+    fn with_session_view<R>(
+        &mut self,
+        session_id: &VibexSessionId,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let had_view = self.borrow_session_view(session_id);
+        if !had_view && self.timeline.session_id.is_none() {
+            // A view with no timeline yet still has to be the borrowed one while
+            // the body runs, so a pane can render its loading state.
+            self.timeline.session_id = Some(session_id.clone());
+        }
+        let outcome = body(self);
+        self.release_session_view();
+        outcome
+    }
+
+    /// Hands the borrowed view back to the store and re-borrows the session the
+    /// primary workbench renders.
+    ///
+    /// The primary workbench must always find the selected session's view
+    /// borrowed, because every non-pane code path reads `self.timeline` as "the
+    /// selected session's timeline".
+    fn release_session_view(&mut self) {
+        let primary = self.selected_session_id.clone();
+        match primary {
+            Some(primary) => {
+                let _ = self.borrow_session_view(&primary);
+            }
+            None => {
+                if let Some(previous_key) = self.view_session_id.take() {
+                    let previous = std::mem::replace(
+                        &mut self.view,
+                        SessionView::new(self.ui_state.session.content_width),
+                    );
+                    let previous_key = previous_key.as_str().to_string();
+                    self.store_session_view(previous_key, previous);
+                }
+            }
+        }
+    }
+
+    /// Applies a newly loaded authoritative timeline to a session's view,
+    /// whether or not that view is the borrowed one.
+    fn adopt_session_view_timeline(
+        &mut self,
+        session_id: VibexSessionId,
+        items: Vec<vibex_core::TimelineItem>,
+    ) {
+        let _ = self.ensure_session_view(&session_id);
+        self.with_session_view(&session_id, |this| {
+            let content_changed = this.timeline.session_id.as_ref() != Some(&session_id)
+                || this.timeline.items != items;
+            if content_changed {
+                this.view.invalidate_render_caches();
+            }
+            reset_pending_user_requests(&mut this.pending_user_request_ids, &session_id, &items);
+            this.timeline
+                .replace_authoritative(session_id.clone(), items);
+            this.agent_loading = false;
+            this.reconcile_optimistic_user_message();
+            this.rebuild_timeline_sizes();
+        });
     }
 
     fn stash_current_composer_draft(&mut self, cx: &App) {
@@ -14448,72 +14646,19 @@ impl VibexWorkbench {
         self.composer_input_syncing = false;
     }
 
-    fn store_agent_session_view(
-        &mut self,
-        session_id: VibexSessionId,
-        entry: AgentSessionViewCacheEntry,
-    ) {
-        let key = session_id.as_str().to_string();
-        insert_bounded_session_view(
-            &mut self.agent_session_view_cache,
-            &mut self.agent_session_view_lru,
-            key,
-            entry,
-            AGENT_SESSION_VIEW_CACHE_LIMIT,
-            AGENT_SESSION_VIEW_CACHE_BYTES,
-            |entry| entry.estimated_resident_bytes,
-        );
-    }
-
-    fn restore_agent_session_view(&mut self, session_id: &VibexSessionId) -> bool {
-        let key = session_id.as_str().to_string();
-        let Some(entry) = self.agent_session_view_cache.remove(&key) else {
-            return false;
-        };
-        self.agent_session_view_lru.retain(|cached| cached != &key);
-        let cached_timeline_layout_width = entry.timeline_layout_width;
+    /// Re-derives the geometry of the borrowed view after it changed shape.
+    ///
+    /// A view that was measured against another width (or another content width
+    /// setting) has to re-estimate its rows, otherwise a pane that just joined a
+    /// split would paint the previous layout's row heights.
+    fn refresh_borrowed_view_geometry(&mut self) {
+        let cached_timeline_layout_width = self.timeline_layout_width;
         let layout_width_changed =
             timeline_layout_width_changed(self.timeline_layout_width, cached_timeline_layout_width);
-        self.timeline = entry.timeline;
-        self.timeline_item_index.get_mut().invalidate();
-        self.runtime_selection = entry.runtime_selection;
-        self.token_usage = entry.token_usage;
-        self.timeline_follow = entry.timeline_follow;
-        self.timeline_scroll = entry.timeline_scroll;
-        self.timeline_row_sizes = entry.timeline_row_sizes;
-        self.timeline_measured_turn_heights = entry.timeline_measured_turn_heights;
-        self.timeline_measured_turn_layout_signatures =
-            entry.timeline_measured_turn_layout_signatures;
-        self.timeline_estimated_turn_heights = entry.timeline_estimated_turn_heights;
-        self.timeline_turn_layout_signature_cache = entry.timeline_turn_layout_signature_cache;
-        self.timeline_process_unit_heights = entry.timeline_process_unit_heights;
-        // A restored extent re-earns any reclaim from the first paints of the
-        // switched-to session instead of carrying paint bookkeeping across.
-        self.timeline_streaming_shrink_candidates.clear();
-        self.timeline_markdown_sources.clear();
-        self.timeline_reasoning_summaries.clear();
-        self.timeline_tool_card_projections.clear();
-        self.timeline_file_diff_previews.clear();
-        self.timeline_file_diff_scrolls.clear();
-        self.timeline_turn_file_changes.clear();
-        self.conversation_turns_cache = entry.conversation_turns_cache;
-        self.conversation_turns_cache_key = entry.conversation_turns_cache_key;
-        self.conversation_turns_summary = entry.conversation_turns_summary;
-        self.streaming_row_state = entry.streaming_row_state;
-        self.sync_conversation_turns_render_cache();
-        self.collapsed_timeline_rows = entry.collapsed_timeline_rows;
-        self.reasoning_expansion = entry.reasoning_expansion;
-        self.timeline_process_expansion = entry.timeline_process_expansion;
-        self.timeline_command_expansion = entry.timeline_command_expansion;
-        self.timeline_file_changes_expansion = entry.timeline_file_changes_expansion;
-        let content_width_changed = entry.content_width != self.ui_state.session.content_width;
+        let content_width_changed = self.view.content_width != self.ui_state.session.content_width;
+        self.view.content_width = self.ui_state.session.content_width;
         let turns_cache_changed = self.conversation_turns_cache_key.as_ref()
             != Some(&self.current_conversation_turns_cache_key());
-        // Measured row extents survive a switch unless the layout that produced
-        // them changed. The turns cache key also moves for view-local state such
-        // as the session's turn-pending flag, and re-estimating every row from
-        // that would resize the whole timeline and visibly scroll the restored
-        // viewport before its first paint.
         let geometry_changed = layout_width_changed || content_width_changed;
         if geometry_changed {
             self.invalidate_timeline_layout_measurements();
@@ -14525,8 +14670,8 @@ impl VibexWorkbench {
         // an in-flight turn keeps the same layout signature and body length.
         // That extent can outlive the transient layout it captured, so a
         // switched-to session would keep a blank band under its last row until
-        // the turn reshaped. Drop the restored measurement so the first paint
-        // re-measures the freshly rendered content instead of preserving it.
+        // the turn reshaped. Drop the measurement so the first paint re-measures
+        // the freshly rendered content instead of preserving it.
         let streaming_last_turn_id = self.conversation_turns_cache.last().and_then(|turn| {
             self.streaming_timeline_row_state(turn)
                 .map(|_| turn.id.clone())
@@ -14540,7 +14685,6 @@ impl VibexWorkbench {
         // under the viewport once the render has rebuilt the row table.
         self.timeline_scroll_anchor_pending =
             !self.timeline_follow.following_bottom && self.timeline_follow.anchor_row_id.is_some();
-        true
     }
 
     fn refresh_agent_token_usage(
@@ -15012,10 +15156,12 @@ impl VibexWorkbench {
                 self.refresh_active_suggestions(ComposerTarget::Session, cx);
                 true
             }
-        } else if let Some(entry) = self.agent_session_view_cache.get_mut(session_id.as_str()) {
-            let changed = entry.runtime_selection.as_ref() != Some(&state);
-            entry.runtime_selection = Some(state.clone());
-            changed
+        } else if self.session_view_exists(session_id) {
+            self.with_session_view(session_id, |this| {
+                let changed = this.runtime_selection.as_ref() != Some(&state);
+                this.runtime_selection = Some(state.clone());
+                changed
+            })
         } else {
             false
         };
@@ -15350,18 +15496,16 @@ impl VibexWorkbench {
 
     fn conversation_turns_cached(&mut self) -> Rc<Vec<Rc<TimelineConversationTurn>>> {
         let key = self.current_conversation_turns_cache_key();
-        if self.conversation_turns_cache_key.as_ref() != Some(&key) {
-            let incrementally_refreshed =
-                self.conversation_turns_cache_key
-                    .as_ref()
-                    .is_some_and(|previous_key| {
-                        refresh_conversation_turns_cache_incrementally(
-                            &mut self.conversation_turns_cache,
-                            previous_key,
-                            &key,
-                            &self.timeline,
-                        )
-                    });
+        if self.view.conversation_turns_cache_key.as_ref() != Some(&key) {
+            let previous_key = self.view.conversation_turns_cache_key.clone();
+            let incrementally_refreshed = previous_key.as_ref().is_some_and(|previous_key| {
+                refresh_conversation_turns_cache_incrementally(
+                    &mut self.view.conversation_turns_cache,
+                    previous_key,
+                    &key,
+                    &self.view.timeline,
+                )
+            });
             if !incrementally_refreshed {
                 self.conversation_turns_cache =
                     Rc::new(self.conversation_turns().into_iter().map(Rc::new).collect());
@@ -15487,14 +15631,17 @@ impl VibexWorkbench {
             // previous parent's child session visible after navigation.
             self.clear_child_agent_context();
         }
-        self.stash_current_agent_session_view();
         self.session_generation = self.session_generation.saturating_add(1);
         let generation = self.session_generation;
         let previous_session_id = self.selected_session_id.clone();
         self.selected_session_id = Some(session_id.clone());
         self.sync_session_group_focus(&session_id);
-        self.turn_preview_rail_visible = false;
-        self.turn_preview_active_index = None;
+        // Selecting a session borrows the view that session already owns. The
+        // view keeps its timeline, its scroll position and its expansion state,
+        // so switching back is instant and cannot show another session's
+        // conversation. A session that was never opened gets a fresh view here
+        // and is loaded below.
+        let had_view = self.borrow_session_view(&session_id);
         self.sync_management_pairing_context(cx);
         self.queue_agent_ui_state();
         if record_history && navigation_changed {
@@ -15509,7 +15656,6 @@ impl VibexWorkbench {
         self.timeline_bottom_control_mounted = false;
         self.timeline_bottom_control_close_task = None;
         self.timeline_duration_tick_task = None;
-        self.agent_generation_stats = None;
         self.timeline_scrollbar_interaction_active = false;
         self.composer_terminals.clear();
         self.selected_composer_terminal_id = None;
@@ -15519,22 +15665,10 @@ impl VibexWorkbench {
         self.composer_terminal_drop_target = None;
         self.composer_terminal_surfaces.clear();
         self.active_composer_terminal_surface_id = None;
-        let restored_cached_view = self.restore_agent_session_view(&session_id);
-        if restored_cached_view {
+        if had_view {
             self.agent_loading = false;
+            self.refresh_borrowed_view_geometry();
         } else {
-            self.timeline = TimelineModel::default();
-            self.runtime_selection = None;
-            self.token_usage = None;
-            self.timeline_follow = TimelineFollowState::default();
-            self.timeline_scroll = VirtualListScrollHandle::new();
-            self.timeline_row_sizes = Rc::new(Vec::new());
-            self.invalidate_timeline_render_caches();
-            self.collapsed_timeline_rows.clear();
-            self.reasoning_expansion.clear();
-            self.timeline_process_expansion.clear();
-            self.timeline_command_expansion.clear();
-            self.timeline_file_changes_expansion.clear();
             self.agent_loading = true;
         }
         self.refresh_agent_token_usage(&session_id, cx);
@@ -15944,12 +16078,12 @@ impl VibexWorkbench {
     fn apply_child_agent_timeline_events(
         &mut self,
         selected_session_id: Option<&VibexSessionId>,
-        events: &[TimelineLiveEvent],
+        batches: &BTreeMap<String, Vec<TimelineLiveEvent>>,
         cx: &mut Context<Self>,
     ) -> bool {
         let mut changed = false;
         let mut reloads = Vec::new();
-        for event in events {
+        for event in batches.values().flatten() {
             if selected_session_id == Some(&event.session_id) {
                 continue;
             }
@@ -16417,7 +16551,6 @@ impl VibexWorkbench {
             &self.ui_state.workbench.active_tab,
             self.new_session_open,
         );
-        self.notify_for_timeline_events(&events);
         let mut sidebar_changed = false;
         for event in &events {
             if timeline_live_event_updates_sidebar_timestamp(event)
@@ -16448,19 +16581,44 @@ impl VibexWorkbench {
         if sidebar_changed || unread_changed {
             self.publish_sidebar_invalidation();
         }
+        // Group the batch by session. Every session on screen owns its own view,
+        // so the batch has to be routed per session instead of being filtered
+        // down to whichever one the sidebar selected: that filter is what used
+        // to freeze every non-focused pane while its session kept working.
+        let mut batches = BTreeMap::<String, Vec<TimelineLiveEvent>>::new();
+        for event in events {
+            batches
+                .entry(event.session_id.as_str().to_string())
+                .or_default()
+                .push(event);
+        }
+        for batch in batches.values() {
+            self.notify_for_timeline_events(batch);
+        }
         let selected_session_id = self.selected_session_id.clone();
         if defer_streaming_work {
-            if selected_session_id.as_ref().is_some_and(|selected| {
-                events.iter().any(|event| {
-                    timeline_live_event_is_well_formed(event) && event.session_id == *selected
-                })
-            }) {
-                // The authoritative timeline is deliberately left untouched
-                // while its surface is hidden. Reconcile it once the Agent
-                // tab is selected again instead of projecting each chunk.
-                self.timeline.mark_lagged();
+            // The authoritative timelines are deliberately left untouched while
+            // the Agent surface is hidden. Reconcile every affected view once
+            // the surface is visible again instead of projecting each chunk.
+            for (key, batch) in &batches {
+                if !batch.iter().any(timeline_live_event_is_well_formed) {
+                    continue;
+                }
+                if selected_session_id
+                    .as_ref()
+                    .is_some_and(|selected| selected.as_str() == key)
+                {
+                    self.timeline.mark_lagged();
+                } else if let Some(view) = self.session_views.get_mut(key) {
+                    view.timeline.mark_lagged();
+                }
             }
-            self.defer_child_agent_timeline_events(&events);
+            self.defer_child_agent_timeline_events(
+                &batches
+                    .values()
+                    .flat_map(|batch| batch.iter().cloned())
+                    .collect::<Vec<_>>(),
+            );
             return timeline_batch_should_repaint(
                 &self.ui_state.workbench.active_tab,
                 unread_changed || sidebar_changed,
@@ -16469,17 +16627,54 @@ impl VibexWorkbench {
             );
         }
         let child_timeline_changed =
-            self.apply_child_agent_timeline_events(selected_session_id.as_ref(), &events, cx);
-        let Some(selected_session_id) = selected_session_id else {
-            return unread_changed || sidebar_changed || child_timeline_changed;
-        };
-        let events = events
-            .into_iter()
-            .filter(|event| event.session_id == selected_session_id)
-            .collect::<Vec<_>>();
-        if events.is_empty() {
-            return unread_changed || sidebar_changed || child_timeline_changed;
+            self.apply_child_agent_timeline_events(selected_session_id.as_ref(), &batches, cx);
+        let mut timeline_changed = false;
+        let mut refetch_pending = false;
+        for (key, batch) in batches {
+            let Ok(session_id) = VibexSessionId::parse(&key) else {
+                continue;
+            };
+            if !self.session_view_exists(&session_id) {
+                // Nothing on screen shows this session; the sidebar bookkeeping
+                // above is all it needs.
+                continue;
+            }
+            if !self.borrow_session_view(&session_id) {
+                // The view was never loaded, so there is nothing to apply the
+                // events to. The group loader owns bringing it up.
+                self.release_session_view();
+                continue;
+            }
+            let (changed, needs_refetch) =
+                self.apply_timeline_events_to_borrowed_view(&session_id, batch, cx);
+            self.release_session_view();
+            timeline_changed |= changed;
+            if needs_refetch {
+                refetch_pending = true;
+                self.refresh_session_view_timeline(&session_id, cx);
+            }
         }
+        timeline_batch_should_repaint(
+            &self.ui_state.workbench.active_tab,
+            unread_changed || sidebar_changed || child_timeline_changed,
+            timeline_changed || child_timeline_changed,
+            refetch_pending,
+        )
+    }
+
+    /// Applies one session's live events to the view currently borrowed.
+    ///
+    /// The caller has already made `session_id`'s view the borrowed one, so the
+    /// ordinary `self.timeline` / `self.conversation_turns_cache` accesses below
+    /// operate on that session and no other. Returns whether the projection
+    /// changed and whether the view needs an authoritative refetch.
+    fn apply_timeline_events_to_borrowed_view(
+        &mut self,
+        session_id: &VibexSessionId,
+        events: Vec<TimelineLiveEvent>,
+        cx: &mut Context<Self>,
+    ) -> (bool, bool) {
+        debug_assert_eq!(self.timeline.session_id.as_ref(), Some(session_id));
         let output_stream_changed = events.iter().any(|event| {
             matches!(
                 &event.item.payload,
@@ -16511,6 +16706,7 @@ impl VibexWorkbench {
             .then(|| agent_reasoning_delta_updates(&events))
             .flatten();
         let auto_continue_refresh = timeline_batch_requires_auto_continue_refresh(&events);
+        let reasoning_display_mode = self.ui_state.session.reasoning_display_mode;
         let changed = self.timeline.apply_live_batch(events);
         let optimistic_reconciled = changed > 0 && self.reconcile_optimistic_user_message();
         if changed > 0 {
@@ -16518,12 +16714,12 @@ impl VibexWorkbench {
                 && let Some(session_updated_at_ms) = self
                     .sessions
                     .iter()
-                    .find(|session| session.id == selected_session_id)
+                    .find(|session| &session.id == session_id)
                     .map(|session| session.updated_at_ms)
             {
                 let ended_normally = latest_timeline_turn_ended_normally(&self.timeline.items);
                 self.cache_auto_continue_turn_status(
-                    &selected_session_id,
+                    session_id,
                     session_updated_at_ms,
                     ended_normally,
                     cx,
@@ -16532,15 +16728,15 @@ impl VibexWorkbench {
             let mut streaming_cache_update = None;
             if updates_existing_item || optimistic_reconciled {
                 self.invalidate_timeline_render_caches();
-            } else if !self.timeline.needs_authoritative_refetch
+            } else if !self.view.timeline.needs_authoritative_refetch
                 && let Some(updates) = streaming_updates.as_deref()
                 && let Some(update) = with_detached_conversation_turns_render_cache(
-                    &mut self.conversation_turns_cache,
-                    &self.conversation_turns_render_cache,
+                    &mut self.view.conversation_turns_cache,
+                    &self.view.conversation_turns_render_cache,
                     |cache| {
                         append_agent_streaming_deltas_to_cache(
                             cache,
-                            &mut self.streaming_row_state,
+                            &mut self.view.streaming_row_state,
                             updates,
                         )
                     },
@@ -16549,16 +16745,16 @@ impl VibexWorkbench {
                 self.conversation_turns_cache_key =
                     Some(self.current_conversation_turns_cache_key());
                 streaming_cache_update = Some(update);
-            } else if !self.timeline.needs_authoritative_refetch
+            } else if !self.view.timeline.needs_authoritative_refetch
                 && let Some(updates) = reasoning_updates.as_deref()
                 && let Some(update) = with_detached_conversation_turns_render_cache(
-                    &mut self.conversation_turns_cache,
-                    &self.conversation_turns_render_cache,
+                    &mut self.view.conversation_turns_cache,
+                    &self.view.conversation_turns_render_cache,
                     |cache| {
                         append_agent_reasoning_deltas_to_cache(
                             cache,
-                            &mut self.streaming_row_state,
-                            self.ui_state.session.reasoning_display_mode,
+                            &mut self.view.streaming_row_state,
+                            reasoning_display_mode,
                             previous_end_sequence,
                             updates,
                         )
@@ -16605,16 +16801,21 @@ impl VibexWorkbench {
                 self.request_timeline_scroll_to_latest();
             }
         }
-        let needs_refetch = self.timeline.needs_authoritative_refetch;
-        if needs_refetch {
+        (changed > 0, self.timeline.needs_authoritative_refetch)
+    }
+
+    /// Refetches one session's authoritative timeline, selected or not.
+    fn refresh_session_view_timeline(
+        &mut self,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_session_id.as_ref() == Some(session_id) {
             self.refresh_selected_agent_timeline(cx);
+            return;
         }
-        timeline_batch_should_repaint(
-            &self.ui_state.workbench.active_tab,
-            unread_changed || sidebar_changed || child_timeline_changed,
-            changed > 0 || child_timeline_changed,
-            needs_refetch,
-        )
+        self.with_session_view(session_id, |this| this.timeline.mark_lagged());
+        self.load_session_group_view(session_id, true, cx);
     }
 
     fn notify_for_timeline_events(&self, events: &[TimelineLiveEvent]) {
@@ -16811,6 +17012,42 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
+    }
+
+    /// Records the width a pane measured against the view that painted it.
+    ///
+    /// The borrowed view usually is the measured one, but a pane can paint after
+    /// the swap has already handed the borrowed slot back, so the width has to
+    /// be routed by session id rather than by "whatever is borrowed now".
+    fn sync_session_view_layout_width(
+        &mut self,
+        session_id: Option<&VibexSessionId>,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if !width.is_finite() || width <= 0.0 {
+            return;
+        }
+        let width = width.round();
+        let Some(session_id) = session_id else {
+            self.sync_timeline_layout_width(width, cx);
+            return;
+        };
+        if self.view_session_id.as_ref() == Some(session_id) {
+            self.sync_timeline_layout_width(width, cx);
+            return;
+        }
+        let current = self
+            .session_views
+            .get(session_id.as_str())
+            .and_then(|view| view.timeline_layout_width);
+        if !timeline_layout_width_changed(current, Some(width)) {
+            return;
+        }
+        let session_id = session_id.clone();
+        self.with_session_view(&session_id, |this| {
+            this.sync_timeline_layout_width(width, cx)
+        });
     }
 
     fn sync_timeline_layout_width(&mut self, width: f32, cx: &mut Context<Self>) {
@@ -18937,14 +19174,7 @@ impl VibexWorkbench {
             message_id,
             unix_timestamp_ms()
         );
-        let after_sequence = if self.timeline.session_id.as_ref() == Some(&session_id) {
-            self.timeline.authoritative_end_sequence.unwrap_or(0)
-        } else {
-            self.agent_session_view_cache
-                .get(session_id.as_str())
-                .and_then(|entry| entry.timeline.authoritative_end_sequence)
-                .unwrap_or(0)
-        };
+        let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
@@ -19116,14 +19346,7 @@ impl VibexWorkbench {
         let optimistic_message = (!is_command).then(|| OptimisticUserMessage {
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
-            after_sequence: if self.timeline.session_id.as_ref() == Some(&session_id) {
-                self.timeline.authoritative_end_sequence.unwrap_or(0)
-            } else {
-                self.agent_session_view_cache
-                    .get(session_id.as_str())
-                    .and_then(|entry| entry.timeline.authoritative_end_sequence)
-                    .unwrap_or(0)
-            },
+            after_sequence: self.session_view_end_sequence(&session_id).unwrap_or(0),
             submitted_at_ms: unix_timestamp_ms(),
             text: text.clone(),
             attachments: attachments.clone(),
@@ -20171,7 +20394,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(edit) = self.inline_user_message_edit.as_mut() else {
+        let serial = self.composer_attachment_serial.saturating_add(1);
+        self.composer_attachment_serial = serial;
+        let Some(edit) = self.view.inline_user_message_edit.as_mut() else {
             return false;
         };
         let label = label.unwrap_or_else(|| {
@@ -20180,8 +20405,6 @@ impl VibexWorkbench {
                 .unwrap_or("attachment")
                 .to_string()
         });
-        self.composer_attachment_serial = self.composer_attachment_serial.saturating_add(1);
-        let serial = self.composer_attachment_serial;
         let marker = inline_composer_attachment_marker(serial);
         edit.attachments.push(InlineComposerAttachment {
             attachment: ComposerAttachment {
@@ -20241,10 +20464,10 @@ impl VibexWorkbench {
         ) else {
             return false;
         };
-        let Some(edit) = self.inline_user_message_edit.as_mut() else {
+        self.composer_attachment_serial = serial;
+        let Some(edit) = self.view.inline_user_message_edit.as_mut() else {
             return false;
         };
-        self.composer_attachment_serial = serial;
         edit.attachments.extend(attachments);
         self.user_message_edit_input.update(cx, |input, cx| {
             input.replace(insertion, window, cx);
@@ -22954,14 +23177,7 @@ impl VibexWorkbench {
         }
         self.composer_queue_paused_session_ids
             .remove(session_id.as_str());
-        let after_sequence = if self.timeline.session_id.as_ref() == Some(&session_id) {
-            self.timeline.authoritative_end_sequence.unwrap_or(0)
-        } else {
-            self.agent_session_view_cache
-                .get(session_id.as_str())
-                .and_then(|entry| entry.timeline.authoritative_end_sequence)
-                .unwrap_or(0)
-        };
+        let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
             session_id: session_id.clone(),
             item_id: TimelineItemId::new(),
@@ -23729,9 +23945,9 @@ impl VibexWorkbench {
         }
         self.discard_optimistic_user_message(session_id);
         self.set_session_turn_pending(session_id, false);
-        self.agent_session_view_cache.remove(session_id.as_str());
+        self.session_views.remove(session_id.as_str());
         self.composer_session_drafts.remove(session_id.as_str());
-        self.agent_session_view_lru
+        self.session_view_lru
             .retain(|cached_session_id| cached_session_id != session_id.as_str());
         self.reconcile_sidebar_state();
 
@@ -26342,11 +26558,11 @@ impl VibexWorkbench {
             .is_some_and(|session_id| session_ids.contains(session_id.as_str()));
         self.sessions
             .retain(|session| !session_ids.contains(session.id.as_str()));
-        self.agent_session_view_cache
+        self.session_views
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.composer_session_drafts
             .retain(|session_id, _| !session_ids.contains(session_id));
-        self.agent_session_view_lru
+        self.session_view_lru
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_new_session_titles
             .retain(|session_id, _| !session_ids.contains(session_id));
@@ -27371,7 +27587,7 @@ impl VibexWorkbench {
                     .as_ref()
                     .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
                 let cached_desired_agent_id = self
-                    .agent_session_view_cache
+                    .session_views
                     .get(session.id.as_str())
                     .and_then(|entry| entry.runtime_selection.as_ref())
                     .map(|state| &state.desired.agent_id);
@@ -27958,8 +28174,13 @@ impl VibexWorkbench {
             // The event bridge may discard presentation-only chunks while the
             // Agent surface is hidden. Force one authoritative catch-up when
             // the surface changes visibility in either direction so startup
-            // on a non-Agent tab is covered as well.
+            // on a non-Agent tab is covered as well. Every stored view is
+            // marked, not just the borrowed one, because a group pane can be
+            // showing a session the sidebar did not select.
             self.timeline.mark_lagged();
+            for view in self.session_views.values_mut() {
+                view.timeline.mark_lagged();
+            }
             for state in self.child_agent_timelines.values_mut() {
                 state.timeline.mark_lagged();
             }
@@ -32581,15 +32802,14 @@ impl VibexWorkbench {
         if self.ui_state.sidebar.organization.group(group_id).is_none() {
             return Empty.into_any_element();
         }
-        // The pane holding the selected session is the focused one. Deriving it
-        // from the selection rather than only from the stored layout keeps a
-        // restored layout from disagreeing with what the sidebar selected.
-        let focused = self.selected_session_id.as_ref().is_some_and(|selected| {
-            pane.session_ids
-                .iter()
-                .any(|session_id| session_id == selected.as_str())
-        });
+        // The focused pane is the one whose *active* session the sidebar
+        // selected. Deriving it from the pane's whole tab list would light up a
+        // pane whose visible conversation is a different tab.
         let active_session_id = pane.active_session_id.clone();
+        let focused = self
+            .selected_session_id
+            .as_ref()
+            .is_some_and(|selected| active_session_id.as_deref() == Some(selected.as_str()));
         let pane_id = pane.id.clone();
         let drop_region = cx
             .has_active_drag()
@@ -32597,7 +32817,6 @@ impl VibexWorkbench {
             .flatten()
             .filter(|target| target.pane_id == pane_id)
             .map(|target| target.region);
-        let strings = self.strings();
 
         let tabs = pane
             .session_ids
@@ -32615,9 +32834,9 @@ impl VibexWorkbench {
                 ))
             })
             .collect::<Vec<_>>();
-        // Splitting needs a session to leave behind, so a pane holding one tab
-        // cannot split.
-        let can_split_pane = pane.session_ids.len() > 1;
+        // A pane always offers a split: a pane with more than one tab moves the
+        // tab into the new pane, and a pane with one tab opens an empty pane
+        // beside it. That is what lets a workspace grow past two panes.
         let mut tab_strip = h_flex()
             .id(format!("session-group-tabs-{pane_id}"))
             .flex_none()
@@ -32685,7 +32904,6 @@ impl VibexWorkbench {
                         let menu_group_id = group_id.to_string();
                         let menu_pane_id = pane_id.clone();
                         let menu_session_id = session_id.clone();
-                        let can_split = can_split_pane;
                         move |menu, _window, cx| {
                             let _ = cx;
                             let split_entity = menu_entity.clone();
@@ -32699,6 +32917,9 @@ impl VibexWorkbench {
                             let leave_entity = menu_entity.clone();
                             let leave_group_id = menu_group_id.clone();
                             let leave_session_id = menu_session_id.clone();
+                            let maximize_entity = menu_entity.clone();
+                            let maximize_group_id = menu_group_id.clone();
+                            let maximize_pane_id = menu_pane_id.clone();
                             menu.item(
                                 PopupMenuItem::new(locale::text(
                                     "Split right",
@@ -32706,7 +32927,7 @@ impl VibexWorkbench {
                                     "向右分割",
                                 ))
                                 .icon(sidebar_icon("icons/vibex/columns-2.svg"))
-                                .disabled(!can_split)
+                                .disabled(false)
                                 .on_click(move |_, _, cx| {
                                     let _ = split_entity.update(cx, |this, cx| {
                                         this.drop_session_group_tab(
@@ -32726,7 +32947,7 @@ impl VibexWorkbench {
                                     "向下分割",
                                 ))
                                 .icon(sidebar_icon("icons/vibex/mosaic.svg"))
-                                .disabled(!can_split)
+                                .disabled(false)
                                 .on_click(move |_, _, cx| {
                                     let _ = down_entity.update(cx, |this, cx| {
                                         this.drop_session_group_tab(
@@ -32740,6 +32961,23 @@ impl VibexWorkbench {
                                 }),
                             )
                             .separator()
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Maximize this pane",
+                                    "最大化此分屏",
+                                    "最大化此分割",
+                                ))
+                                .icon(sidebar_icon("icons/vibex/rectangle-outline.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = maximize_entity.update(cx, |this, cx| {
+                                        this.toggle_session_group_pane_maximized(
+                                            &maximize_group_id,
+                                            &maximize_pane_id,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
                             .item(
                                 PopupMenuItem::new(locale::text(
                                     "Remove from session group",
@@ -32772,9 +33010,15 @@ impl VibexWorkbench {
                 .flex()
                 .items_center()
                 .justify_center()
+                .px_3()
                 .text_xs()
+                .text_center()
                 .text_color(cx.theme().muted_foreground)
-                .child(strings.sidebar_group_new_from_selection)
+                .child(locale::text(
+                    "Drop a session here",
+                    "将会话拖到这里",
+                    "將會話拖到這裡",
+                ))
                 .into_any_element(),
         };
 
@@ -32817,25 +33061,46 @@ impl VibexWorkbench {
             .on_drag_move(cx.listener({
                 let pane_id = pane_id.clone();
                 move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
-                    let bounds = event.bounds;
-                    let position = event.event.position;
-                    let region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
-                        SessionGroupPaneDropRegion::Bottom
-                    } else if position.x >= bounds.origin.x + bounds.size.width * 0.5 {
-                        SessionGroupPaneDropRegion::Right
-                    } else if position.y <= bounds.origin.y + bounds.size.height * 0.28 {
-                        SessionGroupPaneDropRegion::TabGroup
-                    } else {
-                        SessionGroupPaneDropRegion::Content
-                    };
-                    let next = SessionGroupPaneDropTarget {
-                        pane_id: pane_id.clone(),
+                    this.track_session_group_pane_drop(
+                        &pane_id,
+                        event.bounds,
+                        event.event.position,
+                        cx,
+                    );
+                }
+            }))
+            // A session dragged in from the sidebar is the way a pane that holds
+            // one tab still grows the workspace: it joins the group and lands
+            // where it was dropped.
+            .on_drag_move(cx.listener({
+                let pane_id = pane_id.clone();
+                move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                    this.track_session_group_pane_drop(
+                        &pane_id,
+                        event.bounds,
+                        event.event.position,
+                        cx,
+                    );
+                }
+            }))
+            .on_drop(cx.listener({
+                let group_id = group_id.to_string();
+                let pane_id = pane_id.clone();
+                move |this, drag: &SidebarSessionDrag, _, cx| {
+                    let target = this.session_group_pane_drop_target.take();
+                    let region = target
+                        .filter(|target| target.pane_id == pane_id)
+                        .map(|target| target.region)
+                        .unwrap_or(SessionGroupPaneDropRegion::TabGroup);
+                    this.drop_sidebar_session_on_group_pane(
+                        &group_id,
+                        &pane_id,
+                        drag.session_id.as_str(),
+                        &drag.session_ids,
                         region,
-                    };
-                    if this.session_group_pane_drop_target.as_ref() != Some(&next) {
-                        this.session_group_pane_drop_target = Some(next);
-                        cx.notify();
-                    }
+                        cx,
+                    );
+                    cx.stop_propagation();
                 }
             }))
             .on_drop(cx.listener({
@@ -32868,56 +33133,37 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if focused {
-            // The focused pane renders the same conversation area and the same
-            // composer as every other pane. Moving focus must not change what a
-            // pane looks like, only where the keyboard goes.
-            self.prune_elicitation_forms();
-            let conversation = self.render_agent_workbench_for(false, window, cx);
-            return self.session_group_pane_with_composer(session_id, conversation, window, cx);
-        }
-        let Some(pane_session_id) = VibexSessionId::parse(session_id).ok() else {
+        let _ = focused;
+        let Ok(pane_session_id) = VibexSessionId::parse(session_id).ok().ok_or(()) else {
             return Empty.into_any_element();
         };
-        let Some(session) = self
+        if !self
             .sessions
             .iter()
-            .find(|session| session.id.as_str() == session_id)
-            .cloned()
-        else {
-            return Empty.into_any_element();
-        };
-        // A pane that is not focused still renders the session's live
-        // conversation. The view is parked per session, so the pane borrows it
-        // for this frame and hands the focused pane's view back afterwards.
-        // A session that was never opened has no parked view yet, and the pane
-        // falls back to a live summary instead of an empty timeline.
-        if !self
-            .agent_session_view_cache
-            .contains_key(pane_session_id.as_str())
+            .any(|session| session.id == pane_session_id)
         {
-            let summary = self.render_session_group_pane_summary(&session, cx);
-            return self.session_group_pane_with_composer(session_id, summary, window, cx);
+            return Empty.into_any_element();
         }
-        let Some(parked_session_id) = self.swap_live_agent_session_view_to(&pane_session_id) else {
-            let summary = self.render_session_group_pane_summary(&session, cx);
-            return self.session_group_pane_with_composer(session_id, summary, window, cx);
-        };
+        // A pane renders its own session's view, full stop. Focus only decides
+        // where the keyboard goes; it never decides which conversation a pane
+        // shows. Borrowing the pane's own view is what makes that true even
+        // while another pane owns the selection.
+        let had_view = self.borrow_session_view(&pane_session_id);
+        if !had_view && self.timeline.session_id.as_ref() != Some(&pane_session_id) {
+            // The view exists but its timeline was never loaded. Ask for it and
+            // show the loading surface until it lands.
+            self.timeline.session_id = Some(pane_session_id.clone());
+            self.agent_loading = true;
+            self.ensure_session_group_view_loaded(&pane_session_id, cx);
+        }
+        if self.timeline.session_id.is_none() {
+            self.timeline.session_id = Some(pane_session_id.clone());
+        }
+        if focused {
+            self.prune_elicitation_forms();
+        }
         let conversation = self.render_agent_workbench_for(false, window, cx);
-        // Park the pane's view again before the focused pane renders.
-        if let Some(live_session_id) = self.timeline.session_id.clone() {
-            self.stash_agent_session_view_for(&live_session_id);
-        }
-        // Hand the focused session's view back. Falling back to the view this
-        // pane parked keeps a pane from leaving its own conversation on screen
-        // for the focused pane to render.
-        let focused_restored = self
-            .selected_session_id
-            .clone()
-            .is_some_and(|focused_session_id| self.restore_agent_session_view(&focused_session_id));
-        if !focused_restored {
-            let _ = self.restore_agent_session_view(&parked_session_id);
-        }
+        self.release_session_view();
         self.session_group_pane_with_composer(session_id, conversation, window, cx)
     }
 
@@ -32975,7 +33221,7 @@ impl VibexWorkbench {
             return Some(selection.clone());
         }
         if let Some(selection) = self
-            .agent_session_view_cache
+            .session_views
             .get(session_id.as_str())
             .and_then(|entry| entry.runtime_selection.as_ref())
             .map(|state| state.desired.clone())
@@ -33230,151 +33476,6 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// Parks the live view under its own session and loads `session_id`'s.
-    ///
-    /// The live view is parked under `self.timeline.session_id`, not under the
-    /// selection. A group pane can render while the live view holds a third
-    /// session — the selection and the live view only agree once the focused
-    /// pane has rendered — and parking under the selection would silently drop
-    /// that view, leaving the next pane to render whatever the previous one
-    /// loaded.
-    ///
-    /// Returns the session whose view was parked, so the caller can hand it
-    /// back, or `None` when the requested view does not exist.
-    fn swap_live_agent_session_view_to(
-        &mut self,
-        session_id: &VibexSessionId,
-    ) -> Option<VibexSessionId> {
-        let parked_session_id = self.timeline.session_id.clone();
-        if let Some(parked_session_id) = parked_session_id.as_ref() {
-            self.stash_agent_session_view_for(parked_session_id);
-        }
-        if self.restore_agent_session_view(session_id) {
-            return parked_session_id;
-        }
-        if let Some(parked_session_id) = parked_session_id.as_ref() {
-            let _ = self.restore_agent_session_view(parked_session_id);
-        }
-        None
-    }
-
-    /// What a group pane shows before its conversation has been materialized:
-    /// the session's identity, its live state and its most recent turns from
-    /// whatever the parked view already holds.
-    fn render_session_group_pane_summary(
-        &mut self,
-        session: &AgentSession,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let session_id = session.id.as_str().to_string();
-        let turns = self
-            .agent_session_view_cache
-            .get(&session_id)
-            .map(|entry| entry.conversation_turns_cache.clone())
-            .unwrap_or_default();
-        let strings = self.strings();
-        let agent_id = session.agent_id.as_str().to_string();
-        let mut body = v_flex()
-            .id(format!("session-group-preview-{session_id}"))
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .gap_2()
-            .p_3()
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .child(sidebar_agent_logo(&agent_id, true, cx))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_medium()
-                            .child(session.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                sidebar_session_state_label(session.state, strings).unwrap_or_else(
-                                    || match session.state {
-                                        AgentSessionState::Running => {
-                                            locale::text("Running", "运行中", "執行中")
-                                        }
-                                        _ => locale::text("Idle", "空闲", "閒置"),
-                                    },
-                                ),
-                            ),
-                    ),
-            );
-        let preview = turns
-            .iter()
-            .rev()
-            .take(SESSION_GROUP_PANE_PREVIEW_TURNS)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>();
-        if preview.is_empty() {
-            body = body.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(locale::text(
-                        "Loading this session's conversation…",
-                        "正在载入该会话的对话…",
-                        "正在載入該會話的對話…",
-                    )),
-            );
-        } else {
-            for turn in preview {
-                if let Some(user) = turn.user_row.as_ref() {
-                    body = body.child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .min_w_0()
-                            .rounded(px(6.0))
-                            .bg(cx.theme().secondary)
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .child(div().min_w_0().truncate().child(user.title.clone())),
-                    );
-                }
-                if let Some(conclusion) = turn.conclusion_row.as_ref() {
-                    body = body.child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .min_w_0()
-                            .px_2()
-                            .text_xs()
-                            .text_color(cx.theme().foreground.opacity(0.82))
-                            .child(div().min_w_0().line_clamp(6).child(conclusion.body.clone())),
-                    );
-                }
-            }
-        }
-        v_flex()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .child(body)
-            .into_any_element()
-    }
-
     /// Gives every group member a parked view, so each pane can render a full
     /// conversation instead of a summary.
     ///
@@ -33386,114 +33487,126 @@ impl VibexWorkbench {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
-        // `restore_agent_session_view` takes a view out of the cache while it
-        // is live, so the focused session is legitimately absent. Fetching it
-        // would park a fetched timeline that the real view later races with.
-        let mut available = self
-            .agent_session_view_cache
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if let Some(live_session_id) = self.timeline.session_id.as_ref() {
-            available.insert(live_session_id.as_str().to_string());
-        }
-        let missing = group
-            .member_session_ids
-            .iter()
-            .filter(|session_id| {
-                !available.contains(session_id.as_str())
-                    && !self.session_group_view_loads.contains(session_id.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let members = group.member_session_ids.clone();
         // A pane textarea is only needed while its session is in a group.
         let grouped = self.ui_state.sidebar.organization.grouped_session_ids();
         self.session_composer_inputs
             .retain(|session_id, _| grouped.contains(session_id));
         self.session_composer_subscriptions
             .retain(|session_id, _| grouped.contains(session_id));
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        for member_id in missing {
+        // Every member owns a view for as long as it is a member, so a pane can
+        // always borrow one. Members are pinned against eviction, which is what
+        // keeps a wide split from losing the conversation it is showing.
+        for member_id in &members {
+            let Ok(session_id) = VibexSessionId::parse(member_id) else {
+                continue;
+            };
+            self.ensure_session_view(&session_id);
+        }
+        for member_id in members {
             let Ok(session_id) = VibexSessionId::parse(&member_id) else {
                 continue;
             };
-            self.session_group_view_loads.insert(member_id);
-            let runner = gpui_tokio::Tokio::spawn(cx, {
-                let backend = backend.clone();
-                let session_id = session_id.clone();
-                async move {
-                    fetch_authoritative_timeline_via_backend(backend, session_id.clone())
-                        .await
-                        .map(|items| (session_id, items))
-                }
-            });
-            cx.spawn(
-                async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                    let outcome = runner.await;
-                    let _ = entity.update(cx, |this, cx| {
-                        let Ok(Ok((session_id, items))) = outcome else {
-                            // The id stays in the set, so a session whose
-                            // timeline could not be fetched keeps its summary
-                            // instead of starting a fetch on every frame.
-                            return;
-                        };
-                        this.session_group_view_loads.remove(session_id.as_str());
-                        this.park_loaded_session_view(session_id, items);
-                        cx.notify();
-                    });
-                },
-            )
-            .detach();
+            self.ensure_session_group_view_loaded(&session_id, cx);
         }
     }
 
-    /// Parks a view built from an authoritative timeline, without disturbing the
-    /// session that currently owns the live fields.
-    fn park_loaded_session_view(
+    /// Loads one session's authoritative timeline unless its view already has
+    /// one and no refetch is pending.
+    fn ensure_session_group_view_loaded(
         &mut self,
-        session_id: VibexSessionId,
-        items: Vec<vibex_core::TimelineItem>,
+        session_id: &VibexSessionId,
+        cx: &mut Context<Self>,
     ) {
-        // A real parked view may have landed while this fetch was in flight.
-        // Overwriting it would replace the conversation on screen with a stale
-        // copy, which is what made a pane go blank when focus moved.
-        if self
-            .agent_session_view_cache
-            .contains_key(session_id.as_str())
-        {
+        self.load_session_group_view(session_id, false, cx);
+    }
+
+    /// Loads one session's authoritative timeline into its own view.
+    ///
+    /// `force` reloads a view that already has a timeline, which is how a view
+    /// that fell behind the live event stream catches up. The load is keyed by
+    /// session id rather than by a global generation, so a pane's fetch survives
+    /// the user selecting another session while it is in flight and can never
+    /// land in the wrong view.
+    fn load_session_group_view(
+        &mut self,
+        session_id: &VibexSessionId,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = session_id.as_str().to_string();
+        if self.session_group_view_loads.contains(&key) {
             return;
         }
-        let mut timeline = TimelineModel::default();
-        timeline.replace_authoritative(session_id.clone(), items);
-        let mut entry = AgentSessionViewCacheEntry {
-            estimated_resident_bytes: 0,
-            timeline,
-            runtime_selection: None,
-            token_usage: None,
-            timeline_follow: TimelineFollowState::default(),
-            timeline_scroll: VirtualListScrollHandle::new(),
-            timeline_row_sizes: Rc::new(Vec::new()),
-            timeline_measured_turn_heights: BTreeMap::new(),
-            timeline_measured_turn_layout_signatures: BTreeMap::new(),
-            timeline_estimated_turn_heights: BTreeMap::new(),
-            timeline_turn_layout_signature_cache: BTreeMap::new(),
-            timeline_process_unit_heights: BTreeMap::new(),
-            conversation_turns_cache: Rc::new(Vec::new()),
-            conversation_turns_cache_key: None,
-            conversation_turns_summary: ConversationTurnsSummary::default(),
-            streaming_row_state: None,
-            timeline_layout_width: None,
-            content_width: self.ui_state.session.content_width,
-            collapsed_timeline_rows: BTreeSet::new(),
-            reasoning_expansion: BTreeMap::new(),
-            timeline_process_expansion: BTreeMap::new(),
-            timeline_command_expansion: BTreeMap::new(),
-            timeline_file_changes_expansion: BTreeMap::new(),
+        let loaded = match self.view_session_id.as_ref() {
+            Some(borrowed) if borrowed == session_id => self.timeline.session_id.is_some(),
+            _ => self
+                .session_views
+                .get(&key)
+                .is_some_and(|view| view.timeline.session_id.is_some()),
         };
-        entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
-        self.store_agent_session_view(session_id, entry);
+        if loaded && !force {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.session_group_view_loads.insert(key);
+        let runner = gpui_tokio::Tokio::spawn(cx, {
+            let backend = backend.clone();
+            let session_id = session_id.clone();
+            async move {
+                fetch_authoritative_timeline_via_backend(backend, session_id.clone())
+                    .await
+                    .map(|items| (session_id, items))
+            }
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let Ok(Ok((session_id, items))) = outcome else {
+                        // The id stays in the set, so a session whose timeline
+                        // could not be fetched does not start a fetch on every
+                        // frame. Its view keeps whatever it already had.
+                        return;
+                    };
+                    this.session_group_view_loads.remove(session_id.as_str());
+                    this.adopt_session_view_timeline(session_id, items);
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Releases the views of sessions that just left a group.
+    ///
+    /// A session that is no longer grouped only needs its view while it is the
+    /// selected one; everything else goes back to the ordinary bounded budget,
+    /// and its load bookkeeping is cleared so rejoining can fetch again.
+    fn release_group_session_views(&mut self, session_ids: &[String]) {
+        let grouped = self.ui_state.sidebar.organization.grouped_session_ids();
+        for session_id in session_ids {
+            self.session_group_view_loads.remove(session_id);
+            if grouped.contains(session_id) {
+                continue;
+            }
+            if self.view_session_id.as_ref().map(VibexSessionId::as_str)
+                == Some(session_id.as_str())
+            {
+                continue;
+            }
+            if self
+                .selected_session_id
+                .as_ref()
+                .map(VibexSessionId::as_str)
+                == Some(session_id.as_str())
+            {
+                continue;
+            }
+            self.forget_session_view(session_id);
+        }
     }
 
     /// Points the group workspace at the session the sidebar just selected.
@@ -33600,6 +33713,73 @@ impl VibexWorkbench {
         }
     }
 
+    /// Records which edge of which pane a drag is hovering, so the drop overlay
+    /// can show where the session will land.
+    fn track_session_group_pane_drop(
+        &mut self,
+        pane_id: &str,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
+            SessionGroupPaneDropRegion::Bottom
+        } else if position.x >= bounds.origin.x + bounds.size.width * 0.5 {
+            SessionGroupPaneDropRegion::Right
+        } else if position.y <= bounds.origin.y + bounds.size.height * 0.28 {
+            SessionGroupPaneDropRegion::TabGroup
+        } else {
+            SessionGroupPaneDropRegion::Content
+        };
+        let next = SessionGroupPaneDropTarget {
+            pane_id: pane_id.to_string(),
+            region,
+        };
+        if self.session_group_pane_drop_target.as_ref() != Some(&next) {
+            self.session_group_pane_drop_target = Some(next);
+            cx.notify();
+        }
+    }
+
+    /// Drops a sidebar session on a pane: the session joins the group and then
+    /// follows the same path as a tab dragged inside the workspace.
+    fn drop_sidebar_session_on_group_pane(
+        &mut self,
+        group_id: &str,
+        pane_id: &str,
+        session_id: &str,
+        dragged_session_ids: &[String],
+        region: SessionGroupPaneDropRegion,
+        cx: &mut Context<Self>,
+    ) {
+        let already_member = self
+            .ui_state
+            .sidebar
+            .organization
+            .group(group_id)
+            .is_some_and(|group| group.contains(session_id));
+        if !already_member {
+            let mut joining = dragged_session_ids.to_vec();
+            if !joining.iter().any(|id| id == session_id) {
+                joining.push(session_id.to_string());
+            }
+            let session_workspaces = self.sidebar_session_workspaces();
+            if !self.ui_state.sidebar.organization.add_sessions_to_group(
+                group_id,
+                &joining,
+                &session_workspaces,
+            ) {
+                return;
+            }
+            self.ui_state
+                .sidebar
+                .organization
+                .collapsed_group_ids
+                .remove(group_id);
+        }
+        self.drop_session_group_tab(group_id, pane_id, session_id, region, cx);
+    }
+
     fn drop_session_group_tab(
         &mut self,
         group_id: &str,
@@ -33610,6 +33790,11 @@ impl VibexWorkbench {
     ) {
         let new_pane_id = RequestId::new().to_string();
         let new_split_id = RequestId::new().to_string();
+        let direction = if region == SessionGroupPaneDropRegion::Right {
+            vibex_desktop_model::SplitDirection::Horizontal
+        } else {
+            vibex_desktop_model::SplitDirection::Vertical
+        };
         let changed = match region {
             SessionGroupPaneDropRegion::TabGroup | SessionGroupPaneDropRegion::Content => self
                 .ui_state
@@ -33621,16 +33806,15 @@ impl VibexWorkbench {
                         | group.layout.focus_session(pane_id, session_id)
                 }),
             SessionGroupPaneDropRegion::Right | SessionGroupPaneDropRegion::Bottom => {
-                let direction = if region == SessionGroupPaneDropRegion::Right {
-                    vibex_desktop_model::SplitDirection::Horizontal
-                } else {
-                    vibex_desktop_model::SplitDirection::Vertical
-                };
                 self.ui_state
                     .sidebar
                     .organization
                     .group_mut(group_id)
                     .is_some_and(|group| {
+                        // A session that can move out of its pane becomes a real
+                        // split. A pane whose only tab is the dragged one has
+                        // nothing to leave behind, so the split opens an empty
+                        // pane that the next drag fills.
                         group
                             .layout
                             .split_with_session(
@@ -33641,11 +33825,40 @@ impl VibexWorkbench {
                                 new_split_id.clone(),
                                 SessionGroupSplitPosition::After,
                             )
+                            .or_else(|| {
+                                group.layout.split_open_pane(
+                                    pane_id,
+                                    direction,
+                                    new_pane_id.clone(),
+                                    new_split_id.clone(),
+                                    SessionGroupSplitPosition::After,
+                                )
+                            })
                             .is_some()
                     })
             }
         };
         self.session_group_pane_drop_target = None;
+        if changed {
+            self.queue_ui_state();
+            self.publish_sidebar_invalidation();
+        }
+        cx.notify();
+    }
+
+    /// Shows one pane alone, or restores the whole split.
+    fn toggle_session_group_pane_maximized(
+        &mut self,
+        group_id: &str,
+        pane_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .ui_state
+            .sidebar
+            .organization
+            .group_mut(group_id)
+            .is_some_and(|group| group.toggle_maximized_pane(pane_id));
         if changed {
             self.queue_ui_state();
             self.publish_sidebar_invalidation();
@@ -35792,7 +36005,7 @@ impl VibexWorkbench {
             .as_ref()
             .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
         let cached_desired_agent_id = self
-            .agent_session_view_cache
+            .session_views
             .get(&session_id_string)
             .and_then(|entry| entry.runtime_selection.as_ref())
             .map(|state| &state.desired.agent_id);
@@ -40118,6 +40331,12 @@ impl VibexWorkbench {
                 .any(|turn| agent_turn_preview_rail_numbers_turn(turn)))
         .then(|| self.render_agent_turn_preview_rail(turns.as_slice(), cx));
         let timeline_layout_entity = cx.weak_entity();
+        // Prepaint runs after the whole element tree is built, so by then the
+        // borrowed view may already belong to another pane. Carry the measured
+        // session with the closure and write the width back into *that* view,
+        // otherwise a split's two widths would take turns invalidating each
+        // other's row measurements.
+        let timeline_layout_session_id = self.timeline.session_id.clone();
         let timeline_surface = div()
             .relative()
             .flex_1()
@@ -40126,8 +40345,9 @@ impl VibexWorkbench {
             .overflow_hidden()
             .on_prepaint(move |bounds, _, cx| {
                 let width = f32::from(bounds.size.width);
+                let session_id = timeline_layout_session_id.clone();
                 let _ = timeline_layout_entity.update(cx, |this, cx| {
-                    this.sync_timeline_layout_width(width, cx);
+                    this.sync_session_view_layout_width(session_id.as_ref(), width, cx);
                 });
             })
             .when(turns.is_empty(), |this| {
@@ -68676,11 +68896,17 @@ mod tests {
             .expect("optimistic session removal should remain inspectable");
         assert!(optimistic_state.contains("self.sessions\n            .retain"));
         assert!(optimistic_state.contains("self.optimistically_removed_session_ids"));
-        assert!(optimistic_state.contains("self.agent_session_view_cache"));
-        assert!(optimistic_state.contains("self.agent_session_view_lru"));
+        assert!(optimistic_state.contains(
+            "self.session_views
+            .retain"
+        ));
+        assert!(optimistic_state.contains(
+            "self.session_view_lru
+            .retain"
+        ));
         assert!(optimistic_state.contains("self.selected_session_id = None;"));
-        assert!(optimistic_state.contains("self.timeline = TimelineModel::default();"));
-        assert!(optimistic_state.contains("self.invalidate_timeline_render_caches();"));
+        assert!(optimistic_state.contains("self.session_views\n            .retain"));
+        assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
         assert!(optimistic_state.contains("self.reconcile_sidebar_state();"));
 
         let completion = source
@@ -68905,73 +69131,88 @@ mod tests {
     #[test]
     fn session_switch_reuses_cached_timeline_projections_without_deep_clones() {
         let source = include_str!("app.rs");
-        let cache_entry = source
-            .split_once("struct AgentSessionViewCacheEntry {")
+        let view = source
+            .split_once("pub struct SessionView {")
             .and_then(|(_, tail)| tail.split_once("\n}"))
             .map(|(body, _)| body)
-            .expect("session view cache should remain inspectable");
-        assert!(cache_entry.contains("timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>"));
-        assert!(cache_entry.contains("timeline_measured_turn_layout_signatures"));
-        assert!(cache_entry.contains("timeline_layout_width: Option<f32>"));
-        assert!(
-            cache_entry.contains("conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>")
-        );
+            .expect("the session view should remain inspectable");
+        assert!(view.contains("timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>"));
+        assert!(view.contains("timeline_measured_turn_layout_signatures"));
+        assert!(view.contains("timeline_layout_width: Option<f32>"));
+        assert!(view.contains("conversation_turns_cache: Rc<Vec<Rc<TimelineConversationTurn>>>"));
+        // The view is complete: nothing a session needs may live outside it, or
+        // two panes would share it.
+        for field in [
+            "timeline: TimelineModel",
+            "timeline_scroll: VirtualListScrollHandle",
+            "timeline_follow: TimelineFollowState",
+            "streaming_row_state",
+            "runtime_selection",
+            "agent_loading",
+            "collapsed_timeline_rows",
+            "reasoning_expansion",
+        ] {
+            assert!(view.contains(field), "SessionView is missing {field}");
+        }
 
-        let stash = source
-            .split_once("    fn stash_current_agent_session_view(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn store_agent_session_view("))
+        // Switching sessions moves the whole view; it never rebuilds one field
+        // at a time, so a switch cannot lose or mix any of it.
+        let borrow = source
+            .split_once("    fn borrow_session_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether `session_id` already owns a view")
+            })
             .map(|(body, _)| body)
-            .expect("session view stashing should remain inspectable");
-        assert!(stash.contains("timeline: std::mem::take(&mut self.timeline)"));
-        assert!(stash.contains("&mut self.timeline_row_sizes"));
-        assert!(stash.contains("&mut self.timeline_measured_turn_layout_signatures"));
-        assert!(stash.contains("timeline_layout_width: self.timeline_layout_width"));
-        assert!(stash.contains("&mut self.conversation_turns_cache"));
-        assert!(stash.contains("self.timeline_markdown_sources.clear();"));
-        assert!(stash.contains("self.timeline_tool_card_projections.clear();"));
-        assert!(!stash.contains("self.timeline.clone()"));
-        let capture_anchor = stash
-            .find("self.capture_timeline_scroll_anchor();")
-            .expect("the reader's position should be captured before the view is parked");
-        let park_follow = stash
-            .find("timeline_follow: std::mem::take(&mut self.timeline_follow),")
-            .expect("the follow state should still be parked with the view");
-        assert!(capture_anchor < park_follow);
+            .expect("borrowing a session view should remain inspectable");
+        assert!(borrow.contains("std::mem::replace("));
+        assert!(borrow.contains("self.session_views.remove(&key)"));
+        assert!(borrow.contains("self.store_session_view(previous_key, previous)"));
+        assert!(!borrow.contains("self.timeline.clone()"));
+        assert!(!borrow.contains("mem::take(&mut self.timeline)"));
 
-        let restore = source
-            .split_once("    fn restore_agent_session_view(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_agent_token_usage("))
+        let release = source
+            .split_once("    fn release_session_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Applies a newly loaded authoritative timeline")
+            })
             .map(|(body, _)| body)
-            .expect("session view restoration should remain inspectable");
-        assert!(restore.contains("self.agent_session_view_cache.remove(&key)"));
-        assert!(!restore.contains(".cloned()"));
-        assert!(restore.contains("self.timeline_row_sizes = entry.timeline_row_sizes;"));
-        assert!(restore.contains("self.timeline_measured_turn_layout_signatures ="));
-        assert!(restore.contains("cached_timeline_layout_width"));
-        assert!(
-            restore.contains("self.conversation_turns_cache = entry.conversation_turns_cache;")
-        );
-        assert!(restore.contains("entry.content_width != self.ui_state.session.content_width"));
+            .expect("releasing a session view should remain inspectable");
+        assert!(release.contains("self.borrow_session_view(&primary)"));
+
+        // The geometry of a view that changed shape is re-derived from its own
+        // measurements, not from whichever session was borrowed before.
+        let geometry = source
+            .split_once("    fn refresh_borrowed_view_geometry(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Refetches one session's authoritative timeline")
+            })
+            .map(|(body, _)| body)
+            .expect("view geometry refresh should remain inspectable");
+        assert!(geometry.contains("self.streaming_timeline_row_state(turn)"));
+        assert!(geometry.contains("self.invalidate_timeline_turn_measurement(&turn_id);"));
+        assert!(geometry.contains("self.timeline_estimated_turn_heights.remove(&turn_id);"));
+        assert!(geometry.contains("self.rebuild_timeline_sizes();"));
+        assert!(geometry.contains("cached_timeline_layout_width"));
         // Only a real layout change may drop the measured row extents: the
         // turns cache key also moves for view-local session state, and
         // re-estimating the whole table there would scroll the restored view.
-        let geometry = restore
+        let layout_change = geometry
             .find("let geometry_changed = layout_width_changed || content_width_changed;")
-            .expect("restoration should separate layout changes from projection changes");
-        let invalidate = restore
+            .expect("view geometry should separate layout changes from projection changes");
+        let invalidate = geometry
             .find("self.invalidate_timeline_layout_measurements();")
             .expect("a layout change should still invalidate the measurements");
-        assert!(geometry < invalidate);
-        assert!(restore.contains("if geometry_changed || turns_cache_changed {"));
-        assert!(restore.contains("self.timeline_scroll_anchor_pending ="));
-        assert!(restore.contains("!self.timeline_follow.following_bottom"));
+        assert!(layout_change < invalidate);
+        assert!(geometry.contains("if geometry_changed || turns_cache_changed {"));
+        assert!(geometry.contains("self.timeline_scroll_anchor_pending ="));
+        assert!(geometry.contains("!self.timeline_follow.following_bottom"));
 
         let selection = source
             .split_once("    fn select_session_with_history(")
             .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
             .map(|(body, _)| body)
             .expect("session selection should remain inspectable");
-        assert!(selection.contains("self.stash_current_agent_session_view();"));
+        assert!(selection.contains("self.borrow_session_view(&session_id)"));
         assert!(selection.contains("self.timeline_scroll_anchor_pending = false;"));
         assert!(!selection.contains("latest_timeline_turn_ended_normally"));
         assert!(!selection.contains("cache_auto_continue_turn_status"));
@@ -69295,16 +69536,36 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn apply_desktop_event("))
             .map(|(body, _)| body)
             .expect("timeline event batching should remain inspectable");
-        assert!(timeline_batch.contains("self.timeline.apply_live_batch(events)"));
-        assert!(
-            timeline_batch.contains(".filter(|event| event.session_id == selected_session_id)")
-        );
         assert!(timeline_batch.contains("should_defer_timeline_streaming_work"));
         assert!(timeline_batch.contains("timeline_live_event_is_well_formed"));
         assert!(timeline_batch.contains("timeline_live_event_updates_sidebar_timestamp"));
         assert!(timeline_batch.contains("self.timeline.mark_lagged();"));
-        assert!(timeline_batch.contains("self.defer_child_agent_timeline_events(&events);"));
+        assert!(timeline_batch.contains("self.defer_child_agent_timeline_events("));
         assert!(!timeline_batch.contains("cx.notify();"));
+        // Events are grouped by session and applied to each session's own view.
+        // Filtering them down to the selected session is what used to freeze
+        // every non-focused pane.
+        assert!(
+            timeline_batch
+                .contains("let mut batches = BTreeMap::<String, Vec<TimelineLiveEvent>>::new();")
+        );
+        assert!(timeline_batch.contains("self.borrow_session_view(&session_id)"));
+        assert!(timeline_batch.contains("self.release_session_view();"));
+        assert!(
+            timeline_batch
+                .contains("self.apply_timeline_events_to_borrowed_view(&session_id, batch, cx)")
+        );
+        assert!(!timeline_batch.contains("event.session_id == selected_session_id"));
+
+        let apply = source
+            .split_once("    fn apply_timeline_events_to_borrowed_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Refetches one session's authoritative timeline")
+            })
+            .map(|(body, _)| body)
+            .expect("per-session event application should remain inspectable");
+        assert!(apply.contains("self.timeline.apply_live_batch(events)"));
+        assert!(apply.contains("self.conversation_turns_cache"));
 
         let event_handler = source
             .split_once("    fn apply_desktop_event(")
@@ -71658,15 +71919,33 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
             .map(|(body, _)| body)
             .expect("agent workbench renderer should remain inspectable");
-        assert!(workbench.contains("sync_timeline_layout_width"));
+        assert!(workbench.contains("sync_session_view_layout_width"));
         assert!(workbench.contains(".on_prepaint(move |bounds, _, cx|"));
 
         let invalidation = source
             .split_once("    fn invalidate_timeline_layout_measurements(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn sync_timeline_layout_width("))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Records the width a pane measured"))
             .map(|(body, _)| body)
             .expect("timeline layout invalidation should remain inspectable");
         assert!(invalidation.contains("self.timeline_row_sizes = Rc::new(Vec::new());"));
+
+        // A pane's measured width belongs to the view that painted it, not to
+        // whichever view happens to be borrowed when prepaint runs.
+        let width_sync = source
+            .split_once("    fn sync_session_view_layout_width(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn sync_timeline_layout_width("))
+            .map(|(body, _)| body)
+            .expect("per-session width sync should remain inspectable");
+        assert!(width_sync.contains(".session_views"));
+        assert!(width_sync.contains("self.with_session_view(&session_id"));
+        let prepaint = source
+            .split_once("let timeline_layout_session_id = self.timeline.session_id.clone();")
+            .map(|(_, tail)| tail)
+            .expect("the prepaint closure should carry its session");
+        assert!(
+            prepaint
+                .contains("this.sync_session_view_layout_width(session_id.as_ref(), width, cx);")
+        );
     }
 
     #[test]
@@ -72069,22 +72348,24 @@ mod tests {
     fn restored_streaming_turn_reclaims_the_preserved_extent() {
         let source = include_str!("app.rs");
 
-        let restore = source
-            .split_once("    fn restore_agent_session_view(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn refresh_agent_token_usage("))
+        let geometry = source
+            .split_once("    fn refresh_borrowed_view_geometry(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Refetches one session's authoritative timeline")
+            })
             .map(|(body, _)| body)
-            .expect("session view restoration should remain inspectable");
-        assert!(restore.contains("self.streaming_timeline_row_state(turn)"));
-        assert!(restore.contains("self.invalidate_timeline_turn_measurement(&turn_id);"));
-        assert!(restore.contains("self.timeline_estimated_turn_heights.remove(&turn_id);"));
-        assert!(restore.contains("self.rebuild_timeline_sizes();"));
+            .expect("view geometry refresh should remain inspectable");
+        assert!(geometry.contains("self.streaming_timeline_row_state(turn)"));
+        assert!(geometry.contains("self.invalidate_timeline_turn_measurement(&turn_id);"));
+        assert!(geometry.contains("self.timeline_estimated_turn_heights.remove(&turn_id);"));
+        assert!(geometry.contains("self.rebuild_timeline_sizes();"));
 
-        let render_caches = source
-            .split_once("    fn invalidate_timeline_render_caches(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn invalidate_timeline_turn_measurement("))
+        let view_caches = source
+            .split_once("    fn invalidate_render_caches(&mut self) {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn calculate_estimated_resident_bytes("))
             .map(|(body, _)| body)
-            .expect("timeline render cache invalidation should remain inspectable");
-        assert!(render_caches.contains("self.timeline_row_sizes = Rc::new(Vec::new());"));
+            .expect("view render cache invalidation should remain inspectable");
+        assert!(view_caches.contains("self.timeline_row_sizes = Rc::new(Vec::new());"));
     }
 
     #[test]
@@ -78785,9 +79066,9 @@ mod tests {
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
     }
 
-    /// Every pane must render a complete conversation, so a member without a
-    /// parked view has one fetched, and an approval must resolve against the
-    /// session whose timeline carried the request.
+    /// Every pane renders a complete conversation because every member owns a
+    /// complete view: the group opens one per member, loads the ones that have
+    /// no timeline yet, and never hands a pane another session's view.
     #[test]
     fn group_panes_materialize_views_and_resolve_requests_for_their_own_session() {
         let source = include_str!("app.rs");
@@ -78795,41 +79076,45 @@ mod tests {
         let ensure = source
             .split_once("    fn ensure_session_group_views(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Parks a view built from an authoritative timeline")
-            })
-            .map(|(body, _)| body)
-            .expect("group view materialization should remain inspectable");
-        assert!(ensure.contains("fetch_authoritative_timeline_via_backend("));
-        assert!(ensure.contains("!self"));
-        assert!(ensure.contains("session_group_view_loads"));
-
-        let park = source
-            .split_once("    fn park_loaded_session_view(")
-            .and_then(|(_, tail)| {
                 tail.split_once("\n    /// Points the group workspace at the session")
             })
             .map(|(body, _)| body)
-            .expect("parked view construction should remain inspectable");
-        assert!(park.contains("replace_authoritative(session_id.clone(), items)"));
-        assert!(park.contains("store_agent_session_view(session_id, entry)"));
+            .expect("group view materialization should remain inspectable");
+        // Every member gets a view, and every view without a timeline is loaded.
+        assert!(ensure.contains("self.ensure_session_view(&session_id);"));
+        assert!(ensure.contains("self.ensure_session_group_view_loaded(&session_id, cx);"));
 
-        // The workspace asks for the missing views before it lays out panes.
+        let load = source
+            .split_once("    fn load_session_group_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Releases the views of sessions that just left a group.")
+            })
+            .map(|(body, _)| body)
+            .expect("group view loading should remain inspectable");
+        assert!(load.contains("fetch_authoritative_timeline_via_backend("));
+        assert!(load.contains("session_group_view_loads"));
+        assert!(load.contains("this.adopt_session_view_timeline(session_id, items);"));
+        // The load is keyed by session id, so it cannot land in another view.
+        assert!(!load.contains("session_generation"));
+
+        let adopt = source
+            .split_once("    fn adopt_session_view_timeline(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Re-derives the geometry of the borrowed view")
+            })
+            .map(|(body, _)| body)
+            .expect("adopting a loaded timeline should remain inspectable");
+        assert!(adopt.contains("replace_authoritative(session_id.clone(), items)"));
+        assert!(adopt.contains("self.ensure_session_view(&session_id);"));
+        assert!(adopt.contains("self.with_session_view(&session_id"));
+
+        // The workspace materializes the member views before it lays out panes.
         let workspace = source
             .split_once("    fn render_session_group_workspace(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
             .map(|(body, _)| body)
             .expect("group workspace should remain inspectable");
         assert!(workspace.contains("self.ensure_session_group_views(group_id, cx);"));
-
-        // A pane is no longer withheld just because its session owes an answer.
-        let content = source
-            .split_once("    fn render_session_group_pane_content(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// What a group pane shows before its conversation")
-            })
-            .map(|(body, _)| body)
-            .expect("group pane content should remain inspectable");
-        assert!(!content.contains("parked_view_awaits_user"));
 
         // The approval card captures its own session at paint time.
         let actions = source
@@ -78881,51 +79166,57 @@ mod tests {
             .expect("pane message assembly should remain inspectable");
         assert!(take.contains("session_id: session_id.clone(),"));
 
-        // The composer is rendered under every non-focused pane's conversation.
+        // Every pane, focused or not, renders its own view and its own
+        // composer. Focus decides the keyboard, never the content.
         let content = source
             .split_once("    fn render_session_group_pane_content(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
+                tail.split_once("\n    /// The composer textarea of one session group pane")
             })
             .map(|(body, _)| body)
             .expect("group pane content should remain inspectable");
-        // Every pane, focused included, renders the same conversation area and
-        // the same composer: moving focus must not change what a pane looks
-        // like.
-        assert_eq!(
-            content.matches("session_group_pane_with_composer(").count(),
-            4
-        );
-        assert!(content.contains("self.prune_elicitation_forms();"));
-        assert!(!content.contains("self.render_agent_workbench(window, cx)"));
+        assert!(content.contains("self.borrow_session_view(&pane_session_id)"));
+        assert!(content.contains("self.release_session_view();"));
+        assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
+        assert!(content.contains("session_group_pane_with_composer(session_id, conversation"));
+        // The rendered conversation is the pane's own session, never whatever
+        // view happens to be borrowed.
+        assert!(!content.contains("selected_session_id"));
+        assert!(!content.contains("agent_session_view_cache"));
     }
 
-    /// A fetched view must never replace a real parked one, and a session whose
-    /// view is live must not be treated as missing.
+    /// There is exactly one copy of a session's view, and a fetch may only fill
+    /// a view that has no timeline yet: a stale fetched copy must never replace
+    /// the live view a pane is showing.
     #[test]
-    fn group_view_materialization_never_clobbers_a_parked_view() {
+    fn a_session_view_is_filled_once_and_never_overwritten_by_a_stale_fetch() {
         let source = include_str!("app.rs");
 
-        let park = source
-            .split_once("    fn park_loaded_session_view(")
+        let load = source
+            .split_once("    fn load_session_group_view(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Points the group workspace at the session")
+                tail.split_once("\n    /// Releases the views of sessions that just left a group.")
             })
             .map(|(body, _)| body)
-            .expect("parked view construction should remain inspectable");
-        assert!(park.contains("agent_session_view_cache"));
-        assert!(park.contains(".contains_key(session_id.as_str())"));
-        assert!(park.contains("return;"));
+            .expect("group view loading should remain inspectable");
+        // A view that already has a timeline is only reloaded when the caller
+        // asks for a forced catch-up.
+        assert!(load.contains("if loaded && !force {"));
+        assert!(load.contains("self.session_group_view_loads.contains(&key)"));
 
-        let ensure = source
-            .split_once("    fn ensure_session_group_views(")
+        // The store keeps one entry per session; borrowing removes it and
+        // releasing puts the very same entry back.
+        let borrow = source
+            .split_once("    fn borrow_session_view(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Parks a view built from an authoritative timeline")
+                tail.split_once("\n    /// Whether `session_id` already owns a view")
             })
             .map(|(body, _)| body)
-            .expect("group view materialization should remain inspectable");
-        assert!(ensure.contains("self.timeline.session_id.as_ref()"));
-        assert!(ensure.contains("available.insert(live_session_id.as_str().to_string());"));
+            .expect("view borrowing should remain inspectable");
+        assert!(borrow.contains("self.session_views.remove(&key)"));
+        assert!(borrow.contains("self.store_session_view(previous_key, previous)"));
+        assert!(!borrow.contains(".cloned()"));
+        assert!(!borrow.contains("contains_key"));
     }
 
     /// Selecting a member row has to move the group workspace with it, or the
@@ -78952,28 +79243,25 @@ mod tests {
         // follow the selection.
         assert!(sync.contains("group.maximized_pane_id = Some(pane_id);"));
 
-        // Borrowing a pane's view must park the live view under its own
-        // session, or a mismatch with the selection silently drops it and the
-        // next pane renders whatever the previous one loaded.
-        let swap = source
-            .split_once("    fn swap_live_agent_session_view_to(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// What a group pane shows before its conversation")
-            })
+        // Selecting a session borrows that session's own view, so the
+        // selection and the rendered conversation cannot disagree.
+        let selection = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline_remote("))
             .map(|(body, _)| body)
-            .expect("group view swap should remain inspectable");
-        assert!(swap.contains("let parked_session_id = self.timeline.session_id.clone();"));
-        assert!(swap.contains("self.stash_agent_session_view_for(parked_session_id);"));
-        assert!(!swap.contains("selected_session_id"));
+            .expect("session selection should remain inspectable");
+        assert!(selection.contains("let had_view = self.borrow_session_view(&session_id);"));
+        assert!(!selection.contains("stash_current_agent_session_view"));
 
-        // The pane renderer derives focus from the selection as well, so a
-        // restored layout cannot disagree with it.
+        // A pane is focused only when its *active* tab is the selected session,
+        // so the highlighted tab and the conversation always agree.
         let pane = source
             .split_once("    fn render_session_group_pane(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
             .map(|(body, _)| body)
             .expect("group pane renderer should remain inspectable");
-        assert!(pane.contains(".is_some_and(|selected| {"));
+        assert!(pane.contains("active_session_id.as_deref() == Some(selected.as_str())"));
+        assert!(!pane.contains("pane.session_ids\n                .iter()\n                .any"));
     }
 
     #[test]
@@ -79801,35 +80089,45 @@ mod tests {
     fn opened_session_view_cache_is_bounded_and_refreshes_recency() {
         assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 12);
         assert_eq!(AGENT_SESSION_VIEW_CACHE_BYTES, 256 * 1024 * 1024);
+        let pinned = BTreeSet::new();
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();
-        insert_bounded_session_view(
+        insert_bounded_session_view_with_pins(
             &mut cache,
             &mut lru,
             "session_a".into(),
             1,
-            2,
-            usize::MAX,
+            SessionViewBudget {
+                limit: 2,
+                max_bytes: usize::MAX,
+            },
             |_| 1,
+            &pinned,
         );
-        insert_bounded_session_view(
+        insert_bounded_session_view_with_pins(
             &mut cache,
             &mut lru,
             "session_b".into(),
             2,
-            2,
-            usize::MAX,
+            SessionViewBudget {
+                limit: 2,
+                max_bytes: usize::MAX,
+            },
             |_| 1,
+            &pinned,
         );
         touch_session_view_lru(&mut lru, "session_a");
-        insert_bounded_session_view(
+        insert_bounded_session_view_with_pins(
             &mut cache,
             &mut lru,
             "session_c".into(),
             3,
-            2,
-            usize::MAX,
+            SessionViewBudget {
+                limit: 2,
+                max_bytes: usize::MAX,
+            },
             |_| 1,
+            &pinned,
         );
 
         assert_eq!(
@@ -79841,14 +80139,52 @@ mod tests {
         assert_eq!(cache.get("session_c"), Some(&3));
     }
 
+    /// A pinned view belongs to a session a pane is showing, so eviction has to
+    /// skip it even when it is the least recently used entry.
+    #[test]
+    fn pinned_session_views_survive_eviction() {
+        let pinned = ["session_a".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut cache = BTreeMap::new();
+        let mut lru = VecDeque::new();
+        for key in ["session_a", "session_b", "session_c"] {
+            insert_bounded_session_view_with_pins(
+                &mut cache,
+                &mut lru,
+                key.into(),
+                key,
+                SessionViewBudget {
+                    limit: 2,
+                    max_bytes: usize::MAX,
+                },
+                |_| 1,
+                &pinned,
+            );
+        }
+        assert_eq!(cache.get("session_a"), Some(&"session_a"));
+        assert_eq!(cache.get("session_b"), None);
+        assert_eq!(cache.get("session_c"), Some(&"session_c"));
+    }
+
     #[test]
     fn opened_session_view_cache_enforces_a_total_byte_budget() {
+        let pinned = BTreeSet::new();
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();
         for (key, bytes) in [("session_a", 4_usize), ("session_b", 4), ("session_c", 7)] {
-            insert_bounded_session_view(&mut cache, &mut lru, key.into(), bytes, 6, 10, |bytes| {
-                *bytes
-            });
+            insert_bounded_session_view_with_pins(
+                &mut cache,
+                &mut lru,
+                key.into(),
+                bytes,
+                SessionViewBudget {
+                    limit: 6,
+                    max_bytes: 10,
+                },
+                |bytes| *bytes,
+                &pinned,
+            );
         }
         assert_eq!(
             lru.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -79856,14 +80192,17 @@ mod tests {
         );
         assert_eq!(cache.get("session_c"), Some(&7));
 
-        insert_bounded_session_view(
+        insert_bounded_session_view_with_pins(
             &mut cache,
             &mut lru,
             "session_oversized".into(),
             11,
-            6,
-            10,
+            SessionViewBudget {
+                limit: 6,
+                max_bytes: 10,
+            },
             |bytes| *bytes,
+            &pinned,
         );
         assert!(!cache.contains_key("session_oversized"));
         assert_eq!(cache.get("session_c"), Some(&7));
