@@ -7794,12 +7794,10 @@ impl ManagementCenter {
             .trim()
             .to_string();
         if url.is_empty() {
-            self.market_source_error = Some(management_error_text(
-                "Enter a catalog URL",
-                "请输入目录地址",
-                "請輸入目錄位址",
-            )
-            .to_string());
+            self.market_source_error = Some(
+                management_error_text("Enter a catalog URL", "请输入目录地址", "請輸入目錄位址")
+                    .to_string(),
+            );
             cx.notify();
             return;
         }
@@ -7845,9 +7843,9 @@ impl ManagementCenter {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
-                .set_market_sources(MutationRequest::new(
-                    vibex_core::MarketSourceSetRequest { sources },
-                ))
+                .set_market_sources(MutationRequest::new(vibex_core::MarketSourceSetRequest {
+                    sources,
+                }))
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
         });
@@ -7862,7 +7860,8 @@ impl ManagementCenter {
                         this.skill_market_entries.clear();
                     }
                     Ok(Err(error)) => {
-                        this.market_source_error = Some(format!("{}: {}", error.code, error.message))
+                        this.market_source_error =
+                            Some(format!("{}: {}", error.code, error.message))
                     }
                     Err(error) => this.market_source_error = Some(format!("{error}")),
                 }
@@ -7886,9 +7885,9 @@ impl ManagementCenter {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
-                .set_market_sources(MutationRequest::new(
-                    vibex_core::MarketSourceSetRequest { sources },
-                ))
+                .set_market_sources(MutationRequest::new(vibex_core::MarketSourceSetRequest {
+                    sources,
+                }))
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
         });
@@ -7902,7 +7901,8 @@ impl ManagementCenter {
                         this.skill_market_entries.clear();
                     }
                     Ok(Err(error)) => {
-                        this.market_source_error = Some(format!("{}: {}", error.code, error.message))
+                        this.market_source_error =
+                            Some(format!("{}: {}", error.code, error.message))
                     }
                     Err(error) => this.market_source_error = Some(format!("{error}")),
                 }
@@ -10692,9 +10692,7 @@ impl ManagementCenter {
                         "浏览 MCP 市场",
                         "瀏覽 MCP 市場",
                     ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_mcp_market(window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| this.open_mcp_market(window, cx))),
             )
             .child(
                 Button::new("management-mcp-import-sidebar")
@@ -10895,9 +10893,8 @@ impl ManagementCenter {
                     badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
                 }
                 if installed_mcp_names.contains(&entry.name) {
-                    badges.push(
-                        management_locale_text("Installed", "已安装", "已安裝").to_string(),
-                    );
+                    badges
+                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
                 if let Some(value) = entry.categories.first() {
                     badges.push(mcp_market_category_label(*value));
@@ -10929,9 +10926,11 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(badges.into_iter().map(|badge| {
-                                            management_market_badge(badge, cx)
-                                        })),
+                                        .children(
+                                            badges
+                                                .into_iter()
+                                                .map(|badge| management_market_badge(badge, cx)),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -10956,9 +10955,11 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.begin_mcp_market_install(install_entry.clone(), window, cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.begin_mcp_market_install(install_entry.clone(), window, cx)
+                                },
+                            )),
                         ),
                 );
             }
@@ -11007,9 +11008,12 @@ impl ManagementCenter {
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                        management_locale_text("Install", "安装", "安裝"),
-                    ))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(management_locale_text("Install", "安装", "安裝")),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -11049,15 +11053,17 @@ impl ManagementCenter {
                         .checked(checked)
                         .accessibility_label(SharedString::from(agent.label.clone()))
                         .disabled(pending)
-                        .on_click(cx.listener(move |this, checked, _, cx| {
-                            let checked = *checked;
-                            if checked {
-                                this.mcp_market_install_agents.insert(toggle_id.clone());
-                            } else {
-                                this.mcp_market_install_agents.remove(&toggle_id);
-                            }
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                let checked = *checked;
+                                if checked {
+                                    this.mcp_market_install_agents.insert(toggle_id.clone());
+                                } else {
+                                    this.mcp_market_install_agents.remove(&toggle_id);
+                                }
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(div().text_sm().child(agent.label.clone())),
             );
@@ -11123,7 +11129,9 @@ impl ManagementCenter {
                         .label(management_locale_text("Install", "安装", "安裝"))
                         .loading(pending)
                         .disabled(pending)
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx))),
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx)),
+                        ),
                 ),
         )
         .into_any_element()
@@ -11281,9 +11289,12 @@ impl ManagementCenter {
                     v_flex()
                         .w_full()
                         .gap_1()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                            management_locale_text("Install", "安装", "安裝"),
-                        ))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(management_locale_text("Install", "安装", "安裝")),
+                        )
                         .child(
                             div()
                                 .text_sm()
@@ -11362,15 +11373,17 @@ impl ManagementCenter {
                             .checked(checked)
                             .accessibility_label(SharedString::from(agent.label.clone()))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, checked, _, cx| {
-                                let checked = *checked;
-                                if checked {
-                                    this.skill_market_install_agents.insert(toggle_id.clone());
-                                } else {
-                                    this.skill_market_install_agents.remove(&toggle_id);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(
+                                move |this, checked, _, cx| {
+                                    let checked = *checked;
+                                    if checked {
+                                        this.skill_market_install_agents.insert(toggle_id.clone());
+                                    } else {
+                                        this.skill_market_install_agents.remove(&toggle_id);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
                         )
                         .child(div().text_sm().child(agent.label.clone())),
                 );
@@ -11439,9 +11452,8 @@ impl ManagementCenter {
                 if installed_skill_uris
                     .contains(&format!("market:{}:{}", entry.source_id, entry.id))
                 {
-                    badges.push(
-                        management_locale_text("Installed", "已安装", "已安裝").to_string(),
-                    );
+                    badges
+                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
                 if let Some(value) = entry.categories.first() {
                     badges.push(skill_market_category_label(*value));
@@ -11473,9 +11485,11 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(badges.into_iter().map(|badge| {
-                                            management_market_badge(badge, cx)
-                                        })),
+                                        .children(
+                                            badges
+                                                .into_iter()
+                                                .map(|badge| management_market_badge(badge, cx)),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -11493,9 +11507,11 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_skill_market_install(install_entry.clone(), cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.begin_skill_market_install(install_entry.clone(), cx)
+                                },
+                            )),
                         ),
                 );
             }
@@ -11567,7 +11583,8 @@ impl ManagementCenter {
                                 ))
                                 .when(source.builtin, |row| {
                                     row.child(management_market_badge(
-                                        management_locale_text("Builtin", "内置", "內建").to_string(),
+                                        management_locale_text("Builtin", "内置", "內建")
+                                            .to_string(),
                                         cx,
                                     ))
                                 }),
@@ -11682,7 +11699,11 @@ impl ManagementCenter {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text("Add a source", "添加目录源", "新增目錄來源")),
+                            .child(management_locale_text(
+                                "Add a source",
+                                "添加目录源",
+                                "新增目錄來源",
+                            )),
                     )
                     .child(kind_chips)
                     .child(
@@ -11887,9 +11908,7 @@ impl ManagementCenter {
                         "瀏覽技能市場",
                     ))
                     .on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.open_skill_market(window, cx)
-                        }),
+                        cx.listener(|this, _, window, cx| this.open_skill_market(window, cx)),
                     ),
             )
             .child(
