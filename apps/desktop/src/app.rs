@@ -32318,7 +32318,26 @@ impl VibexWorkbench {
         // with the sidebar foreground or it would stay black and disappear on
         // the dark surface.
         let themed_color = cx.theme().sidebar_foreground.opacity(0.80);
-        let mut stack = h_flex().flex_none().items_center();
+        // Overlapping avatars are pulled together with negative margins, which
+        // makes the row's measured width smaller than what it paints. Reserving
+        // the painted width keeps the group name from sliding under the stack.
+        let shown = identities
+            .iter()
+            .filter(|identity| agent_brand_asset(identity).is_some())
+            .count()
+            .min(SESSION_GROUP_AVATAR_LIMIT);
+        let chip = usize::from(identities.len() > SESSION_GROUP_AVATAR_LIMIT);
+        let slots = shown + chip;
+        let stack_width = if slots == 0 {
+            0.0
+        } else {
+            SESSION_GROUP_AVATAR_SIZE
+                + (slots - 1) as f32 * (SESSION_GROUP_AVATAR_SIZE - SESSION_GROUP_AVATAR_OVERLAP)
+        };
+        let mut stack = h_flex()
+            .flex_none()
+            .items_center()
+            .when(slots > 0, |this| this.w(px(stack_width)));
         for (index, identity) in identities.iter().enumerate() {
             if index >= SESSION_GROUP_AVATAR_LIMIT {
                 break;
@@ -32857,7 +32876,6 @@ impl VibexWorkbench {
         // for this frame and hands the focused pane's view back afterwards.
         // A session that was never opened has no parked view yet, and the pane
         // falls back to a live summary instead of an empty timeline.
-        let focused_session_id = self.selected_session_id.clone();
         if !self
             .agent_session_view_cache
             .contains_key(pane_session_id.as_str())
@@ -32865,20 +32883,24 @@ impl VibexWorkbench {
             let summary = self.render_session_group_pane_summary(&session, cx);
             return self.session_group_pane_with_composer(session_id, summary, window, cx);
         }
-        if let Some(focused_session_id) = focused_session_id.as_ref() {
-            self.stash_agent_session_view_for(focused_session_id);
-        }
-        if !self.restore_agent_session_view(&pane_session_id) {
-            if let Some(focused_session_id) = focused_session_id.as_ref() {
-                let _ = self.restore_agent_session_view(focused_session_id);
-            }
+        let Some(parked_session_id) = self.swap_live_agent_session_view_to(&pane_session_id) else {
             let summary = self.render_session_group_pane_summary(&session, cx);
             return self.session_group_pane_with_composer(session_id, summary, window, cx);
-        }
+        };
         let conversation = self.render_agent_workbench_for(false, window, cx);
-        self.stash_agent_session_view_for(&pane_session_id);
-        if let Some(focused_session_id) = focused_session_id.as_ref() {
-            let _ = self.restore_agent_session_view(focused_session_id);
+        // Park the pane's view again before the focused pane renders.
+        if let Some(live_session_id) = self.timeline.session_id.clone() {
+            self.stash_agent_session_view_for(&live_session_id);
+        }
+        // Hand the focused session's view back. Falling back to the view this
+        // pane parked keeps a pane from leaving its own conversation on screen
+        // for the focused pane to render.
+        let focused_restored = self
+            .selected_session_id
+            .clone()
+            .is_some_and(|focused_session_id| self.restore_agent_session_view(&focused_session_id));
+        if !focused_restored {
+            let _ = self.restore_agent_session_view(&parked_session_id);
         }
         self.session_group_pane_with_composer(session_id, conversation, window, cx)
     }
@@ -33190,6 +33212,34 @@ impl VibexWorkbench {
             )
             .child(composer)
             .into_any_element()
+    }
+
+    /// Parks the live view under its own session and loads `session_id`'s.
+    ///
+    /// The live view is parked under `self.timeline.session_id`, not under the
+    /// selection. A group pane can render while the live view holds a third
+    /// session — the selection and the live view only agree once the focused
+    /// pane has rendered — and parking under the selection would silently drop
+    /// that view, leaving the next pane to render whatever the previous one
+    /// loaded.
+    ///
+    /// Returns the session whose view was parked, so the caller can hand it
+    /// back, or `None` when the requested view does not exist.
+    fn swap_live_agent_session_view_to(
+        &mut self,
+        session_id: &VibexSessionId,
+    ) -> Option<VibexSessionId> {
+        let parked_session_id = self.timeline.session_id.clone();
+        if let Some(parked_session_id) = parked_session_id.as_ref() {
+            self.stash_agent_session_view_for(parked_session_id);
+        }
+        if self.restore_agent_session_view(session_id) {
+            return parked_session_id;
+        }
+        if let Some(parked_session_id) = parked_session_id.as_ref() {
+            let _ = self.restore_agent_session_view(parked_session_id);
+        }
+        None
     }
 
     /// What a group pane shows before its conversation has been materialized:
@@ -78836,6 +78886,20 @@ mod tests {
         // A maximized workspace paints one pane, so the maximization has to
         // follow the selection.
         assert!(sync.contains("group.maximized_pane_id = Some(pane_id);"));
+
+        // Borrowing a pane's view must park the live view under its own
+        // session, or a mismatch with the selection silently drops it and the
+        // next pane renders whatever the previous one loaded.
+        let swap = source
+            .split_once("    fn swap_live_agent_session_view_to(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// What a group pane shows before its conversation")
+            })
+            .map(|(body, _)| body)
+            .expect("group view swap should remain inspectable");
+        assert!(swap.contains("let parked_session_id = self.timeline.session_id.clone();"));
+        assert!(swap.contains("self.stash_agent_session_view_for(parked_session_id);"));
+        assert!(!swap.contains("selected_session_id"));
 
         // The pane renderer derives focus from the selection as well, so a
         // restored layout cannot disagree with it.
