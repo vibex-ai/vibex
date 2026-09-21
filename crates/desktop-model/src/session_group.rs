@@ -375,9 +375,9 @@ impl SessionGroupLayout {
     ///
     /// The session may live in `pane_id` or in any other pane; the new pane is
     /// always spliced next to `pane_id`, which is what lets a workspace grow
-    /// past two panes. Splitting a pane that holds nothing but `session_id`
-    /// would leave it empty, so the caller opens an empty pane instead — see
-    /// [`Self::split_open_pane`].
+    /// past two panes. Splitting a pane with its own tab moves the tab into the
+    /// new half and keeps the original pane, empty and ready for another
+    /// session, so a one-tab pane splits instead of refusing.
     ///
     /// Returns the new pane id, or `None` when the layout cannot split further.
     pub fn split_with_session(
@@ -400,10 +400,12 @@ impl SessionGroupLayout {
             return None;
         }
         let source_pane_id = self.pane_containing_session(session_id)?;
-        if source_pane_id == pane_id && self.find_pane(pane_id)?.session_ids.len() < 2 {
-            return None;
+        let mut already_empty = self.empty_pane_ids();
+        if source_pane_id == pane_id {
+            // The source pane is about to lose its only session. Keep it: the
+            // reader asked for a split, not for the pane to disappear.
+            already_empty.insert(pane_id.to_string());
         }
-        let already_empty = self.empty_pane_ids();
         {
             let source = self.find_pane_mut(&source_pane_id)?;
             source.session_ids.retain(|id| id != session_id);
@@ -1014,23 +1016,37 @@ mod tests {
     }
 
     #[test]
-    fn splitting_a_pane_with_one_session_is_rejected() {
+    fn splitting_a_pane_with_one_session_moves_it_and_keeps_the_pane() {
         let mut group =
             SessionGroupUiState::new("会话组 1", "project", "workspace", members(&["a"]));
+        let opened = group
+            .layout
+            .split_with_session(
+                SESSION_GROUP_MAIN_PANE_ID,
+                "a",
+                SplitDirection::Horizontal,
+                "pane-2",
+                "split-1",
+                SessionGroupSplitPosition::After,
+            )
+            .expect("a one-tab pane should still split");
+        // The tab lands in the new half and the original pane stays, empty, so
+        // the reader can fill it with another session.
+        assert_eq!(opened, "pane-2");
+        assert_eq!(
+            group.layout.pane_containing_session("a").as_deref(),
+            Some("pane-2")
+        );
+        assert_eq!(group.layout.pane_count(), 2);
         assert!(
             group
                 .layout
-                .split_with_session(
-                    SESSION_GROUP_MAIN_PANE_ID,
-                    "a",
-                    SplitDirection::Horizontal,
-                    "pane-2",
-                    "split-1",
-                    SessionGroupSplitPosition::After,
-                )
-                .is_none()
+                .find_pane(SESSION_GROUP_MAIN_PANE_ID)
+                .is_some_and(|pane| pane.is_empty())
         );
-        assert_eq!(group.layout.pane_count(), 1);
+        // And the empty pane survives the next membership change.
+        assert!(group.add_members(&members(&["b"])));
+        assert_eq!(group.layout.pane_count(), 2);
     }
 
     #[test]

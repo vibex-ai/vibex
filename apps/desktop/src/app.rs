@@ -82,7 +82,8 @@ use vibex_app_update::{
 };
 use vibex_backend::{
     AgentBackend as _, BackendError, BackendEvent, BackendEventStream, BackendFacade,
-    BackendOperation, BackendProjection, BackendResult, MutationRequest, NativeBackend,
+    BackendOperation, BackendProjection, BackendResult, DeviceBackend, MutationRequest,
+    NativeBackend,
 };
 use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
@@ -6481,6 +6482,12 @@ pub struct VibexWorkbench {
     /// boot falls back to the embedded runtime, so the panel is the only place
     /// that can still explain what happened.
     runtime_connect_errors: BTreeMap<String, String>,
+    /// The embedded runtime's published name. `None` until the boot read
+    /// completes, and then until a rename changes it.
+    local_runtime_name: Option<String>,
+    local_runtime_name_task: Option<Task<()>>,
+    /// An in-flight authoritative rename (embedded or remote).
+    runtime_rename_task: Option<Task<()>>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
     /// The window hosting the editor panel while it is popped out of
@@ -7447,6 +7454,9 @@ impl VibexWorkbench {
             runtime_add_busy: false,
             runtime_remove_pending: None,
             runtime_connect_errors: BTreeMap::new(),
+            local_runtime_name: None,
+            local_runtime_name_task: None,
+            runtime_rename_task: None,
             code_workbench,
             preview_fullscreen_active: false,
             preview_window: None,
@@ -9126,10 +9136,17 @@ impl VibexWorkbench {
     }
 
     fn begin_runtime_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime_registry.remote(&id) else {
-            return;
+        // The embedded runtime is renameable too: it is the runtime every
+        // paired client sees, so its name is the one a rename most needs to
+        // reach.
+        let name = if id == LOCAL_RUNTIME_ID {
+            self.local_runtime_label()
+        } else {
+            let Some(runtime) = self.runtime_registry.remote(&id) else {
+                return;
+            };
+            runtime.display_label()
         };
-        let name = runtime.display_label();
         self.runtime_manager_target = Some(id);
         self.runtime_rename_active = true;
         self.runtime_remove_pending = None;
@@ -9141,6 +9158,12 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Applies a rename to the runtime that owns the name.
+    ///
+    /// A connected runtime is renamed through its authority, which publishes
+    /// the new name to every client. A runtime this shell cannot reach keeps
+    /// the rename locally, exactly as before, because there is nothing to
+    /// propagate it to.
     fn commit_runtime_rename(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.runtime_manager_target.clone() else {
             self.runtime_rename_active = false;
@@ -10069,19 +10092,20 @@ impl VibexWorkbench {
                     move |this, _, _, cx| this.switch_to_runtime(id.clone(), cx)
                 })),
         );
-        if runtime.is_some() {
-            actions = actions.child(
-                Button::new("runtime-detail-rename")
-                    .small()
-                    .ghost()
-                    .label(locale::text("Rename", "重命名", "重新命名"))
-                    .disabled(switching)
-                    .on_click(cx.listener({
-                        let id = id.clone();
-                        move |this, _, window, cx| this.begin_runtime_rename(id.clone(), window, cx)
-                    })),
-            );
-        }
+        // Renaming is offered for the embedded runtime as well: it is the
+        // runtime its paired clients see, and the name is published to all of
+        // them.
+        actions = actions.child(
+            Button::new("runtime-detail-rename")
+                .small()
+                .ghost()
+                .label(locale::text("Rename", "重命名", "重新命名"))
+                .disabled(switching)
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, window, cx| this.begin_runtime_rename(id.clone(), window, cx)
+                })),
+        );
         actions = actions.child(div().flex_1());
         if runtime.is_some() {
             actions = actions.child(
@@ -10431,8 +10455,20 @@ impl VibexWorkbench {
         }
     }
 
+    /// The embedded runtime's label: the name it publishes, which defaults to
+    /// this machine's device name. The generic phrase is only a last resort for
+    /// a runtime that never answered.
     fn local_runtime_label(&self) -> String {
-        locale::text("This device", "本机", "本機").to_string()
+        self.local_runtime_name
+            .clone()
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .map(|config| config.remote_gateway.service.service_name.clone())
+            })
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| locale::text("This device", "本机", "本機").to_string())
     }
 
     /// A row's second line carries identity only. The live state belongs to the
@@ -14642,6 +14678,24 @@ impl VibexWorkbench {
         }
         let _ = self.borrow_session_view(session_id);
         true
+    }
+
+    /// The Agent a session's row should show, from that session's own view.
+    ///
+    /// A view that is borrowed for rendering is not in the store, so reading
+    /// only the store made the row of a pane that lost focus fall back to the
+    /// session's original Agent and drop the one the user had picked.
+    fn session_desired_agent_id(&self, session_id: &str) -> Option<&AgentId> {
+        if self.view_session_id.as_ref().map(VibexSessionId::as_str) == Some(session_id) {
+            return self
+                .runtime_selection
+                .as_ref()
+                .map(|state| &state.desired.agent_id);
+        }
+        self.session_views
+            .get(session_id)
+            .and_then(|view| view.runtime_selection.as_ref())
+            .map(|state| &state.desired.agent_id)
     }
 
     /// The borrowed view's composer textarea, if it has one yet.
@@ -27817,11 +27871,7 @@ impl VibexWorkbench {
                 let selected_desired_agent_id = selected_runtime
                     .as_ref()
                     .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
-                let cached_desired_agent_id = self
-                    .session_views
-                    .get(session.id.as_str())
-                    .and_then(|entry| entry.runtime_selection.as_ref())
-                    .map(|state| &state.desired.agent_id);
+                let cached_desired_agent_id = self.session_desired_agent_id(session.id.as_str());
                 let agent_id = sidebar_session_agent_id(
                     &session.agent_id,
                     selected_desired_agent_id,
@@ -32928,6 +32978,16 @@ impl VibexWorkbench {
     /// makes the stack's left edge depend on its own content width.
     /// each `Avatar` takes the Agent's brand SVG so a group reads as its Agents
     /// rather than as a set of initials.
+    /// The pane that currently shows `session_id`, if it is in a group.
+    fn session_group_session_pane(&self, session_id: &str) -> Option<String> {
+        let organization = &self.ui_state.sidebar.organization;
+        let group_id = organization.group_of_session(session_id)?;
+        organization
+            .group(group_id)?
+            .layout
+            .pane_containing_session(session_id)
+    }
+
     /// The most actionable status among a group's members.
     ///
     /// A collapsed group hides its member rows, so the group row carries what
@@ -33264,10 +33324,17 @@ impl VibexWorkbench {
                     .sessions
                     .iter()
                     .find(|session| session.id.as_str() == session_id)?;
+                // The tab shows the Agent the session's view runs, so a session
+                // whose runtime the user switched does not fall back to the
+                // Agent it was created with.
+                let agent_id = self
+                    .session_desired_agent_id(session_id)
+                    .cloned()
+                    .unwrap_or_else(|| session.agent_id.clone());
                 Some((
                     session_id.clone(),
                     session.title.clone(),
-                    session.agent_id.as_str().to_string(),
+                    agent_id.as_str().to_string(),
                     session.state,
                 ))
             })
@@ -33475,14 +33542,14 @@ impl VibexWorkbench {
                 this.border_1().border_color(cx.theme().border)
             })
             .when(!focused, |this| {
-                // Capture phase so the click focuses the pane instead of
-                // reaching a control that belongs to the focused session.
+                // Focus the pane on the way down. The event keeps propagating so
+                // a tab in a pane that does not hold the keyboard can still
+                // start a drag; stopping it here made those tabs undraggable.
                 this.capture_any_mouse_down(cx.listener({
                     let group_id = group_id.to_string();
                     let pane_id = pane_id.clone();
                     move |this, _: &gpui::MouseDownEvent, _, cx| {
                         this.focus_session_group_pane(&group_id, &pane_id, cx);
-                        cx.stop_propagation();
                     }
                 }))
             })
@@ -33499,8 +33566,10 @@ impl VibexWorkbench {
             .on_drag_move(cx.listener({
                 let pane_id = pane_id.clone();
                 move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
+                    let session_id = event.drag(cx).session_id.clone();
                     this.track_session_group_pane_drop(
                         &pane_id,
+                        Some(session_id.as_str()),
                         event.bounds,
                         event.event.position,
                         cx,
@@ -33515,6 +33584,7 @@ impl VibexWorkbench {
                 move |this, event: &DragMoveEvent<SidebarSessionDrag>, _, cx| {
                     this.track_session_group_pane_drop(
                         &pane_id,
+                        None,
                         event.bounds,
                         event.event.position,
                         cx,
@@ -33874,14 +33944,23 @@ impl VibexWorkbench {
 
     /// Records which edge of which pane a drag is hovering, so the drop overlay
     /// can show where the session will land.
+    ///
+    /// `dragged_session_id` is the tab being dragged, when the drag started in a
+    /// pane. A drag that has not left the pane it came from cannot reorder
+    /// anything — tab reordering is not implemented — so anywhere below the tab
+    /// strip is a request to split that pane, on the axis the pointer moved
+    /// along. Without this the middle of the pane resolved to "move into this
+    /// pane", which is a no-op for the source pane, and the only way to split
+    /// was to drag the tab onto a different pane.
     fn track_session_group_pane_drop(
         &mut self,
         pane_id: &str,
+        dragged_session_id: Option<&str>,
         bounds: gpui::Bounds<gpui::Pixels>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
+        let mut region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
             SessionGroupPaneDropRegion::Bottom
         } else if position.x >= bounds.origin.x + bounds.size.width * 0.5 {
             SessionGroupPaneDropRegion::Right
@@ -33890,6 +33969,17 @@ impl VibexWorkbench {
         } else {
             SessionGroupPaneDropRegion::Content
         };
+        let same_pane = dragged_session_id.is_some_and(|session_id| {
+            self.session_group_session_pane(session_id).as_deref() == Some(pane_id)
+        });
+        if same_pane && region == SessionGroupPaneDropRegion::Content {
+            let center = bounds.center();
+            region = if (position.x - center.x).abs() >= (position.y - center.y).abs() {
+                SessionGroupPaneDropRegion::Right
+            } else {
+                SessionGroupPaneDropRegion::Bottom
+            };
+        }
         let next = SessionGroupPaneDropTarget {
             pane_id: pane_id.to_string(),
             region,
@@ -36154,11 +36244,7 @@ impl VibexWorkbench {
         let selected_desired_agent_id = selected_runtime
             .as_ref()
             .and_then(|selection| selection.as_ref().map(|selection| &selection.agent_id));
-        let cached_desired_agent_id = self
-            .session_views
-            .get(&session_id_string)
-            .and_then(|entry| entry.runtime_selection.as_ref())
-            .map(|state| &state.desired.agent_id);
+        let cached_desired_agent_id = self.session_desired_agent_id(&session_id_string);
         let sidebar_agent_id = sidebar_session_agent_id(
             &session.agent_id,
             selected_desired_agent_id,
@@ -40475,6 +40561,15 @@ impl VibexWorkbench {
         // renders another session's runtime controls while the selection still
         // names the focused pane.
         let live_session_id = self.timeline.session_id.clone();
+        // The virtual list is one element per session: its id scopes the cached
+        // row layout, so two panes must never share it.
+        let timeline_list_id = SharedString::from(format!(
+            "agent-timeline-turns-{}",
+            live_session_id
+                .as_ref()
+                .map(VibexSessionId::as_str)
+                .unwrap_or("none")
+        ));
         // A dismissed alert stays hidden while the same requests are pending,
         // so acknowledging a request the user cannot answer yet does not cost
         // them the timeline row it occupies.
@@ -40565,7 +40660,14 @@ impl VibexWorkbench {
                         .child(
                             v_virtual_list(
                                 cx.entity().clone(),
-                                "agent-timeline-turns",
+                                // Element state is keyed by this id, and the
+                                // virtual list caches its measured row layout
+                                // there. A constant id made every pane share
+                                // one cache: a pane picked up the other pane's
+                                // row heights and scroll offset, which showed up
+                                // as a shrunken timeline with a blank band and a
+                                // viewport that jumped when focus moved.
+                                timeline_list_id.clone(),
                                 row_sizes,
                                 move |this, visible_range, window, cx| {
                                     let rendered_turns = rendered_turns.borrow().clone();
@@ -79697,6 +79799,93 @@ mod tests {
             .expect("the avatar stack should follow the chevron");
         assert!(chevron < avatars);
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// Every pane's timeline is its own virtual list.
+    ///
+    /// The list caches its measured row layout under its element id, so a
+    /// constant id made the panes share one cache: a pane drew the other pane's
+    /// row heights (a shrunken timeline with a blank band) and picked up its
+    /// scroll offset when focus moved.
+    #[test]
+    fn every_pane_timeline_is_its_own_virtual_list() {
+        let source = include_str!("app.rs");
+        let workbench = source
+            .split_once("    fn render_agent_workbench_for(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_choice("))
+            .map(|(body, _)| body)
+            .expect("agent workbench should remain inspectable");
+        let list_id = workbench
+            .find("let timeline_list_id = SharedString::from(format!(")
+            .expect("the timeline list id should be built per session");
+        let list = workbench
+            .find("timeline_list_id.clone(),")
+            .expect("the virtual list should use the per-session id");
+        assert!(list_id < list);
+        assert!(workbench.contains("\"agent-timeline-turns-{}"));
+        assert!(workbench.contains("VibexSessionId::as_str"));
+        // The old constant id must be gone from the call.
+        assert!(!workbench.contains("\"agent-timeline-turns\","));
+    }
+
+    /// A drag that never leaves the pane it started in splits that pane, and a
+    /// pane that does not hold the keyboard can still start the drag.
+    #[test]
+    fn dragging_a_tab_within_its_own_pane_splits_it() {
+        let source = include_str!("app.rs");
+
+        let track = source
+            .split_once("    fn track_session_group_pane_drop(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Drops a sidebar session on a pane"))
+            .map(|(body, _)| body)
+            .expect("pane drop tracking should remain inspectable");
+        assert!(track.contains("dragged_session_id: Option<&str>"));
+        assert!(track.contains("self.session_group_session_pane(session_id).as_deref()"));
+        assert!(track.contains("if same_pane && region == SessionGroupPaneDropRegion::Content {"));
+        assert!(track.contains("SessionGroupPaneDropRegion::Right"));
+        assert!(track.contains("SessionGroupPaneDropRegion::Bottom"));
+
+        // The tab drag hands its session to the tracker, so the tracker can tell
+        // a same-pane drag from a cross-pane one.
+        assert!(source.contains("let session_id = event.drag(cx).session_id.clone();"));
+        assert!(source.contains("this.track_session_group_pane_drop(\n                        &pane_id,\n                        Some(session_id.as_str()),"));
+
+        // A tab in a pane that does not hold the keyboard must still be able to
+        // start a drag: the capture handler focuses the pane without consuming
+        // the press.
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+        let focus_on_down = pane
+            .find("this.focus_session_group_pane(&group_id, &pane_id, cx);")
+            .expect("a non-focused pane should focus on mouse down");
+        let after = &pane[focus_on_down..];
+        let handler_end = after.find("}))").expect("the capture handler should close");
+        assert!(!after[..handler_end].contains("cx.stop_propagation()"));
+    }
+
+    /// A row and a pane tab show the Agent the session's view runs, borrowed or
+    /// stored, so a focus change cannot fall back to the session's original one.
+    #[test]
+    fn session_rows_show_the_agent_their_view_runs() {
+        let source = include_str!("app.rs");
+        let helper = source
+            .split_once("    fn session_desired_agent_id(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The borrowed view's composer textarea")
+            })
+            .map(|(body, _)| body)
+            .expect("desired agent lookup should remain inspectable");
+        assert!(helper.contains("self.view_session_id.as_ref().map(VibexSessionId::as_str)"));
+        assert!(helper.contains(".runtime_selection"));
+        assert!(helper.contains("self.session_views"));
+
+        assert!(
+            source.matches("self.session_desired_agent_id(").count() >= 3,
+            "the helper should serve the sidebar row, the search scan and the pane tab"
+        );
     }
 
     /// A collapsed group reports its members' status in the same trailing
