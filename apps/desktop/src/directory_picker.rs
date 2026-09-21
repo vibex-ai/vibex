@@ -262,7 +262,7 @@ impl DirectoryPickerDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let locale = locale::resolve_locale(locale_mode, locale::system_locale().as_deref());
+        let locale = locale::resolve_locale(locale_mode, locale::system_locale());
         let placeholder = text(locale).search_placeholder;
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let search_events = cx.subscribe(&search_input, |_, _, event: &InputEvent, cx| {
@@ -307,7 +307,7 @@ impl DirectoryPickerDialog {
     }
 
     fn locale(&self) -> ResolvedLocale {
-        locale::resolve_locale(self.locale_mode, locale::system_locale().as_deref())
+        locale::resolve_locale(self.locale_mode, locale::system_locale())
     }
 
     /// Preferred starting root: the requested directory, else the user home,

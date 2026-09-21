@@ -830,7 +830,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
 }
 
 pub fn apply_locale(mode: LocaleMode) -> ResolvedLocale {
-    let locale = resolve_locale(mode, system_locale().as_deref());
+    let locale = resolve_locale(mode, system_locale());
     gpui_component::set_locale(locale.tag());
     locale
 }
@@ -1627,7 +1627,11 @@ pub fn localize_ui_message(message: &str) -> String {
     localize_ui_message_for(current_locale(), message)
 }
 
-pub fn system_locale() -> Option<String> {
+/// The locale the operating system reports, resolved once per process.
+///
+/// The borrow is `'static` on purpose: the render path calls this many times per
+/// frame, and handing back an owned copy made every `strings()` lookup allocate.
+pub fn system_locale() -> Option<&'static str> {
     static SYSTEM_LOCALE: OnceLock<Option<String>> = OnceLock::new();
     SYSTEM_LOCALE
         .get_or_init(|| {
@@ -1647,7 +1651,7 @@ pub fn system_locale() -> Option<String> {
                     (!locale.trim().is_empty()).then_some(locale)
                 })
         })
-        .clone()
+        .as_deref()
 }
 
 #[cfg(test)]

@@ -233,7 +233,7 @@ impl LocalHistoryImportDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let locale = locale::resolve_locale(locale_mode, locale::system_locale().as_deref());
+        let locale = locale::resolve_locale(locale_mode, locale::system_locale());
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(text(locale).search);
             if let Some(initial_search) = initial_search
@@ -273,7 +273,7 @@ impl LocalHistoryImportDialog {
     }
 
     fn locale(&self) -> ResolvedLocale {
-        locale::resolve_locale(self.locale_mode, locale::system_locale().as_deref())
+        locale::resolve_locale(self.locale_mode, locale::system_locale())
     }
 
     fn scan_sessions(&mut self, apply_focus: bool, cx: &mut Context<Self>) {

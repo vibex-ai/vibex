@@ -3304,6 +3304,14 @@ pub struct SessionView {
     /// Owns this view's keystrokes, IME state and draft, so a pane cannot
     /// type into another session's composer.
     composer_subscription: Option<Subscription>,
+    /// The last [`Self::calculate_estimated_resident_bytes`] result, refreshed
+    /// whenever the view is stored back into the session-view cache.
+    ///
+    /// A view sitting in that cache is not being mutated, so its footprint can
+    /// only change while it is borrowed. Refreshing the estimate on store keeps
+    /// the cache's byte budget exact while letting the eviction pass sum cached
+    /// numbers instead of re-walking every stored view's timeline.
+    resident_bytes: usize,
 }
 
 impl SessionView {
@@ -3388,6 +3396,7 @@ impl SessionView {
             composer_terminal_surfaces: BTreeMap::new(),
             active_composer_terminal_surface_id: None,
             composer_subscription: None,
+            resident_bytes: 0,
         }
     }
 
@@ -6679,6 +6688,14 @@ pub struct VibexWorkbench {
     /// never evicted, so a group member cannot lose its timeline while it is on
     /// screen.
     session_view_lru: VecDeque<String>,
+    /// Turn heights prepaint observed for a session, parked until that session's
+    /// own view is the borrowed one.
+    ///
+    /// Prepaint runs after the whole element tree is built, so it cannot know
+    /// which pane it is measuring for; routing the measurement by session id
+    /// here is what keeps a split's panes from writing their row heights into
+    /// whichever view released last. Keyed by session id, then by turn index.
+    pending_timeline_turn_measurements: BTreeMap<String, BTreeMap<usize, (String, f32)>>,
     child_agent_timelines: BTreeMap<String, ChildAgentTimelineState>,
     child_agent_expanded_delegations: BTreeSet<String>,
     child_agent_tabs: Vec<VibexSessionId>,
@@ -6687,7 +6704,25 @@ pub struct VibexWorkbench {
     child_agent_timeline_scroll: ScrollHandle,
     child_agent_render_session: Option<VibexSessionId>,
     agent_streaming_surface_visible: Arc<AtomicBool>,
-    runtime_catalog: Option<SessionRuntimeOptionCatalog>,
+    /// The runtime option catalog, shared rather than owned.
+    ///
+    /// The composer clones it for every pane it renders, and it carries an
+    /// option (with its labels) per Agent/auth-source/model combination. Handing
+    /// out a shared handle keeps a split from deep-copying that list N times a
+    /// frame.
+    runtime_catalog: Option<Rc<SessionRuntimeOptionCatalog>>,
+    /// The cascade projection the composer renders, memoized against the catalog
+    /// and selection it was derived from.
+    ///
+    /// Deriving it walks the whole option catalog and allocates a label for
+    /// every choice, so a session group paid for the same projection once per
+    /// pane. Holding the catalog handle keeps the memo exact: a replacement
+    /// catalog is a different allocation, never a reused address.
+    runtime_cascade_projection: Option<(
+        Rc<SessionRuntimeOptionCatalog>,
+        SessionRuntimeSelection,
+        Rc<RuntimeCascadeProjection>,
+    )>,
     runtime_provider_profiles: Vec<ProviderProfileSummary>,
     optimistic_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
     runtime_selection_requests_in_flight: BTreeSet<String>,
@@ -7580,6 +7615,7 @@ impl VibexWorkbench {
             view_session_id: selected_session_id,
             session_views: BTreeMap::new(),
             session_view_lru: VecDeque::new(),
+            pending_timeline_turn_measurements: BTreeMap::new(),
             child_agent_timelines: BTreeMap::new(),
             child_agent_expanded_delegations: BTreeSet::new(),
             child_agent_tabs: Vec::new(),
@@ -7589,6 +7625,7 @@ impl VibexWorkbench {
             child_agent_render_session: None,
             agent_streaming_surface_visible,
             runtime_catalog: None,
+            runtime_cascade_projection: None,
             runtime_provider_profiles: Vec::new(),
             optimistic_runtime_selections: BTreeMap::new(),
             runtime_selection_requests_in_flight: BTreeSet::new(),
@@ -10748,11 +10785,11 @@ impl VibexWorkbench {
                             // feature controls for the duration of the load.
                             if this.runtime_catalog.is_none() {
                                 this.runtime_catalog =
-                                    Some(build_runtime_option_catalog_for_agents(
+                                    Some(Rc::new(build_runtime_option_catalog_for_agents(
                                         &agents,
                                         &profiles,
                                         &BTreeMap::new(),
-                                    ));
+                                    )));
                             }
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents
@@ -10902,11 +10939,11 @@ impl VibexWorkbench {
                                 && this.runtime_catalog.is_none()
                             {
                                 this.runtime_catalog =
-                                    Some(build_runtime_option_catalog_for_agents(
+                                    Some(Rc::new(build_runtime_option_catalog_for_agents(
                                         &agents,
                                         &profiles,
                                         &BTreeMap::new(),
-                                    ));
+                                    )));
                             }
                             this.runtime_provider_profiles = profiles;
                             this.agent_snapshots = agents
@@ -11187,7 +11224,7 @@ impl VibexWorkbench {
                     }
                     match outcome {
                         Ok(Ok(catalog)) => {
-                            this.runtime_catalog = Some(catalog);
+                            this.runtime_catalog = Some(Rc::new(catalog));
                             if this.reconcile_new_session_runtime_selection()
                                 && this.new_session_open
                             {
@@ -11279,7 +11316,7 @@ impl VibexWorkbench {
     }
 
     fn persist_runtime_selection(&mut self, selection: &SessionRuntimeSelection) {
-        let selection = persisted_runtime_selection(self.runtime_catalog.as_ref(), selection);
+        let selection = persisted_runtime_selection(self.runtime_catalog.as_deref(), selection);
         let mut changed = false;
         let selections_by_agent = &mut self.ui_state.composer.runtime_selections_by_agent;
         if selections_by_agent.get(&selection.agent_id) != Some(&selection) {
@@ -14756,11 +14793,15 @@ impl VibexWorkbench {
         if self.view_session_id.as_ref() == Some(session_id) {
             return true;
         }
-        let key = session_id.as_str().to_string();
-        if self.session_views.contains_key(&key) {
+        // Look the key up borrowed: this runs for every group member on every
+        // frame, and only a view that is actually missing needs an owned key.
+        if self.session_views.contains_key(session_id.as_str()) {
             return true;
         }
-        self.store_session_view(key, SessionView::new(self.ui_state.session.content_width));
+        self.store_session_view(
+            session_id.as_str().to_string(),
+            SessionView::new(self.ui_state.session.content_width),
+        );
         false
     }
 
@@ -14768,8 +14809,28 @@ impl VibexWorkbench {
     ///
     /// Group members are pinned, so a pane never loses the conversation it is
     /// showing to an unrelated session's memory pressure.
-    fn store_session_view(&mut self, key: String, entry: SessionView) {
-        let pinned = self.pinned_session_view_ids();
+    fn store_session_view(&mut self, key: String, mut entry: SessionView) {
+        // Refresh this entry's footprint once, on the way in. Everything already
+        // in the store is frozen (a cached view is not mutated), so the eviction
+        // pass can sum these numbers instead of re-walking every stored view's
+        // timeline on every borrow/release — which a split paid twice per pane,
+        // per frame.
+        entry.resident_bytes = entry.calculate_estimated_resident_bytes();
+        let stored_bytes = self
+            .session_views
+            .values()
+            .map(|view| view.resident_bytes)
+            .fold(0_usize, usize::saturating_add);
+        // Building the pinned set walks every grouped session. It is only read
+        // when the store actually has to evict, so a store that cannot evict
+        // must not pay for it.
+        let may_evict = self.session_views.len() >= AGENT_SESSION_VIEW_CACHE_LIMIT
+            || stored_bytes.saturating_add(entry.resident_bytes) > AGENT_SESSION_VIEW_CACHE_BYTES;
+        let pinned = if may_evict {
+            self.pinned_session_view_ids()
+        } else {
+            BTreeSet::new()
+        };
         insert_bounded_session_view_with_pins(
             &mut self.session_views,
             &mut self.session_view_lru,
@@ -14779,7 +14840,7 @@ impl VibexWorkbench {
                 limit: AGENT_SESSION_VIEW_CACHE_LIMIT,
                 max_bytes: AGENT_SESSION_VIEW_CACHE_BYTES,
             },
-            |entry| entry.calculate_estimated_resident_bytes(),
+            |entry| entry.resident_bytes,
             &pinned,
         );
     }
@@ -15239,6 +15300,32 @@ impl VibexWorkbench {
         let output_tokens = usage.and_then(|usage| usage.output_tokens);
         let cache_rate = usage.and_then(cache_hit_fraction).map(token_usage_percent);
         (input_tokens, output_tokens, cache_rate)
+    }
+
+    /// The cascade projection for `selection`, rebuilt only when the catalog or
+    /// the selection it describes actually changed.
+    ///
+    /// A session group renders a composer per pane, and every pane whose session
+    /// shares a selection wants the same projection. Deriving it allocates a
+    /// label for every choice in the catalog, so it is worth sharing.
+    fn runtime_cascade_projection_for(
+        &mut self,
+        catalog: &Rc<SessionRuntimeOptionCatalog>,
+        selection: &SessionRuntimeSelection,
+    ) -> Rc<RuntimeCascadeProjection> {
+        let cached = self.runtime_cascade_projection.as_ref().and_then(
+            |(cached_catalog, cached_selection, projection)| {
+                (Rc::ptr_eq(cached_catalog, catalog) && cached_selection == selection)
+                    .then(|| projection.clone())
+            },
+        );
+        if let Some(projection) = cached {
+            return projection;
+        }
+        let projection = Rc::new(RuntimeCascadeProjection::from_catalog(catalog, selection));
+        self.runtime_cascade_projection =
+            Some((catalog.clone(), selection.clone(), projection.clone()));
+        projection
     }
 
     fn selected_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
@@ -17236,6 +17323,9 @@ impl VibexWorkbench {
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
+        // A height prepaint parked for this view was measured against the layout
+        // being dropped, so replaying it would restore the old extent.
+        self.invalidate_deferred_timeline_turn_heights();
     }
 
     /// Records the width a pane measured against the view that painted it.
@@ -17826,6 +17916,78 @@ impl VibexWorkbench {
                 .hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    /// Parks a turn height prepaint observed, under the session that painted it.
+    ///
+    /// Prepaint runs after the whole element tree is built, so it cannot know
+    /// which view it measured for. Parking the raw measurement by session id
+    /// lets the pane's own render replay it while that session's view is the
+    /// borrowed one — the same routing [`Self::sync_session_view_layout_width`]
+    /// already does for width.
+    fn defer_timeline_turn_height(
+        &mut self,
+        session_id: Option<&str>,
+        turn_index: usize,
+        turn_id: String,
+        measured_height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = session_id else {
+            // No session to route by means no pane owns the measurement, so the
+            // borrowed view is the only candidate left.
+            self.record_timeline_turn_height(turn_index, turn_id, measured_height, cx);
+            return;
+        };
+        self.pending_timeline_turn_measurements
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(turn_index, (turn_id, measured_height));
+    }
+
+    /// Replays the heights prepaint parked for the borrowed view's session.
+    ///
+    /// Only the borrowed session's entry is taken, so the store stays bounded by
+    /// the number of sessions that actually painted a timeline.
+    fn flush_deferred_timeline_turn_heights(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            return;
+        };
+        let Some(measurements) = self
+            .pending_timeline_turn_measurements
+            .remove(session_id.as_str())
+        else {
+            return;
+        };
+        if measurements.is_empty() {
+            return;
+        }
+        // The layout signature reads the projection, so make it current before
+        // replaying against turn indices.
+        self.conversation_turns_cached();
+        for (turn_index, (turn_id, measured_height)) in measurements {
+            // The projection can move between prepaint and this render. A height
+            // measured against another turn at that index cannot be trusted.
+            if self
+                .conversation_turns_cache
+                .get(turn_index)
+                .is_none_or(|turn| turn.id != turn_id)
+            {
+                continue;
+            }
+            self.record_timeline_turn_height(turn_index, turn_id, measured_height, cx);
+        }
+    }
+
+    /// Drops parked measurements for sessions that no longer paint a timeline.
+    fn invalidate_deferred_timeline_turn_heights(&mut self) {
+        // Clone the id out first: the key would otherwise borrow the view the
+        // parked map is about to be mutated beside.
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            return;
+        };
+        self.pending_timeline_turn_measurements
+            .remove(session_id.as_str());
     }
 
     fn record_timeline_turn_height(
@@ -30799,10 +30961,7 @@ impl VibexWorkbench {
     }
 
     fn resolved_locale(&self) -> locale::ResolvedLocale {
-        locale::resolve_locale(
-            self.ui_state.appearance.locale,
-            locale::system_locale().as_deref(),
-        )
+        locale::resolve_locale(self.ui_state.appearance.locale, locale::system_locale())
     }
 
     fn open_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -33161,6 +33320,10 @@ impl VibexWorkbench {
         };
         let group_id = group_id.to_string();
         let pane_tree = self.render_session_group_node(&group_id, node, window, cx);
+        // Each pane borrowed its own view and left it borrowed, so the whole
+        // workspace hands the primary back once. Doing it per pane made a split
+        // store and reload a view twice for every pane, every frame.
+        self.release_session_view();
         let strings = self.strings();
         v_flex()
             .id("session-group-workspace")
@@ -33671,12 +33834,12 @@ impl VibexWorkbench {
             self.prune_elicitation_forms();
         }
         let conversation = self.render_agent_workbench_for(false, window, cx);
-        // The composer is part of this pane's view, so it has to be built
-        // before the view is handed back. Rendering it after the release made
-        // every pane draw the selected session's textarea — one input shared by
-        // the whole workspace.
+        // The composer is part of this pane's view, so it has to be built while
+        // that view is still borrowed. The borrow itself is handed back by the
+        // workspace once every pane has rendered, not here: re-borrowing the
+        // primary between panes would store and reload a view per pane for
+        // nothing.
         let composer = self.render_composer(window, cx, focused);
-        self.release_session_view();
         self.session_group_pane_with_composer(conversation, composer, window, cx)
     }
 
@@ -33763,15 +33926,16 @@ impl VibexWorkbench {
         force: bool,
         cx: &mut Context<Self>,
     ) {
-        let key = session_id.as_str().to_string();
-        if self.session_group_view_loads.contains(&key) {
+        // This runs for every group member on every frame, so keep the lookups
+        // borrowed and allocate an owned key only when a fetch is really queued.
+        if self.session_group_view_loads.contains(session_id.as_str()) {
             return;
         }
         let loaded = match self.view_session_id.as_ref() {
             Some(borrowed) if borrowed == session_id => self.timeline.session_id.is_some(),
             _ => self
                 .session_views
-                .get(&key)
+                .get(session_id.as_str())
                 .is_some_and(|view| view.timeline.session_id.is_some()),
         };
         if loaded && !force {
@@ -33780,7 +33944,8 @@ impl VibexWorkbench {
         let Some(backend) = self.backend.clone() else {
             return;
         };
-        self.session_group_view_loads.insert(key);
+        self.session_group_view_loads
+            .insert(session_id.as_str().to_string());
         let runner = gpui_tokio::Tokio::spawn(cx, {
             let backend = backend.clone();
             let session_id = session_id.clone();
@@ -38423,7 +38588,7 @@ impl VibexWorkbench {
     fn render_new_session_runtime_cascade(
         &mut self,
         selection: Option<SessionRuntimeSelection>,
-        catalog: Option<SessionRuntimeOptionCatalog>,
+        catalog: Option<Rc<SessionRuntimeOptionCatalog>>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -40536,6 +40701,13 @@ impl VibexWorkbench {
             // user is typing into the focused one.
             self.prune_elicitation_forms();
         }
+        // Replay the row heights prepaint measured for *this* session before the
+        // extent is rebuilt, so a pane's own measurements land in its own view.
+        // Prepaint cannot apply them itself: by then the whole tree is built and
+        // the borrowed view belongs to whichever pane released last, so a split
+        // would write every pane's heights into one view and re-trigger a full
+        // size rebuild on every frame.
+        self.flush_deferred_timeline_turn_heights(cx);
         self.apply_pending_timeline_row_heights();
         // The virtual list pads itself with `py_4`; the scroll anchor needs the
         // same rem-based top inset to map offsets to rows.
@@ -40590,6 +40762,13 @@ impl VibexWorkbench {
         // otherwise a split's two widths would take turns invalidating each
         // other's row measurements.
         let timeline_layout_session_id = self.timeline.session_id.clone();
+        // The row measurement needs the same routing as the width, so carry a
+        // cheap second copy of the session id into the virtual list's closure.
+        let timeline_measure_session_id: Option<SharedString> = self
+            .timeline
+            .session_id
+            .as_ref()
+            .map(|session_id| SharedString::from(session_id.as_str()));
         let timeline_surface = div()
             .relative()
             .flex_1()
@@ -40678,6 +40857,7 @@ impl VibexWorkbench {
                                             let row_height = rendered_row_sizes.get(index)?.height;
                                             let measured_height_entity = cx.weak_entity();
                                             let measured_turn_id = turn.id.clone();
+                                            let measured_session_id = timeline_measure_session_id.clone();
                                             let turn_content = this.render_timeline_turn(
                                                 turn,
                                                 index,
@@ -40709,9 +40889,12 @@ impl VibexWorkbench {
                                                             .on_prepaint(move |bounds, _, cx| {
                                                                 let measured_height =
                                                                     f32::from(bounds.size.height);
+                                                                let session_id =
+                                                                    measured_session_id.clone();
                                                                 let _ = measured_height_entity
                                                                     .update(cx, |this, cx| {
-                                                                        this.record_timeline_turn_height(
+                                                                        this.defer_timeline_turn_height(
+                                                                            session_id.as_deref(),
                                                                             index,
                                                                             measured_turn_id.clone(),
                                                                             measured_height,
@@ -41169,7 +41352,7 @@ impl VibexWorkbench {
     fn render_composer_runtime_cascade(
         &mut self,
         desired: SessionRuntimeSelection,
-        catalog: SessionRuntimeOptionCatalog,
+        catalog: Rc<SessionRuntimeOptionCatalog>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -49783,14 +49966,13 @@ impl VibexWorkbench {
         let auto_continue_toggle_session_id = self.view_session_id.clone();
         let session_running = agent_turn_is_active(self.agent_turn_pending, session_state);
         let generation_status = self.render_agent_generation_status(session_running, cx);
+        // The catalog handle is shared and the projection memoized, so a group
+        // workspace derives one projection per distinct selection per frame
+        // instead of one per pane.
         let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
-            self.runtime_catalog.as_ref().map(|catalog| {
-                (
-                    selection.clone(),
-                    catalog.clone(),
-                    RuntimeCascadeProjection::from_catalog(catalog, selection),
-                )
-            })
+            let catalog = self.runtime_catalog.clone()?;
+            let projection = self.runtime_cascade_projection_for(&catalog, selection);
+            Some((selection.clone(), catalog, projection))
         });
         let compact_runtime_controls =
             composer_runtime_controls_are_compact(self.last_visibility.layout.viewport_width);
@@ -49840,7 +50022,7 @@ impl VibexWorkbench {
                             "icons/vibex/brain.svg",
                             theme::semantic_color("chart-3", is_dark),
                         ),
-                        projection.reasoning_efforts,
+                        projection.reasoning_efforts.clone(),
                         runtime_reasoning_effort_value(Some(&desired)),
                         default_effort,
                         compact_runtime_controls,
@@ -49855,14 +50037,14 @@ impl VibexWorkbench {
                             "icons/vibex/shield-alert.svg",
                             theme::semantic_color("chart-4", is_dark),
                         ),
-                        projection.modes,
+                        projection.modes.clone(),
                         desired.mode_id.clone().unwrap_or_default(),
                         None,
                         compact_runtime_controls,
                         cx,
                     ));
                 }
-                for feature in projection.features {
+                for feature in projection.features.iter().cloned() {
                     other.push(self.render_runtime_feature(
                         RuntimeFeatureTarget::ActiveSession,
                         feature,
@@ -59359,7 +59541,7 @@ impl FoundationSettings {
         let families = crate::platform::system_font_families(cx);
         let strings = locale::strings(locale::resolve_locale(
             ui_state.appearance.locale,
-            locale::system_locale().as_deref(),
+            locale::system_locale(),
         ));
         let language_choices = locale_choices(strings);
         let interface_choices = font_choices(&families, strings.system_ui);
@@ -60210,7 +60392,7 @@ impl FoundationSettings {
     ) {
         let strings = locale::strings(locale::resolve_locale(
             appearance.locale,
-            locale::system_locale().as_deref(),
+            locale::system_locale(),
         ));
         let language_choices = locale_choices(strings);
         let interface_choices = font_choices(&self.font_families, strings.system_ui);
@@ -63490,8 +63672,7 @@ impl Render for FoundationSettings {
         let network_proxy = self.network_proxy(cx);
         let workbench = self.workbench_state(cx);
         let terminal = self.terminal_preferences(cx);
-        let resolved_locale =
-            locale::resolve_locale(appearance.locale, locale::system_locale().as_deref());
+        let resolved_locale = locale::resolve_locale(appearance.locale, locale::system_locale());
         let strings = locale::strings(resolved_locale);
         let viewport_width = f32::from(window.viewport_size().width);
         let vertical_tabs = viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH;
@@ -72410,6 +72591,77 @@ mod tests {
         );
     }
 
+    /// A pane's measured *height* belongs to the view that painted it, exactly
+    /// like its width. Prepaint runs after the tree is built, so it parks the
+    /// measurement under its session and the pane's own render replays it.
+    /// Recording it against whichever view was borrowed made a split write every
+    /// pane's heights into one view, which failed the pending-height validation
+    /// and rebuilt the whole size table on every frame.
+    #[test]
+    fn timeline_turn_heights_are_routed_to_the_session_that_painted_them() {
+        let source = include_str!("app.rs");
+
+        let defer = source
+            .split_once("    fn defer_timeline_turn_height(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Replays the heights prepaint parked"))
+            .map(|(body, _)| body)
+            .expect("the deferred height recorder should remain inspectable");
+        assert!(defer.contains("self.pending_timeline_turn_measurements"));
+        assert!(defer.contains("self.record_timeline_turn_height("));
+
+        // The replay only trusts a measurement whose turn still sits at the
+        // index it was measured at.
+        let flush = source
+            .split_once("    fn flush_deferred_timeline_turn_heights(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Drops parked measurements for sessions")
+            })
+            .map(|(body, _)| body)
+            .expect("the deferred height replay should remain inspectable");
+        assert!(flush.contains(".remove(session_id.as_str())"));
+        assert!(flush.contains("self.conversation_turns_cached();"));
+        assert!(flush.contains("is_none_or(|turn| turn.id != turn_id)"));
+        assert!(flush.contains("self.record_timeline_turn_height("));
+
+        // Prepaint must carry the measured session instead of recording straight
+        // into the borrowed view, and the render must replay before the extent is
+        // validated.
+        let prepaint = source
+            .split_once("let timeline_measure_session_id: Option<SharedString>")
+            .and_then(|(_, tail)| {
+                tail.split_once("let runtime_controls = self.render_runtime_controls(")
+            })
+            .map(|(body, _)| body)
+            .expect("the row prepaint closure should carry its session");
+        assert!(prepaint.contains("this.defer_timeline_turn_height("));
+        assert!(!prepaint.contains("this.record_timeline_turn_height("));
+
+        let workbench = source
+            .split_once("    fn render_agent_workbench_for(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "let rendered_turns = self.conversation_turns_render_cache.clone();",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the workbench renderer should remain inspectable");
+        let flush_call = workbench
+            .find("self.flush_deferred_timeline_turn_heights(cx);")
+            .expect("the renderer should replay parked heights");
+        let apply_call = workbench
+            .find("self.apply_pending_timeline_row_heights();")
+            .expect("the renderer should apply the pending extent");
+        assert!(flush_call < apply_call);
+
+        // Dropping the layout drops the measurements taken against it.
+        let invalidation = source
+            .split_once("    fn invalidate_timeline_layout_measurements(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Records the width a pane measured"))
+            .map(|(body, _)| body)
+            .expect("timeline layout invalidation should remain inspectable");
+        assert!(invalidation.contains("self.invalidate_deferred_timeline_turn_heights();"));
+    }
+
     #[test]
     fn streaming_reasoning_measurements_match_timeline_and_live_rows() {
         let reasoning_row = TimelineRow {
@@ -80090,22 +80342,29 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group pane content should remain inspectable");
         assert!(content.contains("self.borrow_session_view(&pane_session_id)"));
-        assert!(content.contains("self.release_session_view();"));
         assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
         // The composer is built while the pane's own view is borrowed, and the
-        // borrow is only handed back afterwards. Rendering it after the release
-        // made every pane draw the selected session's textarea.
-        let build_composer = content
-            .find("let composer = self.render_composer(window, cx, focused);")
-            .expect("the pane should build its own composer");
-        let release = content
-            .find("self.release_session_view();")
-            .expect("the pane should hand its view back");
-        assert!(build_composer < release);
+        // borrow is handed back by the workspace once every pane has rendered.
+        // Re-borrowing the primary between panes made a split store and reload a
+        // view twice for every pane, every frame.
+        assert!(content.contains("let composer = self.render_composer(window, cx, focused);"));
+        assert!(!content.contains("self.release_session_view();"));
         assert!(
             content
                 .contains("session_group_pane_with_composer(conversation, composer, window, cx)")
         );
+        let workspace = source
+            .split_once("    fn render_session_group_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
+            .map(|(body, _)| body)
+            .expect("group workspace should remain inspectable");
+        let render_panes = workspace
+            .find("self.render_session_group_node(&group_id, node, window, cx)")
+            .expect("the workspace should render its pane tree");
+        let release = workspace
+            .find("self.release_session_view();")
+            .expect("the workspace should hand the borrowed view back once");
+        assert!(render_panes < release);
         // The rendered conversation is the pane's own session, never whatever
         // view happens to be borrowed.
         assert!(!content.contains("selected_session_id"));
@@ -80127,9 +80386,14 @@ mod tests {
             .map(|(body, _)| body)
             .expect("group view loading should remain inspectable");
         // A view that already has a timeline is only reloaded when the caller
-        // asks for a forced catch-up.
+        // asks for a forced catch-up. The guard runs for every group member on
+        // every frame, so it looks the session up borrowed and only allocates an
+        // owned key when a fetch is really queued.
         assert!(load.contains("if loaded && !force {"));
-        assert!(load.contains("self.session_group_view_loads.contains(&key)"));
+        assert!(load.contains("self.session_group_view_loads.contains(session_id.as_str())"));
+        assert!(load.contains(
+            "self.session_group_view_loads\n            .insert(session_id.as_str().to_string());"
+        ));
 
         // The store keeps one entry per session; borrowing removes it and
         // releasing puts the very same entry back.
@@ -81133,6 +81397,45 @@ mod tests {
         );
         assert!(!cache.contains_key("session_oversized"));
         assert_eq!(cache.get("session_c"), Some(&7));
+    }
+
+    /// The store is on the borrow/release path a split walks twice per pane per
+    /// frame, so it must not re-walk every cached view's timeline to weigh them.
+    /// A stored view is frozen, so its footprint is refreshed once on the way in
+    /// and the eviction pass only sums cached numbers.
+    #[test]
+    fn storing_a_session_view_weighs_cached_views_without_rescanning_them() {
+        let source = include_str!("app.rs");
+        let store = source
+            .split_once(
+                "    fn store_session_view(&mut self, key: String, mut entry: SessionView) {",
+            )
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Sessions whose view must survive eviction")
+            })
+            .map(|(body, _)| body)
+            .expect("the session view store should remain inspectable");
+        // The footprint is measured exactly once, for the incoming view.
+        assert_eq!(
+            store
+                .matches("calculate_estimated_resident_bytes()")
+                .count(),
+            1
+        );
+        assert!(store.contains("entry.resident_bytes = "));
+        // The eviction pass weighs cached entries from their stored number.
+        assert!(store.contains("|entry| entry.resident_bytes,"));
+        // The pinned set is only built when the store can actually evict.
+        assert!(store.contains("let may_evict ="));
+        assert!(store.contains("BTreeSet::new()"));
+
+        let insert = source
+            .split_once("fn insert_bounded_session_view_with_pins<T>(")
+            .and_then(|(_, tail)| tail.split_once("\nfn insert_bounded_timeline_projection<T>("))
+            .map(|(body, _)| body)
+            .expect("the bounded session view store should remain inspectable");
+        assert!(insert.contains(".map(&weight)"));
+        assert!(!insert.contains("calculate_estimated_resident_bytes"));
     }
 
     #[test]
