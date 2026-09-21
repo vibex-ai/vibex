@@ -6255,6 +6255,8 @@ pub struct VibexWorkbench {
     sidebar_folder_drag_state: Option<SidebarFolderDragState>,
     sidebar_group_drag_state: Option<SidebarGroupDragState>,
     session_group_pane_drop_target: Option<SessionGroupPaneDropTarget>,
+    /// Group members whose parked view is being fetched.
+    session_group_view_loads: BTreeSet<String>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
@@ -7183,6 +7185,7 @@ impl VibexWorkbench {
             sidebar_folder_drag_state: None,
             sidebar_group_drag_state: None,
             session_group_pane_drop_target: None,
+            session_group_view_loads: BTreeSet::new(),
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
@@ -22522,6 +22525,7 @@ impl VibexWorkbench {
 
     fn resolve_permission(
         &mut self,
+        session_id: VibexSessionId,
         request_id: String,
         response: PermissionResponseKind,
         provider_resolution_id: Option<String>,
@@ -22531,9 +22535,6 @@ impl VibexWorkbench {
             return;
         }
         let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
         let Ok(request_id) = RequestId::parse(request_id) else {
@@ -32330,6 +32331,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.ensure_session_group_views(group_id, cx);
         let layout = group.layout.clone();
         let maximized = group.maximized_pane_id.clone();
         let node = match maximized.as_deref() {
@@ -32793,13 +32795,6 @@ impl VibexWorkbench {
         {
             return self.render_session_group_pane_summary(&session, cx);
         }
-        // The approve/deny and elicitation handlers resolve against the focused
-        // session, so a pane that owes the user an answer must not offer the
-        // controls: it shows its summary and the user answers in the focused
-        // pane, where the request is unambiguous.
-        if self.parked_view_awaits_user(session_id) {
-            return self.render_session_group_pane_summary(&session, cx);
-        }
         if let Some(focused_session_id) = focused_session_id.as_ref() {
             self.stash_agent_session_view_for(focused_session_id);
         }
@@ -32815,23 +32810,6 @@ impl VibexWorkbench {
             let _ = self.restore_agent_session_view(focused_session_id);
         }
         element
-    }
-
-    /// Whether a parked view holds a request the user must answer.
-    fn parked_view_awaits_user(&self, session_id: &str) -> bool {
-        let Some(entry) = self.agent_session_view_cache.get(session_id) else {
-            return false;
-        };
-        if entry.conversation_turns_summary.has_pending_permission {
-            return true;
-        }
-        entry.timeline.items.iter().any(|item| {
-            matches!(
-                &item.payload,
-                TimelinePayload::ElicitationRequest(request)
-                    if request.status == vibex_core::ElicitationRequestStatus::Pending
-            )
-        })
     }
 
     /// What a group pane shows before its conversation has been materialized:
@@ -32907,9 +32885,9 @@ impl VibexWorkbench {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(locale::text(
-                        "Focus this pane to load the conversation.",
-                        "点击该面板以加载对话。",
-                        "點擊該面板以載入對話。",
+                        "Loading this session's conversation…",
+                        "正在载入该会话的对话…",
+                        "正在載入該會話的對話…",
                     )),
             );
         } else {
@@ -32949,6 +32927,103 @@ impl VibexWorkbench {
             .overflow_hidden()
             .child(body)
             .into_any_element()
+    }
+
+    /// Gives every group member a parked view, so each pane can render a full
+    /// conversation instead of a summary.
+    ///
+    /// A session only owns a parked view once it has been the focused one. A
+    /// pane whose session was never opened therefore has nothing to borrow, and
+    /// the workspace would show one complete conversation beside summaries.
+    /// Fetching the missing timelines up front makes every pane complete.
+    fn ensure_session_group_views(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
+            return;
+        };
+        let missing = group
+            .member_session_ids
+            .iter()
+            .filter(|session_id| {
+                !self
+                    .agent_session_view_cache
+                    .contains_key(session_id.as_str())
+                    && !self.session_group_view_loads.contains(session_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        for member_id in missing {
+            let Ok(session_id) = VibexSessionId::parse(&member_id) else {
+                continue;
+            };
+            self.session_group_view_loads.insert(member_id);
+            let runner = gpui_tokio::Tokio::spawn(cx, {
+                let backend = backend.clone();
+                let session_id = session_id.clone();
+                async move {
+                    fetch_authoritative_timeline_via_backend(backend, session_id.clone())
+                        .await
+                        .map(|items| (session_id, items))
+                }
+            });
+            cx.spawn(
+                async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let outcome = runner.await;
+                    let _ = entity.update(cx, |this, cx| {
+                        let Ok(Ok((session_id, items))) = outcome else {
+                            // The id stays in the set, so a session whose
+                            // timeline could not be fetched keeps its summary
+                            // instead of starting a fetch on every frame.
+                            return;
+                        };
+                        this.session_group_view_loads.remove(session_id.as_str());
+                        this.park_loaded_session_view(session_id, items);
+                        cx.notify();
+                    });
+                },
+            )
+            .detach();
+        }
+    }
+
+    /// Parks a view built from an authoritative timeline, without disturbing the
+    /// session that currently owns the live fields.
+    fn park_loaded_session_view(
+        &mut self,
+        session_id: VibexSessionId,
+        items: Vec<vibex_core::TimelineItem>,
+    ) {
+        let mut timeline = TimelineModel::default();
+        timeline.replace_authoritative(session_id.clone(), items);
+        let mut entry = AgentSessionViewCacheEntry {
+            estimated_resident_bytes: 0,
+            timeline,
+            runtime_selection: None,
+            token_usage: None,
+            timeline_follow: TimelineFollowState::default(),
+            timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_row_sizes: Rc::new(Vec::new()),
+            timeline_measured_turn_heights: BTreeMap::new(),
+            timeline_measured_turn_layout_signatures: BTreeMap::new(),
+            timeline_estimated_turn_heights: BTreeMap::new(),
+            timeline_turn_layout_signature_cache: BTreeMap::new(),
+            timeline_process_unit_heights: BTreeMap::new(),
+            conversation_turns_cache: Rc::new(Vec::new()),
+            conversation_turns_cache_key: None,
+            conversation_turns_summary: ConversationTurnsSummary::default(),
+            streaming_row_state: None,
+            timeline_layout_width: None,
+            content_width: self.ui_state.session.content_width,
+            collapsed_timeline_rows: BTreeSet::new(),
+            reasoning_expansion: BTreeMap::new(),
+            timeline_process_expansion: BTreeMap::new(),
+            timeline_command_expansion: BTreeMap::new(),
+            timeline_file_changes_expansion: BTreeMap::new(),
+        };
+        entry.estimated_resident_bytes = entry.calculate_estimated_resident_bytes();
+        self.store_agent_session_view(session_id, entry);
     }
 
     /// Points the group workspace at the session the sidebar just selected.
@@ -33392,7 +33467,18 @@ impl VibexWorkbench {
             })
             .child(row);
         if !collapsed {
-            container = container.children(children);
+            // Member rows sit one level in from the group header, the same step
+            // a folder uses. The indent is what tells a grouped session apart
+            // from a loose one and shows where the group's membership starts and
+            // ends.
+            container = container.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(SIDEBAR_SESSION_CONTENT_GAP))
+                    .pl(px(SIDEBAR_FOLDER_CHILD_INDENT))
+                    .children(children),
+            );
         }
         container.into_any_element()
     }
@@ -47200,6 +47286,10 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let request_id = request.id.as_str().to_string();
+        // The card is drawn while its own session owns the live view, so the
+        // request's session is captured here rather than read back when the
+        // button is pressed — a group pane may have moved the selection on.
+        let resolve_session_id = self.timeline.session_id.clone();
         let options = if request.response_options.is_empty() {
             request
                 .allowed_responses
@@ -47234,12 +47324,22 @@ impl VibexWorkbench {
             .gap_2()
             .children(options.into_iter().map(|(option_id, label, response)| {
                 let resolve_id = request_id.clone();
+                let resolve_session_id = resolve_session_id.clone();
                 let button = Button::new(format!("permission-response:{request_id}:{label}"))
                     .small()
                     .label(label)
                     .disabled(self.agent_action_pending)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.resolve_permission(resolve_id.clone(), response, option_id.clone(), cx)
+                        let Some(session_id) = resolve_session_id.clone() else {
+                            return;
+                        };
+                        this.resolve_permission(
+                            session_id,
+                            resolve_id.clone(),
+                            response,
+                            option_id.clone(),
+                            cx,
+                        )
                     }));
                 match response {
                     PermissionResponseKind::Approve => button.primary().icon(IconName::Check),
@@ -78195,6 +78295,64 @@ mod tests {
         assert!(group_row.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))"));
         assert!(group_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// Every pane must render a complete conversation, so a member without a
+    /// parked view has one fetched, and an approval must resolve against the
+    /// session whose timeline carried the request.
+    #[test]
+    fn group_panes_materialize_views_and_resolve_requests_for_their_own_session() {
+        let source = include_str!("app.rs");
+
+        let ensure = source
+            .split_once("    fn ensure_session_group_views(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Parks a view built from an authoritative timeline")
+            })
+            .map(|(body, _)| body)
+            .expect("group view materialization should remain inspectable");
+        assert!(ensure.contains("fetch_authoritative_timeline_via_backend("));
+        assert!(ensure.contains("!self"));
+        assert!(ensure.contains("session_group_view_loads"));
+
+        let park = source
+            .split_once("    fn park_loaded_session_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Points the group workspace at the session")
+            })
+            .map(|(body, _)| body)
+            .expect("parked view construction should remain inspectable");
+        assert!(park.contains("replace_authoritative(session_id.clone(), items)"));
+        assert!(park.contains("store_agent_session_view(session_id, entry)"));
+
+        // The workspace asks for the missing views before it lays out panes.
+        let workspace = source
+            .split_once("    fn render_session_group_workspace(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
+            .map(|(body, _)| body)
+            .expect("group workspace should remain inspectable");
+        assert!(workspace.contains("self.ensure_session_group_views(group_id, cx);"));
+
+        // A pane is no longer withheld just because its session owes an answer.
+        let content = source
+            .split_once("    fn render_session_group_pane_content(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// What a group pane shows before its conversation")
+            })
+            .map(|(body, _)| body)
+            .expect("group pane content should remain inspectable");
+        assert!(!content.contains("parked_view_awaits_user"));
+
+        // The approval card captures its own session at paint time.
+        let actions = source
+            .split_once("    fn render_permission_response_actions(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_user_message_inline_content("))
+            .map(|(body, _)| body)
+            .expect("permission actions should remain inspectable");
+        assert!(actions.contains("let resolve_session_id = self.timeline.session_id.clone();"));
+        assert!(
+            actions.contains("this.resolve_permission(\n                            session_id,")
+        );
     }
 
     /// Selecting a member row has to move the group workspace with it, or the
