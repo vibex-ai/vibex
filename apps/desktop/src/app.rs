@@ -6611,10 +6611,18 @@ pub struct VibexWorkbench {
 /// session even though the sidebar selected another one.
 fn subscribe_composer_input(
     input: &Entity<TextareaState>,
+    session_id: Option<VibexSessionId>,
     window: &mut Window,
     cx: &mut Context<VibexWorkbench>,
 ) -> Subscription {
     cx.subscribe_in(input, window, move |this, _, event, window, cx| {
+        // A textarea belongs to exactly one session, so its keystrokes are
+        // handled against that session even if the borrowed view has moved on.
+        // The borrow is handed back afterwards, leaving the primary workbench
+        // pointed at the selected session.
+        let switched = session_id
+            .as_ref()
+            .is_some_and(|session_id| this.focus_view_for_input(session_id));
         match event {
             InputEvent::Change => {
                 // Typing into a recalled message turns it into live text, so
@@ -6640,6 +6648,9 @@ fn subscribe_composer_input(
             InputEvent::Focus => this.refresh_suggestions(ComposerTarget::Session, window, cx),
             InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
             InputEvent::PressEnter { shift: false, .. } => {}
+        }
+        if switched {
+            this.release_session_view();
         }
     })
 }
@@ -6870,6 +6881,11 @@ impl VibexWorkbench {
                 "搜尋模型供應商與模型",
             ))
         });
+        let selected_session_id = ui_state
+            .workbench
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| VibexSessionId::parse(id).ok());
         let mut agent_subscriptions = vec![
             cx.subscribe_in(
                 &command_palette_input,
@@ -6988,7 +7004,7 @@ impl VibexWorkbench {
                     | InputEvent::PressEnter { shift: true, .. } => {}
                 },
             ),
-            subscribe_composer_input(&composer_input, window, cx),
+            subscribe_composer_input(&composer_input, selected_session_id.clone(), window, cx),
             cx.subscribe(&image_editor_text_input, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
@@ -7146,11 +7162,6 @@ impl VibexWorkbench {
         };
         let sidebar_scroll = gpui::ScrollHandle::new();
         let selected_session_scroll_anchor = gpui::ScrollAnchor::for_handle(sidebar_scroll.clone());
-        let selected_session_id = ui_state
-            .workbench
-            .selected_session_id
-            .as_deref()
-            .and_then(|id| VibexSessionId::parse(id).ok());
         let navigation_history = NavigationHistory::new(
             workbench_route(&ui_state, selected_session_id.as_ref()),
             WORKBENCH_NAVIGATION_LIMIT,
@@ -7337,7 +7348,7 @@ impl VibexWorkbench {
             sidebar_organization_task: None,
             new_session_agent_drop_target: None,
             collapsed_project_restore: None,
-            selected_session_id,
+            selected_session_id: selected_session_id.clone(),
             pending_new_session: None,
             pending_new_session_titles: HashMap::new(),
             pending_initial_turn_interrupts: BTreeMap::new(),
@@ -7368,7 +7379,7 @@ impl VibexWorkbench {
             runtime_client_id: RuntimeClientId::new(),
             session_generation: 0,
             view: initial_view,
-            view_session_id: None,
+            view_session_id: selected_session_id,
             session_views: BTreeMap::new(),
             session_view_lru: VecDeque::new(),
             child_agent_timelines: BTreeMap::new(),
@@ -14428,6 +14439,19 @@ impl VibexWorkbench {
             .find(|session| &session.id == session_id)
     }
 
+    /// Borrows `session_id`'s view for an input event.
+    ///
+    /// Returns whether the borrowed view changed, so the caller can hand it
+    /// back. A keystroke must be handled against the session that owns the
+    /// textarea, not against whichever session the sidebar happens to show.
+    fn focus_view_for_input(&mut self, session_id: &VibexSessionId) -> bool {
+        if self.view_session_id.as_ref() == Some(session_id) {
+            return false;
+        }
+        let _ = self.borrow_session_view(session_id);
+        true
+    }
+
     /// The borrowed view's composer textarea, if it has one yet.
     fn composer_input_entity(&self) -> Option<Entity<TextareaState>> {
         self.composer_input.clone()
@@ -14453,7 +14477,8 @@ impl VibexWorkbench {
                 .submit_on_enter(true)
                 .placeholder(placeholder)
         });
-        self.composer_subscription = Some(subscribe_composer_input(&input, window, cx));
+        let session_id = self.view_session_id.clone();
+        self.composer_subscription = Some(subscribe_composer_input(&input, session_id, window, cx));
         self.composer_input = Some(input.clone());
         input
     }
@@ -33171,23 +33196,30 @@ impl VibexWorkbench {
             self.prune_elicitation_forms();
         }
         let conversation = self.render_agent_workbench_for(false, window, cx);
+        // The composer is part of this pane's view, so it has to be built
+        // before the view is handed back. Rendering it after the release made
+        // every pane draw the selected session's textarea — one input shared by
+        // the whole workspace.
+        let composer = self.render_composer(window, cx, focused);
         self.release_session_view();
-        self.session_group_pane_with_composer(conversation, window, cx)
+        self.session_group_pane_with_composer(conversation, composer, window, cx)
     }
 
     /// Puts a pane's own composer under its conversation.
     ///
-    /// The pane renders the same composer as the main workbench, reading the
-    /// borrowed view: the textarea, the attachments, the queued messages, the
-    /// runtime controls and the terminal all belong to the pane's session, so
-    /// several sessions can be driven at once instead of only the focused one.
+    /// The composer is built by the caller, while that pane's view is borrowed,
+    /// so it reads the pane's own textarea, attachments, queued messages and
+    /// runtime controls. Only the focused pane's composer is enabled: a pane
+    /// that does not hold the keyboard shows its session's draft but cannot be
+    /// typed into until it is clicked.
     fn session_group_pane_with_composer(
         &mut self,
         content: AnyElement,
+        composer: AnyElement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let composer = self.render_composer(window, cx);
+        let _ = (window, cx);
         v_flex()
             .size_full()
             .min_w_0()
@@ -40202,7 +40234,7 @@ impl VibexWorkbench {
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
             .flatten();
-        let composer = include_composer.then(|| self.render_composer(window, cx));
+        let composer = include_composer.then(|| self.render_composer(window, cx, true));
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
         let composer_fullscreen = if self.composer_terminal_mode {
@@ -49196,7 +49228,17 @@ impl VibexWorkbench {
         Some(queue.into_any_element())
     }
 
-    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Renders the composer of the borrowed view.
+    ///
+    /// `enabled` is false for a group pane that does not hold the keyboard: the
+    /// pane still shows its session's composer, but the surface is dimmed and
+    /// inert until the pane is clicked.
+    fn render_composer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        enabled: bool,
+    ) -> AnyElement {
         let composer_input = self.ensure_composer_input(window, cx);
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
@@ -49387,7 +49429,7 @@ impl VibexWorkbench {
                     "停止当前回复",
                     "停止目前回覆",
                 ))
-                .disabled(self.agent_action_pending)
+                .disabled(self.agent_action_pending || !enabled)
                 .on_click(cx.listener(|this, _, window, cx| this.interrupt_session(window, cx)))
                 .into_any_element()
         } else {
@@ -49399,7 +49441,7 @@ impl VibexWorkbench {
                 .icon(IconName::ArrowUp)
                 .tooltip(locale::text("Send message", "发送消息", "傳送訊息"))
                 .loading(self.agent_action_pending || self.agent_turn_pending)
-                .disabled(!can_send)
+                .disabled(!can_send || !enabled)
                 .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx)))
                 .into_any_element()
         };
@@ -49409,6 +49451,7 @@ impl VibexWorkbench {
             .w_full()
             .min_w_0()
             .flex_none()
+            .when(!enabled, |this| this.opacity(0.55))
             .when(self.composer_expanded, |this| this.flex_1().min_h_0())
             .gap_2()
             .items_center()
@@ -49816,6 +49859,7 @@ impl VibexWorkbench {
                                             .child(
                                                 Textarea::new(&composer_input)
                                                     .appearance(false)
+                                                    .disabled(!enabled)
                                                     .when(self.composer_expanded, |this| {
                                                         this.h_full()
                                                     }),
@@ -67831,7 +67875,7 @@ mod tests {
         // The session composer wires both keys to the shared handler.
         let composer = source
             .split_once(
-                "    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
@@ -68366,7 +68410,7 @@ mod tests {
         let source = include_str!("app.rs");
         let composer = source
             .split_once(
-                "    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
@@ -71250,7 +71294,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("composer input creation should remain inspectable");
         assert!(ensure.contains("self.composer_input = Some(input.clone());"));
-        assert!(ensure.contains("subscribe_composer_input(&input, window, cx)"));
+        assert!(ensure.contains("subscribe_composer_input(&input, session_id, window, cx)"));
 
         // The shared composer subscription is created once per textarea, and it
         // never parks one session's text under another session's key.
@@ -78896,7 +78940,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    /// Gives every group member"))
             .map(|(body, _)| body)
             .expect("pane composer wrapper should remain inspectable");
-        assert!(wrapper.contains("let composer = self.render_composer(window, cx);"));
+        assert!(wrapper.contains("composer: AnyElement"));
         assert!(!source.contains("\n    fn render_session_group_pane_composer("));
         assert!(!source.contains("\n    fn composer_input_for("));
 
@@ -78937,7 +78981,20 @@ mod tests {
         assert!(content.contains("self.borrow_session_view(&pane_session_id)"));
         assert!(content.contains("self.release_session_view();"));
         assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
-        assert!(content.contains("session_group_pane_with_composer(conversation, window, cx)"));
+        // The composer is built while the pane's own view is borrowed, and the
+        // borrow is only handed back afterwards. Rendering it after the release
+        // made every pane draw the selected session's textarea.
+        let build_composer = content
+            .find("let composer = self.render_composer(window, cx, focused);")
+            .expect("the pane should build its own composer");
+        let release = content
+            .find("self.release_session_view();")
+            .expect("the pane should hand its view back");
+        assert!(build_composer < release);
+        assert!(
+            content
+                .contains("session_group_pane_with_composer(conversation, composer, window, cx)")
+        );
         // The rendered conversation is the pane's own session, never whatever
         // view happens to be borrowed.
         assert!(!content.contains("selected_session_id"));
