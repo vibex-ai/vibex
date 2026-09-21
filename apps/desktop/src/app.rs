@@ -427,11 +427,11 @@ const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 /// ellipsis chip. Matches the product limit for the group row.
 const SESSION_GROUP_AVATAR_LIMIT: usize = 5;
 /// Display size of a monochrome Agent mark inside a group avatar.
-const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 13.0;
+const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 14.5;
 /// Edge length of one group avatar, matching the kit's `xsmall` size.
-const SESSION_GROUP_AVATAR_SIZE: f32 = 16.0;
+const SESSION_GROUP_AVATAR_SIZE: f32 = 18.0;
 /// How far consecutive avatars overlap.
-const SESSION_GROUP_AVATAR_OVERLAP: f32 = 6.0;
+const SESSION_GROUP_AVATAR_OVERLAP: f32 = 7.0;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -32883,18 +32883,21 @@ impl VibexWorkbench {
             let Some(asset) = agent_brand_asset(identity) else {
                 continue;
             };
-            // `Avatar` defaults to its medium size, so the group stack has to
-            // ask for the small one explicitly now that it no longer rides
-            // `AvatarGroup`'s shared size.
+            // The avatar is sized from the same constant the stack reserves,
+            // so the painted diameter and the reserved width cannot drift.
             let avatar = if asset.uses_current_color {
-                Avatar::new().xsmall().placeholder(
-                    Icon::default()
-                        .path(asset.path)
-                        .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
-                        .text_color(themed_color),
-                )
+                Avatar::new()
+                    .with_size(px(SESSION_GROUP_AVATAR_SIZE))
+                    .placeholder(
+                        Icon::default()
+                            .path(asset.path)
+                            .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
+                            .text_color(themed_color),
+                    )
             } else {
-                Avatar::new().xsmall().src(asset.path)
+                Avatar::new()
+                    .with_size(px(SESSION_GROUP_AVATAR_SIZE))
+                    .src(asset.path)
             };
             stack = stack.child(
                 div()
@@ -33957,12 +33960,6 @@ impl VibexWorkbench {
             member_count,
         };
         let drag_entity = cx.weak_entity();
-        let scope = self
-            .ui_state
-            .sidebar
-            .organization
-            .group_scope(&group_id)
-            .unwrap_or(SidebarOrganizationScope::Root);
 
         let mut row = div()
             .id(format!("sidebar-group-row-{group_id}"))
@@ -34086,26 +34083,25 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .gap_2()
-                    // The avatar column is the same column a session row puts
-                    // its Agent logo in, so a group reads as a sibling of the
-                    // sessions it holds instead of as a different kind of row.
+                    // The row starts on the same column a session row starts
+                    // its content on, so the chevron below lines up with that
+                    // row's Agent logo and a group reads as a sibling of the
+                    // sessions it holds.
                     .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                     .pr_2()
                     .child(
-                        // The disclosure chevron sits in the indent gutter so it
-                        // cannot push the avatars off that column.
-                        div()
-                            .absolute()
-                            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
-                            .child(
-                                sidebar_icon(if collapsed {
-                                    "icons/vibex/chevrons-right.svg"
-                                } else {
-                                    "icons/vibex/chevrons-down-up.svg"
-                                })
-                                .size(px(12.0))
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
-                            ),
+                        // The disclosure chevron is the row's first laid-out
+                        // content, so it lands on the exact column a sibling
+                        // session row puts its Agent logo in. The avatars follow
+                        // it instead of sharing that column.
+                        sidebar_icon(if collapsed {
+                            "icons/vibex/chevrons-right.svg"
+                        } else {
+                            "icons/vibex/chevrons-down-up.svg"
+                        })
+                        .flex_none()
+                        .size(px(12.0))
+                        .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
                     )
                     .child(div().flex_none().child(avatars))
                     .when(!renaming, |this| {
@@ -34169,13 +34165,7 @@ impl VibexWorkbench {
                     }),
             );
         }
-        let mut container = v_flex()
-            .w_full()
-            .min_w_0()
-            .when(scope == SidebarOrganizationScope::Root, |this| {
-                this.left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
-            })
-            .child(row);
+        let mut container = v_flex().w_full().min_w_0().child(row);
         if !collapsed {
             // Member rows sit one level in from the group header, the same step
             // a folder uses. The indent is what tells a grouped session apart
@@ -34230,6 +34220,10 @@ impl VibexWorkbench {
         let delete_entity = entity.clone();
         let delete_id = group_id.clone();
         menu = menu
+            // The group's own name titles the menu, the way a folder's name
+            // titles its menu, instead of trailing every action.
+            .item(PopupMenuItem::label(group_name))
+            .separator()
             .item(
                 PopupMenuItem::new(locale::text(
                     "Auto continue (all sessions)",
@@ -34287,7 +34281,6 @@ impl VibexWorkbench {
                     });
                 }),
             );
-        menu = menu.item(PopupMenuItem::label(group_name));
         menu
     }
 
@@ -36530,30 +36523,39 @@ impl VibexWorkbench {
                                 }),
                             );
                         } else if !session_group_candidates.is_empty() {
-                            menu = menu
-                                .separator()
-                                .item(PopupMenuItem::label(locale::text(
-                                    "Add to session group",
-                                    "加入会话组",
-                                    "加入會話組",
-                                )));
-                            for (candidate_id, candidate_name) in session_group_candidates.clone() {
-                                let join_entity = context_entity.clone();
-                                let join_session_id = menu_session_id_string.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(candidate_name)
-                                        .icon(sidebar_icon("icons/vibex/layers.svg"))
-                                        .on_click(move |_, _, cx| {
-                                            let _ = join_entity.update(cx, |this, cx| {
-                                                this.add_session_to_group_from_menu(
-                                                    &candidate_id,
-                                                    &join_session_id,
-                                                    cx,
-                                                )
-                                            });
-                                        }),
-                                );
-                            }
+                            // The candidate groups live in a submenu, the same
+                            // shape the file row uses for its advanced
+                            // properties, so the menu stays short and the
+                            // choices are one hover away.
+                            let candidates = session_group_candidates.clone();
+                            let submenu_entity = context_entity.clone();
+                            let submenu_session_id = menu_session_id_string.clone();
+                            menu = menu.separator().submenu_with_icon(
+                                Some(sidebar_icon("icons/vibex/layers.svg")),
+                                locale::text("Add to session group", "加入会话组", "加入會話組"),
+                                window,
+                                cx,
+                                move |mut submenu, _window, _cx| {
+                                    for (candidate_id, candidate_name) in candidates.clone() {
+                                        let join_entity = submenu_entity.clone();
+                                        let join_session_id = submenu_session_id.clone();
+                                        submenu = submenu.item(
+                                            PopupMenuItem::new(candidate_name)
+                                                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = join_entity.update(cx, |this, cx| {
+                                                        this.add_session_to_group_from_menu(
+                                                            &candidate_id,
+                                                            &join_session_id,
+                                                            cx,
+                                                        )
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    submenu
+                                },
+                            );
                         }
                         menu
                         .separator()
@@ -79246,11 +79248,53 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_group_menu("))
             .map(|(body, _)| body)
             .expect("sidebar group renderer should remain inspectable");
-        // The avatar column matches the session logo column, and the chevron
-        // lives in the gutter instead of consuming that column.
+        // The row starts on the session row's content column and the chevron is
+        // its first laid-out child, so the chevron lands on the column a session
+        // row puts its Agent logo in. The avatars follow it.
         assert!(group_row.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))"));
-        assert!(group_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        assert!(!group_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        let chevron = group_row
+            .find("sidebar_icon(if collapsed {")
+            .expect("the group row should start with its disclosure chevron");
+        let avatars = group_row
+            .find(".child(div().flex_none().child(avatars))")
+            .expect("the avatar stack should follow the chevron");
+        assert!(chevron < avatars);
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// The group's own name titles its context menu, and a session joins a group
+    /// through a submenu instead of a flat list of every group.
+    #[test]
+    fn session_group_menus_title_the_group_and_nest_the_choices() {
+        let source = include_str!("app.rs");
+
+        let group_menu = source
+            .split_once("    fn build_sidebar_group_menu(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_folder("))
+            .map(|(body, _)| body)
+            .expect("group menu should remain inspectable");
+        let title = group_menu
+            .find("PopupMenuItem::label(group_name)")
+            .expect("the group name should title the menu");
+        let first_action = group_menu
+            .find("Auto continue (all sessions)")
+            .expect("the menu should still offer auto continue");
+        assert!(title < first_action);
+        assert!(
+            !group_menu
+                .trim_end()
+                .ends_with("PopupMenuItem::label(group_name));\n        menu\n    }")
+        );
+
+        let session_menu = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row should remain inspectable");
+        assert!(session_menu.contains("submenu_with_icon("));
+        assert!(session_menu.contains("\"Add to session group\""));
+        assert!(session_menu.contains("move |mut submenu, _window, _cx|"));
     }
 
     /// Every pane renders a complete conversation because every member owns a
