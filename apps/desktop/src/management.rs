@@ -31,7 +31,7 @@ use gpui_component::{
     form::{Field, Form},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
-    notification::Notification,
+    notification::NotificationType,
     scroll::ScrollableElement as _,
     spinner::Spinner,
     switch::Switch,
@@ -72,7 +72,7 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
-use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
+use crate::gpui_ext::{button_with_aria_label, hint_notification, solid_empty_border};
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::resize_seam;
@@ -7019,13 +7019,30 @@ impl ManagementCenter {
         let notification = self
             .error
             .take()
-            .map(|error| Notification::error(locale::localize_error_message(&error)))
-            .or_else(|| {
-                agent_auth_error
-                    .map(|error| Notification::error(locale::localize_error_message(&error)))
+            .map(|error| {
+                hint_notification(
+                    NotificationType::Error,
+                    locale::localize_error_message(&error),
+                    cx,
+                )
             })
             .or_else(|| {
-                notice.map(|notice| Notification::info(locale::localize_ui_message(&notice)))
+                agent_auth_error.map(|error| {
+                    hint_notification(
+                        NotificationType::Error,
+                        locale::localize_error_message(&error),
+                        cx,
+                    )
+                })
+            })
+            .or_else(|| {
+                notice.map(|notice| {
+                    hint_notification(
+                        NotificationType::Info,
+                        locale::localize_ui_message(&notice),
+                        cx,
+                    )
+                })
             });
         let Some(notification) = notification else {
             return;
@@ -22268,8 +22285,9 @@ mod tests {
             presentation
                 .contains("Theme::global_mut(cx).notification.placement = Anchor::TopCenter;")
         );
-        assert!(presentation.contains("Notification::info("));
-        assert!(presentation.contains("Notification::error("));
+        assert!(presentation.contains("hint_notification("));
+        assert!(presentation.contains("NotificationType::Info"));
+        assert!(presentation.contains("NotificationType::Error"));
         assert!(presentation.contains("let agent_auth_error = self.agent_auth_error.take();"));
         assert!(presentation.contains(".id::<ManagementCenterFeedbackNotification>()"));
         assert!(presentation.contains(".autohide(true)"));

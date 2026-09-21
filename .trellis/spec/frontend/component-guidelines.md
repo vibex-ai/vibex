@@ -245,7 +245,7 @@ struct GitMutationNotification;
 
 Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
 window.push_notification(
-    Notification::success(message)
+    hint_notification(NotificationType::Success, message, cx)
         .id::<GitMutationNotification>()
         .autohide(true)
         .on_click(|_, _, _| {}),
@@ -255,6 +255,14 @@ window.push_notification(
 
 Rules that keep the pattern consistent:
 
+- Build every hint through `gpui_ext::hint_notification`. The kit paints
+  `Notification::message` as text no selection layer can reach, so a hint built
+  with `Notification::info` / `success` / `warning` / `error` shows a message the
+  user cannot copy — including the error text they most often need to paste
+  somewhere else. `hint_notification` carries the same message as selectable
+  content instead, and keeps tone, placement, autohide, and the replace-by-id
+  contract on the kit's component. A source contract in `app.rs` rejects the raw
+  tone constructors, so a new hint cannot regress to unselectable text.
 - Set `Theme::global_mut(cx).notification.placement = Anchor::TopCenter` before
   pushing, and give each hint family its own private zero-sized id type so
   unrelated hints do not replace each other.
@@ -271,6 +279,20 @@ Rules that keep the pattern consistent:
 - Keep a validation message inside the dialog or field that rejected the value;
   the notification layer is for results, not for pointing at the control that
   needs correcting.
+
+The selectable message owns three interactions that a hint must not lose, and
+each one is covered by a test in `app.rs`:
+
+- A release that resolved a selection over the message is a copy gesture, not a
+  click, so it must not dismiss the hint and take the selected text with it. The
+  guard reads the run's own selection snapshot rather than the window selection,
+  because a selection elsewhere in the window is not this hint's gesture.
+- A plain click still dismisses the hint, and it must not move focus: a tracked
+  focus handle takes focus on mouse down unless the press is prevented, which
+  would pull the caret out of whatever the user is typing at.
+- The copy shortcut is dispatched from the focused node, so a release that left a
+  selection takes focus. Without that step the selection exists but
+  `ctrl-c`/`cmd-c` copies nothing.
 
 ### GPUI Post-Mutation Scroll Timing
 

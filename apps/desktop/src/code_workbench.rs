@@ -36,7 +36,7 @@ use gpui_component::{
         Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
-    notification::Notification,
+    notification::NotificationType,
     resizable::{h_resizable, resizable_panel, v_resizable},
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
@@ -88,7 +88,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
-use crate::gpui_ext::solid_empty_border;
+use crate::gpui_ext::{hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -179,7 +179,7 @@ fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, c
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
     window.push_notification(
-        Notification::success(message)
+        hint_notification(NotificationType::Success, message, cx)
             .id::<GitMutationNotification>()
             .autohide(true)
             .on_click(|_, _, _| {}),
@@ -198,10 +198,11 @@ fn push_git_mutation_failure_notice(
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
     window.push_notification(
-        Notification::error(format!(
-            "{label}: {}",
-            locale::localize_error_message(error)
-        ))
+        hint_notification(
+            NotificationType::Error,
+            format!("{label}: {}", locale::localize_error_message(error)),
+            cx,
+        )
         .id::<GitMutationNotification>()
         .autohide(true)
         .on_click(|_, _, _| {}),

@@ -56,7 +56,7 @@ use gpui_component::{
     marker::{Marker, MarkerIcon},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     message::MessageAlignment,
-    notification::Notification,
+    notification::NotificationType,
     popover::Popover,
     progress::{Progress, ProgressCircle},
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -182,7 +182,8 @@ use crate::directory_picker::{
     DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
 };
 use crate::gpui_ext::{
-    DOCS_SELF_HOSTED_SERVER_URL, button_with_aria_label, docs_help_button, solid_empty_border,
+    DOCS_SELF_HOSTED_SERVER_URL, button_with_aria_label, docs_help_button, hint_notification,
+    solid_empty_border,
 };
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
@@ -1898,10 +1899,14 @@ impl VibexWorkbench {
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             window.push_notification(
-                Notification::info(locale::localize_ui_message(&note))
-                    .id::<PersistenceNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                hint_notification(
+                    NotificationType::Info,
+                    locale::localize_ui_message(&note),
+                    cx,
+                )
+                .id::<PersistenceNotification>()
+                .autohide(true)
+                .on_click(|_, _, _| {}),
                 cx,
             );
         });
@@ -1928,8 +1933,12 @@ impl VibexWorkbench {
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             let notification = match notice.tone {
-                SettingsOperationTone::Success => Notification::success(notice.message),
-                SettingsOperationTone::Error => Notification::error(notice.message),
+                SettingsOperationTone::Success => {
+                    hint_notification(NotificationType::Success, notice.message, cx)
+                }
+                SettingsOperationTone::Error => {
+                    hint_notification(NotificationType::Error, notice.message, cx)
+                }
             };
             window.push_notification(
                 notification
@@ -14131,7 +14140,11 @@ impl VibexWorkbench {
         self.sidebar_session_drag_state = None;
         if group.workspace_id != drag_workspace_id {
             window.push_notification(
-                Notification::error(self.strings().sidebar_group_other_worktree),
+                hint_notification(
+                    NotificationType::Error,
+                    self.strings().sidebar_group_other_worktree,
+                    cx,
+                ),
                 cx,
             );
             cx.notify();
@@ -20371,10 +20384,14 @@ impl VibexWorkbench {
         }
         if ambiguous_any {
             window.push_notification(
-                Notification::warning(ambiguous_message_submission_notice())
-                    .id::<AmbiguousMessageSubmissionNotification>()
-                    .autohide(true)
-                    .on_click(|_, _, _| {}),
+                hint_notification(
+                    NotificationType::Warning,
+                    ambiguous_message_submission_notice(),
+                    cx,
+                )
+                .id::<AmbiguousMessageSubmissionNotification>()
+                .autohide(true)
+                .on_click(|_, _, _| {}),
                 cx,
             );
         }
@@ -21894,7 +21911,10 @@ impl VibexWorkbench {
                 let message = format!("failed to open the preview window: {error}");
                 eprintln!("{message}");
                 let _ = origin_window.update(cx, |_, window, cx| {
-                    window.push_notification(Notification::error(message.clone()), cx);
+                    window.push_notification(
+                        hint_notification(NotificationType::Error, message.clone(), cx),
+                        cx,
+                    );
                 });
                 cx.notify();
                 return;
@@ -23564,11 +23584,15 @@ impl VibexWorkbench {
         self.fork_session_pending = true;
         self.agent_error = None;
         window.push_notification(
-            Notification::info(locale::text(
-                "Creating forked session...",
-                "正在创建分叉会话...",
-                "正在建立分支會話...",
-            ))
+            hint_notification(
+                NotificationType::Info,
+                locale::text(
+                    "Creating forked session...",
+                    "正在创建分叉会话...",
+                    "正在建立分支會話...",
+                ),
+                cx,
+            )
             .id::<ForkSessionNotification>()
             .autohide(false),
             cx,
@@ -23621,11 +23645,15 @@ impl VibexWorkbench {
                                 this.select_session_with_history(session_id, false, cx);
                             }
                             window.push_notification(
-                                Notification::info(locale::text(
-                                    "Fork created. Preparing its runtime...",
-                                    "分叉会话已创建，正在准备运行时...",
-                                    "分支會話已建立，正在準備執行環境...",
-                                ))
+                                hint_notification(
+                                    NotificationType::Info,
+                                    locale::text(
+                                        "Fork created. Preparing its runtime...",
+                                        "分叉会话已创建，正在准备运行时...",
+                                        "分支會話已建立，正在準備執行環境...",
+                                    ),
+                                    cx,
+                                )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
                                 cx,
@@ -23672,11 +23700,15 @@ impl VibexWorkbench {
                                 this.refresh_selected_agent_timeline(cx);
                             }
                             window.push_notification(
-                                Notification::success(locale::text(
-                                    "Forked session is ready",
-                                    "分叉会话已就绪",
-                                    "分支會話已就緒",
-                                ))
+                                hint_notification(
+                                    NotificationType::Success,
+                                    locale::text(
+                                        "Forked session is ready",
+                                        "分叉会话已就绪",
+                                        "分支會話已就緒",
+                                    ),
+                                    cx,
+                                )
                                 .id::<ForkSessionNotification>(),
                                 cx,
                             );
@@ -23707,7 +23739,7 @@ impl VibexWorkbench {
                                 )
                             };
                             window.push_notification(
-                                Notification::error(message)
+                                hint_notification(NotificationType::Error, message, cx)
                                     .id::<ForkSessionNotification>()
                                     .autohide(false),
                                 cx,
@@ -23721,11 +23753,15 @@ impl VibexWorkbench {
                                     Some(format!("session fork task failed: {error}"));
                             }
                             window.push_notification(
-                                Notification::error(locale::text(
-                                    "Forked session setup was interrupted",
-                                    "分叉会话设置已中断",
-                                    "分支會話設定已中斷",
-                                ))
+                                hint_notification(
+                                    NotificationType::Error,
+                                    locale::text(
+                                        "Forked session setup was interrupted",
+                                        "分叉会话设置已中断",
+                                        "分支會話設定已中斷",
+                                    ),
+                                    cx,
+                                )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
                                 cx,
@@ -25920,11 +25956,15 @@ impl VibexWorkbench {
         self.fork_session_pending = true;
         self.agent_error = None;
         window.push_notification(
-            Notification::info(locale::text(
-                "Creating forked session...",
-                "正在创建分叉会话...",
-                "正在建立分支會話...",
-            ))
+            hint_notification(
+                NotificationType::Info,
+                locale::text(
+                    "Creating forked session...",
+                    "正在创建分叉会话...",
+                    "正在建立分支會話...",
+                ),
+                cx,
+            )
             .id::<ForkSessionNotification>()
             .autohide(false),
             cx,
@@ -25953,11 +25993,15 @@ impl VibexWorkbench {
                             this.upsert_session_snapshot(session.clone());
                             this.reconcile_sidebar_state();
                             window.push_notification(
-                                Notification::info(locale::text(
-                                    "Fork created. Preparing its runtime...",
-                                    "分叉会话已创建，正在准备运行时...",
-                                    "分支會話已建立，正在準備執行環境...",
-                                ))
+                                hint_notification(
+                                    NotificationType::Info,
+                                    locale::text(
+                                        "Fork created. Preparing its runtime...",
+                                        "分叉会话已创建，正在准备运行时...",
+                                        "分支會話已建立，正在準備執行環境...",
+                                    ),
+                                    cx,
+                                )
                                 .id::<ForkSessionNotification>()
                                 .autohide(false),
                                 cx,
@@ -29016,11 +29060,15 @@ impl VibexWorkbench {
         }
         let Some(home) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
             window.push_notification(
-                Notification::error(locale::text(
-                    "Project icon storage is unavailable",
-                    "项目图标存储不可用",
-                    "專案圖示儲存空間無法使用",
-                )),
+                hint_notification(
+                    NotificationType::Error,
+                    locale::text(
+                        "Project icon storage is unavailable",
+                        "项目图标存储不可用",
+                        "專案圖示儲存空間無法使用",
+                    ),
+                    cx,
+                ),
                 cx,
             );
             return;
@@ -29063,27 +29111,35 @@ impl VibexWorkbench {
                         Ok(Ok(None)) => {}
                         Ok(Err(error)) => {
                             window.push_notification(
-                                Notification::error(format!(
-                                    "{}: {error}",
-                                    locale::text(
-                                        "Could not use project icon",
-                                        "无法使用项目图标",
-                                        "無法使用專案圖示",
-                                    )
-                                )),
+                                hint_notification(
+                                    NotificationType::Error,
+                                    format!(
+                                        "{}: {error}",
+                                        locale::text(
+                                            "Could not use project icon",
+                                            "无法使用项目图标",
+                                            "無法使用專案圖示",
+                                        )
+                                    ),
+                                    cx,
+                                ),
                                 cx,
                             );
                         }
                         Err(error) => {
                             window.push_notification(
-                                Notification::error(format!(
-                                    "{}: {error}",
-                                    locale::text(
-                                        "Could not open project icon",
-                                        "无法打开项目图标",
-                                        "無法開啟專案圖示",
-                                    )
-                                )),
+                                hint_notification(
+                                    NotificationType::Error,
+                                    format!(
+                                        "{}: {error}",
+                                        locale::text(
+                                            "Could not open project icon",
+                                            "无法打开项目图标",
+                                            "無法開啟專案圖示",
+                                        )
+                                    ),
+                                    cx,
+                                ),
                                 cx,
                             );
                         }
@@ -65075,7 +65131,8 @@ mod tests {
 
     use super::*;
     use crate::assets::{AgentBrandAsset, agent_brand_asset};
-    use gpui::{Modifiers, TestAppContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui_component::notification::Notification;
     use vibex_core::{
         AgentCommandExecutionBehavior, AgentCommandSelectionBehavior, AgentId,
         AgentMessageDeltaPayload, AgentMessagePayload, FileOperationPayload, GitChange,
@@ -73511,7 +73568,8 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn dismiss_submission_status("))
             .map(|(body, _)| body)
             .expect("submission reconciliation should remain inspectable");
-        assert!(reconciliation.contains("Notification::warning("));
+        assert!(reconciliation.contains("NotificationType::Warning"));
+        assert!(reconciliation.contains("hint_notification("));
         assert!(reconciliation.contains("ambiguous_message_submission_notice()"));
         assert!(reconciliation.contains(".id::<AmbiguousMessageSubmissionNotification>()"));
         assert!(reconciliation.contains(".autohide(true)"));
@@ -73630,6 +73688,213 @@ mod tests {
         });
     }
 
+    /// How long a dismissed hint needs to leave the stack.
+    ///
+    /// The kit's exit transition is 200ms; the extra frame keeps the assertion
+    /// from racing the animation.
+    const HINT_DISMISS_SETTLE: Duration = Duration::from_millis(400);
+
+    /// Renders the hint layer the way the workbench root does, over a
+    /// focusable surface that stands in for the caret the user was typing at.
+    struct SelectableHintProbe {
+        anchor_focus: FocusHandle,
+    }
+
+    impl SelectableHintProbe {
+        fn new(cx: &mut Context<Self>) -> Self {
+            Self {
+                anchor_focus: cx.focus_handle(),
+            }
+        }
+    }
+
+    impl Render for SelectableHintProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .id("selectable-hint-probe")
+                .size_full()
+                .child(
+                    div()
+                        .id("selectable-hint-focus-anchor")
+                        .track_focus(&self.anchor_focus)
+                        .size_full()
+                        .bg(gpui::black()),
+                )
+                .child(render_top_centered_notification_layer(window, cx))
+        }
+    }
+
+    /// Pushes one hint onto a window that renders the real notification layer,
+    /// with the probe's focusable surface holding focus behind it.
+    fn selectable_hint_window<'a>(
+        message: &'static str,
+        cx: &'a mut TestAppContext,
+    ) -> (&'a mut VisualTestContext, FocusHandle) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+            // The hint's enter animation is wall-clock driven and would leave
+            // the card above the viewport, where no pointer can reach it.
+            cx.set_reduce_motion(true);
+        });
+        let probe = cx.update(|cx| cx.new(SelectableHintProbe::new));
+        let anchor_focus = probe.read_with(cx, |probe, _| probe.anchor_focus.clone());
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            Root::new(probe, window, cx).bordered(false)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            window.focus(&anchor_focus, cx);
+            window.push_notification(
+                hint_notification(NotificationType::Error, message, cx)
+                    .autohide(false)
+                    // The workbench's dismissable hints carry this handler, and
+                    // it is what a drag must not trigger.
+                    .on_click(|_, _, _| {}),
+                cx,
+            );
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        (cx, anchor_focus)
+    }
+
+    fn mounted_hint_count(cx: &mut VisualTestContext) -> usize {
+        cx.update(|window, cx| {
+            Root::read(window, cx)
+                .notification
+                .read(cx)
+                .notifications()
+                .len()
+        })
+    }
+
+    /// A hint's message is only worth showing if it can leave the app: the
+    /// pointer has to be able to select it, and the platform copy shortcut has
+    /// to copy the selection.
+    #[gpui::test]
+    fn a_hint_message_can_be_drag_selected_and_copied(cx: &mut TestAppContext) {
+        let message = "Could not save settings: permission denied";
+        let (cx, anchor_focus) = selectable_hint_window(message, cx);
+        let bounds = cx
+            .debug_bounds("hint-notification-text")
+            .expect("the hint message should be laid out");
+
+        // A message long enough to wrap is dragged corner to corner, so the
+        // assertion covers the whole run and not just its last line.
+        let grab = point(bounds.left() + px(2.0), bounds.top() + px(2.0));
+        let release = point(bounds.right() - px(2.0), bounds.bottom() - px(2.0));
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(release, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(release, MouseButton::Left, Modifiers::none());
+
+        assert_eq!(
+            cx.update(gpui_base::TextSelection::selected_text),
+            message,
+            "the whole hint message should be selectable"
+        );
+        let copy_chord = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        cx.simulate_keystrokes(copy_chord);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(message.to_string()),
+            "the copy shortcut should copy the selected hint"
+        );
+
+        // Releasing the drag is also a click, and the hint must survive it:
+        // dismissing here would take the selected text off the screen.
+        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(
+            mounted_hint_count(cx),
+            1,
+            "a selection release must not dismiss the hint"
+        );
+
+        // The hint is about to unmount, and it is holding the focus the drag
+        // took so the copy shortcut could reach the selection. Closing it hands
+        // that focus back instead of leaving the window with no caret.
+        let list = cx.update(|window, cx| Root::read(window, cx).notification.clone());
+        cx.update(|window, cx| {
+            list.update(cx, |list, cx| list.clear(window, cx));
+        });
+        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(mounted_hint_count(cx), 0);
+        assert!(
+            cx.update(|window, _| anchor_focus.is_focused(window)),
+            "closing a hint must give back the focus its selection took"
+        );
+    }
+
+    /// The guard around a selection release must not cost the hint its
+    /// click-to-dismiss behavior.
+    #[gpui::test]
+    fn a_plain_click_on_a_hint_message_still_dismisses_it(cx: &mut TestAppContext) {
+        let (cx, anchor_focus) = selectable_hint_window("Saved", cx);
+        let bounds = cx
+            .debug_bounds("hint-notification-text")
+            .expect("the hint message should be laid out");
+
+        cx.simulate_click(bounds.center(), Modifiers::none());
+
+        assert_eq!(
+            cx.update(gpui_base::TextSelection::selected_text),
+            "",
+            "a plain click selects nothing"
+        );
+        assert!(
+            cx.update(|window, _| anchor_focus.is_focused(window)),
+            "a plain click must not move the focus the user is typing at"
+        );
+        cx.background_executor.advance_clock(HINT_DISMISS_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(
+            mounted_hint_count(cx),
+            0,
+            "a plain click still dismisses the hint"
+        );
+    }
+
+    /// The kit paints `Notification::message` as text no selection layer can
+    /// reach, so a hint built with one of its tone constructors shows a message
+    /// the user cannot copy. Every hint in the workbench has to be built through
+    /// `hint_notification`, which carries the message as selectable content.
+    #[test]
+    fn every_light_hint_carries_selectable_text() {
+        // This test names the constructors it rejects, so only the production
+        // region of each file is inspected.
+        let production = |source: &'static str| {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(source, |(head, _)| head)
+        };
+        for (path, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("code_workbench.rs", include_str!("code_workbench.rs")),
+            ("management.rs", include_str!("management.rs")),
+        ] {
+            let source = production(source);
+            for tone in ["info", "success", "warning", "error"] {
+                let constructor = format!("Notification::{tone}(");
+                assert!(
+                    !source.contains(&constructor),
+                    "{path} builds a hint with {constructor}; build it with hint_notification so its text can be copied"
+                );
+            }
+        }
+    }
+
     #[test]
     fn persistence_notes_use_top_light_notifications_instead_of_a_page_banner() {
         let source = include_str!("app.rs");
@@ -73639,7 +73904,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("persistence note presenter should remain inspectable");
         assert!(presenter.contains("self.persistence_note.take()"));
-        assert!(presenter.contains("Notification::info(locale::localize_ui_message(&note))"));
+        assert!(presenter.contains("hint_notification("));
+        assert!(presenter.contains("NotificationType::Info"));
+        assert!(presenter.contains("locale::localize_ui_message(&note)"));
         assert!(presenter.contains(".id::<PersistenceNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
         assert!(presenter.contains(".on_click(|_, _, _| {})"));
@@ -73663,8 +73930,9 @@ mod tests {
             .map(|(body, _)| body)
             .expect("settings operation presenter should remain inspectable");
         assert!(presenter.contains("self.settings_operation_notice.take()"));
-        assert!(presenter.contains("Notification::success(notice.message)"));
-        assert!(presenter.contains("Notification::error(notice.message)"));
+        assert!(presenter.contains("NotificationType::Success, notice.message"));
+        assert!(presenter.contains("NotificationType::Error, notice.message"));
+        assert!(presenter.contains("hint_notification("));
         assert!(presenter.contains(".id::<SettingsOperationNotification>()"));
         assert!(presenter.contains(".autohide(true)"));
         assert!(presenter.contains(".on_click(|_, _, _| {})"));
