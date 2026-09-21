@@ -6530,10 +6530,6 @@ pub struct VibexWorkbench {
     /// row has been revealed, so a later manual scroll is never yanked back to
     /// an old card.
     pending_permission_reveal_item_id: Option<String>,
-    /// The pending-request set the user dismissed the permission alert for, by
-    /// session. Keying the dismissal by the set means the next request shows
-    /// the alert again instead of staying hidden for the rest of the session.
-    dismissed_permission_alert_signatures: BTreeMap<String, String>,
     sidebar_rename_input: Entity<InputState>,
     user_message_edit_input: Entity<TextareaState>,
     composer_queue_edit_input: Entity<TextareaState>,
@@ -7456,7 +7452,6 @@ impl VibexWorkbench {
             conversation_find_active_match_ordinal: 0,
             pending_session_search_reveal_item_id: None,
             pending_permission_reveal_item_id: None,
-            dismissed_permission_alert_signatures: BTreeMap::new(),
             sidebar_rename_input,
             user_message_edit_input,
             composer_queue_edit_input,
@@ -18209,16 +18204,20 @@ impl VibexWorkbench {
     /// the sidebar shows for it.
     ///
     /// Dismissing the alert is a view decision: the request stays pending and
-    /// the Agent stays parked. The refresh keeps the sidebar row honest — it
-    /// reads the session's latest state instead of the state the alert was
-    /// raised against.
+    /// the Agent stays parked. It is persisted with the rest of the UI state,
+    /// so acknowledging a request survives a restart. The refresh keeps the
+    /// sidebar row honest — it reads the session's latest state instead of the
+    /// state the alert was raised against.
     fn dismiss_pending_permission_alert(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.timeline.session_id.clone() else {
             return;
         };
         if let Some(signature) = self.pending_permission_alert_signature() {
-            self.dismissed_permission_alert_signatures
+            self.ui_state
+                .session
+                .dismissed_permission_alerts
                 .insert(session_id.as_str().to_string(), signature);
+            self.queue_ui_state();
         }
         self.load_agent_overview(cx);
         if self.selected_session_id.as_ref() == Some(&session_id) {
@@ -18237,7 +18236,9 @@ impl VibexWorkbench {
             return false;
         };
         let Some(dismissed) = self
-            .dismissed_permission_alert_signatures
+            .ui_state
+            .session
+            .dismissed_permission_alerts
             .get(session_id.as_str())
         else {
             return false;
@@ -26731,7 +26732,9 @@ impl VibexWorkbench {
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_user_request_ids
             .retain(|session_id, _| !session_ids.contains(session_id));
-        self.dismissed_permission_alert_signatures
+        self.ui_state
+            .session
+            .dismissed_permission_alerts
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_search_index
             .retain(|session_id, _| !session_ids.contains(session_id));
@@ -26764,6 +26767,7 @@ impl VibexWorkbench {
         }
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
+        self.queue_ui_state();
     }
 
     fn confirm_delete_project(
@@ -72685,6 +72689,10 @@ mod tests {
         assert!(dismiss.contains("self.load_agent_overview(cx);"));
         assert!(dismiss.contains("self.refresh_selected_agent_timeline(cx);"));
         assert!(!dismiss.contains("pending_user_request_ids"));
+        // The dismissal rides the persisted UI state, so a restart does not
+        // bring the alert back.
+        assert!(dismiss.contains("dismissed_permission_alerts"));
+        assert!(dismiss.contains("self.queue_ui_state();"));
 
         // A dismissal only holds while the same requests are pending, so the
         // next request shows the alert again.
@@ -72693,6 +72701,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    /// The pending-request set"))
             .map(|(body, _)| body)
             .expect("alert dismissal state should remain inspectable");
+        assert!(dismissed.contains("dismissed_permission_alerts"));
         assert!(dismissed.contains("pending_permission_alert_signature"));
     }
 

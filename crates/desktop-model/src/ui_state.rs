@@ -1012,6 +1012,11 @@ pub struct SessionUiState {
     /// resumes it or sends a new message.
     #[serde(default)]
     pub auto_continue_paused_session_ids: BTreeSet<String>,
+    /// The pending-request set the "Permission waiting for review" alert was
+    /// dismissed for, by session. Persisted so acknowledging a request survives
+    /// a restart; a new request changes the set and brings the alert back.
+    #[serde(default)]
+    pub dismissed_permission_alerts: BTreeMap<String, String>,
 }
 
 impl Default for SessionUiState {
@@ -1027,6 +1032,7 @@ impl Default for SessionUiState {
             auto_continue_project_ids: BTreeSet::new(),
             auto_continue_session_overrides: BTreeMap::new(),
             auto_continue_paused_session_ids: BTreeSet::new(),
+            dismissed_permission_alerts: BTreeMap::new(),
         }
     }
 }
@@ -1387,6 +1393,16 @@ impl DesktopUiStateV1 {
                 })
                 .take(2_000)
                 .collect();
+        self.session.dismissed_permission_alerts =
+            std::mem::take(&mut self.session.dismissed_permission_alerts)
+                .into_iter()
+                .filter_map(|(session_id, signature)| {
+                    bounded_required(&session_id, 256)
+                        .zip(bounded_required(&signature, 4_096))
+                        .map(|(session_id, signature)| (session_id, signature))
+                })
+                .take(2_000)
+                .collect();
         normalize_ids(&mut self.agent_tab_order, 256);
         self.terminal_tab_titles = std::mem::take(&mut self.terminal_tab_titles)
             .into_iter()
@@ -1450,6 +1466,9 @@ impl DesktopUiStateV1 {
         self.session
             .auto_continue_paused_session_ids
             .retain(|id| references.session_ids.contains(id));
+        self.session
+            .dismissed_permission_alerts
+            .retain(|id, _| references.session_ids.contains(id));
         self.terminal
             .tab_order
             .retain(|id| references.terminal_ids.contains(id));
@@ -2902,6 +2921,7 @@ mod tests {
         session.remove("autoContinueProjectIds");
         session.remove("autoContinueSessionOverrides");
         session.remove("autoContinuePausedSessionIds");
+        session.remove("dismissedPermissionAlerts");
 
         let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -2916,6 +2936,7 @@ mod tests {
         assert!(decoded.session.auto_continue_project_ids.is_empty());
         assert!(decoded.session.auto_continue_session_overrides.is_empty());
         assert!(decoded.session.auto_continue_paused_session_ids.is_empty());
+        assert!(decoded.session.dismissed_permission_alerts.is_empty());
     }
 
     #[test]
@@ -3399,6 +3420,29 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn dismissed_permission_alerts_survive_a_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-ui-state.json");
+        let store = UiStateStore::new(&path);
+        let mut state = DesktopUiStateV1::default();
+        state
+            .session
+            .dismissed_permission_alerts
+            .insert("session_fixture".into(), "request_a|request_b".into());
+        store.save(&state).unwrap();
+
+        let loaded = store.load_or_default(1_000).unwrap().state;
+        assert_eq!(
+            loaded
+                .session
+                .dismissed_permission_alerts
+                .get("session_fixture")
+                .map(String::as_str),
+            Some("request_a|request_b")
         );
     }
 
