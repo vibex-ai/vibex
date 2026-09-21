@@ -10385,35 +10385,7 @@ impl ManagementCenter {
                 management_mcp_resources_title(),
                 resource_count,
                 cx,
-            ))
-            .child(
-                Button::new("management-mcp-new")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .label(management_locale_text(
-                        "New MCP server",
-                        "新建 MCP 服务",
-                        "新建 MCP 服務",
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_mcp_editor(None, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("management-mcp-market")
-                    .small()
-                    .ghost()
-                    .w_full()
-                    .label(management_locale_text(
-                        "Browse MCP market",
-                        "浏览 MCP 市场",
-                        "瀏覽 MCP 市場",
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_mcp_market_dialog(window, cx)),
-                    ),
-            );
+            ));
         if servers.is_empty() {
             if self.loading && self.snapshot.mcp_servers.is_empty() {
                 // This list has no loading gate of its own, so without this it
@@ -10528,6 +10500,40 @@ impl ManagementCenter {
             .min_h_0()
             .gap(px(10.0))
             .child(
+                Button::new("management-mcp-new")
+                    .small()
+                    .secondary()
+                    .w_full()
+                    .h(px(32.0))
+                    .justify_start()
+                    .icon(Icon::default().path("icons/vibex/file-plus.svg"))
+                    .label(management_locale_text(
+                        "New MCP server",
+                        "新建 MCP 服务",
+                        "新建 MCP 服務",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_mcp_editor(None, window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("management-mcp-market")
+                    .small()
+                    .secondary()
+                    .w_full()
+                    .h(px(32.0))
+                    .justify_start()
+                    .icon(Icon::default().path("icons/vibex/package.svg"))
+                    .label(management_locale_text(
+                        "Browse MCP market",
+                        "浏览 MCP 市场",
+                        "瀏覽 MCP 市場",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_mcp_market_dialog(window, cx)),
+                    ),
+            )
+            .child(
                 Button::new("management-mcp-import-sidebar")
                     .small()
                     .secondary()
@@ -10575,39 +10581,14 @@ impl ManagementCenter {
             .cloned()
             .collect::<Vec<_>>();
         let resource_count = skills.len();
-        let mut rows =
-            v_flex()
-                .w_full()
-                .gap(px(6.0))
-                .child(management_resource_sidebar_header(
-                    management_skills_title(),
-                    resource_count,
-                    cx,
-                ))
-                .child(
-                    Button::new("management-skill-new")
-                        .small()
-                        .ghost()
-                        .w_full()
-                        .label(management_locale_text("New Skill", "新建技能", "新建技能"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_skill_editor(None, window, cx)
-                        })),
-                )
-                .child(
-                    Button::new("management-skill-market")
-                        .small()
-                        .ghost()
-                        .w_full()
-                        .label(management_locale_text(
-                            "Browse Skill market",
-                            "浏览技能市场",
-                            "瀏覽技能市場",
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_skill_market_dialog(window, cx)
-                        })),
-                );
+        let mut rows = v_flex()
+            .w_full()
+            .gap(px(6.0))
+            .child(management_resource_sidebar_header(
+                management_skills_title(),
+                resource_count,
+                cx,
+            ));
         if skills.is_empty() {
             if self.loading && self.snapshot.skills.is_empty() {
                 // Same as the MCP list: no loading gate of its own, so it would
@@ -10719,6 +10700,38 @@ impl ManagementCenter {
             .size_full()
             .min_h_0()
             .gap(px(10.0))
+            .child(
+                Button::new("management-skill-new")
+                    .small()
+                    .secondary()
+                    .w_full()
+                    .h(px(32.0))
+                    .justify_start()
+                    .icon(Icon::default().path("icons/vibex/file-plus.svg"))
+                    .label(management_locale_text("New Skill", "新建技能", "新建技能"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_skill_editor(None, window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("management-skill-market")
+                    .small()
+                    .secondary()
+                    .w_full()
+                    .h(px(32.0))
+                    .justify_start()
+                    .icon(Icon::default().path("icons/vibex/package.svg"))
+                    .label(management_locale_text(
+                        "Browse Skill market",
+                        "浏览技能市场",
+                        "瀏覽技能市場",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_skill_market_dialog(window, cx)
+                        }),
+                    ),
+            )
             .child(
                 Button::new("management-skill-import-sidebar")
                     .small()
