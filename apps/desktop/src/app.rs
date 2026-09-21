@@ -375,8 +375,9 @@ const RUNTIME_MANAGER_ROW_HEIGHT: f32 = 46.0;
 /// Every row reserves this lane for the active check, so the status labels
 /// beside it keep one right edge whether or not a row is the active one.
 const RUNTIME_MANAGER_CHECK_LANE_WIDTH: f32 = 16.0;
-/// Every row also reserves the detail lane. Only remotes have a detail stage,
-/// but holding the lane open keeps the status column unbroken across rows.
+/// The trailing lane a remote row gives its detail chevron. A row with nothing
+/// to inspect simply ends after its status: holding the lane open would leave
+/// the embedded runtime's check floating a lane short of the row's edge.
 const RUNTIME_MANAGER_DETAIL_LANE_WIDTH: f32 = 28.0;
 const RUNTIME_DETAIL_LABEL_WIDTH: f32 = 76.0;
 /// The runtime stack glyph. `Boxes` is not part of gpui-component's
@@ -423,6 +424,8 @@ const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 /// How many stacked Agent avatars a session group row shows before the `+N`
 /// ellipsis chip. Matches the product limit for the group row.
 const SESSION_GROUP_AVATAR_LIMIT: usize = 5;
+/// Display size of a monochrome Agent mark inside a group avatar.
+const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 13.0;
 /// How many recent turns a non-focused group pane previews.
 const SESSION_GROUP_PANE_PREVIEW_TURNS: usize = 4;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
@@ -5662,7 +5665,6 @@ impl Render for SidebarGroupDrag {
 
 #[derive(Clone)]
 struct SessionGroupTabDrag {
-    pane_id: String,
     session_id: String,
     label: SharedString,
     agent_id: String,
@@ -9644,32 +9646,25 @@ impl VibexWorkbench {
             })
             .when(selected, |this| this.bg(cx.theme().secondary_active))
             .child(row)
-            .child(if detail_available {
+            .when(detail_available, |this| {
                 // A two-target row, matching the title bar's session heading
                 // plus its actions menu: the body switches, the trailing lane
                 // inspects without changing the authority.
-                Button::new(SharedString::from(format!("runtime-detail-{id}")))
-                    .small()
-                    .custom(row_surface)
-                    .compact()
-                    .size(px(RUNTIME_MANAGER_DETAIL_LANE_WIDTH))
-                    .px_0()
-                    .flex_none()
-                    .tooltip(locale::text("Details", "详情", "詳細資料"))
-                    .accessibility_label(locale::text("Details", "详情", "詳細資料"))
-                    .child(Icon::new(IconName::ChevronRight).size(px(14.0)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_runtime_detail(detail_id.clone(), cx)
-                    }))
-                    .into_any_element()
-            } else {
-                // The embedded runtime has nothing to inspect, but its lane is
-                // still held open: every row's status label and check must land
-                // on the same right edge, or the column breaks in half.
-                div()
-                    .flex_none()
-                    .w(px(RUNTIME_MANAGER_DETAIL_LANE_WIDTH))
-                    .into_any_element()
+                this.child(
+                    Button::new(SharedString::from(format!("runtime-detail-{id}")))
+                        .small()
+                        .custom(row_surface)
+                        .compact()
+                        .size(px(RUNTIME_MANAGER_DETAIL_LANE_WIDTH))
+                        .px_0()
+                        .flex_none()
+                        .tooltip(locale::text("Details", "详情", "詳細資料"))
+                        .accessibility_label(locale::text("Details", "详情", "詳細資料"))
+                        .child(Icon::new(IconName::ChevronRight).size(px(14.0)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_runtime_detail(detail_id.clone(), cx)
+                        })),
+                )
             })
             .into_any_element()
     }
@@ -9976,8 +9971,12 @@ impl VibexWorkbench {
         let busy = self.runtime_add_busy;
         let code_tab = self.runtime_add_tab == RuntimeAddTab::Code;
         let mut fields = v_flex().w_full().gap_2().child(
+            // Underline tabs: the two entries are the same form's two ways in,
+            // so the bar draws one hairline under the active label instead of
+            // boxing each entry into its own control.
             TabBar::new("runtime-add-tabs")
                 .small()
+                .underline()
                 .selected_index(if code_tab { 0 } else { 1 })
                 .on_click(cx.listener(|this, index: &usize, _, cx| {
                     this.runtime_add_tab = if *index == 0 {
@@ -13873,6 +13872,51 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Adds one session to a group from the session's own menu.
+    fn add_session_to_group_from_menu(
+        &mut self,
+        group_id: &str,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let session_workspaces = self.sidebar_session_workspaces();
+        if !self.ui_state.sidebar.organization.add_sessions_to_group(
+            group_id,
+            std::slice::from_ref(&session_id.to_string()),
+            &session_workspaces,
+        ) {
+            return;
+        }
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_group_ids
+            .remove(group_id);
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
+    /// Removes one session from whatever group holds it.
+    fn remove_session_from_group_from_menu(
+        &mut self,
+        group_id: &str,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .ui_state
+            .sidebar
+            .organization
+            .remove_sessions_from_group(group_id, std::slice::from_ref(&session_id.to_string()))
+        {
+            return;
+        }
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
     fn toggle_sidebar_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
         if self
             .ui_state
@@ -15402,6 +15446,7 @@ impl VibexWorkbench {
         let generation = self.session_generation;
         let previous_session_id = self.selected_session_id.clone();
         self.selected_session_id = Some(session_id.clone());
+        self.sync_session_group_focus(&session_id);
         self.turn_preview_rail_visible = false;
         self.turn_preview_active_index = None;
         self.sync_management_pairing_context(cx);
@@ -31932,7 +31977,9 @@ impl VibexWorkbench {
                         cx,
                     ));
                 }
-                SidebarOrganizationItem::Group(group_id) => {
+                SidebarOrganizationItem::Group(group_id)
+                    if parent_folder_id.is_some() || include_root_sessions =>
+                {
                     // Flush the flat session run so the group row keeps its
                     // place among the sessions it was dropped between.
                     push_sidebar_session_run(
@@ -31999,7 +32046,9 @@ impl VibexWorkbench {
                         run.push(*index);
                     }
                 }
-                SidebarOrganizationItem::Project(_) | SidebarOrganizationItem::Session(_) => {}
+                SidebarOrganizationItem::Project(_)
+                | SidebarOrganizationItem::Session(_)
+                | SidebarOrganizationItem::Group(_) => {}
             }
         }
         push_sidebar_session_run(
@@ -32226,10 +32275,26 @@ impl VibexWorkbench {
     /// `AvatarGroup` owns the overlap, the `limit` and the `+N` ellipsis chip;
     /// each `Avatar` takes the Agent's brand SVG so a group reads as its Agents
     /// rather than as a set of initials.
-    fn session_group_avatars(&self, group: &SessionGroupUiState, _cx: &App) -> AnyElement {
+    fn session_group_avatars(&self, group: &SessionGroupUiState, cx: &App) -> AnyElement {
         let identities = self.session_group_agent_identities(group);
+        // A polychrome brand mark keeps its embedded colours and is drawn as an
+        // image. A monochrome mark is an alpha mask, so it has to be painted
+        // with the sidebar foreground or it would stay black and disappear on
+        // the dark surface.
+        let themed_color = cx.theme().sidebar_foreground.opacity(0.80);
         let avatars = identities.iter().filter_map(|identity| {
-            agent_brand_asset(identity).map(|asset| Avatar::new().src(asset.path))
+            agent_brand_asset(identity).map(|asset| {
+                if asset.uses_current_color {
+                    Avatar::new().placeholder(
+                        Icon::default()
+                            .path(asset.path)
+                            .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
+                            .text_color(themed_color),
+                    )
+                } else {
+                    Avatar::new().src(asset.path)
+                }
+            })
         });
         AvatarGroup::new()
             .limit(SESSION_GROUP_AVATAR_LIMIT)
@@ -32412,16 +32477,23 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let group = self.ui_state.sidebar.organization.group(group_id).cloned();
-        let Some(group) = group else {
+        if self.ui_state.sidebar.organization.group(group_id).is_none() {
             return Empty.into_any_element();
-        };
-        let focused = group.focused_pane_id == pane.id;
+        }
+        // The pane holding the selected session is the focused one. Deriving it
+        // from the selection rather than only from the stored layout keeps a
+        // restored layout from disagreeing with what the sidebar selected.
+        let focused = self.selected_session_id.as_ref().is_some_and(|selected| {
+            pane.session_ids
+                .iter()
+                .any(|session_id| session_id == selected.as_str())
+        });
         let active_session_id = pane.active_session_id.clone();
         let pane_id = pane.id.clone();
-        let drop_region = self
-            .session_group_pane_drop_target
-            .as_ref()
+        let drop_region = cx
+            .has_active_drag()
+            .then_some(self.session_group_pane_drop_target.as_ref())
+            .flatten()
             .filter(|target| target.pane_id == pane_id)
             .map(|target| target.region);
         let strings = self.strings();
@@ -32442,6 +32514,9 @@ impl VibexWorkbench {
                 ))
             })
             .collect::<Vec<_>>();
+        // Splitting needs a session to leave behind, so a pane holding one tab
+        // cannot split.
+        let can_split_pane = pane.session_ids.len() > 1;
         let mut tab_strip = h_flex()
             .id(format!("session-group-tabs-{pane_id}"))
             .flex_none()
@@ -32498,13 +32573,91 @@ impl VibexWorkbench {
                     })
                     .on_drag(
                         SessionGroupTabDrag {
-                            pane_id: pane_id.clone(),
                             session_id: session_id.clone(),
                             label: title.clone().into(),
                             agent_id: agent_id.clone(),
                         },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
-                    ),
+                    )
+                    .context_menu({
+                        let menu_entity = cx.weak_entity();
+                        let menu_group_id = group_id.to_string();
+                        let menu_pane_id = pane_id.clone();
+                        let menu_session_id = session_id.clone();
+                        let can_split = can_split_pane;
+                        move |menu, _window, cx| {
+                            let _ = cx;
+                            let split_entity = menu_entity.clone();
+                            let split_group_id = menu_group_id.clone();
+                            let split_pane_id = menu_pane_id.clone();
+                            let split_session_id = menu_session_id.clone();
+                            let down_entity = menu_entity.clone();
+                            let down_group_id = menu_group_id.clone();
+                            let down_pane_id = menu_pane_id.clone();
+                            let down_session_id = menu_session_id.clone();
+                            let leave_entity = menu_entity.clone();
+                            let leave_group_id = menu_group_id.clone();
+                            let leave_session_id = menu_session_id.clone();
+                            menu.item(
+                                PopupMenuItem::new(locale::text(
+                                    "Split right",
+                                    "向右分屏",
+                                    "向右分割",
+                                ))
+                                .icon(sidebar_icon("icons/vibex/columns-2.svg"))
+                                .disabled(!can_split)
+                                .on_click(move |_, _, cx| {
+                                    let _ = split_entity.update(cx, |this, cx| {
+                                        this.drop_session_group_tab(
+                                            &split_group_id,
+                                            &split_pane_id,
+                                            &split_session_id,
+                                            SessionGroupPaneDropRegion::Right,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Split down",
+                                    "向下分屏",
+                                    "向下分割",
+                                ))
+                                .icon(sidebar_icon("icons/vibex/mosaic.svg"))
+                                .disabled(!can_split)
+                                .on_click(move |_, _, cx| {
+                                    let _ = down_entity.update(cx, |this, cx| {
+                                        this.drop_session_group_tab(
+                                            &down_group_id,
+                                            &down_pane_id,
+                                            &down_session_id,
+                                            SessionGroupPaneDropRegion::Bottom,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Remove from session group",
+                                    "移出会话组",
+                                    "移出會話組",
+                                ))
+                                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = leave_entity.update(cx, |this, cx| {
+                                        this.remove_session_from_group_from_menu(
+                                            &leave_group_id,
+                                            &leave_session_id,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                        }
+                    }),
             );
         }
 
@@ -32563,9 +32716,6 @@ impl VibexWorkbench {
             .on_drag_move(cx.listener({
                 let pane_id = pane_id.clone();
                 move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
-                    if event.drag(cx).pane_id == pane_id {
-                        return;
-                    }
                     let bounds = event.bounds;
                     let position = event.event.position;
                     let region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
@@ -32799,6 +32949,52 @@ impl VibexWorkbench {
             .overflow_hidden()
             .child(body)
             .into_any_element()
+    }
+
+    /// Points the group workspace at the session the sidebar just selected.
+    ///
+    /// A member row lives under its group, so selecting it has to move the
+    /// workspace's focused pane and that pane's active tab as well. Without
+    /// this the pane would keep rendering another session's live view under
+    /// the wrong tab strip, because the pane renderer decides "focused" from
+    /// the group layout and the conversation from the live view.
+    fn sync_session_group_focus(&mut self, session_id: &VibexSessionId) {
+        let Some(group_id) = self
+            .ui_state
+            .sidebar
+            .organization
+            .group_of_session(session_id.as_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(group) = self.ui_state.sidebar.organization.group(&group_id) else {
+            return;
+        };
+        let Some(pane_id) = group.layout.pane_containing_session(session_id.as_str()) else {
+            return;
+        };
+        let already_focused = group.focused_pane_id == pane_id
+            && group
+                .layout
+                .find_pane(&pane_id)
+                .and_then(|pane| pane.active_session_id.as_deref())
+                == Some(session_id.as_str());
+        if already_focused {
+            return;
+        }
+        let Some(group) = self.ui_state.sidebar.organization.group_mut(&group_id) else {
+            return;
+        };
+        group.focused_pane_id = pane_id.clone();
+        group.layout.focus_session(&pane_id, session_id.as_str());
+        // A maximized workspace only paints its maximized pane, so the
+        // maximization follows the selection or the chosen session would stay
+        // invisible.
+        if group.maximized_pane_id.is_some() {
+            group.maximized_pane_id = Some(pane_id);
+        }
+        self.queue_ui_state();
     }
 
     fn focus_session_group_pane(&mut self, group_id: &str, pane_id: &str, cx: &mut Context<Self>) {
@@ -33105,17 +33301,26 @@ impl VibexWorkbench {
                     .min_w_0()
                     .items_center()
                     .gap_2()
-                    .px_2()
+                    // The avatar column is the same column a session row puts
+                    // its Agent logo in, so a group reads as a sibling of the
+                    // sessions it holds instead of as a different kind of row.
+                    .pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
+                    .pr_2()
                     .child(
-                        div().flex_none().size(px(14.0)).child(
-                            sidebar_icon(if collapsed {
-                                "icons/vibex/chevrons-right.svg"
-                            } else {
-                                "icons/vibex/chevrons-down-up.svg"
-                            })
-                            .size(px(12.0))
-                            .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
-                        ),
+                        // The disclosure chevron sits in the indent gutter so it
+                        // cannot push the avatars off that column.
+                        div()
+                            .absolute()
+                            .left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))
+                            .child(
+                                sidebar_icon(if collapsed {
+                                    "icons/vibex/chevrons-right.svg"
+                                } else {
+                                    "icons/vibex/chevrons-down-up.svg"
+                                })
+                                .size(px(12.0))
+                                .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
+                            ),
                     )
                     .child(div().flex_none().child(avatars))
                     .when(!renaming, |this| {
@@ -33171,7 +33376,7 @@ impl VibexWorkbench {
             row = row.child(
                 div()
                     .absolute()
-                    .left(px(30.0))
+                    .left(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))
                     .right_2()
                     .top(px(26.0))
                     .when_some(rename_error, |this, error| {
@@ -35043,6 +35248,32 @@ impl VibexWorkbench {
         let hover_group: SharedString = format!("sidebar-session-{session_id_string}").into();
         let context_menu_hovered = self.sidebar_context_menu_target
             == Some(SidebarContextMenuTarget::Session(session_id_string.clone()));
+        // The menu offers the click path for group membership, so joining and
+        // leaving do not depend on discovering the drag gesture.
+        let menu_session_id_string = session_id_string.clone();
+        let session_group_membership = self
+            .ui_state
+            .sidebar
+            .organization
+            .group_of_session(&session_id_string)
+            .map(str::to_string);
+        let session_group_candidates = if session_group_membership.is_some() {
+            Vec::new()
+        } else {
+            self.sidebar_group_ids_for_workspace(
+                session.project_id.as_str(),
+                session.workspace_id.as_str(),
+            )
+            .into_iter()
+            .filter_map(|group_id| {
+                self.ui_state
+                    .sidebar
+                    .organization
+                    .group(&group_id)
+                    .map(|group| (group_id, group.name.clone()))
+            })
+            .collect::<Vec<_>>()
+        };
         let row_background = if selected {
             sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else if move_selected {
@@ -35480,6 +35711,53 @@ impl VibexWorkbench {
                                         });
                                     }),
                             );
+                        }
+                        if let Some(membership) = session_group_membership.clone() {
+                            let leave_entity = context_entity.clone();
+                            let leave_group_id = membership.clone();
+                            let leave_session_id = menu_session_id_string.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(locale::text(
+                                    "Remove from session group",
+                                    "移出会话组",
+                                    "移出會話組",
+                                ))
+                                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = leave_entity.update(cx, |this, cx| {
+                                        this.remove_session_from_group_from_menu(
+                                            &leave_group_id,
+                                            &leave_session_id,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            );
+                        } else if !session_group_candidates.is_empty() {
+                            menu = menu
+                                .separator()
+                                .item(PopupMenuItem::label(locale::text(
+                                    "Add to session group",
+                                    "加入会话组",
+                                    "加入會話組",
+                                )));
+                            for (candidate_id, candidate_name) in session_group_candidates.clone() {
+                                let join_entity = context_entity.clone();
+                                let join_session_id = menu_session_id_string.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(candidate_name)
+                                        .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = join_entity.update(cx, |this, cx| {
+                                                this.add_session_to_group_from_menu(
+                                                    &candidate_id,
+                                                    &join_session_id,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                );
+                            }
                         }
                         menu
                         .separator()
@@ -77886,6 +78164,71 @@ mod tests {
             .map(|(body, _)| body)
             .expect("sidebar project renderer should remain inspectable");
         assert!(!project.contains(".when(detailed_hierarchy, |this| this.pl_3())"));
+    }
+
+    /// A group row must be laid out in the same column as the sessions it
+    /// holds, or its avatars drift away from the Agent logos beside them.
+    #[test]
+    fn session_group_rows_share_the_session_column() {
+        let source = include_str!("app.rs");
+        let project_children = source
+            .split_once("    fn render_sidebar_project_children(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    #[allow(clippy::too_many_arguments)]\n    fn render_sidebar_workspace_children(")
+            })
+            .map(|(body, _)| body)
+            .expect("sidebar project children should remain inspectable");
+        // In the workspace hierarchy a group belongs inside its workspace card,
+        // next to its sessions, exactly like a session row does.
+        assert!(project_children.contains(
+            "SidebarOrganizationItem::Group(group_id)\n                    if parent_folder_id.is_some() || include_root_sessions =>"
+        ));
+        assert!(project_children.contains("| SidebarOrganizationItem::Group(_) => {}"));
+
+        let group_row = source
+            .split_once("    fn render_sidebar_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_group_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar group renderer should remain inspectable");
+        // The avatar column matches the session logo column, and the chevron
+        // lives in the gutter instead of consuming that column.
+        assert!(group_row.contains(".pl(px(SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG))"));
+        assert!(group_row.contains(".left(px(SIDEBAR_ROW_ICON_SLOT_OVERHANG))"));
+        assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// Selecting a member row has to move the group workspace with it, or the
+    /// pane keeps painting another session's live view under its tab strip.
+    #[test]
+    fn selecting_a_group_member_focuses_its_pane_and_tab() {
+        let source = include_str!("app.rs");
+        let selection = source
+            .split_once("    fn select_session_with_history(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline_remote("))
+            .map(|(body, _)| body)
+            .expect("session selection should remain inspectable");
+        assert!(selection.contains("self.sync_session_group_focus(&session_id);"));
+
+        let sync = source
+            .split_once("    fn sync_session_group_focus(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_group_pane("))
+            .map(|(body, _)| body)
+            .expect("group focus sync should remain inspectable");
+        assert!(sync.contains("pane_containing_session(session_id.as_str())"));
+        assert!(sync.contains("group.focused_pane_id = pane_id.clone();"));
+        assert!(sync.contains("group.layout.focus_session(&pane_id, session_id.as_str());"));
+        // A maximized workspace paints one pane, so the maximization has to
+        // follow the selection.
+        assert!(sync.contains("group.maximized_pane_id = Some(pane_id);"));
+
+        // The pane renderer derives focus from the selection as well, so a
+        // restored layout cannot disagree with it.
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+        assert!(pane.contains(".is_some_and(|selected| {"));
     }
 
     #[test]
