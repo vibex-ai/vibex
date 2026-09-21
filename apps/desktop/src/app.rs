@@ -29055,11 +29055,7 @@ impl VibexWorkbench {
     }
 
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
-        let was_open = if self.last_visibility.preview_docked {
-            self.ui_state.workbench.preview_visible
-        } else {
-            self.preview_overlay_open
-        };
+        let was_open = self.preview_panel_open();
         if self.last_visibility.preview_docked {
             self.ui_state.workbench.preview_visible = !self.ui_state.workbench.preview_visible;
             self.queue_ui_state();
@@ -29296,6 +29292,18 @@ impl VibexWorkbench {
         }
     }
 
+    /// Whether the multi-tab preview panel is on screen right now.
+    ///
+    /// A docked panel follows its visibility flag; a window too narrow to dock
+    /// it shows the same choice as an overlay, exactly like the right rail.
+    fn preview_panel_open(&self) -> bool {
+        if self.last_visibility.preview_docked {
+            self.ui_state.workbench.preview_visible
+        } else {
+            self.preview_overlay_open
+        }
+    }
+
     fn selected_session_supports_git(&self) -> bool {
         self.selected_session()
             .and_then(|session| self.workspace_contexts.get(session.workspace_id.as_str()))
@@ -29325,6 +29333,23 @@ impl VibexWorkbench {
             RightRailMode::Files
         };
         let panel_open = self.right_rail_panel_open();
+        // The branded mark leads the bar as the quick toggle for the multi-tab
+        // preview panel: the panel and this rail are the two halves of one
+        // right-hand column, so the control that shows and hides the panel sits
+        // above the rail modes instead of among them.
+        let preview_open = self.preview_panel_open();
+        let preview = right_rail_activity_button(
+            "activity-preview",
+            Icon::default().path("icons/vibex/vibex-mark.svg"),
+        )
+        .tooltip(if preview_open {
+            locale::text("Collapse preview panel", "收起预览面板", "收起預覽面板")
+        } else {
+            locale::text("Open preview panel", "打开预览面板", "開啟預覽面板")
+        })
+        .selected(preview_open)
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
+        .into_any_element();
         let files = right_rail_activity_button(
             "activity-files",
             right_rail_mode_icon(RightRailMode::Files),
@@ -29378,9 +29403,9 @@ impl VibexWorkbench {
                 .into_any_element()
         });
         let mut activities = if git_available {
-            vec![files, git, terminal]
+            vec![preview, files, git, terminal]
         } else {
-            vec![files, terminal]
+            vec![preview, files, terminal]
         };
         if let Some(child_agent_activity) = child_agent_activity {
             activities.push(child_agent_activity);
@@ -68360,11 +68385,13 @@ mod tests {
 
         assert!(renderer.contains("selected_session_supports_git"));
         assert!(renderer.contains("if git_available"));
-        assert!(renderer.contains("vec![files, terminal]"));
+        assert!(renderer.contains("vec![preview, files, terminal]"));
     }
 
+    /// The branded quick button leads the bar and toggles the multi-tab preview
+    /// panel, which shares the right-hand column with this rail.
     #[test]
-    fn right_rail_activity_bar_omits_the_preview_toggle() {
+    fn right_rail_activity_bar_offers_the_preview_toggle() {
         let source = include_str!("app.rs");
         let renderer = source
             .split_once("    fn render_right_rail_activity_bar(")
@@ -68375,7 +68402,14 @@ mod tests {
         assert!(renderer.contains("activity-files"));
         assert!(renderer.contains("activity-git"));
         assert!(renderer.contains("activity-terminal"));
-        assert!(!renderer.contains("activity-preview"));
+        assert!(renderer.contains("activity-preview"));
+        assert!(renderer.contains("icons/vibex/vibex-mark.svg"));
+        assert!(renderer.contains("self.preview_panel_open()"));
+        assert!(renderer.contains("this.toggle_preview(cx)"));
+        assert!(
+            renderer.contains("vec![preview, files, git, terminal]"),
+            "the quick toggle leads the bar, above the rail modes"
+        );
     }
 
     #[test]
