@@ -74,6 +74,13 @@ const MAX_SKILL_DOCUMENT_FETCH_BYTES: u64 = MAX_SKILL_MARKET_DOCUMENT_BYTES + 1;
 fn builtin_market_sources() -> Vec<MarketSource> {
     vec![
         MarketSource {
+            id: "builtin-mcp-picks".to_string(),
+            name: "Vibex MCP Picks".to_string(),
+            url: "builtin://mcp".to_string(),
+            kind: MarketSourceKind::McpCatalog,
+            builtin: true,
+        },
+        MarketSource {
             id: "official-mcp-registry".to_string(),
             name: "Official MCP Registry".to_string(),
             url: "https://registry.modelcontextprotocol.io".to_string(),
@@ -152,10 +159,13 @@ fn sanitize_market_sources(value: serde_json::Value) -> Vec<MarketSource> {
     sources
 }
 
-/// A builtin skill catalog is compiled in, so it needs no URL to be valid.
+/// A builtin catalog is compiled in, so it needs no URL to be valid.
 fn market_source_url_is_allowed(kind: MarketSourceKind, url: &str) -> bool {
     if url.starts_with("builtin://") {
-        return kind == MarketSourceKind::SkillCatalog;
+        return matches!(
+            kind,
+            MarketSourceKind::McpCatalog | MarketSourceKind::SkillCatalog
+        );
     }
     market_url_policy(url).is_ok()
 }
@@ -957,53 +967,294 @@ fn parse_skill_catalog(source: &MarketSource, body: &[u8]) -> Vec<SkillMarketEnt
         .collect()
 }
 
+/// The compiled-in MCP picks.
+///
+/// These are the servers a user reaches for first, so the market is useful
+/// before any source is configured. The registry still supplies the long tail;
+/// this list is what makes the market look like a shelf rather than a search
+/// box on a first run.
+fn builtin_mcp_catalog() -> Vec<McpMarketEntry> {
+    const SOURCE_ID: &str = "builtin-mcp-picks";
+
+    struct Pick {
+        id: &'static str,
+        name: &'static str,
+        description: &'static str,
+        command: &'static str,
+        args: &'static [&'static str],
+        categories: &'static [McpMarketCategory],
+        author: &'static str,
+        env: &'static [(&'static str, &'static str, bool)],
+    }
+
+    let picks: &[Pick] = &[
+        Pick {
+            id: "memory",
+            name: "Memory",
+            description: "Knowledge graph memory that lets a model remember entities and relations across conversations.",
+            command: "npx",
+            args: &["-y", "@modelcontextprotocol/server-memory"],
+            categories: &[McpMarketCategory::Productivity],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "sequential-thinking",
+            name: "Sequential Thinking",
+            description: "Dynamic, reflective step-by-step reasoning for problems that need decomposition.",
+            command: "npx",
+            args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
+            categories: &[McpMarketCategory::Productivity],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "filesystem",
+            name: "Filesystem",
+            description: "Read, write, list, and search files inside a directory the user grants.",
+            command: "npx",
+            args: &[
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "${WORKSPACE}",
+            ],
+            categories: &[McpMarketCategory::Data],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "fetch",
+            name: "Fetch",
+            description: "Fetch a web page and convert it to Markdown for the model to read.",
+            command: "uvx",
+            args: &["mcp-server-fetch"],
+            categories: &[McpMarketCategory::Web],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "time",
+            name: "Time",
+            description: "Time zone conversion and current-time lookups.",
+            command: "uvx",
+            args: &["mcp-server-time"],
+            categories: &[McpMarketCategory::Productivity],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "git",
+            name: "Git",
+            description: "Read repository status, diffs, and logs, and run common Git operations.",
+            command: "uvx",
+            args: &["mcp-server-git"],
+            categories: &[McpMarketCategory::Devtools],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "playwright",
+            name: "Playwright",
+            description: "Drive a browser through accessibility snapshots: open pages, click, fill forms, and take screenshots.",
+            command: "npx",
+            args: &["-y", "@playwright/mcp@latest"],
+            categories: &[McpMarketCategory::Web],
+            author: "microsoft",
+            env: &[],
+        },
+        Pick {
+            id: "context7",
+            name: "Context7",
+            description: "Pull up-to-date documentation for a library so the model stops answering from stale memory.",
+            command: "npx",
+            args: &["-y", "@upstash/context7-mcp"],
+            categories: &[McpMarketCategory::Docs],
+            author: "upstash",
+            env: &[],
+        },
+        Pick {
+            id: "everything",
+            name: "Everything",
+            description: "A reference server that exercises every MCP capability, useful for verifying a client integration.",
+            command: "npx",
+            args: &["-y", "@modelcontextprotocol/server-everything"],
+            categories: &[McpMarketCategory::Devtools],
+            author: "modelcontextprotocol",
+            env: &[],
+        },
+        Pick {
+            id: "github",
+            name: "GitHub",
+            description: "Browse repositories, issues, and pull requests through the GitHub API.",
+            command: "npx",
+            args: &["-y", "@modelcontextprotocol/server-github"],
+            categories: &[McpMarketCategory::Devtools],
+            author: "modelcontextprotocol",
+            env: &[(
+                "GITHUB_PERSONAL_ACCESS_TOKEN",
+                "A GitHub personal access token with the scopes the server should use.",
+                true,
+            )],
+        },
+        Pick {
+            id: "postgres",
+            name: "PostgreSQL",
+            description: "Query a PostgreSQL database with read-only access by default.",
+            command: "npx",
+            args: &[
+                "-y",
+                "@modelcontextprotocol/server-postgres",
+                "${DATABASE_URL}",
+            ],
+            categories: &[McpMarketCategory::Data],
+            author: "modelcontextprotocol",
+            env: &[(
+                "DATABASE_URL",
+                "The connection string of the database to expose.",
+                true,
+            )],
+        },
+        Pick {
+            id: "sqlite",
+            name: "SQLite",
+            description: "Inspect and query a local SQLite database file.",
+            command: "uvx",
+            args: &["mcp-server-sqlite", "--db-path", "${DATABASE_PATH}"],
+            categories: &[McpMarketCategory::Data],
+            author: "modelcontextprotocol",
+            env: &[(
+                "DATABASE_PATH",
+                "Absolute path of the SQLite file to open.",
+                true,
+            )],
+        },
+    ];
+
+    picks
+        .iter()
+        .map(|pick| McpMarketEntry {
+            id: pick.id.to_string(),
+            source_id: SOURCE_ID.to_string(),
+            name: pick.name.to_string(),
+            description: Some(pick.description.to_string()),
+            homepage: None,
+            categories: pick.categories.to_vec(),
+            transport: McpServerTransportKind::Stdio,
+            command: Some(pick.command.to_string()),
+            args: pick.args.iter().map(|arg| arg.to_string()).collect(),
+            url: None,
+            env: pick
+                .env
+                .iter()
+                .map(|(name, description, required)| MarketEnvRequirement {
+                    name: name.to_string(),
+                    description: Some(description.to_string()),
+                    required: *required,
+                    secret: env_name_looks_secret(name),
+                    default_value: None,
+                    placeholder: None,
+                })
+                .collect(),
+            verified: true,
+            version: None,
+            author: Some(pick.author.to_string()),
+        })
+        .collect()
+}
+
 /// The compiled-in skill picks.
 ///
-/// Deliberately small: it exists so the market renders something useful on a
-/// first run with no configuration, not to be the shelf. The volume comes from
+/// Deliberately a floor rather than the shelf: it exists so the market renders
+/// something useful on a first run with no configuration. The volume comes from
 /// configured sources.
 fn builtin_skill_catalog() -> Vec<SkillMarketEntry> {
     const SOURCE_ID: &str = "builtin-skills";
-    let picks: [(&str, &str, &str, &str, SkillMarketCategory); 4] = [
+    const ANTHROPIC: &str = "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills";
+    let picks: [(&str, &str, &str, &str, SkillMarketCategory); 10] = [
         (
             "docx",
             "Word documents",
             "Create, read, and edit Word (.docx) files with tracked changes and comments",
-            "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/docx/SKILL.md",
+            "docx/SKILL.md",
             SkillMarketCategory::Docs,
         ),
         (
             "pdf",
             "PDF files",
             "Read, extract, merge, split, and generate PDF files",
-            "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/pdf/SKILL.md",
+            "pdf/SKILL.md",
             SkillMarketCategory::Docs,
         ),
         (
             "xlsx",
             "Excel spreadsheets",
             "Work with spreadsheets: formulas, charts, pivots, and multiple sheets",
-            "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/xlsx/SKILL.md",
+            "xlsx/SKILL.md",
             SkillMarketCategory::Data,
         ),
         (
             "pptx",
             "PowerPoint decks",
             "Create, edit, and analyze PowerPoint (.pptx) presentations",
-            "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills/pptx/SKILL.md",
+            "pptx/SKILL.md",
             SkillMarketCategory::Docs,
+        ),
+        (
+            "mcp-builder",
+            "MCP Builder",
+            "Build MCP servers that connect models to tools and data",
+            "mcp-builder/SKILL.md",
+            SkillMarketCategory::Coding,
+        ),
+        (
+            "skill-creator",
+            "Skill Creator",
+            "Author new skills and measure how well they work",
+            "skill-creator/SKILL.md",
+            SkillMarketCategory::Coding,
+        ),
+        (
+            "artifacts-builder",
+            "Artifacts Builder",
+            "Assemble self-contained HTML artifacts from a description",
+            "artifacts-builder/SKILL.md",
+            SkillMarketCategory::Coding,
+        ),
+        (
+            "canvas-design",
+            "Canvas design",
+            "Produce visual layouts and diagrams on a canvas",
+            "canvas-design/SKILL.md",
+            SkillMarketCategory::Writing,
+        ),
+        (
+            "brand-guidelines",
+            "Brand guidelines",
+            "Apply a consistent brand voice and visual identity to generated work",
+            "brand-guidelines/SKILL.md",
+            SkillMarketCategory::Writing,
+        ),
+        (
+            "webapp-testing",
+            "Webapp testing",
+            "Drive and verify a local web app with a browser automation tool",
+            "webapp-testing/SKILL.md",
+            SkillMarketCategory::Workflow,
         ),
     ];
     picks
         .into_iter()
-        .map(|(id, name, description, url, category)| SkillMarketEntry {
+        .map(|(id, name, description, path, category)| SkillMarketEntry {
             id: id.to_string(),
             source_id: SOURCE_ID.to_string(),
             name: name.to_string(),
             description: Some(description.to_string()),
-            homepage: None,
+            homepage: Some(format!(
+                "https://github.com/anthropics/skills/tree/main/skills/{}",
+                path.trim_end_matches("/SKILL.md")
+            )),
             categories: vec![category],
-            document_url: url.to_string(),
+            document_url: format!("{ANTHROPIC}/{path}"),
             verified: true,
             version: None,
             author: Some("anthropic".to_string()),
@@ -1249,9 +1500,13 @@ impl ProviderConfigService {
                     search_mcp_registry(&client, source, Some(&query), limit)
                 }
                 MarketSourceKind::McpCatalog => {
-                    match fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES) {
-                        Ok((body, _)) => Ok((parse_mcp_catalog(source, &body), false)),
-                        Err(error) => Err(source_failure(source, &error, None)),
+                    if source.url.starts_with("builtin://") {
+                        Ok((builtin_mcp_catalog(), false))
+                    } else {
+                        match fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES) {
+                            Ok((body, _)) => Ok((parse_mcp_catalog(source, &body), false)),
+                            Err(error) => Err(source_failure(source, &error, None)),
+                        }
                     }
                 }
                 _ => continue,
@@ -1367,9 +1622,13 @@ impl ProviderConfigService {
                     .0
             }
             MarketSourceKind::McpCatalog => {
-                let (body, _) =
-                    fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
-                parse_mcp_catalog(source, &body)
+                if source.url.starts_with("builtin://") {
+                    builtin_mcp_catalog()
+                } else {
+                    let (body, _) =
+                        fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
+                    parse_mcp_catalog(source, &body)
+                }
             }
             _ => Vec::new(),
         };
@@ -1874,6 +2133,51 @@ mod tests {
                 market_url_policy(&entry.document_url).is_ok(),
                 "{} must point at a public https document",
                 entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_mcp_catalog_entries_are_startable_and_categorized() {
+        let entries = builtin_mcp_catalog();
+        assert!(
+            entries.len() >= 8,
+            "the builtin shelf should be more than a token few entries"
+        );
+        for entry in &entries {
+            assert_eq!(entry.transport, McpServerTransportKind::Stdio);
+            assert!(
+                entry
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty()),
+                "{} must carry a launcher",
+                entry.id
+            );
+            assert!(
+                !entry.args.is_empty(),
+                "{} must carry the package it launches",
+                entry.id
+            );
+            assert!(
+                !entry.categories.is_empty(),
+                "{} must be categorized, or the chips cannot reach it",
+                entry.id
+            );
+            assert_eq!(entry.source_id, "builtin-mcp-picks");
+        }
+    }
+
+    #[test]
+    fn builtin_sources_cover_both_markets() {
+        let sources = builtin_market_sources();
+        assert!(sources.iter().any(|source| source.kind.is_mcp()));
+        assert!(sources.iter().any(|source| source.kind.is_skill()));
+        for source in &sources {
+            assert!(
+                market_source_url_is_allowed(source.kind, &source.url),
+                "{} must pass the same policy a user source would",
+                source.id
             );
         }
     }
