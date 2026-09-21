@@ -6216,6 +6216,12 @@ pub struct VibexWorkbench {
     composer_queue_edit_input: Entity<TextareaState>,
     composer_goal_edit_input: Entity<TextareaState>,
     composer_input: Entity<TextareaState>,
+    /// One composer textarea per session group pane. A pane that is not focused
+    /// owns a real input instead of borrowing the focused session's, so several
+    /// sessions can be driven at once.
+    session_composer_inputs: BTreeMap<String, Entity<TextareaState>>,
+    /// Keeps each per-session composer subscription alive.
+    session_composer_subscriptions: BTreeMap<String, gpui::Subscription>,
     image_editor_text_input: Entity<TextareaState>,
     composer_input_session_id: Option<VibexSessionId>,
     composer_input_syncing: bool,
@@ -7148,6 +7154,8 @@ impl VibexWorkbench {
             composer_queue_edit_input,
             composer_goal_edit_input,
             composer_input,
+            session_composer_inputs: BTreeMap::new(),
+            session_composer_subscriptions: BTreeMap::new(),
             image_editor_text_input,
             composer_input_session_id: selected_session_id.clone(),
             composer_input_syncing: false,
@@ -32298,15 +32306,18 @@ impl VibexWorkbench {
             let Some(asset) = agent_brand_asset(identity) else {
                 continue;
             };
+            // `Avatar` defaults to its medium size, so the group stack has to
+            // ask for the small one explicitly now that it no longer rides
+            // `AvatarGroup`'s shared size.
             let avatar = if asset.uses_current_color {
-                Avatar::new().placeholder(
+                Avatar::new().xsmall().placeholder(
                     Icon::default()
                         .path(asset.path)
                         .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
                         .text_color(themed_color),
                 )
             } else {
-                Avatar::new().src(asset.path)
+                Avatar::new().xsmall().src(asset.path)
             };
             stack = stack.child(
                 div()
@@ -32831,7 +32842,8 @@ impl VibexWorkbench {
             .agent_session_view_cache
             .contains_key(pane_session_id.as_str())
         {
-            return self.render_session_group_pane_summary(&session, cx);
+            let summary = self.render_session_group_pane_summary(&session, cx);
+            return self.session_group_pane_with_composer(session_id, summary, window, cx);
         }
         if let Some(focused_session_id) = focused_session_id.as_ref() {
             self.stash_agent_session_view_for(focused_session_id);
@@ -32840,14 +32852,324 @@ impl VibexWorkbench {
             if let Some(focused_session_id) = focused_session_id.as_ref() {
                 let _ = self.restore_agent_session_view(focused_session_id);
             }
-            return self.render_session_group_pane_summary(&session, cx);
+            let summary = self.render_session_group_pane_summary(&session, cx);
+            return self.session_group_pane_with_composer(session_id, summary, window, cx);
         }
-        let element = self.render_agent_workbench_for(false, window, cx);
+        let conversation = self.render_agent_workbench_for(false, window, cx);
         self.stash_agent_session_view_for(&pane_session_id);
         if let Some(focused_session_id) = focused_session_id.as_ref() {
             let _ = self.restore_agent_session_view(focused_session_id);
         }
-        element
+        self.session_group_pane_with_composer(session_id, conversation, window, cx)
+    }
+
+    /// The composer textarea of one session group pane, created on first use.
+    ///
+    /// The entity is what receives keystrokes and holds IME state, so a pane
+    /// cannot share the focused session's textarea: each pane needs its own.
+    fn composer_input_for(
+        &mut self,
+        session_id: &VibexSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        let key = session_id.as_str().to_string();
+        if let Some(input) = self.session_composer_inputs.get(&key) {
+            return input.clone();
+        }
+        let placeholder = self.strings().message_agent;
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .submit_on_enter(true)
+                .placeholder(placeholder)
+        });
+        let submit_key = key.clone();
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { shift: false, .. } => {
+                    this.send_session_group_pane_message(&submit_key, window, cx);
+                }
+                InputEvent::Change | InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                InputEvent::PressEnter { shift: true, .. } => {}
+            },
+        );
+        self.session_composer_subscriptions
+            .insert(key.clone(), subscription);
+        self.session_composer_inputs.insert(key, input.clone());
+        input
+    }
+
+    /// The runtime selection a pane's session should send with.
+    ///
+    /// The focused session answers from the live selection; any other session
+    /// answers from its parked view, which the runtime event pump keeps current.
+    fn session_runtime_selection_for(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<SessionRuntimeSelection> {
+        if self.selected_session_id.as_ref() == Some(session_id) {
+            return self.selected_runtime_selection();
+        }
+        if let Some(selection) = self.optimistic_runtime_selections.get(session_id.as_str()) {
+            return Some(selection.clone());
+        }
+        if let Some(selection) = self
+            .agent_session_view_cache
+            .get(session_id.as_str())
+            .and_then(|entry| entry.runtime_selection.as_ref())
+            .map(|state| state.desired.clone())
+        {
+            return Some(selection);
+        }
+        // A pane whose view was materialized from a fetched timeline has no
+        // selection yet. Fall back to the Agent's remembered choice, then to the
+        // catalog, so the pane can still send.
+        let agent_id = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)?
+            .agent_id
+            .clone();
+        let catalog = self.runtime_catalog.as_ref()?;
+        self.ui_state
+            .composer
+            .runtime_selections_by_agent
+            .get(&agent_id)
+            .cloned()
+            .filter(|selection| {
+                catalog.options.iter().any(|option| {
+                    option.selection.agent_id == selection.agent_id
+                        && option.selection.auth_source == selection.auth_source
+                        && option.selection.model == selection.model
+                })
+            })
+            .or_else(|| {
+                catalog
+                    .options
+                    .iter()
+                    .find(|option| option.selection.agent_id == agent_id)
+                    .map(|option| option.selection.clone())
+            })
+    }
+
+    /// Builds a message from one pane's textarea, for that pane's session.
+    fn take_composer_message_for(
+        &mut self,
+        session_id: &VibexSessionId,
+        input: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ComposerQueueMessage> {
+        if input.update(cx, |input, cx| {
+            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        }) {
+            return None;
+        }
+        let selection = self.session_runtime_selection_for(session_id)?;
+        let raw_text = input.read(cx).value().to_string();
+        let (text, attachments) = composer_submission_payload(&raw_text, &[]);
+        if text.trim().is_empty() {
+            return None;
+        }
+        // Command discovery is an authority-local capability, so a paired client
+        // submits typed text verbatim.
+        let allow_manual_provider_slash = self.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .agent()
+                .manager()
+                .command_discovery_capabilities(&AgentCommandDiscoverRequest {
+                    agent_id: Some(selection.agent_id.clone()),
+                    provider_profile_id: selection.provider_profile_id().cloned(),
+                    session_id: Some(session_id.clone()),
+                    workspace_id: None,
+                    trigger: Some(AgentCommandTrigger::Slash),
+                    query: None,
+                    limit: Some(1),
+                })
+                .map(|capabilities| capabilities.slash_commands)
+                .unwrap_or(false)
+        });
+        let command_invocation =
+            resolve_composer_command_invocation(&text, None, allow_manual_provider_slash);
+        self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
+        let message = ComposerQueueMessage {
+            id: self.composer_queue_serial,
+            session_id: session_id.clone(),
+            desired_runtime: selection,
+            text,
+            attachments,
+            command_invocation,
+        };
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        Some(message)
+    }
+
+    /// Sends whatever a group pane's composer holds, to that pane's session.
+    fn send_session_group_pane_message(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(pane_session_id) = VibexSessionId::parse(session_id) else {
+            return;
+        };
+        let Some(input) = self.session_composer_inputs.get(session_id).cloned() else {
+            return;
+        };
+        let Some(message) = self.take_composer_message_for(&pane_session_id, &input, window, cx)
+        else {
+            return;
+        };
+        self.dispatch_composer_message(
+            message,
+            ComposerQueueDispatchBehavior::Automatic,
+            window,
+            cx,
+        );
+    }
+
+    /// Stops the turn running in one group pane, without touching the others.
+    fn interrupt_session_for(
+        &mut self,
+        session_id: VibexSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_action_pending {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.pause_auto_continue(&session_id, cx);
+        self.notification_suppressed_session_ids
+            .insert(session_id.as_str().to_string());
+        let turn_was_locally_pending = self.session_turn_pending(&session_id);
+        self.agent_action_pending = true;
+        self.agent_error = None;
+        let generation = self.session_generation;
+        let interrupted_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .agent()
+                .interrupt(MutationRequest::new(session_id.clone()))
+                .await
+                .map_err(crate::app::remote_error_into_vibex)?;
+            Ok::<_, vibex_core::VibexError>(backend.agent().open_session(session_id).await.ok())
+        });
+        self.agent_action_task = Some(cx.spawn_in(
+            window,
+            async move |entity: WeakEntity<Self>, cx| {
+                let outcome = runner.await;
+                let _ = entity.update_in(cx, |this, _window, cx| {
+                    if let Ok(Ok(session)) = &outcome {
+                        if let Some(session) = session {
+                            this.upsert_session_snapshot(session.clone());
+                        }
+                        this.reconcile_sidebar_state();
+                        if !turn_was_locally_pending {
+                            this.set_session_turn_pending(&interrupted_session_id, false);
+                        }
+                        this.publish_sidebar_invalidation();
+                        this.sync_auto_continue_for_session(&interrupted_session_id, cx);
+                    }
+                    this.agent_action_pending = false;
+                    if this.session_generation != generation {
+                        return;
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// The composer a group pane renders below its conversation.
+    fn render_session_group_pane_composer(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Ok(pane_session_id) = VibexSessionId::parse(session_id) else {
+            return Empty.into_any_element();
+        };
+        let input = self.composer_input_for(&pane_session_id, window, cx);
+        let can_send = !self.agent_action_pending && !input.read(cx).value().trim().is_empty();
+        let turn_pending = self.session_turn_pending(&pane_session_id);
+        let send_session_id = session_id.to_string();
+        let stop_session_id = session_id.to_string();
+        h_flex()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .items_end()
+            .gap_2()
+            .px_2()
+            .pb_2()
+            .child(div().flex_1().min_w_0().child(Textarea::new(&input)))
+            .when(turn_pending, |this| {
+                this.child(
+                    Button::new(format!("session-group-pane-stop-{session_id}"))
+                        .small()
+                        .danger()
+                        .compact()
+                        .icon(IconName::Close)
+                        .tooltip(locale::text("Stop", "停止", "停止"))
+                        .disabled(self.agent_action_pending)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Ok(session_id) = VibexSessionId::parse(&stop_session_id) else {
+                                return;
+                            };
+                            this.interrupt_session_for(session_id, window, cx);
+                        })),
+                )
+            })
+            .child(
+                Button::new(format!("session-group-pane-send-{session_id}"))
+                    .small()
+                    .primary()
+                    .compact()
+                    .icon(IconName::ArrowUp)
+                    .tooltip(locale::text("Send", "发送", "傳送"))
+                    .disabled(!can_send)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.send_session_group_pane_message(&send_session_id, window, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Puts a pane's own composer under its conversation.
+    ///
+    /// Every pane owns its composer, so several sessions can be driven at once
+    /// instead of only the focused one.
+    fn session_group_pane_with_composer(
+        &mut self,
+        session_id: &str,
+        content: AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let composer = self.render_session_group_pane_composer(session_id, window, cx);
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(content),
+            )
+            .child(composer)
+            .into_any_element()
     }
 
     /// What a group pane shows before its conversation has been materialized:
@@ -32989,6 +33311,12 @@ impl VibexWorkbench {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // A pane textarea is only needed while its session is in a group.
+        let grouped = self.ui_state.sidebar.organization.grouped_session_ids();
+        self.session_composer_inputs
+            .retain(|session_id, _| grouped.contains(session_id));
+        self.session_composer_subscriptions
+            .retain(|session_id, _| grouped.contains(session_id));
         let Some(backend) = self.backend.clone() else {
             return;
         };
@@ -78390,6 +78718,60 @@ mod tests {
         assert!(actions.contains("let resolve_session_id = self.timeline.session_id.clone();"));
         assert!(
             actions.contains("this.resolve_permission(\n                            session_id,")
+        );
+    }
+
+    /// Every pane owns a composer, so several sessions can be driven at once.
+    #[test]
+    fn every_group_pane_owns_its_composer() {
+        let source = include_str!("app.rs");
+
+        let factory = source
+            .split_once("    fn composer_input_for(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// The runtime selection a pane's session should send with.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("per-pane composer factory should remain inspectable");
+        assert!(factory.contains("session_composer_inputs"));
+        assert!(factory.contains("submit_on_enter(true)"));
+        assert!(factory.contains("send_session_group_pane_message"));
+
+        // Sending targets the pane's own session, not the selected one.
+        let send = source
+            .split_once("    fn send_session_group_pane_message(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Stops the turn running in one group pane")
+            })
+            .map(|(body, _)| body)
+            .expect("pane send should remain inspectable");
+        assert!(send.contains("take_composer_message_for(&pane_session_id, &input, window, cx)"));
+        assert!(!send.contains("selected_session_id"));
+
+        let take = source
+            .split_once("    fn take_composer_message_for(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Sends whatever a group pane's composer holds")
+            })
+            .map(|(body, _)| body)
+            .expect("pane message assembly should remain inspectable");
+        assert!(take.contains("session_id: session_id.clone(),"));
+
+        // The composer is rendered under every non-focused pane's conversation.
+        let content = source
+            .split_once("    fn render_session_group_pane_content(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
+            })
+            .map(|(body, _)| body)
+            .expect("group pane content should remain inspectable");
+        assert_eq!(
+            content
+                .matches("session_group_pane_with_composer(session_id,")
+                .count(),
+            3
         );
     }
 
