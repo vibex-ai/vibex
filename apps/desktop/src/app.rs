@@ -14409,11 +14409,22 @@ impl VibexWorkbench {
             self.composer_session_drafts.remove(session_id.as_str());
             return;
         }
-        let text = self.composer_input.read(cx).value().to_string();
+        // A session rendered in a group pane keeps its text in that pane's own
+        // textarea, so the draft has to be read from there. Reading the shared
+        // composer would park a stale string over the pane's real draft.
+        let (text, attachments, command_entry) =
+            match self.session_composer_inputs.get(session_id.as_str()) {
+                Some(input) => (input.read(cx).value().to_string(), Vec::new(), None),
+                None => (
+                    self.composer_input.read(cx).value().to_string(),
+                    self.composer_attachments.clone(),
+                    self.composer_command_entry.clone(),
+                ),
+            };
         let draft = ComposerSessionDraft {
-            attachments: inline_composer_attachments_in_text(&text, &self.composer_attachments),
+            attachments: inline_composer_attachments_in_text(&text, &attachments),
             text,
-            command_entry: self.composer_command_entry.clone(),
+            command_entry,
         };
         store_composer_session_draft(&mut self.composer_session_drafts, session_id, draft);
     }
@@ -32858,7 +32869,12 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if focused {
-            return self.render_agent_workbench(window, cx);
+            // The focused pane renders the same conversation area and the same
+            // composer as every other pane. Moving focus must not change what a
+            // pane looks like, only where the keyboard goes.
+            self.prune_elicitation_forms();
+            let conversation = self.render_agent_workbench_for(false, window, cx);
+            return self.session_group_pane_with_composer(session_id, conversation, window, cx);
         }
         let Some(pane_session_id) = VibexSessionId::parse(session_id).ok() else {
             return Empty.into_any_element();
@@ -33370,13 +33386,22 @@ impl VibexWorkbench {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
+        // `restore_agent_session_view` takes a view out of the cache while it
+        // is live, so the focused session is legitimately absent. Fetching it
+        // would park a fetched timeline that the real view later races with.
+        let mut available = self
+            .agent_session_view_cache
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(live_session_id) = self.timeline.session_id.as_ref() {
+            available.insert(live_session_id.as_str().to_string());
+        }
         let missing = group
             .member_session_ids
             .iter()
             .filter(|session_id| {
-                !self
-                    .agent_session_view_cache
-                    .contains_key(session_id.as_str())
+                !available.contains(session_id.as_str())
                     && !self.session_group_view_loads.contains(session_id.as_str())
             })
             .cloned()
@@ -33431,6 +33456,15 @@ impl VibexWorkbench {
         session_id: VibexSessionId,
         items: Vec<vibex_core::TimelineItem>,
     ) {
+        // A real parked view may have landed while this fetch was in flight.
+        // Overwriting it would replace the conversation on screen with a stale
+        // copy, which is what made a pane go blank when focus moved.
+        if self
+            .agent_session_view_cache
+            .contains_key(session_id.as_str())
+        {
+            return;
+        }
         let mut timeline = TimelineModel::default();
         timeline.replace_authoritative(session_id.clone(), items);
         let mut entry = AgentSessionViewCacheEntry {
@@ -78855,12 +78889,43 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group pane content should remain inspectable");
+        // Every pane, focused included, renders the same conversation area and
+        // the same composer: moving focus must not change what a pane looks
+        // like.
         assert_eq!(
-            content
-                .matches("session_group_pane_with_composer(session_id,")
-                .count(),
-            3
+            content.matches("session_group_pane_with_composer(").count(),
+            4
         );
+        assert!(content.contains("self.prune_elicitation_forms();"));
+        assert!(!content.contains("self.render_agent_workbench(window, cx)"));
+    }
+
+    /// A fetched view must never replace a real parked one, and a session whose
+    /// view is live must not be treated as missing.
+    #[test]
+    fn group_view_materialization_never_clobbers_a_parked_view() {
+        let source = include_str!("app.rs");
+
+        let park = source
+            .split_once("    fn park_loaded_session_view(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Points the group workspace at the session")
+            })
+            .map(|(body, _)| body)
+            .expect("parked view construction should remain inspectable");
+        assert!(park.contains("agent_session_view_cache"));
+        assert!(park.contains(".contains_key(session_id.as_str())"));
+        assert!(park.contains("return;"));
+
+        let ensure = source
+            .split_once("    fn ensure_session_group_views(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Parks a view built from an authoritative timeline")
+            })
+            .map(|(body, _)| body)
+            .expect("group view materialization should remain inspectable");
+        assert!(ensure.contains("self.timeline.session_id.as_ref()"));
+        assert!(ensure.contains("available.insert(live_session_id.as_str().to_string());"));
     }
 
     /// Selecting a member row has to move the group workspace with it, or the
