@@ -441,6 +441,11 @@ const SIDEBAR_SESSION_REORDER_GAP: f32 = 2.0;
 const SIDEBAR_WORKSPACE_REORDER_GAP: f32 = 5.0;
 const SIDEBAR_WORKSPACE_ROW_HEIGHT: f32 = 44.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = 40.0;
+/// Width of the trailing column a sidebar row keeps for its status.
+///
+/// Session rows, workspace rows and group rows all reserve the same column, so
+/// a count, a spinner and a status dot land on one vertical line.
+const SIDEBAR_STATUS_COLUMN_WIDTH: f32 = 76.0;
 const SIDEBAR_DRAG_PREVIEW_WIDTH: f32 = 280.0;
 const SIDEBAR_DRAG_HORIZONTAL_SLOP: f32 = 16.0;
 const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
@@ -32847,6 +32852,56 @@ impl VibexWorkbench {
     /// makes the stack's left edge depend on its own content width.
     /// each `Avatar` takes the Agent's brand SVG so a group reads as its Agents
     /// rather than as a set of initials.
+    /// The most actionable status among a group's members.
+    ///
+    /// A collapsed group hides its member rows, so the group row carries what
+    /// they would have shown. An expanded group does not: every member row
+    /// already reports its own state, and repeating the aggregate above them
+    /// would say the same thing twice.
+    ///
+    /// `None` means the members are all idle and read, which is when the row
+    /// shows the member count instead.
+    fn session_group_status(&self, group: &SessionGroupUiState) -> Option<SidebarWorkspaceStatus> {
+        let mut summary = vibex_desktop_model::WorkspaceAgentSummary::default();
+        let mut awaiting_user = false;
+        let mut has_unread_completion = false;
+        let mut turn_pending = false;
+        for member_id in &group.member_session_ids {
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| session.id.as_str() == member_id)
+            else {
+                continue;
+            };
+            summary.total += 1;
+            match session.state {
+                AgentSessionState::Running | AgentSessionState::Initializing => {
+                    summary.running += 1;
+                }
+                AgentSessionState::NeedsInput => summary.needs_input += 1,
+                AgentSessionState::Error => summary.failed += 1,
+                _ => {}
+            }
+            awaiting_user |= self
+                .pending_user_request_ids
+                .contains_key(member_id.as_str());
+            has_unread_completion |= self
+                .unread_agent_completion_session_ids
+                .contains(member_id.as_str());
+            turn_pending |= self.session_turn_pending(&session.id);
+        }
+        let status = sidebar_workspace_status(
+            summary,
+            false,
+            false,
+            has_unread_completion,
+            awaiting_user,
+            turn_pending,
+        );
+        (status != SidebarWorkspaceStatus::Complete).then_some(status)
+    }
+
     fn session_group_avatars(&self, group: &SessionGroupUiState, cx: &App) -> AnyElement {
         let identities = self.session_group_agent_identities(group);
         // A polychrome brand mark keeps its embedded colours and is drawn as an
@@ -33927,6 +33982,11 @@ impl VibexWorkbench {
             self.sidebar_rename_target == Some(SidebarRenameTarget::Group(group_id.clone()));
         let group_name = group.name.clone();
         let member_count = group.member_count();
+        // A collapsed group stands in for its members, so it reports their
+        // status; an expanded one lets each member row speak for itself.
+        let collapsed_status = collapsed
+            .then(|| self.session_group_status(&group))
+            .flatten();
         let pinned = group.pinned;
         let auto_continue = group.auto_continue;
         let avatars = self.session_group_avatars(&group, cx);
@@ -34113,13 +34173,6 @@ impl VibexWorkbench {
                                 .text_color(cx.theme().sidebar_foreground)
                                 .child(group_name.clone()),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                                .child(format!("{member_count}")),
-                        )
                     })
                     .when(renaming, |this| {
                         this.child(
@@ -34131,10 +34184,25 @@ impl VibexWorkbench {
                         )
                     })
                     .child(
+                        // The trailing column is the same one a session row
+                        // keeps for its status, so the count and a member's
+                        // status land on one vertical line across both rows.
                         h_flex()
+                            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
                             .flex_none()
                             .items_center()
-                            .gap_1()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .text_sm()
+                            .text_color(cx.theme().sidebar_foreground.opacity(0.48))
+                            .when_some(collapsed_status, |this, status| {
+                                this.child(sidebar_aggregate_status_indicator(status, cx))
+                            })
+                            .when(collapsed_status.is_none(), |this| {
+                                this.child(
+                                    div().flex_none().text_xs().child(format!("{member_count}")),
+                                )
+                            })
                             .when(pinned, |this| {
                                 this.child(
                                     sidebar_icon("icons/vibex/pin.svg")
@@ -35599,19 +35667,7 @@ impl VibexWorkbench {
             awaiting_user,
             turn_pending,
         );
-        let status_indicator = match workspace_status {
-            SidebarWorkspaceStatus::Running => Spinner::new()
-                .icon(Icon::new(IconName::LoaderCircle))
-                .color(cx.theme().primary)
-                .xsmall()
-                .into_any_element(),
-            SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
-            SidebarWorkspaceStatus::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
-            SidebarWorkspaceStatus::UnreadCompletion => sidebar_status_dot(cx.theme().success),
-            SidebarWorkspaceStatus::Complete => {
-                sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
-            }
-        };
+        let status_indicator = sidebar_aggregate_status_indicator(workspace_status, cx);
         let workspace_menu_entity = cx.weak_entity();
         let workspace_menu_branch = branch.clone();
         let workspace_menu_project_id = project_for_folder.clone();
@@ -36639,7 +36695,7 @@ impl VibexWorkbench {
                     )
                     .child(
                         h_flex()
-                            .w(px(76.0))
+                            .w(px(SIDEBAR_STATUS_COLUMN_WIDTH))
                             .flex_none()
                             .items_center()
                             .justify_end()
@@ -56639,6 +56695,27 @@ fn sidebar_workspace_status(
         SidebarWorkspaceStatus::UnreadCompletion
     } else {
         SidebarWorkspaceStatus::Complete
+    }
+}
+
+/// The indicator an aggregate row shows for the sessions it stands for.
+///
+/// A workspace row and a collapsed group row answer the same question — "what
+/// is the most actionable thing among my sessions" — so they draw it the same
+/// way.
+fn sidebar_aggregate_status_indicator(status: SidebarWorkspaceStatus, cx: &App) -> AnyElement {
+    match status {
+        SidebarWorkspaceStatus::Running => Spinner::new()
+            .icon(Icon::new(IconName::LoaderCircle))
+            .color(cx.theme().primary)
+            .xsmall()
+            .into_any_element(),
+        SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
+        SidebarWorkspaceStatus::NeedsInput => sidebar_attention_glyph(cx).into_any_element(),
+        SidebarWorkspaceStatus::UnreadCompletion => sidebar_status_dot(cx.theme().success),
+        SidebarWorkspaceStatus::Complete => {
+            sidebar_status_dot(cx.theme().sidebar_foreground.opacity(0.28))
+        }
     }
 }
 
@@ -79091,7 +79168,13 @@ mod tests {
             "SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG"
         ));
         assert!(workspace.contains(".gap(px(0.0))"));
-        assert!(workspace.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
+        assert!(workspace.contains("sidebar_aggregate_status_indicator(workspace_status, cx)"));
+        let aggregate = source
+            .split_once("fn sidebar_aggregate_status_indicator(")
+            .and_then(|(_, tail)| tail.split_once("\nfn sidebar_session_status_indicator("))
+            .map(|(body, _)| body)
+            .expect("aggregate status renderer should remain inspectable");
+        assert!(aggregate.contains("cx.theme().sidebar_foreground.opacity(0.28)"));
         assert!(workspace.contains(".w(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".h(px(SIDEBAR_PROJECT_ICON_SLOT_SIZE))"));
         assert!(workspace.contains(".pl_0()"));
@@ -79275,6 +79358,60 @@ mod tests {
             .expect("the avatar stack should follow the chevron");
         assert!(chevron < avatars);
         assert!(!group_row.contains(".px_2()\n                    .child(\n                        div().flex_none().size(px(14.0))"));
+    }
+
+    /// A collapsed group reports its members' status in the same trailing
+    /// column a session row keeps for its own, and shows the count only when
+    /// there is no status to report.
+    #[test]
+    fn a_collapsed_group_reports_member_status_in_the_session_status_column() {
+        let source = include_str!("app.rs");
+
+        let status = source
+            .split_once("    fn session_group_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn session_group_avatars("))
+            .map(|(body, _)| body)
+            .expect("group status aggregation should remain inspectable");
+        // The aggregate reuses the priority a workspace row already encodes.
+        assert!(status.contains("sidebar_workspace_status("));
+        assert!(status.contains("pending_user_request_ids"));
+        assert!(status.contains("unread_agent_completion_session_ids"));
+        assert!(status.contains("session_turn_pending(&session.id)"));
+        assert!(status.contains("(status != SidebarWorkspaceStatus::Complete).then_some(status)"));
+
+        let group_row = source
+            .split_once("    fn render_sidebar_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn build_sidebar_group_menu("))
+            .map(|(body, _)| body)
+            .expect("sidebar group renderer should remain inspectable");
+        // Collapsed is what decides whether the row speaks for its members.
+        assert!(group_row.contains("let collapsed_status = collapsed"));
+        assert!(group_row.contains("self.session_group_status(&group)"));
+        // The count and the status share one fixed-width trailing column, the
+        // same one a session row uses.
+        assert!(group_row.contains(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))"));
+        let status_slot = group_row
+            .find("sidebar_aggregate_status_indicator(status, cx)")
+            .expect("the group row should render the aggregate status");
+        let count_slot = group_row
+            .find("format!(\"{member_count}\")")
+            .expect("the group row should render the member count");
+        assert!(status_slot < count_slot);
+        assert!(group_row.contains(".when_some(collapsed_status, |this, status| {"));
+        assert!(group_row.contains(".when(collapsed_status.is_none(), |this| {"));
+        assert_eq!(
+            source
+                .matches("\nconst SIDEBAR_STATUS_COLUMN_WIDTH: f32 = 76.0;")
+                .count(),
+            1
+        );
+        assert!(
+            source
+                .matches(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))")
+                .count()
+                >= 2,
+            "the session row and the group row should share the status column"
+        );
     }
 
     /// The group's own name titles its context menu, and a session joins a group
