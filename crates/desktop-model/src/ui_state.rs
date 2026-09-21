@@ -1397,9 +1397,7 @@ impl DesktopUiStateV1 {
             std::mem::take(&mut self.session.dismissed_permission_alerts)
                 .into_iter()
                 .filter_map(|(session_id, signature)| {
-                    bounded_required(&session_id, 256)
-                        .zip(bounded_required(&signature, 4_096))
-                        .map(|(session_id, signature)| (session_id, signature))
+                    bounded_required(&session_id, 256).zip(bounded_required(&signature, 4_096))
                 })
                 .take(2_000)
                 .collect();
