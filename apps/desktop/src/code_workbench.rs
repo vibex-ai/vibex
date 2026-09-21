@@ -1076,7 +1076,7 @@ pub struct CodeWorkbench {
     /// hydration pass cannot read the previous session's tabs into the new one.
     preview_layout_generation: u64,
     preview_panel_fullscreen: bool,
-    /// Whether the preview panel is hosted by its own window instead of the
+    /// Whether the editor panel is hosted by its own window instead of the
     /// workbench column. The entity is the same in either host, so tabs,
     /// editors, and terminals move with it.
     preview_detached: bool,
@@ -2553,16 +2553,20 @@ impl CodeWorkbench {
         });
     }
 
+    /// Asks the workbench to collapse the editor panel.
+    ///
+    /// Collapsing hides the panel without closing its tabs, so the same tabs
+    /// come back the next time it opens.
     fn request_close_preview_panel(&self, cx: &mut Context<Self>) {
         let Some(parent) = self.parent.clone() else {
             return;
         };
         cx.defer(move |cx| {
-            let _ = parent.update(cx, |parent, cx| parent.close_code_preview(cx));
+            let _ = parent.update(cx, |parent, cx| parent.collapse_code_preview(cx));
         });
     }
 
-    /// Asks the workbench to move the preview panel into its own window, or
+    /// Asks the workbench to move the editor panel into its own window, or
     /// back into the workbench column. The panel is never re-created, so every
     /// open tab travels with it.
     fn request_preview_window(
@@ -2613,7 +2617,7 @@ impl CodeWorkbench {
             return;
         };
         cx.defer(move |cx| {
-            let _ = parent.update(cx, |parent, cx| parent.close_code_preview(cx));
+            let _ = parent.update(cx, |parent, cx| parent.collapse_code_preview(cx));
         });
     }
 
@@ -5479,23 +5483,6 @@ impl CodeWorkbench {
         }
     }
 
-    pub(crate) fn close_panel_tabs(&mut self, cx: &mut Context<Self>) {
-        let tab_ids = self.preview.tabs.keys().cloned().collect::<Vec<_>>();
-        for tab_id in tab_ids {
-            let disposition = self.preview.close_guarded(&tab_id, true, &BTreeSet::new());
-            if disposition == PreviewCloseDisposition::Closed {
-                self.cleanup_closed_tab(&tab_id, true, cx);
-            }
-        }
-        self.set_preview_panel_fullscreen(false, cx);
-        self.preview.set_fullscreen(None);
-        self.preview.set_side_preview(None);
-        self.sync_terminal_surface_activity(cx);
-        self.persist(cx);
-        self.persist_editor_recovery(cx);
-        cx.notify();
-    }
-
     /// Selects `path` in the Files tree and opens the right rail on it.
     ///
     /// A nested file only becomes selectable once every directory above it is
@@ -7894,9 +7881,9 @@ impl CodeWorkbench {
                                     .icon(IconName::File)
                                     .label(link_path)
                                     .tooltip(locale::text(
-                                        "Open workspace link in Preview",
-                                        "在预览中打开工作区链接",
-                                        "在預覽中開啟工作區連結",
+                                        "Open workspace link in Editor",
+                                        "在编辑器中打开工作区链接",
+                                        "在編輯器中開啟工作區連結",
                                     ))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.open_file(open_path.clone(), false, window, cx)
@@ -9113,15 +9100,15 @@ impl Render for CodeWorkbench {
                                     })
                                     .tooltip(if is_detached {
                                         locale::text(
-                                            "Dock preview into the main window",
-                                            "嵌入主窗口",
-                                            "嵌入主視窗",
+                                            "Dock editor into the main window",
+                                            "将编辑器嵌入主窗口",
+                                            "將編輯器嵌入主視窗",
                                         )
                                     } else {
                                         locale::text(
-                                            "Pop out preview window",
-                                            "弹出为独立窗口",
-                                            "彈出為獨立視窗",
+                                            "Pop out editor window",
+                                            "弹出编辑器窗口",
+                                            "彈出編輯器視窗",
                                         )
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -9170,9 +9157,9 @@ impl Render for CodeWorkbench {
                                     .size(px(28.0))
                                     .icon(IconName::Close)
                                     .tooltip(locale::text(
-                                        "Close preview panel",
-                                        "关闭预览面板",
-                                        "關閉預覽面板",
+                                        "Close editor",
+                                        "关闭编辑器",
+                                        "關閉編輯器",
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.request_close_preview_panel(cx)
@@ -9192,15 +9179,15 @@ impl Render for CodeWorkbench {
                         .child(div().min_w_0().text_xs().child(
                             match locale::current_locale() {
                                 locale::ResolvedLocale::En => format!(
-                                    "Dirty buffers keep Preview on the current workspace; pending {}",
+                                    "Dirty buffers keep the editor on the current workspace; pending {}",
                                     pending.root.display()
                                 ),
                                 locale::ResolvedLocale::ZhCn => format!(
-                                    "存在未保存的缓冲区，预览仍停留在当前工作区；等待切换到 {}",
+                                    "存在未保存的缓冲区，编辑器仍停留在当前工作区；等待切换到 {}",
                                     pending.root.display()
                                 ),
                                 locale::ResolvedLocale::ZhTw => format!(
-                                    "存在未儲存的緩衝區，預覽仍停留在目前工作區；等待切換到 {}",
+                                    "存在未儲存的緩衝區，編輯器仍停留在目前工作區；等待切換到 {}",
                                     pending.root.display()
                                 ),
                             },

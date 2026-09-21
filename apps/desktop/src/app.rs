@@ -6267,7 +6267,7 @@ pub struct VibexWorkbench {
     runtime_connect_errors: BTreeMap<String, String>,
     code_workbench: Entity<CodeWorkbench>,
     preview_fullscreen_active: bool,
-    /// The window hosting the multi-tab preview panel while it is popped out of
+    /// The window hosting the editor panel while it is popped out of
     /// the workbench. `None` means the panel is hosted inline, and the two are
     /// mutually exclusive so the workbench never draws a second panel.
     preview_window: Option<AnyWindowHandle>,
@@ -21605,7 +21605,7 @@ impl VibexWorkbench {
         });
     }
 
-    /// Moves the multi-tab preview panel between the workbench column and its
+    /// Moves the editor panel between the workbench column and its
     /// own window. The panel entity changes host instead of being rebuilt, so
     /// open tabs, editor buffers, and terminals travel with it and there is
     /// never more than one panel.
@@ -21632,7 +21632,7 @@ impl VibexWorkbench {
         }
     }
 
-    /// Records where the preview panel opens, and moves a panel that is already
+    /// Records where the editor panel opens, and moves a panel that is already
     /// open so the change is visible immediately instead of on the next open.
     pub(crate) fn set_preview_window_mode(
         &mut self,
@@ -27937,7 +27937,7 @@ impl VibexWorkbench {
     /// Park the right-hand column of the scope that is on screen and install
     /// the one parked for `owner`.
     ///
-    /// The rail and the multi-tab preview are two halves of the same column, so
+    /// The rail and the editor are two halves of the same column, so
     /// they move together: switching sessions in project scope keeps both, and
     /// in session scope restores what that session last had open.
     fn switch_workspace_layout_owner(&mut self, owner: Option<String>, cx: &mut Context<Self>) {
@@ -29055,21 +29055,18 @@ impl VibexWorkbench {
     }
 
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
-        let was_open = self.preview_panel_open();
+        if self.preview_panel_open() {
+            self.collapse_code_preview(cx);
+            return;
+        }
         if self.last_visibility.preview_docked {
-            self.ui_state.workbench.preview_visible = !self.ui_state.workbench.preview_visible;
+            self.ui_state.workbench.preview_visible = true;
             self.queue_ui_state();
         } else {
             (self.preview_overlay_open, self.right_rail_overlay_open) =
                 toggle_exclusive_overlay(self.preview_overlay_open, self.right_rail_overlay_open);
         }
-        if was_open {
-            self.code_workbench
-                .update(cx, |workbench, cx| workbench.exit_fullscreen(cx));
-            // Hiding the panel hides it everywhere: leaving the detached window
-            // behind would keep a panel the workbench no longer shows.
-            self.close_preview_window(cx);
-        } else if self.ui_state.workbench.preview_window_mode.is_window()
+        if self.ui_state.workbench.preview_window_mode.is_window()
             && let Some(window_handle) = self.window_handle
         {
             self.detach_preview_window(window_handle, cx);
@@ -29077,7 +29074,7 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Opens the preview panel where the user configured it to open.
+    /// Opens the editor panel where the user configured it to open.
     pub(crate) fn reveal_code_preview(&mut self, cx: &mut Context<Self>) {
         self.show_code_preview_inline(cx);
         if self.ui_state.workbench.preview_window_mode.is_window()
@@ -29105,18 +29102,27 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    pub(crate) fn close_code_preview(&mut self, cx: &mut Context<Self>) {
-        // Closing the panel closes its window too; the workbench clears the
-        // handle first so the window teardown does not read as "dock it back".
-        self.close_preview_window(cx);
-        self.code_workbench
-            .update(cx, |workbench, cx| workbench.close_panel_tabs(cx));
-        let visibility_changed = self.ui_state.workbench.preview_visible;
-        self.ui_state.workbench.preview_visible = false;
-        self.preview_overlay_open = false;
-        if visibility_changed {
-            self.queue_ui_state();
+    /// Collapses the editor panel without touching its tabs.
+    ///
+    /// The rail's logo button and the panel header's close button both land
+    /// here, so hiding the panel means one thing wherever it is asked for: the
+    /// tabs stay open and the panel comes back exactly as it was left.
+    ///
+    /// Collapsing the panel closes its window too; the workbench clears the
+    /// handle first so the window teardown does not read as "dock it back".
+    pub(crate) fn collapse_code_preview(&mut self, cx: &mut Context<Self>) {
+        if !self.preview_panel_open() {
+            return;
         }
+        if self.last_visibility.preview_docked {
+            self.ui_state.workbench.preview_visible = false;
+            self.queue_ui_state();
+        } else {
+            self.preview_overlay_open = false;
+        }
+        self.code_workbench
+            .update(cx, |workbench, cx| workbench.exit_fullscreen(cx));
+        self.close_preview_window(cx);
         cx.notify();
     }
 
@@ -29292,7 +29298,7 @@ impl VibexWorkbench {
         }
     }
 
-    /// Whether the multi-tab preview panel is on screen right now.
+    /// Whether the editor panel is on screen right now.
     ///
     /// A docked panel follows its visibility flag; a window too narrow to dock
     /// it shows the same choice as an overlay, exactly like the right rail.
@@ -29334,7 +29340,7 @@ impl VibexWorkbench {
         };
         let panel_open = self.right_rail_panel_open();
         // The branded mark leads the bar as the quick toggle for the multi-tab
-        // preview panel: the panel and this rail are the two halves of one
+        // editor panel: the panel and this rail are the two halves of one
         // right-hand column, so the control that shows and hides the panel sits
         // above the rail modes instead of among them.
         let preview_open = self.preview_panel_open();
@@ -29343,9 +29349,9 @@ impl VibexWorkbench {
             Icon::default().path("icons/vibex/vibex-mark.svg"),
         )
         .tooltip(if preview_open {
-            locale::text("Collapse preview panel", "收起预览面板", "收起預覽面板")
+            locale::text("Collapse editor", "收起编辑器", "收起編輯器")
         } else {
-            locale::text("Open preview panel", "打开预览面板", "開啟預覽面板")
+            locale::text("Open editor", "打开编辑器", "開啟編輯器")
         })
         .selected(preview_open)
         .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
@@ -46007,9 +46013,9 @@ impl VibexWorkbench {
                             .icon(IconName::FolderOpen)
                             .label(path.clone())
                             .tooltip(locale::text(
-                                "Open Agent file operation in Preview",
-                                "在预览中打开 Agent 文件操作",
-                                "在預覽中開啟 Agent 檔案操作",
+                                "Open Agent file operation in Editor",
+                                "在编辑器中打开 Agent 文件操作",
+                                "在編輯器中開啟 Agent 檔案操作",
                             ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_code_file(path.clone(), window, cx)
@@ -46332,9 +46338,9 @@ impl VibexWorkbench {
                                 .size(px(28.0))
                                 .icon(IconName::FolderOpen)
                                 .tooltip(locale::text(
-                                    "Open file in Preview",
-                                    "在预览中打开文件",
-                                    "在預覽中開啟檔案",
+                                    "Open file in Editor",
+                                    "在编辑器中打开文件",
+                                    "在編輯器中開啟檔案",
                                 ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
@@ -51434,7 +51440,7 @@ impl VibexWorkbench {
     }
 }
 
-/// Where the workbench column draws the multi-tab preview panel.
+/// Where the workbench column draws the editor panel.
 ///
 /// The panel has exactly one host at a time. While it is detached the workbench
 /// draws none of these surfaces, because the detached window draws the same
@@ -57466,7 +57472,7 @@ fn shortcut_action_label(action: &str, strings: Strings) -> &'static str {
     let locale = strings.locale;
     match action {
         "toggle_sidebar" => locale::text_for(locale, "Toggle sidebar", "切换侧栏", "切換側邊欄"),
-        "toggle_preview" => locale::text_for(locale, "Toggle preview", "切换预览", "切換預覽"),
+        "toggle_preview" => locale::text_for(locale, "Toggle editor", "切换编辑器", "切換編輯器"),
         "toggle_right_rail" => {
             locale::text_for(locale, "Toggle right rail", "切换右侧栏", "切換右側欄")
         }
@@ -58049,13 +58055,22 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Workbench,
-            locale::text("Preview window", "预览窗口", "預覽視窗"),
+            locale::text("Editor window", "编辑器窗口", "編輯器視窗"),
             locale::text(
-                "Choose whether the multi-tab preview opens inside the workbench or in a window of its own.",
-                "选择多标签预览在主窗口内嵌打开，还是弹出为独立窗口。",
-                "選擇多分頁預覽在主視窗內嵌開啟，或彈出為獨立視窗。",
+                "Choose whether the editor opens inside the workbench or in a window of its own.",
+                "选择编辑器在主窗口内嵌打开，还是弹出为独立窗口。",
+                "選擇編輯器在主視窗內嵌開啟，或彈出為獨立視窗。",
             ),
-            &["preview", "window", "popup", "预览", "視窗", "獨立"],
+            &[
+                "preview",
+                "editor",
+                "window",
+                "popup",
+                "预览",
+                "编辑器",
+                "視窗",
+                "獨立",
+            ],
         ),
         settings_search_candidate(
             SettingsSection::Workbench,
@@ -58095,9 +58110,9 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
             SettingsSection::Workbench,
             locale::text("Workspace state", "工作区状态", "工作區狀態"),
             locale::text(
-                "Choose whether sessions of one project checkout share the right rail, the integrated panel, and the multi-tab preview.",
-                "选择同一项目检出下的会话共享右侧栏、集成面板和多标签预览，还是每个会话各自保存。",
-                "選擇同一專案簽出下的會話共享右側欄、整合面板與多分頁預覽，或每個會話各自儲存。",
+                "Choose whether sessions of one project checkout share the right rail, the integrated panel, and the editor.",
+                "选择同一项目检出下的会话共享右侧栏、集成面板和编辑器，还是每个会话各自保存。",
+                "選擇同一專案簽出下的會話共享右側欄、整合面板與編輯器，或每個會話各自儲存。",
             ),
             &[
                 "workspace state",
@@ -62021,11 +62036,11 @@ impl FoundationSettings {
                     locale::text("Layout", "布局", "版面"),
                     vec![
                     setting_row(
-                        locale::text("Preview window", "预览窗口", "預覽視窗"),
+                        locale::text("Editor window", "编辑器窗口", "編輯器視窗"),
                         locale::text(
-                            "Choose whether the multi-tab preview opens inside the workbench or in a window of its own.",
-                            "选择多标签预览在主窗口内嵌打开，还是弹出为独立窗口。",
-                            "選擇多分頁預覽在主視窗內嵌開啟，或彈出為獨立視窗。",
+                            "Choose whether the editor opens inside the workbench or in a window of its own.",
+                            "选择编辑器在主窗口内嵌打开，还是弹出为独立窗口。",
+                            "選擇編輯器在主視窗內嵌開啟，或彈出為獨立視窗。",
                         ),
                         preview_window_control,
                         stacked,
@@ -62034,9 +62049,9 @@ impl FoundationSettings {
                     setting_row(
                         locale::text("Workspace state", "工作区状态", "工作區狀態"),
                         locale::text(
-                            "Sessions in the same project checkout share the right rail, the integrated panel, and the multi-tab preview. Per session keeps them apart and restores each session's own column.",
-                            "同一项目检出下的会话共享右侧栏、集成面板和多标签预览；按会话则为每个会话单独保存，切换会话时恢复。",
-                            "同一專案簽出下的會話共享右側欄、整合面板與多分頁預覽；按會話則為每個會話單獨儲存，切換會話時還原。",
+                            "Sessions in the same project checkout share the right rail, the integrated panel, and the editor. Per session keeps them apart and restores each session's own column.",
+                            "同一项目检出下的会话共享右侧栏、集成面板和编辑器；按会话则为每个会话单独保存，切换会话时恢复。",
+                            "同一專案簽出下的會話共享右側欄、整合面板與編輯器；按會話則為每個會話單獨儲存，切換會話時還原。",
                         ),
                         workspace_scope_control,
                         stacked,
@@ -68388,8 +68403,8 @@ mod tests {
         assert!(renderer.contains("vec![preview, files, terminal]"));
     }
 
-    /// The branded quick button leads the bar and toggles the multi-tab preview
-    /// panel, which shares the right-hand column with this rail.
+    /// The branded quick button leads the bar and toggles the editor panel,
+    /// which shares the right-hand column with this rail.
     #[test]
     fn right_rail_activity_bar_offers_the_preview_toggle() {
         let source = include_str!("app.rs");
@@ -68410,6 +68425,40 @@ mod tests {
             renderer.contains("vec![preview, files, git, terminal]"),
             "the quick toggle leads the bar, above the rail modes"
         );
+    }
+
+    /// Closing the editor panel collapses it, and the rail's logo button
+    /// performs the same collapse: the tabs stay open either way.
+    #[test]
+    fn closing_the_editor_panel_keeps_its_tabs() {
+        let source = include_str!("app.rs");
+        let collapse = source
+            .split_once("    pub(crate) fn collapse_code_preview(")
+            .and_then(|(_, tail)| tail.split_once("\n    pub(crate) fn reveal_file_in_right_rail("))
+            .map(|(body, _)| body)
+            .expect("the collapse path should remain inspectable");
+
+        assert!(collapse.contains("self.close_preview_window(cx)"));
+        assert!(collapse.contains("workbench.exit_fullscreen(cx)"));
+        assert!(
+            !collapse.contains("close_panel_tabs"),
+            "collapsing the panel must keep the open tabs"
+        );
+
+        let toggle = source
+            .split_once("    fn toggle_preview(&mut self, cx: &mut Context<Self>) {")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Opens the editor panel"))
+            .map(|(body, _)| body)
+            .expect("the rail toggle should remain inspectable");
+        assert!(
+            toggle.contains("self.collapse_code_preview(cx)"),
+            "the rail button collapses through the same path"
+        );
+
+        // The panel header's close button asks for that same collapse.
+        let panel = include_str!("code_workbench.rs");
+        assert!(panel.contains("\"Close editor\""));
+        assert!(panel.contains("parent.collapse_code_preview(cx)"));
     }
 
     #[test]
@@ -69906,9 +69955,7 @@ mod tests {
         // disagree with where the panel just went.
         let button = source
             .split_once("    pub(crate) fn set_preview_window_detached(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Records where the preview panel opens")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Records where the editor panel opens"))
             .map(|(body, _)| body)
             .expect("the panel button should remain inspectable");
         assert!(button.contains("self.set_preview_window_mode("));
@@ -70032,7 +70079,7 @@ mod tests {
     }
 
     /// Stands in for the workbench: an entity that closes a window it owns from
-    /// inside its own update, exactly the way docking the preview panel does.
+    /// inside its own update, exactly the way docking the editor panel does.
     struct PreviewWindowCloseProbe {
         closing: Rc<Cell<Option<WindowId>>>,
         removal_returned: Rc<Cell<bool>>,
@@ -78367,7 +78414,7 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\nfn localize_network_proxy_error("))
             .map(|(body, _)| body)
             .expect("shell should remain inspectable");
-        // Workbench column, preview panel, and right-rail panel each start
+        // Workbench column, editor panel, and right-rail panel each start
         // below the bar; the floating panels anchor below it as well.
         assert!(shell.matches(".pt(px(TITLE_BAR_HEIGHT))").count() >= 3);
         assert!(shell.matches(".top(px(TITLE_BAR_HEIGHT))").count() >= 2);
