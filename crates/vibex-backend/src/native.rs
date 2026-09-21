@@ -42,9 +42,9 @@ use vibex_core::{
     GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
     GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, Hook, HookCreateRequest,
     HookDeleteRequest, HookInstallPreview, HookInstallPreviewRequest, HookUpdateRequest,
-    ManagementSnapshotPayload, MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry,
-    McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
+    ManagementSnapshotPayload, McpMarketInstallRequest, McpMarketInstallResult,
+    McpMarketSearchRequest, McpMarketSearchResponse, McpServer, McpServerAgentMatrix,
+    McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
@@ -2469,35 +2469,6 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
-    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime.ensure_accepting_actions()?;
-            runtime
-                .management()
-                .providers()
-                .management()
-                .market_sources()
-                .map_err(Into::into)
-        })
-    }
-
-    fn set_market_sources(
-        &self,
-        request: MutationRequest<MarketSourceSetRequest>,
-    ) -> BackendFuture<'_, MarketSourceListResponse> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime.ensure_accepting_actions()?;
-            runtime
-                .management()
-                .providers()
-                .management()
-                .set_market_sources(request.payload)
-                .map_err(Into::into)
-        })
-    }
-
     fn search_mcp_market(
         &self,
         request: McpMarketSearchRequest,
@@ -2514,26 +2485,6 @@ impl ManagementBackend for NativeBackend {
                     BackendError::failed(
                         "market_search_task_failed",
                         "the market search task did not complete",
-                    )
-                })?
-                .map_err(Into::into)
-        })
-    }
-
-    fn mcp_market_entry(
-        &self,
-        request: McpMarketEntryRequest,
-    ) -> BackendFuture<'_, McpMarketEntry> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime.ensure_accepting_actions()?;
-            let service = runtime.management().providers().management();
-            tokio::task::spawn_blocking(move || service.mcp_market_entry(request))
-                .await
-                .map_err(|_| {
-                    BackendError::failed(
-                        "market_entry_task_failed",
-                        "the market entry task did not complete",
                     )
                 })?
                 .map_err(Into::into)

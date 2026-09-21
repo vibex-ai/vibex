@@ -34,7 +34,6 @@ use vibex_core::{
     GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
     GitWorktreeRestoreRequest, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
     HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
-    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
@@ -1307,28 +1306,10 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
-    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse> {
-        disconnected_future!()
-    }
-
-    fn set_market_sources(
-        &self,
-        _request: MutationRequest<MarketSourceSetRequest>,
-    ) -> BackendFuture<'_, MarketSourceListResponse> {
-        disconnected_future!()
-    }
-
     fn search_mcp_market(
         &self,
         _request: McpMarketSearchRequest,
     ) -> BackendFuture<'_, McpMarketSearchResponse> {
-        disconnected_future!()
-    }
-
-    fn mcp_market_entry(
-        &self,
-        _request: McpMarketEntryRequest,
-    ) -> BackendFuture<'_, McpMarketEntry> {
         disconnected_future!()
     }
 

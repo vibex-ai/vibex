@@ -562,29 +562,11 @@ impl ProviderManagementFacade {
         self.service.validate_mcp_server(request)
     }
 
-    pub fn market_sources(&self) -> VibexResult<vibex_core::MarketSourceListResponse> {
-        self.service.market_sources()
-    }
-
-    pub fn set_market_sources(
-        &self,
-        request: vibex_core::MarketSourceSetRequest,
-    ) -> VibexResult<vibex_core::MarketSourceListResponse> {
-        self.service.set_market_sources(request)
-    }
-
     pub fn search_mcp_market(
         &self,
         request: vibex_core::McpMarketSearchRequest,
     ) -> VibexResult<vibex_core::McpMarketSearchResponse> {
         self.service.search_mcp_market(request)
-    }
-
-    pub fn mcp_market_entry(
-        &self,
-        request: vibex_core::McpMarketEntryRequest,
-    ) -> VibexResult<vibex_core::McpMarketEntry> {
-        self.service.mcp_market_entry(request)
     }
 
     pub fn install_mcp_market_entry(

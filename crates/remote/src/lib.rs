@@ -3317,40 +3317,6 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderSkillValidateResponse { result: value })
                 .map_err(remote_payload_encode_error)
         }
-        RemoteProviderRequest::MarketSourceList(request) => {
-            authorize_provider_action(
-                runtime,
-                request.auth,
-                RemoteActionClass::ReadProviderSettings,
-                Some(request_id),
-                correlation_id,
-            )?;
-            let sources = run_market_blocking(move || service.market_sources())?;
-            serde_json::to_value(vibex_core::RemoteProviderMarketSourceListResponse { sources })
-                .map_err(remote_payload_encode_error)
-        }
-        RemoteProviderRequest::MarketSourceSet(request) => {
-            let auth = authorize_provider_action(
-                runtime,
-                request.auth,
-                RemoteActionClass::MutateProviderSettings,
-                Some(request_id.clone()),
-                correlation_id.clone(),
-            )?;
-            let sources = run_market_blocking(move || service.set_market_sources(request.request));
-            audit_provider_mutation(
-                runtime,
-                &auth,
-                "market_source_set".to_string(),
-                "Market sources updated from a paired device",
-                sources.is_ok(),
-                Some(request_id),
-                correlation_id,
-            )?;
-            let sources = sources?;
-            serde_json::to_value(vibex_core::RemoteProviderMarketSourceSetResponse { sources })
-                .map_err(remote_payload_encode_error)
-        }
         RemoteProviderRequest::McpMarketSearch(request) => {
             authorize_provider_action(
                 runtime,
@@ -3361,18 +3327,6 @@ async fn dispatch_provider_request(
             )?;
             let result = run_market_blocking(move || service.search_mcp_market(request.request))?;
             serde_json::to_value(vibex_core::RemoteProviderMcpMarketSearchResponse { result })
-                .map_err(remote_payload_encode_error)
-        }
-        RemoteProviderRequest::McpMarketEntry(request) => {
-            authorize_provider_action(
-                runtime,
-                request.auth,
-                RemoteActionClass::ReadProviderSettings,
-                Some(request_id),
-                correlation_id,
-            )?;
-            let entry = run_market_blocking(move || service.mcp_market_entry(request.request))?;
-            serde_json::to_value(vibex_core::RemoteProviderMcpMarketEntryResponse { entry })
                 .map_err(remote_payload_encode_error)
         }
         RemoteProviderRequest::McpMarketInstall(request) => {

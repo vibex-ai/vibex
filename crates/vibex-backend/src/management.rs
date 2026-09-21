@@ -25,7 +25,6 @@ use vibex_core::{
     CustomAgentCreateRequest, CustomAgentDeleteRequest, DiagnosticExportOutcome,
     DiagnosticExportPayload, Hook, HookCreateRequest, HookDeleteRequest, HookInstallPreview,
     HookInstallPreviewRequest, HookUpdateRequest, ManagementSnapshotPayload,
-    MarketSourceListResponse, MarketSourceSetRequest, McpMarketEntry, McpMarketEntryRequest,
     McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
     McpMarketSearchResponse, McpServer, McpServerAgentMatrix, McpServerAgentMatrixListRequest,
     McpServerCreateRequest, McpServerDeleteRequest, McpServerDiscoverRequest,
@@ -480,20 +479,10 @@ pub trait ManagementBackend: BackendBound {
         request: McpServerValidateRequest,
     ) -> BackendFuture<'_, McpServerValidationResult>;
 
-    fn market_sources(&self) -> BackendFuture<'_, MarketSourceListResponse>;
-
-    fn set_market_sources(
-        &self,
-        request: MutationRequest<MarketSourceSetRequest>,
-    ) -> BackendFuture<'_, MarketSourceListResponse>;
-
     fn search_mcp_market(
         &self,
         request: McpMarketSearchRequest,
     ) -> BackendFuture<'_, McpMarketSearchResponse>;
-
-    fn mcp_market_entry(&self, request: McpMarketEntryRequest)
-    -> BackendFuture<'_, McpMarketEntry>;
 
     fn install_mcp_market_entry(
         &self,

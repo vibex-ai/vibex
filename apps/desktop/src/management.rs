@@ -825,11 +825,8 @@ pub struct ManagementCenter {
     mcp_market_open: bool,
     mcp_market_query: Entity<InputState>,
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
-    mcp_market_failures: Vec<vibex_core::MarketSourceFailure>,
     mcp_market_loading: bool,
     mcp_market_error: Option<String>,
-    /// `None` is the "all categories" chip.
-    mcp_market_category: Option<vibex_core::McpMarketCategory>,
     /// Entry the install form is configuring; `None` while browsing.
     mcp_market_install_target: Option<vibex_core::McpMarketEntry>,
     mcp_market_install_agents: BTreeSet<String>,
@@ -838,26 +835,14 @@ pub struct ManagementCenter {
     skill_market_open: bool,
     skill_market_query: Entity<InputState>,
     skill_market_entries: Vec<vibex_core::SkillMarketEntry>,
-    skill_market_failures: Vec<vibex_core::MarketSourceFailure>,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
-    /// `None` is the "all categories" chip.
-    skill_market_category: Option<vibex_core::SkillMarketCategory>,
     /// Entry the install form is configuring; `None` while browsing.
     skill_market_install_target: Option<vibex_core::SkillMarketEntry>,
     skill_market_install_agents: BTreeSet<String>,
     /// The previewed document, held so install writes exactly what was shown.
     skill_market_document: Option<vibex_core::SkillMarketDocument>,
     skill_market_preview_loading: bool,
-    /// Every configured catalog source, builtin and user-added.
-    market_sources: Vec<vibex_core::MarketSource>,
-    market_sources_loading: bool,
-    /// Whether the source manager is showing over the market.
-    market_sources_open: bool,
-    market_source_name_draft: Entity<InputState>,
-    market_source_url_draft: Entity<InputState>,
-    market_source_kind_draft: vibex_core::MarketSourceKind,
-    market_source_error: Option<String>,
     mcp_validation: Option<(String, String, bool)>,
     skill_validation: Option<(String, String, bool)>,
     /// Agent whose native file the MCP and Skills export cards target.
@@ -1039,20 +1024,6 @@ impl ManagementCenter {
                 "Search the Skill market",
                 "搜索技能市场",
                 "搜尋技能市場",
-            ))
-        });
-        let market_source_name_draft = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "Source name (optional)",
-                "源名称（可选）",
-                "來源名稱（可選）",
-            ))
-        });
-        let market_source_url_draft = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(management_locale_text(
-                "https://example.com/catalog.json",
-                "https://example.com/catalog.json",
-                "https://example.com/catalog.json",
             ))
         });
         let mcp_name_draft = cx.new(|cx| {
@@ -1633,31 +1604,20 @@ impl ManagementCenter {
             mcp_market_open: false,
             mcp_market_query,
             mcp_market_entries: Vec::new(),
-            mcp_market_failures: Vec::new(),
             mcp_market_loading: false,
             mcp_market_error: None,
-            mcp_market_category: None,
             mcp_market_install_target: None,
             mcp_market_install_agents: BTreeSet::new(),
             mcp_market_install_env: BTreeMap::new(),
             skill_market_open: false,
             skill_market_query,
             skill_market_entries: Vec::new(),
-            skill_market_failures: Vec::new(),
             skill_market_loading: false,
             skill_market_error: None,
-            skill_market_category: None,
             skill_market_install_target: None,
             skill_market_install_agents: BTreeSet::new(),
             skill_market_document: None,
             skill_market_preview_loading: false,
-            market_sources: Vec::new(),
-            market_sources_loading: false,
-            market_sources_open: false,
-            market_source_name_draft,
-            market_source_url_draft,
-            market_source_kind_draft: vibex_core::MarketSourceKind::McpRegistry,
-            market_source_error: None,
             mcp_validation: None,
             skill_validation: None,
             resource_export_agent_id: None,
@@ -7725,9 +7685,6 @@ impl ManagementCenter {
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
         self.mcp_market_install_agents = self.market_default_agents();
-        self.mcp_market_category = None;
-        self.market_sources_open = false;
-        self.load_market_sources(cx);
         self.search_mcp_market(window, cx);
     }
 
@@ -7735,188 +7692,18 @@ impl ManagementCenter {
         self.mcp_market_open = false;
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
-        self.market_sources_open = false;
         cx.notify();
-    }
-
-    fn set_mcp_market_category(
-        &mut self,
-        category: Option<vibex_core::McpMarketCategory>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.mcp_market_category = category;
-        self.search_mcp_market(window, cx);
     }
 
     /// Load the configured catalog sources.
     ///
     /// Sources live in the authoritative runtime rather than this view, so a
     /// paired device sees the same list the desktop does.
-    fn load_market_sources(&mut self, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        self.market_sources_loading = true;
-        let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .management()
-                .market_sources()
-                .await
-                .map_err(crate::app::remote_error_into_vibex)
-        });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                this.market_sources_loading = false;
-                match outcome {
-                    Ok(Ok(response)) => this.market_sources = response.sources,
-                    Ok(Err(error)) => {
-                        this.market_source_error =
-                            Some(format!("{}: {}", error.code, error.message))
-                    }
-                    Err(error) => this.market_source_error = Some(format!("{error}")),
-                }
-                cx.notify();
-            });
-        }));
-    }
-
-    fn add_market_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let url = self
-            .market_source_url_draft
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if url.is_empty() {
-            self.market_source_error = Some(
-                management_error_text("Enter a catalog URL", "请输入目录地址", "請輸入目錄位址")
-                    .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let kind = self.market_source_kind_draft;
-        let name = {
-            let typed = self
-                .market_source_name_draft
-                .read(cx)
-                .value()
-                .trim()
-                .to_string();
-            if typed.is_empty() {
-                // Fall back to the host so the row is still identifiable.
-                url.split("://")
-                    .nth(1)
-                    .and_then(|rest| rest.split('/').next())
-                    .unwrap_or(&url)
-                    .to_string()
-            } else {
-                typed
-            }
-        };
-        let mut sources = self
-            .market_sources
-            .iter()
-            .filter(|source| !source.builtin)
-            .cloned()
-            .collect::<Vec<_>>();
-        let id = format!("user-{}", vibex_core::RequestId::new().as_str());
-        sources.push(vibex_core::MarketSource {
-            id,
-            name,
-            url,
-            kind,
-            builtin: false,
-        });
-        self.market_source_error = None;
-        self.market_source_name_draft
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.market_source_url_draft
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .management()
-                .set_market_sources(MutationRequest::new(vibex_core::MarketSourceSetRequest {
-                    sources,
-                }))
-                .await
-                .map_err(crate::app::remote_error_into_vibex)
-        });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(response)) => {
-                        this.market_sources = response.sources;
-                        // A new source changes what a search can find.
-                        this.mcp_market_entries.clear();
-                        this.skill_market_entries.clear();
-                    }
-                    Ok(Err(error)) => {
-                        this.market_source_error =
-                            Some(format!("{}: {}", error.code, error.message))
-                    }
-                    Err(error) => this.market_source_error = Some(format!("{error}")),
-                }
-                cx.notify();
-            });
-        }));
-    }
-
-    fn remove_market_source(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        let sources = self
-            .market_sources
-            .iter()
-            .filter(|source| !source.builtin && source.id != id)
-            .cloned()
-            .collect::<Vec<_>>();
-        self.market_source_error = None;
-        let entity = cx.weak_entity();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .management()
-                .set_market_sources(MutationRequest::new(vibex_core::MarketSourceSetRequest {
-                    sources,
-                }))
-                .await
-                .map_err(crate::app::remote_error_into_vibex)
-        });
-        self.mutation_task = Some(cx.spawn(async move |_, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                match outcome {
-                    Ok(Ok(response)) => {
-                        this.market_sources = response.sources;
-                        this.mcp_market_entries.clear();
-                        this.skill_market_entries.clear();
-                    }
-                    Ok(Err(error)) => {
-                        this.market_source_error =
-                            Some(format!("{}: {}", error.code, error.message))
-                    }
-                    Err(error) => this.market_source_error = Some(format!("{error}")),
-                }
-                cx.notify();
-            });
-        }));
-    }
-
     fn search_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
         let query = self.mcp_market_query.read(cx).value().trim().to_string();
-        let category = self.mcp_market_category;
         self.mcp_market_loading = true;
         self.mcp_market_error = None;
         let entity = cx.weak_entity();
@@ -7925,8 +7712,6 @@ impl ManagementCenter {
                 .management()
                 .search_mcp_market(vibex_core::McpMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    category,
-                    source_ids: Vec::new(),
                     limit: Some(60),
                     offset: None,
                 })
@@ -7940,7 +7725,6 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(response)) => {
                         this.mcp_market_entries = response.entries;
-                        this.mcp_market_failures = response.failed_sources;
                     }
                     Ok(Err(error)) => {
                         this.mcp_market_error = Some(format!("{}: {}", error.code, error.message));
@@ -8017,9 +7801,9 @@ impl ManagementCenter {
                 });
             }
         }
-        let source_id = entry.source_id.clone();
         let entry_id = entry.id.clone();
         let display_name = entry.name.clone();
+        let candidate = market_entry_to_candidate(&entry, &env_values);
         let active_locale = locale::current_locale();
         self.mutation = Some(ManagementMutation::McpAction(format!(
             "marketInstall:{entry_id}"
@@ -8031,11 +7815,10 @@ impl ManagementCenter {
                 .management()
                 .install_mcp_market_entry(MutationRequest::new(
                     vibex_core::McpMarketInstallRequest {
-                        source_id,
                         entry_id,
                         agent_ids,
                         env_values,
-                        candidate: None,
+                        candidate,
                     },
                 ))
                 .await
@@ -8109,9 +7892,6 @@ impl ManagementCenter {
         self.skill_market_install_target = None;
         self.skill_market_document = None;
         self.skill_market_install_agents = self.market_default_agents();
-        self.skill_market_category = None;
-        self.market_sources_open = false;
-        self.load_market_sources(cx);
         self.search_skill_market(window, cx);
     }
 
@@ -8119,18 +7899,7 @@ impl ManagementCenter {
         self.skill_market_open = false;
         self.skill_market_install_target = None;
         self.skill_market_document = None;
-        self.market_sources_open = false;
         cx.notify();
-    }
-
-    fn set_skill_market_category(
-        &mut self,
-        category: Option<vibex_core::SkillMarketCategory>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.skill_market_category = category;
-        self.search_skill_market(window, cx);
     }
 
     fn search_skill_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -8138,7 +7907,6 @@ impl ManagementCenter {
             return;
         };
         let query = self.skill_market_query.read(cx).value().trim().to_string();
-        let category = self.skill_market_category;
         self.skill_market_loading = true;
         self.skill_market_error = None;
         let entity = cx.weak_entity();
@@ -8147,8 +7915,6 @@ impl ManagementCenter {
                 .management()
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    category,
-                    source_ids: Vec::new(),
                     limit: Some(60),
                     offset: None,
                 })
@@ -8162,7 +7928,6 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(response)) => {
                         this.skill_market_entries = response.entries;
-                        this.skill_market_failures = response.failed_sources;
                     }
                     Ok(Err(error)) => {
                         this.skill_market_error =
@@ -8196,8 +7961,9 @@ impl ManagementCenter {
             backend
                 .management()
                 .skill_market_document(vibex_core::SkillMarketDocumentRequest {
-                    source_id: entry.source_id,
-                    entry_id: entry.id,
+                    entry_id: entry.id.clone(),
+                    source: entry.source.clone(),
+                    skill_id: entry.skill_id.clone(),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -8259,7 +8025,6 @@ impl ManagementCenter {
                 .management()
                 .install_skill_market_entry(MutationRequest::new(
                     vibex_core::SkillMarketInstallRequest {
-                        source_id: entry.source_id,
                         entry_id: entry.id,
                         agent_ids,
                         document,
@@ -10718,18 +10483,13 @@ impl ManagementCenter {
     }
 
     /// The MCP market, rendered in the section body rather than as an overlay.
+    /// The MCP market, rendered in the section body rather than as an overlay.
     fn render_mcp_market(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.market_sources_open {
-            return self.render_market_sources_panel(true, cx);
-        }
         let pending = self.mutation.is_some();
         let loading = self.mcp_market_loading;
         let error = self.mcp_market_error.clone();
-        let failures = self.mcp_market_failures.clone();
         let entries = self.mcp_market_entries.clone();
-        let category = self.mcp_market_category;
         let install_target = self.mcp_market_install_target.clone();
-        let source_count = self.market_sources.len();
         let query_input = self.mcp_market_query.clone();
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
@@ -10751,39 +10511,21 @@ impl ManagementCenter {
                         .on_click(cx.listener(|this, _, _, cx| this.close_mcp_market(cx))),
                 )
                 .child(
-                    h_flex()
+                    v_flex()
                         .w_full()
-                        .justify_between()
-                        .gap_3()
+                        .gap_1()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                            management_locale_text("MCP market", "MCP 市场", "MCP 市場"),
+                        ))
                         .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                                    management_locale_text("MCP market", "MCP 市场", "MCP 市場"),
-                                ))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "The exact command is shown before anything is saved.",
-                                            "保存前会完整展示将要执行的命令。",
-                                            "儲存前會完整展示將要執行的命令。",
-                                        )),
-                                ),
-                        )
-                        .child(
-                            Button::new("management-mcp-market-sources")
-                                .small()
-                                .ghost()
-                                .icon(Icon::default().path("icons/vibex/database.svg"))
-                                .label(market_source_count_label(source_count))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.market_sources_open = true;
-                                    this.load_market_sources(cx);
-                                })),
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "The exact command is shown before anything is saved.",
+                                    "保存前会完整展示将要执行的命令。",
+                                    "儲存前會完整展示將要執行的命令。",
+                                )),
                         ),
                 )
                 .child(
@@ -10810,42 +10552,8 @@ impl ManagementCenter {
                 ),
         );
 
-        // Category chips narrow what is already on screen; the backend applies
-        // the same filter, so a refresh keeps the selection.
-        let mut chips = h_flex().w_full().flex_none().flex_wrap().gap_1();
-        chips = chips.child(management_option_chip(
-            SharedString::from("management-mcp-market-cat-all"),
-            SharedString::from(management_locale_text("All", "全部", "全部")),
-            category.is_none(),
-            false,
-            None,
-            cx.listener(|this, _, window, cx| this.set_mcp_market_category(None, window, cx)),
-            cx,
-        ));
-        for value in vibex_core::McpMarketCategory::ALL {
-            chips = chips.child(management_option_chip(
-                SharedString::from(format!("management-mcp-market-cat-{}", value.as_str())),
-                SharedString::from(mcp_market_category_label(value)),
-                category == Some(value),
-                false,
-                None,
-                cx.listener(move |this, _, window, cx| {
-                    this.set_mcp_market_category(Some(value), window, cx)
-                }),
-                cx,
-            ));
-        }
-        content = content.child(chips);
-
         if let Some(error) = &error {
             content = content.child(management_market_banner(error.clone(), true, cx));
-        }
-        if !failures.is_empty() {
-            content = content.child(management_market_banner(
-                market_failure_summary(&failures),
-                false,
-                cx,
-            ));
         }
 
         if let Some(target) = install_target {
@@ -10871,34 +10579,18 @@ impl ManagementCenter {
                     .description
                     .clone()
                     .unwrap_or_else(|| management_unconfigured_label().to_string());
-                let command_line = match entry.transport {
-                    vibex_core::McpServerTransportKind::Stdio => {
-                        let mut parts = Vec::new();
-                        if let Some(command) = &entry.command {
-                            parts.push(command.clone());
-                        }
-                        parts.extend(entry.args.clone());
-                        parts.join(" ")
-                    }
-                    _ => entry.url.clone().unwrap_or_default(),
-                };
-                let category_id = entry
-                    .categories
-                    .first()
-                    .map(|value| value.as_str())
-                    .unwrap_or("devtools");
-                let icon = market_category_icon_path(category_id);
+                let command_line = market_entry_command_line(entry);
                 let mut badges = Vec::new();
                 if entry.verified {
                     badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
                 }
                 if installed_mcp_names.contains(&entry.name) {
-                    badges
-                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
+                    badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
-                if let Some(value) = entry.categories.first() {
-                    badges.push(mcp_market_category_label(*value));
+                if let Some(version) = entry.version.as_deref() {
+                    badges.push(version.to_string());
                 }
+                badges.push(market_transport_label(entry.transport));
                 let install_entry = entry.clone();
                 grid = grid.child(
                     h_flex()
@@ -10909,7 +10601,10 @@ impl ManagementCenter {
                         .border_1()
                         .border_color(cx.theme().border)
                         .p_3()
-                        .child(management_market_glyph(icon, cx))
+                        .child(management_market_glyph(
+                            market_transport_icon_path(entry.transport),
+                            cx,
+                        ))
                         .child(
                             v_flex()
                                 .min_w_0()
@@ -10926,11 +10621,9 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(
-                                            badges
-                                                .into_iter()
-                                                .map(|badge| management_market_badge(badge, cx)),
-                                        ),
+                                        .children(badges.into_iter().map(|badge| {
+                                            management_market_badge(badge, cx)
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -10955,11 +10648,9 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.begin_mcp_market_install(install_entry.clone(), window, cx)
-                                },
-                            )),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.begin_mcp_market_install(install_entry.clone(), window, cx)
+                            })),
                         ),
                 );
             }
@@ -11008,12 +10699,9 @@ impl ManagementCenter {
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(management_locale_text("Install", "安装", "安裝")),
-                    )
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                        management_locale_text("Install", "安装", "安裝"),
+                    ))
                     .child(
                         div()
                             .text_sm()
@@ -11053,17 +10741,15 @@ impl ManagementCenter {
                         .checked(checked)
                         .accessibility_label(SharedString::from(agent.label.clone()))
                         .disabled(pending)
-                        .on_click(cx.listener(
-                            move |this, checked, _, cx| {
-                                let checked = *checked;
-                                if checked {
-                                    this.mcp_market_install_agents.insert(toggle_id.clone());
-                                } else {
-                                    this.mcp_market_install_agents.remove(&toggle_id);
-                                }
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |this, checked, _, cx| {
+                            let checked = *checked;
+                            if checked {
+                                this.mcp_market_install_agents.insert(toggle_id.clone());
+                            } else {
+                                this.mcp_market_install_agents.remove(&toggle_id);
+                            }
+                            cx.notify();
+                        })),
                     )
                     .child(div().text_sm().child(agent.label.clone())),
             );
@@ -11129,9 +10815,7 @@ impl ManagementCenter {
                         .label(management_locale_text("Install", "安装", "安裝"))
                         .loading(pending)
                         .disabled(pending)
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx))),
                 ),
         )
         .into_any_element()
@@ -11139,19 +10823,13 @@ impl ManagementCenter {
 
     /// The Skill market, rendered in the section body rather than as an overlay.
     fn render_skills_market(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.market_sources_open {
-            return self.render_market_sources_panel(false, cx);
-        }
         let pending = self.mutation.is_some();
         let loading = self.skill_market_loading;
         let preview_loading = self.skill_market_preview_loading;
         let error = self.skill_market_error.clone();
-        let failures = self.skill_market_failures.clone();
         let entries = self.skill_market_entries.clone();
-        let category = self.skill_market_category;
         let install_target = self.skill_market_install_target.clone();
         let document = self.skill_market_document.clone();
-        let source_count = self.market_sources.len();
         let query_input = self.skill_market_query.clone();
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
@@ -11169,39 +10847,21 @@ impl ManagementCenter {
                         .on_click(cx.listener(|this, _, _, cx| this.close_skill_market(cx))),
                 )
                 .child(
-                    h_flex()
+                    v_flex()
                         .w_full()
-                        .justify_between()
-                        .gap_3()
+                        .gap_1()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                            management_locale_text("Skill market", "技能市场", "技能市場"),
+                        ))
                         .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                                    management_locale_text("Skill market", "技能市场", "技能市場"),
-                                ))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(management_locale_text(
-                                            "The full text is previewed before install.",
-                                            "安装前可预览技能全文。",
-                                            "安裝前可預覽技能全文。",
-                                        )),
-                                ),
-                        )
-                        .child(
-                            Button::new("management-skill-market-sources")
-                                .small()
-                                .ghost()
-                                .icon(Icon::default().path("icons/vibex/database.svg"))
-                                .label(market_source_count_label(source_count))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.market_sources_open = true;
-                                    this.load_market_sources(cx);
-                                })),
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "The full text is previewed before install.",
+                                    "安装前可预览技能全文。",
+                                    "安裝前可預覽技能全文。",
+                                )),
                         ),
                 )
                 .child(
@@ -11228,40 +10888,8 @@ impl ManagementCenter {
                 ),
         );
 
-        let mut chips = h_flex().w_full().flex_none().flex_wrap().gap_1();
-        chips = chips.child(management_option_chip(
-            SharedString::from("management-skill-market-cat-all"),
-            SharedString::from(management_locale_text("All", "全部", "全部")),
-            category.is_none(),
-            false,
-            None,
-            cx.listener(|this, _, window, cx| this.set_skill_market_category(None, window, cx)),
-            cx,
-        ));
-        for value in vibex_core::SkillMarketCategory::ALL {
-            chips = chips.child(management_option_chip(
-                SharedString::from(format!("management-skill-market-cat-{}", value.as_str())),
-                SharedString::from(skill_market_category_label(value)),
-                category == Some(value),
-                false,
-                None,
-                cx.listener(move |this, _, window, cx| {
-                    this.set_skill_market_category(Some(value), window, cx)
-                }),
-                cx,
-            ));
-        }
-        content = content.child(chips);
-
         if let Some(error) = &error {
             content = content.child(management_market_banner(error.clone(), true, cx));
-        }
-        if !failures.is_empty() {
-            content = content.child(management_market_banner(
-                market_failure_summary(&failures),
-                false,
-                cx,
-            ));
         }
 
         if let Some(target) = install_target {
@@ -11289,12 +10917,9 @@ impl ManagementCenter {
                     v_flex()
                         .w_full()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(management_locale_text("Install", "安装", "安裝")),
-                        )
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                            management_locale_text("Install", "安装", "安裝"),
+                        ))
                         .child(
                             div()
                                 .text_sm()
@@ -11373,17 +10998,15 @@ impl ManagementCenter {
                             .checked(checked)
                             .accessibility_label(SharedString::from(agent.label.clone()))
                             .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, checked, _, cx| {
-                                    let checked = *checked;
-                                    if checked {
-                                        this.skill_market_install_agents.insert(toggle_id.clone());
-                                    } else {
-                                        this.skill_market_install_agents.remove(&toggle_id);
-                                    }
-                                    cx.notify();
-                                },
-                            )),
+                            .on_click(cx.listener(move |this, checked, _, cx| {
+                                let checked = *checked;
+                                if checked {
+                                    this.skill_market_install_agents.insert(toggle_id.clone());
+                                } else {
+                                    this.skill_market_install_agents.remove(&toggle_id);
+                                }
+                                cx.notify();
+                            })),
                         )
                         .child(div().text_sm().child(agent.label.clone())),
                 );
@@ -11430,33 +11053,13 @@ impl ManagementCenter {
                 .collect();
             for entry in &entries {
                 let name = entry.name.clone();
-                let description = entry
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| management_unconfigured_label().to_string());
-                let author_line = entry
-                    .author
-                    .clone()
-                    .unwrap_or_else(|| entry.source_id.clone());
-                let category_id = entry
-                    .categories
-                    .first()
-                    .map(|value| value.as_str())
-                    .unwrap_or("workflow");
-                let icon = market_category_icon_path(category_id);
                 let mut badges = Vec::new();
-                if entry.verified {
-                    badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
+                if installed_skill_uris.contains(&format!("market:{}", entry.id)) {
+                    badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
-                badges.push(author_line);
-                if installed_skill_uris
-                    .contains(&format!("market:{}:{}", entry.source_id, entry.id))
-                {
-                    badges
-                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
-                }
-                if let Some(value) = entry.categories.first() {
-                    badges.push(skill_market_category_label(*value));
+                badges.push(entry.source.clone());
+                if entry.installs > 0 {
+                    badges.push(market_installs_label(entry.installs));
                 }
                 let install_entry = entry.clone();
                 grid = grid.child(
@@ -11468,7 +11071,7 @@ impl ManagementCenter {
                         .border_1()
                         .border_color(cx.theme().border)
                         .p_3()
-                        .child(management_market_glyph(icon, cx))
+                        .child(management_market_glyph("icons/vibex/book-open.svg", cx))
                         .child(
                             v_flex()
                                 .min_w_0()
@@ -11485,17 +11088,16 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(
-                                            badges
-                                                .into_iter()
-                                                .map(|badge| management_market_badge(badge, cx)),
-                                        ),
+                                        .children(badges.into_iter().map(|badge| {
+                                            management_market_badge(badge, cx)
+                                        })),
                                 )
                                 .child(
                                     div()
-                                        .text_sm()
+                                        .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(description),
+                                        .truncate()
+                                        .child(entry.skill_id.clone()),
                                 ),
                         )
                         .child(
@@ -11507,11 +11109,9 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.begin_skill_market_install(install_entry.clone(), cx)
-                                },
-                            )),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_skill_market_install(install_entry.clone(), cx)
+                            })),
                         ),
                 );
             }
@@ -11526,217 +11126,6 @@ impl ManagementCenter {
         }
         content.into_any_element()
     }
-
-    /// Catalog source manager, shared by both markets.
-    ///
-    /// `mcp` picks which kinds the add form offers; the stored list is shared,
-    /// because a source belongs to the product rather than to one market.
-    fn render_market_sources_panel(&mut self, mcp: bool, cx: &mut Context<Self>) -> AnyElement {
-        let pending = self.mutation.is_some();
-        let loading = self.market_sources_loading;
-        let error = self.market_source_error.clone();
-        let sources = self.market_sources.clone();
-        let kind = self.market_source_kind_draft;
-        let name_input = self.market_source_name_draft.clone();
-        let url_input = self.market_source_url_draft.clone();
-
-        let kinds: &[vibex_core::MarketSourceKind] = if mcp {
-            &[
-                vibex_core::MarketSourceKind::McpRegistry,
-                vibex_core::MarketSourceKind::McpCatalog,
-            ]
-        } else {
-            &[
-                vibex_core::MarketSourceKind::SkillCatalog,
-                vibex_core::MarketSourceKind::SkillRepository,
-            ]
-        };
-
-        let mut list = v_flex().w_full().gap_2();
-        for source in &sources {
-            let mut row = h_flex()
-                .w_full()
-                .gap_3()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(cx.theme().border)
-                .p_3()
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .flex_1()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .flex_wrap()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(source.name.clone()),
-                                )
-                                .child(management_market_badge(
-                                    market_source_kind_label(source.kind),
-                                    cx,
-                                ))
-                                .when(source.builtin, |row| {
-                                    row.child(management_market_badge(
-                                        management_locale_text("Builtin", "内置", "內建")
-                                            .to_string(),
-                                        cx,
-                                    ))
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(source.url.clone()),
-                        ),
-                );
-            if !source.builtin {
-                let remove_id = source.id.clone();
-                row = row.child(
-                    Button::new(SharedString::from(format!(
-                        "management-market-source-remove-{}",
-                        source.id
-                    )))
-                    .small()
-                    .ghost()
-                    .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                    .label(management_locale_text("Remove", "移除", "移除"))
-                    .disabled(pending)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.remove_market_source(remove_id.clone(), cx)
-                    })),
-                );
-            }
-            list = list.child(row);
-        }
-        if sources.is_empty() {
-            list = list.child(management_market_empty_row(cx));
-        }
-
-        let mut kind_chips = h_flex().w_full().flex_wrap().gap_1();
-        for value in kinds {
-            let value = *value;
-            kind_chips = kind_chips.child(management_option_chip(
-                SharedString::from(format!("management-market-source-kind-{}", value.as_str())),
-                SharedString::from(market_source_kind_label(value)),
-                kind == value,
-                false,
-                None,
-                cx.listener(move |this, _, _, cx| {
-                    this.market_source_kind_draft = value;
-                    cx.notify();
-                }),
-                cx,
-            ));
-        }
-
-        let mut panel = v_flex()
-            .size_full()
-            .min_h_0()
-            .gap_3()
-            .child(
-                Button::new("management-market-sources-back")
-                    .xsmall()
-                    .ghost()
-                    .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                    .label(management_locale_text("Back to the market", "返回市场", "返回市場"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.market_sources_open = false;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                        management_locale_text("Catalog sources", "目录源", "目錄來源"),
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Sources are fetched from the public network. Builtin sources cannot be removed.",
-                                "目录源从公网获取；内置源不可移除。",
-                                "目錄來源從公網取得；內建來源不可移除。",
-                            )),
-                    ),
-            );
-
-        if let Some(error) = &error {
-            panel = panel.child(management_market_banner(error.clone(), true, cx));
-        }
-        if loading {
-            panel = panel.child(management_market_loading_row(cx));
-        }
-
-        panel = panel
-            .child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(list),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Add a source",
-                                "添加目录源",
-                                "新增目錄來源",
-                            )),
-                    )
-                    .child(kind_chips)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(200.0))
-                                    .flex_none()
-                                    .child(Input::new(&name_input).small().w_full()),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(Input::new(&url_input).small().w_full()),
-                            )
-                            .child(
-                                Button::new("management-market-source-add")
-                                    .small()
-                                    .primary()
-                                    .label(management_locale_text("Add", "添加", "新增"))
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_market_source(window, cx)
-                                    })),
-                            ),
-                    ),
-            );
-        panel.into_any_element()
-    }
-
     fn render_skills_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         let query = self.skill_search.read(cx).value().trim().to_lowercase();
@@ -20749,109 +20138,30 @@ fn profile_pane_shell(
 /// the answer is legible from shape and weight as well as from color.
 ///
 /// Category label for the MCP market chips and card badges.
-fn mcp_market_category_label(value: vibex_core::McpMarketCategory) -> String {
-    management_locale_text_for(
-        locale::current_locale(),
-        match value {
-            vibex_core::McpMarketCategory::Devtools => "Devtools",
-            vibex_core::McpMarketCategory::Web => "Web",
-            vibex_core::McpMarketCategory::Docs => "Docs",
-            vibex_core::McpMarketCategory::Data => "Data",
-            vibex_core::McpMarketCategory::Productivity => "Productivity",
-        },
-        match value {
-            vibex_core::McpMarketCategory::Devtools => "开发工具",
-            vibex_core::McpMarketCategory::Web => "网络",
-            vibex_core::McpMarketCategory::Docs => "文档",
-            vibex_core::McpMarketCategory::Data => "数据",
-            vibex_core::McpMarketCategory::Productivity => "效率",
-        },
-        match value {
-            vibex_core::McpMarketCategory::Devtools => "開發工具",
-            vibex_core::McpMarketCategory::Web => "網路",
-            vibex_core::McpMarketCategory::Docs => "文件",
-            vibex_core::McpMarketCategory::Data => "資料",
-            vibex_core::McpMarketCategory::Productivity => "效率",
-        },
-    )
+/// The transport a market entry would install as, named for a badge.
+fn market_transport_label(transport: vibex_core::McpServerTransportKind) -> String {
+    match transport {
+        vibex_core::McpServerTransportKind::Stdio => "stdio",
+        vibex_core::McpServerTransportKind::Http => "http",
+        vibex_core::McpServerTransportKind::Sse => "sse",
+    }
     .to_string()
 }
 
-/// Category label for the Skill market chips and card badges.
-fn skill_market_category_label(value: vibex_core::SkillMarketCategory) -> String {
-    management_locale_text_for(
-        locale::current_locale(),
-        match value {
-            vibex_core::SkillMarketCategory::Workflow => "Workflow",
-            vibex_core::SkillMarketCategory::Writing => "Writing",
-            vibex_core::SkillMarketCategory::Coding => "Coding",
-            vibex_core::SkillMarketCategory::Data => "Data",
-            vibex_core::SkillMarketCategory::Docs => "Docs",
-        },
-        match value {
-            vibex_core::SkillMarketCategory::Workflow => "工作流",
-            vibex_core::SkillMarketCategory::Writing => "写作",
-            vibex_core::SkillMarketCategory::Coding => "编程",
-            vibex_core::SkillMarketCategory::Data => "数据",
-            vibex_core::SkillMarketCategory::Docs => "文档",
-        },
-        match value {
-            vibex_core::SkillMarketCategory::Workflow => "工作流",
-            vibex_core::SkillMarketCategory::Writing => "寫作",
-            vibex_core::SkillMarketCategory::Coding => "程式",
-            vibex_core::SkillMarketCategory::Data => "資料",
-            vibex_core::SkillMarketCategory::Docs => "文件",
-        },
-    )
-    .to_string()
-}
-
-fn market_source_kind_label(kind: vibex_core::MarketSourceKind) -> String {
-    management_locale_text_for(
-        locale::current_locale(),
-        match kind {
-            vibex_core::MarketSourceKind::McpRegistry => "MCP registry",
-            vibex_core::MarketSourceKind::McpCatalog => "MCP catalog",
-            vibex_core::MarketSourceKind::SkillCatalog => "Skill catalog",
-            vibex_core::MarketSourceKind::SkillRepository => "Skill repository",
-        },
-        match kind {
-            vibex_core::MarketSourceKind::McpRegistry => "MCP 注册表",
-            vibex_core::MarketSourceKind::McpCatalog => "MCP 目录",
-            vibex_core::MarketSourceKind::SkillCatalog => "技能目录",
-            vibex_core::MarketSourceKind::SkillRepository => "技能仓库",
-        },
-        match kind {
-            vibex_core::MarketSourceKind::McpRegistry => "MCP 註冊表",
-            vibex_core::MarketSourceKind::McpCatalog => "MCP 目錄",
-            vibex_core::MarketSourceKind::SkillCatalog => "技能目錄",
-            vibex_core::MarketSourceKind::SkillRepository => "技能倉庫",
-        },
-    )
-    .to_string()
-}
-
-/// The "Sources · N" affordance. The count is the whole point of the label, so
-/// it is built here rather than assembled from a translated template.
-fn market_source_count_label(count: usize) -> String {
-    match locale::current_locale() {
-        ResolvedLocale::En => format!("Sources · {count}"),
-        ResolvedLocale::ZhCn => format!("市场源 · {count}"),
-        ResolvedLocale::ZhTw => format!("市場源 · {count}"),
+/// One glyph per transport, so a card is identifiable before it is read.
+fn market_transport_icon_path(transport: vibex_core::McpServerTransportKind) -> &'static str {
+    match transport {
+        vibex_core::McpServerTransportKind::Stdio => "icons/vibex/square-terminal.svg",
+        _ => "icons/vibex/globe.svg",
     }
 }
 
-/// One glyph per tool family, so a card is identifiable before it is read.
-fn market_category_icon_path(category: &str) -> &'static str {
-    match category {
-        "devtools" | "coding" => "icons/vibex/code-xml.svg",
-        "web" => "icons/vibex/globe.svg",
-        "docs" => "icons/vibex/book-open.svg",
-        "data" => "icons/vibex/database.svg",
-        "productivity" => "icons/vibex/list-checks.svg",
-        "workflow" => "icons/vibex/workflow.svg",
-        "writing" => "icons/vibex/pencil.svg",
-        _ => "icons/vibex/package.svg",
+/// An install count is only worth showing when it is large enough to rank on.
+fn market_installs_label(installs: u64) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{installs} installs"),
+        ResolvedLocale::ZhCn => format!("{installs} 次安装"),
+        ResolvedLocale::ZhTw => format!("{installs} 次安裝"),
     }
 }
 
@@ -20869,16 +20179,55 @@ fn market_entry_command_line(entry: &vibex_core::McpMarketEntry) -> String {
     }
 }
 
-/// A source that failed is named, so an empty list never reads as "no matches".
-fn market_failure_summary(failures: &[vibex_core::MarketSourceFailure]) -> String {
-    failures
-        .iter()
-        .map(|failure| match &failure.host {
-            Some(host) => format!("{} ({host}): {}", failure.source_name, failure.code),
-            None => format!("{}: {}", failure.source_name, failure.code),
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
+/// Turn the entry the user was shown plus the form's answers into a create
+/// request. Values the form supplied win over the catalog's defaults, because
+/// the form is where a credential the catalog could not know about is entered.
+fn market_entry_to_candidate(
+    entry: &vibex_core::McpMarketEntry,
+    env_values: &[vibex_core::McpServerEnvEntry],
+) -> vibex_core::McpServerCreateRequest {
+    let mut env = Vec::new();
+    for requirement in &entry.env {
+        let supplied = env_values
+            .iter()
+            .find(|value| value.name == requirement.name)
+            .map(|value| value.value.clone())
+            .filter(|value| !value.trim().is_empty());
+        let resolved = supplied.or_else(|| requirement.default_value.clone());
+        if let Some(value) = resolved {
+            env.push(vibex_core::McpServerEnvEntry {
+                name: requirement.name.clone(),
+                value,
+            });
+        }
+    }
+    // Values for names the catalog did not declare are still carried: an entry
+    // may need a variable the publisher did not annotate.
+    for value in env_values {
+        if !env.iter().any(|existing| existing.name == value.name)
+            && !value.name.trim().is_empty()
+            && !value.value.trim().is_empty()
+        {
+            env.push(value.clone());
+        }
+    }
+    vibex_core::McpServerCreateRequest {
+        display_name: entry.name.clone(),
+        transport_kind: entry.transport,
+        status: vibex_core::McpServerStatus::Enabled,
+        scope_kind: vibex_core::McpServerScopeKind::User,
+        project_id: None,
+        workspace_id: None,
+        command: entry.command.clone(),
+        args: entry.args.clone(),
+        env,
+        url: entry.url.clone(),
+        headers: Vec::new(),
+        description: entry.description.clone(),
+        tags: vec!["market".to_string()],
+        secret_references: Vec::new(),
+        provider_matrix: Vec::new(),
+    }
 }
 
 fn management_market_glyph(icon_path: &str, cx: &App) -> AnyElement {
@@ -20979,9 +20328,6 @@ fn management_market_command_preview(command: &str, cx: &App) -> AnyElement {
         .child(command.to_string())
         .into_any_element()
 }
-
-/// The tooltip is optional and doubles as the accessible name, so it is passed
-/// only when it says something the visible label does not.
 fn management_option_chip(
     id: SharedString,
     label: SharedString,

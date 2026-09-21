@@ -1,22 +1,26 @@
 //! Marketplace catalog fetching and installation.
 //!
 //! This module owns the only outbound network calls the Config Center makes on
-//! behalf of a market. Two rules shape everything below.
+//! behalf of a market. Three rules shape everything below.
 //!
 //! **The authoritative owner fetches.** The desktop renders catalog values; it
 //! never fetches one itself. That keeps a paired device from becoming a second
 //! network client with its own proxy and TLS story, and it means a catalog is
 //! fetched once for every client of this runtime.
 //!
-//! **A source fails alone.** A search merges several sources, and any one of
-//! them may be slow, unreachable, or malformed. None of those may take the
-//! whole search down: each failure is returned in `failed_sources` naming the
-//! host that refused, so the UI can explain it instead of showing an empty list.
+//! **Each market has one upstream.** MCP reads the official registry. The Skill
+//! market reads a public skill index for search and resolves the document from
+//! the repository it names. There is no user-configured source list, so there is
+//! no policy for one.
+//!
+//! **A market never invents an entry.** Everything the UI shows came out of an
+//! upstream response; an entry the upstream did not publish cannot be listed.
 //!
 //! ## Network boundary
 //!
-//! Sources are user-configurable, so a fixed host allowlist is not available
-//! here the way it is for the update feed. The boundary is instead:
+//! Both upstreams are fixed, but a Skill entry names a repository and the
+//! document is fetched from a CDN, so the fetcher still validates every URL it
+//! is handed rather than trusting its caller:
 //!
 //! - credentials-free `https` only, at the source and at every redirect hop;
 //! - literal loopback, private, link-local, and otherwise non-public addresses
@@ -32,23 +36,16 @@
 
 use std::io::Read;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 use vibex_core::{
-    AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_MARKET_SOURCES_PER_SEARCH,
-    MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement, MarketSource, MarketSourceFailure,
-    MarketSourceKind, MarketSourceListResponse, MarketSourceSetRequest, McpMarketCategory,
-    McpMarketEntry, McpMarketEntryRequest, McpMarketInstallRequest, McpMarketInstallResult,
-    McpMarketSearchRequest, McpMarketSearchResponse, McpServerCreateRequest, McpServerEnvEntry,
-    McpServerScopeKind, McpServerStatus, McpServerTransportKind, SkillCreateRequest,
-    SkillMarketCategory, SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry,
-    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse, SkillScopeKind, SkillSourceKind, SkillStatus, VibexError,
-    VibexResult,
+    AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
+    McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
+    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest, SkillMarketDocument, SkillMarketDocumentRequest,
+    SkillMarketEntry, SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse, SkillScopeKind, SkillSourceKind, SkillStatus, VibexError, VibexResult,
 };
-
 use vibex_db::{McpServerRepository, SkillRepository};
 
 use crate::{
@@ -56,119 +53,28 @@ use crate::{
     normalize_skill_create_request, validate_mcp_create_request, validate_skill_create_request,
 };
 
+/// The official MCP registry. Its `v0.1` API is the only MCP catalog.
+const MCP_REGISTRY_BASE: &str = "https://registry.modelcontextprotocol.io";
+/// The public Skill index, used for search only.
+const SKILL_INDEX_SEARCH: &str = "https://www.skills.sh/api/search";
+/// Lists a repository's files without touching the GitHub API, which rate
+/// limits unauthenticated callers to a handful of requests per hour.
+const JSDELIVR_DATA: &str = "https://data.jsdelivr.com/v1/packages/gh";
+/// Serves the document itself.
+const JSDELIVR_CDN: &str = "https://cdn.jsdelivr.net/gh";
+
 /// One request may not take longer than this, including every redirect.
 const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Redirect hops followed before the fetch is refused.
 const MAX_MARKET_REDIRECTS: usize = 5;
-/// Entries a single source may contribute, so one huge catalog cannot flood the
-/// merged list.
-const MAX_ENTRIES_PER_SOURCE: usize = 200;
+/// Entries a single response may contribute, so one huge catalog cannot flood
+/// the list.
+const MAX_ENTRIES_PER_SEARCH: usize = 200;
 /// A Skill document is markdown; anything past this is not one.
 const MAX_SKILL_DOCUMENT_FETCH_BYTES: u64 = MAX_SKILL_MARKET_DOCUMENT_BYTES + 1;
-
-/// Sources that ship with the app.
-///
-/// They are the offline floor: when every user source is unreachable these
-/// still render, which is what keeps the market useful on a first run with no
-/// configuration.
-fn builtin_market_sources() -> Vec<MarketSource> {
-    vec![
-        MarketSource {
-            id: "builtin-mcp-picks".to_string(),
-            name: "Vibex MCP Picks".to_string(),
-            url: "builtin://mcp".to_string(),
-            kind: MarketSourceKind::McpCatalog,
-            builtin: true,
-        },
-        MarketSource {
-            id: "official-mcp-registry".to_string(),
-            name: "Official MCP Registry".to_string(),
-            url: "https://registry.modelcontextprotocol.io".to_string(),
-            kind: MarketSourceKind::McpRegistry,
-            builtin: true,
-        },
-        MarketSource {
-            id: "builtin-skills".to_string(),
-            name: "Vibex Skill Picks".to_string(),
-            url: "builtin://skills".to_string(),
-            kind: MarketSourceKind::SkillCatalog,
-            builtin: true,
-        },
-    ]
-}
-
-/// User sources live beside the database rather than in it: they are small,
-/// non-relational, and read on every market open, so a file keeps the schema
-/// untouched.
-fn user_market_sources_path(db_path: &Path) -> PathBuf {
-    db_path
-        .parent()
-        .map(|parent| parent.join("market_sources.json"))
-        .unwrap_or_else(|| PathBuf::from("market_sources.json"))
-}
-
-fn load_user_market_sources(db_path: &Path) -> Vec<MarketSource> {
-    let path = user_market_sources_path(db_path);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return Vec::new();
-    };
-    sanitize_market_sources(value)
-}
-
-/// Repair whatever was persisted into a usable source list.
-///
-/// Anything that is not a credentials-free `https` URL, or that repeats an id,
-/// is dropped rather than surfaced: a source the fetcher would refuse anyway
-/// must not appear in the UI as a working one.
-fn sanitize_market_sources(value: serde_json::Value) -> Vec<MarketSource> {
-    let raw = value
-        .get("sources")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    let mut sources = Vec::new();
-    for item in raw {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let id = object.get("id").and_then(serde_json::Value::as_str);
-        let name = object.get("name").and_then(serde_json::Value::as_str);
-        let url = object.get("url").and_then(serde_json::Value::as_str);
-        let kind = object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .and_then(MarketSourceKind::parse);
-        let (Some(id), Some(name), Some(url), Some(kind)) = (id, name, url, kind) else {
-            continue;
-        };
-        if !market_source_url_is_allowed(kind, url) || !seen.insert(id.to_string()) {
-            continue;
-        }
-        sources.push(MarketSource {
-            id: id.chars().take(64).collect(),
-            name: name.chars().take(64).collect(),
-            url: url.to_string(),
-            kind,
-            builtin: false,
-        });
-    }
-    sources
-}
-
-/// A builtin catalog is compiled in, so it needs no URL to be valid.
-fn market_source_url_is_allowed(kind: MarketSourceKind, url: &str) -> bool {
-    if url.starts_with("builtin://") {
-        return matches!(
-            kind,
-            MarketSourceKind::McpCatalog | MarketSourceKind::SkillCatalog
-        );
-    }
-    market_url_policy(url).is_ok()
-}
+/// Branches tried when resolving a skill's document. The index does not publish
+/// a branch, and these two cover effectively every public repository.
+const SKILL_BRANCHES: [&str; 2] = ["main", "master"];
 
 // ---------------------------------------------------------------------------
 // Fetch policy
@@ -211,36 +117,32 @@ fn is_public_ip(ip: IpAddr) -> bool {
 /// the same name as `localhost`, and the dot form is a classic way to slip past
 /// a suffix check.
 fn market_url_policy(raw: &str) -> Result<reqwest::Url, VibexError> {
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| {
-        VibexError::validation(
-            "market_source_url_invalid",
-            "market source URL does not parse",
-        )
-    })?;
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|_| VibexError::validation("market_url_invalid", "market URL does not parse"))?;
     if url.scheme() != "https" {
         return Err(VibexError::validation(
-            "market_source_url_insecure",
-            "market sources must use https",
+            "market_url_insecure",
+            "market URLs must use https",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(VibexError::validation(
-            "market_source_url_credentials",
-            "market sources must not carry credentials",
+            "market_url_credentials",
+            "market URLs must not carry credentials",
         ));
     }
     let Some(host) = url.host_str() else {
         return Err(VibexError::validation(
-            "market_source_url_host_missing",
-            "market source URL has no host",
+            "market_url_host_missing",
+            "market URL has no host",
         ));
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !is_public_ip(ip) {
             return Err(VibexError::validation(
-                "market_source_url_not_public",
-                "market source URL must resolve to a public address",
+                "market_url_not_public",
+                "market URL must resolve to a public address",
             ));
         }
     } else if host == "localhost"
@@ -250,8 +152,8 @@ fn market_url_policy(raw: &str) -> Result<reqwest::Url, VibexError> {
         || !host.contains('.')
     {
         return Err(VibexError::validation(
-            "market_source_url_not_public",
-            "market source URL must be a public host",
+            "market_url_not_public",
+            "market URL must be a public host",
         ));
     }
     Ok(url)
@@ -283,9 +185,10 @@ fn fetch_market_bytes(
     let mut url = market_url_policy(raw_url)?;
     let mut hops = 0usize;
     loop {
-        let response = client.get(url.clone()).send().map_err(|error| {
-            market_source_failure_error(&url, "market_source_unreachable", error.to_string())
-        })?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|error| market_fetch_error(&url, "market_unreachable", error.to_string()))?;
         let status = response.status();
         if status.is_redirection() {
             let location = response
@@ -295,23 +198,23 @@ fn fetch_market_bytes(
                 .map(str::to_string);
             let Some(location) = location else {
                 return Err(VibexError::provider(
-                    "market_source_redirect_invalid",
-                    "market source redirected without a location",
+                    "market_redirect_invalid",
+                    "the market redirected without a location",
                 ));
             };
             hops += 1;
             if hops > MAX_MARKET_REDIRECTS {
                 return Err(VibexError::provider(
-                    "market_source_redirect_limit",
-                    "market source redirected too many times",
+                    "market_redirect_limit",
+                    "the market redirected too many times",
                 ));
             }
             // Resolve relative redirects against the hop that produced them,
             // then re-run the whole policy on the result.
             let next = url.join(&location).map_err(|_| {
                 VibexError::provider(
-                    "market_source_redirect_invalid",
-                    "market source redirected to an invalid location",
+                    "market_redirect_invalid",
+                    "the market redirected to an invalid location",
                 )
             })?;
             url = market_url_policy(next.as_str())?;
@@ -319,18 +222,18 @@ fn fetch_market_bytes(
         }
         if !status.is_success() {
             return Err(VibexError::provider(
-                "market_source_rejected",
-                format!("market source responded with HTTP {}", status.as_u16()),
+                "market_rejected",
+                format!("the market responded with HTTP {}", status.as_u16()),
             )
             .with_diagnostic("host", url.host_str().unwrap_or_default()));
         }
-        if let Some(length) = response.content_length()
-            && length > limit
-        {
-            return Err(VibexError::provider(
-                "market_source_too_large",
-                "market source response exceeded the size limit",
-            ));
+        if let Some(length) = response.content_length() {
+            if length > limit {
+                return Err(VibexError::provider(
+                    "market_response_too_large",
+                    "the market response exceeded the size limit",
+                ));
+            }
         }
         let host = url.host_str().unwrap_or_default().to_string();
         let mut body = Vec::new();
@@ -338,26 +241,20 @@ fn fetch_market_bytes(
         response
             .take(limit)
             .read_to_end(&mut body)
-            .map_err(|error| {
-                VibexError::provider("market_source_read_failed", error.to_string())
-            })?;
+            .map_err(|error| VibexError::provider("market_read_failed", error.to_string()))?;
         if body.len() as u64 >= limit {
             return Err(VibexError::provider(
-                "market_source_too_large",
-                "market source response exceeded the size limit",
+                "market_response_too_large",
+                "the market response exceeded the size limit",
             ));
         }
         return Ok((body, host));
     }
 }
 
-fn market_source_failure_error(
-    url: &reqwest::Url,
-    code: &'static str,
-    message: String,
-) -> VibexError {
+fn market_fetch_error(url: &reqwest::Url, code: &'static str, message: String) -> VibexError {
     VibexError::provider(code, message)
-        .with_recovery_hint("Check the source URL and the network connection")
+        .with_recovery_hint("Check the network connection and retry")
         .with_diagnostic("host", url.host_str().unwrap_or_default())
 }
 
@@ -367,107 +264,29 @@ fn fetch_market_json<T: serde::de::DeserializeOwned>(
 ) -> VibexResult<T> {
     let (body, host) = fetch_market_bytes(client, url, MAX_MARKET_RESPONSE_BYTES)?;
     serde_json::from_slice(&body).map_err(|error| {
-        VibexError::provider("market_source_malformed", error.to_string())
-            .with_diagnostic("host", host)
+        VibexError::provider("market_malformed", error.to_string()).with_diagnostic("host", host)
     })
 }
 
-fn source_failure(
-    source: &MarketSource,
-    error: &VibexError,
-    fallback_host: Option<String>,
-) -> MarketSourceFailure {
-    let host = error
-        .diagnostics
-        .iter()
-        .find(|entry| entry.key == "host")
-        .map(|entry| entry.value.clone())
-        .or(fallback_host);
-    MarketSourceFailure {
-        source_id: source.id.clone(),
-        source_name: source.name.clone(),
-        code: error.code.clone(),
-        message: error.message.clone(),
-        host,
+fn urlencode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
     }
+    out
 }
 
-// ---------------------------------------------------------------------------
-// Source listing
-// ---------------------------------------------------------------------------
-
-impl ProviderConfigService {
-    pub fn market_sources(&self) -> VibexResult<MarketSourceListResponse> {
-        let mut sources = builtin_market_sources();
-        sources.extend(load_user_market_sources(self.database_path()));
-        Ok(MarketSourceListResponse { sources })
-    }
-
-    /// Replace the user source list. Builtin sources are always retained, so a
-    /// client cannot delete the offline floor by omission.
-    pub fn set_market_sources(
-        &self,
-        request: MarketSourceSetRequest,
-    ) -> VibexResult<MarketSourceListResponse> {
-        let mut sanitized: Vec<MarketSource> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for source in request.sources {
-            let trimmed = source.url.trim().to_string();
-            if !market_source_url_is_allowed(source.kind, &trimmed) {
-                return Err(VibexError::validation(
-                    "market_source_url_invalid",
-                    "market source URL is not an allowed public https URL",
-                )
-                .with_diagnostic("sourceId", source.id.clone()));
-            }
-            if !seen.insert(source.id.clone()) {
-                continue;
-            }
-            sanitized.push(MarketSource {
-                id: source.id.chars().take(64).collect(),
-                name: source.name.chars().take(64).collect(),
-                url: trimmed,
-                kind: source.kind,
-                builtin: false,
-            });
-        }
-        let payload = serde_json::json!({ "sources": sanitized });
-        let path = user_market_sources_path(self.database_path());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                VibexError::storage("market_sources_write_failed", error.to_string())
-            })?;
-        }
-        let encoded = serde_json::to_vec_pretty(&payload).map_err(|error| {
-            VibexError::storage("market_sources_encode_failed", error.to_string())
-        })?;
-        std::fs::write(&path, encoded).map_err(|error| {
-            VibexError::storage("market_sources_write_failed", error.to_string())
-        })?;
-        self.market_sources()
-    }
-
-    /// Every source a search should visit, restricted to the requested kind.
-    fn market_sources_for_kind(
-        &self,
-        requested: &[String],
-        mcp: bool,
-    ) -> VibexResult<Vec<MarketSource>> {
-        let all = self.market_sources()?.sources;
-        let mut selected: Vec<MarketSource> = all
-            .into_iter()
-            .filter(|source| {
-                if mcp {
-                    source.kind.is_mcp()
-                } else {
-                    source.kind.is_skill()
-                }
-            })
-            .filter(|source| requested.is_empty() || requested.iter().any(|id| id == &source.id))
-            .collect();
-        selected.truncate(MAX_MARKET_SOURCES_PER_SEARCH);
-        Ok(selected)
-    }
+fn env_name_looks_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+        .iter()
+        .any(|needle| upper.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +322,8 @@ struct RegistryServer {
     description: Option<String>,
     #[serde(default)]
     homepage: Option<String>,
+    #[serde(default, rename = "websiteUrl")]
+    website_url: Option<String>,
     #[serde(default)]
     packages: Vec<RegistryPackage>,
     #[serde(default)]
@@ -660,14 +481,7 @@ fn registry_env_requirements(package: &RegistryPackage) -> Vec<MarketEnvRequirem
         .collect()
 }
 
-fn env_name_looks_secret(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
-        .iter()
-        .any(|needle| upper.contains(needle))
-}
-
-fn registry_server_to_entry(source_id: &str, server: &RegistryServer) -> Option<McpMarketEntry> {
+fn registry_server_to_entry(server: &RegistryServer) -> Option<McpMarketEntry> {
     let display = server
         .title
         .as_deref()
@@ -675,6 +489,10 @@ fn registry_server_to_entry(source_id: &str, server: &RegistryServer) -> Option<
         .filter(|value| !value.is_empty())
         .unwrap_or(server.name.as_str())
         .to_string();
+    let homepage = server
+        .homepage
+        .clone()
+        .or_else(|| server.website_url.clone());
 
     // Prefer a stdio package: it is the form every agent can host.
     if let Some(package) = server.packages.first() {
@@ -695,11 +513,9 @@ fn registry_server_to_entry(source_id: &str, server: &RegistryServer) -> Option<
         args.push(identifier);
         return Some(McpMarketEntry {
             id: registry_entry_id(&server.name),
-            source_id: source_id.to_string(),
             name: display,
             description: server.description.clone(),
-            homepage: server.homepage.clone(),
-            categories: Vec::new(),
+            homepage,
             transport: McpServerTransportKind::Stdio,
             command: Some(runtime),
             args,
@@ -722,11 +538,9 @@ fn registry_server_to_entry(source_id: &str, server: &RegistryServer) -> Option<
     })?;
     Some(McpMarketEntry {
         id: registry_entry_id(&server.name),
-        source_id: source_id.to_string(),
         name: display,
         description: server.description.clone(),
-        homepage: server.homepage.clone(),
-        categories: Vec::new(),
+        homepage,
         transport: McpServerTransportKind::Http,
         command: None,
         args: Vec::new(),
@@ -740,18 +554,15 @@ fn registry_server_to_entry(source_id: &str, server: &RegistryServer) -> Option<
 
 fn search_mcp_registry(
     client: &reqwest::blocking::Client,
-    source: &MarketSource,
     query: Option<&str>,
     limit: u32,
-) -> Result<(Vec<McpMarketEntry>, bool), MarketSourceFailure> {
-    let base = source.url.trim_end_matches('/');
-    let mut url = format!("{base}/v0.1/servers?version=latest&limit={limit}");
+) -> VibexResult<(Vec<McpMarketEntry>, bool)> {
+    let mut url = format!("{MCP_REGISTRY_BASE}/v0.1/servers?version=latest&limit={limit}");
     if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
         url.push_str("&search=");
         url.push_str(&urlencode(query));
     }
-    let response: RegistryListResponse =
-        fetch_market_json(client, &url).map_err(|error| source_failure(source, &error, None))?;
+    let response: RegistryListResponse = fetch_market_json(client, &url)?;
     let has_more = response
         .metadata
         .as_ref()
@@ -761,645 +572,158 @@ fn search_mcp_registry(
         .servers
         .iter()
         .filter_map(|record| record.server.as_ref())
-        .filter_map(|server| registry_server_to_entry(&source.id, server))
-        .take(MAX_ENTRIES_PER_SOURCE)
+        .filter_map(registry_server_to_entry)
+        .take(MAX_ENTRIES_PER_SEARCH)
         .collect();
     Ok((entries, has_more))
 }
 
-fn urlencode(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            b' ' => out.push('+'),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
-// Static catalog adapters
+// Skill index adapter
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct McpCatalogFile {
+struct SkillIndexResponse {
     #[serde(default)]
-    servers: Vec<McpCatalogEntryRecord>,
+    skills: Vec<SkillIndexSkill>,
+    #[serde(default)]
+    count: u64,
 }
 
 #[derive(Debug, Deserialize)]
-struct McpCatalogEntryRecord {
+struct SkillIndexSkill {
     id: String,
+    #[serde(rename = "skillId")]
+    skill_id: String,
     name: String,
     #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    homepage: Option<String>,
-    #[serde(default)]
-    categories: Vec<String>,
-    #[serde(default)]
-    transport: Option<String>,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    env: Vec<McpCatalogEnvRecord>,
-    #[serde(default)]
-    verified: bool,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    author: Option<String>,
+    installs: u64,
+    source: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct McpCatalogEnvRecord {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    required: bool,
-    #[serde(default)]
-    secret: bool,
-    #[serde(default)]
-    default_value: Option<String>,
-    #[serde(default)]
-    placeholder: Option<String>,
-}
-
-fn parse_mcp_catalog(source: &MarketSource, body: &[u8]) -> Vec<McpMarketEntry> {
-    let Ok(file) = serde_json::from_slice::<McpCatalogFile>(body) else {
-        return Vec::new();
-    };
-    file.servers
-        .into_iter()
-        .filter_map(|record| {
-            let transport = match record.transport.as_deref().unwrap_or("stdio") {
-                "stdio" => McpServerTransportKind::Stdio,
-                "http" => McpServerTransportKind::Http,
-                "sse" => McpServerTransportKind::Sse,
-                _ => return None,
-            };
-            // A template the market could not start must never be listed.
-            if transport == McpServerTransportKind::Stdio
-                && record
-                    .command
-                    .as_deref()
-                    .is_none_or(|command| command.trim().is_empty())
-            {
-                return None;
-            }
-            if transport != McpServerTransportKind::Stdio
-                && !record
-                    .url
-                    .as_deref()
-                    .is_some_and(|url| market_url_policy(url).is_ok())
-            {
-                return None;
-            }
-            Some(McpMarketEntry {
-                id: record.id,
-                source_id: source.id.clone(),
-                name: record.name,
-                description: record.description,
-                homepage: record.homepage,
-                categories: record
-                    .categories
-                    .iter()
-                    .filter_map(|value| McpMarketCategory::parse(value))
-                    .collect(),
-                transport,
-                command: record.command,
-                args: record.args,
-                url: record.url,
-                env: record
-                    .env
-                    .into_iter()
-                    .map(|env| MarketEnvRequirement {
-                        name: env.name,
-                        description: env.description,
-                        required: env.required,
-                        secret: env.secret,
-                        default_value: env.default_value,
-                        placeholder: env.placeholder,
-                    })
-                    .collect(),
-                verified: record.verified,
-                version: record.version,
-                author: record.author,
-            })
-        })
-        .take(MAX_ENTRIES_PER_SOURCE)
-        .collect()
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillCatalogFile {
-    #[serde(default)]
-    skills: Vec<SkillCatalogEntryRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillCatalogEntryRecord {
-    id: String,
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    homepage: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    document_url: Option<String>,
-    #[serde(default)]
-    categories: Vec<String>,
-    #[serde(default)]
-    verified: bool,
-    #[serde(default)]
-    version: Option<String>,
-}
-
-fn parse_skill_catalog(source: &MarketSource, body: &[u8]) -> Vec<SkillMarketEntry> {
-    let Ok(file) = serde_json::from_slice::<SkillCatalogFile>(body) else {
-        return Vec::new();
-    };
-    file.skills
-        .into_iter()
-        .filter_map(|record| {
-            let document_url = record
-                .document_url
-                .as_deref()
-                .or(record.url.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            // The document is fetched later, so a URL the fetcher would refuse
-            // must not be offered as installable.
-            if market_url_policy(document_url).is_err() {
-                return None;
-            }
-            Some(SkillMarketEntry {
-                id: record.id,
-                source_id: source.id.clone(),
-                name: record.name,
-                description: record.description,
-                homepage: record.homepage,
-                categories: record
-                    .categories
-                    .iter()
-                    .filter_map(|value| SkillMarketCategory::parse(value))
-                    .collect(),
-                document_url: document_url.to_string(),
-                verified: record.verified,
-                version: record.version,
-                author: record.author,
-            })
-        })
-        .take(MAX_ENTRIES_PER_SOURCE)
-        .collect()
-}
-
-/// The compiled-in MCP picks.
-///
-/// These are the servers a user reaches for first, so the market is useful
-/// before any source is configured. The registry still supplies the long tail;
-/// this list is what makes the market look like a shelf rather than a search
-/// box on a first run.
-fn builtin_mcp_catalog() -> Vec<McpMarketEntry> {
-    const SOURCE_ID: &str = "builtin-mcp-picks";
-
-    struct Pick {
-        id: &'static str,
-        name: &'static str,
-        description: &'static str,
-        command: &'static str,
-        args: &'static [&'static str],
-        categories: &'static [McpMarketCategory],
-        author: &'static str,
-        env: &'static [(&'static str, &'static str, bool)],
-    }
-
-    let picks: &[Pick] = &[
-        Pick {
-            id: "memory",
-            name: "Memory",
-            description: "Knowledge graph memory that lets a model remember entities and relations across conversations.",
-            command: "npx",
-            args: &["-y", "@modelcontextprotocol/server-memory"],
-            categories: &[McpMarketCategory::Productivity],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "sequential-thinking",
-            name: "Sequential Thinking",
-            description: "Dynamic, reflective step-by-step reasoning for problems that need decomposition.",
-            command: "npx",
-            args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
-            categories: &[McpMarketCategory::Productivity],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "filesystem",
-            name: "Filesystem",
-            description: "Read, write, list, and search files inside a directory the user grants.",
-            command: "npx",
-            args: &[
-                "-y",
-                "@modelcontextprotocol/server-filesystem",
-                "${WORKSPACE}",
-            ],
-            categories: &[McpMarketCategory::Data],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "fetch",
-            name: "Fetch",
-            description: "Fetch a web page and convert it to Markdown for the model to read.",
-            command: "uvx",
-            args: &["mcp-server-fetch"],
-            categories: &[McpMarketCategory::Web],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "time",
-            name: "Time",
-            description: "Time zone conversion and current-time lookups.",
-            command: "uvx",
-            args: &["mcp-server-time"],
-            categories: &[McpMarketCategory::Productivity],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "git",
-            name: "Git",
-            description: "Read repository status, diffs, and logs, and run common Git operations.",
-            command: "uvx",
-            args: &["mcp-server-git"],
-            categories: &[McpMarketCategory::Devtools],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "playwright",
-            name: "Playwright",
-            description: "Drive a browser through accessibility snapshots: open pages, click, fill forms, and take screenshots.",
-            command: "npx",
-            args: &["-y", "@playwright/mcp@latest"],
-            categories: &[McpMarketCategory::Web],
-            author: "microsoft",
-            env: &[],
-        },
-        Pick {
-            id: "context7",
-            name: "Context7",
-            description: "Pull up-to-date documentation for a library so the model stops answering from stale memory.",
-            command: "npx",
-            args: &["-y", "@upstash/context7-mcp"],
-            categories: &[McpMarketCategory::Docs],
-            author: "upstash",
-            env: &[],
-        },
-        Pick {
-            id: "everything",
-            name: "Everything",
-            description: "A reference server that exercises every MCP capability, useful for verifying a client integration.",
-            command: "npx",
-            args: &["-y", "@modelcontextprotocol/server-everything"],
-            categories: &[McpMarketCategory::Devtools],
-            author: "modelcontextprotocol",
-            env: &[],
-        },
-        Pick {
-            id: "github",
-            name: "GitHub",
-            description: "Browse repositories, issues, and pull requests through the GitHub API.",
-            command: "npx",
-            args: &["-y", "@modelcontextprotocol/server-github"],
-            categories: &[McpMarketCategory::Devtools],
-            author: "modelcontextprotocol",
-            env: &[(
-                "GITHUB_PERSONAL_ACCESS_TOKEN",
-                "A GitHub personal access token with the scopes the server should use.",
-                true,
-            )],
-        },
-        Pick {
-            id: "postgres",
-            name: "PostgreSQL",
-            description: "Query a PostgreSQL database with read-only access by default.",
-            command: "npx",
-            args: &[
-                "-y",
-                "@modelcontextprotocol/server-postgres",
-                "${DATABASE_URL}",
-            ],
-            categories: &[McpMarketCategory::Data],
-            author: "modelcontextprotocol",
-            env: &[(
-                "DATABASE_URL",
-                "The connection string of the database to expose.",
-                true,
-            )],
-        },
-        Pick {
-            id: "sqlite",
-            name: "SQLite",
-            description: "Inspect and query a local SQLite database file.",
-            command: "uvx",
-            args: &["mcp-server-sqlite", "--db-path", "${DATABASE_PATH}"],
-            categories: &[McpMarketCategory::Data],
-            author: "modelcontextprotocol",
-            env: &[(
-                "DATABASE_PATH",
-                "Absolute path of the SQLite file to open.",
-                true,
-            )],
-        },
-    ];
-
-    picks
-        .iter()
-        .map(|pick| McpMarketEntry {
-            id: pick.id.to_string(),
-            source_id: SOURCE_ID.to_string(),
-            name: pick.name.to_string(),
-            description: Some(pick.description.to_string()),
-            homepage: None,
-            categories: pick.categories.to_vec(),
-            transport: McpServerTransportKind::Stdio,
-            command: Some(pick.command.to_string()),
-            args: pick.args.iter().map(|arg| arg.to_string()).collect(),
-            url: None,
-            env: pick
-                .env
-                .iter()
-                .map(|(name, description, required)| MarketEnvRequirement {
-                    name: name.to_string(),
-                    description: Some(description.to_string()),
-                    required: *required,
-                    secret: env_name_looks_secret(name),
-                    default_value: None,
-                    placeholder: None,
-                })
-                .collect(),
-            verified: true,
-            version: None,
-            author: Some(pick.author.to_string()),
-        })
-        .collect()
-}
-
-/// The compiled-in skill picks.
-///
-/// Deliberately a floor rather than the shelf: it exists so the market renders
-/// something useful on a first run with no configuration. The volume comes from
-/// configured sources.
-fn builtin_skill_catalog() -> Vec<SkillMarketEntry> {
-    const SOURCE_ID: &str = "builtin-skills";
-    const ANTHROPIC: &str = "https://cdn.jsdelivr.net/gh/anthropics/skills@main/skills";
-    let picks: [(&str, &str, &str, &str, SkillMarketCategory); 10] = [
-        (
-            "docx",
-            "Word documents",
-            "Create, read, and edit Word (.docx) files with tracked changes and comments",
-            "docx/SKILL.md",
-            SkillMarketCategory::Docs,
-        ),
-        (
-            "pdf",
-            "PDF files",
-            "Read, extract, merge, split, and generate PDF files",
-            "pdf/SKILL.md",
-            SkillMarketCategory::Docs,
-        ),
-        (
-            "xlsx",
-            "Excel spreadsheets",
-            "Work with spreadsheets: formulas, charts, pivots, and multiple sheets",
-            "xlsx/SKILL.md",
-            SkillMarketCategory::Data,
-        ),
-        (
-            "pptx",
-            "PowerPoint decks",
-            "Create, edit, and analyze PowerPoint (.pptx) presentations",
-            "pptx/SKILL.md",
-            SkillMarketCategory::Docs,
-        ),
-        (
-            "mcp-builder",
-            "MCP Builder",
-            "Build MCP servers that connect models to tools and data",
-            "mcp-builder/SKILL.md",
-            SkillMarketCategory::Coding,
-        ),
-        (
-            "skill-creator",
-            "Skill Creator",
-            "Author new skills and measure how well they work",
-            "skill-creator/SKILL.md",
-            SkillMarketCategory::Coding,
-        ),
-        (
-            "artifacts-builder",
-            "Artifacts Builder",
-            "Assemble self-contained HTML artifacts from a description",
-            "artifacts-builder/SKILL.md",
-            SkillMarketCategory::Coding,
-        ),
-        (
-            "canvas-design",
-            "Canvas design",
-            "Produce visual layouts and diagrams on a canvas",
-            "canvas-design/SKILL.md",
-            SkillMarketCategory::Writing,
-        ),
-        (
-            "brand-guidelines",
-            "Brand guidelines",
-            "Apply a consistent brand voice and visual identity to generated work",
-            "brand-guidelines/SKILL.md",
-            SkillMarketCategory::Writing,
-        ),
-        (
-            "webapp-testing",
-            "Webapp testing",
-            "Drive and verify a local web app with a browser automation tool",
-            "webapp-testing/SKILL.md",
-            SkillMarketCategory::Workflow,
-        ),
-    ];
-    picks
-        .into_iter()
-        .map(|(id, name, description, path, category)| SkillMarketEntry {
-            id: id.to_string(),
-            source_id: SOURCE_ID.to_string(),
-            name: name.to_string(),
-            description: Some(description.to_string()),
-            homepage: Some(format!(
-                "https://github.com/anthropics/skills/tree/main/skills/{}",
-                path.trim_end_matches("/SKILL.md")
-            )),
-            categories: vec![category],
-            document_url: format!("{ANTHROPIC}/{path}"),
-            verified: true,
-            version: None,
-            author: Some("anthropic".to_string()),
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// GitHub repository scan
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct GitHubRepo {
-    #[serde(default)]
-    default_branch: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTree {
-    #[serde(default)]
-    tree: Vec<GitHubTreeEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTreeEntry {
-    path: String,
-    #[serde(default, rename = "type")]
-    entry_type: Option<String>,
-}
-
-/// `https://github.com/owner/repo` → `(owner, repo)`.
-fn parse_github_repo(url: &str) -> Option<(String, String)> {
-    let parsed = market_url_policy(url).ok()?;
-    if parsed.host_str() != Some("github.com") {
-        return None;
-    }
-    let mut segments = parsed.path_segments()?.filter(|part| !part.is_empty());
-    let owner = segments.next()?.to_string();
-    let repo = segments.next()?.trim_end_matches(".git").to_string();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((owner, repo))
-}
-
-fn is_scannable_skill_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("node_modules/") || lower.starts_with(".git/") || lower.contains("/.git/") {
-        return false;
-    }
-    lower.ends_with("/skill.md") || lower == "skill.md"
-}
-
-fn skill_id_from_path(path: &str) -> String {
-    let parent = path
-        .trim_end_matches("SKILL.md")
-        .trim_end_matches("skill.md")
-        .trim_end_matches('/');
-    let slug = parent.rsplit('/').next().unwrap_or("skill");
-    let mut out = String::new();
-    for ch in slug.chars() {
-        let ch = ch.to_ascii_lowercase();
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        } else if !out.ends_with('-') && !out.is_empty() {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "skill".to_string()
-    } else {
-        trimmed.chars().take(64).collect()
-    }
-}
-
-/// Scan a GitHub repository for `SKILL.md` documents.
-///
-/// The repository tree is read through the API, but documents are served from
-/// the CDN: the raw host is TLS-flaky from some networks while the CDN edge
-/// reaches them reliably.
-fn scan_skill_repository(
+fn search_skill_index(
     client: &reqwest::blocking::Client,
-    source: &MarketSource,
-) -> Result<Vec<SkillMarketEntry>, MarketSourceFailure> {
-    let Some((owner, repo)) = parse_github_repo(&source.url) else {
-        return Err(MarketSourceFailure {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            code: "market_source_repo_invalid".to_string(),
-            message: "skill repository sources must be a github.com owner/repo URL".to_string(),
-            host: None,
-        });
-    };
-    let api_base = format!("https://api.github.com/repos/{owner}/{repo}");
-    let repo_info: GitHubRepo = fetch_market_json(client, &api_base)
-        .map_err(|error| source_failure(source, &error, Some("api.github.com".to_string())))?;
-    let branch = repo_info
-        .default_branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("main")
-        .to_string();
-    let tree_url = format!("{api_base}/git/trees/{branch}?recursive=1");
-    let tree: GitHubTree = fetch_market_json(client, &tree_url)
-        .map_err(|error| source_failure(source, &error, Some("api.github.com".to_string())))?;
-
-    let entries = tree
-        .tree
-        .iter()
-        .filter(|entry| entry.entry_type.as_deref() == Some("blob"))
-        .filter(|entry| is_scannable_skill_path(&entry.path))
-        .filter_map(|entry| {
-            let id = skill_id_from_path(&entry.path);
-            let document_url = format!(
-                "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{}",
-                entry.path
-            );
-            if market_url_policy(&document_url).is_err() {
-                return None;
-            }
-            Some(SkillMarketEntry {
-                name: id.clone(),
-                id,
-                source_id: source.id.clone(),
-                description: None,
-                homepage: Some(format!(
-                    "https://github.com/{owner}/{repo}/tree/{branch}/{}",
-                    entry
-                        .path
-                        .rsplit_once('/')
-                        .map(|(dir, _)| dir)
-                        .unwrap_or_default()
-                )),
-                categories: Vec::new(),
-                document_url,
-                verified: false,
-                version: None,
-                author: Some(owner.clone()),
-            })
+    query: &str,
+    limit: u32,
+    offset: u32,
+) -> VibexResult<SkillMarketSearchResponse> {
+    let url = format!(
+        "{SKILL_INDEX_SEARCH}?q={}&limit={limit}&offset={offset}",
+        urlencode(query)
+    );
+    let response: SkillIndexResponse = fetch_market_json(client, &url)?;
+    let entries = response
+        .skills
+        .into_iter()
+        .filter(|skill| {
+            // The document is resolved from the repository later, so an entry
+            // naming something that is not `owner/repo` cannot be installed and
+            // must not be listed.
+            parse_github_source(&skill.source).is_ok()
         })
-        .take(MAX_ENTRIES_PER_SOURCE)
-        .collect();
-    Ok(entries)
+        .map(|skill| SkillMarketEntry {
+            id: skill.id,
+            skill_id: skill.skill_id,
+            name: skill.name,
+            source: skill.source,
+            installs: skill.installs,
+        })
+        .take(MAX_ENTRIES_PER_SEARCH)
+        .collect::<Vec<_>>();
+    let total = response.count;
+    let has_more = (offset as u64 + entries.len() as u64) < total;
+    Ok(SkillMarketSearchResponse {
+        entries,
+        total,
+        has_more,
+    })
+}
+
+/// Split an `owner/repo` reference, rejecting anything that could escape it.
+fn parse_github_source(source: &str) -> VibexResult<(String, String)> {
+    let mut parts = source.trim().split('/');
+    let owner = parts.next().unwrap_or_default().trim();
+    let repo = parts.next().unwrap_or_default().trim();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return Err(VibexError::validation(
+            "market_skill_source_invalid",
+            "a skill source must be an owner/repo reference",
+        ));
+    }
+    let allowed = |value: &str| {
+        value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    if !allowed(owner) || !allowed(repo) {
+        return Err(VibexError::validation(
+            "market_skill_source_invalid",
+            "a skill source must be an owner/repo reference",
+        ));
+    }
+    Ok((owner.to_string(), repo.trim_end_matches(".git").to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct JsDelivrListing {
+    #[serde(default)]
+    files: Vec<JsDelivrFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsDelivrFile {
+    name: String,
+}
+
+/// Resolve a skill directory to the raw URL of its `SKILL.md`.
+///
+/// The index publishes a directory name, not a path, so the repository is
+/// listed and the directory is matched by its last path segment. A repository
+/// holding exactly one skill resolves even when the names disagree.
+fn resolve_skill_document_url(
+    client: &reqwest::blocking::Client,
+    source: &str,
+    skill_id: &str,
+) -> VibexResult<String> {
+    let (owner, repo) = parse_github_source(source)?;
+    for branch in SKILL_BRANCHES {
+        let listing_url = format!("{JSDELIVR_DATA}/{owner}/{repo}@{branch}?structure=flat");
+        let Ok(listing) = fetch_market_json::<JsDelivrListing>(client, &listing_url) else {
+            continue;
+        };
+        let documents = listing
+            .files
+            .iter()
+            .map(|file| file.name.trim_start_matches('/').to_string())
+            .filter(|path| {
+                let lower = path.to_ascii_lowercase();
+                lower == "skill.md" || lower.ends_with("/skill.md")
+            })
+            .collect::<Vec<_>>();
+        if documents.is_empty() {
+            continue;
+        }
+        let matched = documents
+            .iter()
+            .find(|path| {
+                path.rsplit_once('/')
+                    .map(|(dir, _)| dir.rsplit('/').next().unwrap_or_default())
+                    .is_some_and(|dir| dir.eq_ignore_ascii_case(skill_id))
+            })
+            .or_else(|| (documents.len() == 1).then(|| &documents[0]));
+        if let Some(path) = matched {
+            let url = format!("{JSDELIVR_CDN}/{owner}/{repo}@{branch}/{path}");
+            if market_url_policy(&url).is_ok() {
+                return Ok(url);
+            }
+        }
+    }
+    Err(VibexError::validation(
+        "market_skill_document_not_found",
+        "the skill document could not be located in its repository",
+    )
+    .with_diagnostic("source", source.to_string())
+    .with_diagnostic("skillId", skill_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,11 +789,11 @@ fn skill_document_from_text(entry_id: &str, text: &str) -> SkillMarketDocument {
 
 fn render_skill_document(name: &str, description: Option<&str>, body: &str) -> String {
     let mut out = format!("---\nname: {}\n", name.replace('\n', " "));
-    if let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) {
-        out.push_str(&format!(
-            "description: {}\n",
-            description.replace('\n', " ")
-        ));
+    if let Some(description) = description
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str(&format!("description: {}\n", description.replace('\n', " ")));
     }
     out.push_str("---\n\n");
     out.push_str(body.trim());
@@ -1486,278 +810,53 @@ impl ProviderConfigService {
         &self,
         request: McpMarketSearchRequest,
     ) -> VibexResult<McpMarketSearchResponse> {
-        let sources = self.market_sources_for_kind(&request.source_ids, true)?;
         let client = market_http_client()?;
         let limit = request.limit.unwrap_or(30).clamp(1, 100);
-        let query = request.query.clone().unwrap_or_default();
-        let mut entries = Vec::new();
-        let mut failed_sources = Vec::new();
-        let mut has_more = false;
-
-        for source in &sources {
-            let outcome = match source.kind {
-                MarketSourceKind::McpRegistry => {
-                    search_mcp_registry(&client, source, Some(&query), limit)
-                }
-                MarketSourceKind::McpCatalog => {
-                    if source.url.starts_with("builtin://") {
-                        Ok((builtin_mcp_catalog(), false))
-                    } else {
-                        match fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES) {
-                            Ok((body, _)) => Ok((parse_mcp_catalog(source, &body), false)),
-                            Err(error) => Err(source_failure(source, &error, None)),
-                        }
-                    }
-                }
-                _ => continue,
-            };
-            match outcome {
-                Ok((mut source_entries, source_has_more)) => {
-                    if request.query.is_some() && source.kind == MarketSourceKind::McpCatalog {
-                        let needle = query.to_lowercase();
-                        source_entries.retain(|entry| {
-                            entry.name.to_lowercase().contains(&needle)
-                                || entry
-                                    .description
-                                    .as_deref()
-                                    .is_some_and(|value| value.to_lowercase().contains(&needle))
-                        });
-                    }
-                    has_more |= source_has_more;
-                    entries.append(&mut source_entries);
-                }
-                Err(failure) => failed_sources.push(failure),
-            }
-        }
-
-        if let Some(category) = request.category {
-            entries.retain(|entry| entry.categories.contains(&category));
-        }
-        let offset = request.offset.unwrap_or(0) as usize;
-        let entries = entries.into_iter().skip(offset).collect();
-        Ok(McpMarketSearchResponse {
-            entries,
-            failed_sources,
-            has_more,
-        })
+        let (entries, has_more) = search_mcp_registry(&client, request.query.as_deref(), limit)?;
+        Ok(McpMarketSearchResponse { entries, has_more })
     }
 
     pub fn search_skill_market(
         &self,
         request: SkillMarketSearchRequest,
     ) -> VibexResult<SkillMarketSearchResponse> {
-        let sources = self.market_sources_for_kind(&request.source_ids, false)?;
         let client = market_http_client()?;
-        let query = request.query.clone().unwrap_or_default();
-        let mut entries = Vec::new();
-        let mut failed_sources = Vec::new();
-
-        for source in &sources {
-            let outcome = match source.kind {
-                MarketSourceKind::SkillCatalog => {
-                    if source.url.starts_with("builtin://") {
-                        Ok(builtin_skill_catalog())
-                    } else {
-                        match fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES) {
-                            Ok((body, _)) => Ok(parse_skill_catalog(source, &body)),
-                            Err(error) => Err(source_failure(source, &error, None)),
-                        }
-                    }
-                }
-                MarketSourceKind::SkillRepository => scan_skill_repository(&client, source),
-                _ => continue,
-            };
-            match outcome {
-                Ok(mut source_entries) => {
-                    if !query.trim().is_empty() {
-                        let needle = query.to_lowercase();
-                        source_entries.retain(|entry| {
-                            entry.name.to_lowercase().contains(&needle)
-                                || entry
-                                    .description
-                                    .as_deref()
-                                    .is_some_and(|value| value.to_lowercase().contains(&needle))
-                        });
-                    }
-                    entries.append(&mut source_entries);
-                }
-                Err(failure) => failed_sources.push(failure),
-            }
+        let query = request.query.as_deref().map(str::trim).unwrap_or_default();
+        // The index refuses anything shorter than two characters, so a short
+        // query is answered locally instead of being sent to fail.
+        if query.chars().count() < 2 {
+            return Ok(SkillMarketSearchResponse {
+                entries: Vec::new(),
+                total: 0,
+                has_more: false,
+            });
         }
-
-        if let Some(category) = request.category {
-            entries.retain(|entry| entry.categories.contains(&category));
-        }
-        let offset = request.offset.unwrap_or(0) as usize;
-        let entries = entries.into_iter().skip(offset).collect();
-        Ok(SkillMarketSearchResponse {
-            entries,
-            failed_sources,
-            has_more: false,
-        })
-    }
-
-    /// Resolve one entry again by id.
-    ///
-    /// Install calls this rather than trusting a client-supplied template, so a
-    /// crafted request cannot introduce a server the catalog never published.
-    pub fn mcp_market_entry(&self, request: McpMarketEntryRequest) -> VibexResult<McpMarketEntry> {
-        let sources =
-            self.market_sources_for_kind(std::slice::from_ref(&request.source_id), true)?;
-        let source = sources
-            .iter()
-            .find(|source| source.id == request.source_id)
-            .ok_or_else(|| {
-                VibexError::validation("market_source_not_found", "market source was not found")
-                    .with_diagnostic("sourceId", request.source_id.clone())
-            })?;
-        let client = market_http_client()?;
-        let mut entries = match source.kind {
-            MarketSourceKind::McpRegistry => {
-                search_mcp_registry(&client, source, None, 100)
-                    .map_err(|failure| {
-                        VibexError::provider(failure.code, failure.message)
-                            .with_diagnostic("sourceId", failure.source_id)
-                    })?
-                    .0
-            }
-            MarketSourceKind::McpCatalog => {
-                if source.url.starts_with("builtin://") {
-                    builtin_mcp_catalog()
-                } else {
-                    let (body, _) =
-                        fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
-                    parse_mcp_catalog(source, &body)
-                }
-            }
-            _ => Vec::new(),
-        };
-        entries
-            .iter()
-            .position(|entry| entry.id == request.entry_id)
-            .map(|index| entries.remove(index))
-            .ok_or_else(|| {
-                VibexError::validation("market_entry_not_found", "market entry was not found")
-                    .with_diagnostic("entryId", request.entry_id.clone())
-            })
+        let limit = request.limit.unwrap_or(30).clamp(1, 100);
+        search_skill_index(&client, query, limit, request.offset.unwrap_or(0))
     }
 
     pub fn skill_market_document(
         &self,
         request: SkillMarketDocumentRequest,
     ) -> VibexResult<SkillMarketDocument> {
-        let sources =
-            self.market_sources_for_kind(std::slice::from_ref(&request.source_id), false)?;
-        let source = sources
-            .iter()
-            .find(|source| source.id == request.source_id)
-            .ok_or_else(|| {
-                VibexError::validation("market_source_not_found", "market source was not found")
-                    .with_diagnostic("sourceId", request.source_id.clone())
-            })?;
-        let entry = self
-            .skill_market_entry_for(source, &request.entry_id)?
-            .ok_or_else(|| {
-                VibexError::validation("market_entry_not_found", "market entry was not found")
-                    .with_diagnostic("entryId", request.entry_id.clone())
-            })?;
         let client = market_http_client()?;
+        let document_url =
+            resolve_skill_document_url(&client, &request.source, &request.skill_id)?;
         let (body, _) =
-            fetch_market_bytes(&client, &entry.document_url, MAX_SKILL_DOCUMENT_FETCH_BYTES)?;
+            fetch_market_bytes(&client, &document_url, MAX_SKILL_DOCUMENT_FETCH_BYTES)?;
         let text = String::from_utf8(body).map_err(|_| {
             VibexError::provider(
                 "market_skill_document_not_utf8",
                 "skill documents must be UTF-8 markdown",
             )
         })?;
-        Ok(skill_document_from_text(&entry.id, &text))
-    }
-
-    fn skill_market_entry_for(
-        &self,
-        source: &MarketSource,
-        entry_id: &str,
-    ) -> VibexResult<Option<SkillMarketEntry>> {
-        let mut entries = if source.url.starts_with("builtin://") {
-            builtin_skill_catalog()
-        } else {
-            let client = market_http_client()?;
-            match source.kind {
-                MarketSourceKind::SkillCatalog => {
-                    let (body, _) =
-                        fetch_market_bytes(&client, &source.url, MAX_MARKET_RESPONSE_BYTES)?;
-                    parse_skill_catalog(source, &body)
-                }
-                MarketSourceKind::SkillRepository => scan_skill_repository(&client, source)
-                    .map_err(|failure| {
-                        VibexError::provider(failure.code, failure.message)
-                            .with_diagnostic("sourceId", failure.source_id)
-                    })?,
-                _ => Vec::new(),
-            }
-        };
-        Ok(entries
-            .iter()
-            .position(|entry| entry.id == entry_id)
-            .map(|index| entries.remove(index)))
+        Ok(skill_document_from_text(&request.entry_id, &text))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
-
-/// Turn a market template into a create request.
-///
-/// User-supplied env values win over the catalog's defaults, because the form
-/// is where a credential the catalog could not know about is entered.
-fn market_entry_to_candidate(
-    entry: &McpMarketEntry,
-    env_values: &[McpServerEnvEntry],
-) -> McpServerCreateRequest {
-    let mut env = Vec::new();
-    for requirement in &entry.env {
-        let supplied = env_values
-            .iter()
-            .find(|value| value.name == requirement.name)
-            .map(|value| value.value.clone())
-            .filter(|value| !value.trim().is_empty());
-        let resolved = supplied.or_else(|| requirement.default_value.clone());
-        if let Some(value) = resolved {
-            env.push(McpServerEnvEntry {
-                name: requirement.name.clone(),
-                value,
-            });
-        }
-    }
-    // Values for names the catalog did not declare are still carried: an entry
-    // may need a variable the publisher did not annotate.
-    for value in env_values {
-        if !env.iter().any(|existing| existing.name == value.name)
-            && !value.name.trim().is_empty()
-            && !value.value.trim().is_empty()
-        {
-            env.push(value.clone());
-        }
-    }
-    McpServerCreateRequest {
-        display_name: entry.name.clone(),
-        transport_kind: entry.transport,
-        status: McpServerStatus::Enabled,
-        scope_kind: McpServerScopeKind::User,
-        project_id: None,
-        workspace_id: None,
-        command: entry.command.clone(),
-        args: entry.args.clone(),
-        env,
-        url: entry.url.clone(),
-        headers: Vec::new(),
-        description: entry.description.clone(),
-        tags: vec!["market".to_string()],
-        secret_references: Vec::new(),
-        provider_matrix: Vec::new(),
-    }
-}
 
 /// Whether an agent can host this transport.
 ///
@@ -1781,19 +880,7 @@ impl ProviderConfigService {
                 "select at least one agent to install into",
             ));
         }
-        // The candidate is either the editable form's result or the catalog
-        // template re-resolved from the source; never a client-invented server
-        // when the catalog can be asked.
-        let candidate = match request.candidate.clone() {
-            Some(candidate) => candidate,
-            None => {
-                let entry = self.mcp_market_entry(McpMarketEntryRequest {
-                    source_id: request.source_id.clone(),
-                    entry_id: request.entry_id.clone(),
-                })?;
-                market_entry_to_candidate(&entry, &request.env_values)
-            }
-        };
+        let candidate = request.candidate.clone();
         validate_mcp_create_request(&candidate)?;
 
         let (hostable, skipped): (Vec<AgentId>, Vec<AgentId>) = request
@@ -1845,11 +932,10 @@ impl ProviderConfigService {
 
         if McpServerRepository::get(&conn, &server.id)?.is_some() {
             McpServerRepository::update(&conn, &server)?;
-            McpServerRepository::replace_agent_matrix(&conn, &server.id, &server.agent_matrix)?;
         } else {
             McpServerRepository::insert(&conn, &server)?;
-            McpServerRepository::replace_agent_matrix(&conn, &server.id, &server.agent_matrix)?;
         }
+        McpServerRepository::replace_agent_matrix(&conn, &server.id, &server.agent_matrix)?;
         let readback = McpServerRepository::get(&conn, &server.id)?.ok_or_else(|| {
             VibexError::storage(
                 "market_install_readback_missing",
@@ -1923,7 +1009,7 @@ impl ProviderConfigService {
             scope_kind: SkillScopeKind::User,
             project_id: None,
             workspace_id: None,
-            source_uri: Some(format!("market:{}:{}", request.source_id, request.entry_id)),
+            source_uri: Some(format!("market:{}", request.entry_id)),
             description: request.document.description.clone(),
             tags: vec!["market".to_string()],
             content_preview: Some(request.document.body.chars().take(2048).collect()),
@@ -1961,11 +1047,10 @@ impl ProviderConfigService {
 
         if SkillRepository::get(&conn, &skill.id)?.is_some() {
             SkillRepository::update(&conn, &skill)?;
-            SkillRepository::replace_agent_matrix(&conn, &skill.id, &skill.agent_matrix)?;
         } else {
             SkillRepository::insert(&conn, &skill)?;
-            SkillRepository::replace_agent_matrix(&conn, &skill.id, &skill.agent_matrix)?;
         }
+        SkillRepository::replace_agent_matrix(&conn, &skill.id, &skill.agent_matrix)?;
         let readback = SkillRepository::get(&conn, &skill.id)?.ok_or_else(|| {
             VibexError::storage(
                 "market_install_readback_missing",
@@ -2103,82 +1188,26 @@ mod tests {
     #[test]
     fn transport_gate_excludes_sse_for_codex_and_deepseek() {
         let codex = AgentId::parse("codex").unwrap();
-        assert!(!agent_can_host_transport(
-            &codex,
-            McpServerTransportKind::Sse
-        ));
-        assert!(agent_can_host_transport(
-            &codex,
-            McpServerTransportKind::Stdio
-        ));
+        assert!(!agent_can_host_transport(&codex, McpServerTransportKind::Sse));
+        assert!(agent_can_host_transport(&codex, McpServerTransportKind::Stdio));
         let claude = AgentId::parse("claude").unwrap();
-        assert!(agent_can_host_transport(
-            &claude,
-            McpServerTransportKind::Sse
-        ));
+        assert!(agent_can_host_transport(&claude, McpServerTransportKind::Sse));
     }
 
     #[test]
-    fn skill_paths_skip_vendor_directories() {
-        assert!(is_scannable_skill_path("skills/demo/SKILL.md"));
-        assert!(!is_scannable_skill_path("node_modules/pkg/SKILL.md"));
-        assert!(!is_scannable_skill_path(".git/x/SKILL.md"));
-        assert!(!is_scannable_skill_path("skills/demo/README.md"));
-    }
-
-    #[test]
-    fn builtin_skill_catalog_entries_are_public_https() {
-        for entry in builtin_skill_catalog() {
-            assert!(
-                market_url_policy(&entry.document_url).is_ok(),
-                "{} must point at a public https document",
-                entry.id
-            );
-        }
-    }
-
-    #[test]
-    fn builtin_mcp_catalog_entries_are_startable_and_categorized() {
-        let entries = builtin_mcp_catalog();
-        assert!(
-            entries.len() >= 8,
-            "the builtin shelf should be more than a token few entries"
+    fn skill_source_must_be_a_plain_owner_repo_pair() {
+        assert_eq!(
+            parse_github_source("anthropics/skills").unwrap(),
+            ("anthropics".to_string(), "skills".to_string())
         );
-        for entry in &entries {
-            assert_eq!(entry.transport, McpServerTransportKind::Stdio);
-            assert!(
-                entry
-                    .command
-                    .as_deref()
-                    .is_some_and(|command| !command.trim().is_empty()),
-                "{} must carry a launcher",
-                entry.id
-            );
-            assert!(
-                !entry.args.is_empty(),
-                "{} must carry the package it launches",
-                entry.id
-            );
-            assert!(
-                !entry.categories.is_empty(),
-                "{} must be categorized, or the chips cannot reach it",
-                entry.id
-            );
-            assert_eq!(entry.source_id, "builtin-mcp-picks");
-        }
-    }
-
-    #[test]
-    fn builtin_sources_cover_both_markets() {
-        let sources = builtin_market_sources();
-        assert!(sources.iter().any(|source| source.kind.is_mcp()));
-        assert!(sources.iter().any(|source| source.kind.is_skill()));
-        for source in &sources {
-            assert!(
-                market_source_url_is_allowed(source.kind, &source.url),
-                "{} must pass the same policy a user source would",
-                source.id
-            );
-        }
+        assert_eq!(
+            parse_github_source("anthropics/skills.git").unwrap().1,
+            "skills"
+        );
+        // A nested path could point the fetch at another repository's subtree.
+        assert!(parse_github_source("anthropics/skills/pdf").is_err());
+        assert!(parse_github_source("anthropics").is_err());
+        assert!(parse_github_source("").is_err());
+        assert!(parse_github_source("../../etc/passwd").is_err());
     }
 }

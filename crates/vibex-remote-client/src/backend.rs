@@ -4371,52 +4371,6 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
-    fn market_sources(&self) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
-        let this = self.clone();
-        Box::pin(async move {
-            let payload = RemoteProviderRequest::MarketSourceList(
-                vibex_core::RemoteProviderMarketSourceListRequest { auth: this.auth() },
-            );
-            let value = this
-                .rpc(
-                    RemoteOperationKind::ProviderSettings,
-                    payload,
-                    None,
-                    None,
-                    vibex_core::RemoteTimeoutClass::Standard,
-                )
-                .await?;
-            Ok(decode::<vibex_core::RemoteProviderMarketSourceListResponse>(value)?.sources)
-        })
-    }
-
-    fn set_market_sources(
-        &self,
-        request: MutationRequest<vibex_core::MarketSourceSetRequest>,
-    ) -> BackendFuture<'_, vibex_core::MarketSourceListResponse> {
-        let this = self.clone();
-        Box::pin(async move {
-            request.validate()?;
-            let key = Self::mutation_key(&request);
-            let payload = RemoteProviderRequest::MarketSourceSet(
-                vibex_core::RemoteProviderMarketSourceSetRequest {
-                    auth: this.auth(),
-                    request: request.payload,
-                },
-            );
-            let value = this
-                .rpc(
-                    RemoteOperationKind::ProviderSettings,
-                    payload,
-                    Some(request.request_id),
-                    Some((&key, request.expected_revision.as_deref(), None)),
-                    vibex_core::RemoteTimeoutClass::Standard,
-                )
-                .await?;
-            Ok(decode::<vibex_core::RemoteProviderMarketSourceSetResponse>(value)?.sources)
-        })
-    }
-
     fn search_mcp_market(
         &self,
         request: vibex_core::McpMarketSearchRequest,
@@ -4441,31 +4395,6 @@ impl ManagementBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<vibex_core::RemoteProviderMcpMarketSearchResponse>(value)?.result)
-        })
-    }
-
-    fn mcp_market_entry(
-        &self,
-        request: vibex_core::McpMarketEntryRequest,
-    ) -> BackendFuture<'_, vibex_core::McpMarketEntry> {
-        let this = self.clone();
-        Box::pin(async move {
-            let payload = RemoteProviderRequest::McpMarketEntry(
-                vibex_core::RemoteProviderMcpMarketEntryRequest {
-                    auth: this.auth(),
-                    request,
-                },
-            );
-            let value = this
-                .rpc(
-                    RemoteOperationKind::ProviderSettings,
-                    payload,
-                    None,
-                    None,
-                    vibex_core::RemoteTimeoutClass::LongRunning,
-                )
-                .await?;
-            Ok(decode::<vibex_core::RemoteProviderMcpMarketEntryResponse>(value)?.entry)
         })
     }
 
