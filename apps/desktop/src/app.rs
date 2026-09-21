@@ -537,6 +537,10 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
+/// Where the permission alert aims the card it points at. The alert names a
+/// card rather than a keyword inside one, so a card taller than the viewport
+/// opens on its header instead of on an arbitrary line.
+const AGENT_PERMISSION_REVEAL_AIM: f32 = 0.0;
 /// Top padding of the virtual timeline list before the first render reports the
 /// window's rem size. The list's `py_4` resolves to one rem.
 const AGENT_TIMELINE_LIST_PADDING_TOP_PX: f32 = 16.0;
@@ -3030,6 +3034,13 @@ impl ConversationTurnsSummary {
             has_pending_permission: turns.iter().any(|turn| turn.borrow().pending_permission),
         }
     }
+}
+
+/// Where the permission alert has to scroll to reach the request it names.
+struct PendingPermissionRevealTarget {
+    turn_id: String,
+    turn_index: usize,
+    item_id: String,
 }
 
 struct AgentSessionViewCacheEntry {
@@ -6183,6 +6194,17 @@ pub struct VibexWorkbench {
     /// be scrolled into view. Cleared once the row has been revealed, so a
     /// later manual scroll is never yanked back to an old match.
     pending_session_search_reveal_item_id: Option<String>,
+    /// Row holding the card the permission alert points at, waiting for its
+    /// next paint to be scrolled into view. The alert sits above the viewport
+    /// and the card can be inside a collapsed or windowed process section, so
+    /// the reveal is resolved once the row has been laid out. Cleared once the
+    /// row has been revealed, so a later manual scroll is never yanked back to
+    /// an old card.
+    pending_permission_reveal_item_id: Option<String>,
+    /// The pending-request set the user dismissed the permission alert for, by
+    /// session. Keying the dismissal by the set means the next request shows
+    /// the alert again instead of staying hidden for the rest of the session.
+    dismissed_permission_alert_signatures: BTreeMap<String, String>,
     sidebar_rename_input: Entity<InputState>,
     user_message_edit_input: Entity<TextareaState>,
     composer_queue_edit_input: Entity<TextareaState>,
@@ -7111,6 +7133,8 @@ impl VibexWorkbench {
             session_search_highlight_query: None,
             conversation_find_active_match_ordinal: 0,
             pending_session_search_reveal_item_id: None,
+            pending_permission_reveal_item_id: None,
+            dismissed_permission_alert_signatures: BTreeMap::new(),
             sidebar_rename_input,
             user_message_edit_input,
             composer_queue_edit_input,
@@ -17580,6 +17604,7 @@ impl VibexWorkbench {
         // A manual scroll outranks a reveal that never landed, so a match the
         // user scrolled away from is not yanked back into view later.
         self.pending_session_search_reveal_item_id = None;
+        self.pending_permission_reveal_item_id = None;
         self.timeline_follow.set_following_bottom(false);
         let scrolled_toward_bottom = delta_y < 0.0;
         let generation = self.session_generation;
@@ -17626,6 +17651,7 @@ impl VibexWorkbench {
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
         self.pending_session_search_reveal_item_id = None;
+        self.pending_permission_reveal_item_id = None;
         self.timeline_follow.set_following_bottom(false);
         cx.notify();
     }
@@ -17659,6 +17685,105 @@ impl VibexWorkbench {
         self.timeline_scroll
             .scroll_to_item(turn_index, ScrollStrategy::Top);
         cx.notify();
+    }
+
+    /// Scrolls the timeline to the card the permission alert points at.
+    ///
+    /// The alert names a request rather than a row: its card can sit inside a
+    /// collapsed process section and, in a long conversation, outside the
+    /// rendered window. The turn is expanded and centered first, then the row
+    /// itself is revealed once it has been laid out.
+    fn reveal_pending_permission_card(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_permission_reveal_target() else {
+            return;
+        };
+        self.timeline_scroll_wheel_idle_task = None;
+        self.timeline_follow.set_following_bottom(false);
+        self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
+        self.pending_session_search_reveal_item_id = None;
+        self.timeline_process_expansion
+            .insert(target.turn_id.clone(), true);
+        self.invalidate_timeline_turn_measurement(&target.turn_id);
+        self.rebuild_timeline_sizes();
+        self.pending_permission_reveal_item_id = Some(target.item_id);
+        self.timeline_scroll
+            .scroll_to_item(target.turn_index, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    /// The newest pending request the alert covers, as a scroll target.
+    ///
+    /// The turns come from the same projection the virtual list renders, so the
+    /// index it returns addresses the row table the scroll is resolved against.
+    fn pending_permission_reveal_target(&mut self) -> Option<PendingPermissionRevealTarget> {
+        let turns = self.conversation_turns_cached();
+        turns
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(turn_index, turn)| {
+                if !turn.pending_permission {
+                    return None;
+                }
+                let row = turn
+                    .process_rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.pending_permission)?;
+                let item_id = row.item_ids.last()?.clone();
+                Some(PendingPermissionRevealTarget {
+                    turn_id: turn.id.clone(),
+                    turn_index,
+                    item_id,
+                })
+            })
+    }
+
+    /// Hides the permission alert for the live session and refreshes the state
+    /// the sidebar shows for it.
+    ///
+    /// Dismissing the alert is a view decision: the request stays pending and
+    /// the Agent stays parked. The refresh keeps the sidebar row honest — it
+    /// reads the session's latest state instead of the state the alert was
+    /// raised against.
+    fn dismiss_pending_permission_alert(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            return;
+        };
+        if let Some(signature) = self.pending_permission_alert_signature() {
+            self.dismissed_permission_alert_signatures
+                .insert(session_id.as_str().to_string(), signature);
+        }
+        self.load_agent_overview(cx);
+        if self.selected_session_id.as_ref() == Some(&session_id) {
+            self.refresh_selected_agent_timeline(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the alert stays hidden for the requests currently pending.
+    ///
+    /// A dismissal only holds while the same set is pending: answering one
+    /// request and receiving the next changes the signature, so the alert comes
+    /// back rather than staying dismissed for the rest of the session.
+    fn permission_alert_is_dismissed(&self, session_id: Option<&VibexSessionId>) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        let Some(dismissed) = self
+            .dismissed_permission_alert_signatures
+            .get(session_id.as_str())
+        else {
+            return false;
+        };
+        self.pending_permission_alert_signature().as_deref() == Some(dismissed.as_str())
+    }
+
+    /// The pending-request set the alert covers, as one comparable string.
+    fn pending_permission_alert_signature(&self) -> Option<String> {
+        let pending = self.timeline.pending_permission_ids();
+        (!pending.is_empty()).then(|| pending.into_iter().collect::<Vec<_>>().join("|"))
     }
 
     fn scroll_timeline_to_latest(&self) {
@@ -26141,6 +26266,8 @@ impl VibexWorkbench {
         self.unread_agent_completion_session_ids
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_user_request_ids
+            .retain(|session_id, _| !session_ids.contains(session_id));
+        self.dismissed_permission_alert_signatures
             .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_search_index
             .retain(|session_id, _| !session_ids.contains(session_id));
@@ -39139,7 +39266,15 @@ impl VibexWorkbench {
         let rendered_row_sizes = row_sizes.clone();
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
-        let pending_permission = turns_summary.has_pending_permission;
+        // The live view owns the session, not the selection: a group pane
+        // renders another session's runtime controls while the selection still
+        // names the focused pane.
+        let live_session_id = self.timeline.session_id.clone();
+        // A dismissed alert stays hidden while the same requests are pending,
+        // so acknowledging a request the user cannot answer yet does not cost
+        // them the timeline row it occupies.
+        let pending_permission = turns_summary.has_pending_permission
+            && !self.permission_alert_is_dismissed(live_session_id.as_ref());
         self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
@@ -39288,10 +39423,6 @@ impl VibexWorkbench {
                 )
             })
             .when_some(turn_preview_rail, |this, rail| this.child(rail));
-        // The live view owns the session, not the selection: a group pane
-        // renders another session's runtime controls while the selection still
-        // names the focused pane.
-        let live_session_id = self.timeline.session_id.clone();
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
@@ -39391,6 +39522,9 @@ impl VibexWorkbench {
                     .child(runtime_controls)
                     .when(pending_permission, |this| {
                         // Tauri parity: "Permission waiting for review" alert above the timeline.
+                        // The alert doubles as the jump affordance: the request
+                        // it names can sit anywhere in a long conversation, so
+                        // clicking the body scrolls its card into view.
                         this.child(
                             h_flex()
                                 .w_full()
@@ -39400,6 +39534,7 @@ impl VibexWorkbench {
                                 .pt_2()
                                 .child(
                                     h_flex()
+                                        .id("permission-alert")
                                         .w_full()
                                         .when_some(content_max_width, |this, max_width| {
                                             this.max_w(px(max_width))
@@ -39413,6 +39548,13 @@ impl VibexWorkbench {
                                         .bg(cx.theme().background)
                                         .px_3()
                                         .py_2()
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(theme::hover_wash(cx.theme().is_dark()))
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.reveal_pending_permission_card(cx)
+                                        }))
                                         .child(
                                             Icon::default()
                                                 .path("icons/vibex/shield-alert.svg")
@@ -39442,6 +39584,28 @@ impl VibexWorkbench {
                                                             "在 Agent 繼續前，先查看時間線卡片中的請求操作。",
                                                         )),
                                                 ),
+                                        )
+                                        .child(
+                                            // Closing only puts the alert away;
+                                            // the request stays pending, so the
+                                            // sidebar is refreshed against the
+                                            // session's latest state rather than
+                                            // being told the request is gone.
+                                            Button::new("permission-alert-dismiss")
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .size(px(20.0))
+                                                .icon(IconName::Close)
+                                                .tooltip(locale::text(
+                                                    "Dismiss",
+                                                    "关闭",
+                                                    "關閉",
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.dismiss_pending_permission_alert(cx);
+                                                })),
                                         ),
                                 ),
                         )
@@ -42819,36 +42983,40 @@ impl VibexWorkbench {
         self.highlight_session_search_rows(std::slice::from_ref(row), element, cx)
     }
 
-    /// Wraps one row's element so the find bar's current match can be scrolled
-    /// into view once it has been laid out.
+    /// Wraps one row's element so the row the find bar is on — or the card the
+    /// permission alert points at — can be scrolled into view once it has been
+    /// laid out.
     ///
-    /// The match itself is tinted inside the row's own text — see
-    /// [`Self::session_search_highlighted_row_text`] — and the wrapper paints
-    /// nothing: tinting the whole message buried the keyword the user was
-    /// looking for. The wrapper only exists for the row holding the active
-    /// match, and only until that row has been revealed.
+    /// The wrapper paints nothing: a find match is tinted inside the row's own
+    /// text — see [`Self::session_search_highlighted_row_text`] — and the alert
+    /// only needs its card on screen. It exists for one row, and only until
+    /// that row has been revealed.
     fn highlight_session_search_rows(
         &self,
         rows: &[TimelineRow],
         element: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(highlight) = self.session_search_highlight_for_rows(rows) else {
-            return element;
+        let aim = if self.permission_reveal_pending_for_rows(rows) {
+            AGENT_PERMISSION_REVEAL_AIM
+        } else {
+            let Some(highlight) = self.session_search_highlight_for_rows(rows) else {
+                return element;
+            };
+            if !highlight.active || !self.session_search_reveal_pending_for_rows(rows) {
+                return element;
+            }
+            highlight.aim
         };
         // The find bar searches the open conversation, and the child-agent
-        // panel scrolls its own handle, so a match must never nudge it.
-        if !highlight.active
-            || self.rendering_child_agent_timeline()
-            || !self.session_search_reveal_pending_for_rows(rows)
-        {
+        // panel scrolls its own handle, so a reveal must never nudge it.
+        if self.rendering_child_agent_timeline() {
             return element;
         }
         let item_ids = rows
             .iter()
             .flat_map(|row| row.item_ids.iter().cloned())
             .collect::<Vec<_>>();
-        let aim = highlight.aim;
         let entity = cx.weak_entity();
         let scroll = self.timeline_scroll.clone();
         div()
@@ -42872,6 +43040,15 @@ impl VibexWorkbench {
             })
     }
 
+    fn permission_reveal_pending_for_rows(&self, rows: &[TimelineRow]) -> bool {
+        self.pending_permission_reveal_item_id
+            .as_ref()
+            .is_some_and(|pending| {
+                rows.iter()
+                    .any(|row| row.item_ids.iter().any(|item_id| item_id == pending))
+            })
+    }
+
     /// Nudges the timeline so a laid-out match row — or the keyword inside a
     /// row taller than the viewport — sits inside the visible area.
     ///
@@ -42879,7 +43056,7 @@ impl VibexWorkbench {
     /// routinely taller than the viewport: an expanded process section alone
     /// can be. The row therefore reports its own painted bounds once it has
     /// been laid out, and the offset moves by the smallest amount that brings
-    /// the match into view.
+    /// the match — or the permission alert's card — into view.
     fn reveal_session_search_row(
         &mut self,
         item_ids: &[String],
@@ -42888,18 +43065,28 @@ impl VibexWorkbench {
         scroll: &VirtualListScrollHandle,
         cx: &mut Context<Self>,
     ) {
-        if !item_ids
-            .iter()
-            .any(|item_id| Some(item_id) == self.pending_session_search_reveal_item_id.as_ref())
-        {
+        let reveals_permission = self
+            .pending_permission_reveal_item_id
+            .as_ref()
+            .is_some_and(|pending| item_ids.iter().any(|item_id| item_id == pending));
+        let reveals_match = self
+            .pending_session_search_reveal_item_id
+            .as_ref()
+            .is_some_and(|pending| item_ids.iter().any(|item_id| item_id == pending));
+        if !reveals_permission && !reveals_match {
             return;
         }
         // The row's prepaint bounds already carry the scroll offset, so they
         // are directly comparable with the viewport the handle tracked. A
         // viewport with no height has nothing to reveal inside, and the
-        // turn-level scroll the find bar already asked for still stands.
+        // turn-level scroll the caller already asked for still stands.
         let viewport = scroll.bounds();
-        self.pending_session_search_reveal_item_id = None;
+        if reveals_permission {
+            self.pending_permission_reveal_item_id = None;
+        }
+        if reveals_match {
+            self.pending_session_search_reveal_item_id = None;
+        }
         if viewport.size.height <= px(0.0) {
             return;
         }
@@ -43630,14 +43817,18 @@ impl VibexWorkbench {
         }
     }
 
-    /// The unit holding the find bar's pending reveal, built even when it falls
-    /// outside the window so the match can still be scrolled to.
+    /// The unit holding the find bar's pending reveal — or the permission
+    /// alert's pending reveal — built even when it falls outside the window so
+    /// the target can still be scrolled to.
     fn timeline_process_pinned_unit(
         &self,
         turn: &TimelineConversationTurn,
         units: &[TimelineProcessUnit],
     ) -> Option<usize> {
-        let pending = self.pending_session_search_reveal_item_id.as_deref()?;
+        let pending = self
+            .pending_permission_reveal_item_id
+            .as_deref()
+            .or(self.pending_session_search_reveal_item_id.as_deref())?;
         units.iter().position(|unit| {
             turn.process_rows[unit.rows.clone()]
                 .iter()
@@ -71137,6 +71328,57 @@ mod tests {
             locale::strings(locale::ResolvedLocale::ZhCn).agent_waiting_confirmation,
             "等待确认中..."
         );
+    }
+
+    #[test]
+    fn permission_alert_jumps_to_its_card_and_dismissal_refreshes_the_session_state() {
+        let source = include_str!("app.rs");
+        let alert = source
+            .split_once(
+                "// Tauri parity: \"Permission waiting for review\" alert above the timeline.",
+            )
+            .and_then(|(_, tail)| tail.split_once(".child(timeline_surface)"))
+            .map(|(body, _)| body)
+            .expect("permission alert should remain inspectable");
+        // The alert is both the jump affordance and the dismissal control, so
+        // closing it must not run the body's own click handler.
+        assert!(alert.contains("this.reveal_pending_permission_card(cx)"));
+        assert!(alert.contains("Button::new(\"permission-alert-dismiss\")"));
+        assert!(alert.contains("cx.stop_propagation();"));
+        assert!(alert.contains("this.dismiss_pending_permission_alert(cx)"));
+
+        let reveal = source
+            .split_once("    fn reveal_pending_permission_card(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The newest pending request the alert covers")
+            })
+            .map(|(body, _)| body)
+            .expect("permission reveal should remain inspectable");
+        // The virtual list only scrolls whole turns, so the card is revealed
+        // once its row has been laid out.
+        assert!(reveal.contains("self.pending_permission_reveal_item_id = Some(target.item_id);"));
+        assert!(reveal.contains("self.timeline_scroll"));
+        assert!(reveal.contains("ScrollStrategy::Center"));
+
+        let dismiss = source
+            .split_once("    fn dismiss_pending_permission_alert(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether the alert stays hidden"))
+            .map(|(body, _)| body)
+            .expect("permission dismissal should remain inspectable");
+        // Closing only puts the alert away: the sidebar is refreshed against
+        // the session's latest state instead of being told the request is gone.
+        assert!(dismiss.contains("self.load_agent_overview(cx);"));
+        assert!(dismiss.contains("self.refresh_selected_agent_timeline(cx);"));
+        assert!(!dismiss.contains("pending_user_request_ids"));
+
+        // A dismissal only holds while the same requests are pending, so the
+        // next request shows the alert again.
+        let dismissed = source
+            .split_once("    fn permission_alert_is_dismissed(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pending-request set"))
+            .map(|(body, _)| body)
+            .expect("alert dismissal state should remain inspectable");
+        assert!(dismissed.contains("pending_permission_alert_signature"));
     }
 
     #[test]
