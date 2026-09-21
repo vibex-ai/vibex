@@ -42,9 +42,10 @@ use serde::Deserialize;
 use vibex_core::{
     AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
     McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest, SkillMarketDocument, SkillMarketDocumentRequest,
-    SkillMarketEntry, SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
-    SkillMarketSearchResponse, SkillScopeKind, SkillSourceKind, SkillStatus, VibexError, VibexResult,
+    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest, SkillMarketDocument,
+    SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
+    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillScopeKind,
+    SkillSourceKind, SkillStatus, VibexError, VibexResult,
 };
 use vibex_db::{McpServerRepository, SkillRepository};
 
@@ -789,11 +790,11 @@ fn skill_document_from_text(entry_id: &str, text: &str) -> SkillMarketDocument {
 
 fn render_skill_document(name: &str, description: Option<&str>, body: &str) -> String {
     let mut out = format!("---\nname: {}\n", name.replace('\n', " "));
-    if let Some(description) = description
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        out.push_str(&format!("description: {}\n", description.replace('\n', " ")));
+    if let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) {
+        out.push_str(&format!(
+            "description: {}\n",
+            description.replace('\n', " ")
+        ));
     }
     out.push_str("---\n\n");
     out.push_str(body.trim());
@@ -840,10 +841,8 @@ impl ProviderConfigService {
         request: SkillMarketDocumentRequest,
     ) -> VibexResult<SkillMarketDocument> {
         let client = market_http_client()?;
-        let document_url =
-            resolve_skill_document_url(&client, &request.source, &request.skill_id)?;
-        let (body, _) =
-            fetch_market_bytes(&client, &document_url, MAX_SKILL_DOCUMENT_FETCH_BYTES)?;
+        let document_url = resolve_skill_document_url(&client, &request.source, &request.skill_id)?;
+        let (body, _) = fetch_market_bytes(&client, &document_url, MAX_SKILL_DOCUMENT_FETCH_BYTES)?;
         let text = String::from_utf8(body).map_err(|_| {
             VibexError::provider(
                 "market_skill_document_not_utf8",
@@ -1188,10 +1187,19 @@ mod tests {
     #[test]
     fn transport_gate_excludes_sse_for_codex_and_deepseek() {
         let codex = AgentId::parse("codex").unwrap();
-        assert!(!agent_can_host_transport(&codex, McpServerTransportKind::Sse));
-        assert!(agent_can_host_transport(&codex, McpServerTransportKind::Stdio));
+        assert!(!agent_can_host_transport(
+            &codex,
+            McpServerTransportKind::Sse
+        ));
+        assert!(agent_can_host_transport(
+            &codex,
+            McpServerTransportKind::Stdio
+        ));
         let claude = AgentId::parse("claude").unwrap();
-        assert!(agent_can_host_transport(&claude, McpServerTransportKind::Sse));
+        assert!(agent_can_host_transport(
+            &claude,
+            McpServerTransportKind::Sse
+        ));
     }
 
     #[test]

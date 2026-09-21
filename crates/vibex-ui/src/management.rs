@@ -1838,14 +1838,14 @@ mod tests {
             error_future()
         }
 
-                fn search_mcp_market(
+        fn search_mcp_market(
             &self,
             _request: vibex_core::McpMarketSearchRequest,
         ) -> BackendFuture<'_, vibex_core::McpMarketSearchResponse> {
             error_future()
         }
 
-            fn install_mcp_market_entry(
+        fn install_mcp_market_entry(
             &self,
             _request: MutationRequest<vibex_core::McpMarketInstallRequest>,
         ) -> BackendFuture<'_, vibex_core::McpMarketInstallResult> {

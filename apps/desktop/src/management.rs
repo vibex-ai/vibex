@@ -228,33 +228,6 @@ impl Render for ManagementSidebarResizeDrag {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManagementImportKind {
-    Mcp,
-    Skill,
-}
-
-struct ManagementImportDialog {
-    center: Entity<ManagementCenter>,
-    kind: ManagementImportKind,
-    _center_subscription: Subscription,
-}
-
-impl ManagementImportDialog {
-    fn new(
-        center: Entity<ManagementCenter>,
-        kind: ManagementImportKind,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let center_subscription = cx.observe(&center, |_, _, cx| cx.notify());
-        Self {
-            center,
-            kind,
-            _center_subscription: center_subscription,
-        }
-    }
-}
-
 struct ManagementProfileDialog {
     center: Entity<ManagementCenter>,
     _center_subscription: Subscription,
@@ -7084,6 +7057,11 @@ impl ManagementCenter {
                 .find(|server| server.id.as_str() == id)
                 .cloned()
         });
+        // The editor takes the section body, so the other panes stand down.
+        self.mcp_market_open = false;
+        self.mcp_import_open = false;
+        self.mcp_discovery = None;
+        self.mcp_market_install_target = None;
         self.mcp_transport_draft = existing
             .as_ref()
             .map(|server| server.transport_kind)
@@ -7381,6 +7359,11 @@ impl ManagementCenter {
                 .find(|skill| skill.id.as_str() == id)
                 .cloned()
         });
+        self.skill_market_open = false;
+        self.skill_import_open = false;
+        self.skill_discovery = None;
+        self.skill_market_install_target = None;
+        self.skill_market_document = None;
         self.skill_name_draft.update(cx, |state, cx| {
             state.set_value(
                 existing
@@ -7542,70 +7525,16 @@ impl ManagementCenter {
             .unwrap_or_else(|| AgentId::parse("claude").expect("builtin Agent id is valid"))
     }
 
-    fn open_mcp_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_import_dialog(ManagementImportKind::Mcp, window, cx);
-    }
-
-    fn open_import_dialog(
-        &mut self,
-        kind: ManagementImportKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Show the native-import view in the section body.
+    fn open_mcp_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.mutation.is_some() {
             return;
         }
-        match kind {
-            ManagementImportKind::Mcp => {
-                self.mcp_import_open = true;
-                self.mcp_discovery = None;
-            }
-            ManagementImportKind::Skill => {
-                self.skill_import_open = true;
-                self.skill_discovery = None;
-            }
-        }
-        let center = cx.entity();
-        let dialog_center = center.clone();
-        let dialog_content = cx.new(|cx| ManagementImportDialog::new(center.clone(), kind, cx));
-        let dialog_width = (f32::from(window.viewport_size().width) - 32.0).clamp(320.0, 672.0);
-        let dialog_height = (f32::from(window.viewport_size().height) - 32.0).clamp(280.0, 608.0);
-        let title = match kind {
-            ManagementImportKind::Mcp => {
-                management_locale_text("Native MCP import", "原生 MCP 导入", "原生 MCP 匯入")
-            }
-            ManagementImportKind::Skill => {
-                management_locale_text("Native Skill import", "原生技能导入", "原生技能匯入")
-            }
-        };
-        window.open_dialog(cx, move |dialog, _, _| {
-            let dialog_center = dialog_center.clone();
-            dialog
-                .title(title)
-                .w(px(dialog_width))
-                .max_w(px(dialog_width))
-                .h(px(dialog_height))
-                .child(dialog_content.clone())
-                .on_close(move |_, _, cx| {
-                    dialog_center.update(cx, |center, cx| {
-                        match kind {
-                            ManagementImportKind::Mcp => {
-                                center.mcp_import_open = false;
-                                center.mcp_discovery = None;
-                            }
-                            ManagementImportKind::Skill => {
-                                center.skill_import_open = false;
-                                center.skill_discovery = None;
-                            }
-                        }
-                        cx.notify();
-                    });
-                })
-        });
-        match kind {
-            ManagementImportKind::Mcp => self.discover_mcp_servers(cx),
-            ManagementImportKind::Skill => self.discover_skills(cx),
-        }
+        self.mcp_market_open = false;
+        self.mcp_editor_open = false;
+        self.mcp_import_open = true;
+        self.mcp_discovery = None;
+        self.discover_mcp_servers(cx);
     }
 
     fn discover_mcp_servers(&mut self, cx: &mut Context<Self>) {
@@ -7682,6 +7611,8 @@ impl ManagementCenter {
             return;
         }
         self.mcp_market_open = true;
+        self.mcp_import_open = false;
+        self.mcp_editor_open = false;
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
         self.mcp_market_install_agents = self.market_default_agents();
@@ -7889,6 +7820,8 @@ impl ManagementCenter {
             return;
         }
         self.skill_market_open = true;
+        self.skill_import_open = false;
+        self.skill_editor_open = false;
         self.skill_market_install_target = None;
         self.skill_market_document = None;
         self.skill_market_install_agents = self.market_default_agents();
@@ -8278,8 +8211,15 @@ impl ManagementCenter {
         );
     }
 
-    fn open_skill_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_import_dialog(ManagementImportKind::Skill, window, cx);
+    fn open_skill_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutation.is_some() {
+            return;
+        }
+        self.skill_market_open = false;
+        self.skill_editor_open = false;
+        self.skill_import_open = true;
+        self.skill_discovery = None;
+        self.discover_skills(cx);
     }
 
     fn discover_skills(&mut self, cx: &mut Context<Self>) {
@@ -10418,6 +10358,13 @@ impl ManagementCenter {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected_mcp_id = Some(select_id.clone());
+                    // The list is the way back to a resource: picking one has to
+                    // dismiss whichever other pane the right side was showing.
+                    this.mcp_market_open = false;
+                    this.mcp_import_open = false;
+                    this.mcp_editor_open = false;
+                    this.mcp_market_install_target = None;
+                    this.mcp_discovery = None;
                     cx.notify();
                 })),
                 accessible_label,
@@ -10493,64 +10440,64 @@ impl ManagementCenter {
         let query_input = self.mcp_market_query.clone();
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
-        content = content.child(
-            v_flex()
-                .w_full()
-                .flex_none()
-                .gap_2()
-                .child(
-                    Button::new("management-mcp-market-back")
-                        .xsmall()
-                        .ghost()
-                        .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                        .label(management_locale_text(
-                            "My MCP servers",
-                            "我的 MCP 服务",
-                            "我的 MCP 服務",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_mcp_market(cx))),
-                )
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                            management_locale_text("MCP market", "MCP 市场", "MCP 市場"),
-                        ))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "The exact command is shown before anything is saved.",
-                                    "保存前会完整展示将要执行的命令。",
-                                    "儲存前會完整展示將要執行的命令。",
-                                )),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .child(Input::new(&query_input).small().w_full().cleanable(true)),
-                        )
-                        .child(
-                            Button::new("management-mcp-market-search")
-                                .small()
-                                .outline()
-                                .label(management_locale_text("Search", "搜索", "搜尋"))
-                                .loading(loading)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.search_mcp_market(window, cx)
-                                })),
-                        ),
-                ),
-        );
+        content =
+            content.child(
+                v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        Button::new("management-mcp-market-back")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
+                            .label(management_locale_text(
+                                "My MCP servers",
+                                "我的 MCP 服务",
+                                "我的 MCP 服務",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_mcp_market(cx))),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                                management_locale_text("MCP market", "MCP 市场", "MCP 市場"),
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(management_locale_text(
+                                        "The exact command is shown before anything is saved.",
+                                        "保存前会完整展示将要执行的命令。",
+                                        "儲存前會完整展示將要執行的命令。",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                div().min_w_0().flex_1().child(
+                                    Input::new(&query_input).small().w_full().cleanable(true),
+                                ),
+                            )
+                            .child(
+                                Button::new("management-mcp-market-search")
+                                    .small()
+                                    .outline()
+                                    .label(management_locale_text("Search", "搜索", "搜尋"))
+                                    .loading(loading)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.search_mcp_market(window, cx)
+                                    })),
+                            ),
+                    ),
+            );
 
         if let Some(error) = &error {
             content = content.child(management_market_banner(error.clone(), true, cx));
@@ -10585,7 +10532,8 @@ impl ManagementCenter {
                     badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
                 }
                 if installed_mcp_names.contains(&entry.name) {
-                    badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
+                    badges
+                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
                 if let Some(version) = entry.version.as_deref() {
                     badges.push(version.to_string());
@@ -10621,9 +10569,11 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(badges.into_iter().map(|badge| {
-                                            management_market_badge(badge, cx)
-                                        })),
+                                        .children(
+                                            badges
+                                                .into_iter()
+                                                .map(|badge| management_market_badge(badge, cx)),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -10648,9 +10598,11 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.begin_mcp_market_install(install_entry.clone(), window, cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.begin_mcp_market_install(install_entry.clone(), window, cx)
+                                },
+                            )),
                         ),
                 );
             }
@@ -10699,9 +10651,12 @@ impl ManagementCenter {
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                        management_locale_text("Install", "安装", "安裝"),
-                    ))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(management_locale_text("Install", "安装", "安裝")),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -10741,15 +10696,17 @@ impl ManagementCenter {
                         .checked(checked)
                         .accessibility_label(SharedString::from(agent.label.clone()))
                         .disabled(pending)
-                        .on_click(cx.listener(move |this, checked, _, cx| {
-                            let checked = *checked;
-                            if checked {
-                                this.mcp_market_install_agents.insert(toggle_id.clone());
-                            } else {
-                                this.mcp_market_install_agents.remove(&toggle_id);
-                            }
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            move |this, checked, _, cx| {
+                                let checked = *checked;
+                                if checked {
+                                    this.mcp_market_install_agents.insert(toggle_id.clone());
+                                } else {
+                                    this.mcp_market_install_agents.remove(&toggle_id);
+                                }
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(div().text_sm().child(agent.label.clone())),
             );
@@ -10815,7 +10772,9 @@ impl ManagementCenter {
                         .label(management_locale_text("Install", "安装", "安裝"))
                         .loading(pending)
                         .disabled(pending)
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx))),
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.confirm_mcp_market_install(cx)),
+                        ),
                 ),
         )
         .into_any_element()
@@ -10917,9 +10876,12 @@ impl ManagementCenter {
                     v_flex()
                         .w_full()
                         .gap_1()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                            management_locale_text("Install", "安装", "安裝"),
-                        ))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(management_locale_text("Install", "安装", "安裝")),
+                        )
                         .child(
                             div()
                                 .text_sm()
@@ -10998,15 +10960,17 @@ impl ManagementCenter {
                             .checked(checked)
                             .accessibility_label(SharedString::from(agent.label.clone()))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, checked, _, cx| {
-                                let checked = *checked;
-                                if checked {
-                                    this.skill_market_install_agents.insert(toggle_id.clone());
-                                } else {
-                                    this.skill_market_install_agents.remove(&toggle_id);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(
+                                move |this, checked, _, cx| {
+                                    let checked = *checked;
+                                    if checked {
+                                        this.skill_market_install_agents.insert(toggle_id.clone());
+                                    } else {
+                                        this.skill_market_install_agents.remove(&toggle_id);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
                         )
                         .child(div().text_sm().child(agent.label.clone())),
                 );
@@ -11055,7 +11019,8 @@ impl ManagementCenter {
                 let name = entry.name.clone();
                 let mut badges = Vec::new();
                 if installed_skill_uris.contains(&format!("market:{}", entry.id)) {
-                    badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
+                    badges
+                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
                 }
                 badges.push(entry.source.clone());
                 if entry.installs > 0 {
@@ -11088,9 +11053,11 @@ impl ManagementCenter {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(name),
                                         )
-                                        .children(badges.into_iter().map(|badge| {
-                                            management_market_badge(badge, cx)
-                                        })),
+                                        .children(
+                                            badges
+                                                .into_iter()
+                                                .map(|badge| management_market_badge(badge, cx)),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -11109,9 +11076,11 @@ impl ManagementCenter {
                             .outline()
                             .label(management_locale_text("Install", "安装", "安裝"))
                             .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_skill_market_install(install_entry.clone(), cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.begin_skill_market_install(install_entry.clone(), cx)
+                                },
+                            )),
                         ),
                 );
             }
@@ -11126,6 +11095,233 @@ impl ManagementCenter {
         }
         content.into_any_element()
     }
+    /// The native-import view, rendered in the section body rather than as an
+    /// overlay. `mcp` picks which discovery response it lists.
+    fn render_import_view(&mut self, mcp: bool, cx: &mut Context<Self>) -> AnyElement {
+        let pending = self.mutation.is_some();
+        let discovering = match mcp {
+            true => matches!(
+                &self.mutation,
+                Some(ManagementMutation::McpAction(action)) if action == "discover"
+            ),
+            false => matches!(
+                &self.mutation,
+                Some(ManagementMutation::SkillAction(action)) if action == "discover"
+            ),
+        };
+        let candidates = if mcp {
+            self.mcp_discovery
+                .as_ref()
+                .map(|response| {
+                    response
+                        .discoveries
+                        .iter()
+                        .map(|item| {
+                            (
+                                item.discovery_id.clone(),
+                                item.candidate
+                                    .as_ref()
+                                    .map(|candidate| candidate.display_name.clone())
+                                    .unwrap_or_else(|| item.import_key.clone()),
+                                item.source_path.clone(),
+                                item.status,
+                                item.status == vibex_core::ResourceDiscoveryStatus::Importable
+                                    && item.candidate.is_some(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            self.skill_discovery
+                .as_ref()
+                .map(|response| {
+                    response
+                        .discoveries
+                        .iter()
+                        .map(|item| {
+                            (
+                                item.discovery_id.clone(),
+                                item.display_name.clone(),
+                                item.source_path.clone(),
+                                item.status,
+                                item.status == vibex_core::ResourceDiscoveryStatus::Importable,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let icon = if mcp {
+            IconName::Network
+        } else {
+            IconName::BookOpen
+        };
+        let title = if mcp {
+            management_locale_text("Import existing MCP", "导入已有 MCP", "匯入已有 MCP")
+        } else {
+            management_locale_text("Import existing Skills", "导入已有技能", "匯入已有技能")
+        };
+
+        let mut rows = v_flex().w_full().gap_2();
+        if discovering {
+            rows = rows.child(management_market_loading_row(cx));
+        } else if candidates.is_empty() {
+            rows = rows.child(
+                solid_empty_border(
+                    EmptyState::new()
+                        .flex_none()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p_4(),
+                )
+                .header(EmptyHeader::new().title(EmptyTitle::new().child(
+                    management_locale_text(
+                        "No import candidates",
+                        "没有可导入的候选项",
+                        "沒有可匯入的候選項",
+                    ),
+                ))),
+            );
+        }
+        for (id, candidate_title, subtitle, status, importable) in candidates {
+            let action = format!("import:{id}");
+            let importing = if mcp {
+                matches!(
+                    &self.mutation,
+                    Some(ManagementMutation::McpAction(active)) if active == &action
+                )
+            } else {
+                matches!(
+                    &self.mutation,
+                    Some(ManagementMutation::SkillAction(active)) if active == &action
+                )
+            };
+            let import_id = id.clone();
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.70))
+                    .p_3()
+                    .child(Icon::new(icon.clone()).size(px(16.0)))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(div().truncate().text_sm().font_medium().child(candidate_title))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(management_status_badge(
+                        management_resource_discovery_status_label(status).to_string(),
+                        cx,
+                    ))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "management-import-candidate-{id}"
+                        )))
+                        .small()
+                        .outline()
+                        .label(management_locale_text("Import", "导入", "匯入"))
+                        .loading(importing)
+                        .disabled(pending || !importable)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if mcp {
+                                this.import_mcp_discovery(import_id.clone(), cx)
+                            } else {
+                                this.import_skill_discovery(import_id.clone(), cx)
+                            }
+                        })),
+                    ),
+            );
+        }
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_3()
+            .child(
+                Button::new("management-import-back")
+                    .xsmall()
+                    .ghost()
+                    .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
+                    .label(if mcp {
+                        management_locale_text("My MCP servers", "我的 MCP 服务", "我的 MCP 服務")
+                    } else {
+                        management_locale_text("My Skills", "我的技能", "我的技能")
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if mcp {
+                            this.mcp_import_open = false;
+                            this.mcp_discovery = None;
+                        } else {
+                            this.skill_import_open = false;
+                            this.skill_discovery = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .pr_1()
+                    .child(rows),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .justify_end()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .pt_3()
+                    .child(
+                        Button::new("management-import-rescan")
+                            .small()
+                            .outline()
+                            .icon(IconName::Search)
+                            .label(if discovering {
+                                management_locale_text("Detecting...", "正在探测...", "正在探測...")
+                            } else {
+                                management_locale_text("Detect", "探测", "探測")
+                            })
+                            .loading(discovering)
+                            .disabled(pending)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if mcp {
+                                    this.mcp_discovery = None;
+                                    this.discover_mcp_servers(cx);
+                                } else {
+                                    this.skill_discovery = None;
+                                    this.discover_skills(cx);
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_skills_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let copy = management_copy();
         let query = self.skill_search.read(cx).value().trim().to_lowercase();
@@ -11261,6 +11457,12 @@ impl ManagementCenter {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected_skill_id = Some(select_id.clone());
+                    this.skill_market_open = false;
+                    this.skill_import_open = false;
+                    this.skill_editor_open = false;
+                    this.skill_market_install_target = None;
+                    this.skill_market_document = None;
+                    this.skill_discovery = None;
                     cx.notify();
                 })),
                 accessible_label,
@@ -11378,7 +11580,7 @@ impl ManagementCenter {
                             .min_w_0()
                             .items_center()
                             .gap_2()
-                            .child(Icon::new(icon).size(px(16.0)))
+                            .child(Icon::new(icon.clone()).size(px(16.0)))
                             .child(div().truncate().text_sm().font_medium().child(title)),
                     )
                     .child(
@@ -14839,6 +15041,9 @@ impl ManagementCenter {
         if self.mcp_market_open {
             return self.render_mcp_market(cx);
         }
+        if self.mcp_import_open {
+            return self.render_import_view(true, cx);
+        }
         if self.mcp_editor_open {
             let editor = self.render_mcp_editor(cx);
             return v_flex().w_full().gap_2().child(editor).into_any_element();
@@ -15113,6 +15318,9 @@ impl ManagementCenter {
     fn render_skills(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.skill_market_open {
             return self.render_skills_market(cx);
+        }
+        if self.skill_import_open {
+            return self.render_import_view(false, cx);
         }
         if self.skill_editor_open {
             let editor = self.render_skill_editor(cx);
@@ -18559,273 +18767,6 @@ impl Render for ManagementProfileDialog {
         self.center.update(cx, |center, cx| {
             center.render_profile_editor_dialog(window, cx)
         })
-    }
-}
-
-impl Render for ManagementImportDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (open, discovering, mutation, candidates) = {
-            let center = self.center.read(cx);
-            match self.kind {
-                ManagementImportKind::Mcp => (
-                    center.mcp_import_open,
-                    matches!(
-                        &center.mutation,
-                        Some(ManagementMutation::McpAction(action)) if action == "discover"
-                    ),
-                    center.mutation.clone(),
-                    center
-                        .mcp_discovery
-                        .as_ref()
-                        .map(|response| {
-                            response
-                                .discoveries
-                                .iter()
-                                .map(|item| {
-                                    (
-                                        item.discovery_id.clone(),
-                                        item.candidate
-                                            .as_ref()
-                                            .map(|candidate| candidate.display_name.clone())
-                                            .unwrap_or_else(|| item.import_key.clone()),
-                                        item.source_path.clone(),
-                                        item.status,
-                                        item.status
-                                            == vibex_core::ResourceDiscoveryStatus::Importable
-                                            && item.candidate.is_some(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                ),
-                ManagementImportKind::Skill => (
-                    center.skill_import_open,
-                    matches!(
-                        &center.mutation,
-                        Some(ManagementMutation::SkillAction(action)) if action == "discover"
-                    ),
-                    center.mutation.clone(),
-                    center
-                        .skill_discovery
-                        .as_ref()
-                        .map(|response| {
-                            response
-                                .discoveries
-                                .iter()
-                                .map(|item| {
-                                    (
-                                        item.discovery_id.clone(),
-                                        item.display_name.clone(),
-                                        item.source_path.clone(),
-                                        item.status,
-                                        item.status
-                                            == vibex_core::ResourceDiscoveryStatus::Importable,
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                ),
-            }
-        };
-        if !open {
-            cx.defer_in(window, |_, window, cx| {
-                if window.has_active_dialog(cx) {
-                    window.close_dialog(cx);
-                }
-            });
-            return div().size_full();
-        }
-
-        let pending = mutation.is_some();
-        let mut rows = v_flex().w_full().gap_2();
-        if discovering {
-            rows = rows.child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.70))
-                    .bg(cx.theme().muted.opacity(0.25))
-                    .p_3()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(Spinner::new())
-                    .child(management_locale_text(
-                        "Detecting configurations from installed Agents...",
-                        "正在从已安装的 Agent 中探测配置...",
-                        "正在從已安裝的 Agent 中探測配置...",
-                    )),
-            );
-        } else if candidates.is_empty() {
-            rows = rows.child(
-                solid_empty_border(
-                    EmptyState::new()
-                        .flex_none()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_4(),
-                )
-                .header(EmptyHeader::new().title(EmptyTitle::new().child(
-                    management_locale_text(
-                        "No import candidates",
-                        "没有可导入的候选项",
-                        "沒有可匯入的候選項",
-                    ),
-                ))),
-            );
-        }
-        if !discovering {
-            for (id, title, subtitle, status, importable) in candidates {
-                let action = format!("import:{id}");
-                let importing = match (&self.kind, &mutation) {
-                    (ManagementImportKind::Mcp, Some(ManagementMutation::McpAction(active))) => {
-                        active == &action
-                    }
-                    (
-                        ManagementImportKind::Skill,
-                        Some(ManagementMutation::SkillAction(active)),
-                    ) => active == &action,
-                    _ => false,
-                };
-                let import_id = id.clone();
-                let kind = self.kind;
-                let icon = match kind {
-                    ManagementImportKind::Mcp => IconName::Network,
-                    ManagementImportKind::Skill => IconName::BookOpen,
-                };
-                rows = rows.child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.70))
-                        .p_3()
-                        .child(Icon::new(icon).size(px(16.0)))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .child(div().truncate().text_sm().font_medium().child(title))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(subtitle),
-                                ),
-                        )
-                        .child(management_status_badge(
-                            management_resource_discovery_status_label(status).to_string(),
-                            cx,
-                        ))
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-import-candidate-{id}"
-                            )))
-                            .small()
-                            .outline()
-                            .label(management_locale_text("Import", "导入", "匯入"))
-                            .loading(importing)
-                            .disabled(pending || !importable)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let center = this.center.clone();
-                                    center.update(cx, |center, cx| match kind {
-                                        ManagementImportKind::Mcp => {
-                                            center.import_mcp_discovery(import_id.clone(), cx)
-                                        }
-                                        ManagementImportKind::Skill => {
-                                            center.import_skill_discovery(import_id.clone(), cx)
-                                        }
-                                    });
-                                },
-                            )),
-                        ),
-                );
-            }
-        }
-
-        let kind = self.kind;
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .gap_3()
-            .child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(rows),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .justify_end()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .child(
-                        Button::new("management-import-rescan")
-                            .small()
-                            .outline()
-                            .icon(IconName::Search)
-                            .label(if discovering {
-                                management_locale_text("Detecting...", "正在探测...", "正在探測...")
-                            } else {
-                                management_locale_text("Detect", "探测", "探測")
-                            })
-                            .loading(discovering)
-                            .disabled(pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let center = this.center.clone();
-                                center.update(cx, |center, cx| match kind {
-                                    ManagementImportKind::Mcp => {
-                                        center.mcp_discovery = None;
-                                        center.discover_mcp_servers(cx);
-                                    }
-                                    ManagementImportKind::Skill => {
-                                        center.skill_discovery = None;
-                                        center.discover_skills(cx);
-                                    }
-                                });
-                            })),
-                    )
-                    .child(
-                        Button::new("management-import-close")
-                            .small()
-                            .secondary()
-                            .label(management_locale_text("Close", "关闭", "關閉"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let center = this.center.clone();
-                                let kind = this.kind;
-                                center.update(cx, |center, cx| {
-                                    match kind {
-                                        ManagementImportKind::Mcp => {
-                                            center.mcp_import_open = false;
-                                            center.mcp_discovery = None;
-                                        }
-                                        ManagementImportKind::Skill => {
-                                            center.skill_import_open = false;
-                                            center.skill_discovery = None;
-                                        }
-                                    }
-                                    cx.notify();
-                                });
-                                window.close_dialog(cx);
-                            })),
-                    ),
-            )
     }
 }
 
