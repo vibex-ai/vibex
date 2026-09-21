@@ -38,7 +38,10 @@ use vibex_desktop_runtime::{
     normalize_https_origin,
 };
 
-use crate::{locale, theme};
+use crate::{
+    gpui_ext::{DOCS_REMOTE_MOBILE_URL, docs_help_button},
+    locale, theme,
+};
 
 const PAIRING_OFFER_TTL_MS: u32 = 90_000;
 const OFFER_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -4152,11 +4155,28 @@ pub(crate) fn open_remote_access_pairing(
         let popover = theme::semantic_color("popover", is_dark);
         let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
         dialog
-            .title(locale::text(
-                "Connect a mobile device",
-                "连接移动设备",
-                "連接行動裝置",
-            ))
+            // The title and its help glyph are one header row: the glyph opens
+            // the remote-development documentation, which is where the pairing
+            // and permission choices this dialog offers are explained.
+            .title(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(locale::text(
+                        "Connect a mobile device",
+                        "连接移动设备",
+                        "連接行動裝置",
+                    ))
+                    .child(docs_help_button(
+                        "connect-mobile-device-docs",
+                        locale::text(
+                            "Mobile connection documentation",
+                            "移动设备连接文档",
+                            "行動裝置連線文件",
+                        ),
+                        DOCS_REMOTE_MOBILE_URL,
+                    )),
+            )
             .w(px(dialog_width))
             .max_w(px(dialog_width))
             .h_auto()
@@ -5353,6 +5373,25 @@ mod tests {
         assert!(devices_page.contains("if self.state.device_page_count() > 1 {"));
         assert!(devices_page.contains("self.state.device_page_slice()"));
         assert!(!devices_page.contains("self.state.devices.clone()"));
+    }
+
+    /// The dialog title carries the help glyph beside the surface it explains:
+    /// pairing, transports, and permissions are the remote-development page's
+    /// subject, and the title row is where the dialog names itself.
+    #[test]
+    fn the_pairing_dialog_title_links_to_the_remote_mobile_docs() {
+        let source = include_str!("remote_access_pairing.rs");
+        let opener = source
+            .split_once("pub(crate) fn open_remote_access_pairing(")
+            .and_then(|(_, tail)| tail.split_once("\nfn pairing_dialog_max_height("))
+            .map(|(body, _)| body)
+            .expect("the pairing dialog opener should remain inspectable");
+        assert!(opener.contains(".title("));
+        assert!(opener.contains("docs_help_button("));
+        assert!(
+            opener.contains("DOCS_REMOTE_MOBILE_URL"),
+            "the title's help glyph must open the remote development page"
+        );
     }
 
     #[test]

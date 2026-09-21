@@ -181,7 +181,9 @@ use crate::code_workbench::{
 use crate::directory_picker::{
     DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
 };
-use crate::gpui_ext::{button_with_aria_label, solid_empty_border};
+use crate::gpui_ext::{
+    DOCS_SELF_HOSTED_SERVER_URL, button_with_aria_label, docs_help_button, solid_empty_border,
+};
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
     apply_mosaic, apply_rectangle, apply_text,
@@ -9514,23 +9516,41 @@ impl VibexWorkbench {
             .w_full()
             .min_h_0()
             .child(
-                // The panel names itself once, at a title's size. It carries no
-                // header action: the command that adds a runtime is the
-                // panel's own footer button, where it can say what it does in
-                // words instead of hiding behind a plus.
-                div()
+                // The panel names itself once, at a title's size, and carries
+                // one header action: the help glyph that opens the self-hosted
+                // runtime documentation. The command that adds a runtime is
+                // still the panel's own footer button, where it can say what it
+                // does in words instead of hiding behind a plus.
+                h_flex()
                     .w_full()
                     .flex_none()
-                    .truncate()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .px_2()
                     .pt_1()
                     .pb_2()
-                    .text_lg()
-                    .font_medium()
-                    .child(locale::text(
-                        "Manage runtimes",
-                        "管理运行时",
-                        "管理執行階段",
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_lg()
+                            .font_medium()
+                            .child(locale::text(
+                                "Manage runtimes",
+                                "管理运行时",
+                                "管理執行階段",
+                            )),
+                    )
+                    .child(docs_help_button(
+                        "runtime-manager-docs",
+                        locale::text(
+                            "Self-hosted runtime documentation",
+                            "自托管运行时文档",
+                            "自架執行階段文件",
+                        ),
+                        DOCS_SELF_HOSTED_SERVER_URL,
                     )),
             )
             .child(body)
@@ -78173,6 +78193,24 @@ mod tests {
                 "{open} must keep a scrollbar on the region it scrolls"
             );
         }
+    }
+
+    /// The panel's header carries exactly one action: the help glyph that opens
+    /// the self-hosted runtime documentation, where the runtimes this panel
+    /// manages are set up.
+    #[test]
+    fn the_runtime_manager_header_links_to_the_self_hosted_docs() {
+        let source = include_str!("app.rs");
+        let list = source
+            .split_once("    fn render_runtime_manager_list(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_row("))
+            .map(|(body, _)| body)
+            .expect("the runtime manager list should remain inspectable");
+        assert!(list.contains("docs_help_button("));
+        assert!(
+            list.contains("DOCS_SELF_HOSTED_SERVER_URL"),
+            "the help glyph must open the self-hosted runtime page"
+        );
     }
 
     /// A runtime's state belongs to its row's status lane. The identity line

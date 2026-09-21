@@ -62,6 +62,19 @@ tooltip itself `Role::Tooltip` does not name its trigger. When both are present,
 the visible label wins so explanatory tooltip copy cannot replace the command's
 short accessible name.
 
+### Documentation Help Buttons
+
+A surface that needs a help affordance uses `gpui_ext::docs_help_button(id,
+label, url)` rather than composing its own glyph button. The helper owns one
+geometry (a 24px ghost target with a 14px `circle-question-mark` child, matching
+the panel headers around it), sets `label` as both tooltip and AccessKit name,
+and passes the URL through `validate_external_open_url` before the platform
+opens it. Documentation pages live as `DOCS_*_URL` constants in the same module
+so a domain change is one edit, and the glyph stays a child rather than
+`Button::icon` so the frame owns its size. `gpui_ext` tests assert every docs URL
+passes the external-open boundary and that the glyph is in the asset bundle,
+because an unregistered icon path renders as nothing with no error.
+
 ### Window Caption Controls
 
 The workbench draws its own minimize/maximize/close buttons only when it owns the
