@@ -36,7 +36,7 @@ use gpui_component::{
     InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _, Theme,
     ThemeStyled as _, TitleBar, VirtualListScrollHandle, WindowExt as _,
     animation::EffectTransition as Transition,
-    avatar::{Avatar, AvatarGroup},
+    avatar::Avatar,
     bubble::{Bubble, BubbleContent, BubbleReactions},
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     collapsible::Collapsible,
@@ -426,6 +426,10 @@ const SIDEBAR_REORDER_ROW_HEIGHT: f32 = 32.0;
 const SESSION_GROUP_AVATAR_LIMIT: usize = 5;
 /// Display size of a monochrome Agent mark inside a group avatar.
 const SESSION_GROUP_AVATAR_LOGO_SIZE: f32 = 13.0;
+/// Edge length of one group avatar, matching the kit's `xsmall` size.
+const SESSION_GROUP_AVATAR_SIZE: f32 = 16.0;
+/// How far consecutive avatars overlap.
+const SESSION_GROUP_AVATAR_OVERLAP: f32 = 6.0;
 /// How many recent turns a non-focused group pane previews.
 const SESSION_GROUP_PANE_PREVIEW_TURNS: usize = 4;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
@@ -32273,7 +32277,10 @@ impl VibexWorkbench {
 
     /// The stacked Agent avatars of one group row.
     ///
-    /// `AvatarGroup` owns the overlap, the `limit` and the `+N` ellipsis chip;
+    /// The stack is built explicitly rather than through `AvatarGroup` so the
+    /// leftmost avatar lands exactly on the row's content origin: the kit group
+    /// lays its children out in a reversed flex with negative margins, which
+    /// makes the stack's left edge depend on its own content width.
     /// each `Avatar` takes the Agent's brand SVG so a group reads as its Agents
     /// rather than as a set of initials.
     fn session_group_avatars(&self, group: &SessionGroupUiState, cx: &App) -> AnyElement {
@@ -32283,26 +32290,57 @@ impl VibexWorkbench {
         // with the sidebar foreground or it would stay black and disappear on
         // the dark surface.
         let themed_color = cx.theme().sidebar_foreground.opacity(0.80);
-        let avatars = identities.iter().filter_map(|identity| {
-            agent_brand_asset(identity).map(|asset| {
-                if asset.uses_current_color {
-                    Avatar::new().placeholder(
-                        Icon::default()
-                            .path(asset.path)
-                            .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
-                            .text_color(themed_color),
-                    )
-                } else {
-                    Avatar::new().src(asset.path)
-                }
-            })
-        });
-        AvatarGroup::new()
-            .limit(SESSION_GROUP_AVATAR_LIMIT)
-            .ellipsis()
-            .xsmall()
-            .children(avatars)
-            .into_any_element()
+        let mut stack = h_flex().flex_none().items_center();
+        for (index, identity) in identities.iter().enumerate() {
+            if index >= SESSION_GROUP_AVATAR_LIMIT {
+                break;
+            }
+            let Some(asset) = agent_brand_asset(identity) else {
+                continue;
+            };
+            let avatar = if asset.uses_current_color {
+                Avatar::new().placeholder(
+                    Icon::default()
+                        .path(asset.path)
+                        .size(px(SESSION_GROUP_AVATAR_LOGO_SIZE))
+                        .text_color(themed_color),
+                )
+            } else {
+                Avatar::new().src(asset.path)
+            };
+            stack = stack.child(
+                div()
+                    .flex_none()
+                    .when(index > 0, |this| this.ml(px(-SESSION_GROUP_AVATAR_OVERLAP)))
+                    .child(avatar),
+            );
+        }
+        if identities.len() > SESSION_GROUP_AVATAR_LIMIT {
+            stack = stack.child(
+                div()
+                    .flex_none()
+                    .ml(px(-SESSION_GROUP_AVATAR_OVERLAP))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(SESSION_GROUP_AVATAR_SIZE))
+                            .rounded_full()
+                            .bg(cx.theme().secondary)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "+{}",
+                                identities.len() - SESSION_GROUP_AVATAR_LIMIT
+                            )),
+                    ),
+            );
+        }
+        stack.into_any_element()
     }
 
     // -- Session group workspace ------------------------------------------
