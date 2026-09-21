@@ -2320,6 +2320,162 @@ fn right_rail_activity_button(id: impl Into<ElementId>, icon: Icon) -> Button {
         .icon(icon)
 }
 
+/// One button in the right rail's activity bar.
+///
+/// The ids are the keys of the persisted activity order, so they must stay
+/// stable: a button that changes its id loses its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RightRailActivity {
+    Editor,
+    Files,
+    Git,
+    Terminal,
+    ChildAgents,
+}
+
+impl RightRailActivity {
+    /// Every button, in the order a fresh install shows them.
+    const ALL: [Self; 5] = [
+        Self::Editor,
+        Self::Files,
+        Self::Git,
+        Self::Terminal,
+        Self::ChildAgents,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Editor => "rail_activity_editor",
+            Self::Files => right_rail_activity_id(RightRailMode::Files),
+            Self::Git => right_rail_activity_id(RightRailMode::Git),
+            Self::Terminal => "rail_activity_terminal",
+            Self::ChildAgents => "rail_activity_child_agents",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Editor => Icon::default().path("icons/vibex/file-code.svg"),
+            Self::Files => right_rail_mode_icon(RightRailMode::Files),
+            Self::Git => right_rail_mode_icon(RightRailMode::Git),
+            Self::Terminal => Icon::new(IconName::SquareTerminal),
+            Self::ChildAgents => Icon::new(IconName::Bot),
+        }
+    }
+}
+
+/// Which side of the button under the pointer a dragged activity would land on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightRailActivityDropPosition {
+    Before,
+    After,
+}
+
+/// The place a dragged activity button would land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RightRailActivityDropTarget {
+    activity: RightRailActivity,
+    position: RightRailActivityDropPosition,
+}
+
+/// An activity button being dragged along the bar.
+#[derive(Clone)]
+struct RightRailActivityDrag {
+    activity: RightRailActivity,
+}
+
+impl Render for RightRailActivityDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size(px(RIGHT_ACTIVITY_BUTTON_SIZE))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .shadow_lg()
+            .opacity(0.94)
+            .child(
+                self.activity
+                    .icon()
+                    .size(px(RIGHT_ACTIVITY_BUTTON_SIZE * 0.75)),
+            )
+    }
+}
+
+/// The insertion line a dragged activity draws against the button it would land
+/// beside.
+fn right_rail_activity_drop_line(position: RightRailActivityDropPosition, cx: &App) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(4.0))
+        .right(px(4.0))
+        .h(px(2.0))
+        .rounded_full()
+        .bg(cx.theme().primary)
+        .when(position == RightRailActivityDropPosition::Before, |this| {
+            this.top(px(-2.0))
+        })
+        .when(position == RightRailActivityDropPosition::After, |this| {
+            this.bottom(px(-2.0))
+        })
+        .into_any_element()
+}
+
+/// The activity bar buttons in the reader's order.
+///
+/// The persisted order leads; a button it does not name — a fresh install, or
+/// one that predates the button — keeps its built-in place after the named
+/// ones.
+fn resolved_right_rail_activity_order(persisted: &[String]) -> Vec<RightRailActivity> {
+    let mut order = Vec::with_capacity(RightRailActivity::ALL.len());
+    for id in persisted {
+        if let Some(activity) = RightRailActivity::ALL
+            .into_iter()
+            .find(|activity| activity.id() == id)
+            && !order.contains(&activity)
+        {
+            order.push(activity);
+        }
+    }
+    for activity in RightRailActivity::ALL {
+        if !order.contains(&activity) {
+            order.push(activity);
+        }
+    }
+    order
+}
+
+/// Moves `dragged` beside `target`, returning the bar's new order.
+fn reordered_right_rail_activities(
+    order: &[RightRailActivity],
+    dragged: RightRailActivity,
+    target: RightRailActivity,
+    position: RightRailActivityDropPosition,
+) -> Vec<RightRailActivity> {
+    let mut order = order.to_vec();
+    if dragged == target {
+        return order;
+    }
+    let Some(from) = order.iter().position(|activity| *activity == dragged) else {
+        return order;
+    };
+    order.remove(from);
+    let mut to = order
+        .iter()
+        .position(|activity| *activity == target)
+        .unwrap_or(order.len());
+    if position == RightRailActivityDropPosition::After {
+        to += 1;
+    }
+    order.insert(to, dragged);
+    order
+}
+
 fn git_activity_badge(count: u32, cx: &Context<VibexWorkbench>) -> AnyElement {
     div()
         .absolute()
@@ -6426,6 +6582,8 @@ pub struct VibexWorkbench {
     sidebar_folder_drag_state: Option<SidebarFolderDragState>,
     sidebar_group_drag_state: Option<SidebarGroupDragState>,
     session_group_pane_drop_target: Option<SessionGroupPaneDropTarget>,
+    /// Where a dragged right-rail activity button would land.
+    right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
@@ -7341,6 +7499,7 @@ impl VibexWorkbench {
             sidebar_folder_drag_state: None,
             sidebar_group_drag_state: None,
             session_group_pane_drop_target: None,
+            right_rail_activity_drop_target: None,
             session_group_view_loads: BTreeSet::new(),
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
@@ -29330,6 +29489,57 @@ impl VibexWorkbench {
         }
     }
 
+    /// The activity bar buttons in the reader's order.
+    fn right_rail_activity_order(&self) -> Vec<RightRailActivity> {
+        resolved_right_rail_activity_order(&self.ui_state.right_rail.activity_order)
+    }
+
+    /// Remembers which side of a button a dragged activity would land on.
+    fn track_right_rail_activity_drop(
+        &mut self,
+        activity: RightRailActivity,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let position = if position.y < bounds.origin.y + bounds.size.height * 0.5 {
+            RightRailActivityDropPosition::Before
+        } else {
+            RightRailActivityDropPosition::After
+        };
+        let next = RightRailActivityDropTarget { activity, position };
+        if self.right_rail_activity_drop_target.as_ref() != Some(&next) {
+            self.right_rail_activity_drop_target = Some(next);
+            cx.notify();
+        }
+    }
+
+    /// Moves a dropped activity button beside the one it landed on.
+    fn drop_right_rail_activity(
+        &mut self,
+        dragged: RightRailActivity,
+        target: RightRailActivity,
+        position: RightRailActivityDropPosition,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_rail_activity_drop_target = None;
+        let order = reordered_right_rail_activities(
+            &self.right_rail_activity_order(),
+            dragged,
+            target,
+            position,
+        );
+        let next = order
+            .iter()
+            .map(|activity| activity.id().to_string())
+            .collect::<Vec<_>>();
+        if self.ui_state.right_rail.activity_order != next {
+            self.ui_state.right_rail.activity_order = next;
+            self.queue_ui_state();
+        }
+        cx.notify();
+    }
+
     fn render_right_rail_activity_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let git_available = self.selected_session_supports_git();
         let active_mode = if git_available {
@@ -29338,51 +29548,73 @@ impl VibexWorkbench {
             RightRailMode::Files
         };
         let panel_open = self.right_rail_panel_open();
-        // The branded mark leads the bar as the quick toggle for the multi-tab
-        // editor panel: the panel and this rail are the two halves of one
-        // right-hand column, so the control that shows and hides the panel sits
-        // above the rail modes instead of among them.
         let preview_open = self.preview_panel_open();
-        let preview = right_rail_activity_button(
-            "activity-preview",
-            Icon::default().path("icons/vibex/vibex-mark.svg"),
-        )
-        .tooltip(if preview_open {
-            locale::text("Collapse editor", "收起编辑器", "收起編輯器")
-        } else {
-            locale::text("Open editor", "打开编辑器", "開啟編輯器")
-        })
-        .selected(preview_open)
-        .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
-        .into_any_element();
-        let files = right_rail_activity_button(
-            "activity-files",
-            right_rail_mode_icon(RightRailMode::Files),
-        )
-        .tooltip(locale::text("Files", "文件", "檔案"))
-        .selected(panel_open && active_mode == RightRailMode::Files)
-        .on_click(
-            cx.listener(|this, _, _, cx| this.toggle_right_rail_mode(RightRailMode::Files, cx)),
-        )
-        .into_any_element();
         let pending_commit_count = self.git_pending_commit_count;
-        let git =
-            right_rail_activity_button("activity-git", right_rail_mode_icon(RightRailMode::Git))
-                .tooltip("Git")
-                .selected(panel_open && active_mode == RightRailMode::Git)
+        let show_git_badge =
+            self.ui_state.workbench.show_git_change_count && pending_commit_count > 0;
+        let child_agents_available = has_managed_child_agent_delegations(&self.timeline.items)
+            || !self.child_agent_tabs.is_empty();
+        // The insertion line only draws while a drag is in flight, so a
+        // finished or cancelled drag cannot leave one behind.
+        let drop_target = cx
+            .has_active_drag()
+            .then(|| self.right_rail_activity_drop_target.clone())
+            .flatten();
+
+        let mut activities = Vec::with_capacity(RightRailActivity::ALL.len());
+        for activity in self.right_rail_activity_order() {
+            let available = match activity {
+                RightRailActivity::Git => git_available,
+                RightRailActivity::ChildAgents => child_agents_available,
+                _ => true,
+            };
+            if !available {
+                continue;
+            }
+            let button = match activity {
+                RightRailActivity::Editor => {
+                    right_rail_activity_button("activity-preview", activity.icon())
+                        .tooltip(if preview_open {
+                            locale::text("Collapse editor", "收起编辑器", "收起編輯器")
+                        } else {
+                            locale::text("Open editor", "打开编辑器", "開啟編輯器")
+                        })
+                        .selected(preview_open)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
+                        .into_any_element()
+                }
+                RightRailActivity::Files => right_rail_activity_button(
+                    "activity-files",
+                    right_rail_mode_icon(RightRailMode::Files),
+                )
+                .tooltip(locale::text("Files", "文件", "檔案"))
+                .selected(panel_open && active_mode == RightRailMode::Files)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_right_rail_mode(RightRailMode::Git, cx)
-                }));
-        let git = div()
-            .relative()
-            .child(git)
-            .when(
-                self.ui_state.workbench.show_git_change_count && pending_commit_count > 0,
-                |this| this.child(git_activity_badge(pending_commit_count, cx)),
-            )
-            .into_any_element();
-        let terminal =
-            right_rail_activity_button("activity-terminal", Icon::new(IconName::SquareTerminal))
+                    this.toggle_right_rail_mode(RightRailMode::Files, cx)
+                }))
+                .into_any_element(),
+                RightRailActivity::Git => {
+                    let git = right_rail_activity_button(
+                        "activity-git",
+                        right_rail_mode_icon(RightRailMode::Git),
+                    )
+                    .tooltip("Git")
+                    .selected(panel_open && active_mode == RightRailMode::Git)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_right_rail_mode(RightRailMode::Git, cx)
+                    }));
+                    div()
+                        .relative()
+                        .child(git)
+                        .when(show_git_badge, |this| {
+                            this.child(git_activity_badge(pending_commit_count, cx))
+                        })
+                        .into_any_element()
+                }
+                RightRailActivity::Terminal => right_rail_activity_button(
+                    "activity-terminal",
+                    Icon::new(IconName::SquareTerminal),
+                )
                 .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     let terminal_preview_open = this.code_preview_visible
@@ -29393,27 +29625,64 @@ impl VibexWorkbench {
                         this.create_preview_terminal(window.window_handle(), None, None, cx);
                     }
                 }))
-                .into_any_element();
-        let child_agent_activity = (has_managed_child_agent_delegations(&self.timeline.items)
-            || !self.child_agent_tabs.is_empty())
-        .then(|| {
-            right_rail_activity_button("activity-child-agents", Icon::new(IconName::Bot))
-                .tooltip(locale::text(
-                    "Child Agent timelines",
-                    "子 Agent 时间线",
-                    "子 Agent 時間線",
-                ))
-                .selected(panel_open && self.child_agent_panel_active)
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_child_agent_panel(cx)))
-                .into_any_element()
-        });
-        let mut activities = if git_available {
-            vec![preview, files, git, terminal]
-        } else {
-            vec![preview, files, terminal]
-        };
-        if let Some(child_agent_activity) = child_agent_activity {
-            activities.push(child_agent_activity);
+                .into_any_element(),
+                RightRailActivity::ChildAgents => {
+                    right_rail_activity_button("activity-child-agents", Icon::new(IconName::Bot))
+                        .tooltip(locale::text(
+                            "Child Agent timelines",
+                            "子 Agent 时间线",
+                            "子 Agent 時間線",
+                        ))
+                        .selected(panel_open && self.child_agent_panel_active)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_child_agent_panel(cx)))
+                        .into_any_element()
+                }
+            };
+            let drop_position = drop_target
+                .as_ref()
+                .filter(|target| target.activity == activity)
+                .map(|target| target.position);
+            activities.push(
+                div()
+                    .id(format!("right-rail-activity-slot-{}", activity.id()))
+                    .relative()
+                    .flex_none()
+                    .child(button)
+                    // Dragging a button past its neighbours reorders the bar;
+                    // the order is persisted, so it survives a restart.
+                    .on_drag(RightRailActivityDrag { activity }, |drag, _, _, cx| {
+                        cx.new(|_| drag.clone())
+                    })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<RightRailActivityDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            this.track_right_rail_activity_drop(
+                                activity,
+                                event.bounds,
+                                event.event.position,
+                                cx,
+                            );
+                        },
+                    ))
+                    .on_drop(
+                        cx.listener(move |this, drag: &RightRailActivityDrag, _, cx| {
+                            let position = this
+                                .right_rail_activity_drop_target
+                                .as_ref()
+                                .filter(|target| target.activity == activity)
+                                .map(|target| target.position)
+                                .unwrap_or(RightRailActivityDropPosition::Before);
+                            this.drop_right_rail_activity(drag.activity, activity, position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .when_some(drop_position, |this, position| {
+                        this.child(right_rail_activity_drop_line(position, cx))
+                    })
+                    .into_any_element(),
+            );
         }
 
         v_flex()
@@ -68139,11 +68408,11 @@ mod tests {
 
         assert!(renderer.contains("selected_session_supports_git"));
         assert!(renderer.contains("if git_available"));
-        assert!(renderer.contains("vec![preview, files, terminal]"));
+        assert!(renderer.contains("RightRailActivity::Git => git_available"));
     }
 
-    /// The branded quick button leads the bar and toggles the editor panel,
-    /// which shares the right-hand column with this rail.
+    /// The editor button leads the bar and toggles the panel, which shares the
+    /// right-hand column with this rail.
     #[test]
     fn right_rail_activity_bar_offers_the_preview_toggle() {
         let source = include_str!("app.rs");
@@ -68157,13 +68426,123 @@ mod tests {
         assert!(renderer.contains("activity-git"));
         assert!(renderer.contains("activity-terminal"));
         assert!(renderer.contains("activity-preview"));
-        assert!(renderer.contains("icons/vibex/vibex-mark.svg"));
         assert!(renderer.contains("self.preview_panel_open()"));
         assert!(renderer.contains("this.toggle_preview(cx)"));
         assert!(
-            renderer.contains("vec![preview, files, git, terminal]"),
-            "the quick toggle leads the bar, above the rail modes"
+            renderer.contains("self.right_rail_activity_order()"),
+            "the bar draws its buttons in the reader's order"
         );
+    }
+
+    /// The editor button carries an editor icon rather than the product mark.
+    #[test]
+    fn the_editor_activity_carries_an_editor_icon() {
+        let source = include_str!("app.rs");
+        let icons = source
+            .split_once("    fn icon(self) -> Icon {")
+            .and_then(|(_, tail)| tail.split_once("\n    }\n}"))
+            .map(|(body, _)| body)
+            .expect("the activity icons should remain inspectable");
+
+        assert!(icons.contains("icons/vibex/file-code.svg"));
+        assert!(!icons.contains("vibex-mark.svg"));
+    }
+
+    /// The bar keeps the order the reader dragged it into, and a button the
+    /// persisted order does not name keeps its built-in place.
+    #[test]
+    fn the_activity_order_follows_the_drag_and_keeps_unknown_buttons() {
+        assert_eq!(
+            resolved_right_rail_activity_order(&[]),
+            RightRailActivity::ALL.to_vec()
+        );
+
+        let persisted = vec![
+            "rail_activity_terminal".to_string(),
+            "rail_plugin_system_git".to_string(),
+            "rail_activity_terminal".to_string(),
+            "rail_activity_missing".to_string(),
+        ];
+        assert_eq!(
+            resolved_right_rail_activity_order(&persisted),
+            vec![
+                RightRailActivity::Terminal,
+                RightRailActivity::Git,
+                RightRailActivity::Editor,
+                RightRailActivity::Files,
+                RightRailActivity::ChildAgents,
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_an_activity_moves_it_beside_its_target() {
+        let order = resolved_right_rail_activity_order(&[]);
+
+        assert_eq!(
+            reordered_right_rail_activities(
+                &order,
+                RightRailActivity::Editor,
+                RightRailActivity::Terminal,
+                RightRailActivityDropPosition::After,
+            ),
+            vec![
+                RightRailActivity::Files,
+                RightRailActivity::Git,
+                RightRailActivity::Terminal,
+                RightRailActivity::Editor,
+                RightRailActivity::ChildAgents,
+            ]
+        );
+        assert_eq!(
+            reordered_right_rail_activities(
+                &order,
+                RightRailActivity::ChildAgents,
+                RightRailActivity::Files,
+                RightRailActivityDropPosition::Before,
+            ),
+            vec![
+                RightRailActivity::Editor,
+                RightRailActivity::ChildAgents,
+                RightRailActivity::Files,
+                RightRailActivity::Git,
+                RightRailActivity::Terminal,
+            ]
+        );
+        assert_eq!(
+            reordered_right_rail_activities(
+                &order,
+                RightRailActivity::Git,
+                RightRailActivity::Git,
+                RightRailActivityDropPosition::After,
+            ),
+            order
+        );
+    }
+
+    /// The activity buttons are draggable and the drop target is persisted.
+    #[test]
+    fn the_right_rail_activity_bar_reorders_by_drag() {
+        let source = include_str!("app.rs");
+        let renderer = source
+            .split_once("    fn render_right_rail_activity_bar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn open_management("))
+            .map(|(renderer, _)| renderer)
+            .expect("right rail activity renderer should remain inspectable");
+
+        assert!(renderer.contains("on_drag(RightRailActivityDrag { activity }"));
+        assert!(renderer.contains("DragMoveEvent<RightRailActivityDrag>"));
+        assert!(renderer.contains("on_drop("));
+        assert!(renderer.contains("right_rail_activity_drop_line(position, cx)"));
+        assert!(renderer.contains("this.drop_right_rail_activity("));
+
+        let drop = source
+            .split_once("    fn drop_right_rail_activity(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_right_rail_activity_bar("))
+            .map(|(body, _)| body)
+            .expect("the drop handler should remain inspectable");
+        assert!(drop.contains("self.ui_state.right_rail.activity_order = next"));
+        assert!(drop.contains("self.queue_ui_state()"));
     }
 
     /// Closing the editor panel collapses it, and the rail's logo button
