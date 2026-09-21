@@ -736,42 +736,6 @@ impl InlineComposerAttachment {
     }
 }
 
-fn inline_composer_attachments_in_text(
-    text: &str,
-    attachments: &[InlineComposerAttachment],
-) -> Vec<InlineComposerAttachment> {
-    attachments
-        .iter()
-        .filter(|attachment| attachment.range_in(text).is_some())
-        .cloned()
-        .collect()
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ComposerSessionDraft {
-    text: String,
-    attachments: Vec<InlineComposerAttachment>,
-    command_entry: Option<AgentCommandEntry>,
-}
-
-impl ComposerSessionDraft {
-    fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.attachments.is_empty() && self.command_entry.is_none()
-    }
-}
-
-fn store_composer_session_draft(
-    drafts: &mut BTreeMap<String, ComposerSessionDraft>,
-    session_id: &VibexSessionId,
-    draft: ComposerSessionDraft,
-) {
-    if draft.is_empty() {
-        drafts.remove(session_id.as_str());
-    } else {
-        drafts.insert(session_id.as_str().to_string(), draft);
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineAttachmentEdit {
     Backspace,
@@ -3137,6 +3101,38 @@ pub struct SessionView {
     timeline_process_expansion: BTreeMap<String, bool>,
     timeline_command_expansion: BTreeMap<String, bool>,
     timeline_file_changes_expansion: BTreeMap<String, bool>,
+    composer_input: Option<Entity<TextareaState>>,
+    composer_attachments: Vec<InlineComposerAttachment>,
+    composer_attachment_serial: u64,
+    composer_command_entry: Option<AgentCommandEntry>,
+    suggestions: Vec<AgentCommandEntry>,
+    suggestion_selection: ComposerSuggestionSelection,
+    suggestion_context: Option<ComposerSuggestionContext>,
+    suggestion_loading: bool,
+    suggestion_request_serial: u64,
+    composer_history: ComposerHistoryState,
+    composer_expanded: bool,
+    composer_goal_editing: bool,
+    composer_plan_expanded: Option<ComposerPlanIdentity>,
+    dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
+    attachment_image_preview: Option<AttachmentImagePreviewState>,
+    composer_queue_editing_id: Option<u64>,
+    composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
+    composer_queue_edit_geometry: ComposerGeometry,
+    composer_queue_drop_target: Option<ComposerQueueDropTarget>,
+    composer_terminals: Vec<TerminalSession>,
+    selected_composer_terminal_id: Option<TerminalId>,
+    composer_terminal_mode: bool,
+    composer_terminal_expanded: bool,
+    composer_terminal_height: f32,
+    composer_terminal_resize_drag: Option<ComposerTerminalResizeDragState>,
+    composer_terminal_drop_target: Option<ComposerTerminalDropTarget>,
+    composer_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
+    active_composer_terminal_surface_id: Option<String>,
+    suggestion_task: Option<Task<()>>,
+    /// Owns this view's keystrokes, IME state and draft, so a pane cannot
+    /// type into another session's composer.
+    composer_subscription: Option<Subscription>,
 }
 
 impl SessionView {
@@ -3191,6 +3187,36 @@ impl SessionView {
             timeline_process_expansion: BTreeMap::new(),
             timeline_command_expansion: BTreeMap::new(),
             timeline_file_changes_expansion: BTreeMap::new(),
+            composer_input: None,
+            composer_attachments: Vec::new(),
+            composer_attachment_serial: 0,
+            composer_command_entry: None,
+            suggestions: Vec::new(),
+            suggestion_selection: ComposerSuggestionSelection::default(),
+            suggestion_context: None,
+            suggestion_loading: false,
+            suggestion_request_serial: 0,
+            suggestion_task: None,
+            composer_history: ComposerHistoryState::default(),
+            composer_expanded: false,
+            composer_goal_editing: false,
+            composer_plan_expanded: None,
+            dismissed_composer_plans: BTreeSet::new(),
+            attachment_image_preview: None,
+            composer_queue_editing_id: None,
+            composer_queue_edit_attachments: Vec::new(),
+            composer_queue_edit_geometry: ComposerGeometry::default(),
+            composer_queue_drop_target: None,
+            composer_terminals: Vec::new(),
+            selected_composer_terminal_id: None,
+            composer_terminal_mode: false,
+            composer_terminal_expanded: false,
+            composer_terminal_height: COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX,
+            composer_terminal_resize_drag: None,
+            composer_terminal_drop_target: None,
+            composer_terminal_surfaces: BTreeMap::new(),
+            active_composer_terminal_surface_id: None,
+            composer_subscription: None,
         }
     }
 
@@ -6356,17 +6382,11 @@ pub struct VibexWorkbench {
     user_message_edit_input: Entity<TextareaState>,
     composer_queue_edit_input: Entity<TextareaState>,
     composer_goal_edit_input: Entity<TextareaState>,
-    composer_input: Entity<TextareaState>,
     /// One composer textarea per session group pane. A pane that is not focused
     /// owns a real input instead of borrowing the focused session's, so several
     /// sessions can be driven at once.
-    session_composer_inputs: BTreeMap<String, Entity<TextareaState>>,
     /// Keeps each per-session composer subscription alive.
-    session_composer_subscriptions: BTreeMap<String, gpui::Subscription>,
     image_editor_text_input: Entity<TextareaState>,
-    composer_input_session_id: Option<VibexSessionId>,
-    composer_input_syncing: bool,
-    composer_session_drafts: BTreeMap<String, ComposerSessionDraft>,
     new_session_input: Entity<TextareaState>,
     new_session_worktree_name_input: Entity<InputState>,
     new_session_worktree_path_input: Entity<InputState>,
@@ -6506,16 +6526,7 @@ pub struct VibexWorkbench {
     runtime_authentication_menu: Option<RuntimeAuthenticationMenuState>,
     composer_geometry: ComposerGeometry,
     runtime_choice_menu_open: Option<String>,
-    suggestions: Vec<AgentCommandEntry>,
-    suggestion_selection: ComposerSuggestionSelection,
-    suggestion_context: Option<ComposerSuggestionContext>,
-    composer_history: ComposerHistoryState,
-    suggestion_loading: bool,
-    suggestion_request_serial: u64,
-    composer_command_entry: Option<AgentCommandEntry>,
     new_session_command_entry: Option<AgentCommandEntry>,
-    composer_attachments: Vec<InlineComposerAttachment>,
-    composer_attachment_serial: u64,
     composer_queue: Vec<ComposerQueueMessage>,
     composer_queue_serial: u64,
     composer_queue_manual_session_ids: BTreeSet<String>,
@@ -6529,25 +6540,7 @@ pub struct VibexWorkbench {
     /// Last runtime activation generation probed for native steering, so a
     /// runtime switch re-probes once instead of on every selection event.
     native_steering_probed_generations: BTreeMap<String, i64>,
-    composer_queue_editing_id: Option<u64>,
-    composer_queue_edit_attachments: Vec<InlineComposerAttachment>,
-    composer_queue_edit_geometry: ComposerGeometry,
-    composer_queue_drop_target: Option<ComposerQueueDropTarget>,
     /// Goal objective being edited inline in the composer goal bar.
-    composer_goal_editing: bool,
-    composer_plan_expanded: Option<ComposerPlanIdentity>,
-    dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
-    attachment_image_preview: Option<AttachmentImagePreviewState>,
-    composer_expanded: bool,
-    composer_terminals: Vec<TerminalSession>,
-    selected_composer_terminal_id: Option<TerminalId>,
-    composer_terminal_mode: bool,
-    composer_terminal_expanded: bool,
-    composer_terminal_height: f32,
-    composer_terminal_resize_drag: Option<ComposerTerminalResizeDragState>,
-    composer_terminal_drop_target: Option<ComposerTerminalDropTarget>,
-    composer_terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
-    active_composer_terminal_surface_id: Option<String>,
     optimistic_user_messages: BTreeMap<String, OptimisticUserMessage>,
     startup_loading: bool,
     startup_loading_indicator_visible: bool,
@@ -6588,7 +6581,6 @@ pub struct VibexWorkbench {
     agent_terminal_task: Option<Task<()>>,
     agent_action_task: Option<Task<()>>,
     fork_session_task: Option<Task<()>>,
-    suggestion_task: Option<Task<()>>,
     session_search_index_task: Option<Task<()>>,
     sidebar_picker_task: Option<Task<()>>,
     new_session_eligibility_task: Option<Task<()>>,
@@ -6609,6 +6601,47 @@ pub struct VibexWorkbench {
     appearance_subscription: Option<Subscription>,
     quit_subscription: Option<Subscription>,
     _agent_subscriptions: Vec<Subscription>,
+}
+
+/// Wires one session's composer textarea to the workbench.
+///
+/// Every session owns a textarea, so the same wiring is used for the initial
+/// session and for each session a group pane opens. The callback routes the
+/// keyboard by the textarea's own session: a pane's Enter sends to the pane's
+/// session even though the sidebar selected another one.
+fn subscribe_composer_input(
+    input: &Entity<TextareaState>,
+    window: &mut Window,
+    cx: &mut Context<VibexWorkbench>,
+) -> Subscription {
+    cx.subscribe_in(input, window, move |this, _, event, window, cx| {
+        match event {
+            InputEvent::Change => {
+                // Typing into a recalled message turns it into live text, so
+                // the arrows stop walking history and the preserved draft is
+                // dropped instead of overwriting the edit later.
+                this.reset_composer_history();
+                this.sync_inline_composer_attachments(false, cx);
+                this.sync_composer_command_entry(ComposerTarget::Session, cx);
+                this.refresh_suggestions(ComposerTarget::Session, window, cx);
+            }
+            InputEvent::PressEnter { secondary, shift } if !shift => {
+                let command_enter =
+                    this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter;
+                if command_enter && !*secondary {
+                    if let Some(input) = this.composer_input_entity() {
+                        input.update(cx, |input, cx| input.replace("\n", window, cx));
+                    }
+                    this.sync_inline_composer_attachments(false, cx);
+                } else if !command_enter || *secondary {
+                    this.handle_composer_enter(window, cx)
+                }
+            }
+            InputEvent::Focus => this.refresh_suggestions(ComposerTarget::Session, window, cx),
+            InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
+            InputEvent::PressEnter { shift: false, .. } => {}
+        }
+    })
 }
 
 /// Field access on the workbench resolves to the borrowed session view.
@@ -6955,41 +6988,7 @@ impl VibexWorkbench {
                     | InputEvent::PressEnter { shift: true, .. } => {}
                 },
             ),
-            cx.subscribe_in(
-                &composer_input,
-                window,
-                |this, _, event, window, cx| match event {
-                    InputEvent::Change => {
-                        if this.composer_input_syncing {
-                            return;
-                        }
-                        // Typing into a recalled message turns it into live
-                        // text, so the arrows stop walking history and the
-                        // preserved draft is dropped instead of overwriting
-                        // the edit later.
-                        this.reset_composer_history();
-                        this.sync_inline_composer_attachments(false, cx);
-                        this.sync_composer_command_entry(ComposerTarget::Session, cx);
-                        this.refresh_suggestions(ComposerTarget::Session, window, cx);
-                    }
-                    InputEvent::PressEnter { secondary, shift } if !shift => {
-                        let command_enter =
-                            this.ui_state.composer.message_send_key == MessageSendKey::CommandEnter;
-                        if command_enter && !*secondary {
-                            this.composer_input
-                                .update(cx, |input, cx| input.replace("\n", window, cx));
-                            this.sync_inline_composer_attachments(false, cx);
-                        } else if !command_enter || *secondary {
-                            this.handle_composer_enter(window, cx)
-                        }
-                    }
-                    InputEvent::Focus => {
-                        this.refresh_suggestions(ComposerTarget::Session, window, cx)
-                    }
-                    InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
-                    InputEvent::PressEnter { shift: false, .. } => {}
-                },
-            ),
+            subscribe_composer_input(&composer_input, window, cx),
             cx.subscribe(&image_editor_text_input, |_, _, _: &InputEvent, cx| {
                 cx.notify()
             }),
@@ -7161,6 +7160,8 @@ impl VibexWorkbench {
         // The view store is built from the persisted content width before
         // `ui_state` moves into the workbench.
         let initial_content_width = ui_state.session.content_width;
+        let mut initial_view = SessionView::new(initial_content_width);
+        initial_view.composer_input = Some(composer_input.clone());
         let mut new_session_workspace = NewSessionWorkspaceState::default();
         new_session_workspace.clear(
             RequestId::new().to_string(),
@@ -7291,13 +7292,7 @@ impl VibexWorkbench {
             user_message_edit_input,
             composer_queue_edit_input,
             composer_goal_edit_input,
-            composer_input,
-            session_composer_inputs: BTreeMap::new(),
-            session_composer_subscriptions: BTreeMap::new(),
             image_editor_text_input,
-            composer_input_session_id: selected_session_id.clone(),
-            composer_input_syncing: false,
-            composer_session_drafts: BTreeMap::new(),
             new_session_input,
             new_session_worktree_name_input,
             new_session_worktree_path_input,
@@ -7372,7 +7367,7 @@ impl VibexWorkbench {
             navigation_history,
             runtime_client_id: RuntimeClientId::new(),
             session_generation: 0,
-            view: SessionView::new(initial_content_width),
+            view: initial_view,
             view_session_id: None,
             session_views: BTreeMap::new(),
             session_view_lru: VecDeque::new(),
@@ -7412,16 +7407,7 @@ impl VibexWorkbench {
             runtime_authentication_menu: None,
             composer_geometry: ComposerGeometry::default(),
             runtime_choice_menu_open: None,
-            suggestions: Vec::new(),
-            suggestion_selection: ComposerSuggestionSelection::default(),
-            suggestion_context: None,
-            composer_history: ComposerHistoryState::default(),
-            suggestion_loading: false,
-            suggestion_request_serial: 0,
-            composer_command_entry: None,
             new_session_command_entry: None,
-            composer_attachments: Vec::new(),
-            composer_attachment_serial: 0,
             composer_queue: Vec::new(),
             composer_queue_serial: 0,
             composer_queue_manual_session_ids: BTreeSet::new(),
@@ -7431,24 +7417,6 @@ impl VibexWorkbench {
             composer_queue_steering_session_ids: BTreeSet::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
-            composer_queue_editing_id: None,
-            composer_queue_edit_attachments: Vec::new(),
-            composer_queue_edit_geometry: ComposerGeometry::default(),
-            composer_queue_drop_target: None,
-            composer_goal_editing: false,
-            composer_plan_expanded: None,
-            dismissed_composer_plans: BTreeSet::new(),
-            attachment_image_preview: None,
-            composer_expanded: false,
-            composer_terminals: Vec::new(),
-            selected_composer_terminal_id: None,
-            composer_terminal_mode: false,
-            composer_terminal_expanded: false,
-            composer_terminal_height: COMPOSER_TERMINAL_DEFAULT_HEIGHT_PX,
-            composer_terminal_resize_drag: None,
-            composer_terminal_drop_target: None,
-            composer_terminal_surfaces: BTreeMap::new(),
-            active_composer_terminal_surface_id: None,
             optimistic_user_messages: BTreeMap::new(),
             startup_loading: true,
             startup_loading_indicator_visible: false,
@@ -7482,7 +7450,6 @@ impl VibexWorkbench {
             agent_terminal_task: None,
             agent_action_task: None,
             fork_session_task: None,
-            suggestion_task: None,
             session_search_index_task: None,
             sidebar_picker_task: None,
             new_session_eligibility_task: None,
@@ -14450,6 +14417,47 @@ impl VibexWorkbench {
         }
     }
 
+    /// The session whose view is currently borrowed.
+    ///
+    /// The composer renders for the borrowed view, so a group pane composes for
+    /// its own session while the sidebar keeps its selection.
+    fn view_session(&self) -> Option<&AgentSession> {
+        let session_id = self.view_session_id.as_ref()?;
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+    }
+
+    /// The borrowed view's composer textarea, if it has one yet.
+    fn composer_input_entity(&self) -> Option<Entity<TextareaState>> {
+        self.composer_input.clone()
+    }
+
+    /// The borrowed view's composer textarea, created and wired on first use.
+    ///
+    /// Every session owns its own textarea, so a pane's draft, cursor and IME
+    /// state belong to that session alone. That is what lets a pane render the
+    /// same composer as the main workbench without typing into it.
+    fn ensure_composer_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        if let Some(input) = self.composer_input.as_ref() {
+            return input.clone();
+        }
+        let placeholder = self.strings().message_agent;
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .submit_on_enter(true)
+                .placeholder(placeholder)
+        });
+        self.composer_subscription = Some(subscribe_composer_input(&input, window, cx));
+        self.composer_input = Some(input.clone());
+        input
+    }
+
     /// Whether `session_id` already owns a view, borrowed or stored.
     fn session_view_exists(&self, session_id: &VibexSessionId) -> bool {
         self.view_session_id.as_ref() == Some(session_id)
@@ -14593,57 +14601,6 @@ impl VibexWorkbench {
             this.reconcile_optimistic_user_message();
             this.rebuild_timeline_sizes();
         });
-    }
-
-    fn stash_current_composer_draft(&mut self, cx: &App) {
-        let Some(session_id) = self.composer_input_session_id.as_ref() else {
-            return;
-        };
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.id == *session_id)
-        {
-            self.composer_session_drafts.remove(session_id.as_str());
-            return;
-        }
-        // A session rendered in a group pane keeps its text in that pane's own
-        // textarea, so the draft has to be read from there. Reading the shared
-        // composer would park a stale string over the pane's real draft.
-        let (text, attachments, command_entry) =
-            match self.session_composer_inputs.get(session_id.as_str()) {
-                Some(input) => (input.read(cx).value().to_string(), Vec::new(), None),
-                None => (
-                    self.composer_input.read(cx).value().to_string(),
-                    self.composer_attachments.clone(),
-                    self.composer_command_entry.clone(),
-                ),
-            };
-        let draft = ComposerSessionDraft {
-            attachments: inline_composer_attachments_in_text(&text, &attachments),
-            text,
-            command_entry,
-        };
-        store_composer_session_draft(&mut self.composer_session_drafts, session_id, draft);
-    }
-
-    fn sync_selected_composer_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_input_session_id == self.selected_session_id {
-            return;
-        }
-        let draft = self
-            .selected_session_id
-            .as_ref()
-            .and_then(|session_id| self.composer_session_drafts.remove(session_id.as_str()))
-            .unwrap_or_default();
-        self.composer_input_session_id = self.selected_session_id.clone();
-        self.reset_composer_history();
-        self.composer_attachments = draft.attachments;
-        self.composer_command_entry = draft.command_entry;
-        self.composer_input_syncing = true;
-        self.composer_input
-            .update(cx, |input, cx| input.set_value(draft.text, window, cx));
-        self.composer_input_syncing = false;
     }
 
     /// Re-derives the geometry of the borrowed view after it changed shape.
@@ -14882,7 +14839,7 @@ impl VibexWorkbench {
             .and_then(|stats| stats.compaction_count)
             .unwrap_or_default();
         let mut file_changes = self.agent_turn_file_changes_cached(&turn).as_ref().clone();
-        if let Some(session) = self.selected_session().cloned()
+        if let Some(session) = self.view_session().cloned()
             && let Some(status) = self.code_workbench.read(cx).git_status()
             && status.workspace_id == session.workspace_id
         {
@@ -14893,10 +14850,7 @@ impl VibexWorkbench {
         let agent_id = self
             .selected_runtime_selection()
             .map(|selection| selection.agent_id)
-            .or_else(|| {
-                self.selected_session()
-                    .map(|session| session.agent_id.clone())
-            })?;
+            .or_else(|| self.view_session().map(|session| session.agent_id.clone()))?;
         let agent_label = runtime_agent_label(&self.agent_snapshots, &agent_id);
         let agent_identity = self
             .agent_snapshots
@@ -15625,7 +15579,6 @@ impl VibexWorkbench {
             self.rebuild_timeline_sizes();
         }
         if navigation_changed {
-            self.stash_current_composer_draft(cx);
             // Child tabs and expanded previews are scoped to the parent
             // session currently shown in the center timeline. Do not leave a
             // previous parent's child session visible after navigation.
@@ -18129,15 +18082,21 @@ impl VibexWorkbench {
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
     }
 
-    fn input_for_composer_target(&self, target: ComposerTarget) -> Entity<TextareaState> {
+    /// The textarea a composer target writes into.
+    ///
+    /// The session target is the *borrowed* view's textarea, so a group pane
+    /// reads and writes the composer of the session it is showing.
+    fn input_for_composer_target(&self, target: ComposerTarget) -> Option<Entity<TextareaState>> {
         match target {
-            ComposerTarget::Session => self.composer_input.clone(),
-            ComposerTarget::NewSession => self.new_session_input.clone(),
+            ComposerTarget::Session => self.composer_input_entity(),
+            ComposerTarget::NewSession => Some(self.new_session_input.clone()),
         }
     }
 
     fn sync_composer_command_entry(&mut self, target: ComposerTarget, cx: &App) {
-        let input = self.input_for_composer_target(target);
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
         let raw_text = input.read(cx).value().to_string();
         let (text, _) = composer_submission_payload(
             &raw_text,
@@ -18164,7 +18123,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = self.input_for_composer_target(target);
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
         let composition_active = input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         });
@@ -18188,7 +18149,9 @@ impl VibexWorkbench {
         target: ComposerTarget,
         cx: &mut Context<Self>,
     ) {
-        let input = self.input_for_composer_target(target);
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
 
         let value = input.read(cx).value().to_string();
         let selection = input.read(cx).selected_range();
@@ -18288,6 +18251,7 @@ impl VibexWorkbench {
 
         self.suggestion_request_serial = self.suggestion_request_serial.saturating_add(1);
         let request_serial = self.suggestion_request_serial;
+        let request_session_id = self.view_session_id.clone();
         self.suggestion_context = Some(context.clone());
         if !preserve_rows {
             self.suggestions.clear();
@@ -18312,6 +18276,7 @@ impl VibexWorkbench {
                 let _ = entity.update(cx, |this, cx| {
                     if this.suggestion_request_serial != request_serial
                         || this.suggestion_context.as_ref() != Some(&context)
+                        || this.view_session_id.as_ref() != request_session_id.as_ref()
                     {
                         return;
                     }
@@ -18320,8 +18285,8 @@ impl VibexWorkbench {
                         Ok(Ok(response)) => response.entries,
                         _ => Vec::new(),
                     };
-                    this.suggestion_selection
-                        .replace_items(this.suggestions.len().min(10));
+                    let suggestion_count = this.suggestions.len().min(10);
+                    this.suggestion_selection.replace_items(suggestion_count);
                     cx.notify();
                 });
             },
@@ -18346,8 +18311,10 @@ impl VibexWorkbench {
         };
         // An in-progress IME composition owns every arrow key, and a suggestion
         // popup opened by the recalled text keeps its own selection keys.
-        let composing = self.composer_input.update(cx, |input, cx| {
-            EntityInputHandler::marked_text_range(input, window, cx).is_some()
+        let composing = self.composer_input_entity().is_some_and(|input| {
+            input.update(cx, |input, cx| {
+                EntityInputHandler::marked_text_range(input, window, cx).is_some()
+            })
         });
         if composing {
             return;
@@ -18436,11 +18403,12 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let composer_input = self.ensure_composer_input(window, cx);
         let Some(session_id) = self.selected_session_id.clone() else {
             return false;
         };
         let active = self.composer_history_recall_active();
-        let empty = self.composer_input.read(cx).value().trim().is_empty();
+        let empty = composer_input.read(cx).value().trim().is_empty();
         // `Up` is the way in, and only from an empty composer. `Down` only ever
         // walks back toward that empty state.
         if !active && !(previous && empty) {
@@ -18481,7 +18449,7 @@ impl VibexWorkbench {
             return false;
         };
         if !active {
-            self.composer_history.draft = self.composer_input.read(cx).value().to_string();
+            self.composer_history.draft = composer_input.read(cx).value().to_string();
             self.composer_history.session_id = Some(session_id);
         }
         self.composer_history.index = Some(index);
@@ -18514,14 +18482,13 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.composer_input_syncing = true;
-        self.composer_input.update(cx, |input, cx| {
+        let composer_input = self.ensure_composer_input(window, cx);
+        composer_input.update(cx, |input, cx| {
             input.set_value(text, window, cx);
             let end = input.value().len();
             input.set_selected_range(end..end, cx);
             input.focus(window, cx);
         });
-        self.composer_input_syncing = false;
         self.sync_inline_composer_attachments(false, cx);
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
         self.refresh_suggestions(ComposerTarget::Session, window, cx);
@@ -18539,11 +18506,11 @@ impl VibexWorkbench {
             .suggestion_context
             .as_ref()
             .is_none_or(|context| context.target != target)
-            || self
-                .input_for_composer_target(target)
-                .update(cx, |input, cx| {
+            || self.input_for_composer_target(target).is_none_or(|input| {
+                input.update(cx, |input, cx| {
                     EntityInputHandler::marked_text_range(input, window, cx).is_some()
                 })
+            })
         {
             return;
         }
@@ -18599,7 +18566,9 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = self.input_for_composer_target(target);
+        let Some(input) = self.input_for_composer_target(target) else {
+            return;
+        };
         let value = input.read(cx).value().to_string();
         let selection = input.read(cx).selected_range();
         let Some(trigger) = composer_trigger_for_selection(&value, selection) else {
@@ -18641,7 +18610,7 @@ impl VibexWorkbench {
         let input = if new_session {
             self.new_session_input.clone()
         } else {
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         let marker = if new_session {
             self.new_session_attachments
@@ -18809,7 +18778,7 @@ impl VibexWorkbench {
         let input = if new_session {
             self.new_session_input.clone()
         } else {
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         let attachments = if new_session {
             self.new_session_attachments.clone()
@@ -18889,7 +18858,7 @@ impl VibexWorkbench {
         let input = if new_session {
             self.new_session_input.clone()
         } else {
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         let composition_active = input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
@@ -18957,11 +18926,16 @@ impl VibexWorkbench {
         }
     }
 
-    fn capture_composer_copy(&mut self, new_session: bool, cx: &mut Context<Self>) {
+    fn capture_composer_copy(
+        &mut self,
+        new_session: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = if new_session {
             self.new_session_input.clone()
         } else {
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         let (text, selection) = {
             let input = input.read(cx);
@@ -18985,8 +18959,8 @@ impl VibexWorkbench {
             return;
         }
 
-        self.composer_input
-            .update(cx, |input, cx| input.replace("\n", window, cx));
+        let composer_input = self.ensure_composer_input(window, cx);
+        composer_input.update(cx, |input, cx| input.replace("\n", window, cx));
         self.sync_inline_composer_attachments(false, cx);
         self.sync_composer_command_entry(ComposerTarget::Session, cx);
         self.refresh_suggestions(ComposerTarget::Session, window, cx);
@@ -18994,7 +18968,7 @@ impl VibexWorkbench {
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let session_running = self
-            .selected_session_id
+            .view_session_id
             .as_ref()
             .is_some_and(|session_id| self.agent_session_is_active(session_id));
         if self.agent_action_pending && !session_running {
@@ -19041,7 +19015,8 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<ComposerQueueMessage> {
-        if self.composer_input.update(cx, |input, cx| {
+        let composer_input = self.ensure_composer_input(window, cx);
+        if composer_input.update(cx, |input, cx| {
             EntityInputHandler::marked_text_range(input, window, cx).is_some()
         }) {
             return None;
@@ -19052,12 +19027,12 @@ impl VibexWorkbench {
             // text is submitted verbatim.
             return self.take_composer_message_remote(window, cx);
         };
-        let session_id = self.selected_session_id.clone()?;
+        let session_id = self.view_session_id.clone()?;
         let Some(selection) = self.selected_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
             return None;
         };
-        let raw_text = self.composer_input.read(cx).value().to_string();
+        let raw_text = composer_input.read(cx).value().to_string();
         let (text, attachments) =
             composer_submission_payload(&raw_text, &self.composer_attachments);
         if text.trim().is_empty() && attachments.is_empty() {
@@ -19094,8 +19069,7 @@ impl VibexWorkbench {
         };
         // Clear the captured draft before queueing or dispatch so completion can
         // never erase text the user typed for a later message.
-        self.composer_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
@@ -19113,12 +19087,13 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<ComposerQueueMessage> {
-        let session_id = self.selected_session_id.clone()?;
+        let composer_input = self.ensure_composer_input(window, cx);
+        let session_id = self.view_session_id.clone()?;
         let Some(selection) = self.selected_runtime_selection() else {
             self.agent_error = Some("Runtime selection is not ready".into());
             return None;
         };
-        let raw_text = self.composer_input.read(cx).value().to_string();
+        let raw_text = composer_input.read(cx).value().to_string();
         let (text, attachments) =
             composer_submission_payload(&raw_text, &self.composer_attachments);
         if text.trim().is_empty() && attachments.is_empty() {
@@ -19133,8 +19108,7 @@ impl VibexWorkbench {
             attachments,
             command_invocation: None,
         };
-        self.composer_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        composer_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.composer_attachments.clear();
         self.composer_command_entry = None;
         self.clear_suggestions();
@@ -19187,7 +19161,7 @@ impl VibexWorkbench {
         if self.auto_continue_enabled(&session_id) {
             self.resume_auto_continue(&session_id, cx);
         }
-        if self.selected_session_id.as_ref() == Some(&session_id) {
+        if self.view_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
         }
         cx.notify();
@@ -19361,7 +19335,7 @@ impl VibexWorkbench {
         if let Some(optimistic_message) = optimistic_message {
             self.install_optimistic_user_message(optimistic_message);
         }
-        if self.selected_session_id.as_ref() == Some(&session_id) {
+        if self.view_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
         }
         cx.notify();
@@ -20519,7 +20493,7 @@ impl VibexWorkbench {
             self.new_session_input.clone()
         } else {
             self.composer_attachments.push(inline_attachment);
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         input.update(cx, |input, cx| {
             input.replace(inline_composer_attachment_insertion(&marker), window, cx);
@@ -20645,7 +20619,7 @@ impl VibexWorkbench {
             self.new_session_input.clone()
         } else {
             self.composer_attachments.extend(attachments);
-            self.composer_input.clone()
+            self.ensure_composer_input(window, cx)
         };
         input.update(cx, |input, cx| {
             input.replace(insertion, window, cx);
@@ -21476,13 +21450,16 @@ impl VibexWorkbench {
                 .first()
                 .map(|terminal| terminal.id.clone());
         }
-        let composer_changed = self.composer_terminals != composer_terminals;
-        self.composer_terminals = composer_terminals;
-        self.composer_terminal_surfaces.retain(|terminal_id, _| {
-            self.composer_terminals
-                .iter()
-                .any(|terminal| terminal.id.as_str() == terminal_id)
-        });
+        let composer_changed = self.view.composer_terminals != composer_terminals;
+        self.view.composer_terminals = composer_terminals;
+        let live_terminals = &self.view.composer_terminals;
+        self.view
+            .composer_terminal_surfaces
+            .retain(|terminal_id, _| {
+                live_terminals
+                    .iter()
+                    .any(|terminal| terminal.id.as_str() == terminal_id)
+            });
         self.sync_composer_terminal_surface_activity(cx);
         if self.ui_state.terminal.tab_order != previous_order {
             self.queue_ui_state();
@@ -23017,7 +22994,7 @@ impl VibexWorkbench {
             return;
         }
         let (Some(backend), Some(session_id)) =
-            (self.backend.clone(), self.selected_session_id.clone())
+            (self.backend.clone(), self.view_session_id.clone())
         else {
             return;
         };
@@ -23282,7 +23259,7 @@ impl VibexWorkbench {
         if self.auto_continue_enabled(&session_id) {
             self.resume_auto_continue(&session_id, cx);
         }
-        if self.selected_session_id.as_ref() == Some(&session_id) {
+        if self.view_session_id.as_ref() == Some(&session_id) {
             self.agent_error = None;
         }
         cx.notify();
@@ -23946,7 +23923,6 @@ impl VibexWorkbench {
         self.discard_optimistic_user_message(session_id);
         self.set_session_turn_pending(session_id, false);
         self.session_views.remove(session_id.as_str());
-        self.composer_session_drafts.remove(session_id.as_str());
         self.session_view_lru
             .retain(|cached_session_id| cached_session_id != session_id.as_str());
         self.reconcile_sidebar_state();
@@ -25087,8 +25063,9 @@ impl VibexWorkbench {
         } else {
             ComposerTarget::Session
         };
-        let input = self.input_for_composer_target(target);
-        input.update(cx, |input, cx| input.focus(window, cx));
+        if let Some(input) = self.input_for_composer_target(target) {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
     }
 
     /// Start the popover's exit animation.
@@ -26560,8 +26537,6 @@ impl VibexWorkbench {
             .retain(|session| !session_ids.contains(session.id.as_str()));
         self.session_views
             .retain(|session_id, _| !session_ids.contains(session_id));
-        self.composer_session_drafts
-            .retain(|session_id, _| !session_ids.contains(session_id));
         self.session_view_lru
             .retain(|session_id| !session_ids.contains(session_id));
         self.pending_new_session_titles
@@ -26599,7 +26574,6 @@ impl VibexWorkbench {
             self.token_usage = None;
             self.agent_loading = false;
             self.agent_turn_pending = false;
-            self.composer_input_session_id = None;
             self.composer_attachments.clear();
             self.composer_command_entry = None;
             self.clear_suggestions();
@@ -29564,8 +29538,9 @@ impl VibexWorkbench {
         if self.composer_terminal_mode {
             self.composer_terminal_mode = false;
             self.sync_composer_terminal_surface_activity(cx);
-            self.composer_input
-                .update(cx, |input, cx| input.focus(window, cx));
+            if let Some(input) = self.composer_input_entity() {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
             cx.notify();
             return;
         }
@@ -29713,9 +29688,11 @@ impl VibexWorkbench {
                 cx,
             )
         });
-        self.composer_input.update(cx, |input, cx| {
-            input.set_placeholder(strings.message_agent, window, cx)
-        });
+        if let Some(input) = self.composer_input_entity() {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(strings.message_agent, window, cx)
+            });
+        }
         self.new_session_input.update(cx, |input, cx| {
             input.set_placeholder(strings.new_session_prompt_placeholder, window, cx)
         });
@@ -33195,301 +33172,22 @@ impl VibexWorkbench {
         }
         let conversation = self.render_agent_workbench_for(false, window, cx);
         self.release_session_view();
-        self.session_group_pane_with_composer(session_id, conversation, window, cx)
-    }
-
-    /// The composer textarea of one session group pane, created on first use.
-    ///
-    /// The entity is what receives keystrokes and holds IME state, so a pane
-    /// cannot share the focused session's textarea: each pane needs its own.
-    fn composer_input_for(
-        &mut self,
-        session_id: &VibexSessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextareaState> {
-        let key = session_id.as_str().to_string();
-        if let Some(input) = self.session_composer_inputs.get(&key) {
-            return input.clone();
-        }
-        let placeholder = self.strings().message_agent;
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 8)
-                .submit_on_enter(true)
-                .placeholder(placeholder)
-        });
-        let submit_key = key.clone();
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { shift: false, .. } => {
-                    this.send_session_group_pane_message(&submit_key, window, cx);
-                }
-                InputEvent::Change | InputEvent::Focus | InputEvent::Blur => cx.notify(),
-                InputEvent::PressEnter { shift: true, .. } => {}
-            },
-        );
-        self.session_composer_subscriptions
-            .insert(key.clone(), subscription);
-        self.session_composer_inputs.insert(key, input.clone());
-        input
-    }
-
-    /// The runtime selection a pane's session should send with.
-    ///
-    /// The focused session answers from the live selection; any other session
-    /// answers from its parked view, which the runtime event pump keeps current.
-    fn session_runtime_selection_for(
-        &self,
-        session_id: &VibexSessionId,
-    ) -> Option<SessionRuntimeSelection> {
-        if self.selected_session_id.as_ref() == Some(session_id) {
-            return self.selected_runtime_selection();
-        }
-        if let Some(selection) = self.optimistic_runtime_selections.get(session_id.as_str()) {
-            return Some(selection.clone());
-        }
-        if let Some(selection) = self
-            .session_views
-            .get(session_id.as_str())
-            .and_then(|entry| entry.runtime_selection.as_ref())
-            .map(|state| state.desired.clone())
-        {
-            return Some(selection);
-        }
-        // A pane whose view was materialized from a fetched timeline has no
-        // selection yet. Fall back to the Agent's remembered choice, then to the
-        // catalog, so the pane can still send.
-        let agent_id = self
-            .sessions
-            .iter()
-            .find(|session| &session.id == session_id)?
-            .agent_id
-            .clone();
-        let catalog = self.runtime_catalog.as_ref()?;
-        self.ui_state
-            .composer
-            .runtime_selections_by_agent
-            .get(&agent_id)
-            .cloned()
-            .filter(|selection| {
-                catalog.options.iter().any(|option| {
-                    option.selection.agent_id == selection.agent_id
-                        && option.selection.auth_source == selection.auth_source
-                        && option.selection.model == selection.model
-                })
-            })
-            .or_else(|| {
-                catalog
-                    .options
-                    .iter()
-                    .find(|option| option.selection.agent_id == agent_id)
-                    .map(|option| option.selection.clone())
-            })
-    }
-
-    /// Builds a message from one pane's textarea, for that pane's session.
-    fn take_composer_message_for(
-        &mut self,
-        session_id: &VibexSessionId,
-        input: &Entity<TextareaState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<ComposerQueueMessage> {
-        if input.update(cx, |input, cx| {
-            EntityInputHandler::marked_text_range(input, window, cx).is_some()
-        }) {
-            return None;
-        }
-        let selection = self.session_runtime_selection_for(session_id)?;
-        let raw_text = input.read(cx).value().to_string();
-        let (text, attachments) = composer_submission_payload(&raw_text, &[]);
-        if text.trim().is_empty() {
-            return None;
-        }
-        // Command discovery is an authority-local capability, so a paired client
-        // submits typed text verbatim.
-        let allow_manual_provider_slash = self.runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .agent()
-                .manager()
-                .command_discovery_capabilities(&AgentCommandDiscoverRequest {
-                    agent_id: Some(selection.agent_id.clone()),
-                    provider_profile_id: selection.provider_profile_id().cloned(),
-                    session_id: Some(session_id.clone()),
-                    workspace_id: None,
-                    trigger: Some(AgentCommandTrigger::Slash),
-                    query: None,
-                    limit: Some(1),
-                })
-                .map(|capabilities| capabilities.slash_commands)
-                .unwrap_or(false)
-        });
-        let command_invocation =
-            resolve_composer_command_invocation(&text, None, allow_manual_provider_slash);
-        self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
-        let message = ComposerQueueMessage {
-            id: self.composer_queue_serial,
-            session_id: session_id.clone(),
-            desired_runtime: selection,
-            text,
-            attachments,
-            command_invocation,
-        };
-        input.update(cx, |input, cx| input.set_value("", window, cx));
-        Some(message)
-    }
-
-    /// Sends whatever a group pane's composer holds, to that pane's session.
-    fn send_session_group_pane_message(
-        &mut self,
-        session_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(pane_session_id) = VibexSessionId::parse(session_id) else {
-            return;
-        };
-        let Some(input) = self.session_composer_inputs.get(session_id).cloned() else {
-            return;
-        };
-        let Some(message) = self.take_composer_message_for(&pane_session_id, &input, window, cx)
-        else {
-            return;
-        };
-        self.dispatch_composer_message(
-            message,
-            ComposerQueueDispatchBehavior::Automatic,
-            window,
-            cx,
-        );
-    }
-
-    /// Stops the turn running in one group pane, without touching the others.
-    fn interrupt_session_for(
-        &mut self,
-        session_id: VibexSessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.agent_action_pending {
-            return;
-        }
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        self.pause_auto_continue(&session_id, cx);
-        self.notification_suppressed_session_ids
-            .insert(session_id.as_str().to_string());
-        let turn_was_locally_pending = self.session_turn_pending(&session_id);
-        self.agent_action_pending = true;
-        self.agent_error = None;
-        let generation = self.session_generation;
-        let interrupted_session_id = session_id.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            backend
-                .agent()
-                .interrupt(MutationRequest::new(session_id.clone()))
-                .await
-                .map_err(crate::app::remote_error_into_vibex)?;
-            Ok::<_, vibex_core::VibexError>(backend.agent().open_session(session_id).await.ok())
-        });
-        self.agent_action_task = Some(cx.spawn_in(
-            window,
-            async move |entity: WeakEntity<Self>, cx| {
-                let outcome = runner.await;
-                let _ = entity.update_in(cx, |this, _window, cx| {
-                    if let Ok(Ok(session)) = &outcome {
-                        if let Some(session) = session {
-                            this.upsert_session_snapshot(session.clone());
-                        }
-                        this.reconcile_sidebar_state();
-                        if !turn_was_locally_pending {
-                            this.set_session_turn_pending(&interrupted_session_id, false);
-                        }
-                        this.publish_sidebar_invalidation();
-                        this.sync_auto_continue_for_session(&interrupted_session_id, cx);
-                    }
-                    this.agent_action_pending = false;
-                    if this.session_generation != generation {
-                        return;
-                    }
-                    cx.notify();
-                });
-            },
-        ));
-    }
-
-    /// The composer a group pane renders below its conversation.
-    fn render_session_group_pane_composer(
-        &mut self,
-        session_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Ok(pane_session_id) = VibexSessionId::parse(session_id) else {
-            return Empty.into_any_element();
-        };
-        let input = self.composer_input_for(&pane_session_id, window, cx);
-        let can_send = !self.agent_action_pending && !input.read(cx).value().trim().is_empty();
-        let turn_pending = self.session_turn_pending(&pane_session_id);
-        let send_session_id = session_id.to_string();
-        let stop_session_id = session_id.to_string();
-        h_flex()
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .items_end()
-            .gap_2()
-            .px_2()
-            .pb_2()
-            .child(div().flex_1().min_w_0().child(Textarea::new(&input)))
-            .when(turn_pending, |this| {
-                this.child(
-                    Button::new(format!("session-group-pane-stop-{session_id}"))
-                        .small()
-                        .danger()
-                        .compact()
-                        .icon(IconName::Close)
-                        .tooltip(locale::text("Stop", "停止", "停止"))
-                        .disabled(self.agent_action_pending)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Ok(session_id) = VibexSessionId::parse(&stop_session_id) else {
-                                return;
-                            };
-                            this.interrupt_session_for(session_id, window, cx);
-                        })),
-                )
-            })
-            .child(
-                Button::new(format!("session-group-pane-send-{session_id}"))
-                    .small()
-                    .primary()
-                    .compact()
-                    .icon(IconName::ArrowUp)
-                    .tooltip(locale::text("Send", "发送", "傳送"))
-                    .disabled(!can_send)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.send_session_group_pane_message(&send_session_id, window, cx)
-                    })),
-            )
-            .into_any_element()
+        self.session_group_pane_with_composer(conversation, window, cx)
     }
 
     /// Puts a pane's own composer under its conversation.
     ///
-    /// Every pane owns its composer, so several sessions can be driven at once
-    /// instead of only the focused one.
+    /// The pane renders the same composer as the main workbench, reading the
+    /// borrowed view: the textarea, the attachments, the queued messages, the
+    /// runtime controls and the terminal all belong to the pane's session, so
+    /// several sessions can be driven at once instead of only the focused one.
     fn session_group_pane_with_composer(
         &mut self,
-        session_id: &str,
         content: AnyElement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let composer = self.render_session_group_pane_composer(session_id, window, cx);
+        let composer = self.render_composer(window, cx);
         v_flex()
             .size_full()
             .min_w_0()
@@ -33507,24 +33205,17 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// Gives every group member a parked view, so each pane can render a full
-    /// conversation instead of a summary.
+    /// Gives every group member a complete view and loads the ones that have no
+    /// timeline yet.
     ///
-    /// A session only owns a parked view once it has been the focused one. A
-    /// pane whose session was never opened therefore has nothing to borrow, and
-    /// the workspace would show one complete conversation beside summaries.
-    /// Fetching the missing timelines up front makes every pane complete.
+    /// A session only has a timeline once something asked for it. Without this
+    /// pass the workspace would show one complete conversation beside panes
+    /// stuck on their loading state.
     fn ensure_session_group_views(&mut self, group_id: &str, cx: &mut Context<Self>) {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
         let members = group.member_session_ids.clone();
-        // A pane textarea is only needed while its session is in a group.
-        let grouped = self.ui_state.sidebar.organization.grouped_session_ids();
-        self.session_composer_inputs
-            .retain(|session_id, _| grouped.contains(session_id));
-        self.session_composer_subscriptions
-            .retain(|session_id, _| grouped.contains(session_id));
         // Every member owns a view for as long as it is a member, so a pane can
         // always borrow one. Members are pinned against eviction, which is what
         // keeps a wide split from losing the conversation it is showing.
@@ -39780,8 +39471,8 @@ impl VibexWorkbench {
                                                         },
                                                     ))
                                                     .capture_action(cx.listener(
-                                                        |this, _: &InputCopy, _, cx| {
-                                                            this.capture_composer_copy(true, cx)
+                                                        |this, _: &InputCopy, window, cx| {
+                                                            this.capture_composer_copy(true, window, cx)
                                                         },
                                                     ))
                                                     .capture_action(cx.listener(
@@ -40316,7 +40007,6 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if include_composer {
-            self.sync_selected_composer_draft(window, cx);
             // Elicitation drafts are keyed by request id and shared across the
             // workbench, so only the focused view may prune them. A pane that
             // borrowed another session's timeline must not drop the answers the
@@ -40512,7 +40202,7 @@ impl VibexWorkbench {
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
             .flatten();
-        let composer = include_composer.then(|| self.render_composer(cx));
+        let composer = include_composer.then(|| self.render_composer(window, cx));
         // Terminal mode routes its own near-fullscreen expansion through the
         // same timeline-collapse path as the input composer's expanded state.
         let composer_fullscreen = if self.composer_terminal_mode {
@@ -41287,7 +40977,7 @@ impl VibexWorkbench {
             .size(px(32.0))
             .icon(IconName::SquareTerminal)
             .tooltip(tooltip)
-            .disabled(self.agent_action_pending || self.selected_session_id.is_none())
+            .disabled(self.agent_action_pending || self.view_session_id.is_none())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.switch_to_composer_terminal(window.window_handle(), window, cx)
             }))
@@ -41726,8 +41416,7 @@ impl VibexWorkbench {
                                     .icon(IconName::Plus)
                                     .tooltip(locale::text("New terminal", "新建终端", "新增終端機"))
                                     .disabled(
-                                        self.agent_action_pending
-                                            || self.selected_session_id.is_none(),
+                                        self.agent_action_pending || self.view_session_id.is_none(),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.create_composer_terminal(window.window_handle(), cx)
@@ -41818,7 +41507,7 @@ impl VibexWorkbench {
                                                     ))
                                                     .disabled(
                                                         self.agent_action_pending
-                                                            || self.selected_session_id.is_none(),
+                                                            || self.view_session_id.is_none(),
                                                     )
                                                     .on_click(cx.listener(
                                                         |this, _, window, cx| {
@@ -41930,7 +41619,8 @@ impl VibexWorkbench {
             && self.selected_session_id.is_some()
         {
             (
-                self.composer_input.clone(),
+                self.composer_input_entity()
+                    .unwrap_or_else(|| self.new_session_input.clone()),
                 self.composer_attachments.clone(),
                 self.composer_geometry.input_bounds,
             )
@@ -48142,7 +47832,7 @@ impl VibexWorkbench {
             ComposerTarget::Session => {
                 !self.new_session_open
                     && self.ui_state.workbench.active_tab == "agent"
-                    && self.selected_session_id.is_some()
+                    && self.view_session_id.is_some()
                     && !self.composer_terminal_mode
             }
             ComposerTarget::NewSession => self.new_session_open,
@@ -48380,7 +48070,7 @@ impl VibexWorkbench {
     }
 
     fn render_composer_collaboration(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let session_id = self.selected_session_id.as_ref()?;
+        let session_id = self.view_session_id.as_ref()?;
         let collaborations = active_collaborations(&self.timeline.items);
         let latest = collaborations.last()?;
         let expansion_key = format!("composer-collaboration:{}", session_id);
@@ -48812,7 +48502,7 @@ impl VibexWorkbench {
     }
 
     fn render_composer_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let session_id = self.selected_session_id.as_ref()?;
+        let session_id = self.view_session_id.as_ref()?;
         let plan = current_agent_plan(&self.timeline.items)?;
         let identity = composer_plan_identity(session_id, &plan, &self.timeline.items);
         if self.dismissed_composer_plans.contains(&identity) {
@@ -49025,7 +48715,7 @@ impl VibexWorkbench {
         goal_row: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let session_id = self.selected_session_id.clone()?;
+        let session_id = self.view_session_id.clone()?;
         let messages = self
             .composer_queue
             .iter()
@@ -49506,21 +49196,22 @@ impl VibexWorkbench {
         Some(queue.into_any_element())
     }
 
-    fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let composer_input = self.ensure_composer_input(window, cx);
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
         let selected_runtime = self.selected_runtime_selection();
-        let can_send = self.selected_session_id.is_some()
+        let can_send = self.view_session_id.is_some()
             && selected_runtime.is_some()
             && !self.agent_action_pending
-            && (!self.composer_input.read(cx).value().trim().is_empty()
+            && (!composer_input.read(cx).value().trim().is_empty()
                 || !self.composer_attachments.is_empty());
-        let session_state = self.selected_agent_session_state();
-        if let Some(session_id) = self.selected_session_id.clone() {
+        let session_state = self.live_agent_session_state();
+        if let Some(session_id) = self.view_session_id.clone() {
             self.sync_auto_continue_for_session(&session_id, cx);
         }
-        let auto_continue_turn_status = self.selected_session().and_then(|session| {
+        let auto_continue_turn_status = self.view_session().and_then(|session| {
             self.cached_auto_continue_turn_status(&session.id, session.updated_at_ms)
         });
         let continuation_available = auto_continue_turn_status.is_some_and(|status| {
@@ -49540,7 +49231,7 @@ impl VibexWorkbench {
             || locale::text("Continue", "继续", "繼續").to_string(),
             |remaining| auto_continue_countdown_label(self.resolved_locale(), remaining),
         );
-        let auto_continue_toggle_session_id = self.selected_session_id.clone();
+        let auto_continue_toggle_session_id = self.view_session_id.clone();
         let session_running = agent_turn_is_active(self.agent_turn_pending, session_state);
         let generation_status = self.render_agent_generation_status(session_running, cx);
         let runtime_projection = selected_runtime.as_ref().and_then(|selection| {
@@ -49561,7 +49252,7 @@ impl VibexWorkbench {
         let composer_plan = self.render_composer_plan(cx);
         // The goal row rides the queued-message surface whenever that panel is
         // up; on its own it wears the same shell as the panel.
-        let composer_queue_visible = self.selected_session_id.as_ref().is_some_and(|session_id| {
+        let composer_queue_visible = self.view_session_id.as_ref().is_some_and(|session_id| {
             self.composer_queue
                 .iter()
                 .any(|message| &message.session_id == session_id)
@@ -50070,8 +49761,8 @@ impl VibexWorkbench {
                                                 },
                                             ))
                                             .capture_action(cx.listener(
-                                                |this, _: &InputCopy, _, cx| {
-                                                    this.capture_composer_copy(false, cx)
+                                                |this, _: &InputCopy, window, cx| {
+                                                    this.capture_composer_copy(false, window, cx)
                                                 },
                                             ))
                                             .capture_action(cx.listener(
@@ -50123,13 +49814,13 @@ impl VibexWorkbench {
                                                 },
                                             ))
                                             .child(
-                                                Textarea::new(&self.composer_input)
+                                                Textarea::new(&composer_input)
                                                     .appearance(false)
                                                     .when(self.composer_expanded, |this| {
                                                         this.h_full()
                                                     }),
                                             )
-                                            .child(composer_token_highlight(&self.composer_input)),
+                                            .child(composer_token_highlight(&composer_input)),
                                     )
                                     .child(
                                         v_flex()
@@ -60395,9 +60086,11 @@ impl FoundationSettings {
     ) {
         let _ = self.workbench.update(cx, |this, cx| {
             this.ui_state.composer.message_send_key = key;
-            this.composer_input.update(cx, |input, cx| {
-                input.set_placeholder(this.strings().message_agent, window, cx);
-            });
+            if let Some(input) = this.composer_input_entity() {
+                input.update(cx, |input, cx| {
+                    input.set_placeholder(this.strings().message_agent, window, cx);
+                });
+            }
             this.queue_ui_state();
             cx.notify();
         });
@@ -68129,7 +67822,7 @@ mod tests {
         // The composer's own change event ends the walk, so typed text is
         // never replaced by a stale draft.
         let subscription = source
-            .split_once("            cx.subscribe_in(\n                &composer_input,")
+            .split_once("fn subscribe_composer_input(")
             .and_then(|(_, tail)| tail.split_once("InputEvent::PressEnter { secondary, shift }"))
             .map(|(body, _)| body)
             .expect("composer input subscription should remain inspectable");
@@ -68137,7 +67830,9 @@ mod tests {
 
         // The session composer wires both keys to the shared handler.
         let composer = source
-            .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
+            .split_once(
+                "    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+            )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
@@ -68670,7 +68365,9 @@ mod tests {
     fn composer_terminal_toggle_sits_below_fullscreen_control() {
         let source = include_str!("app.rs");
         let composer = source
-            .split_once("    fn render_composer(&mut self, cx: &mut Context<Self>)")
+            .split_once(
+                "    fn render_composer(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+            )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
@@ -71528,57 +71225,42 @@ mod tests {
         assert!(!selection.contains("self.agent_turn_pending = false;"));
     }
 
+    /// A composer draft lives in its session's own textarea, so navigating away
+    /// and back cannot park one session's text over another's.
     #[test]
-    fn composer_drafts_follow_their_session_across_navigation() {
-        let first = VibexSessionId::parse("session_first_draft").unwrap();
-        let second = VibexSessionId::parse("session_second_draft").unwrap();
-        let mut drafts = BTreeMap::new();
-        store_composer_session_draft(
-            &mut drafts,
-            &first,
-            ComposerSessionDraft {
-                text: "first unsent message".to_string(),
-                ..Default::default()
-            },
-        );
-        store_composer_session_draft(
-            &mut drafts,
-            &second,
-            ComposerSessionDraft {
-                text: "second unsent message".to_string(),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            drafts.get(first.as_str()).map(|draft| draft.text.as_str()),
-            Some("first unsent message")
-        );
-        assert_eq!(
-            drafts.remove(second.as_str()).map(|draft| draft.text),
-            Some("second unsent message".to_string())
-        );
-        assert_eq!(
-            drafts.get(first.as_str()).map(|draft| draft.text.as_str()),
-            Some("first unsent message")
-        );
-
-        store_composer_session_draft(&mut drafts, &first, ComposerSessionDraft::default());
-        assert!(!drafts.contains_key(first.as_str()));
-
+    fn composer_drafts_live_in_their_sessions_own_textarea() {
         let source = include_str!("app.rs");
-        let selection = source
-            .split_once("    fn select_session_with_history(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn load_agent_session_timeline("))
+        let view = source
+            .split_once("pub struct SessionView {")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
             .map(|(body, _)| body)
-            .expect("session navigation should remain inspectable");
-        assert!(selection.contains("self.stash_current_composer_draft(cx);"));
-        let renderer = source
-            .split_once("    fn render_agent_workbench(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .expect("the session view should remain inspectable");
+        assert!(view.contains("composer_input: Option<Entity<TextareaState>>"));
+        assert!(view.contains("composer_attachments: Vec<InlineComposerAttachment>"));
+        assert!(view.contains("composer_subscription: Option<Subscription>"));
+        assert!(view.contains("composer_history: ComposerHistoryState"));
+        assert!(!view.contains("composer_input_session_id"));
+        assert!(!view.contains("composer_session_drafts"));
+
+        let ensure = source
+            .split_once("    fn ensure_composer_input(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Whether `session_id` already owns a view")
+            })
             .map(|(body, _)| body)
-            .expect("Agent workbench renderer should remain inspectable");
-        assert!(renderer.contains("self.sync_selected_composer_draft(window, cx);"));
+            .expect("composer input creation should remain inspectable");
+        assert!(ensure.contains("self.composer_input = Some(input.clone());"));
+        assert!(ensure.contains("subscribe_composer_input(&input, window, cx)"));
+
+        // The shared composer subscription is created once per textarea, and it
+        // never parks one session's text under another session's key.
+        let factory = source
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Field access on the workbench"))
+            .map(|(body, _)| body)
+            .expect("composer subscription factory should remain inspectable");
+        assert!(factory.contains("cx.subscribe_in(input, window"));
+        assert!(!factory.contains("composer_input_syncing"));
     }
 
     #[test]
@@ -72780,8 +72462,8 @@ mod tests {
             .expect("composer renderer should remain inspectable");
 
         assert!(!workbench.contains(".when_some(self.agent_error.clone()"));
-        assert!(composer.contains("let session_state = self.selected_agent_session_state();"));
-        assert!(!composer.contains("self.selected_session().map(|session| session.state)"));
+        assert!(composer.contains("let session_state = self.live_agent_session_state();"));
+        assert!(!composer.contains("self.view_session().map(|session| session.state)"));
         let error_position = composer
             .find(".when_some(self.agent_error.clone()")
             .expect("composer should render Agent errors");
@@ -73689,8 +73371,8 @@ mod tests {
     fn expanded_composer_enter_inserts_a_newline_and_send_stays_button_driven() {
         let source = include_str!("app.rs");
         let subscriptions = source
-            .split_once("        let mut agent_subscriptions =")
-            .and_then(|(_, tail)| tail.split_once("\n        let parent ="))
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| tail.split_once("InputEvent::Focus =>"))
             .map(|(body, _)| body)
             .expect("input subscriptions should remain inspectable");
         assert!(subscriptions.contains("this.handle_composer_enter(window, cx)"));
@@ -75841,7 +75523,6 @@ mod tests {
     fn inline_composer_attachment_metadata_survives_marker_undo_until_draft_save() {
         let attachment = inline_composer_attachment(1, "diagram");
         let text_with_marker = format!("before{}after", attachment.marker);
-        let text_without_marker = "beforeafter";
 
         assert!(
             inline_composer_clipboard_item(
@@ -75850,13 +75531,6 @@ mod tests {
                 0..text_with_marker.len(),
             )
             .is_some()
-        );
-        assert!(
-            inline_composer_attachments_in_text(
-                text_without_marker,
-                std::slice::from_ref(&attachment),
-            )
-            .is_empty()
         );
         let source = include_str!("app.rs");
         let sync = source
@@ -79209,57 +78883,61 @@ mod tests {
         );
     }
 
-    /// Every pane owns a composer, so several sessions can be driven at once.
+    /// Every pane renders the same composer as the main workbench, reading its
+    /// own session's view, so several sessions can be driven at once.
     #[test]
-    fn every_group_pane_owns_its_composer() {
+    fn every_group_pane_renders_the_real_composer_for_its_own_session() {
         let source = include_str!("app.rs");
 
-        let factory = source
-            .split_once("    fn composer_input_for(")
-            .and_then(|(_, tail)| {
-                tail.split_once(
-                    "\n    /// The runtime selection a pane's session should send with.",
-                )
-            })
+        // The pane reuses the workbench composer instead of a second, simpler
+        // one: there is exactly one composer implementation.
+        let wrapper = source
+            .split_once("\n    fn session_group_pane_with_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Gives every group member"))
             .map(|(body, _)| body)
-            .expect("per-pane composer factory should remain inspectable");
-        assert!(factory.contains("session_composer_inputs"));
-        assert!(factory.contains("submit_on_enter(true)"));
-        assert!(factory.contains("send_session_group_pane_message"));
+            .expect("pane composer wrapper should remain inspectable");
+        assert!(wrapper.contains("let composer = self.render_composer(window, cx);"));
+        assert!(!source.contains("\n    fn render_session_group_pane_composer("));
+        assert!(!source.contains("\n    fn composer_input_for("));
 
-        // Sending targets the pane's own session, not the selected one.
-        let send = source
-            .split_once("    fn send_session_group_pane_message(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Stops the turn running in one group pane")
-            })
+        // Composing targets the pane's own session: the send path reads the
+        // borrowed view's session, not the sidebar selection.
+        let submit = source
+            .split_once("\n    fn submit_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn take_composer_message("))
             .map(|(body, _)| body)
-            .expect("pane send should remain inspectable");
-        assert!(send.contains("take_composer_message_for(&pane_session_id, &input, window, cx)"));
-        assert!(!send.contains("selected_session_id"));
+            .expect("composer submission should remain inspectable");
+        assert!(submit.contains(".view_session_id"));
+        assert!(!submit.contains("selected_session_id"));
 
         let take = source
-            .split_once("    fn take_composer_message_for(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// Sends whatever a group pane's composer holds")
-            })
+            .split_once("\n    fn take_composer_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Remote twin of"))
             .map(|(body, _)| body)
-            .expect("pane message assembly should remain inspectable");
-        assert!(take.contains("session_id: session_id.clone(),"));
+            .expect("composer message assembly should remain inspectable");
+        assert!(take.contains("self.view_session_id.clone()?"));
+
+        // Stopping acts on the borrowed view's session too.
+        let interrupt = source
+            .split_once("\n    fn interrupt_session_with_queue_behavior(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn continue_session("))
+            .map(|(body, _)| body)
+            .expect("interrupt should remain inspectable");
+        assert!(interrupt.contains(".view_session_id.clone()"));
 
         // Every pane, focused or not, renders its own view and its own
         // composer. Focus decides the keyboard, never the content.
         let content = source
-            .split_once("    fn render_session_group_pane_content(")
+            .split_once("\n    fn render_session_group_pane_content(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    /// The composer textarea of one session group pane")
+                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
             })
             .map(|(body, _)| body)
             .expect("group pane content should remain inspectable");
         assert!(content.contains("self.borrow_session_view(&pane_session_id)"));
         assert!(content.contains("self.release_session_view();"));
         assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
-        assert!(content.contains("session_group_pane_with_composer(session_id, conversation"));
+        assert!(content.contains("session_group_pane_with_composer(conversation, window, cx)"));
         // The rendered conversation is the pane's own session, never whatever
         // view happens to be borrowed.
         assert!(!content.contains("selected_session_id"));
