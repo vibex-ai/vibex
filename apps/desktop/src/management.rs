@@ -9307,10 +9307,9 @@ impl ManagementCenter {
                         target_agent_id,
                     );
                     if import_item_ids.is_empty() {
-                        return Err(VibexError::validation(
-                            "provider_native_import_no_candidate",
-                            "no importable cc-switch Provider record was found for this Agent",
-                        ));
+                        let (code, message) =
+                            native_import_empty_reason(&preview, target_agent_id, active_locale);
+                        return Err(VibexError::validation(code, message));
                     }
                     let mut imported_count = 0usize;
                     let mut missing_secret_count = 0usize;
@@ -20023,6 +20022,94 @@ fn pending_cc_switch_import_item_ids(
         .collect()
 }
 
+/// Explains why a cc-switch import produced no work for `target_agent_id`.
+///
+/// A single `provider_native_import_no_candidate` covered three unrelated
+/// situations, so the UI could only say "operation failed". Naming them lets
+/// the user see whether CC Switch is missing, has nothing for this Agent, has
+/// already been imported, or has a config Vibex cannot parse.
+fn native_import_empty_reason(
+    preview: &vibex_core::ProviderNativeImportPreview,
+    target_agent_id: &AgentId,
+    locale: ResolvedLocale,
+) -> (&'static str, String) {
+    let label = vibex_core::builtin_agent_definitions()
+        .into_iter()
+        .find(|definition| &definition.id == target_agent_id)
+        .map(|definition| definition.label)
+        .unwrap_or_else(|| target_agent_id.as_str().to_string());
+    let cc_switch_items = preview
+        .items
+        .iter()
+        .filter(|item| item.agent_id.as_ref() == Some(target_agent_id))
+        .filter(|item| {
+            item.source == vibex_core::ProviderNativeImportSource::CcSwitch
+                || provider_option_value(&item.provider_options, PROVIDER_OPTION_NATIVE_SOURCE)
+                    == Some("cc-switch")
+        })
+        .collect::<Vec<_>>();
+
+    if cc_switch_items.is_empty() {
+        if preview
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "provider_native_import_cc_switch_missing")
+        {
+            return (
+                "provider_native_import_cc_switch_missing",
+                match locale {
+                    ResolvedLocale::En => {
+                        "The CC Switch provider database was not found".to_string()
+                    }
+                    ResolvedLocale::ZhCn => "未找到 CC Switch 数据库，无法导入配置".to_string(),
+                    ResolvedLocale::ZhTw => "未找到 CC Switch 資料庫，無法匯入設定".to_string(),
+                },
+            );
+        }
+        return (
+            "provider_native_import_agent_not_in_cc_switch",
+            match locale {
+                ResolvedLocale::En => {
+                    format!("CC Switch has no provider configuration for {label}")
+                }
+                ResolvedLocale::ZhCn => format!("CC Switch 中没有 {label} 的供应商配置"),
+                ResolvedLocale::ZhTw => format!("CC Switch 中沒有 {label} 的供應商設定"),
+            },
+        );
+    }
+
+    if cc_switch_items
+        .iter()
+        .any(|item| native_import_status_is_eligible(item.status))
+    {
+        return (
+            "provider_native_import_already_imported",
+            match locale {
+                ResolvedLocale::En => {
+                    format!("Every {label} provider in CC Switch is already imported")
+                }
+                ResolvedLocale::ZhCn => format!("{label} 的 CC Switch 供应商配置已全部导入"),
+                ResolvedLocale::ZhTw => format!("{label} 的 CC Switch 供應商設定已全部匯入"),
+            },
+        );
+    }
+
+    (
+        "provider_native_import_blocked",
+        match locale {
+            ResolvedLocale::En => {
+                format!("Every {label} provider in CC Switch is blocked by a parse error")
+            }
+            ResolvedLocale::ZhCn => {
+                format!("{label} 在 CC Switch 中的供应商配置存在解析错误，无法导入")
+            }
+            ResolvedLocale::ZhTw => {
+                format!("{label} 在 CC Switch 中的供應商設定存在解析錯誤，無法匯入")
+            }
+        },
+    )
+}
+
 fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) -> AnyElement {
     let identity = format!("{identity} {label}").to_ascii_lowercase();
     agent_brand_icon(
@@ -23111,6 +23198,57 @@ mod tests {
             .map(|id| id.into_string())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["request_pending", "request_fallback_source"]);
+    }
+
+    #[test]
+    fn native_import_empty_reason_names_each_missing_case() {
+        let grok = AgentId::parse("grok").expect("valid Agent id");
+        let options = provider_options(&[
+            (PROVIDER_OPTION_NATIVE_SOURCE, "cc-switch"),
+            (PROVIDER_OPTION_CC_SWITCH_DB_PATH, "/tmp/cc-switch.db"),
+            (PROVIDER_OPTION_CC_SWITCH_PROVIDER_ID, "grok-alpha"),
+            (PROVIDER_OPTION_CC_SWITCH_APP_TYPE, "grokbuild"),
+        ]);
+        let mut preview = vibex_core::ProviderNativeImportPreview {
+            preview_id: vibex_core::RequestId::parse("request_preview").expect("valid preview id"),
+            sources: vec![vibex_core::ProviderNativeImportSource::CcSwitch],
+            files: Vec::new(),
+            items: Vec::new(),
+            diagnostics: Vec::new(),
+            created_at_ms: 1,
+        };
+
+        let (code, message) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        assert_eq!(code, "provider_native_import_agent_not_in_cc_switch");
+        assert!(message.contains("Grok Build"));
+
+        preview
+            .diagnostics
+            .push(vibex_core::ProviderNativeImportDiagnostic {
+                code: "provider_native_import_cc_switch_missing".to_string(),
+                message: String::new(),
+                source: vibex_core::ProviderNativeImportSource::CcSwitch,
+                file_kind: None,
+                redacted_details: Vec::new(),
+            });
+        let (code, _) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        assert_eq!(code, "provider_native_import_cc_switch_missing");
+        preview.diagnostics.clear();
+
+        preview.items.push(native_import_item(
+            "request_grok",
+            vibex_core::ProviderNativeImportSource::CcSwitch,
+            &grok,
+            vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup,
+            options,
+        ));
+        let (code, message) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        assert_eq!(code, "provider_native_import_already_imported");
+        assert!(message.contains("Grok Build"));
+
+        preview.items[0].status = vibex_core::ProviderNativeImportItemStatus::BlockedByParseError;
+        let (code, _) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        assert_eq!(code, "provider_native_import_blocked");
     }
 
     #[test]
