@@ -96,6 +96,22 @@ but an unexpired `Running` lease returns busy.
 - Repository identity is the canonical `git rev-parse --git-common-dir`
   identity. Main, nested, and linked worktrees of one repository therefore
   share the repository lock key.
+- `GitPathIdentity` is a comparison value, not a filesystem path.
+  `normalized_path` and `canonical_path` are case-folded and separator-folded
+  for comparison and are not guaranteed to be openable. Anything that opens,
+  creates, or removes a file inside the Git directory — the mutation lock in
+  particular — must resolve the real path through `repository_common_dir`.
+  On Windows `Path::canonicalize` returns a verbatim `\\?\C:\...` path, and
+  folding separators without dropping that prefix first yields `/?/c:/...`:
+  Win32 only accepts a *doubled* leading separator as the verbatim marker, so
+  the result is a root-relative path whose first component is a literal `?`,
+  and `CreateFileW` rejects it with `ERROR_INVALID_NAME` (os error 123). The
+  same mangled value is unusable as a `git -C` argument.
+- Managed worktree paths must leave room for Git's own nested state. Git for
+  Windows enforces the 260 character `MAX_PATH` budget through the ANSI path
+  API, and a linked worktree nests state under
+  `.git/worktrees/<name>/rebase-merge/`, which adds well over a hundred
+  characters on top of the worktree path.
 - Eligibility requires a non-bare working tree, repository/common-dir identity,
   a commit-resolving `HEAD`, and a valid default base ref. Bare, unborn,
   missing, non-directory, non-working-tree, and unprobeable paths return typed
