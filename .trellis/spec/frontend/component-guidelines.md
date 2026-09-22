@@ -416,9 +416,25 @@ message) and let the pane read only what those cached. The same multiplication
 applies to derived values and to elements that are not on screen: share a
 projection per distinct runtime selection instead of memoizing one slot a split
 thrashes, and build a closed dropdown's rows only while it is open. The pane's own
-borrow is unweighed (`borrow_session_view_unweighed`); the workspace hands every
-pane back through one weighed release once the tree is built, so weighing per pane
-walked the previously borrowed view's whole timeline once per pane, per frame.
+borrow is unweighed (`borrow_session_view_unweighed`); the pane hands its own
+borrow back once it has been built, and the workspace drops the pane views the
+layout no longer has.
+
+A group pane owns its element tree behind a cached view boundary
+(`SessionGroupPaneView` in `apps/desktop/src/app.rs`). The workbench is a single
+entity, so building the panes inline made every repaint cost N panes and made one
+pane's animation everyone's problem: `Window::request_animation_frame` notifies
+the view whose tree holds the animated element, and that view was always the
+workbench. A cached pane re-renders alone, so a spinner, a shimmer or a
+scrollbar in one pane no longer rebuilds its siblings. Because the pane still
+reads the workbench's state, its view observes the workbench and refreshes on any
+workbench notify — that is what keeps a cached pane from going stale. The same
+rule applies to any long-lived animation inside a pane: a repeating element is a
+frame driver for as long as it is mounted, so it must be reserved for work that
+is actually in flight. The agent thinking shimmer is the worked example: a row's
+`streaming` flag outlives an interrupted turn, so the sweep asks the session
+(`borrowed_session_turn_is_live`) and an idle row keeps the label without the
+animation.
 
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks

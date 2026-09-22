@@ -6071,6 +6071,74 @@ impl Render for SessionGroupTabDrag {
     }
 }
 
+/// One session-group pane's element tree, behind a cached view boundary.
+///
+/// The workbench is a single entity, so every notify rebuilt every pane's
+/// conversation and composer. That multiplied the cost of any repaint by the
+/// number of panes, and it made a pane's own animation everyone's problem:
+/// `Window::request_animation_frame` notifies the view whose tree holds the
+/// animated element, and with the panes built inline that view was always the
+/// workbench. A spinner or a loading shimmer in one pane therefore rebuilt the
+/// whole split, every frame.
+///
+/// A pane that owns its element tree re-renders alone. The pane still reads the
+/// workbench's state, so this view observes the workbench: any workbench notify
+/// refreshes the pane exactly as the inline render did, while a notify raised
+/// inside the pane — its own animation, its virtual list, its text input —
+/// reaches only this entity.
+struct SessionGroupPaneView {
+    workbench: WeakEntity<VibexWorkbench>,
+    group_id: String,
+    pane_id: String,
+}
+
+impl SessionGroupPaneView {
+    fn new(
+        workbench: &Entity<VibexWorkbench>,
+        group_id: String,
+        pane_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The pane renders the workbench's state, so a workbench notify has to
+        // refresh it. Dropping the subscription would freeze the pane at its
+        // first frame.
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+            group_id,
+            pane_id,
+        }
+    }
+}
+
+impl Render for SessionGroupPaneView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let group_id = self.group_id.clone();
+        let pane_id = self.pane_id.clone();
+        workbench.update(cx, |this, cx| {
+            let Some(pane) = this
+                .ui_state
+                .sidebar
+                .organization
+                .group(&group_id)
+                .and_then(|group| group.layout.find_pane(&pane_id))
+                .cloned()
+            else {
+                return Empty.into_any_element();
+            };
+            let element = this.render_session_group_pane(&group_id, pane, window, cx);
+            // The pane borrowed its own view for the render pass. Hand the
+            // primary back here so the invariant every non-pane path relies on
+            // holds once this pane has been built.
+            this.release_session_view_unweighed();
+            element
+        })
+    }
+}
+
 /// Where a session tab would land inside a group workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionGroupPaneDropRegion {
@@ -6644,6 +6712,12 @@ pub struct VibexWorkbench {
     right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
     /// Group members whose parked view is being fetched.
     session_group_view_loads: BTreeSet<String>,
+    /// One cached view per rendered group pane, keyed by pane id.
+    ///
+    /// A pane that owns its element tree re-renders without rebuilding its
+    /// siblings, so the frame cost of a split stops growing with the number of
+    /// panes. Entries are dropped with the panes the layout no longer has.
+    session_group_pane_views: BTreeMap<String, Entity<SessionGroupPaneView>>,
     sidebar_organization_drop_target: Option<SidebarOrganizationDropTarget>,
     sidebar_organization_root_drop_target:
         Option<(Vec<SidebarOrganizationItem>, SidebarOrganizationScope)>,
@@ -7597,6 +7671,7 @@ impl VibexWorkbench {
             session_group_pane_drop_target: None,
             right_rail_activity_drop_target: None,
             session_group_view_loads: BTreeSet::new(),
+            session_group_pane_views: BTreeMap::new(),
             sidebar_organization_drop_target: None,
             sidebar_organization_root_drop_target: None,
             sidebar_auto_archive_task: None,
@@ -16103,6 +16178,18 @@ impl VibexWorkbench {
     }
 
     /// Whether the live view's session has an Agent turn in flight.
+    /// Whether the borrowed view's session has a turn in flight.
+    ///
+    /// A row's `streaming` flag says "this row is the unfinished tail of a
+    /// turn"; it stays set when a turn was interrupted, because nothing ever
+    /// finalizes those items. Anything that *animates* while a row streams has
+    /// to ask the session instead: an interrupted turn left a repeating shimmer
+    /// running in every pane holding that session, which kept the whole
+    /// workbench repainting at frame rate with no work in flight.
+    fn borrowed_session_turn_is_live(&self) -> bool {
+        agent_turn_is_active(self.live_turn_pending(), self.live_agent_session_state())
+    }
+
     fn live_turn_pending(&self) -> bool {
         self.timeline
             .session_id
@@ -33712,7 +33799,6 @@ impl VibexWorkbench {
         &mut self,
         group_id: &str,
         group: &SessionGroupUiState,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_session_group_views(group_id, cx);
@@ -33726,11 +33812,14 @@ impl VibexWorkbench {
             None => layout,
         };
         let group_id = group_id.to_string();
-        let pane_tree = self.render_session_group_node(&group_id, node, window, cx);
-        // Each pane borrowed its own view and left it borrowed, so the whole
-        // workspace hands the primary back once. Doing it per pane made a split
-        // store and reload a view twice for every pane, every frame.
-        self.release_session_view();
+        let pane_tree = self.render_session_group_node(&group_id, node, cx);
+        // Every pane releases its own borrow once it has been built, so the
+        // workspace only has to drop the views of panes the layout no longer
+        // has. A maximized workspace still keeps the panes it is not painting:
+        // restoring them must not rebuild their conversations from scratch.
+        let live_panes = group.layout.pane_ids();
+        self.session_group_pane_views
+            .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
         let strings = self.strings();
         v_flex()
             .id("session-group-workspace")
@@ -33784,16 +33873,42 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The cached view that renders one group pane.
+    ///
+    /// Created on first use and kept while the layout has the pane, so a pane's
+    /// element tree survives a frame that did not touch it: a repaint caused by
+    /// one pane's animation, or by the workbench's own chrome, no longer rebuilds
+    /// the other panes' conversations and composers.
+    fn session_group_pane_view(
+        &mut self,
+        group_id: &str,
+        pane_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<SessionGroupPaneView> {
+        if let Some(view) = self.session_group_pane_views.get(pane_id) {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| {
+            SessionGroupPaneView::new(&workbench, group_id.to_string(), pane_id.to_string(), cx)
+        });
+        self.session_group_pane_views
+            .insert(pane_id.to_string(), view.clone());
+        view
+    }
+
     fn render_session_group_node(
         &mut self,
         group_id: &str,
         node: SessionGroupLayout,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
             SessionGroupLayout::Pane { pane } => {
-                self.render_session_group_pane(group_id, pane, window, cx)
+                let pane_view = self.session_group_pane_view(group_id, &pane.id, cx);
+                pane_view
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element()
             }
             SessionGroupLayout::Split {
                 id,
@@ -33852,7 +33967,7 @@ impl VibexWorkbench {
                         resizable_panel()
                             .size(px(600.0 * ratio))
                             .size_range(px(160.0)..gpui::Pixels::MAX)
-                            .child(self.render_session_group_node(group_id, child, window, cx)),
+                            .child(self.render_session_group_node(group_id, child, cx)),
                     );
                 }
                 split.into_any_element()
@@ -43760,10 +43875,12 @@ impl VibexWorkbench {
                     };
                     let pending_tooltip =
                         agent_progress_tooltip(&pending_label, strings.agent_pending_response);
+                    let live = self.borrowed_session_turn_is_live();
                     response = response.child(render_agent_thinking_indicator(
                         &turn.id,
                         &agent_progress_label(&pending_label, strings.agent_pending_response),
                         &pending_tooltip,
+                        live,
                         cx,
                     ));
                 }
@@ -46574,8 +46691,9 @@ impl VibexWorkbench {
             true,
             Instant::now(),
         );
+        let live = self.borrowed_session_turn_is_live();
         let content =
-            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, cx);
+            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, live, cx);
         let toggle_id = row_id.clone();
         let mut container = h_flex()
             .id(row_id.clone())
@@ -46641,7 +46759,8 @@ impl VibexWorkbench {
         );
         let disclosure_visible = summary.has_more;
         let content = if row.streaming {
-            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, cx)
+            let live = self.borrowed_session_turn_is_live();
+            render_agent_thinking_indicator(&row_id, &summary.preview, &summary.tooltip, live, cx)
         } else {
             div()
                 .id(format!("reasoning-preview:{row_id}"))
@@ -52182,7 +52301,7 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
         } else if let Some((group_id, group)) = self.active_session_group() {
-            self.render_session_group_workspace(&group_id, &group, window, cx)
+            self.render_session_group_workspace(&group_id, &group, cx)
         } else {
             self.render_agent_workbench(window, cx)
         };
@@ -54014,6 +54133,7 @@ fn render_agent_thinking_indicator(
     turn_id: &str,
     label: &str,
     tooltip: &str,
+    live: bool,
     cx: &App,
 ) -> AnyElement {
     let label: SharedString = truncate_agent_thinking_label(label).into();
@@ -54025,6 +54145,24 @@ fn render_agent_thinking_indicator(
     // The indicator hugs that label so callers can place a disclosure chevron
     // directly after it. Constrained rows shrink it via `min_w_0` and clip the
     // nowrap label with `overflow_hidden`.
+    // The sweep repeats for as long as it is mounted, so it is reserved for a
+    // turn that is actually in flight. A row whose session is idle keeps the
+    // label and drops the animation.
+    let body: AnyElement = if live {
+        ShimmerText::new(label)
+            .id(animation_id)
+            .text_color(cx.theme().muted_foreground)
+            .duration(AGENT_THINKING_SHIMMER_SWEEP)
+            .spread(AGENT_THINKING_SHIMMER_SPREAD)
+            .into_any_element()
+    } else {
+        div()
+            .min_w_0()
+            .truncate()
+            .text_color(cx.theme().muted_foreground)
+            .child(label)
+            .into_any_element()
+    };
     h_flex()
         .min_w_0()
         .justify_start()
@@ -54037,13 +54175,7 @@ fn render_agent_thinking_indicator(
                 .overflow_hidden()
                 .text_sm()
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .child(
-                    ShimmerText::new(label)
-                        .id(animation_id)
-                        .text_color(cx.theme().muted_foreground)
-                        .duration(AGENT_THINKING_SHIMMER_SWEEP)
-                        .spread(AGENT_THINKING_SHIMMER_SPREAD),
-                ),
+                .child(body),
         )
         .into_any_element()
 }
@@ -67297,6 +67429,29 @@ mod tests {
         assert!(!renderer.contains("set_offset"));
         assert!(!renderer.contains("overflow_x_scroll"));
         assert!(renderer.contains("Tooltip::new(tooltip.clone())"));
+        // The sweep repeats for as long as it is mounted, so it only runs for a
+        // turn that is actually in flight. A row's `streaming` flag outlives an
+        // interrupted turn, and a shimmer left running there kept every pane
+        // holding that session repainting at frame rate.
+        assert!(renderer.contains("let body: AnyElement = if live {"));
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(body, _)| body)
+            .unwrap_or(source);
+        assert_eq!(
+            production
+                .matches("let live = self.borrowed_session_turn_is_live();")
+                .count(),
+            3,
+            "every shimmer site must ask whether the turn is actually live"
+        );
+        let live = source
+            .split_once("    fn borrowed_session_turn_is_live(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn live_turn_pending("))
+            .map(|(body, _)| body)
+            .expect("the live-turn helper should remain inspectable");
+        assert!(live.contains("agent_turn_is_active"));
+        assert!(live.contains("self.live_agent_session_state()"));
     }
 
     #[test]
@@ -81009,8 +81164,7 @@ mod tests {
         assert!(content.contains("self.borrow_session_view_unweighed(&pane_session_id)"));
         assert!(!content.contains("self.borrow_session_view(&pane_session_id)"));
         assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
-        // The composer is built while the pane's own view is borrowed, and the
-        // borrow is handed back by the workspace once every pane has rendered.
+        // The composer is built while the pane's own view is borrowed.
         // Re-borrowing the primary between panes made a split store and reload a
         // view twice for every pane, every frame.
         assert!(content.contains("let composer = self.render_composer(window, cx, focused);"));
@@ -81019,18 +81173,26 @@ mod tests {
             content
                 .contains("session_group_pane_with_composer(conversation, composer, window, cx)")
         );
+        // The pane owns its element tree behind a cached view boundary, so it
+        // also hands its own borrow back; the workspace only drops the views of
+        // panes the layout no longer has.
+        let pane_view = source
+            .split_once("impl Render for SessionGroupPaneView {")
+            .and_then(|(_, tail)| tail.split_once("\n/// Where a session tab would land"))
+            .map(|(body, _)| body)
+            .expect("the pane view should remain inspectable");
+        assert!(pane_view.contains("this.render_session_group_pane(&group_id, pane, window, cx)"));
+        assert!(pane_view.contains("this.release_session_view_unweighed();"));
         let workspace = source
             .split_once("    fn render_session_group_workspace(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_node("))
             .map(|(body, _)| body)
             .expect("group workspace should remain inspectable");
-        let render_panes = workspace
-            .find("self.render_session_group_node(&group_id, node, window, cx)")
-            .expect("the workspace should render its pane tree");
-        let release = workspace
-            .find("self.release_session_view();")
-            .expect("the workspace should hand the borrowed view back once");
-        assert!(render_panes < release);
+        assert!(
+            workspace.contains("self.session_group_pane_views\n            .retain(|pane_id, _|")
+        );
+        assert!(workspace.contains("self.render_session_group_node(&group_id, node, cx)"));
+        assert!(!workspace.contains("self.release_session_view();"));
         // The rendered conversation is the pane's own session, never whatever
         // view happens to be borrowed.
         assert!(!content.contains("selected_session_id"));
