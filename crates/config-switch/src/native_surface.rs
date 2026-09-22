@@ -28,7 +28,7 @@
 //!   than rewritten, because replacing it would silently delete servers the
 //!   user configured by hand.
 
-use vibex_core::ProviderNativeConfigFileKind;
+use vibex_core::{McpServerTransportKind, ProviderNativeConfigFileKind};
 
 /// Separates Vibex-owned regions from user content in TOML and YAML files.
 pub(crate) const MCP_MARKER_START: &str = "# >>> VIBEX MANAGED MCP EXPORT";
@@ -253,6 +253,27 @@ pub(crate) fn native_mcp_absent_reason(agent_id: &str) -> &'static str {
         .find(|row| row.agent_id == agent_id)
         .map(|row| row.mcp_absent_reason)
         .unwrap_or(NO_MCP_FILE)
+}
+
+/// Whether an Agent's native file can express this transport.
+///
+/// A JSON surface carries a full transport object, so it can hold stdio, HTTP
+/// and SSE entries. The TOML and YAML marker blocks Vibex writes only know the
+/// stdio shape, so an HTTP or SSE entry has no representation there and must be
+/// refused rather than silently dropped.
+pub(crate) fn native_mcp_surface_supports_transport(
+    agent_id: &str,
+    transport: McpServerTransportKind,
+) -> bool {
+    let Some(surface) = native_mcp_surface(agent_id) else {
+        return false;
+    };
+    match surface.format {
+        NativeFileFormat::Json => true,
+        NativeFileFormat::Toml | NativeFileFormat::Yaml => {
+            transport == McpServerTransportKind::Stdio
+        }
+    }
 }
 
 /// Every Agent that has a native MCP file, for coverage reporting.

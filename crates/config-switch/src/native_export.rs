@@ -19,8 +19,9 @@ use vibex_db::{
 
 use crate::ProviderConfigService;
 use crate::native_surface::{
-    NativeMcpEntry, NativeMcpTransport, NativeSurfaceError, SKILL_MANIFEST_NAME, SKILLS_DIR_NAME,
-    native_mcp_absent_reason, native_mcp_surface, render_mcp_file, render_skill_manifest,
+    MCP_MARKER_START, NativeFileFormat, NativeMcpEntry, NativeMcpSurface, NativeMcpTransport,
+    NativeSurfaceError, SKILL_MANIFEST_NAME, SKILLS_DIR_NAME, native_mcp_absent_reason,
+    native_mcp_surface, render_mcp_file, render_skill_manifest,
 };
 use crate::secrets::resolve_provider_secret_reference;
 
@@ -48,6 +49,23 @@ const CODEX_PROVIDER_MARKER_LABEL: &str = "Vibex managed TOML block";
 struct ApplyFileError {
     error: Box<VibexError>,
     restored: bool,
+}
+
+/// What a direct (non-previewed) Agent MCP file write achieved.
+///
+/// A market install is user-initiated, so it materializes the Agent's native
+/// file without the preview step. The caller still has to know whether the
+/// Agent can actually receive the server, because an `enabled` matrix row
+/// alone is not delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentNativeMcpWrite {
+    /// The file now contains the enabled servers.
+    Written,
+    /// The file already contained exactly those servers.
+    Unchanged,
+    /// No write happened; the reason is reported so the caller does not claim
+    /// the Agent can receive the server.
+    NotWritten(String),
 }
 
 /// Resolved write targets for one preview.
@@ -170,6 +188,123 @@ impl ProviderConfigService {
     ) -> VibexResult<Vec<ProviderNativeExportRecordSummary>> {
         let conn = self.open_connection()?;
         ProviderNativeExportRepository::list(&conn, request)
+    }
+
+    /// Writes the Agent's currently enabled MCP servers into its own MCP
+    /// configuration file.
+    ///
+    /// This is the delivery path for Agents whose ACP server never forwards
+    /// `session/new.mcpServers` (see [`crate::mcp_delivery`]). A market install
+    /// is itself an explicit, user-initiated action, so it materializes the
+    /// file directly instead of going through the preview flow; it still reuses
+    /// the same renderer, foreign-container guard, backup and atomic replace,
+    /// so it cannot produce a file the previewed export would have refused.
+    pub(crate) fn write_agent_native_mcp(
+        &self,
+        agent_id: &AgentId,
+        servers: &[McpServer],
+    ) -> AgentNativeMcpWrite {
+        let roots = self.native_export_roots(agent_id);
+        write_agent_native_mcp_with_roots(agent_id, servers, &roots)
+    }
+
+    /// Re-materializes the native MCP file of every named Agent that reads one.
+    ///
+    /// A matrix write can enable or disable a server for an Agent whose CLI
+    /// reads its own file (see [`crate::mcp_delivery`]). Without this the file
+    /// would keep a server the user just disabled, or miss one just enabled,
+    /// because the native file is a mirror rather than a live link.
+    ///
+    /// The refresh is best-effort: a native write must never fail the matrix
+    /// mutation the user asked for. The next install or explicit native export
+    /// repairs a file this could not update.
+    pub(crate) fn refresh_agent_native_mcp(
+        &self,
+        conn: &rusqlite::Connection,
+        agent_ids: impl IntoIterator<Item = AgentId>,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for agent_id in agent_ids {
+            if !seen.insert(agent_id.clone())
+                || crate::mcp_delivery::agent_mcp_delivery(agent_id.as_str())
+                    != crate::mcp_delivery::AgentMcpDelivery::NativeFile
+            {
+                continue;
+            }
+            let servers =
+                McpServerRepository::list_enabled_for_agent(conn, &agent_id, ProviderKind::Acp);
+            if let Ok(servers) = servers {
+                let _ = self.write_agent_native_mcp(&agent_id, &servers);
+            }
+        }
+    }
+}
+
+/// Renders and applies one Agent's enabled MCP servers into its native file.
+///
+/// Split from [`ProviderConfigService::write_agent_native_mcp`] so tests can
+/// pin the Agent home to a temporary directory without an Agent snapshot.
+fn write_agent_native_mcp_with_roots(
+    agent_id: &AgentId,
+    servers: &[McpServer],
+    roots: &NativeExportRoots,
+) -> AgentNativeMcpWrite {
+    let Some(surface) = native_mcp_surface(agent_id.as_str()).copied() else {
+        return AgentNativeMcpWrite::NotWritten(format!(
+            "{} has no native MCP configuration file Vibex can write",
+            agent_id.as_str()
+        ));
+    };
+    let Some(home) = native_agent_home(roots) else {
+        return AgentNativeMcpWrite::NotWritten(format!(
+            "the home directory for {} could not be resolved, so there is nowhere safe to write its native MCP file",
+            agent_id.as_str()
+        ));
+    };
+    let target = normalize_lexical(&home.join(surface.relative_path));
+    let mut diagnostics = Vec::new();
+    let mut skipped = Vec::new();
+    let entries = native_mcp_entries(servers, &mut diagnostics, &mut skipped);
+    let before = match read_optional(&target) {
+        Ok(before) => before.unwrap_or_default(),
+        Err(error) => return AgentNativeMcpWrite::NotWritten(error.to_string()),
+    };
+    // Nothing enabled and nothing Vibex owns in the file: leave it alone
+    // instead of creating an empty managed region. An existing managed region
+    // is still rewritten, which is how disabling the last server clears it.
+    if entries.is_empty() && !native_file_has_managed_mcp(&surface, &before) {
+        return AgentNativeMcpWrite::Unchanged;
+    }
+    let rendered = match render_mcp_file(&surface, Some(&before), &entries) {
+        Ok(rendered) => rendered,
+        Err(error) => return AgentNativeMcpWrite::NotWritten(native_surface_refusal(&error)),
+    };
+    let plan = ready_plan(
+        &RequestId::new(),
+        ProviderNativeExportSource::AgentDefault,
+        surface.file_kind,
+        target,
+        before,
+        rendered.content,
+        Some(format!("Vibex managed MCP block for {}", agent_id.as_str())),
+    );
+    if plan.operation_kind == ProviderNativeExportOperationKind::NoOp {
+        return AgentNativeMcpWrite::Unchanged;
+    }
+    match apply_file_plan(&plan) {
+        Ok(()) => AgentNativeMcpWrite::Written,
+        Err(error) => AgentNativeMcpWrite::NotWritten(error.error.to_string()),
+    }
+}
+
+/// Whether a native file already carries a Vibex-managed MCP region.
+///
+/// Used to decide whether an empty enabled set means "nothing to do" or
+/// "remove what Vibex previously wrote".
+fn native_file_has_managed_mcp(surface: &NativeMcpSurface, content: &str) -> bool {
+    match surface.format {
+        NativeFileFormat::Json => content.contains(&format!("\"{}\"", surface.container)),
+        NativeFileFormat::Toml | NativeFileFormat::Yaml => content.contains(MCP_MARKER_START),
     }
 }
 
@@ -1870,6 +2005,121 @@ mod tests {
             .find(|entry| entry.name == "PLAIN")
             .expect("plain env entry survives the round trip");
         assert_eq!(env.value, "value");
+    }
+
+    #[test]
+    fn market_native_mcp_write_lands_where_the_agent_reads_it() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("grok-home");
+        let agent_id = AgentId::parse("grok").unwrap();
+        let servers = vec![stdio_server("Files", "npx")];
+
+        let outcome = write_agent_native_mcp_with_roots(
+            &agent_id,
+            &servers,
+            &NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(outcome, AgentNativeMcpWrite::Written);
+
+        // grok reads `config.toml` `[mcp_servers.<name>]` at launch, which is
+        // the only way a market install can reach it.
+        let target = home.join("config.toml");
+        assert!(target.exists());
+        let written = fs::read_to_string(&target).unwrap();
+        assert!(written.contains("[mcp_servers."));
+        assert!(written.contains("command = \"npx\""));
+
+        // A second write of the same set is a no-op, not a rewrite.
+        let again = write_agent_native_mcp_with_roots(
+            &agent_id,
+            &servers,
+            &NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(again, AgentNativeMcpWrite::Unchanged);
+    }
+
+    #[test]
+    fn market_native_mcp_write_refuses_a_container_the_user_owns() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("grok-home");
+        fs::create_dir_all(&home).unwrap();
+        let target = home.join("config.toml");
+        fs::write(&target, "[mcp_servers.user_owned]\ncommand = \"user\"\n").unwrap();
+
+        let outcome = write_agent_native_mcp_with_roots(
+            &AgentId::parse("grok").unwrap(),
+            &[stdio_server("Files", "npx")],
+            &NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(outcome, AgentNativeMcpWrite::NotWritten(_)));
+        assert!(
+            fs::read_to_string(&target).unwrap().contains("user_owned"),
+            "a file the user owns must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn market_native_mcp_write_reports_an_unresolvable_home() {
+        let outcome = write_agent_native_mcp_with_roots(
+            &AgentId::parse("grok").unwrap(),
+            &[stdio_server("Files", "npx")],
+            &NativeExportRoots::default(),
+        );
+        assert!(matches!(outcome, AgentNativeMcpWrite::NotWritten(_)));
+    }
+
+    #[test]
+    fn market_native_mcp_write_clears_the_managed_region_when_nothing_is_enabled() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("grok-home");
+        let agent_id = AgentId::parse("grok").unwrap();
+        let roots = NativeExportRoots {
+            agent_home: Some(home.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_agent_native_mcp_with_roots(&agent_id, &[stdio_server("Files", "npx")], &roots),
+            AgentNativeMcpWrite::Written
+        );
+        // Disabling the last server has to remove it from the file too, or the
+        // Agent would keep calling a server the user turned off.
+        assert_eq!(
+            write_agent_native_mcp_with_roots(&agent_id, &[], &roots),
+            AgentNativeMcpWrite::Written
+        );
+        let written = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!written.contains("[mcp_servers."));
+    }
+
+    #[test]
+    fn market_native_mcp_write_leaves_an_unmanaged_file_alone() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("grok-home");
+        fs::create_dir_all(&home).unwrap();
+        let target = home.join("config.toml");
+        fs::write(&target, "model = \"gpt-5\"\n").unwrap();
+
+        let outcome = write_agent_native_mcp_with_roots(
+            &AgentId::parse("grok").unwrap(),
+            &[],
+            &NativeExportRoots {
+                agent_home: Some(home.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, AgentNativeMcpWrite::Unchanged);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "model = \"gpt-5\"\n");
     }
 
     #[test]

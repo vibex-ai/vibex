@@ -447,6 +447,51 @@ mod tests {
         }
     }
 
+    /// The market install path sits below the dialect layer, so
+    /// `vibex-config-switch` restates which Agents deviate from the wire path.
+    /// This test fails the moment the two tables disagree, which is what keeps
+    /// a market install from claiming delivery it cannot make.
+    #[test]
+    fn market_delivery_classification_matches_the_dialect_table() {
+        use vibex_config_switch::mcp_delivery::{
+            AgentMcpDelivery, agent_has_native_mcp_file, agent_mcp_delivery,
+        };
+
+        let mut agent_ids: BTreeSet<&str> = agent_dialect_profiles()
+            .iter()
+            .map(|p| p.agent_id)
+            .collect();
+        agent_ids.extend(vibex_core::acp_agent_catalog_entries().iter().map(|e| e.id));
+
+        for agent_id in agent_ids {
+            let delivery = agent_dialect_profile(agent_id).mcp_wire_delivery;
+            let market = agent_mcp_delivery(agent_id);
+            match delivery {
+                McpWireDelivery::Delivered => assert_eq!(
+                    market,
+                    AgentMcpDelivery::Wire,
+                    "{agent_id} forwards the wire but the market treats it as {market:?}"
+                ),
+                McpWireDelivery::NativeConfig => {
+                    assert_eq!(
+                        market,
+                        AgentMcpDelivery::NativeFile,
+                        "{agent_id} reads its own file but the market treats it as {market:?}"
+                    );
+                    assert!(
+                        agent_has_native_mcp_file(agent_id),
+                        "{agent_id} needs a native MCP surface or it has no delivery path"
+                    );
+                }
+                McpWireDelivery::AcceptedButDropped | McpWireDelivery::Rejected => assert_eq!(
+                    market,
+                    AgentMcpDelivery::Unsupported,
+                    "{agent_id} drops or rejects the wire but the market treats it as {market:?}"
+                ),
+            }
+        }
+    }
+
     /// BYOK activates from the presence of `COPILOT_PROVIDER_BASE_URL` alone,
     /// so an inherited dev-shell value would redirect an agent-account session
     /// to a foreign endpoint without any visible signal.

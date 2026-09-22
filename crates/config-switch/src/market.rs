@@ -57,13 +57,16 @@ use serde::Deserialize;
 use vibex_core::{
     AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
     McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest,
+    McpMarketSearchResponse, McpServerTransportKind, ProviderKind, SkillCreateRequest,
     SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
     SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillScopeKind,
     SkillSourceKind, SkillStatus, VibexError, VibexResult,
 };
 use vibex_db::{McpServerRepository, SkillRepository};
 
+use crate::mcp_delivery::{AgentMcpDelivery, agent_has_native_mcp_file, agent_mcp_delivery};
+use crate::native_export::AgentNativeMcpWrite;
+use crate::native_surface::native_mcp_surface_supports_transport;
 use crate::{
     ProviderConfigService, diagnostic, find_existing_mcp_server, normalize_mcp_create_request,
     normalize_skill_create_request, validate_mcp_create_request, validate_skill_create_request,
@@ -1456,15 +1459,62 @@ impl ProviderConfigService {
         let candidate = request.candidate.clone();
         validate_mcp_create_request(&candidate)?;
 
-        let (hostable, skipped): (Vec<AgentId>, Vec<AgentId>) = request
-            .agent_ids
-            .iter()
-            .cloned()
-            .partition(|agent_id| agent_can_host_transport(agent_id, candidate.transport_kind));
+        // Resolve the delivery channel before writing anything. An Agent that
+        // has no channel at all is refused up front instead of getting an
+        // `enabled` row that can never produce a tool.
+        let mut diagnostics = Vec::new();
+        let mut hostable: Vec<AgentId> = Vec::new();
+        let mut native_agents: Vec<AgentId> = Vec::new();
+        let mut skipped: Vec<AgentId> = Vec::new();
+        for agent_id in &request.agent_ids {
+            match agent_mcp_delivery(agent_id.as_str()) {
+                AgentMcpDelivery::Unsupported => {
+                    diagnostics.push(diagnostic(
+                        "marketInstallAgentUnsupported",
+                        agent_id.as_str(),
+                    ));
+                    skipped.push(agent_id.clone());
+                }
+                AgentMcpDelivery::NativeFile => {
+                    if !agent_has_native_mcp_file(agent_id.as_str()) {
+                        diagnostics.push(diagnostic(
+                            "marketInstallAgentUnsupported",
+                            agent_id.as_str(),
+                        ));
+                        skipped.push(agent_id.clone());
+                    } else if native_mcp_surface_supports_transport(
+                        agent_id.as_str(),
+                        candidate.transport_kind,
+                    ) {
+                        hostable.push(agent_id.clone());
+                        native_agents.push(agent_id.clone());
+                    } else {
+                        // A TOML or YAML surface only knows the stdio shape, so
+                        // an HTTP or SSE entry has nowhere to go.
+                        diagnostics.push(diagnostic(
+                            "marketInstallTransportSkipped",
+                            agent_id.as_str(),
+                        ));
+                        skipped.push(agent_id.clone());
+                    }
+                }
+                AgentMcpDelivery::Wire => {
+                    if agent_can_host_transport(agent_id, candidate.transport_kind) {
+                        hostable.push(agent_id.clone());
+                    } else {
+                        diagnostics.push(diagnostic(
+                            "marketInstallTransportSkipped",
+                            agent_id.as_str(),
+                        ));
+                        skipped.push(agent_id.clone());
+                    }
+                }
+            }
+        }
         if hostable.is_empty() {
             return Err(VibexError::validation(
                 "market_install_no_hostable_agent",
-                "none of the selected agents can host this server's transport",
+                "none of the selected agents can receive MCP servers",
             ));
         }
 
@@ -1491,7 +1541,6 @@ impl ProviderConfigService {
                 candidate.clone(),
             )),
         };
-        let mut diagnostics = Vec::new();
         let mut matrix = server.agent_matrix.clone();
         for agent_id in &hostable {
             set_agent_matrix_entry(&mut matrix, agent_id, true, now);
@@ -1509,16 +1558,53 @@ impl ProviderConfigService {
             McpServerRepository::insert(&conn, &server)?;
         }
         McpServerRepository::replace_agent_matrix(&conn, &server.id, &server.agent_matrix)?;
-        let readback = McpServerRepository::get(&conn, &server.id)?.ok_or_else(|| {
+        let mut readback = McpServerRepository::get(&conn, &server.id)?.ok_or_else(|| {
             VibexError::storage(
                 "market_install_readback_missing",
                 "the installed MCP server could not be read back",
             )
         })?;
 
+        // Agents that read their own MCP file receive the server now, not on
+        // some later manual export. A write that cannot happen is not a
+        // delivery, so the enabled row is withdrawn and the Agent is reported
+        // as skipped rather than left claiming a server it cannot call.
+        let mut matrix_rewrite_needed = false;
+        for agent_id in &native_agents {
+            let servers =
+                McpServerRepository::list_enabled_for_agent(&conn, agent_id, ProviderKind::Acp)?;
+            match self.write_agent_native_mcp(agent_id, &servers) {
+                AgentNativeMcpWrite::Written | AgentNativeMcpWrite::Unchanged => {
+                    diagnostics.push(diagnostic(
+                        "marketInstallNativeMcpWritten",
+                        agent_id.as_str(),
+                    ));
+                }
+                AgentNativeMcpWrite::NotWritten(reason) => {
+                    diagnostics.push(diagnostic(
+                        "marketInstallNativeMcpNotWritten",
+                        format!("{}: {reason}", agent_id.as_str()),
+                    ));
+                    set_agent_matrix_entry(&mut readback.agent_matrix, agent_id, false, now);
+                    hostable.retain(|enabled| enabled != agent_id);
+                    skipped.push(agent_id.clone());
+                    matrix_rewrite_needed = true;
+                }
+            }
+        }
+        if matrix_rewrite_needed {
+            McpServerRepository::replace_agent_matrix(&conn, &readback.id, &readback.agent_matrix)?;
+            readback = McpServerRepository::get(&conn, &readback.id)?.ok_or_else(|| {
+                VibexError::storage(
+                    "market_install_readback_missing",
+                    "the installed MCP server could not be read back",
+                )
+            })?;
+        }
+
         if !skipped.is_empty() {
             diagnostics.push(diagnostic(
-                "marketInstallTransportSkipped",
+                "marketInstallSkippedAgents",
                 skipped
                     .iter()
                     .map(|agent_id| agent_id.as_str())

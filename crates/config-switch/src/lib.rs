@@ -76,6 +76,7 @@ use vibex_db::{
 };
 
 mod market;
+pub mod mcp_delivery;
 mod native_export;
 mod native_import;
 mod native_surface;
@@ -1923,13 +1924,18 @@ impl ProviderConfigService {
 
     pub fn delete_mcp_server(&self, request: McpServerDeleteRequest) -> VibexResult<()> {
         let conn = self.open_connection()?;
-        if McpServerRepository::get(&conn, &request.mcp_server_id)?.is_none() {
-            return Err(
-                VibexError::validation("mcp_server_not_found", "MCP server was not found")
-                    .with_diagnostic("mcpServerId", request.mcp_server_id.as_str()),
-            );
-        }
-        McpServerRepository::soft_delete(&conn, &request.mcp_server_id)
+        let server = McpServerRepository::get(&conn, &request.mcp_server_id)?.ok_or_else(|| {
+            VibexError::validation("mcp_server_not_found", "MCP server was not found")
+                .with_diagnostic("mcpServerId", request.mcp_server_id.as_str())
+        })?;
+        McpServerRepository::soft_delete(&conn, &request.mcp_server_id)?;
+        // A deleted server must disappear from every Agent that reads its own
+        // MCP file, not just from the database.
+        self.refresh_agent_native_mcp(
+            &conn,
+            server.agent_matrix.into_iter().map(|entry| entry.agent_id),
+        );
+        Ok(())
     }
 
     pub fn set_mcp_server_provider_matrix(
@@ -1973,6 +1979,7 @@ impl ProviderConfigService {
                     .with_diagnostic("mcpServerId", request.mcp_server_id.as_str()),
             );
         }
+        let previous = McpServerRepository::list_agent_matrix(&conn, &request.mcp_server_id)?;
         let now = unix_timestamp_ms();
         let matrix = request
             .agent_matrix
@@ -1985,6 +1992,15 @@ impl ProviderConfigService {
             })
             .collect::<Vec<_>>();
         McpServerRepository::replace_agent_matrix(&conn, &request.mcp_server_id, &matrix)?;
+        // An Agent that reads its own MCP file has to see the new state now,
+        // including the Agents this matrix dropped entirely.
+        self.refresh_agent_native_mcp(
+            &conn,
+            previous
+                .into_iter()
+                .map(|entry| entry.agent_id)
+                .chain(matrix.iter().map(|entry| entry.agent_id.clone())),
+        );
         McpServerRepository::get(&conn, &request.mcp_server_id)?.ok_or_else(|| {
             VibexError::storage(
                 "mcp_server_agent_matrix_readback_failed",
@@ -11335,6 +11351,56 @@ args = ["--root", "/tmp/workspace"]
                 .agent_matrix
                 .iter()
                 .any(|entry| entry.agent_id == codex_agent && entry.enabled)
+        );
+    }
+
+    #[test]
+    fn market_install_only_enables_agents_that_can_receive_mcp() {
+        let dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(dir.path().join("vibex.db"));
+        let claude = AgentId::parse("claude").unwrap();
+        let pi = AgentId::parse("pi").unwrap();
+        let result = service
+            .install_mcp_market_entry(vibex_core::McpMarketInstallRequest {
+                entry_id: "mcp-server/test".to_string(),
+                agent_ids: vec![claude.clone(), pi.clone()],
+                env_values: Vec::new(),
+                candidate: McpServerCreateRequest {
+                    display_name: "Market Files".to_string(),
+                    transport_kind: McpServerTransportKind::Stdio,
+                    status: McpServerStatus::Enabled,
+                    scope_kind: McpServerScopeKind::User,
+                    project_id: None,
+                    workspace_id: None,
+                    command: Some("mcp-files".to_string()),
+                    args: vec!["--root".to_string()],
+                    env: Vec::new(),
+                    url: None,
+                    headers: Vec::new(),
+                    description: Some("From the market".to_string()),
+                    tags: vec!["market".to_string()],
+                    secret_references: Vec::new(),
+                    provider_matrix: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        // A wire Agent is enabled; an Agent with no delivery path is refused
+        // instead of being reported as installed.
+        assert_eq!(result.enabled_agent_ids, vec![claude.clone()]);
+        assert_eq!(result.skipped_agent_ids, vec![pi]);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "marketInstallAgentUnsupported")
+        );
+        assert!(
+            result
+                .server
+                .agent_matrix
+                .iter()
+                .any(|entry| entry.agent_id == claude && entry.enabled)
         );
     }
 
