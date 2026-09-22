@@ -38,7 +38,10 @@ pub mod usage;
 pub mod workbench;
 pub mod workspace;
 
-pub use acp_catalog::{AcpAgentCatalogEntry, acp_agent_catalog_entries};
+pub use acp_catalog::{
+    ACP_AGENT_MANUAL_VERSION, AcpAgentCatalogEntry, acp_agent_catalog_entries,
+    acp_agent_verified_version,
+};
 
 pub use agent::{
     AgentCommandDiscoverRequest, AgentCommandDiscoverResponse, AgentCommandDiscovery,
@@ -320,6 +323,7 @@ pub use remote::{
     RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
     RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
     RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
+    RemoteAgentRollbackManagedAgentRequest, RemoteAgentRollbackManagedAgentResponse,
     RemoteAgentRuntimeEventsRequest, RemoteAgentRuntimeEventsResponse,
     RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
     RemoteAgentRuntimeProbeCancelRequest, RemoteAgentRuntimeProbeCancelResponse,

@@ -27,7 +27,7 @@ use vibex_config_switch::ProviderConfigService;
 use vibex_core::{
     AgentCommandConfig, AgentId, AgentListRequest, AgentManagedDistributionKind,
     AgentManagedInstallState, AgentManagedInstallStatus, AgentUpdateConfigRequest, VibexError,
-    VibexResult, acp_registry_agent_id, unix_timestamp_ms,
+    VibexResult, acp_agent_verified_version, acp_registry_agent_id, unix_timestamp_ms,
 };
 use vibex_db::{
     AgentManagedInstallationRecord, AgentManagedInstallationRepository, apply_migrations,
@@ -265,7 +265,19 @@ impl AgentInstallService {
 
     pub async fn install(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
         let _guard = self.acquire_agent_operation(&agent_id).await;
-        self.install_locked(agent_id).await
+        self.install_locked(agent_id, ManagedInstallTarget::Latest)
+            .await
+    }
+
+    /// Installs the Adapter version Vibex verified for this Agent, replacing a
+    /// newer one if that is what is installed.
+    ///
+    /// This is the only install path that may move an installation backwards,
+    /// and it is deliberately explicit: nothing calls it on the user's behalf.
+    pub async fn rollback(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
+        let _guard = self.acquire_agent_operation(&agent_id).await;
+        self.install_locked(agent_id, ManagedInstallTarget::Verified)
+            .await
     }
 
     /// Restores an existing healthy installation during startup without
@@ -290,12 +302,15 @@ impl AgentInstallService {
             )?;
             return Ok(record.state);
         }
-        self.install_locked(agent_id).await
+        self.install_locked(agent_id, ManagedInstallTarget::Latest)
+            .await
     }
 
     pub async fn check_update(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
         let _guard = self.acquire_agent_operation(&agent_id).await;
-        let (registry_id, entry) = self.load_install_entry(&agent_id, true).await?;
+        let (registry_id, entry) = self
+            .load_install_entry(&agent_id, true, ManagedInstallTarget::Latest)
+            .await?;
         let distribution = resolve_distribution(&entry)?;
         let now = unix_timestamp_ms();
         let existing = self.read_record(&agent_id)?;
@@ -495,10 +510,31 @@ impl AgentInstallService {
             .collect())
     }
 
-    async fn install_locked(&self, agent_id: AgentId) -> VibexResult<AgentManagedInstallState> {
-        let (registry_id, entry) = self.load_install_entry(&agent_id, false).await?;
+    async fn install_locked(
+        &self,
+        agent_id: AgentId,
+        target: ManagedInstallTarget,
+    ) -> VibexResult<AgentManagedInstallState> {
+        let (registry_id, entry) = self.load_install_entry(&agent_id, false, target).await?;
         let distribution = resolve_distribution(&entry)?;
         let distribution_kind = distribution.kind();
+        // A binary archive names one release and carries no version to swap,
+        // so an Agent distributed that way has nothing to roll back to even
+        // when the catalog pins a version for it. This is decided on the
+        // resolved distribution, not the entry, because an Agent may publish
+        // binaries for other platforms and npm for this one.
+        if target == ManagedInstallTarget::Verified
+            && !matches!(
+                distribution,
+                ResolvedDistribution::Npm(_) | ResolvedDistribution::Uvx(_)
+            )
+        {
+            return Err(VibexError::capability(
+                "agent_verified_version_unsupported",
+                "This Agent's distribution cannot be installed at a specific version",
+            )
+            .with_diagnostic("agentId", agent_id.as_str().to_string()));
+        }
         let (node_runtime, uv_runtime) = match &distribution {
             ResolvedDistribution::Npm(_) => (
                 Some(
@@ -522,7 +558,11 @@ impl AgentInstallService {
         let previous_is_usable = previous
             .as_ref()
             .is_some_and(record_has_usable_installation);
-        if previous_is_usable
+        // Only the channel target refuses to go backwards. A verified-version
+        // install exists precisely to return to the version Vibex tested, and
+        // the offer is only made when it differs from what is installed.
+        if target == ManagedInstallTarget::Latest
+            && previous_is_usable
             && let Some(installed_version) = previous
                 .as_ref()
                 .and_then(|record| record.state.installed_version.as_deref())
@@ -780,6 +820,19 @@ impl AgentInstallService {
     }
 
     async fn load_install_entry(
+        &self,
+        agent_id: &AgentId,
+        force_registry: bool,
+        target: ManagedInstallTarget,
+    ) -> VibexResult<(String, RegistryEntry)> {
+        let (registry_id, entry) = self
+            .load_channel_install_entry(agent_id, force_registry)
+            .await?;
+        Ok((registry_id, pin_entry_to_target(agent_id, entry, target)?))
+    }
+
+    /// The entry an Agent's own release channel currently publishes.
+    async fn load_channel_install_entry(
         &self,
         agent_id: &AgentId,
         force_registry: bool,
@@ -2947,6 +3000,71 @@ fn managed_npm_companion_for_registry_id(registry_agent_id: &str) -> Option<&'st
         "pi-acp" => Some(PI_COMMAND_NAME),
         _ => None,
     }
+}
+
+/// Which Adapter version an install request targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedInstallTarget {
+    /// Whatever the Agent's own release channel currently publishes.
+    Latest,
+    /// The version Vibex verified and pinned in its catalog.
+    ///
+    /// This is the only target allowed to move an installation backwards. The
+    /// pin is Vibex's own compatibility statement, so a user asking for it is
+    /// not the stale-candidate case `reject_semver_downgrade` guards against.
+    Verified,
+}
+
+/// Rewrites a resolved entry to the exact version an install request targets.
+///
+/// The distribution's exact spec and `entry.version` are read by the parser,
+/// the install fingerprint, and the version the record reports, so they move
+/// together or not at all. Whether the Agent's distribution can be installed
+/// at a specific version at all is decided after resolution, where the
+/// platform's distribution is known.
+fn pin_entry_to_target(
+    agent_id: &AgentId,
+    mut entry: RegistryEntry,
+    target: ManagedInstallTarget,
+) -> VibexResult<RegistryEntry> {
+    if target == ManagedInstallTarget::Latest {
+        return Ok(entry);
+    }
+    let verified = acp_agent_verified_version(agent_id.as_str()).ok_or_else(|| {
+        VibexError::capability(
+            "agent_verified_version_unavailable",
+            "Agent has no Vibex-verified Adapter version to roll back to",
+        )
+        .with_diagnostic("agentId", agent_id.as_str().to_string())
+    })?;
+    if let Some(npx) = entry.distribution.npx.as_mut() {
+        npx.package = repin_npm_spec(&npx.package, verified);
+    }
+    if let Some(uvx) = entry.distribution.uvx.as_mut() {
+        uvx.package = repin_uvx_spec(&uvx.package, verified);
+    }
+    entry.version = verified.to_string();
+    Ok(entry)
+}
+
+/// Replaces the version of an exact npm spec, keeping the package identity.
+/// `rsplit_once('@')` leaves a leading scope `@` alone.
+fn repin_npm_spec(spec: &str, version: &str) -> String {
+    let package = spec.rsplit_once('@').map_or(spec, |(package, _)| package);
+    format!("{package}@{version}")
+}
+
+/// Replaces the version of an exact uvx spec, keeping both the package
+/// identity and whichever separator the Registry used. Hermes carries an
+/// extras suffix (`hermes-cli[acp]==0.19.0`) that must survive the rewrite.
+fn repin_uvx_spec(spec: &str, version: &str) -> String {
+    if let Some((package, _)) = spec.rsplit_once("==") {
+        return format!("{package}=={version}");
+    }
+    if let Some((package, _)) = spec.rsplit_once('@') {
+        return format!("{package}@{version}");
+    }
+    format!("{spec}=={version}")
 }
 
 fn resolve_distribution(entry: &RegistryEntry) -> VibexResult<ResolvedDistribution> {
@@ -5745,6 +5863,94 @@ mod tests {
         );
         assert!(parse_exact_npm_spec("agent@^1.2.3", "1.2.3").is_err());
         assert!(parse_exact_npm_spec("agent@1.2.4", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn repinned_specs_keep_the_package_identity_and_reparse() {
+        // A leading scope `@` must survive the version swap.
+        assert_eq!(
+            repin_npm_spec("@openma/deepseek-harness-acp@0.4.33", "0.4.32"),
+            "@openma/deepseek-harness-acp@0.4.32"
+        );
+        assert_eq!(repin_npm_spec("pi-acp@0.0.33", "0.0.32"), "pi-acp@0.0.32");
+        assert_eq!(
+            parse_exact_npm_spec(
+                &repin_npm_spec("@openma/deepseek-harness-acp@0.4.33", "0.4.32"),
+                "0.4.32"
+            )
+            .unwrap(),
+            ("@openma/deepseek-harness-acp", "0.4.32")
+        );
+
+        // uvx keeps both its separator style and an extras suffix.
+        assert_eq!(
+            repin_uvx_spec("hermes-agent[acp]==0.19.0", "0.18.0"),
+            "hermes-agent[acp]==0.18.0"
+        );
+        assert_eq!(
+            repin_uvx_spec("minion-code@0.1.44", "0.1.43"),
+            "minion-code@0.1.43"
+        );
+        assert_eq!(
+            repin_uvx_spec("fast-agent-acp", "1.0.0"),
+            "fast-agent-acp==1.0.0"
+        );
+        assert_eq!(
+            parse_exact_uvx_spec(
+                &repin_uvx_spec("hermes-agent[acp]==0.19.0", "0.18.0"),
+                "0.18.0"
+            )
+            .unwrap()
+            .exact_spec(),
+            "hermes-agent[acp]==0.18.0"
+        );
+    }
+
+    #[test]
+    fn pinning_to_the_verified_version_moves_spec_and_version_together() {
+        let agent = AgentId::parse("deepseek-harness").unwrap();
+        let entry = RegistryEntry {
+            id: "deepseek-harness-acp".to_string(),
+            version: "0.5.0".to_string(),
+            distribution: RegistryDistribution {
+                binary: None,
+                npx: Some(RegistryNpxDistribution {
+                    package: "@openma/deepseek-harness-acp@0.5.0".to_string(),
+                    args: Vec::new(),
+                }),
+                uvx: None,
+                kiro: None,
+            },
+        };
+
+        let pinned = pin_entry_to_target(&agent, entry.clone(), ManagedInstallTarget::Verified)
+            .expect("the catalog pins this Agent");
+        assert_eq!(pinned.version, "0.4.33");
+        assert_eq!(
+            pinned
+                .distribution
+                .npx
+                .as_ref()
+                .expect("npm distribution survives")
+                .package,
+            "@openma/deepseek-harness-acp@0.4.33"
+        );
+        assert_eq!(
+            parse_exact_npm_spec(
+                &pinned.distribution.npx.as_ref().unwrap().package,
+                &pinned.version
+            )
+            .unwrap(),
+            ("@openma/deepseek-harness-acp", "0.4.33")
+        );
+
+        let unchanged = pin_entry_to_target(&agent, entry, ManagedInstallTarget::Latest).unwrap();
+        assert_eq!(unchanged.version, "0.5.0");
+
+        let unpinned = AgentId::parse("devin").unwrap();
+        let error = pin_entry_to_target(&unpinned, unchanged, ManagedInstallTarget::Verified)
+            .expect_err("an Agent Vibex does not pin has nothing to roll back to");
+        assert_eq!(error.code, "agent_verified_version_unavailable");
     }
 
     #[test]

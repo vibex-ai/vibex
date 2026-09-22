@@ -4,7 +4,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::acp_catalog::{AcpAgentCatalogEntry, acp_agent_catalog_entries};
+use crate::acp_catalog::{
+    AcpAgentCatalogEntry, acp_agent_catalog_entries, acp_agent_verified_version,
+};
 use crate::error::{VibexError, VibexResult};
 use crate::provider::{ProviderBindingMetadata, ProviderKind};
 
@@ -161,6 +163,33 @@ impl AgentManagedInstallState {
             self.status,
             AgentManagedInstallStatus::Installed | AgentManagedInstallStatus::UpdateAvailable
         ) && self.installed_version.is_some()
+    }
+
+    /// The Adapter version this installation can be rolled back to — Vibex's
+    /// own catalog pin — or `None` when there is nothing to roll back to.
+    ///
+    /// Three things have to hold, and each rules out a different offer. The
+    /// installation must be usable, because reinstalling from scratch already
+    /// goes through Install. The recorded distribution must install an exact
+    /// version: a binary distribution carries one release archive URL with no
+    /// version to swap, and an Agent Vibex does not pin has no verified
+    /// version at all. Finally the pin must differ from what is installed,
+    /// because reinstalling the same version is not a rollback.
+    ///
+    /// This is derived rather than stored so a snapshot can never carry a
+    /// rollback offer that the catalog has since moved past.
+    pub fn rollback_version(&self, agent_id: &AgentId) -> Option<&'static str> {
+        if !self.has_usable_installation() {
+            return None;
+        }
+        if !matches!(
+            self.distribution_kind,
+            Some(AgentManagedDistributionKind::Npm | AgentManagedDistributionKind::Uvx)
+        ) {
+            return None;
+        }
+        let verified = acp_agent_verified_version(agent_id.as_str())?;
+        (self.installed_version.as_deref() != Some(verified)).then_some(verified)
     }
 }
 
@@ -932,6 +961,56 @@ mod tests {
                 "{latest_managed} must use its Vibex-managed latest CLI distribution"
             );
         }
+    }
+
+    #[test]
+    fn rollback_version_is_offered_only_where_an_exact_version_can_be_installed() {
+        let agent = AgentId::parse("deepseek-harness").unwrap();
+        let installed =
+            |kind: AgentManagedDistributionKind, version: &str| AgentManagedInstallState {
+                managed: true,
+                status: AgentManagedInstallStatus::Installed,
+                distribution_kind: Some(kind),
+                installed_version: Some(version.to_string()),
+                available_version: Some(version.to_string()),
+                last_error_code: None,
+                last_error_message: None,
+                updated_at_ms: None,
+            };
+
+        assert_eq!(
+            installed(AgentManagedDistributionKind::Npm, "0.4.32").rollback_version(&agent),
+            Some("0.4.33")
+        );
+        assert_eq!(
+            installed(AgentManagedDistributionKind::Uvx, "0.4.32").rollback_version(&agent),
+            Some("0.4.33")
+        );
+        assert_eq!(
+            installed(AgentManagedDistributionKind::Npm, "0.4.33").rollback_version(&agent),
+            None,
+            "reinstalling the pinned version is not a rollback"
+        );
+        assert_eq!(
+            installed(AgentManagedDistributionKind::Binary, "0.4.32").rollback_version(&agent),
+            None,
+            "a binary archive names one release and carries no version to swap"
+        );
+
+        let unpinned = AgentId::parse("devin").unwrap();
+        assert_eq!(
+            installed(AgentManagedDistributionKind::Npm, "1.0.0").rollback_version(&unpinned),
+            None,
+            "an Agent Vibex does not pin has no verified version"
+        );
+        assert_eq!(
+            AgentManagedInstallState::not_installed().rollback_version(&agent),
+            None
+        );
+        assert_eq!(
+            AgentManagedInstallState::external().rollback_version(&agent),
+            None
+        );
     }
 
     #[test]

@@ -2204,6 +2204,7 @@ pub enum RemoteProviderOperationKind {
     ProbeAgentRuntimeOptions,
     DiscoverOwnedModelCatalog,
     InstallManagedAgent,
+    RollbackManagedAgent,
     CheckManagedAgentUpdate,
     UninstallManagedAgent,
     DeleteAgentAuthCatalog,
@@ -2536,6 +2537,19 @@ pub struct RemoteAgentInstallManagedAgentRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentInstallManagedAgentResponse {
+    pub state: AgentManagedInstallState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRollbackManagedAgentRequest {
+    pub auth: RemoteAuthProof,
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRollbackManagedAgentResponse {
     pub state: AgentManagedInstallState,
 }
 
@@ -3539,6 +3553,7 @@ pub enum RemoteProviderRequest {
     ProbeAgentRuntimeOptions(RemoteAgentProbeRuntimeOptionsRequest),
     DiscoverOwnedModelCatalog(RemoteAgentOwnedModelCatalogRequest),
     InstallManagedAgent(RemoteAgentInstallManagedAgentRequest),
+    RollbackManagedAgent(RemoteAgentRollbackManagedAgentRequest),
     CheckManagedAgentUpdate(RemoteAgentCheckManagedAgentUpdateRequest),
     UninstallManagedAgent(RemoteAgentUninstallManagedAgentRequest),
     DeleteAgentAuthCatalog(RemoteAgentDeleteAgentAuthCatalogRequest),
@@ -3644,6 +3659,7 @@ impl RemoteProviderRequest {
                 | Self::RefreshAgentSnapshot(_)
                 | Self::ProbeAgentRuntimeOptions(_)
                 | Self::InstallManagedAgent(_)
+                | Self::RollbackManagedAgent(_)
                 | Self::CheckManagedAgentUpdate(_)
                 | Self::UninstallManagedAgent(_)
                 | Self::DeleteAgentAuthCatalog(_)
@@ -3679,6 +3695,7 @@ impl RemoteProviderRequest {
                 RemoteProviderOperationKind::DiscoverOwnedModelCatalog
             }
             Self::InstallManagedAgent(_) => RemoteProviderOperationKind::InstallManagedAgent,
+            Self::RollbackManagedAgent(_) => RemoteProviderOperationKind::RollbackManagedAgent,
             Self::CheckManagedAgentUpdate(_) => {
                 RemoteProviderOperationKind::CheckManagedAgentUpdate
             }

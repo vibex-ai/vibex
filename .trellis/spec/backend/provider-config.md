@@ -346,6 +346,26 @@ environment key and the final ACP authentication decision.
 - Saving a Model whose declared capabilities or wire protocol changed drops that Model's cached `provider_model_runtime_option_snapshots` row. A successful per-Model probe is reused by model id, and the cache key carries no part of the declaration, so without the drop the run options keep advertising the previous vocabulary and an edited declaration looks ignored. An edit that cannot change a probe answer (display name, notes, unrelated fields) keeps the evidence.
 - Pin the route-level `compat: { supportsDeveloperRole: false }` on every route whose `api` is `openai-completions` or `openai-responses`. pi-ai sends a reasoning Model's system prompt in the `developer` role unless the endpoint's compatibility report says the endpoint takes it, and it resolves that report by detecting the provider id and the endpoint — neither of which recognizes a Vibex route, so the OpenAI default `true` stays in force. A gateway that only speaks OpenAI's older vocabulary then rejects the whole turn (`400`, unknown variant `developer`) while the same Model on an Agent account keeps working, and the rejection reaches the run options as a bare JSON-RPC failure. The pin and `reasoningEfforts` travel together: the role only changes once the Model reasons. Never write the pin for an `anthropic-messages` route — Anthropic Messages offers no such switch, and the Harness refuses a route-level switch no Model on the route can apply rather than ignoring it, which fails the entire settings file.
 - Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as the settings overlay writes it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route.
+- Roll back installs the Adapter version Vibex pins in its own catalog for that
+  Agent, and is the only install target allowed to move an installation
+  backwards. The pin is Vibex's compatibility statement, so a user asking for
+  it is not the stale-candidate case the channel target rejects; scoping
+  `reject_semver_downgrade` to the channel target is what keeps both rules
+  true at once.
+- Offer the rollback only where it can actually complete: a usable managed
+  installation, a recorded npm or uvx distribution, and a catalog pin that
+  differs from the installed version. A binary distribution carries one
+  release archive URL with no version to swap, and an Agent whose catalog entry
+  is `manual` has no pin at all, so neither may show the action. Derive this
+  from the installation state and the catalog rather than storing it, so a
+  snapshot can never offer a version the catalog has since moved past.
+- Move the distribution's exact spec and the entry version together when
+  pinning, because the parser, the install fingerprint, and the version the
+  record reports all read both. A rewrite that changes only one leaves an entry
+  the installer rejects as `agent_npm_spec_invalid`.
+- A rollback is not a hold. The Agent keeps tracking its own release channel
+  afterwards, so the next update check may report a newer version again; that
+  is the user's decision to make, not a state Vibex pins them into.
 - Provider, protocol, endpoint, credential, or model changes remain process-scoped and require restart and resume.
 
 ### 3. Tests Required
@@ -2926,10 +2946,10 @@ APIs but does not participate in the online route above.
 
 ### 1. Scope / Trigger
 
-- Trigger: the user clicks Add, Upgrade, or Uninstall for an ACP Agent whose
-  `AgentDefinition` maps to either the verified ACP Registry or a documented
-  Vibex-managed latest CLI channel. The right-hand Config Center panel is the
-  user-visible operation surface.
+- Trigger: the user clicks Add, Upgrade, Roll back to the Vibex-verified
+  version, or Uninstall for an ACP Agent whose `AgentDefinition` maps to either
+  the verified ACP Registry or a documented Vibex-managed latest CLI channel.
+  The right-hand Config Center panel is the user-visible operation surface.
 - Agents without a verified Registry distribution or an explicit managed
   latest channel remain external-CLI Agents; Vibex does not download or
   replace their user-installed command.
@@ -2938,6 +2958,7 @@ APIs but does not participate in the online route above.
 
 ```text
 AgentInstallService::install(agent_id).await
+AgentInstallService::rollback(agent_id).await
 AgentInstallService::check_update(agent_id).await
 AgentInstallService::uninstall(agent_id).await
 AgentInstallService::bootstrap_agent_ids() -> Vec<AgentId>
@@ -2982,6 +3003,34 @@ AgentManagedInstallationRecord {
   PyPI identity with optional validated extras, the version must be exact
   SemVer, and it must equal the resolved entry version; ranges, URLs, VCS
   references, and local paths are rejected before `uv` runs.
+- Roll back installs the Adapter version Vibex pins in its own catalog for that
+  Agent, and is the only install target allowed to move an installation
+  backwards. The pin is Vibex's compatibility statement, so a user asking for
+  it is not the stale-candidate case the channel target rejects; scoping
+  `reject_semver_downgrade` to the channel target is what keeps both rules true
+  at once.
+- Offer the rollback only where it can actually complete: a usable managed
+  installation, a resolved npm or uvx distribution, and a catalog pin that
+  differs from the installed version. A binary archive names one release and
+  carries no version to swap, and an Agent whose catalog entry is `manual` has
+  no pin at all, so neither may show the action. Decide this on the
+  platform-resolved distribution, not the entry, because an Agent may publish
+  binaries for other platforms and npm for this one. Derive the offer from the
+  installation state and the catalog rather than storing it, so a snapshot can
+  never advertise a version the catalog has since moved past.
+- Move the distribution's exact spec and the entry version together when
+  pinning, because the parser, the install fingerprint, and the version the
+  record reports all read both. Rewriting only one leaves an entry the
+  installer rejects as `agent_npm_spec_invalid`/`agent_uvx_spec_not_exact`.
+  Keep the package identity intact: a leading npm scope `@`, a uvx extras
+  suffix such as `hermes-agent[acp]`, and whichever uvx separator the Registry
+  used all survive the version swap.
+- A rollback is not a hold. The Agent keeps tracking its own release channel
+  afterwards, so the next update check may report a newer version again; that
+  is the user's decision to make, not a state Vibex pins them into.
+- A rollback re-probes runtime options after refreshing the snapshot, because
+  the Adapter version decides which model catalogue the Agent advertises and
+  the options the newer version reported no longer apply.
 - Pi is a managed npm bundle: Vibex installs the Registry-pinned `pi-acp`
   Adapter and resolves the latest published `@earendil-works/pi-coding-agent`
   runtime before installing both exact versions in the same isolated tree.
@@ -3094,7 +3143,14 @@ AgentManagedInstallationRecord {
   fails closed without probing a user-global Agent command.
 - Download or extraction timeout -> bounded process error and a persisted
   `Failed`/`UpdateAvailable` state suitable for retry.
-- Registry downgrade candidate -> `conflict/agent_install_downgrade_rejected`.
+- Registry downgrade candidate on the channel target ->
+  `conflict/agent_install_downgrade_rejected`. The verified-version target is
+  exempt by design; it is the one path whose whole purpose is to go backwards.
+- Rollback for an Agent whose catalog entry is `manual` ->
+  `capability/agent_verified_version_unavailable`.
+- Rollback for an Agent whose platform distribution is a binary archive or the
+  Kiro manifest -> `capability/agent_verified_version_unsupported`. Neither
+  carries a version to swap, so no partial or mislabelled install is written.
 - Missing, unexecutable, malformed, pre-22 Node/npm, or pre-22.19 Node/npm for
   Pi -> reject that candidate and continue through system then managed runtime
   fallback.
@@ -3128,6 +3184,13 @@ AgentManagedInstallationRecord {
 - Base: opening Config Center reads the cached installation state without
   downloading; an explicit Check for updates refreshes the Registry and any
   applicable official latest CLI channel.
+- Good: an Agent installed ahead of Vibex's pin offers Roll back with the
+  verified version beside the installed one; rolling back installs that exact
+  version, the offer disappears because the pin now equals what is installed,
+  and the next update check may legitimately report a newer version again.
+- Base: an Agent installed at the pinned version, one distributed only as a
+  binary archive, and one with a `manual` catalog entry show no Roll back
+  action at all.
 - Good: removing an Agent deletes its command, installation row, and auth
   catalog; a later startup does not reinstall it unless the user adds it again.
 - Good: Codex can continue downloading while Claude is toggled or checked; each
@@ -3155,15 +3218,23 @@ AgentManagedInstallationRecord {
   Node launcher syntax, Minion's exact ACP runtime dependency and legacy
   same-version manifest repair,
   explicit/system/managed `uv` selection and fallback, exact `uvx` and Hermes
-  `[acp]` extra parsing, metadata entry-point validation, relocatable Python
-  cache recovery, interrupted recovery, and uninstall cleanup.
+  `[acp]` extra parsing, metadata entry-point validation, relocatable Pythoncache recovery, interrupted recovery, and uninstall cleanup.
+- `cargo test -p vibex-core agent_config` covers the rollback offer: an npm or
+  uvx installation on a version other than the pin offers it, the pinned
+  version itself, a binary distribution, an unpinned Agent, and a
+  not-installed or external state do not.
+- `cargo test -p vibex-desktop-runtime repinned_specs` and
+  `pinning_to_the_verified_version` cover the version swap: a leading npm
+  scope, a uvx extras suffix, both uvx separators, the unchanged channel
+  target, and `agent_verified_version_unavailable` for an unpinned Agent.
+  The repinned spec must still parse against its own entry version.
 - `cargo test -p vibex-config-switch agent` covers removal of runtime and auth
   snapshots plus managed command/version matching.
 - `cargo test -p vibex-agent-acp runtime` covers dynamic managed identities,
   conservative event/pool/restore/evidence behavior, and exact external
   descriptor compatibility.
-- Desktop management tests cover Add loading, upgrade loading, failed-install
-  detail rendering, and Agent registry refresh events.
+- Desktop management tests cover Add loading, upgrade loading, rollback
+  loading, failed-install detail rendering, and Agent registry refresh events.
 - `cargo test -p vibex-desktop agent_mutations_are_keyed_by_their_target_agent
   --locked` asserts every concurrent Agent mutation maps to its target id and
   unrelated ids remain independently actionable.

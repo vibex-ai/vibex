@@ -152,7 +152,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "devin",
         "Devin CLI",
         "Cognition's Devin for Terminal via Agent Client Protocol",
-        "manual",
+        ACP_AGENT_MANUAL_VERSION,
         "https://cli.devin.ai/docs",
         &["devin", "acp"],
     ),
@@ -252,7 +252,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "kiro",
         "Kiro CLI",
         "Amazon's AI coding agent with native ACP support",
-        "manual",
+        ACP_AGENT_MANUAL_VERSION,
         "https://kiro.dev/docs/cli/acp/",
         &["kiro-cli", "acp"],
     ),
@@ -356,6 +356,25 @@ pub fn acp_agent_catalog_entries() -> &'static [AcpAgentCatalogEntry] {
     ACP_AGENT_CATALOG
 }
 
+/// Catalog version marker for an Agent Vibex does not pin.
+///
+/// The Adapter ships its own installer, so Vibex has no verified version to
+/// install and nothing to roll back to.
+pub const ACP_AGENT_MANUAL_VERSION: &str = "manual";
+
+/// The Adapter version Vibex verified for an Agent — its catalog pin.
+///
+/// `None` when the Agent is not catalog-managed or its catalog entry declares
+/// no verified version. Callers that can act on the answer must also check
+/// that the Agent's distribution installs an exact version at all.
+pub fn acp_agent_verified_version(agent_id: &str) -> Option<&'static str> {
+    acp_agent_catalog_entries()
+        .iter()
+        .find(|entry| entry.id == agent_id)
+        .map(|entry| entry.version)
+        .filter(|version| *version != ACP_AGENT_MANUAL_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -405,5 +424,17 @@ mod tests {
             &["npx", "-y", "@openma/deepseek-harness-acp@0.4.33"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
+    }
+
+    #[test]
+    fn verified_versions_skip_agents_vibex_does_not_pin() {
+        assert_eq!(
+            acp_agent_verified_version("deepseek-harness"),
+            Some("0.4.33")
+        );
+        assert_eq!(acp_agent_verified_version("gemini"), Some("0.47.0"));
+        assert_eq!(acp_agent_verified_version("devin"), None);
+        assert_eq!(acp_agent_verified_version("kiro"), None);
+        assert_eq!(acp_agent_verified_version("not-a-catalog-agent"), None);
     }
 }

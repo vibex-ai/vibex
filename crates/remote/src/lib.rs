@@ -424,6 +424,11 @@ pub trait RemoteAgentInstallSource: Send + Sync {
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentManagedInstallState>;
 
+    async fn rollback_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState>;
+
     async fn check_managed_agent_update(
         &self,
         agent_id: vibex_core::AgentId,
@@ -4050,6 +4055,32 @@ async fn dispatch_provider_request(
             )?;
             let value = result?;
             serde_json::to_value(vibex_core::RemoteAgentInstallManagedAgentResponse {
+                state: value,
+            })
+            .map_err(remote_payload_encode_error)
+        }
+        RemoteProviderRequest::RollbackManagedAgent(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth.clone(),
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let agent_id = request.agent_id.clone();
+            let source = agent_install_source(state)?;
+            let result = source.rollback_managed_agent(agent_id.clone()).await;
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "agent_rollback".to_string(),
+                "Managed Agent rolled back to the Vibex-verified version from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let value = result?;
+            serde_json::to_value(vibex_core::RemoteAgentRollbackManagedAgentResponse {
                 state: value,
             })
             .map_err(remote_payload_encode_error)

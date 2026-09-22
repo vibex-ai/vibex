@@ -106,6 +106,13 @@ pub trait ManagementBackend: BackendBound {
         request: MutationRequest<AgentId>,
     ) -> BackendFuture<'_, AgentManagedInstallState>;
 
+    /// Installs the Adapter version Vibex verified for an Agent, which may be
+    /// older than what is currently installed.
+    fn rollback_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState>;
+
     fn check_managed_agent_update(
         &self,
         request: MutationRequest<AgentId>,

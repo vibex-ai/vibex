@@ -603,6 +603,13 @@ impl ManagementBackend for DisconnectedBackend {
         disconnected_future!()
     }
 
+    fn rollback_managed_agent(
+        &self,
+        _request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        disconnected_future!()
+    }
+
     fn check_managed_agent_update(
         &self,
         _request: MutationRequest<AgentId>,

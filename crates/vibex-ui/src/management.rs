@@ -1249,6 +1249,13 @@ mod tests {
             error_future()
         }
 
+        fn rollback_managed_agent(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, AgentManagedInstallState> {
+            error_future()
+        }
+
         fn check_managed_agent_update(
             &self,
             _request: MutationRequest<AgentId>,

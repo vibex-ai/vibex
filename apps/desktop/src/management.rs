@@ -471,6 +471,7 @@ enum ManagementMutation {
     ProviderDisplayOrder(String),
     AgentToggle(String),
     AgentInstall(String),
+    AgentRollback(String),
     AgentUpdateCheck(String),
     AgentUninstall(String),
     AgentDiscovery,
@@ -598,6 +599,7 @@ impl ManagementMutation {
             Self::ProviderDisplayOrder(id) => format!("provider:display-order:{id}"),
             Self::AgentToggle(id) => format!("agent:toggle:{id}"),
             Self::AgentInstall(id) => format!("agent:install:{id}"),
+            Self::AgentRollback(id) => format!("agent:rollback:{id}"),
             Self::AgentUpdateCheck(id) => format!("agent:update-check:{id}"),
             Self::AgentUninstall(id) => format!("agent:uninstall:{id}"),
             Self::AgentDiscovery => "agent:discover".into(),
@@ -635,6 +637,7 @@ impl ManagementMutation {
             ),
             Self::AgentAuth { agent_id, .. }
             | Self::AgentInstall(agent_id)
+            | Self::AgentRollback(agent_id)
             | Self::AgentUpdateCheck(agent_id)
             | Self::AgentUninstall(agent_id)
             | Self::ProviderDisplayOrder(agent_id) => Some(agent_id),
@@ -6201,6 +6204,67 @@ impl ManagementCenter {
         );
     }
 
+    /// Installs the Adapter version Vibex verified for this Agent, which may
+    /// be older than what is installed.
+    fn rollback_managed_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
+            self.error = Some(
+                management_error_text("Invalid Agent id", "Agent 标识无效", "Agent 識別碼無效")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.selected_agent_id = Some(agent_id.clone());
+        let active_locale = locale::current_locale();
+        self.begin_simple_task(
+            ManagementMutation::AgentRollback(agent_id),
+            cx,
+            async move {
+                backend
+                    .management()
+                    .rollback_managed_agent(MutationRequest::new(parsed_agent_id.clone()))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                backend
+                    .management()
+                    .refresh_agent_snapshot(vibex_core::AgentRefreshSnapshotRequest {
+                        agent_id: parsed_agent_id.clone(),
+                        cwd_scope: None,
+                    })
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                // The Adapter version decides which model catalogue the Agent
+                // advertises, so the options the newer version reported must be
+                // replaced rather than kept.
+                let runtime_probe = backend
+                    .agent()
+                    .probe_agent_runtime_options(MutationRequest::new(
+                        AgentRuntimeOptionProbeRequest {
+                            agent_id: parsed_agent_id,
+                        },
+                    ))
+                    .await
+                    .map_err(crate::app::remote_error_into_vibex);
+                let message = management_locale_text_for(
+                    active_locale,
+                    "Agent rolled back to the Vibex-verified version",
+                    "Agent 已回滚到 Vibex 验证版本",
+                    "Agent 已回滾到 Vibex 驗證版本",
+                )
+                .to_string();
+                Ok(management_append_runtime_option_probe(
+                    message,
+                    runtime_probe,
+                    active_locale,
+                ))
+            },
+        );
+    }
+
     fn install_managed_agent(&mut self, agent_id: String, upgrading: bool, cx: &mut Context<Self>) {
         let Ok(parsed_agent_id) = AgentId::parse(agent_id.clone()) else {
             self.error = Some(
@@ -6894,6 +6958,7 @@ impl ManagementCenter {
                     &completed_mutation,
                     ManagementMutation::AgentToggle(_)
                         | ManagementMutation::AgentInstall(_)
+                        | ManagementMutation::AgentRollback(_)
                         | ManagementMutation::AgentUpdateCheck(_)
                         | ManagementMutation::AgentUninstall(_)
                         | ManagementMutation::AgentDiscovery
@@ -9735,7 +9800,8 @@ impl ManagementCenter {
             let added = agent.added;
             let managed_installing = matches!(
                 mutation,
-                Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
+                Some(ManagementMutation::AgentInstall(active_id))
+                    | Some(ManagementMutation::AgentRollback(active_id)) if active_id == &id
             );
             let selected = (added || agent.managed_install.managed || managed_installing)
                 && self.selected_agent_id.as_deref() == Some(id.as_str());
@@ -14108,12 +14174,19 @@ impl ManagementCenter {
             mutation,
             Some(ManagementMutation::AgentInstall(active_id)) if active_id == &id
         );
+        let rolling_back = matches!(
+            mutation,
+            Some(ManagementMutation::AgentRollback(active_id)) if active_id == &id
+        );
         let uninstalling = matches!(
             mutation,
             Some(ManagementMutation::AgentUninstall(active_id)) if active_id == &id
         );
         let update_available =
             state.status == vibex_core::AgentManagedInstallStatus::UpdateAvailable;
+        // Vibex's own catalog pin, offered only where this installation can
+        // actually be moved to it.
+        let rollback_version = state.rollback_version(&agent.id);
         let mut content = v_flex().w_full().gap_2();
         let available_version = state
             .available_version
@@ -14150,6 +14223,17 @@ impl ManagementCenter {
                                     management_locale_text("Available", "可用版本", "可用版本")
                                 ),
                             ))
+                        })
+                        .when_some(rollback_version, |row, version| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: v{version}",
+                                        management_locale_text("Verified", "验证版本", "驗證版本")
+                                    )),
+                            )
                         }),
                 ),
         );
@@ -14205,6 +14289,27 @@ impl ManagementCenter {
                         move |this, _, _, cx| this.install_managed_agent(id.clone(), true, cx)
                     })),
                 management_locale_text("Upgrade", "升级", "升級"),
+            ));
+        }
+        if rollback_version.is_some() {
+            actions = actions.child(management_detail_icon_action(
+                Button::new(SharedString::from(format!(
+                    "management-agent-rollback-{id}"
+                )))
+                .small()
+                .outline()
+                .icon(IconName::Undo2)
+                .loading(rolling_back)
+                .disabled(pending)
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| this.rollback_managed_agent(id.clone(), cx)
+                })),
+                management_locale_text(
+                    "Roll back to the Vibex-verified version",
+                    "回滚到 Vibex 验证版本",
+                    "回滾到 Vibex 驗證版本",
+                ),
             ));
         }
         if agent.added || state.installed_version.is_some() {
@@ -14444,7 +14549,9 @@ impl ManagementCenter {
             &selected_agent.managed_install,
         ) || matches!(
             self.agent_mutations.get(&selected_id),
-            Some(ManagementMutation::AgentInstall(active_id)) if active_id == &selected_id
+            Some(ManagementMutation::AgentInstall(active_id))
+                | Some(ManagementMutation::AgentRollback(active_id))
+                if active_id == &selected_id
         );
         if installation_pending {
             return v_flex()
@@ -23589,9 +23696,14 @@ mod tests {
             .expect("Agent toggle handler should remain inspectable");
         let add = source
             .split_once("    fn set_agent_added(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn install_managed_agent("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn rollback_managed_agent("))
             .map(|(body, _)| body)
             .expect("Agent add handler should remain inspectable");
+        let managed_rollback = source
+            .split_once("    fn rollback_managed_agent(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn install_managed_agent("))
+            .map(|(body, _)| body)
+            .expect("managed Agent rollback handler should remain inspectable");
         let managed_install = source
             .split_once("    fn install_managed_agent(")
             .and_then(|(_, tail)| tail.split_once("\n    fn check_managed_agent_update("))
@@ -23612,6 +23724,13 @@ mod tests {
         // must not reach for the runtime option probe at all.
         assert!(!toggle.contains(".probe_agent_runtime_options("));
         assert_eq!(add.matches(".probe_agent_runtime_options(").count(), 1);
+        assert_eq!(
+            managed_rollback
+                .matches(".probe_agent_runtime_options(")
+                .count(),
+            1,
+            "a rollback changes the Adapter version, so its model catalogue must be re-probed"
+        );
         assert_eq!(
             managed_install
                 .matches(".probe_agent_runtime_options(")

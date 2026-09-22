@@ -874,6 +874,15 @@ impl AgentHandle {
         self.install_service.install(agent_id).await
     }
 
+    /// Installs the Adapter version Vibex verified for this Agent, replacing a
+    /// newer installation when that is what is present.
+    pub async fn rollback_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.install_service.rollback(agent_id).await
+    }
+
     pub async fn check_managed_agent_update(
         &self,
         agent_id: vibex_core::AgentId,
@@ -1430,6 +1439,13 @@ impl vibex_remote::RemoteAgentInstallSource for AgentInstallSource {
         agent_id: vibex_core::AgentId,
     ) -> VibexResult<vibex_core::AgentManagedInstallState> {
         self.agent.install_managed_agent(agent_id).await
+    }
+
+    async fn rollback_managed_agent(
+        &self,
+        agent_id: vibex_core::AgentId,
+    ) -> VibexResult<vibex_core::AgentManagedInstallState> {
+        self.agent.rollback_managed_agent(agent_id).await
     }
 
     async fn check_managed_agent_update(

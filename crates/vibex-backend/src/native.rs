@@ -1686,6 +1686,22 @@ impl ManagementBackend for NativeBackend {
         })
     }
 
+    fn rollback_managed_agent(
+        &self,
+        request: MutationRequest<AgentId>,
+    ) -> BackendFuture<'_, AgentManagedInstallState> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .rollback_managed_agent(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn check_managed_agent_update(
         &self,
         request: MutationRequest<AgentId>,
