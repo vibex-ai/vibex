@@ -436,6 +436,20 @@ is actually in flight. The agent thinking shimmer is the worked example: a row's
 (`borrowed_session_turn_is_live`) and an idle row keeps the label without the
 animation.
 
+A drag over the group workspace is resolved per pane, and only the pane that
+contains the pointer may claim the shared drop target. GPUI dispatches a typed
+`on_drag_move` callback to every rendered target that listens for that drag type,
+so each pane measures the same pointer against its own bounds; the ownership
+check and the region both live in `session_group_pane_drop_region` in
+`apps/desktop/src/app.rs`. A pane the pointer is not inside must neither claim
+the target nor clear a claim another pane just made — release it only while it
+still owns it. Without that check the pane painted last won every move: a tab
+dragged inside its own pane resolved to the "merge into this pane" region, which
+is a no-op for the pane it came from, while the same drag onto the last-painted
+pane still split it. A drag that has not left its own pane cannot reorder tabs,
+so below the tab strip it reads as a split on the axis the pointer left the
+pane's center along.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar

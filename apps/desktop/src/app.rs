@@ -6164,6 +6164,49 @@ struct SessionGroupPaneDropTarget {
     region: SessionGroupPaneDropRegion,
 }
 
+/// The region of `pane_bounds` a drag at `position` asks for, or `None` when
+/// the pointer is not inside that pane.
+///
+/// GPUI calls every `on_drag_move` listener in the window on every move, so all
+/// panes resolve the same pointer against their own bounds and the answer has to
+/// say which pane owns the move. Without that, the pane painted last claimed the
+/// shared drop target, and the pane actually under the pointer fell back to
+/// "merge into this pane" — a no-op for the pane a tab came from, which is why a
+/// drag inside its own pane did nothing while a drag onto another pane split it.
+///
+/// `same_pane` is whether the dragged session already lives in this pane. Such a
+/// drag cannot reorder anything, so the middle of its own pane reads as a
+/// request to split on the axis the pointer left the pane's center along.
+fn session_group_pane_drop_region(
+    pane_bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    same_pane: bool,
+) -> Option<SessionGroupPaneDropRegion> {
+    if !pane_bounds.contains(&position) {
+        return None;
+    }
+    let region = if position.y >= pane_bounds.origin.y + pane_bounds.size.height * 0.72 {
+        SessionGroupPaneDropRegion::Bottom
+    } else if position.x >= pane_bounds.origin.x + pane_bounds.size.width * 0.5 {
+        SessionGroupPaneDropRegion::Right
+    } else if position.y <= pane_bounds.origin.y + pane_bounds.size.height * 0.28 {
+        SessionGroupPaneDropRegion::TabGroup
+    } else {
+        SessionGroupPaneDropRegion::Content
+    };
+    if same_pane && region == SessionGroupPaneDropRegion::Content {
+        let center = pane_bounds.center();
+        return Some(
+            if (position.x - center.x).abs() >= (position.y - center.y).abs() {
+                SessionGroupPaneDropRegion::Right
+            } else {
+                SessionGroupPaneDropRegion::Bottom
+            },
+        );
+    }
+    Some(region)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarGroupDragState {
     group_id: String,
@@ -34727,6 +34770,9 @@ impl VibexWorkbench {
     /// along. Without this the middle of the pane resolved to "move into this
     /// pane", which is a no-op for the source pane, and the only way to split
     /// was to drag the tab onto a different pane.
+    ///
+    /// Only the pane the pointer is inside may claim the target; the region and
+    /// that ownership check both live in [`session_group_pane_drop_region`].
     fn track_session_group_pane_drop(
         &mut self,
         pane_id: &str,
@@ -34735,26 +34781,24 @@ impl VibexWorkbench {
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let mut region = if position.y >= bounds.origin.y + bounds.size.height * 0.72 {
-            SessionGroupPaneDropRegion::Bottom
-        } else if position.x >= bounds.origin.x + bounds.size.width * 0.5 {
-            SessionGroupPaneDropRegion::Right
-        } else if position.y <= bounds.origin.y + bounds.size.height * 0.28 {
-            SessionGroupPaneDropRegion::TabGroup
-        } else {
-            SessionGroupPaneDropRegion::Content
-        };
         let same_pane = dragged_session_id.is_some_and(|session_id| {
             self.session_group_session_pane(session_id).as_deref() == Some(pane_id)
         });
-        if same_pane && region == SessionGroupPaneDropRegion::Content {
-            let center = bounds.center();
-            region = if (position.x - center.x).abs() >= (position.y - center.y).abs() {
-                SessionGroupPaneDropRegion::Right
-            } else {
-                SessionGroupPaneDropRegion::Bottom
-            };
-        }
+        let Some(region) = session_group_pane_drop_region(bounds, position, same_pane) else {
+            // The pointer is not over this pane. Every pane hears every move, so
+            // this one releases the target only while it still owns it: the pane
+            // the pointer moved into may have claimed it already, and clearing
+            // here would throw that claim away.
+            if self
+                .session_group_pane_drop_target
+                .as_ref()
+                .is_some_and(|target| target.pane_id == pane_id)
+            {
+                self.session_group_pane_drop_target = None;
+                cx.notify();
+            }
+            return;
+        };
         let next = SessionGroupPaneDropTarget {
             pane_id: pane_id.to_string(),
             region,
@@ -81071,9 +81115,10 @@ mod tests {
             .expect("pane drop tracking should remain inspectable");
         assert!(track.contains("dragged_session_id: Option<&str>"));
         assert!(track.contains("self.session_group_session_pane(session_id).as_deref()"));
-        assert!(track.contains("if same_pane && region == SessionGroupPaneDropRegion::Content {"));
-        assert!(track.contains("SessionGroupPaneDropRegion::Right"));
-        assert!(track.contains("SessionGroupPaneDropRegion::Bottom"));
+        // The region and the ownership check live in one helper, which the
+        // tracker must delegate to; resolving a region for a pane the pointer is
+        // not inside is the bug this file's region test pins down.
+        assert!(track.contains("session_group_pane_drop_region(bounds, position, same_pane)"));
 
         // The tab drag hands its session to the tracker, so the tracker can tell
         // a same-pane drag from a cross-pane one.
@@ -81094,6 +81139,84 @@ mod tests {
         let after = &pane[focus_on_down..];
         let handler_end = after.find("}))").expect("the capture handler should close");
         assert!(!after[..handler_end].contains("cx.stop_propagation()"));
+    }
+
+    /// A pane answers for a drag move only when the pointer is inside it.
+    ///
+    /// GPUI calls every pane's drag-move listener on every move in the window,
+    /// so each pane resolves the same pointer against its own bounds and writes
+    /// one shared drop target. When a pane the pointer was never in could claim
+    /// that target, the pane painted last won every move: a tab dragged inside
+    /// its own pane landed on the no-op "merge into this pane" region — so
+    /// nothing happened — while a drag onto the pane that happened to paint last
+    /// still split. Both halves of that report come from this resolution.
+    #[test]
+    fn only_the_pane_under_the_pointer_resolves_a_drop_region() {
+        // A 400x600 pane at (400, 100): the left half is x < 600, the tab strip
+        // is y < 268, and the bottom band starts at y = 532.
+        let pane = Bounds {
+            origin: gpui::Point {
+                x: px(400.0),
+                y: px(100.0),
+            },
+            size: Size {
+                width: px(400.0),
+                height: px(600.0),
+            },
+        };
+        let at = |x: f32, y: f32| point(px(x), px(y));
+
+        // A pane the pointer is not inside resolves nothing, whichever region of
+        // its own box the pointer would have landed in. This is what kept a drag
+        // onto the pane under the cursor from being answered by another pane.
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(900.0, 400.0), true),
+            None
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(900.0, 400.0), false),
+            None
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(500.0, 40.0), true),
+            None
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(399.0, 400.0), false),
+            None
+        );
+
+        // Inside the pane the edges keep their meaning: the bottom band wins over
+        // the right half, the right half splits sideways, and the tab strip is
+        // still a merge rather than a split, even for the pane's own tab.
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(700.0, 600.0), true),
+            Some(SessionGroupPaneDropRegion::Bottom)
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(700.0, 400.0), true),
+            Some(SessionGroupPaneDropRegion::Right)
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(500.0, 150.0), true),
+            Some(SessionGroupPaneDropRegion::TabGroup)
+        );
+
+        // The middle of the pane a tab already lives in is a request to split,
+        // along whichever axis the pointer left the center on.
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(500.0, 400.0), true),
+            Some(SessionGroupPaneDropRegion::Right)
+        );
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(580.0, 330.0), true),
+            Some(SessionGroupPaneDropRegion::Bottom)
+        );
+        // The same middle of a pane the tab does not live in just merges it.
+        assert_eq!(
+            session_group_pane_drop_region(pane, at(500.0, 400.0), false),
+            Some(SessionGroupPaneDropRegion::Content)
+        );
     }
 
     /// A row and a pane tab show the Agent the session's view runs, borrowed or
