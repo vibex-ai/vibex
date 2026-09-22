@@ -228,13 +228,13 @@ fn fetch_market_bytes(
             )
             .with_diagnostic("host", url.host_str().unwrap_or_default()));
         }
-        if let Some(length) = response.content_length() {
-            if length > limit {
-                return Err(VibexError::provider(
-                    "market_response_too_large",
-                    "the market response exceeded the size limit",
-                ));
-            }
+        if let Some(length) = response.content_length()
+            && length > limit
+        {
+            return Err(VibexError::provider(
+                "market_response_too_large",
+                "the market response exceeded the size limit",
+            ));
         }
         let host = url.host_str().unwrap_or_default().to_string();
         let mut body = Vec::new();
