@@ -32,6 +32,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::NotificationType,
+    pagination::Pagination,
     scroll::ScrollableElement as _,
     spinner::Spinner,
     switch::Switch,
@@ -801,6 +802,10 @@ pub struct ManagementCenter {
     mcp_market_open: bool,
     mcp_market_query: Entity<InputState>,
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
+    /// 1-based page the MCP market grid is showing.
+    mcp_market_page: usize,
+    /// True when the registry holds entries beyond the fetched window.
+    mcp_market_has_more: bool,
     mcp_market_loading: bool,
     mcp_market_error: Option<String>,
     /// Entry the install form is configuring; `None` while browsing.
@@ -811,6 +816,8 @@ pub struct ManagementCenter {
     skill_market_open: bool,
     skill_market_query: Entity<InputState>,
     skill_market_entries: Vec<vibex_core::SkillMarketEntry>,
+    /// 1-based page the Skill market grid is showing.
+    skill_market_page: usize,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
     /// Entry the install form is configuring; `None` while browsing.
@@ -1580,6 +1587,8 @@ impl ManagementCenter {
             mcp_market_open: false,
             mcp_market_query,
             mcp_market_entries: Vec::new(),
+            mcp_market_page: 1,
+            mcp_market_has_more: false,
             mcp_market_loading: false,
             mcp_market_error: None,
             mcp_market_install_target: None,
@@ -1588,6 +1597,7 @@ impl ManagementCenter {
             skill_market_open: false,
             skill_market_query,
             skill_market_entries: Vec::new(),
+            skill_market_page: 1,
             skill_market_loading: false,
             skill_market_error: None,
             skill_market_install_target: None,
@@ -7708,10 +7718,10 @@ impl ManagementCenter {
         cx.notify();
     }
 
-    /// Load the configured catalog sources.
+    /// Load one window of the registry for the current query.
     ///
-    /// Sources live in the authoritative runtime rather than this view, so a
-    /// paired device sees the same list the desktop does.
+    /// Entries live in the authoritative runtime rather than this view, so a
+    /// paired device sees the same catalog the desktop does.
     fn search_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
@@ -7719,13 +7729,15 @@ impl ManagementCenter {
         let query = self.mcp_market_query.read(cx).value().trim().to_string();
         self.mcp_market_loading = true;
         self.mcp_market_error = None;
+        // A new search is a new result set, so it starts at its first page.
+        self.mcp_market_page = 1;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .search_mcp_market(vibex_core::McpMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    limit: Some(60),
+                    limit: Some(MARKET_FETCH_LIMIT),
                     offset: None,
                 })
                 .await
@@ -7738,6 +7750,7 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(response)) => {
                         this.mcp_market_entries = response.entries;
+                        this.mcp_market_has_more = response.has_more;
                     }
                     Ok(Err(error)) => {
                         this.mcp_market_error = Some(format!("{}: {}", error.code, error.message));
@@ -7924,13 +7937,15 @@ impl ManagementCenter {
         let query = self.skill_market_query.read(cx).value().trim().to_string();
         self.skill_market_loading = true;
         self.skill_market_error = None;
+        // A new search is a new result set, so it starts at its first page.
+        self.skill_market_page = 1;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    limit: Some(60),
+                    limit: Some(MARKET_FETCH_LIMIT),
                     offset: None,
                 })
                 .await
@@ -10521,6 +10536,11 @@ impl ManagementCenter {
         let entries = self.mcp_market_entries.clone();
         let install_target = self.mcp_market_install_target.clone();
         let query_input = self.mcp_market_query.clone();
+        // The pager is drawn against the window in hand, so a page that no
+        // longer exists after a search falls back to the last one.
+        let page = self.mcp_market_page.min(market_page_count(entries.len()));
+        let page_entries = market_page_slice(&entries, page);
+        let has_more = self.mcp_market_has_more;
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
         content =
@@ -10608,7 +10628,7 @@ impl ManagementCenter {
                 .iter()
                 .map(|server| server.display_name.clone())
                 .collect();
-            for entry in &entries {
+            for entry in page_entries {
                 let name = entry.name.clone();
                 let description = entry
                     .description
@@ -10702,6 +10722,31 @@ impl ManagementCenter {
                     .pr_1()
                     .child(grid),
             );
+            if !entries.is_empty() {
+                let entity = cx.weak_entity();
+                content = content.child(management_market_pager(
+                    "management-mcp-market-pagination",
+                    page,
+                    entries.len(),
+                    // The registry pages by cursor, so a fetched window is a
+                    // prefix of a longer catalog rather than all of it.
+                    has_more.then(|| {
+                        management_locale_text(
+                            "The registry holds more servers than this page window; narrow the search to reach them.",
+                            "注册表中还有更多服务，请缩小搜索范围以查看。",
+                            "註冊表中還有更多服務，請縮小搜尋範圍以查看。",
+                        )
+                        .to_string()
+                    }),
+                    move |page, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.mcp_market_page = *page;
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ));
+            }
         }
         content.into_any_element()
     }
@@ -10881,6 +10926,10 @@ impl ManagementCenter {
         // The index cannot search for fewer than two characters, so a shorter
         // query shows the browse list rather than an empty result.
         let browsing = query_input.read(cx).value().trim().chars().count() < 2;
+        // The pager is drawn against the window in hand, so a page that no
+        // longer exists after a search falls back to the last one.
+        let page = self.skill_market_page.min(market_page_count(entries.len()));
+        let page_entries = market_page_slice(&entries, page);
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
         content = content.child(
@@ -11130,7 +11179,7 @@ impl ManagementCenter {
                 .iter()
                 .filter_map(|skill| skill.source_uri.clone())
                 .collect();
-            for entry in &entries {
+            for entry in page_entries {
                 let name = entry.name.clone();
                 let mut badges = Vec::new();
                 if installed_skill_uris.contains(&format!("market:{}", entry.id)) {
@@ -11207,6 +11256,24 @@ impl ManagementCenter {
                     .pr_1()
                     .child(grid),
             );
+            if !entries.is_empty() {
+                let entity = cx.weak_entity();
+                content = content.child(management_market_pager(
+                    "management-skill-market-pagination",
+                    page,
+                    entries.len(),
+                    // The index reports no total and serves no second page, so
+                    // the pager covers exactly the window that was fetched.
+                    None,
+                    move |page, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.skill_market_page = *page;
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ));
+            }
         }
         content.into_any_element()
     }
@@ -20421,6 +20488,103 @@ fn management_market_empty_row(
         .into_any_element()
 }
 
+/// Market cards one page shows.
+///
+/// Both markets fetch a single window of entries and page through it locally.
+/// Neither upstream can answer "show me page 5": the MCP registry pages by an
+/// opaque cursor that only walks forward, and the Skill index ignores the
+/// offset outright. A page number is therefore only meaningful against a list
+/// already in hand.
+const MARKET_PAGE_SIZE: usize = 12;
+
+/// Entries one search fetches, and so the most the pager can ever show.
+///
+/// Both markets clamp the limit to this value, so asking for more would only
+/// pretend to.
+const MARKET_FETCH_LIMIT: u32 = 100;
+
+/// Pages a fetched window divides into.
+///
+/// An empty window still reports one page so the control has a stable value
+/// instead of collapsing.
+fn market_page_count(entries: usize) -> usize {
+    entries.div_ceil(MARKET_PAGE_SIZE).max(1)
+}
+
+/// The slice of a fetched window that one page shows.
+fn market_page_slice<T>(entries: &[T], page: usize) -> &[T] {
+    let start = page.saturating_sub(1).saturating_mul(MARKET_PAGE_SIZE);
+    let end = start.saturating_add(MARKET_PAGE_SIZE).min(entries.len());
+    entries.get(start..end).unwrap_or_default()
+}
+
+/// The range of the fetched window the current page is showing.
+fn market_page_range_label(page: usize, total: usize) -> String {
+    if total == 0 {
+        return management_locale_text("No entries", "没有条目", "沒有條目").to_string();
+    }
+    let first = (page.saturating_sub(1)) * MARKET_PAGE_SIZE + 1;
+    let last = (first + MARKET_PAGE_SIZE - 1).min(total);
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("{first}–{last} of {total}"),
+        ResolvedLocale::ZhCn => format!("第 {first}–{last} 项，共 {total} 项"),
+        ResolvedLocale::ZhTw => format!("第 {first}–{last} 項，共 {total} 項"),
+    }
+}
+
+/// The pager under a market grid.
+///
+/// `note` carries whatever the upstream said about entries beyond the fetched
+/// window, so a capped list is never mistaken for the whole catalog.
+fn management_market_pager(
+    id: &'static str,
+    page: usize,
+    total: usize,
+    note: Option<String>,
+    on_page: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let mut summary = v_flex().min_w_0().gap_0p5().child(
+        div()
+            .min_w_0()
+            .truncate()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(market_page_range_label(page, total)),
+    );
+    if let Some(note) = note {
+        summary = summary.child(
+            div()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(note),
+        );
+    }
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .pt_2()
+        .child(summary)
+        .child(
+            Pagination::new(id)
+                .small()
+                // The row already supplies the separation from the grid.
+                .py_0()
+                .current_page(page)
+                .total_pages(market_page_count(total))
+                .visible_pages(5)
+                .on_click(on_page),
+        )
+        .into_any_element()
+}
+
 /// The exact launcher the install would save, shown before it is saved.
 fn management_market_command_preview(command: &str, cx: &App) -> AnyElement {
     div()
@@ -22380,6 +22544,77 @@ mod tests {
         assert!(auth_scope.contains("!management_agent_installation_pending("));
         assert!(source.contains("fn schedule_agent_install_refresh("));
         assert!(source.contains("MANAGEMENT_AGENT_INSTALL_REFRESH_INTERVAL"));
+    }
+
+    #[test]
+    fn market_pages_cover_the_fetched_window_without_gaps() {
+        assert_eq!(market_page_count(0), 1);
+        assert_eq!(market_page_count(1), 1);
+        assert_eq!(market_page_count(MARKET_PAGE_SIZE), 1);
+        assert_eq!(market_page_count(MARKET_PAGE_SIZE + 1), 2);
+        assert_eq!(market_page_count(MARKET_FETCH_LIMIT as usize), 9);
+
+        let entries: Vec<usize> = (0..MARKET_FETCH_LIMIT as usize).collect();
+        // Paging through the window visits every entry exactly once and in
+        // order, so no card can be skipped or shown twice.
+        let mut seen = Vec::new();
+        for page in 1..=market_page_count(entries.len()) {
+            seen.extend_from_slice(market_page_slice(&entries, page));
+        }
+        assert_eq!(seen, entries);
+        assert_eq!(market_page_slice(&entries, 1).len(), MARKET_PAGE_SIZE);
+        // A page past the end is empty rather than a panic, which is what the
+        // renderer relies on when a search shrinks the window underneath it.
+        assert!(market_page_slice(&entries, 99).is_empty());
+        assert!(market_page_slice::<usize>(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn market_range_label_names_the_visible_window() {
+        assert!(market_page_range_label(1, 100).contains("1–12"));
+        assert!(market_page_range_label(1, 100).contains("100"));
+        // The final page stops at the window's end rather than at the page size.
+        assert!(market_page_range_label(9, 100).contains("97–100"));
+        assert!(!market_page_range_label(1, 0).is_empty());
+    }
+
+    #[test]
+    fn market_pagers_use_the_kit_pagination_component() {
+        let source = include_str!("management.rs");
+        for (open, close) in [
+            (
+                "    fn render_mcp_market(",
+                "\n    fn render_mcp_market_install_form(",
+            ),
+            (
+                "    fn render_skills_market(",
+                "\n    /// The native-import view",
+            ),
+        ] {
+            let render = source
+                .split_once(open)
+                .and_then(|(_, tail)| tail.split_once(close))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{open} should remain inspectable"));
+            assert!(
+                render.contains("market_page_slice(&entries, page)"),
+                "{open} should render one page of the fetched window"
+            );
+            assert!(
+                render.contains("management_market_pager("),
+                "{open} should draw the pager under its grid"
+            );
+        }
+
+        let pager = source
+            .split_once("fn management_market_pager(")
+            .and_then(|(_, tail)| tail.split_once("\n/// The exact launcher"))
+            .map(|(body, _)| body)
+            .expect("the market pager should remain inspectable");
+        assert!(pager.contains("Pagination::new(id)"));
+        assert!(pager.contains(".current_page(page)"));
+        assert!(pager.contains(".total_pages(market_page_count(total))"));
+        assert!(pager.contains(".on_click(on_page)"));
     }
 
     fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
