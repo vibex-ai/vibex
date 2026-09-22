@@ -4181,7 +4181,7 @@ mod tests {
             command: "npx".to_string(),
             args: vec![
                 "-y".to_string(),
-                "@openma/deepseek-harness-acp@0.4.32".to_string(),
+                "@openma/deepseek-harness-acp@0.4.33".to_string(),
             ],
             env: Vec::new(),
             cwd_template: Some("{workspaceRoot}".to_string()),
@@ -4197,7 +4197,7 @@ mod tests {
 
         config.command = "/usr/bin/node".to_string();
         config.args = vec![
-            "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.32-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
+            "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.33-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
         ];
         assert!(acp_config_supports_deepseek_harness_commands(&config));
 
@@ -4220,7 +4220,7 @@ mod tests {
                 config: Some(AcpProviderConfig {
                     command: "/usr/bin/node".to_string(),
                     args: vec![
-                        "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.32-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
+                        "/home/dev/.vibex/acp-agents/agents/deepseek-harness/0.4.33-cb92ecb5d865/node_modules/@openma/deepseek-harness-acp/dist/bin.js".to_string(),
                     ],
                     env: Vec::new(),
                     cwd_template: Some("{workspaceRoot}".to_string()),

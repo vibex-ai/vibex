@@ -2242,21 +2242,36 @@ impl AcpModelIdProjection {
     fn new(entries: Vec<LegacyAgentProviderModelIdProjection>) -> VibexResult<Self> {
         let mut projection = Self::default();
         for entry in entries {
-            if let Some(existing) = projection.runtime_to_product.insert(
-                entry.runtime_model_id.clone(),
-                entry.product_model_id.clone(),
-            ) && existing != entry.product_model_id
-            {
-                return Err(VibexError::validation(
-                    "acp_model_id_projection_ambiguous",
-                    "Agent runtime model id maps to multiple configured models",
-                ));
+            projection.insert_runtime_id(&entry.runtime_model_id, &entry.product_model_id)?;
+            // A read-back alias resolves to the same product id but never
+            // becomes the projected wire form: an Adapter that predates the
+            // qualified spelling rejects it outright.
+            for alias in &entry.runtime_model_id_aliases {
+                projection.insert_runtime_id(alias, &entry.product_model_id)?;
             }
             projection
                 .product_to_runtime
                 .insert(entry.product_model_id, entry.runtime_model_id);
         }
         Ok(projection)
+    }
+
+    fn insert_runtime_id(
+        &mut self,
+        runtime_model_id: &str,
+        product_model_id: &str,
+    ) -> VibexResult<()> {
+        if let Some(existing) = self
+            .runtime_to_product
+            .insert(runtime_model_id.to_string(), product_model_id.to_string())
+            && existing != product_model_id
+        {
+            return Err(VibexError::validation(
+                "acp_model_id_projection_ambiguous",
+                "Agent runtime model id maps to multiple configured models",
+            ));
+        }
+        Ok(())
     }
 
     fn runtime_id(&self, product_model_id: &str) -> String {
@@ -21079,12 +21094,62 @@ mod tests {
         let projection = AcpModelIdProjection::new(vec![LegacyAgentProviderModelIdProjection {
             product_model_id: "gpt-5.6-sol".to_string(),
             runtime_model_id: "custom:gpt-5.6-sol".to_string(),
+            runtime_model_id_aliases: Vec::new(),
         }])
         .unwrap();
 
         assert_eq!(projection.runtime_id("gpt-5.6-sol"), "custom:gpt-5.6-sol");
         assert_eq!(projection.product_id("custom:gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(projection.product_id("unmapped"), "unmapped");
+    }
+
+    #[test]
+    fn model_id_projection_reads_back_qualified_aliases_without_sending_them() {
+        // DeepSeek Harness 0.4.33 qualifies the option id as `route::model`
+        // while 0.4.32 rejects that spelling, so the bare id must stay on the
+        // wire and only the read-back side may accept both.
+        let projection = AcpModelIdProjection::new(vec![LegacyAgentProviderModelIdProjection {
+            product_model_id: "deepseek-v4.1-flash".to_string(),
+            runtime_model_id: "deepseek-v4.1-flash".to_string(),
+            runtime_model_id_aliases: vec!["acp::deepseek-v4.1-flash".to_string()],
+        }])
+        .unwrap();
+
+        assert_eq!(
+            projection.runtime_id("deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            projection.product_id("deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            projection.product_id("acp::deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            projection.product_id("other::deepseek-v4.1-flash"),
+            "other::deepseek-v4.1-flash"
+        );
+    }
+
+    #[test]
+    fn model_id_projection_rejects_an_alias_owned_by_another_model() {
+        let error = AcpModelIdProjection::new(vec![
+            LegacyAgentProviderModelIdProjection {
+                product_model_id: "model-a".to_string(),
+                runtime_model_id: "model-a".to_string(),
+                runtime_model_id_aliases: vec!["acp::shared".to_string()],
+            },
+            LegacyAgentProviderModelIdProjection {
+                product_model_id: "model-b".to_string(),
+                runtime_model_id: "acp::shared".to_string(),
+                runtime_model_id_aliases: Vec::new(),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.code, "acp_model_id_projection_ambiguous");
     }
 
     fn discovery_with_models(models: &[&str]) -> ProviderSessionConfigState {

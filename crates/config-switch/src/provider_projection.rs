@@ -113,6 +113,14 @@ pub struct LegacyAgentProviderProjectionRuntimePlan {
 pub struct LegacyAgentProviderModelIdProjection {
     pub product_model_id: String,
     pub runtime_model_id: String,
+    /// Additional runtime spellings the Agent may report back for this Model
+    /// even though `runtime_model_id` is the spelling Vibex sends.
+    ///
+    /// An Agent that qualifies its own option ids can echo a value the
+    /// projected form never produced. The projected form stays authoritative
+    /// on the way out — an older Adapter rejects the qualified spelling — so
+    /// these are read-back aliases only and never become a wire value.
+    pub runtime_model_id_aliases: Vec<String>,
 }
 
 impl ResolvedAgentProviderProjection {
@@ -935,17 +943,11 @@ impl ProviderConfigService {
             return Ok(None);
         };
         let (provider, _, binding, descriptor) = load_projection_input(&conn, &binding.id)?;
-        Ok(Some(
-            binding
-                .configured_models
-                .iter()
-                .filter(|model| model.enabled)
-                .map(|model| LegacyAgentProviderModelIdProjection {
-                    product_model_id: model.provider_model_id.clone(),
-                    runtime_model_id: projected_runtime_model_id(&provider, &descriptor, model),
-                })
-                .collect(),
-        ))
+        Ok(Some(legacy_model_id_projection_entries(
+            &provider,
+            &descriptor,
+            &binding,
+        )))
     }
 
     pub fn plan_legacy_agent_provider_projection(
@@ -2341,6 +2343,28 @@ fn opencode_model_key(provider_id: &str, model_id: &str) -> String {
         .to_string()
 }
 
+/// The product-to-runtime model id mapping for one persisted binding. Disabled
+/// Models are omitted so a Model the user turned off cannot claim a runtime id
+/// that an enabled Model needs.
+fn legacy_model_id_projection_entries(
+    provider: &ModelProviderProfile,
+    descriptor: &AgentProviderProjectionDescriptor,
+    binding: &AgentModelProviderBinding,
+) -> Vec<LegacyAgentProviderModelIdProjection> {
+    binding
+        .configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .map(|model| LegacyAgentProviderModelIdProjection {
+            product_model_id: model.provider_model_id.clone(),
+            runtime_model_id: projected_runtime_model_id(provider, descriptor, model),
+            runtime_model_id_aliases: projected_runtime_model_id_aliases(
+                provider, descriptor, model,
+            ),
+        })
+        .collect()
+}
+
 fn projected_runtime_model_id(
     provider: &ModelProviderProfile,
     descriptor: &AgentProviderProjectionDescriptor,
@@ -2450,6 +2474,61 @@ fn projected_runtime_model_id(
         return format!("custom:{model_id}");
     }
     model.agent_model_id.clone()
+}
+
+/// Runtime spellings the Agent may report for a Model whose projected ACP
+/// option id is not the one it echoes.
+///
+/// The DeepSeek Harness names every model option `route::model` once more than
+/// one provider route is registered — `deepseek-harness-acp` 0.4.33 changed
+/// that trigger from "not the current default route" to "more than one route",
+/// and the Harness always mounts its own `deepseek-official` route beside the
+/// projected `llm-pi-ai` one, so the qualifier is always present. The bare id
+/// stays the projected form because 0.4.32 answers `route::model` with
+/// `-32602 unknown model`; the qualified spelling is therefore a read-back
+/// alias, which is what keeps both Adapter versions working against one
+/// projection. Vibex derives the route id exactly as the settings projection
+/// writes it, so the two cannot drift.
+fn projected_runtime_model_id_aliases(
+    provider: &ModelProviderProfile,
+    descriptor: &AgentProviderProjectionDescriptor,
+    model: &AgentConfiguredModelBinding,
+) -> Vec<String> {
+    let deepseek_harness = matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
+        }
+    );
+    if !deepseek_harness {
+        return Vec::new();
+    }
+    let model_id = projection_model_id(Some(model));
+    let Some(model_id) = model_id else {
+        return Vec::new();
+    };
+    vec![format!(
+        "{}::{model_id}",
+        deepseek_harness_route_id(provider)
+    )]
+}
+
+/// The `llm-pi-ai` route id the Harness settings projection registers for a
+/// Vibex Profile. The Harness qualifies model option ids with exactly this
+/// name, so the settings overlay and the read-back alias must derive it the
+/// same way.
+fn deepseek_harness_route_id(provider: &ModelProviderProfile) -> String {
+    sanitize_provider_id(
+        provider
+            .vendor_hint
+            .as_deref()
+            .unwrap_or_else(|| provider.id.as_str()),
+    )
 }
 
 fn require_secret_env_key(key: Option<&str>) -> VibexResult<&str> {
@@ -3458,12 +3537,7 @@ fn deepseek_harness_overlay(
     secret_env_key: &str,
 ) -> VibexResult<String> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
-    let provider_id = sanitize_provider_id(
-        provider
-            .vendor_hint
-            .as_deref()
-            .unwrap_or_else(|| provider.id.as_str()),
-    );
+    let provider_id = deepseek_harness_route_id(provider);
     let api = deepseek_harness_api(model);
     let group = overlay_model_group(binding, model, |model| deepseek_harness_api(Some(model)));
     let model_entries: Vec<serde_json::Value> = if group.is_empty() {
@@ -4442,6 +4516,91 @@ mod tests {
                 Some("model-a")
             );
             assert!(!overlay.contains("secret-value"));
+        }
+    }
+
+    #[test]
+    fn deepseek_harness_model_id_alias_tracks_the_projected_route_id() {
+        let (provider, _, binding, descriptor) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        let model = &binding.configured_models[0];
+
+        let overlay = deepseek_harness_overlay(
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            Some(model),
+            "DEEPSEEK_API_KEY",
+        )
+        .unwrap();
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay).unwrap();
+        let route_id = settings["llm-pi-ai"]["providers"]
+            .as_mapping()
+            .and_then(|providers| providers.keys().next())
+            .and_then(serde_yaml::Value::as_str)
+            .expect("the overlay registers exactly one route");
+
+        // The wire form stays bare: `deepseek-harness-acp` 0.4.32 answers the
+        // qualified spelling with `-32602 unknown model`.
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, model),
+            "model-a"
+        );
+        // The read-back alias must be spelled exactly as the Harness will,
+        // which means the same route id the settings overlay just wrote.
+        assert_eq!(
+            projected_runtime_model_id_aliases(&provider, &descriptor, model),
+            vec![format!("{route_id}::model-a")]
+        );
+        assert_eq!(route_id, "fake");
+
+        // The persisted binding must carry that same pair, so the runtime
+        // never has to re-derive the route id.
+        let entries = legacy_model_id_projection_entries(&provider, &descriptor, &binding);
+        assert_eq!(
+            entries,
+            vec![LegacyAgentProviderModelIdProjection {
+                product_model_id: "model-a".to_string(),
+                runtime_model_id: "model-a".to_string(),
+                runtime_model_id_aliases: vec![format!("{route_id}::model-a")],
+            }]
+        );
+    }
+
+    #[test]
+    fn disabled_models_claim_no_runtime_model_id() {
+        let (provider, _, mut binding, descriptor) =
+            fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+        let mut disabled = binding.configured_models[0].clone();
+        disabled.provider_model_id = "model-b".to_string();
+        disabled.agent_model_id = "model-b".to_string();
+        disabled.enabled = false;
+        binding.configured_models.push(disabled);
+
+        let entries = legacy_model_id_projection_entries(&provider, &descriptor, &binding);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].product_model_id, "model-a");
+    }
+
+    #[test]
+    fn other_projections_declare_no_model_id_alias() {
+        for strategy in [
+            ConfigOverlayStrategy::HermesYaml,
+            ConfigOverlayStrategy::ZcodeJson,
+            ConfigOverlayStrategy::PiModelsJson,
+            ConfigOverlayStrategy::OpenCodeInlineProvider,
+            ConfigOverlayStrategy::CodexStableHome,
+        ] {
+            let (provider, _, binding, descriptor) = fixture(strategy.clone());
+            assert!(
+                projected_runtime_model_id_aliases(
+                    &provider,
+                    &descriptor,
+                    &binding.configured_models[0]
+                )
+                .is_empty(),
+                "{strategy:?} must not declare a read-back alias"
+            );
         }
     }
 
