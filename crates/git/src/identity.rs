@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
@@ -22,7 +23,31 @@ pub fn same_path_identity(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bo
 }
 
 pub fn repository_identity(repo_path: impl AsRef<Path>) -> VibexResult<GitRepositoryIdentity> {
-    let repo_path = repo_path.as_ref();
+    let (repository_root, common_dir) = repository_root_and_common_dir(repo_path.as_ref())?;
+    let repository_root = canonical_path_identity(repository_root);
+    let git_common_dir = canonical_path_identity(common_dir);
+    Ok(GitRepositoryIdentity {
+        comparison_key: format!("git-common:{}", git_common_dir.comparison_key),
+        repository_root,
+        git_common_dir,
+    })
+}
+
+/// Resolves the on-disk path of the repository's common Git directory
+/// (`rev-parse --git-common-dir`).
+///
+/// [`repository_identity`] reports the same directory, but as a *comparison*
+/// value: it is lower-cased and separator-folded, so it is not a path that
+/// filesystem calls are guaranteed to accept. Code that has to `open`,
+/// `create`, or `remove` a file inside the Git directory must use this instead.
+pub fn repository_common_dir(repo_path: impl AsRef<Path>) -> VibexResult<PathBuf> {
+    let (_, common_dir) = repository_root_and_common_dir(repo_path.as_ref())?;
+    // Canonicalizing keeps callers on one shared file when the same checkout is
+    // reached through a symlink, an 8.3 short name, or a different case.
+    Ok(std::fs::canonicalize(&common_dir).unwrap_or(common_dir))
+}
+
+fn repository_root_and_common_dir(repo_path: &Path) -> VibexResult<(PathBuf, PathBuf)> {
     ensure_working_tree(repo_path)?;
     let repository_root = git_stdout(repo_path, &["rev-parse", "--show-toplevel"])?;
     let repository_root = PathBuf::from(repository_root.trim());
@@ -33,13 +58,7 @@ pub fn repository_identity(repo_path: impl AsRef<Path>) -> VibexResult<GitReposi
     } else {
         repository_root.join(common_dir)
     };
-    let repository_root = canonical_path_identity(repository_root);
-    let git_common_dir = canonical_path_identity(common_dir);
-    Ok(GitRepositoryIdentity {
-        comparison_key: format!("git-common:{}", git_common_dir.comparison_key),
-        repository_root,
-        git_common_dir,
-    })
+    Ok((repository_root, common_dir))
 }
 
 pub fn project_git_eligibility(
@@ -452,10 +471,12 @@ fn normalize_path_text(path: &Path, windows_semantics: bool) -> String {
 
 fn normalize_windows_path(value: &str) -> String {
     let replaced = value.replace('\\', "/");
+    let replaced = strip_windows_namespace_prefix(&replaced);
+    let replaced = replaced.as_ref();
     let (prefix, tail) = if replaced.as_bytes().get(1) == Some(&b':') {
         (&replaced[..2], &replaced[2..])
     } else {
-        ("", replaced.as_str())
+        ("", replaced)
     };
     let absolute = tail.starts_with('/');
     let mut components: Vec<&str> = Vec::new();
@@ -476,6 +497,42 @@ fn normalize_windows_path(value: &str) -> String {
     }
     normalized.push_str(&components.join("/"));
     normalized.to_ascii_lowercase()
+}
+
+/// Strips the Win32 namespace prefix that `std::fs::canonicalize` prepends on
+/// Windows: `\\?\C:\...` for drive paths and `\\?\UNC\server\share` for
+/// network paths.
+///
+/// This has to happen *before* separator normalization. Win32 only treats a
+/// doubled leading separator as the verbatim marker, so once separators are
+/// folded a retained prefix degenerates into a single leading `/`
+/// (`/?/c:/...`): no longer a verbatim path, but a root-relative one whose
+/// first component is a literal `?`. `CreateFileW` rejects that with
+/// `ERROR_INVALID_NAME` (os error 123), and Git rejects it as an unknown path.
+fn strip_windows_namespace_prefix(value: &str) -> Cow<'_, str> {
+    let Some(rest) = value
+        .strip_prefix("//?/")
+        .or_else(|| value.strip_prefix("//./"))
+    else {
+        return Cow::Borrowed(value);
+    };
+    if rest
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("unc/"))
+    {
+        // `\\?\UNC\server\share` names the same location as `\\server\share`.
+        return Cow::Owned(format!("//{}", &rest[4..]));
+    }
+    // Only a drive-letter tail (`C:/...`) is unambiguously absolute once the
+    // prefix is gone. Anything else — a `Volume{...}` GUID path, for example —
+    // is left alone rather than reinterpreted as a relative component.
+    let drive_letter = rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && rest.as_bytes().get(1) == Some(&b':');
+    if drive_letter {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 fn looks_like_windows_path(value: &str) -> bool {
@@ -509,6 +566,49 @@ mod tests {
         let left = canonical_path_identity_from_text(r"C:\\Repo\\Feature");
         let right = canonical_path_identity_from_text("c:/repo/feature");
         assert_eq!(left.comparison_key, right.comparison_key);
+    }
+
+    #[test]
+    fn windows_verbatim_prefix_does_not_become_a_rooted_component() {
+        // `std::fs::canonicalize` returns `\\?\C:\...` on Windows. Folding the
+        // separators without dropping the prefix first yields `/?/c:/...`,
+        // which `CreateFileW` rejects with `ERROR_INVALID_NAME` (os error 123).
+        assert_eq!(
+            normalize_windows_path(r"\\?\C:\Repo\.git"),
+            normalize_windows_path(r"C:\Repo\.git")
+        );
+        assert_eq!(normalize_windows_path(r"\\?\C:\Repo\.git"), "c:/repo/.git");
+    }
+
+    #[test]
+    fn windows_verbatim_unc_prefix_matches_the_plain_unc_form() {
+        assert_eq!(
+            normalize_windows_path(r"\\?\UNC\Server\Share\repo"),
+            normalize_windows_path(r"\\Server\Share\repo")
+        );
+    }
+
+    #[test]
+    fn canonical_identity_paths_are_openable() {
+        let root = temp_path("identity-openable");
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = canonical_path_identity(&root);
+        for candidate in [
+            Some(identity.normalized_path.as_str()),
+            identity.canonical_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(Path::new(candidate).join("probe.lock"))
+                .unwrap_or_else(|error| panic!("{candidate} is not openable: {error}"));
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

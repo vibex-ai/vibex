@@ -50,15 +50,7 @@ struct GitMutationGuard {
 
 impl GitMutationGuard {
     fn claim(root: &Path) -> VibexResult<Self> {
-        let identity = repository_identity(root)?;
-        let common_dir = PathBuf::from(
-            identity
-                .git_common_dir
-                .canonical_path
-                .as_deref()
-                .unwrap_or(&identity.git_common_dir.normalized_path),
-        );
-        let lock_path = common_dir.join(VIBEX_GIT_MUTATION_LOCK_FILE);
+        let lock_path = repository_common_dir(root)?.join(VIBEX_GIT_MUTATION_LOCK_FILE);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
