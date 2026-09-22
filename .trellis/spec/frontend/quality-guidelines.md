@@ -920,6 +920,13 @@ let worker = cx.background_spawn(async move {
   where needed.
 - Keep terminal output rendering buffered and throttled.
 - Paginate history and large timeline fetches.
+- Render code never probes the filesystem, the environment, or `PATH`. A panel
+  that needs a machine fact — installed editors, available shells, font files —
+  reads a value probed once per process, warmed from the background executor at
+  startup, not recomputed per frame. The Files panel header asking `PATH` for
+  sixteen editors on every frame was thousands of `is_file` lookups on Windows
+  (`PATHEXT` multiplies each program by a dozen names), about 60 ms per frame,
+  and it read as the panel hitching the moment it opened.
 
 ## Accessibility Expectations
 

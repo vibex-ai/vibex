@@ -95,6 +95,7 @@ use crate::pdf_surface::PdfSurface;
 use crate::platform::{
     available_external_tools, open_external_url, open_native_terminal_for_path,
     open_path_with_default_app, open_path_with_external_tool, reveal_path_in_file_manager,
+    warm_external_open_tools,
 };
 use crate::resize_seam;
 use crate::skeleton;
@@ -7634,7 +7635,7 @@ impl CodeWorkbench {
                                             "Tools", "工具", "工具",
                                         )));
                                     let tools = available_external_tools();
-                                    for tool in &tools {
+                                    for tool in tools {
                                         let tool_entity = submenu_entity.clone();
                                         let tool_path = path.clone();
                                         let tool_id = tool.id.to_string();
@@ -9472,6 +9473,15 @@ impl CodeRightRail {
         );
         let file_tree_blur_subscription =
             cx.on_blur(&file_tree_focus, window, Self::on_file_tree_blur);
+        // The Files header lists the external editors this machine has, and
+        // finding them walks every `PATH` directory for every candidate name —
+        // thousands of filesystem lookups on Windows, where `PATHEXT` turns each
+        // program into a dozen more names. That list is a fact about the machine
+        // rather than about the frame, so the probe runs here, off the render
+        // thread, and the header reads a list that is already there instead of
+        // stalling on the frame the panel opens.
+        cx.background_spawn(async move { warm_external_open_tools() })
+            .detach();
         Self {
             workbench,
             projection,
@@ -10509,7 +10519,7 @@ impl CodeRightRail {
                     .item(open_tool_menu_section_label(locale::text(
                         "Tools", "工具", "工具",
                     )));
-                for tool in tools.clone() {
+                for tool in tools {
                     let tool_controller = submenu_controller.clone();
                     let tool_path = submenu_path.clone();
                     let tool_id = tool.id.to_string();
@@ -14292,7 +14302,7 @@ impl CodeRightRail {
                             .item(open_tool_menu_section_label(locale::text(
                                 "Tools", "工具", "工具",
                             )));
-                        for tool in tools.clone() {
+                        for tool in tools {
                             let tool_view = menu_view.clone();
                             let tool_id = tool.id.to_string();
                             menu = menu.item(open_tool_menu_item(tool.id, tool.label).on_click(

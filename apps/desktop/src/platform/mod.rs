@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use std::{borrow::Cow, collections::BTreeSet};
@@ -661,7 +662,34 @@ const EXTERNAL_OPEN_TOOLS: &[ExternalOpenToolDefinition] = &[
     },
 ];
 
-pub fn available_external_tools() -> Vec<ExternalOpenTool> {
+/// The tools detected on this machine, probed once per process.
+///
+/// Detection walks every `PATH` directory for every candidate name, and on
+/// Windows `PATHEXT` turns each program into a dozen more names, so a single
+/// probe is thousands of `is_file` lookups. The Files panel asks for this list
+/// while its header renders; repeating the walk per frame is what made the
+/// panel hitch as it opened, so the first answer is kept and every later
+/// question is a read of it. A tool installed while Vibex runs is picked up on
+/// the next launch.
+static DETECTED_EXTERNAL_OPEN_TOOLS: OnceLock<Vec<ExternalOpenTool>> = OnceLock::new();
+
+/// The external editors and project tools installed on this machine.
+///
+/// Cheap after the first call, which is the one that probes. Warm the cache
+/// with [`warm_external_open_tools`] rather than letting a render pay for it.
+pub fn available_external_tools() -> &'static [ExternalOpenTool] {
+    DETECTED_EXTERNAL_OPEN_TOOLS.get_or_init(detect_external_tools)
+}
+
+/// Probes for the installed tools ahead of the first render that asks for them.
+///
+/// The probe blocks on the filesystem and the panel that reads the list renders
+/// on the frame it opens, so call this from the background executor at startup.
+pub fn warm_external_open_tools() {
+    let _ = available_external_tools();
+}
+
+fn detect_external_tools() -> Vec<ExternalOpenTool> {
     EXTERNAL_OPEN_TOOLS
         .iter()
         .filter(|tool| {
@@ -1051,6 +1079,23 @@ mod tests {
     fn foundation_native_surfaces_fail_truthfully() {
         let host = FoundationNativeSurfaceHost;
         assert_eq!(host.capabilities(), NativeSurfaceCapabilities::FOUNDATION);
+    }
+
+    /// Detection walks `PATH` for every candidate name of every tool, which on
+    /// Windows is thousands of `is_file` lookups. The Files panel header asks
+    /// for the list while it renders, so the walk has to happen once and every
+    /// later question has to read the same answer: two calls that hand back
+    /// different slices are two walks, and that is the frame the panel hitches
+    /// on.
+    #[test]
+    fn the_installed_tool_list_is_probed_once_and_then_reused() {
+        warm_external_open_tools();
+        let warmed = available_external_tools();
+        let again = available_external_tools();
+        assert!(
+            std::ptr::eq(warmed, again),
+            "a later call re-probed the filesystem instead of reusing the first result"
+        );
     }
 
     #[test]
