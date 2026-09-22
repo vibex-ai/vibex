@@ -1264,6 +1264,11 @@ impl AgentInstallService {
                 agent_id,
                 &adapter_script_rel,
             )?)
+        } else if cfg!(windows) && agent_id.as_str() == "deepseek-harness" {
+            Some(npm_deepseek_harness_launcher_source(
+                agent_id,
+                &adapter_script_rel,
+            )?)
         } else if cfg!(windows) {
             Some(npm_windows_adapter_launcher_source(
                 agent_id,
@@ -3962,13 +3967,139 @@ fn npm_windows_adapter_launcher_source(
     Ok(format!(
         r#""use strict";
 const path = require("node:path");
-const {{ pathToFileURL }} = require("node:url");
 
 require(path.join(__dirname, {windows_hook}));
+const {{ spawn }} = require("node:child_process");
+
+// Run the adapter as its own main module. Importing it in-process leaves
+// `process.argv[1]` pointing at this launcher, which silently disables CLI
+// adapters that only start when their own entry file is invoked directly.
 const adapter = path.join(__dirname, {adapter_script});
-import(pathToFileURL(adapter).href).catch((error) => {{
+const child = spawn(process.execPath, [adapter, ...process.argv.slice(2)], {{ stdio: "inherit", env: process.env }});
+child.on("error", (error) => {{
   console.error("Failed to start", {label}, "ACP adapter:", error);
   process.exitCode = 1;
+}});
+child.on("close", (code, signal) => {{
+  if (signal) {{
+    process.kill(process.pid, signal);
+  }} else {{
+    process.exitCode = code ?? 1;
+  }}
+}});
+"#
+    ))
+}
+
+/// Launcher for the DeepSeek Harness ACP adapter.
+///
+/// The adapter unpacks its bundled `vendor/dsh-runtime.tgz` on first launch.
+/// That archive carries symlinks under `node_modules/.bin`, and Windows refuses
+/// to create them without Developer Mode or elevation, so the adapter dies with
+/// `EPERM` before ACP `initialize`. Pre-extract the archive with those entries
+/// skipped and drop the `.dsh-acp-runtime` marker the adapter probes for; the
+/// skipped files are CLI shims only and are not needed to start the runtime.
+fn npm_deepseek_harness_launcher_source(
+    agent_id: &AgentId,
+    adapter_script: &Path,
+) -> VibexResult<String> {
+    let adapter_script = adapter_script.to_str().ok_or_else(|| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path was not valid UTF-8",
+        )
+    })?;
+    let adapter_script = serde_json::to_string(adapter_script).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_path_invalid",
+            "ACP adapter path could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let label = serde_json::to_string(agent_id.as_str()).map_err(|error| {
+        VibexError::validation(
+            "agent_npm_launcher_agent_invalid",
+            "managed npm Agent id could not be encoded",
+        )
+        .with_diagnostic("error", error.to_string())
+    })?;
+    let windows_hook = serde_json::to_string(NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME)
+        .expect("static Windows child process hook name is valid JSON");
+    Ok(format!(
+        r#""use strict";
+const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
+const crypto = require("node:crypto");
+
+require(path.join(__dirname, {windows_hook}));
+const {{ spawn }} = require("node:child_process");
+const {{ createRequire }} = require("node:module");
+
+const adapter = path.join(__dirname, {adapter_script});
+
+function cacheRoot() {{
+  const explicit = process.env.DSH_ACP_CACHE_DIR;
+  if (explicit) return explicit;
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) {{
+    return path.join(process.env.LOCALAPPDATA, "dsh-acp");
+  }}
+  const xdg = process.env.XDG_CACHE_HOME;
+  return path.join(xdg || path.join(os.homedir(), ".cache"), "dsh-acp");
+}}
+
+function ensureVendoredRuntime() {{
+  try {{
+    const packageRoot = path.dirname(path.dirname(adapter));
+    const metadataPath = path.join(packageRoot, "vendor", "runtime.json");
+    if (!fs.existsSync(metadataPath)) return;
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+    if (!metadata || !metadata.archive || !metadata.dsh || !metadata.sha256) return;
+    const archive = path.join(packageRoot, "vendor", metadata.archive);
+    if (!fs.existsSync(archive)) return;
+    const target = path.join(cacheRoot(), metadata.dsh + "-" + metadata.sha256.slice(0, 12));
+    const marker = path.join(target, ".dsh-acp-runtime");
+    if (fs.existsSync(marker)) return;
+    const actual = crypto.createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
+    if (actual !== metadata.sha256) return;
+    fs.mkdirSync(path.dirname(target), {{ recursive: true }});
+    fs.rmSync(target, {{ recursive: true, force: true }});
+    const temporary = fs.mkdtempSync(path.join(path.dirname(target), ".extract-"));
+    try {{
+      const tar = createRequire(adapter)("tar");
+      tar.x({{
+        cwd: temporary,
+        file: archive,
+        sync: true,
+        strict: true,
+        filter: (_path, entry) => entry.type !== "SymbolicLink",
+      }});
+      fs.writeFileSync(path.join(temporary, ".dsh-acp-runtime"), metadata.dsh + "\n");
+      try {{
+        fs.renameSync(temporary, target);
+      }} catch (error) {{
+        if (!fs.existsSync(marker)) throw error;
+      }}
+    }} finally {{
+      fs.rmSync(temporary, {{ recursive: true, force: true }});
+    }}
+  }} catch (error) {{
+    console.error("vibex: DeepSeek Harness runtime pre-extraction failed:", error);
+  }}
+}}
+
+ensureVendoredRuntime();
+const child = spawn(process.execPath, [adapter, ...process.argv.slice(2)], {{ stdio: "inherit", env: process.env }});
+child.on("error", (error) => {{
+  console.error("Failed to start", {label}, "ACP adapter:", error);
+  process.exitCode = 1;
+}});
+child.on("close", (code, signal) => {{
+  if (signal) {{
+    process.kill(process.pid, signal);
+  }} else {{
+    process.exitCode = code ?? 1;
+  }}
 }});
 "#
     ))
@@ -4033,15 +4164,25 @@ fn npm_companion_launcher_source(agent_id: &AgentId, adapter_script: &Path) -> V
     Ok(format!(
         r#""use strict";
 const path = require("node:path");
-const {{ pathToFileURL }} = require("node:url");
 
 if (process.platform === "win32") require(path.join(__dirname, {windows_hook}));
+const {{ spawn }} = require("node:child_process");
+
 const companionCommand = process.platform === "win32" ? {windows_command} : {command};
 process.env[{environment}] = path.join(__dirname, "node_modules", ".bin", companionCommand);
+// Run the adapter as its own main module; see npm_windows_adapter_launcher_source.
 const adapter = path.join(__dirname, {adapter_script});
-import(pathToFileURL(adapter).href).catch((error) => {{
+const child = spawn(process.execPath, [adapter, ...process.argv.slice(2)], {{ stdio: "inherit", env: process.env }});
+child.on("error", (error) => {{
   console.error("Failed to start", {label}, "ACP adapter:", error);
   process.exitCode = 1;
+}});
+child.on("close", (code, signal) => {{
+  if (signal) {{
+    process.kill(process.pid, signal);
+  }} else {{
+    process.exitCode = code ?? 1;
+  }}
 }});
 "#
     ))
@@ -5746,7 +5887,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let node = root.join("node");
-        let adapter = root.join("node_modules/@openma/deepseek-harness-acp/dist/bin.js");
+        let adapter = root
+            .join("node_modules")
+            .join("@openma")
+            .join("deepseek-harness-acp")
+            .join("dist")
+            .join("bin.js");
         fs::create_dir_all(adapter.parent().unwrap()).unwrap();
         fs::write(&node, b"fixture").unwrap();
         fs::write(&adapter, b"fixture").unwrap();
@@ -5798,6 +5944,48 @@ mod tests {
     }
 
     #[test]
+    fn windows_adapter_launcher_runs_the_adapter_as_the_main_module() {
+        let launcher = npm_windows_adapter_launcher_source(
+            &AgentId::parse("zcode").unwrap(),
+            Path::new("node_modules/zcode-acp-server/dist/cli.js"),
+        )
+        .unwrap();
+
+        assert!(launcher.contains("spawn(process.execPath, [adapter, ...process.argv.slice(2)]"));
+        assert!(launcher.contains("stdio: \"inherit\""));
+        assert!(!launcher.contains("import(pathToFileURL"));
+    }
+
+    #[test]
+    fn companion_launcher_runs_the_adapter_as_the_main_module() {
+        let launcher = npm_companion_launcher_source(
+            &AgentId::parse("pi").unwrap(),
+            Path::new("node_modules/pi-acp/dist/index.js"),
+        )
+        .unwrap();
+
+        assert!(launcher.contains("spawn(process.execPath, [adapter, ...process.argv.slice(2)]"));
+        assert!(launcher.contains("PI_ACP_PI_COMMAND"));
+        assert!(!launcher.contains("import(pathToFileURL"));
+    }
+
+    #[test]
+    fn deepseek_harness_launcher_pre_extracts_the_runtime_without_symlinks() {
+        let launcher = npm_deepseek_harness_launcher_source(
+            &AgentId::parse("deepseek-harness").unwrap(),
+            Path::new("node_modules/@openma/deepseek-harness-acp/dist/bin.js"),
+        )
+        .unwrap();
+
+        assert!(launcher.contains("DSH_ACP_CACHE_DIR"));
+        assert!(launcher.contains(".dsh-acp-runtime"));
+        assert!(launcher.contains("entry.type !== \"SymbolicLink\""));
+        assert!(launcher.contains("createRequire(adapter)(\"tar\")"));
+        assert!(launcher.contains("spawn(process.execPath, [adapter, ...process.argv.slice(2)]"));
+        assert!(!launcher.contains("import(pathToFileURL"));
+    }
+
+    #[test]
     fn amp_binary_launcher_uses_the_private_cli_and_forwards_acp_arguments() {
         let launcher = npm_companion_binary_launcher_source(
             &AgentId::parse("amp-acp").unwrap(),
@@ -5830,6 +6018,11 @@ mod tests {
             npm_companion_binary_launcher_source(
                 &AgentId::parse("amp-acp").unwrap(),
                 Path::new("amp-acp"),
+            )
+            .unwrap(),
+            npm_deepseek_harness_launcher_source(
+                &AgentId::parse("deepseek-harness").unwrap(),
+                Path::new("node_modules/adapter/dist/index.js"),
             )
             .unwrap(),
         ];
