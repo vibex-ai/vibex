@@ -379,6 +379,23 @@ snapshot on the next activation. Use recognizable expand/collapse iconography
 for this global control rather than history or generic chevron symbols. Pinned
 sessions should keep a persistent inline marker before the session title so the
 pin state remains visible when the row action buttons are hidden.
+
+A session-group workspace renders several Agent sessions side by side, and every
+pane owns a complete per-session view: timeline, derived projections, scroll and
+measurement state, expansions, runtime selection and composer. Focus only moves
+the keyboard — losing focus must never stop a pane's timeline from updating or
+change what that pane renders. The render pass is not the whole frame, though:
+virtual lists and custom elements build their rows during layout and prepaint,
+after the workspace already handed the borrowed view back. Code that renders or
+measures a pane's rows there has to borrow that pane's own view first
+(`with_session_view_for_render` in `apps/desktop/src/app.rs`). Resolving
+payloads, expansion state, workspace paths or row heights against whichever view
+happens to be borrowed paints the focused session inside another pane and leaves
+that pane's layout frozen at its first estimates, which shows up as a timeline
+that stops updating and as blank bands between rows. Measurements a pane records
+during prepaint belong to the same view, and the transient borrow is
+deliberately unweighed so a per-row swap does not re-walk a whole timeline.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar

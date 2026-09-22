@@ -14847,6 +14847,22 @@ impl VibexWorkbench {
     /// Returns whether the session already had a view. A `false` answer means
     /// the caller is looking at a fresh, still-empty view and should load one.
     fn borrow_session_view(&mut self, session_id: &VibexSessionId) -> bool {
+        self.borrow_session_view_weighed(session_id, true)
+    }
+
+    /// Borrows a view for work that runs outside the render pass, cheaply.
+    ///
+    /// Layout and prepaint run after the render pass handed every pane's view
+    /// back, so a pane that renders a row there has to borrow its own view
+    /// again. That swap happens many times per frame, and re-weighing either
+    /// side of it would walk a whole timeline each time for a number the render
+    /// pass refreshes anyway. The entry keeps the footprint it was last stored
+    /// with; only the map move and the LRU touch are paid here.
+    fn borrow_session_view_unweighed(&mut self, session_id: &VibexSessionId) -> bool {
+        self.borrow_session_view_weighed(session_id, false)
+    }
+
+    fn borrow_session_view_weighed(&mut self, session_id: &VibexSessionId, weigh: bool) -> bool {
         if self.view_session_id.as_ref() == Some(session_id) {
             return self.timeline.session_id.as_ref() == Some(session_id);
         }
@@ -14858,7 +14874,11 @@ impl VibexWorkbench {
         );
         if let Some(previous_key) = previous_key {
             let previous_key = previous_key.as_str().to_string();
-            self.store_session_view(previous_key, previous);
+            if weigh {
+                self.store_session_view(previous_key, previous);
+            } else {
+                self.insert_session_view(previous_key, previous);
+            }
         }
         self.view_session_id = Some(session_id.clone());
         match self.session_views.remove(&key) {
@@ -15023,6 +15043,27 @@ impl VibexWorkbench {
         );
     }
 
+    /// Puts a view back into the store under its session id, keeping the
+    /// footprint it was last weighed at.
+    ///
+    /// The transient borrows layout and prepaint make to render a pane against
+    /// its own view come through here, and they run once per rendered row, so
+    /// this path must not re-walk a timeline, sum every stored footprint or
+    /// build the pinned set. The budget stays enforced by
+    /// [`Self::store_session_view`], which is what the render pass hands every
+    /// pane's view back through.
+    fn insert_session_view(&mut self, key: String, entry: SessionView) {
+        self.session_views.remove(&key);
+        self.session_view_lru.retain(|cached| cached != &key);
+        if AGENT_SESSION_VIEW_CACHE_LIMIT == 0
+            || entry.resident_bytes > AGENT_SESSION_VIEW_CACHE_BYTES
+        {
+            return;
+        }
+        self.session_views.insert(key.clone(), entry);
+        touch_session_view_lru(&mut self.session_view_lru, &key);
+    }
+
     /// Sessions whose view must survive eviction: the selected session and
     /// every session a group workspace is currently showing.
     fn pinned_session_view_ids(&self) -> BTreeSet<String> {
@@ -15065,6 +15106,39 @@ impl VibexWorkbench {
         outcome
     }
 
+    /// Borrows `session_id`'s view for work that runs after the render pass.
+    ///
+    /// A session group builds its panes during the render pass but lays them
+    /// out and paints them afterwards, when the borrowed view already belongs
+    /// to the focused pane. Every row a pane paints there — its payloads, its
+    /// expansion state, its measured heights — would otherwise be resolved
+    /// against the focused session's view, which froze a working pane's
+    /// timeline and left blank bands in it. This borrow makes the pane's own
+    /// view current for the duration of `body`, and hands the primary back
+    /// afterwards so the invariant [`Self::release_session_view`] protects still
+    /// holds for whatever runs next.
+    ///
+    /// The swap is unweighed: it happens once per rendered row, and the render
+    /// pass already weighs a view when it hands it back.
+    fn with_session_view_for_render<R>(
+        &mut self,
+        session_id: Option<&VibexSessionId>,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(session_id) = session_id else {
+            // No session to route by means the borrowed view is the only
+            // candidate left.
+            return body(self);
+        };
+        let had_view = self.borrow_session_view_unweighed(session_id);
+        if !had_view && self.timeline.session_id.is_none() {
+            self.timeline.session_id = Some(session_id.clone());
+        }
+        let outcome = body(self);
+        self.release_session_view_unweighed();
+        outcome
+    }
+
     /// Hands the borrowed view back to the store and re-borrows the session the
     /// primary workbench renders.
     ///
@@ -15072,10 +15146,24 @@ impl VibexWorkbench {
     /// borrowed, because every non-pane code path reads `self.timeline` as "the
     /// selected session's timeline".
     fn release_session_view(&mut self) {
+        self.release_session_view_weighed(true)
+    }
+
+    /// Hands back a view borrowed for layout or prepaint, without re-weighing
+    /// either side of the swap.
+    fn release_session_view_unweighed(&mut self) {
+        self.release_session_view_weighed(false)
+    }
+
+    fn release_session_view_weighed(&mut self, weigh: bool) {
         let primary = self.selected_session_id.clone();
         match primary {
             Some(primary) => {
-                let _ = self.borrow_session_view(&primary);
+                if weigh {
+                    let _ = self.borrow_session_view(&primary);
+                } else {
+                    let _ = self.borrow_session_view_unweighed(&primary);
+                }
             }
             None => {
                 if let Some(previous_key) = self.view_session_id.take() {
@@ -15084,7 +15172,11 @@ impl VibexWorkbench {
                         SessionView::new(self.ui_state.session.content_width),
                     );
                     let previous_key = previous_key.as_str().to_string();
-                    self.store_session_view(previous_key, previous);
+                    if weigh {
+                        self.store_session_view(previous_key, previous);
+                    } else {
+                        self.insert_session_view(previous_key, previous);
+                    }
                 }
             }
         }
@@ -15358,7 +15450,7 @@ impl VibexWorkbench {
         let (added_lines, removed_lines) =
             turn_file_changes_line_counts(&file_changes).unwrap_or_default();
         let agent_id = self
-            .selected_runtime_selection()
+            .view_runtime_selection()
             .map(|selection| selection.agent_id)
             .or_else(|| self.view_session().map(|session| session.agent_id.clone()))?;
         let agent_label = runtime_agent_label(&self.agent_snapshots, &agent_id);
@@ -15507,14 +15599,43 @@ impl VibexWorkbench {
     }
 
     fn selected_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
-        let session_id = self.selected_session_id.as_ref()?;
+        let session_id = self.selected_session_id.clone()?;
+        self.runtime_selection_for_session(&session_id)
+    }
+
+    /// The runtime selection the borrowed view renders.
+    ///
+    /// A group pane renders its own session's runtime controls while the
+    /// sidebar still selects the focused pane's session, so the lookup has to
+    /// follow the borrowed view rather than the selection.
+    fn view_runtime_selection(&self) -> Option<SessionRuntimeSelection> {
+        let session_id = self.view_session_id.clone()?;
+        self.runtime_selection_for_session(&session_id)
+    }
+
+    /// The runtime selection a session renders, selected or not.
+    fn runtime_selection_for_session(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<SessionRuntimeSelection> {
         self.optimistic_runtime_selections
             .get(session_id.as_str())
             .cloned()
             .or_else(|| {
-                self.runtime_selection
-                    .as_ref()
-                    .map(|state| state.desired.clone())
+                // The live selection lives in the view that owns the session:
+                // the borrowed one for the session being rendered, the stored
+                // one otherwise. Reading the borrowed view for any other
+                // session would hand a pane the focused pane's Agent.
+                if self.view_session_id.as_ref() == Some(session_id) {
+                    self.runtime_selection
+                        .as_ref()
+                        .map(|state| state.desired.clone())
+                } else {
+                    self.session_views
+                        .get(session_id.as_str())
+                        .and_then(|view| view.runtime_selection.as_ref())
+                        .map(|state| state.desired.clone())
+                }
             })
             .or_else(|| {
                 // Imported sessions predate runtime selection state. They are
@@ -15525,7 +15646,7 @@ impl VibexWorkbench {
                     .runtime_selection_uninitialized_sessions
                     .contains(session_id.as_str())
                 {
-                    self.fallback_runtime_selection_for_uninitialized()
+                    self.fallback_runtime_selection_for(session_id)
                 } else {
                     None
                 }
@@ -15539,12 +15660,14 @@ impl VibexWorkbench {
         })
     }
 
-    fn fallback_runtime_selection_for_uninitialized(&self) -> Option<SessionRuntimeSelection> {
-        let session_id = self.selected_session_id.as_ref()?;
+    fn fallback_runtime_selection_for(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> Option<SessionRuntimeSelection> {
         let session = self
             .sessions
             .iter()
-            .find(|session| session.id == *session_id)?;
+            .find(|session| &session.id == session_id)?;
         let agent_id = session.agent_id.clone();
         let catalog = self.runtime_catalog.as_ref()?;
         if let Some(selection) = self
@@ -40969,6 +41092,11 @@ impl VibexWorkbench {
             .session_id
             .as_ref()
             .map(|session_id| SharedString::from(session_id.as_str()));
+        // The virtual list builds its rows during layout and prepaint, after the
+        // render pass has handed this pane's view back. Carry the session so the
+        // closure can borrow it again: a row resolved against the focused pane's
+        // view loses its payloads, its expansion state and its measurements.
+        let timeline_render_session_id = self.timeline.session_id.clone();
         let timeline_surface = div()
             .relative()
             .flex_1()
@@ -41049,65 +41177,85 @@ impl VibexWorkbench {
                                 timeline_list_id.clone(),
                                 row_sizes,
                                 move |this, visible_range, window, cx| {
-                                    let rendered_turns = rendered_turns.borrow().clone();
-                                    let turn_count = rendered_turns.len();
-                                    visible_range
-                                        .filter_map(|index| {
-                                            let turn = rendered_turns.get(index)?;
-                                            let row_height = rendered_row_sizes.get(index)?.height;
-                                            let measured_height_entity = cx.weak_entity();
-                                            let measured_turn_id = turn.id.clone();
-                                            let measured_session_id = timeline_measure_session_id.clone();
-                                            let turn_content = this.render_timeline_turn(
-                                                turn,
-                                                index,
-                                                index == 0,
-                                                index + 1 == turn_count,
-                                                window,
-                                                cx,
-                                            );
-                                            Some(
-                                                h_flex()
-                                                    .w_full()
-                                                    .h(row_height)
-                                                    .justify_center()
-                                                    // `h_flex` defaults to items_center; rows must
-                                                    // top-align so estimation slack stays below the
-                                                    // content instead of re-centering it.
-                                                    .items_start()
-                                                    .overflow_hidden()
-                                                    .child(
-                                                        div()
+                                    // Layout and prepaint run after the render
+                                    // pass, so the borrowed view belongs to the
+                                    // focused pane by now. Building this pane's
+                                    // rows against it would freeze a working
+                                    // pane's conversation and hand its rows the
+                                    // other session's expansions and caches.
+                                    this.with_session_view_for_render(
+                                        timeline_render_session_id.as_ref(),
+                                        |this| {
+                                            let rendered_turns = rendered_turns.borrow().clone();
+                                            let turn_count = rendered_turns.len();
+                                            visible_range
+                                                .filter_map(|index| {
+                                                    let turn = rendered_turns.get(index)?;
+                                                    let row_height =
+                                                        rendered_row_sizes.get(index)?.height;
+                                                    let measured_height_entity = cx.weak_entity();
+                                                    let measured_turn_id = turn.id.clone();
+                                                    let measured_session_id =
+                                                        timeline_measure_session_id.clone();
+                                                    let turn_content = this.render_timeline_turn(
+                                                        turn,
+                                                        index,
+                                                        index == 0,
+                                                        index + 1 == turn_count,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    Some(
+                                                        h_flex()
                                                             .w_full()
-                                                            .min_w_0()
-                                                            .when_some(
-                                                                content_max_width,
-                                                                |this, max_width| {
-                                                                    this.max_w(px(max_width))
-                                                                },
+                                                            .h(row_height)
+                                                            .justify_center()
+                                                            // `h_flex` defaults to items_center; rows must
+                                                            // top-align so estimation slack stays below the
+                                                            // content instead of re-centering it.
+                                                            .items_start()
+                                                            .overflow_hidden()
+                                                            .child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .min_w_0()
+                                                                    .when_some(
+                                                                        content_max_width,
+                                                                        |this, max_width| {
+                                                                            this.max_w(px(max_width))
+                                                                        },
+                                                                    )
+                                                                    .on_prepaint(
+                                                                        move |bounds, _, cx| {
+                                                                            let measured_height = f32::from(
+                                                                                bounds.size.height,
+                                                                            );
+                                                                            let session_id =
+                                                                                measured_session_id
+                                                                                    .clone();
+                                                                            let _ = measured_height_entity
+                                                                                .update(
+                                                                                    cx,
+                                                                                    |this, cx| {
+                                                                                        this.defer_timeline_turn_height(
+                                                                                            session_id.as_deref(),
+                                                                                            index,
+                                                                                            measured_turn_id.clone(),
+                                                                                            measured_height,
+                                                                                            cx,
+                                                                                        )
+                                                                                    },
+                                                                                );
+                                                                        },
+                                                                    )
+                                                                    .child(turn_content),
                                                             )
-                                                            .on_prepaint(move |bounds, _, cx| {
-                                                                let measured_height =
-                                                                    f32::from(bounds.size.height);
-                                                                let session_id =
-                                                                    measured_session_id.clone();
-                                                                let _ = measured_height_entity
-                                                                    .update(cx, |this, cx| {
-                                                                        this.defer_timeline_turn_height(
-                                                                            session_id.as_deref(),
-                                                                            index,
-                                                                            measured_turn_id.clone(),
-                                                                            measured_height,
-                                                                            cx,
-                                                                        )
-                                                                    });
-                                                            })
-                                                            .child(turn_content),
+                                                            .into_any_element(),
                                                     )
-                                                    .into_any_element(),
-                                            )
-                                        })
-                                        .collect()
+                                                })
+                                                .collect()
+                                        },
+                                    )
                                 },
                             )
                             .size_full()
@@ -43520,7 +43668,10 @@ impl VibexWorkbench {
         is_latest_turn: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let session = self.selected_session()?.clone();
+        // The card belongs to the conversation being rendered, so it resolves
+        // its workspace from that view's session: a group pane must not show
+        // the focused pane's checkout.
+        let session = self.view_session()?.clone();
         let mut summary = self.agent_turn_file_changes_cached(turn).as_ref().clone();
         if summary.files.is_empty() {
             return None;
@@ -43929,12 +44080,20 @@ impl VibexWorkbench {
         let turns = self.conversation_turns_render_cache.clone();
         let build_units = units.clone();
         let build_entity = entity.clone();
+        // The units are built during prepaint too, so they carry the session
+        // that owns them and borrow that view back while they render and while
+        // the run records what they measured. A run that measured itself
+        // against the focused pane's view never converged: its units kept the
+        // first estimates, and the slack they left painted as a blank band.
+        let run_session_id = self.timeline.session_id.clone();
+        let build_session_id = run_session_id.clone();
         vec![
             TimelineProcessRun {
                 units,
                 origins,
                 total_height,
                 pinned_unit,
+                session_id: run_session_id,
                 entity,
                 build_unit: Box::new(move |index, window, cx| {
                     let turn = turns
@@ -43947,7 +44106,9 @@ impl VibexWorkbench {
                     };
                     build_entity
                         .update(cx, |this, cx| {
-                            this.render_timeline_process_unit(&turn, unit, window, cx)
+                            this.with_session_view_for_render(build_session_id.as_ref(), |this| {
+                                this.render_timeline_process_unit(&turn, unit, window, cx)
+                            })
                         })
                         .unwrap_or_else(|_| Empty.into_any_element())
                 }),
@@ -44909,8 +45070,11 @@ impl VibexWorkbench {
         {
             return summary.clone();
         }
+        // The summary belongs to the view being rendered, so the workspace root
+        // it resolves paths against is that view's session — the selected one
+        // for the primary workbench, the pane's own while a split renders it.
         let workspace_root = self
-            .selected_session()
+            .view_session()
             .map(|session| session.workspace_root.clone());
         let summary = {
             let timeline = self.active_timeline();
@@ -46856,7 +47020,7 @@ impl VibexWorkbench {
         let measured_turn_id = row.turn_id.clone();
         let open_path = agent_file_operation_preview_path(
             &operation.path,
-            self.selected_session()
+            self.view_session()
                 .map(|session| session.workspace_root.as_str()),
         );
         let title = format!(
@@ -48703,7 +48867,7 @@ impl VibexWorkbench {
         }
 
         let workspace_root = self
-            .selected_session()
+            .view_session()
             .map(|session| session.workspace_root.as_str());
         let (document, attachment_actions) = user_message_inline_document(
             &text,
@@ -50133,7 +50297,11 @@ impl VibexWorkbench {
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
-        let selected_runtime = self.selected_runtime_selection();
+        // The composer renders for the borrowed view, so every control on it —
+        // the runtime cascade, the send gate and the auto-continue countdown —
+        // reads that view's session. The sidebar selection names the focused
+        // pane, which is not necessarily the pane being rendered.
+        let selected_runtime = self.view_runtime_selection();
         let can_send = self.view_session_id.is_some()
             && selected_runtime.is_some()
             && !self.agent_action_pending
@@ -50152,11 +50320,11 @@ impl VibexWorkbench {
             })
         });
         let auto_continue_enabled = self
-            .selected_session_id
+            .view_session_id
             .as_ref()
             .is_some_and(|session_id| self.auto_continue_enabled(session_id));
         let auto_continue_remaining = self
-            .selected_session_id
+            .view_session_id
             .as_ref()
             .and_then(|session_id| self.auto_continue_remaining_seconds(session_id));
         let continue_button_label = auto_continue_remaining.map_or_else(
@@ -54586,6 +54754,12 @@ struct TimelineProcessRun {
     /// Unit holding the pending find-in-conversation reveal, built even when it
     /// falls outside the window so the match can still be scrolled to.
     pinned_unit: Option<usize>,
+    /// The session whose view this run's units belong to.
+    ///
+    /// Prepaint borrows it back before building or measuring a unit, so a run
+    /// that is not the focused pane's own still reads its own expansions and
+    /// records its own measurements.
+    session_id: Option<VibexSessionId>,
     /// The workbench, for recording what the run measured.
     entity: WeakEntity<VibexWorkbench>,
     /// Builds unit `index` on demand.
@@ -54741,8 +54915,11 @@ impl Element for TimelineProcessRun {
         }
         if !measurements.is_empty() {
             let units = self.units.clone();
+            let session_id = self.session_id.clone();
             let _ = self.entity.update(cx, |this, cx| {
-                this.record_timeline_process_unit_heights(&units, &measurements, cx)
+                this.with_session_view_for_render(session_id.as_ref(), |this| {
+                    this.record_timeline_process_unit_heights(&units, &measurements, cx)
+                })
             });
         }
     }
@@ -80659,6 +80836,124 @@ mod tests {
         // view happens to be borrowed.
         assert!(!content.contains("selected_session_id"));
         assert!(!content.contains("agent_session_view_cache"));
+    }
+
+    /// A pane lays out and paints its rows after the render pass handed its
+    /// view back, so the row renderer borrows that view again.
+    ///
+    /// Without it every row a non-focused pane painted resolved its payloads,
+    /// its expansion state and its measured heights against the focused
+    /// session's view: the process run kept the first estimates, the slack it
+    /// left painted as a blank band, and switching focus rewrote the layout
+    /// because the measurements landed in whichever view was borrowed.
+    #[test]
+    fn group_pane_rows_render_against_the_panes_own_view() {
+        let source = include_str!("app.rs");
+
+        // The virtual list closure carries the pane's session and borrows it
+        // for the whole row build, which is where the payload lookups and the
+        // height estimates happen.
+        let timeline = source
+            .split_once(
+                "        let timeline_render_session_id = self.timeline.session_id.clone();",
+            )
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n            .when_some(turn_preview_rail, |this, rail| this.child(rail));",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the timeline surface should remain inspectable");
+        assert!(timeline.contains("this.with_session_view_for_render("));
+        assert!(timeline.contains("timeline_render_session_id.as_ref(),"));
+        let borrows = timeline
+            .find("this.with_session_view_for_render(")
+            .expect("the row build should borrow the pane's view");
+        let renders = timeline
+            .find("this.render_timeline_turn(")
+            .expect("the row build should render the pane's turn");
+        assert!(borrows < renders);
+
+        // The windowed process run builds its units and records what they
+        // measured during prepaint too, so it carries the session as well.
+        let run = source
+            .split_once("struct TimelineProcessRun {")
+            .and_then(|(_, tail)| tail.split_once("\nimpl TimelineProcessRun {"))
+            .map(|(body, _)| body)
+            .expect("the process run should remain inspectable");
+        assert!(run.contains("session_id: Option<VibexSessionId>,"));
+
+        let build = source
+            .split_once("                build_unit: Box::new(move |index, window, cx| {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn command_permission_rows_are_linked("))
+            .map(|(body, _)| body)
+            .expect("the process unit builder should remain inspectable");
+        assert!(build.contains("this.with_session_view_for_render(build_session_id.as_ref(),"));
+
+        let prepaint = source
+            .split_once("        if !measurements.is_empty() {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn paint(\n        &mut self,"))
+            .map(|(body, _)| body)
+            .expect("the process run prepaint should remain inspectable");
+        assert!(prepaint.contains("this.with_session_view_for_render(session_id.as_ref(),"));
+        assert!(
+            prepaint
+                .contains("this.record_timeline_process_unit_heights(&units, &measurements, cx)")
+        );
+
+        // The swap is unweighed: it happens once per rendered row, and the
+        // render pass already weighs every view it hands back.
+        let swap = source
+            .split_once("    fn with_session_view_for_render<R>(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Hands the borrowed view back to the store")
+            })
+            .map(|(body, _)| body)
+            .expect("the render borrow should remain inspectable");
+        assert!(swap.contains("self.borrow_session_view_unweighed(session_id)"));
+        assert!(swap.contains("self.release_session_view_unweighed();"));
+
+        let insert = source
+            .split_once("    fn insert_session_view(&mut self, key: String, entry: SessionView) {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Sessions whose view must survive eviction")
+            })
+            .map(|(body, _)| body)
+            .expect("the transient insert should remain inspectable");
+        assert!(insert.contains("self.session_views.insert(key.clone(), entry);"));
+        assert!(!insert.contains("calculate_estimated_resident_bytes"));
+        assert!(!insert.contains("pinned_session_view_ids"));
+        assert!(!insert.contains("insert_bounded_session_view_with_pins"));
+
+        // The timeline resolves its workspace from the view it renders, so a
+        // pane never shows the focused pane's checkout or Agent.
+        let file_changes = source
+            .split_once("    fn agent_turn_file_changes_cached(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// File snapshots can be large,"))
+            .map(|(body, _)| body)
+            .expect("the turn file changes projection should remain inspectable");
+        assert!(file_changes.contains("self\n            .view_session()"));
+        assert!(!file_changes.contains("selected_session()"));
+
+        let status = source
+            .split_once("    fn render_agent_generation_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_controls("))
+            .map(|(body, _)| body)
+            .expect("the generation status renderer should remain inspectable");
+        assert!(status.contains("self\n            .view_runtime_selection()"));
+
+        // The composer renders for the borrowed view too: its cascade, its send
+        // gate and its auto-continue countdown belong to the pane's own session,
+        // not to whichever pane the sidebar selected.
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("the composer renderer should remain inspectable");
+        assert!(composer.contains("let selected_runtime = self.view_runtime_selection();"));
+        assert!(!composer.contains("self.selected_runtime_selection()"));
+        assert!(composer.contains("self.auto_continue_enabled(session_id)"));
+        assert!(composer.contains("self.auto_continue_remaining_seconds(session_id)"));
     }
 
     /// There is exactly one copy of a session's view, and a fetch may only fill
