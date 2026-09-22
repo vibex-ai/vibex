@@ -5,6 +5,19 @@ pub struct AcpAgentCatalogEntry {
     pub label: &'static str,
     pub description: &'static str,
     pub version: &'static str,
+    /// The oldest Adapter version whose provider projection Vibex still
+    /// supports, when that is older than `version`.
+    ///
+    /// `version` is the pin: what Vibex verifies, installs, and rolls back to.
+    /// The floor is the compatibility statement. They diverge when a newer
+    /// Adapter changes a wire detail and Vibex keeps a read-back shim for the
+    /// older spelling instead of dropping the release: the pin moves forward
+    /// while the floor stays on the oldest release the shim still covers.
+    /// Collapsing the two would turn a runtime Vibex can still project into a
+    /// conservative one (`agent_projection_version_mismatch`), which hides the
+    /// provider editor and fails `session/new` for every user who has not yet
+    /// upgraded. `None` means the pin is also the floor.
+    pub compatible_version: Option<&'static str>,
     pub install_url: &'static str,
     pub command: &'static [&'static str],
     pub env: &'static [(&'static str, &'static str)],
@@ -26,11 +39,19 @@ impl AcpAgentCatalogEntry {
             label,
             description,
             version,
+            compatible_version: None,
             install_url,
             command,
             env: &[],
             supports_mcp_servers: None,
         }
+    }
+
+    /// Declare a compatibility floor older than the catalog pin. See
+    /// [`AcpAgentCatalogEntry::compatible_version`].
+    const fn with_compatible_version(mut self, version: &'static str) -> Self {
+        self.compatible_version = Some(version);
+        self
     }
 
     const fn with_preset_id(mut self, preset_id: &'static str) -> Self {
@@ -147,7 +168,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
             "-y",
             "@openma/deepseek-harness-acp@0.4.33",
         ],
-    ),
+    )
+    // 0.4.33 qualifies every ACP model option id as `route::model`; Vibex keeps
+    // the bare id on the wire and reads the qualified spelling back as an alias
+    // so 0.4.32 keeps working. The projection floor therefore stays on 0.4.32
+    // even though the pin moved to 0.4.33.
+    .with_compatible_version("0.4.32"),
     AcpAgentCatalogEntry::new(
         "devin",
         "Devin CLI",
@@ -419,6 +445,7 @@ mod tests {
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
         assert_eq!(deepseek.version, "0.4.33");
+        assert_eq!(deepseek.compatible_version, Some("0.4.32"));
         assert_eq!(
             deepseek.command,
             &["npx", "-y", "@openma/deepseek-harness-acp@0.4.33"]

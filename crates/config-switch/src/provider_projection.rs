@@ -270,6 +270,7 @@ impl AgentProviderProjectionEngine {
         )?;
         project_credential_control(
             descriptor,
+            model_provider,
             credential,
             &mut secret_env,
             &mut targets,
@@ -1351,6 +1352,7 @@ fn project_provider_control(
 
 fn project_credential_control(
     descriptor: &AgentProviderProjectionDescriptor,
+    provider: &ModelProviderProfile,
     credential: Option<&ModelProviderCredentialReference>,
     secret_env: &mut Vec<ProjectionSecretEnvReference>,
     targets: &mut Vec<ProjectionTargetPreview>,
@@ -1371,25 +1373,37 @@ fn project_credential_control(
                     "selected credential cannot be projected to the required Secret environment target",
                 ));
             };
-            let secret_env_key = credential_secret_env_key(descriptor, credential, secret_env_key);
-            secret_env.push(ProjectionSecretEnvReference {
-                key: secret_env_key.to_string(),
-                credential_id: credential.id.clone(),
-                secret_reference: secret_reference.clone(),
-            });
-            targets.push(ProjectionTargetPreview {
-                field: "credential".to_string(),
-                target_kind: ProjectionTargetKind::Environment,
-                target: secret_env_key.to_string(),
-                value_preview: if secret_reference.setup_state
-                    == ProviderSecretSetupState::Available
-                {
-                    "configured".to_string()
-                } else {
-                    "missing".to_string()
-                },
-                secret: true,
-            });
+            // The declared key is always the first Secret environment entry: it
+            // is the name the Agent reads for the launch-level credential. Any
+            // additional name is one the Agent derives on its own from the
+            // projected route, and must carry the same Secret.
+            let mut secret_env_keys =
+                vec![credential_secret_env_key(descriptor, credential, secret_env_key).to_string()];
+            for alias in deepseek_harness_credential_env_aliases(descriptor, provider) {
+                if !secret_env_keys.contains(&alias) {
+                    secret_env_keys.push(alias);
+                }
+            }
+            for key in secret_env_keys {
+                secret_env.push(ProjectionSecretEnvReference {
+                    key: key.clone(),
+                    credential_id: credential.id.clone(),
+                    secret_reference: secret_reference.clone(),
+                });
+                targets.push(ProjectionTargetPreview {
+                    field: "credential".to_string(),
+                    target_kind: ProjectionTargetKind::Environment,
+                    target: key,
+                    value_preview: if secret_reference.setup_state
+                        == ProviderSecretSetupState::Available
+                    {
+                        "configured".to_string()
+                    } else {
+                        "missing".to_string()
+                    },
+                    secret: true,
+                });
+            }
         }
         AgentCredentialControl::ManagedConfigOverlay { .. } => {
             if credential
@@ -2476,6 +2490,25 @@ fn projected_runtime_model_id(
     model.agent_model_id.clone()
 }
 
+/// Whether a descriptor projects the DeepSeek Harness `settings.yaml` overlay.
+///
+/// Every Harness-specific derivation — the route id, the read-back model alias,
+/// and the route-derived credential name — keys off this same shape, so they
+/// cannot disagree about which Agent they are describing.
+fn projects_deepseek_harness_settings(descriptor: &AgentProviderProjectionDescriptor) -> bool {
+    matches!(
+        descriptor.provider_control,
+        AgentProviderControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
+        }
+    ) || matches!(
+        descriptor.model_control,
+        AgentModelControl::ManagedConfigOverlay {
+            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
+        }
+    )
+}
+
 /// Runtime spellings the Agent may report for a Model whose projected ACP
 /// option id is not the one it echoes.
 ///
@@ -2494,18 +2527,7 @@ fn projected_runtime_model_id_aliases(
     descriptor: &AgentProviderProjectionDescriptor,
     model: &AgentConfiguredModelBinding,
 ) -> Vec<String> {
-    let deepseek_harness = matches!(
-        descriptor.provider_control,
-        AgentProviderControl::ManagedConfigOverlay {
-            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
-        }
-    ) || matches!(
-        descriptor.model_control,
-        AgentModelControl::ManagedConfigOverlay {
-            strategy: ConfigOverlayStrategy::DeepseekHarnessSettingsYaml
-        }
-    );
-    if !deepseek_harness {
+    if !projects_deepseek_harness_settings(descriptor) {
         return Vec::new();
     }
     let model_id = projection_model_id(Some(model));
@@ -2529,6 +2551,49 @@ fn deepseek_harness_route_id(provider: &ModelProviderProfile) -> String {
             .as_deref()
             .unwrap_or_else(|| provider.id.as_str()),
     )
+}
+
+/// The Secret environment name the ACP wrapper derives from a route id.
+///
+/// The wrapper gates every prompt on the name it computes from the *route*, not
+/// on the `apiKeyEnv` the route's `llm-pi-ai` entry declares: a route that is
+/// neither DeepSeek's own nor a known vendor resolves to
+/// `<ROUTE_ID>_API_KEY`. `deepseek-harness-acp` 0.4.33 started recording the
+/// resolved route id on the session record when a Model switch happens, so the
+/// first prompt after a switch asks for the derived name while `session/new` —
+/// which still sees no `--provider` — asks for `DEEPSEEK_API_KEY`.
+///
+/// The transform mirrors the wrapper exactly (collapse runs of non-alphanumeric
+/// characters into one `_`, then upper-case), so the projected route id and the
+/// credential name it implies cannot drift.
+fn deepseek_harness_credential_env_key(route_id: &str) -> String {
+    let mut key = String::with_capacity(route_id.len() + "_API_KEY".len());
+    let mut separated = false;
+    for character in route_id.chars() {
+        if character.is_ascii_alphanumeric() {
+            key.push(character.to_ascii_uppercase());
+            separated = false;
+        } else if !separated {
+            key.push('_');
+            separated = true;
+        }
+    }
+    key.push_str("_API_KEY");
+    key
+}
+
+/// Secret environment names the projected Harness route may be gated on, beyond
+/// the `apiKeyEnv` its settings overlay declares.
+fn deepseek_harness_credential_env_aliases(
+    descriptor: &AgentProviderProjectionDescriptor,
+    provider: &ModelProviderProfile,
+) -> Vec<String> {
+    if !projects_deepseek_harness_settings(descriptor) {
+        return Vec::new();
+    }
+    vec![deepseek_harness_credential_env_key(
+        &deepseek_harness_route_id(provider),
+    )]
 }
 
 fn require_secret_env_key(key: Option<&str>) -> VibexResult<&str> {
@@ -4568,6 +4633,66 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_harness_projects_the_route_derived_credential_name_beside_the_declared_one() {
+        // The ACP wrapper gates every prompt on the name it derives from the
+        // route, while the settings overlay only declares `apiKeyEnv`. Both
+        // names must carry the selected Secret: `session/new` reads the
+        // declared one, and the first prompt after a Model switch reads the
+        // derived one, because 0.4.33 records the resolved route on the session
+        // record.
+        assert_eq!(deepseek_harness_credential_env_key("acp"), "ACP_API_KEY");
+        assert_eq!(
+            deepseek_harness_credential_env_key("my--route"),
+            "MY_ROUTE_API_KEY",
+            "the transform must collapse separator runs exactly as the wrapper does"
+        );
+
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "deepseek-harness")
+            .expect("the DeepSeek Harness owns a projection descriptor");
+        let (provider, runtime, binding) = typed_projection_fixture(descriptor);
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            descriptor,
+            "typed-matrix",
+        )
+        .unwrap();
+
+        // The settings overlay keeps naming the declared key, which is what the
+        // launch-level gate resolves before `session/new`.
+        let overlay = plan
+            .overlay_files
+            .iter()
+            .find(|overlay| overlay.relative_path == "settings.yaml")
+            .expect("the projection writes the Harness settings");
+        let settings: serde_yaml::Value = serde_yaml::from_str(&overlay.content).unwrap();
+        let route = settings["llm-pi-ai"]["providers"]
+            .as_mapping()
+            .and_then(|providers| providers.values().next())
+            .expect("the settings register exactly one route");
+        assert_eq!(route["apiKeyEnv"].as_str(), Some("DEEPSEEK_API_KEY"));
+
+        let keys = plan
+            .secret_env
+            .iter()
+            .map(|reference| reference.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["DEEPSEEK_API_KEY", "MATRIX_PROVIDER_API_KEY"]);
+        assert_eq!(
+            plan.secret_env[0].credential_id,
+            plan.secret_env[1].credential_id
+        );
+        assert_eq!(
+            plan.secret_env[0].secret_reference,
+            plan.secret_env[1].secret_reference
+        );
+    }
+
+    #[test]
     fn disabled_models_claim_no_runtime_model_id() {
         let (provider, _, mut binding, descriptor) =
             fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
@@ -5237,6 +5362,18 @@ mod tests {
         overlay_path: Option<&'static str>,
         overlay_format: Option<&'static str>,
         runtime_home_env_key: Option<&'static str>,
+    }
+
+    impl TypedProjectionExpectation {
+        /// Secret environment names the Agent derives from the projected route
+        /// on top of the descriptor's declared key. The fixture route id is
+        /// `matrix-provider`, so the derived spelling is fixed here too.
+        fn derived_secret_env_keys(&self) -> &'static [&'static str] {
+            match self.agent_id {
+                "deepseek-harness" => &["MATRIX_PROVIDER_API_KEY"],
+                _ => &[],
+            }
+        }
     }
 
     fn typed_projection_expectations() -> [TypedProjectionExpectation; 22] {
@@ -5955,8 +6092,35 @@ mod tests {
                 "typed-matrix",
             )
             .unwrap_or_else(|error| panic!("{} projection failed: {error:?}", expected.agent_id));
-            assert_eq!(plan.secret_env.len(), 1, "{}", expected.agent_id);
-            assert_eq!(plan.secret_env[0].key, expected.secret_env_key);
+            let mut expected_secret_keys = vec![expected.secret_env_key];
+            expected_secret_keys.extend(expected.derived_secret_env_keys());
+            let projected_secret_keys = plan
+                .secret_env
+                .iter()
+                .map(|reference| reference.key.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                projected_secret_keys, expected_secret_keys,
+                "{}",
+                expected.agent_id
+            );
+            // Every projected name must carry the same Secret, and must be
+            // visible in the preview, or the editor cannot report the target.
+            let credential_id = plan.secret_env[0].credential_id.clone();
+            let secret_reference = plan.secret_env[0].secret_reference.clone();
+            for reference in &plan.secret_env {
+                assert_eq!(reference.credential_id, credential_id);
+                assert_eq!(reference.secret_reference, secret_reference);
+                assert!(
+                    plan.preview.targets.iter().any(|target| {
+                        target.target_kind == ProjectionTargetKind::Environment
+                            && target.target == reference.key
+                    }),
+                    "{} does not preview the {} credential target",
+                    expected.agent_id,
+                    reference.key
+                );
+            }
             let expected_model = match expected.agent_id {
                 "pi" => "matrix-provider/agent-model",
                 "hermes" => "custom:agent-model",

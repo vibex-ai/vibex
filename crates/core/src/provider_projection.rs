@@ -2184,6 +2184,64 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_harness_projects_the_compatibility_floor_below_the_catalog_pin() {
+        let registry = AgentProviderProjectionRegistry::builtin().unwrap();
+        let route = route(
+            "deepseek-harness",
+            crate::agent_provider_runtime::default_acp_adapter_id(
+                &AgentId::parse("deepseek-harness").unwrap(),
+            )
+            .as_str(),
+        )
+        .unwrap();
+        let identity = |version: &str| AgentRuntimeVersionIdentity {
+            route: route.clone(),
+            adapter_version: None,
+            agent_version: Some(version.to_string()),
+            runtime_dependencies: BTreeMap::new(),
+            source: AgentVersionSource::Detected,
+        };
+
+        // The catalog pin moved to 0.4.33, but 0.4.32 still speaks the projected
+        // bare model id, so its runtime keeps the typed surface instead of
+        // collapsing to `agent_projection_version_mismatch`.
+        let floored = identity("0.4.32");
+        let resolution = registry.resolve(&floored).unwrap();
+        assert_eq!(
+            resolution.match_kind,
+            ProjectionDescriptorMatch::SemverRange
+        );
+        let capability = AgentProviderProjectionCapability::from_resolution(
+            &floored,
+            &resolution,
+            ProjectionAuthState::Missing,
+        );
+        for control in [
+            AgentProjectionFormControl::ApiKey,
+            AgentProjectionFormControl::Model,
+        ] {
+            assert!(capability.form_controls.contains(&control), "{control:?}");
+        }
+
+        let pinned = identity("0.4.33");
+        assert_eq!(
+            registry.resolve(&pinned).unwrap().match_kind,
+            ProjectionDescriptorMatch::SemverRange
+        );
+
+        let below = identity("0.4.31");
+        let resolution = registry.resolve(&below).unwrap();
+        assert_eq!(
+            resolution.match_kind,
+            ProjectionDescriptorMatch::Conservative
+        );
+        assert_eq!(
+            resolution.diagnostic_code.as_deref(),
+            Some("agent_projection_version_mismatch")
+        );
+    }
+
+    #[test]
     fn codex_0146_descriptor_and_binding_reject_chat() {
         let registry = AgentProviderProjectionRegistry::builtin().unwrap();
         let descriptor = registry

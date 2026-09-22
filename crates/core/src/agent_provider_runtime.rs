@@ -307,16 +307,19 @@ impl CatalogProjectionShape {
 
 fn catalog_version_compatibility(
     version: &str,
+    compatible_version: Option<&str>,
     mode: AgentProviderCapabilityMode,
     shape: &CatalogProjectionShape,
 ) -> (AgentVersionPolicy, AgentVersionCompatibility) {
     // Every explicit ReplaceableProvider projector uses its researched
-    // catalog version as a minimum supported version. Managed/cloud/local
-    // Agents and conservative entries retain their stricter policies.
+    // catalog version as a minimum supported version, unless the catalog
+    // declares an older compatibility floor for a release the projection still
+    // supports through a read-back shim. Managed/cloud/local Agents and
+    // conservative entries retain their stricter policies.
     if mode == AgentProviderCapabilityMode::ReplaceableProvider
         && shape.supports_vibex_model_provider_projection()
     {
-        at_least_or_manual(version)
+        at_least_or_manual(compatible_version.unwrap_or(version))
     } else {
         exact_or_manual(version)
     }
@@ -768,11 +771,13 @@ fn conservative_replaceable_shape(agent_id: &str) -> VibexResult<CatalogProjecti
 fn catalog_manifest_entry(
     id: &str,
     version: &str,
+    compatible_version: Option<&str>,
 ) -> VibexResult<AgentProviderRolloutManifestEntry> {
     let agent_id = AgentId::parse(id)?;
     let mode = mode_for(id);
     let shape = catalog_projection_shape(id, mode)?;
-    let (version_policy, _) = catalog_version_compatibility(version, mode, &shape);
+    let (version_policy, _) =
+        catalog_version_compatibility(version, compatible_version, mode, &shape);
     let entry = AgentProviderRolloutManifestEntry {
         agent_id: agent_id.clone(),
         catalog_version: version.to_string(),
@@ -850,7 +855,11 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
         });
     }
     for entry in acp_agent_catalog_entries() {
-        entries.push(catalog_manifest_entry(entry.id, entry.version)?);
+        entries.push(catalog_manifest_entry(
+            entry.id,
+            entry.version,
+            entry.compatible_version,
+        )?);
     }
     validate_rollout_manifest(&entries)?;
     Ok(entries)
@@ -936,7 +945,8 @@ pub fn catalog_projection_descriptors() -> VibexResult<Vec<AgentProviderProjecti
         let agent_id = AgentId::parse(entry.id)?;
         let mode = mode_for(entry.id);
         let shape = catalog_projection_shape(entry.id, mode)?;
-        let (_, compatibility) = catalog_version_compatibility(entry.version, mode, &shape);
+        let (_, compatibility) =
+            catalog_version_compatibility(entry.version, entry.compatible_version, mode, &shape);
         result.push(AgentProviderProjectionDescriptor {
             id: descriptor_id(&agent_id),
             descriptor_version: "1".to_string(),
@@ -1752,12 +1762,16 @@ mod tests {
             .iter()
             .filter(|descriptor| typed_projectors.contains(&descriptor.route.agent_id.as_str()))
         {
-            let catalog_version = acp_agent_catalog_entries()
+            let catalog_entry = acp_agent_catalog_entries()
                 .iter()
                 .find(|entry| entry.id == descriptor.route.agent_id.as_str())
-                .expect("typed projector is present in the ACP catalog")
-                .version;
-            let expected_requirement = format!(">={catalog_version}");
+                .expect("typed projector is present in the ACP catalog");
+            let expected_requirement = format!(
+                ">={}",
+                catalog_entry
+                    .compatible_version
+                    .unwrap_or(catalog_entry.version)
+            );
             assert!(
                 matches!(
                     descriptor.compatibility,
@@ -1767,7 +1781,7 @@ mod tests {
                         runtime_dependency_ranges: ref ranges,
                     } if range == &expected_requirement && ranges.is_empty()
                 ),
-                "{} must accept its catalog version and newer versions",
+                "{} must accept its compatibility floor and newer versions",
                 descriptor.route.agent_id
             );
         }

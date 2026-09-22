@@ -335,7 +335,7 @@ environment key and the final ACP authentication decision.
 - Materialize the selected Profile as a private `$DSH_HOME/settings.yaml` containing one `llm-pi-ai.providers` route and the matching `agent-default-model` selection. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` alone.
 - Map Vibex wire protocols to Harness API ids exactly: `openai_chat_completions` -> `openai-completions`, `openai_responses` -> `openai-responses`, and `anthropic_messages` -> `anthropic-messages`.
 - Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
-- Name that environment reference `DEEPSEEK_API_KEY`. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`.
+- Name that environment reference `DEEPSEEK_API_KEY`, and project the route-derived name beside it. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`. A second, prompt-time gate derives its name from the projected route instead — `<ROUTE_ID>_API_KEY`, upper-cased with every run of non-alphanumeric characters collapsed to a single `_` — and never consults the route's `apiKeyEnv`: `deepseek-harness-acp` 0.4.33 began recording the resolved route id on the session record when a Model switch happens, so the first prompt after a switch asks for `ACP_API_KEY` while the launch gate still asks for `DEEPSEEK_API_KEY`. Project both names, each carrying the selected credential's Secret; either name alone leaves one of the two gates failing with `provider_authentication_required`. Derive the route-derived name from the same route id the settings overlay writes, so the two cannot drift.
 - Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens and 32,768 output tokens when those limits are undeclared.
 - A Vibex route id is never a pi-ai catalog provider, so the projected `contextWindow` / `maxTokens` are the only limits the Harness knows for that Model: they are what it carries as the run's model metadata and reports back as the session's context window. The same model on an Agent account resolves the Harness's own catalog entry instead (a 1,000,000-token DeepSeek model reports 1.0m there and 262.1k on a Vibex route that declares nothing). Declaring the real limits is what makes a BYOK route report the same window as the account route. See "Declared Model Context And Output Limits".
 - Write the model `input` modality only when the Model declares it: `image_input: true` -> `[text, image]`, `image_input: false` -> `[text]`. An undeclared modality omits `input` entirely, because the Harness resolves an absent entry from its own pi-ai catalog first. Projecting an explicit `[text]` for an undeclared Model makes the Harness replace every prompt image with `[image omitted because this model accepts text only; ...]` before the request leaves the process, so the Agent never receives the image and no error surfaces.
@@ -345,7 +345,7 @@ environment key and the final ACP authentication decision.
 - Accept only the Agent's thinking-level vocabulary — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — with a non-empty wire spelling for every level except `off`, and at least one level beyond `off`. The Harness rejects the whole settings file for anything else (unknown key, valueless level other than `off`, an offer of nothing to think with), so the Provider editor and the projection both refuse it while the Model is still nameable instead of leaving a session that cannot start.
 - Saving a Model whose declared capabilities or wire protocol changed drops that Model's cached `provider_model_runtime_option_snapshots` row. A successful per-Model probe is reused by model id, and the cache key carries no part of the declaration, so without the drop the run options keep advertising the previous vocabulary and an edited declaration looks ignored. An edit that cannot change a probe answer (display name, notes, unrelated fields) keeps the evidence.
 - Pin the route-level `compat: { supportsDeveloperRole: false }` on every route whose `api` is `openai-completions` or `openai-responses`. pi-ai sends a reasoning Model's system prompt in the `developer` role unless the endpoint's compatibility report says the endpoint takes it, and it resolves that report by detecting the provider id and the endpoint — neither of which recognizes a Vibex route, so the OpenAI default `true` stays in force. A gateway that only speaks OpenAI's older vocabulary then rejects the whole turn (`400`, unknown variant `developer`) while the same Model on an Agent account keeps working, and the rejection reaches the run options as a bare JSON-RPC failure. The pin and `reasoningEfforts` travel together: the role only changes once the Model reasons. Never write the pin for an `anthropic-messages` route — Anthropic Messages offers no such switch, and the Harness refuses a route-level switch no Model on the route can apply rather than ignoring it, which fails the entire settings file.
-- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as the settings overlay writes it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route.
+- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as the settings overlay writes it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route. The bare id is the only form both Adapter versions accept, so the catalog pin moves to `0.4.33` while the compatibility floor stays `0.4.32`: raising the floor with the pin would make an installed `0.4.32` runtime conservative and hide the provider editor for a release the projection still supports.
 - Roll back installs the Adapter version Vibex pins in its own catalog for that
   Agent, and is the only install target allowed to move an installation
   backwards. The pin is Vibex's compatibility statement, so a user asking for
@@ -378,6 +378,7 @@ environment key and the final ACP authentication decision.
 - Provider editor tests assert a declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh for a Model the catalogue still advertises.
 - Projection tests assert the developer-role pin is present with value `false` exactly on the Chat Completions and Responses routes and absent — with no `compat` key at all — on the Anthropic Messages route, and that a reasoning route Model keeps its projected `reasoningEfforts` alongside the pin.
 - Projection tests assert the DeepSeek Harness read-back alias is `{projected route id}::{model id}` — the same route id the settings overlay writes — and that no other Agent projection declares one. Runtime tests assert the alias resolves to its product Model while the projected wire form stays bare, and that an alias another Model already owns is rejected as `acp_model_id_projection_ambiguous`.
+- Runtime tests assert the DeepSeek Harness descriptor pins `0.4.33` while accepting `>=0.4.32`: a `0.4.32` identity resolves to the typed projection with its credential and model controls, a `0.4.33` identity resolves the same way, and `0.4.31` is conservative with `agent_projection_version_mismatch`.
 - The typed projector matrix asserts the private `settings.yaml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
 
 ## Scenario: Declared Model Context And Output Limits
@@ -3992,7 +3993,7 @@ ResolvedAgentProviderProjection {
 
 ### 3. Contracts
 
-- The 17 descriptors accept their researched catalog versions and later
+- The 17 descriptors accept their researched compatibility floors and later
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
   `>=0.1.23`, DeepSeek Harness ACP `>=0.4.32`, Dirac `>=0.4.1`, Factory Droid
   `>=0.153.1`, Goose `>=1.33.1`,
@@ -4001,6 +4002,18 @@ ResolvedAgentProviderProjection {
   Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
   `>=0.96.14`. Older, missing, manual, or non-semantic versions never inherit
   these schemas.
+- The catalog version is the pin — the release Vibex verifies, installs, and
+  rolls back to — and the compatibility floor is a separate statement. They
+  are the same value unless the catalog entry declares
+  `compatible_version`, which it does only when a newer release changed a wire
+  detail and Vibex kept a read-back shim for the older spelling. DeepSeek
+  Harness is the one such Agent: the pin is `0.4.33` while the floor stays
+  `0.4.32`, because `0.4.33` qualifies every ACP model option id as
+  `route::model` and Vibex answers that spelling with a read-back alias rather
+  than dropping `0.4.32`. Bumping the pin alone must not raise the floor: an
+  already-installed runtime below the pin but at or above the floor keeps the
+  typed projection instead of collapsing to the conservative surface with
+  `agent_projection_version_mismatch`.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
@@ -4013,7 +4026,7 @@ ResolvedAgentProviderProjection {
 | --- | --- | --- |
 | Copilot | `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` / `COPILOT_MODEL` | `COPILOT_HOME` points at the private projection root. |
 | CodeWhale | `CODEWHALE_BASE_URL` / `OPENAI_API_KEY` / `CODEWHALE_MODEL` | `CODEWHALE_PROVIDER=openai`; `CODEWHALE_HOME` is private. |
-| DeepSeek Harness | `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` / `DSH_MODEL` | The ACP bridge documents all three launch variables; `DSH_HOME` keeps credentials and sessions in Vibex-owned state. |
+| DeepSeek Harness | `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` / `DSH_MODEL` | The ACP bridge documents all three launch variables; `DSH_HOME` keeps credentials and sessions in Vibex-owned state. The same Secret is also projected under the route-derived `<ROUTE_ID>_API_KEY` name the prompt-time gate reads. |
 | Poolside | `POOLSIDE_STANDALONE_BASE_URL` / `POOLSIDE_API_KEY` / `POOLSIDE_STANDALONE_MODEL` | A trailing `/v1` is removed before launch. |
 
 - The other 13 use code-owned typed overlays; serializers, relative paths,
@@ -4103,8 +4116,16 @@ ResolvedAgentProviderProjection {
   `all_typed_catalog_projectors_map_provider_env_secret_model_and_private_state`
   parses every JSON/TOML/YAML overlay, checks all 17 endpoint/key/model
   projections, Goose/Grok selection, home paths, Crow/Stakpak args, fingerprint
-  drift, and Secret redaction. Version-probe tests assert the 12 trusted system
+  drift, and Secret redaction. It asserts the full projected Secret environment
+  name list per Agent, so the DeepSeek Harness case must show both
+  `DEEPSEEK_API_KEY` and the fixture's route-derived `MATRIX_PROVIDER_API_KEY`
+  sharing one credential. Version-probe tests assert the 12 trusted system
   binary names.
+- Config-switch
+  `deepseek_harness_projects_the_route_derived_credential_name_beside_the_declared_one`
+  pins the wrapper's name transform (including separator-run collapsing) and
+  asserts the overlay keeps declaring `apiKeyEnv: DEEPSEEK_API_KEY` while the
+  plan's Secret environment carries both names against one credential.
 - ACP `projection_process_args_preserve_stakpak_root_argument_order` and
   `probe_process_args_use_materialized_probe_overlay_paths` assert real/probe
   argument parity, ordering, and deduplication. Process snapshot tests assert
