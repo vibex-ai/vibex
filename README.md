@@ -123,8 +123,8 @@ Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
     <tr>
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://www.codebuddy.cn/cli/">
-          <img src="docs/assets/agents/codebuddy-code.svg" alt="Codebuddy Code logo" width="28" /><br />
-          <sub><b>Codebuddy Code</b></sub>
+          <img src="docs/assets/agents/codebuddy-code.svg" alt="Codebuddy logo" width="28" /><br />
+          <sub><b>Codebuddy</b></sub>
         </a>
       </td>
       <td align="center" valign="middle" width="135" height="84">
@@ -153,8 +153,8 @@ Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
       </td>
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://docs.x.ai/build/overview">
-          <img src="docs/assets/agents/grok.svg" alt="Grok logo" width="28" /><br />
-          <sub><b>Grok</b></sub>
+          <img src="docs/assets/agents/grok.svg" alt="Grok Build logo" width="28" /><br />
+          <sub><b>Grok Build</b></sub>
         </a>
       </td>
     </tr>
@@ -198,8 +198,8 @@ Works with **any ACP-compatible agent** — if it speaks ACP, it runs in Vibex.
 
 Built-in presets include **Claude Code**, **Codex**, **ZCode**, and
 **OpenCode**. The ACP catalog also includes integrations such as **Antigravity**,
-**Cline**, **Codebuddy Code**, **Cursor**, **Gemini CLI**, **GitHub Copilot**,
-**Devin**, **Grok**, **Hermes**, **Kimi Code**, **Pi**, **DeepSeek Harness**, and
+**Cline**, **Codebuddy**, **Cursor**, **Gemini CLI**, **GitHub Copilot**,
+**Devin**, **Grok Build**, **Hermes**, **Kimi Code**, **Pi**, **DeepSeek Harness**, and
 more. Availability is checked against the installed runtime, provider
 configuration, and live capability probes.
 

@@ -14,7 +14,7 @@ use vibex_core::{
     ProviderNativeImportRedactedField, ProviderNativeImportSource, ProviderOptions,
     ProviderProfile, ProviderProfileCreateRequest, ProviderSecretBackend, ProviderSecretKind,
     ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, RequestId, VibexError,
-    VibexResult, builtin_agent_definitions, unix_timestamp_ms,
+    VibexResult, builtin_agent_definitions, supports_native_provider_import, unix_timestamp_ms,
 };
 use vibex_db::ProviderProfileRepository;
 
@@ -1247,14 +1247,20 @@ fn cc_switch_acp_import_item(
 
 fn cc_switch_agent_mapping(app_type: &str) -> Option<CcSwitchAgentMapping> {
     let normalized = normalize_cc_switch_app_type(app_type);
+    // CC Switch names the xAI CLI `grokbuild`; Vibex keeps the Agent id `grok`.
+    // Every other alias is a legacy spelling of an Agent id Vibex already uses.
     let agent_id = match normalized.as_str() {
         "claude-code" => "claude",
         "open-code" => "opencode",
+        "grokbuild" | "grok-build" => "grok",
         _ => normalized.as_str(),
     };
     let definition = builtin_agent_definitions()
         .into_iter()
         .find(|definition| definition.id.as_str() == agent_id)?;
+    if !supports_native_provider_import(&definition.id) {
+        return None;
+    }
     let provider_kind = match definition.id.as_str() {
         "claude" => ProviderKind::Claude,
         "codex" => ProviderKind::Codex,
@@ -2603,6 +2609,39 @@ wire_api = "responses"
                 && item.default_model.as_deref() == Some("gpt-5.5")
         }));
         assert!(!format!("{preview:?}").contains("secret-value"));
+    }
+
+    #[test]
+    fn native_import_cc_switch_mapping_only_accepts_supported_agents() {
+        for (app_type, expected_agent_id) in [
+            ("claude", "claude"),
+            ("claude-code", "claude"),
+            ("codex", "codex"),
+            ("gemini", "gemini"),
+            ("opencode", "opencode"),
+            ("open-code", "opencode"),
+            ("hermes", "hermes"),
+            ("pi", "pi"),
+            ("grokbuild", "grok"),
+            ("grok-build", "grok"),
+        ] {
+            let mapping = cc_switch_agent_mapping(app_type).expect(app_type);
+            assert_eq!(mapping.agent_id.as_str(), expected_agent_id, "{app_type}");
+        }
+        for app_type in [
+            "cursor",
+            "copilot",
+            "cline",
+            "kimi",
+            "claude-desktop",
+            "openclaw",
+            "mcode",
+        ] {
+            assert!(
+                cc_switch_agent_mapping(app_type).is_none(),
+                "unsupported CC Switch app type {app_type} must stay unmapped"
+            );
+        }
     }
 
     #[test]

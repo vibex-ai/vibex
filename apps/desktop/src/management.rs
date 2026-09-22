@@ -14587,6 +14587,8 @@ impl ManagementCenter {
             return detail_empty_state(copy.no_agents, copy.no_agents_description, cx);
         }
         let selected_agent_id = selected_agent.id.as_str().to_string();
+        let native_import_supported =
+            vibex_core::supports_native_provider_import(&selected_agent.id);
         if !self.model_provider_agent_ids.contains(&selected_agent_id) {
             return v_flex()
                 .w_full()
@@ -15073,7 +15075,7 @@ impl ManagementCenter {
                                         this.open_profile_creator(window, cx);
                                     })),
                             )
-                            .child(
+                            .children(native_import_supported.then(|| {
                                 Button::new("provider-empty-import-existing")
                                     .small()
                                     .secondary()
@@ -15084,8 +15086,8 @@ impl ManagementCenter {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let agent_id = this.selected_agent_id.clone();
                                         this.preview_native_import(true, agent_id, cx)
-                                    })),
-                            ),
+                                    }))
+                            })),
                     ),
                 )
                 .into_any_element()
@@ -15114,19 +15116,21 @@ impl ManagementCenter {
                                 .flex_wrap()
                                 .justify_end()
                                 .gap_2()
-                                .child(management_detail_icon_action(
-                                    Button::new("provider-import-existing")
-                                        .small()
-                                        .secondary()
-                                        .icon(Icon::default().path("icons/vibex/import.svg"))
-                                        .loading(native_importing)
-                                        .disabled(pending)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let agent_id = this.selected_agent_id.clone();
-                                            this.preview_native_import(true, agent_id, cx)
-                                        })),
-                                    copy.import_configuration,
-                                ))
+                                .children(native_import_supported.then(|| {
+                                    management_detail_icon_action(
+                                        Button::new("provider-import-existing")
+                                            .small()
+                                            .secondary()
+                                            .icon(Icon::default().path("icons/vibex/import.svg"))
+                                            .loading(native_importing)
+                                            .disabled(pending)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let agent_id = this.selected_agent_id.clone();
+                                                this.preview_native_import(true, agent_id, cx)
+                                            })),
+                                        copy.import_configuration,
+                                    )
+                                }))
                                 .child(management_detail_icon_action(
                                     Button::new("provider-add-configuration")
                                         .small()
@@ -19321,7 +19325,7 @@ fn management_native_export_sources() -> Vec<(vibex_core::ProviderNativeExportSo
         (vibex_core::ProviderNativeExportSource::Codex, "Codex"),
         (vibex_core::ProviderNativeExportSource::Claude, "Claude"),
         (vibex_core::ProviderNativeExportSource::Cursor, "Cursor"),
-        (vibex_core::ProviderNativeExportSource::Grok, "Grok"),
+        (vibex_core::ProviderNativeExportSource::Grok, "Grok Build"),
         (vibex_core::ProviderNativeExportSource::Gemini, "Gemini"),
         (vibex_core::ProviderNativeExportSource::Kimi, "Kimi"),
         (vibex_core::ProviderNativeExportSource::OpenCode, "OpenCode"),
@@ -19332,7 +19336,7 @@ fn management_native_export_sources() -> Vec<(vibex_core::ProviderNativeExportSo
         (vibex_core::ProviderNativeExportSource::Cline, "Cline"),
         (
             vibex_core::ProviderNativeExportSource::CodeBuddy,
-            "CodeBuddy",
+            "Codebuddy",
         ),
         (vibex_core::ProviderNativeExportSource::Copilot, "Copilot"),
         (vibex_core::ProviderNativeExportSource::OpenClaw, "OpenClaw"),
@@ -23925,6 +23929,36 @@ mod tests {
         assert!(empty.contains("this.open_profile_creator(window, cx)"));
         assert!(empty.contains("this.preview_native_import(true, agent_id, cx)"));
         assert!(!empty.contains("compact_empty_state("));
+    }
+
+    #[test]
+    fn model_provider_import_is_offered_only_for_supported_agents() {
+        let source = include_str!("management.rs");
+        let render = source
+            .split_once("    fn render_providers(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_mcp("))
+            .map(|(body, _)| body)
+            .expect("Provider renderer should remain inspectable");
+
+        assert!(render.contains("vibex_core::supports_native_provider_import(&selected_agent.id)"));
+        assert_eq!(
+            render.matches("native_import_supported.then(||").count(),
+            2,
+            "both the empty state and the populated toolbar must gate the import action"
+        );
+        for button_id in ["provider-empty-import-existing", "provider-import-existing"] {
+            let button_position = render.find(button_id).expect(button_id);
+            let gate_position = render[..button_position]
+                .rfind("native_import_supported.then(||")
+                .expect("the import action must sit behind the support gate");
+            assert_eq!(
+                render[gate_position..button_position]
+                    .matches(".child(")
+                    .count(),
+                0,
+                "{button_id} must not be added through an ungated child"
+            );
+        }
     }
 
     #[test]

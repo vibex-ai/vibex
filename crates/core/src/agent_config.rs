@@ -421,6 +421,19 @@ pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
     )
 }
 
+/// Returns whether Vibex can import a Provider configuration for this Agent.
+///
+/// Native import reads CC Switch's provider table, and only these app types
+/// have a Vibex-side projection today. The management surface hides the import
+/// action for every other Agent so it cannot dead-end on
+/// `provider_native_import_no_candidate`.
+pub fn supports_native_provider_import(agent_id: &AgentId) -> bool {
+    matches!(
+        agent_id.as_str(),
+        "claude" | "codex" | "gemini" | "hermes" | "opencode" | "pi" | "grok"
+    )
+}
+
 /// Builds a runtime definition from a persisted custom Agent configuration.
 /// Custom definitions deliberately use conservative ACP capabilities.
 pub fn custom_agent_definition(config: &AgentConfig) -> Option<AgentDefinition> {
@@ -1096,6 +1109,30 @@ mod tests {
                 .iter()
                 .filter(|definition| !is_user_visible_agent(&definition.id))
                 .all(|definition| !expected.contains(definition.id.as_str()))
+        );
+    }
+
+    #[test]
+    fn native_provider_import_policy_matches_the_importable_agent_catalog() {
+        let definitions = builtin_agent_definitions();
+        let importable = definitions
+            .iter()
+            .filter(|definition| supports_native_provider_import(&definition.id))
+            .map(|definition| definition.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "claude", "codex", "gemini", "grok", "hermes", "opencode", "pi",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(importable, expected);
+        assert!(
+            definitions
+                .iter()
+                .filter(|definition| !is_user_visible_agent(&definition.id))
+                .all(|definition| !supports_native_provider_import(&definition.id)),
+            "a hidden Agent must not advertise provider import"
         );
     }
 }

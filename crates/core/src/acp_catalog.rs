@@ -114,7 +114,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
     ),
     AcpAgentCatalogEntry::new(
         "codebuddy-code",
-        "Codebuddy Code",
+        "Codebuddy",
         "Tencent Cloud's official intelligent coding tool",
         "2.109.0",
         "https://www.codebuddy.cn/cli/",
@@ -244,7 +244,7 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
     ),
     AcpAgentCatalogEntry::new(
         "grok",
-        "Grok",
+        "Grok Build",
         "xAI's Grok Build agentic coding CLI with plan mode and parallel subagents. Requires a SuperGrok or X Premium+ subscription.",
         "1.0.8",
         "https://docs.x.ai/build/overview",

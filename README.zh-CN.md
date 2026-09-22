@@ -112,8 +112,8 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
     <tr>
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://www.codebuddy.cn/cli/">
-          <img src="docs/assets/agents/codebuddy-code.svg" alt="Codebuddy Code logo" width="28" /><br />
-          <sub><b>Codebuddy Code</b></sub>
+          <img src="docs/assets/agents/codebuddy-code.svg" alt="Codebuddy logo" width="28" /><br />
+          <sub><b>Codebuddy</b></sub>
         </a>
       </td>
       <td align="center" valign="middle" width="135" height="84">
@@ -142,8 +142,8 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
       </td>
       <td align="center" valign="middle" width="135" height="84">
         <a href="https://docs.x.ai/build/overview">
-          <img src="docs/assets/agents/grok.svg" alt="Grok logo" width="28" /><br />
-          <sub><b>Grok</b></sub>
+          <img src="docs/assets/agents/grok.svg" alt="Grok Build logo" width="28" /><br />
+          <sub><b>Grok Build</b></sub>
         </a>
       </td>
     </tr>
@@ -185,7 +185,7 @@ Vibex 使用 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) 作
   </table>
 </div>
 
-内置预设包括 **Claude Code**、**Codex**、**ZCode** 和 **OpenCode**。ACP 目录还包含 **Antigravity**、**Cline**、**Codebuddy Code**、**Cursor**、**Gemini CLI**、**GitHub Copilot**、**Devin**、**Grok**、**Hermes**、**Kimi Code**、**Pi**、**DeepSeek Harness** 等集成。Vibex 会根据本机已安装的运行时、供应商配置和实时能力探测结果判断可用性。
+内置预设包括 **Claude Code**、**Codex**、**ZCode** 和 **OpenCode**。ACP 目录还包含 **Antigravity**、**Cline**、**Codebuddy**、**Cursor**、**Gemini CLI**、**GitHub Copilot**、**Devin**、**Grok Build**、**Hermes**、**Kimi Code**、**Pi**、**DeepSeek Harness** 等集成。Vibex 会根据本机已安装的运行时、供应商配置和实时能力探测结果判断可用性。
 
 你也可以注册任意兼容 ACP 的可执行程序, 配置其命令、参数、环境变量和显示元数据。新增 Agent 无需修改 UI, 也无需再实现一套厂商专用的会话协议。
 
