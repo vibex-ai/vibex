@@ -11298,7 +11298,13 @@ impl ManagementCenter {
                         v_flex()
                             .min_w_0()
                             .flex_1()
-                            .child(div().truncate().text_sm().font_medium().child(candidate_title))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child(candidate_title),
+                            )
                             .child(
                                 div()
                                     .truncate()

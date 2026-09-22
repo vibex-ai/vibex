@@ -74271,9 +74271,7 @@ mod tests {
         });
         let probe = cx.update(|cx| cx.new(SelectableHintProbe::new));
         let anchor_focus = probe.read_with(cx, |probe, _| probe.anchor_focus.clone());
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            Root::new(probe, window, cx).bordered(false)
-        });
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(probe, window, cx).bordered(false));
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
@@ -80292,9 +80290,7 @@ mod tests {
             .find("this.focus_session_group_pane(&group_id, &pane_id, cx);")
             .expect("a non-focused pane should focus on mouse down");
         let after = &pane[focus_on_down..];
-        let handler_end = after
-            .find("}))")
-            .expect("the capture handler should close");
+        let handler_end = after.find("}))").expect("the capture handler should close");
         assert!(!after[..handler_end].contains("cx.stop_propagation()"));
     }
 
