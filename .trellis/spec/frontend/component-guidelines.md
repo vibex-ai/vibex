@@ -396,6 +396,15 @@ that stops updating and as blank bands between rows. Measurements a pane records
 during prepaint belong to the same view, and the transient borrow is
 deliberately unweighed so a per-row swap does not re-walk a whole timeline.
 
+The same rule covers input that arrives without focusing the pane. A wheel event
+is routed to the element under the pointer, so scrolling a pane the keyboard is
+not on clears that pane's follow state — borrow its view in the listener too. A
+follow state written into the borrowed (focused) view leaves the scrolled pane
+still following its own stream, so the next chunk drags the reader back to the
+bottom, and the focused pane stops following for a reason the user never asked
+for. Mouse-down interactions do not need this: the pane focuses itself on
+mouse-down before the click handler runs.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar

@@ -15113,10 +15113,18 @@ impl VibexWorkbench {
     /// to the focused pane. Every row a pane paints there — its payloads, its
     /// expansion state, its measured heights — would otherwise be resolved
     /// against the focused session's view, which froze a working pane's
-    /// timeline and left blank bands in it. This borrow makes the pane's own
-    /// view current for the duration of `body`, and hands the primary back
-    /// afterwards so the invariant [`Self::release_session_view`] protects still
-    /// holds for whatever runs next.
+    /// timeline and left blank bands in it. The same holds for an input event
+    /// that reaches a pane the keyboard does not: a wheel event clears the
+    /// follow state of the pane under the pointer, not of the focused one.
+    ///
+    /// This borrow makes the pane's own view current for the duration of
+    /// `body`, and hands the primary back afterwards so the invariant
+    /// [`Self::release_session_view`] protects still holds for whatever runs
+    /// next.
+    ///
+    /// A view that is missing is deliberately left without a session id: naming
+    /// its session there would mark it loaded, and the pane loader skips a view
+    /// whose timeline is already named, so it would never fetch one.
     ///
     /// The swap is unweighed: it happens once per rendered row, and the render
     /// pass already weighs a view when it hands it back.
@@ -15130,10 +15138,7 @@ impl VibexWorkbench {
             // candidate left.
             return body(self);
         };
-        let had_view = self.borrow_session_view_unweighed(session_id);
-        if !had_view && self.timeline.session_id.is_none() {
-            self.timeline.session_id = Some(session_id.clone());
-        }
+        let _ = self.borrow_session_view_unweighed(session_id);
         let outcome = body(self);
         self.release_session_view_unweighed();
         outcome
@@ -18622,27 +18627,32 @@ impl VibexWorkbench {
         self.pending_permission_reveal_item_id = None;
         self.timeline_follow.set_following_bottom(false);
         let scrolled_toward_bottom = delta_y < 0.0;
-        let generation = self.session_generation;
+        // A wheel event is routed to the pane under the pointer, which is not
+        // necessarily the focused one, so the follow state just cleared above
+        // belongs to the session this handler was borrowed for. Carry it into
+        // the idle task: applying the resume to whichever view is borrowed when
+        // the timer fires is what let a pane the reader scrolled away from snap
+        // itself back to the bottom as its session kept streaming.
+        let session_id = self.view_session_id.clone();
         // Trackpad inertia emits more wheel events after the gesture; resume only once it is idle.
         self.timeline_scroll_wheel_idle_task = Some(cx.spawn(async move |entity, cx| {
             cx.background_executor()
                 .timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)
                 .await;
             let _ = entity.update(cx, |this, cx| {
-                if this.session_generation != generation {
-                    return;
-                }
-                this.timeline_scroll_wheel_idle_task = None;
-                let should_follow = timeline_should_resume_follow_after_scroll_idle(
-                    scrolled_toward_bottom,
-                    this.timeline_distance_to_bottom(),
-                    this.timeline_scrollbar_interaction_active,
-                );
-                this.timeline_follow.set_following_bottom(should_follow);
-                if should_follow {
-                    this.request_timeline_scroll_to_latest();
-                }
-                cx.notify();
+                this.with_session_view_for_render(session_id.as_ref(), |this| {
+                    this.timeline_scroll_wheel_idle_task = None;
+                    let should_follow = timeline_should_resume_follow_after_scroll_idle(
+                        scrolled_toward_bottom,
+                        this.timeline_distance_to_bottom(),
+                        this.timeline_scrollbar_interaction_active,
+                    );
+                    this.timeline_follow.set_following_bottom(should_follow);
+                    if should_follow {
+                        this.request_timeline_scroll_to_latest();
+                    }
+                    cx.notify();
+                });
             });
         }));
     }
@@ -41161,8 +41171,19 @@ impl VibexWorkbench {
                                 this.finish_timeline_scrollbar_interaction(cx)
                             }),
                         )
-                        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                            this.handle_timeline_scroll_wheel(event, cx)
+                        .on_scroll_wheel(cx.listener({
+                            // The wheel is routed to the pane under the pointer,
+                            // so the follow state it clears has to be that
+                            // pane's: writing it into the borrowed view left the
+                            // scrolled pane still following its own stream, and
+                            // it snapped back to the bottom on the next chunk.
+                            let scroll_session_id = timeline_render_session_id.clone();
+                            move |this, event: &ScrollWheelEvent, _, cx| {
+                                this.with_session_view_for_render(
+                                    scroll_session_id.as_ref(),
+                                    |this| this.handle_timeline_scroll_wheel(event, cx),
+                                );
+                            }
                         }))
                         .child(
                             v_virtual_list(
@@ -72744,6 +72765,35 @@ mod tests {
         assert!(handler.contains("self.timeline_scroll.max_offset().y <= px(0.0)"));
         assert!(handler.contains(".timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)"));
         assert_eq!(handler.matches("cx.notify();").count(), 1);
+
+        // A wheel event reaches the pane under the pointer, not the focused one,
+        // so the handler and the resume timer that follows it both run against
+        // the session the pane shows. Clearing the borrowed view's follow state
+        // instead left the scrolled pane following its own stream, which dragged
+        // the reader back to the bottom on the next chunk.
+        assert!(handler.contains("let session_id = self.view_session_id.clone();"));
+        assert!(handler.contains("this.with_session_view_for_render(session_id.as_ref(),"));
+        assert!(!handler.contains("session_generation"));
+
+        let timeline = source
+            .split_once("let timeline_render_session_id = self.timeline.session_id.clone();")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n            .when_some(turn_preview_rail, |this, rail| this.child(rail));",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the timeline surface should remain inspectable");
+        let wheel = timeline
+            .find(".on_scroll_wheel(cx.listener({")
+            .expect("the timeline should handle the wheel");
+        let borrow = timeline[wheel..]
+            .find("this.with_session_view_for_render(")
+            .expect("the wheel handler should borrow the pane's view");
+        let call = timeline[wheel..]
+            .find("this.handle_timeline_scroll_wheel(event, cx)")
+            .expect("the wheel handler should run the follow-state update");
+        assert!(borrow < call);
     }
 
     #[test]
