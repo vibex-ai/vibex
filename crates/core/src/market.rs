@@ -140,8 +140,13 @@ pub struct SkillMarketSearchRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketSearchResponse {
     pub entries: Vec<SkillMarketEntry>,
-    /// How many matches the index reports, which is often more than this page.
+    /// How many entries this response carries.
+    ///
+    /// The index reports a count capped at the page size and ignores the
+    /// pagination offset, so there is no grand total to report and no second
+    /// page to fetch. This equals `entries.len()`.
     pub total: u64,
+    /// Always false for this market: the index cannot serve a further page.
     pub has_more: bool,
 }
 

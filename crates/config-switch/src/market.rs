@@ -58,6 +58,18 @@ use crate::{
 const MCP_REGISTRY_BASE: &str = "https://registry.modelcontextprotocol.io";
 /// The public Skill index, used for search only.
 const SKILL_INDEX_SEARCH: &str = "https://www.skills.sh/api/search";
+/// The query that stands in for browsing the Skill index.
+///
+/// The index has no list endpoint: `q` is mandatory, must be at least two
+/// characters, and is the only way in. A market that opened on an empty query
+/// would therefore show nothing at all, so the browse view asks the index for a
+/// deliberately broad term instead. This is a query, not an invented entry:
+/// every row it returns is still published by the index. The index hands those
+/// rows back in its own fuzzy-match order rather than by popularity, so the
+/// caller re-ranks them for the browse view.
+const SKILL_INDEX_BROWSE_QUERY: &str = "skill";
+/// Shortest query the index accepts. Anything shorter is a bad request.
+const SKILL_INDEX_MIN_QUERY_CHARS: usize = 2;
 /// Lists a repository's files without touching the GitHub API, which rate
 /// limits unauthenticated callers to a handful of requests per hour.
 const JSDELIVR_DATA: &str = "https://data.jsdelivr.com/v1/packages/gh";
@@ -587,8 +599,6 @@ fn search_mcp_registry(
 struct SkillIndexResponse {
     #[serde(default)]
     skills: Vec<SkillIndexSkill>,
-    #[serde(default)]
-    count: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -631,13 +641,44 @@ fn search_skill_index(
         })
         .take(MAX_ENTRIES_PER_SEARCH)
         .collect::<Vec<_>>();
-    let total = response.count;
-    let has_more = (offset as u64 + entries.len() as u64) < total;
+    // The index caps the `count` it reports at the page size, so it is the size
+    // of this page rather than a grand total, and it ignores `offset` outright.
+    // A second page therefore cannot be fetched, and the honest answer is that
+    // this response is the whole of what the index would hand over.
     Ok(SkillMarketSearchResponse {
+        total: entries.len() as u64,
         entries,
-        total,
-        has_more,
+        has_more: false,
     })
+}
+
+/// What a caller's query means to the index.
+struct SkillIndexQuery {
+    /// The query actually sent upstream.
+    text: String,
+    /// True when the caller did not ask for anything in particular, so the
+    /// result is a browse list rather than a relevance ranking.
+    browsing: bool,
+}
+
+/// Resolve a caller's query into the one actually sent to the index.
+///
+/// An empty or single-character query is not a failed search, it is the browse
+/// view: the caller has not asked for anything in particular yet. The index
+/// cannot express that, so those become the broad browse query. Anything the
+/// index would accept is passed through untouched.
+fn skill_index_query(query: Option<&str>) -> SkillIndexQuery {
+    let query = query.map(str::trim).unwrap_or_default();
+    if query.chars().count() < SKILL_INDEX_MIN_QUERY_CHARS {
+        return SkillIndexQuery {
+            text: SKILL_INDEX_BROWSE_QUERY.to_string(),
+            browsing: true,
+        };
+    }
+    SkillIndexQuery {
+        text: query.to_string(),
+        browsing: false,
+    }
 }
 
 /// Split an `owner/repo` reference, rejecting anything that could escape it.
@@ -822,18 +863,20 @@ impl ProviderConfigService {
         request: SkillMarketSearchRequest,
     ) -> VibexResult<SkillMarketSearchResponse> {
         let client = market_http_client()?;
-        let query = request.query.as_deref().map(str::trim).unwrap_or_default();
-        // The index refuses anything shorter than two characters, so a short
-        // query is answered locally instead of being sent to fail.
-        if query.chars().count() < 2 {
-            return Ok(SkillMarketSearchResponse {
-                entries: Vec::new(),
-                total: 0,
-                has_more: false,
-            });
-        }
+        let query = skill_index_query(request.query.as_deref());
         let limit = request.limit.unwrap_or(30).clamp(1, 100);
-        search_skill_index(&client, query, limit, request.offset.unwrap_or(0))
+        let mut response =
+            search_skill_index(&client, &query.text, limit, request.offset.unwrap_or(0))?;
+        if query.browsing {
+            // A browse query carries no relevance signal — the index only
+            // matched it against a broad term — so it is reordered into the one
+            // ranking a market without a query should read as: most installed
+            // first. A real search keeps the index's own relevance order.
+            response
+                .entries
+                .sort_by_key(|entry| std::cmp::Reverse(entry.installs));
+        }
+        Ok(response)
     }
 
     pub fn skill_market_document(
@@ -1217,5 +1260,37 @@ mod tests {
         assert!(parse_github_source("anthropics").is_err());
         assert!(parse_github_source("").is_err());
         assert!(parse_github_source("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn browse_query_stands_in_for_an_empty_search() {
+        // The index rejects a query shorter than two characters, so the browse
+        // view must never send one through.
+        for empty in [None, Some(""), Some("   "), Some("a")] {
+            let resolved = skill_index_query(empty);
+            assert_eq!(resolved.text, SKILL_INDEX_BROWSE_QUERY);
+            assert!(
+                resolved.browsing,
+                "{empty:?} must resolve to the browse view"
+            );
+        }
+        // Two characters is the first query the index accepts, so it is passed
+        // through rather than replaced, and it stays a search.
+        for search in ["ai", "kubernetes"] {
+            let resolved = skill_index_query(Some(search));
+            assert_eq!(resolved.text, search);
+            assert!(!resolved.browsing, "{search:?} must stay a search");
+        }
+        let padded = skill_index_query(Some("  ai  "));
+        assert_eq!(padded.text, "ai");
+        assert!(!padded.browsing);
+    }
+
+    #[test]
+    fn browse_query_is_long_enough_for_the_index() {
+        assert!(
+            SKILL_INDEX_BROWSE_QUERY.chars().count() >= SKILL_INDEX_MIN_QUERY_CHARS,
+            "the browse query must satisfy the index's own minimum"
+        );
     }
 }

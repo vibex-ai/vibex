@@ -10593,7 +10593,12 @@ impl ManagementCenter {
             if loading && entries.is_empty() {
                 grid = grid.child(management_market_loading_row(cx));
             } else if entries.is_empty() {
-                grid = grid.child(management_market_empty_row(cx));
+                grid = grid.child(management_market_empty_row(
+                    "No MCP servers found",
+                    "没有找到 MCP 服务",
+                    "沒有找到 MCP 服務",
+                    cx,
+                ));
             }
             // A server the user already saved is marked rather than hidden:
             // reinstalling is a legitimate way to pick up a changed command.
@@ -10873,6 +10878,9 @@ impl ManagementCenter {
         let install_target = self.skill_market_install_target.clone();
         let document = self.skill_market_document.clone();
         let query_input = self.skill_market_query.clone();
+        // The index cannot search for fewer than two characters, so a shorter
+        // query shows the browse list rather than an empty result.
+        let browsing = query_input.read(cx).value().trim().chars().count() < 2;
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
         content = content.child(
@@ -10927,6 +10935,25 @@ impl ManagementCenter {
                                     this.search_skill_market(window, cx)
                                 })),
                         ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if browsing {
+                            management_locale_text(
+                                "Showing the most installed Skills. Type at least 2 characters to search.",
+                                "当前显示安装量最高的技能；输入至少 2 个字符即可搜索。",
+                                "目前顯示安裝量最高的技能；輸入至少 2 個字元即可搜尋。",
+                            )
+                        } else {
+                            management_locale_text(
+                                "Results are ranked by install count.",
+                                "结果按安装量排序。",
+                                "結果按安裝量排序。",
+                            )
+                        }),
                 ),
         );
 
@@ -11090,7 +11117,12 @@ impl ManagementCenter {
             if loading && entries.is_empty() {
                 grid = grid.child(management_market_loading_row(cx));
             } else if entries.is_empty() {
-                grid = grid.child(management_market_empty_row(cx));
+                grid = grid.child(management_market_empty_row(
+                    "No Skills match this search",
+                    "没有匹配的技能",
+                    "沒有匹配的技能",
+                    cx,
+                ));
             }
             let installed_skill_uris: BTreeSet<String> = self
                 .snapshot
@@ -20371,7 +20403,12 @@ fn management_market_loading_row(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn management_market_empty_row(cx: &App) -> AnyElement {
+fn management_market_empty_row(
+    en: &'static str,
+    zh_cn: &'static str,
+    zh_tw: &'static str,
+    cx: &App,
+) -> AnyElement {
     div()
         .w_full()
         .rounded(px(6.0))
@@ -20380,11 +20417,7 @@ fn management_market_empty_row(cx: &App) -> AnyElement {
         .p_4()
         .text_sm()
         .text_color(cx.theme().muted_foreground)
-        .child(management_locale_text(
-            "No market entries",
-            "没有市场条目",
-            "沒有市場條目",
-        ))
+        .child(management_locale_text(en, zh_cn, zh_tw))
         .into_any_element()
 }
 
