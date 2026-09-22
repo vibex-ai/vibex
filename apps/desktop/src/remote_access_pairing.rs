@@ -1112,12 +1112,18 @@ impl RemoteAccessPairing {
             locale::ResolvedLocale::ZhCn => format!("重命名“{device_name}”？"),
             locale::ResolvedLocale::ZhTw => format!("重新命名「{device_name}」？"),
         };
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(device_name.clone()));
-            input.update(cx, |input, cx| {
-                input.set_selected_range(0..device_name.len(), cx);
-                input.focus(window, cx);
-            });
+        // Keep the input outside the dialog builder. A builder is evaluated
+        // again on every repaint, so an input created inside one would be
+        // replaced — along with its focus handle and its text — while the user
+        // types.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(device_name.clone())
+                .placeholder(locale::text("Device name", "设备名称", "裝置名稱"))
+        });
+        let input_for_focus = input.clone();
+        let selection_end = device_name.len();
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let device_input = input.clone();
             let device_id = device_id.clone();
             let entity = entity.clone();
@@ -1173,6 +1179,15 @@ impl RemoteAccessPairing {
                     });
                     true
                 })
+        });
+        // The dialog's focus trap claims focus while it mounts; request the
+        // field on the next frame and select the current name so typing
+        // replaces it.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| {
+                input.set_selected_range(0..selection_end, cx);
+                input.focus(window, cx);
+            });
         });
     }
 
@@ -5681,5 +5696,41 @@ mod tests {
             .map(|(body, _)| body)
             .expect("dialog dismissal should remain inspectable");
         assert!(dismiss.contains("self.stop_presence_poll();"));
+    }
+
+    /// A dialog builder is evaluated again on every repaint, so an input created
+    /// inside one is replaced — focus handle and text included — as soon as the
+    /// user types, which makes the rename field impossible to edit.
+    #[test]
+    fn device_rename_dialog_keeps_one_input_entity_across_repaints() {
+        let source = include_str!("remote_access_pairing.rs");
+        let dialog = source
+            .split_once("    fn confirm_rename_device(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn confirm_delete_device("))
+            .map(|(body, _)| body)
+            .expect("the device rename dialog should remain inspectable");
+
+        let input_creation = dialog
+            .find("let input = cx.new(")
+            .expect("the device name input should be created once");
+        let dialog_open = dialog
+            .find("window.open_dialog(cx")
+            .expect("the rename dialog should open after its input exists");
+        assert!(
+            input_creation < dialog_open,
+            "the input entity must be created outside the dialog builder"
+        );
+        assert!(
+            !dialog[dialog_open..].contains("cx.new("),
+            "the dialog builder must not replace the input entity on every repaint"
+        );
+        assert!(
+            dialog.contains("window.on_next_frame(move |window, cx|"),
+            "the input should take focus after the dialog's focus trap mounts"
+        );
+        assert!(
+            dialog.contains("input.set_selected_range(0..selection_end, cx)"),
+            "the current name should be selected so typing replaces it"
+        );
     }
 }

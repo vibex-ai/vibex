@@ -4683,6 +4683,11 @@ impl MobileApp {
         self.pending_input_writes
             .push((InputField::HostName, initial));
         self.show_host_overlay(host_id, MobileOverlay::HostRename, window, cx);
+        // A rename sheet exists to be typed into, so it opens with the field
+        // focused and the keyboard up rather than waiting for a second tap.
+        self.host_name_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        crate::platform::show_keyboard();
     }
 
     fn open_host_remove(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -19481,6 +19486,58 @@ mod tests {
         assert_eq!(
             app.read_with(cx, |app, _| app.known_hosts[0].server_kind),
             RemoteServerKind::Headless
+        );
+    }
+
+    /// A rename sheet exists to be typed into: opening it must hand the caret to
+    /// its field, otherwise the first keystroke goes nowhere until the user taps
+    /// the input a second time.
+    #[gpui::test]
+    fn host_rename_sheet_opens_with_its_field_focused(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = MobileApp::new(data_dir.path().to_path_buf(), window, cx);
+            app.mode = RootMode::Workspace;
+            app
+        });
+        cx.run_until_parked();
+
+        let bundle = host_bundle("studio-desktop", "studio.local");
+        let host_id = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.remember_host(&bundle, RemoteServerKind::Desktop);
+                let host_id = app.known_hosts[0].id.clone();
+                // The field is seeded with the runtime's name, so a rename
+                // starts from what the sheet is actually renaming.
+                app.known_hosts[0].name_override = Some("studio".to_string());
+                app.host_overlay_target = Some(host_id.clone());
+                app.open_host_rename(&noop_mouse_up(), window, cx);
+                host_id
+            })
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.overlay),
+            Some(MobileOverlay::HostRename),
+            "the rename sheet should be the open overlay for {host_id}"
+        );
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (focused, value) = cx.update(|window, cx| {
+            let input = app.read(cx).host_name_input.clone();
+            let input = input.read(cx);
+            (
+                input.focus_handle(cx).is_focused(window),
+                input.value().to_string(),
+            )
+        });
+        assert_eq!(value, "studio", "the sheet should seed its field");
+        assert!(
+            focused,
+            "the rename field should own the caret when the sheet opens"
         );
     }
 }

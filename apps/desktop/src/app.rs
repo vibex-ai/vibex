@@ -22995,16 +22995,18 @@ impl VibexWorkbench {
         let cancel_label = locale::text("Cancel", "取消", "取消");
         let rename_label = locale::text("Rename", "重命名", "重新命名");
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(initial.clone())
-                    .placeholder(terminal_name_placeholder)
-            });
-            input.update(cx, |input, cx| {
-                input.set_selected_range(0..initial.len(), cx);
-                input.focus(window, cx);
-            });
+        // Keep the input outside the dialog builder. A builder is evaluated
+        // again on every repaint, so an input created inside one would be
+        // replaced — along with its focus handle and its text — while the user
+        // types.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial.clone())
+                .placeholder(terminal_name_placeholder)
+        });
+        let input_for_focus = input.clone();
+        let selection_end = initial.len();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let rename_input = input.clone();
             let entity = entity.clone();
             let terminal_id = terminal_id.clone();
@@ -23048,6 +23050,15 @@ impl VibexWorkbench {
                     }
                     true
                 })
+        });
+        // The dialog's focus trap claims focus while it mounts; request the
+        // field on the next frame and select the current title so typing
+        // replaces it.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| {
+                input.set_selected_range(0..selection_end, cx);
+                input.focus(window, cx);
+            });
         });
     }
 
@@ -24933,16 +24944,18 @@ impl VibexWorkbench {
         let cancel_label = locale::text("Cancel", "取消", "取消");
         let apply_label = locale::text("Apply", "应用", "套用");
         let entity = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(initial.clone())
-                    .placeholder(title.clone())
-            });
-            input.update(cx, |input, cx| {
-                input.set_selected_range(0..initial.len(), cx);
-                input.focus(window, cx);
-            });
+        // Keep the input outside the dialog builder. A builder is evaluated
+        // again on every repaint, so an input created inside one would be
+        // replaced — along with its focus handle and its text — while the user
+        // types.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial.clone())
+                .placeholder(title.clone())
+        });
+        let input_for_focus = input.clone();
+        let selection_end = initial.len();
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let feature_input = input.clone();
             let feature_id = feature_id.clone();
             let entity = entity.clone();
@@ -24991,6 +25004,15 @@ impl VibexWorkbench {
                     });
                     true
                 })
+        });
+        // The dialog's focus trap claims focus while it mounts; request the
+        // field on the next frame and select the current value so typing
+        // replaces it.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| {
+                input.set_selected_range(0..selection_end, cx);
+                input.focus(window, cx);
+            });
         });
     }
 
@@ -61175,13 +61197,19 @@ impl FoundationSettings {
     fn open_custom_shell_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.weak_entity();
         let initial = self.terminal_preferences(cx).shell.unwrap_or_default();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(initial.clone())
-                    .placeholder(locale::text("Shell path", "Shell 路径", "Shell 路徑"))
-            });
+        // Keep the input outside the dialog builder. A builder is evaluated
+        // again on every repaint, so an input created inside one would be
+        // replaced — along with its focus handle and its text — while the user
+        // types.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial.clone())
+                .placeholder(locale::text("Shell path", "Shell 路径", "Shell 路徑"))
+        });
+        let input_for_focus = input.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let apply = entity.clone();
+            let input_for_apply = input.clone();
             dialog
                 .title(locale::text("Custom shell", "自定义 Shell", "自訂 Shell"))
                 .w(px(420.0))
@@ -61204,7 +61232,7 @@ impl FoundationSettings {
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    let value = input.read(cx).value().trim().to_string();
+                    let value = input_for_apply.read(cx).value().trim().to_string();
                     if value.is_empty() || std::path::Path::new(&value).is_file() {
                         let _ = apply.update(cx, |settings, cx| {
                             settings.set_terminal_shell(value, cx);
@@ -61230,6 +61258,11 @@ impl FoundationSettings {
                         false
                     }
                 })
+        });
+        // The dialog's focus trap claims focus while it mounts, so the field
+        // takes it on the next frame.
+        window.on_next_frame(move |window, cx| {
+            input_for_focus.update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -77362,6 +77395,65 @@ mod tests {
             dialog.contains("settings.shortcut_note.clone()"),
             "a rejected chord should be reported inside the dialog"
         );
+    }
+
+    /// A dialog builder is evaluated again on every repaint, so an input created
+    /// inside one is replaced — focus handle and text included — as soon as the
+    /// user types, which makes the field impossible to edit. Every dialog field
+    /// therefore has to exist before the dialog opens and take focus after the
+    /// dialog's focus trap has mounted.
+    #[test]
+    fn dialog_inputs_are_created_before_their_dialog_opens() {
+        let source = include_str!("app.rs");
+        let dialogs = [
+            (
+                "    fn prompt_rename_composer_terminal(",
+                "\n    fn open_local_history_import_dialog(",
+                "terminal rename",
+                "input.set_selected_range(0..selection_end, cx)",
+            ),
+            (
+                "    fn prompt_runtime_feature_value(",
+                "\n    fn choose_new_session_agent(",
+                "runtime feature value",
+                "input.set_selected_range(0..selection_end, cx)",
+            ),
+            (
+                "    fn open_custom_shell_dialog(",
+                "\n    fn open_shortcut_dialog(",
+                "custom shell",
+                "input.focus(window, cx)",
+            ),
+        ];
+        for (start, end, label, focus_assertion) in dialogs {
+            let body = source
+                .split_once(start)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("the {label} dialog should remain inspectable"));
+            let input_creation = body
+                .find("let input = cx.new(")
+                .unwrap_or_else(|| panic!("the {label} input should be created once"));
+            let dialog_open = body
+                .find("window.open_dialog(cx")
+                .unwrap_or_else(|| panic!("the {label} dialog should open after its input exists"));
+            assert!(
+                input_creation < dialog_open,
+                "{label}: the input entity must be created outside the dialog builder"
+            );
+            assert!(
+                !body[dialog_open..].contains("cx.new("),
+                "{label}: the dialog builder must not replace the input entity on every repaint"
+            );
+            assert!(
+                body.contains("window.on_next_frame(move |window, cx|"),
+                "{label}: the input should take focus after the dialog's focus trap mounts"
+            );
+            assert!(
+                body.contains(focus_assertion),
+                "{label}: the field should be ready to type into"
+            );
+        }
     }
 
     /// One label serves the shortcuts page, the settings search, and the command

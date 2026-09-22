@@ -224,6 +224,13 @@ looks like an unresponsive control. The exception is a rejection raised while th
 dialog is still open for a correction that is not tied to a field: route it
 through the notification layer, which stacks above every dialog.
 
+A mobile overlay sheet that exists to be typed into — a rename, a new-project
+path — follows the same rule from the other side: focus its field and call
+`crate::platform::show_keyboard()` when the sheet opens. The mobile app keeps its
+kit input entities for the lifetime of the app, so the failure is not a replaced
+entity but a sheet that opens with the caret nowhere: the first keystroke is lost
+and the user has to tap the field before the keyboard appears.
+
 ### Light Hints
 
 Transient feedback that answers an action the user just took — a link copied, a
