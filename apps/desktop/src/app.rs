@@ -566,6 +566,12 @@ const AGENT_TIMELINE_STREAMING_SHRINK_SETTLE: Duration = Duration::from_millis(2
 /// Confirming paints required before a settled shrink is accepted.
 const AGENT_TIMELINE_STREAMING_SHRINK_CONFIRMATIONS: u8 = 2;
 const AGENT_TIMELINE_STREAMING_SHRINK_EPSILON_PX: f32 = 1.0;
+/// How long a completion probe that already ran for a revision is left alone
+/// before the same revision may be probed again.
+const AUTO_CONTINUE_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// Cascade projections the composer memo keeps: one per distinct runtime
+/// selection a session-group split can show at once, with room to spare.
+const RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT: usize = 8;
 const AUTO_CONTINUE_COUNTDOWN_SECONDS: u8 = 5;
 const AUTO_CONTINUE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SIDEBAR_AUTO_ARCHIVE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -6717,14 +6723,18 @@ pub struct VibexWorkbench {
     /// out a shared handle keeps a split from deep-copying that list N times a
     /// frame.
     runtime_catalog: Option<Rc<SessionRuntimeOptionCatalog>>,
-    /// The cascade projection the composer renders, memoized against the catalog
-    /// and selection it was derived from.
+    /// The cascade projections the composer renders, memoized against the
+    /// catalog and selection each was derived from.
     ///
-    /// Deriving it walks the whole option catalog and allocates a label for
+    /// Deriving one walks the whole option catalog and allocates a label for
     /// every choice, so a session group paid for the same projection once per
-    /// pane. Holding the catalog handle keeps the memo exact: a replacement
-    /// catalog is a different allocation, never a reused address.
-    runtime_cascade_projection: Option<(
+    /// pane. Holding the catalog handle keeps each memo exact: a replacement
+    /// catalog is a different allocation, never a reused address. The list is
+    /// least-recently-used and bounded by
+    /// [`RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT`], so a split whose panes select
+    /// different runtimes keeps one projection each instead of thrashing a
+    /// single slot.
+    runtime_cascade_projection: Vec<(
         Rc<SessionRuntimeOptionCatalog>,
         SessionRuntimeSelection,
         Rc<RuntimeCascadeProjection>,
@@ -6800,6 +6810,12 @@ pub struct VibexWorkbench {
     auto_continue_paused_turn_session_ids: BTreeSet<String>,
     auto_continue_handled_turns: BTreeMap<String, i64>,
     auto_continue_turn_statuses: BTreeMap<String, AutoContinueTurnStatus>,
+    /// The revision each session's last completion probe was issued for, and
+    /// when. A probe that cannot answer for a revision must be retried on a
+    /// backoff rather than re-issued on every sync: the sync runs from several
+    /// event paths, and without this a session whose probe never settles kept
+    /// the workbench repainting for as long as it stayed on screen.
+    auto_continue_probe_attempts: BTreeMap<String, (i64, Instant)>,
     auto_continue_probe_tasks: BTreeMap<String, AutoContinueProbeTask>,
     auto_continue_countdowns: BTreeMap<String, AutoContinueCountdown>,
     auto_continue_countdown_tasks: BTreeMap<String, Task<()>>,
@@ -7631,7 +7647,7 @@ impl VibexWorkbench {
             child_agent_render_session: None,
             agent_streaming_surface_visible,
             runtime_catalog: None,
-            runtime_cascade_projection: None,
+            runtime_cascade_projection: Vec::new(),
             runtime_provider_profiles: Vec::new(),
             optimistic_runtime_selections: BTreeMap::new(),
             runtime_selection_requests_in_flight: BTreeSet::new(),
@@ -7685,6 +7701,7 @@ impl VibexWorkbench {
             auto_continue_paused_turn_session_ids: BTreeSet::new(),
             auto_continue_handled_turns: BTreeMap::new(),
             auto_continue_turn_statuses: BTreeMap::new(),
+            auto_continue_probe_attempts: BTreeMap::new(),
             auto_continue_probe_tasks: BTreeMap::new(),
             auto_continue_countdowns: BTreeMap::new(),
             auto_continue_countdown_tasks: BTreeMap::new(),
@@ -11765,6 +11782,8 @@ impl VibexWorkbench {
             .map(|existing| (existing.state, existing.updated_at_ms))
         {
             if existing_state != session.state || existing_updated_at_ms != session.updated_at_ms {
+                self.auto_continue_probe_attempts
+                    .remove(session.id.as_str());
                 self.auto_continue_turn_statuses.remove(session.id.as_str());
                 self.auto_continue_probe_tasks.remove(session.id.as_str());
                 self.cancel_auto_continue_countdown(&session.id);
@@ -11808,6 +11827,8 @@ impl VibexWorkbench {
             self.auto_continue_paused_turn_session_ids
                 .remove(session_id.as_str());
             self.auto_continue_handled_turns.remove(session_id.as_str());
+            self.auto_continue_probe_attempts
+                .remove(session_id.as_str());
             self.auto_continue_turn_statuses.remove(session_id.as_str());
             self.auto_continue_probe_tasks.remove(session_id.as_str());
             self.cancel_auto_continue_countdown(session_id);
@@ -11900,28 +11921,34 @@ impl VibexWorkbench {
         session_updated_at_ms: i64,
         ended_normally: Option<bool>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(session) = self
             .sessions
             .iter()
             .find(|session| &session.id == session_id)
         else {
-            return;
+            return false;
         };
         if session.updated_at_ms != session_updated_at_ms {
             // The probe answered for a revision that was superseded while it
             // ran. Let a waiting auto-send queue re-evaluate so it can probe the
             // current revision instead of waiting forever.
             self.mark_composer_queue_for_recheck(session_id);
-            return;
+            return false;
         }
-        self.auto_continue_turn_statuses.insert(
-            session_id.as_str().to_string(),
-            AutoContinueTurnStatus {
-                session_updated_at_ms,
-                ended_normally,
-            },
-        );
+        let changed = self
+            .auto_continue_turn_statuses
+            .insert(
+                session_id.as_str().to_string(),
+                AutoContinueTurnStatus {
+                    session_updated_at_ms,
+                    ended_normally,
+                },
+            )
+            .is_none_or(|previous| {
+                previous.session_updated_at_ms != session_updated_at_ms
+                    || previous.ended_normally != ended_normally
+            });
         if self
             .auto_continue_probe_tasks
             .get(session_id.as_str())
@@ -11934,6 +11961,7 @@ impl VibexWorkbench {
         // was waiting on an unobserved revision. Re-evaluate on the next frame,
         // where the dispatch path can honor the settled answer.
         self.mark_composer_queue_for_recheck(session_id);
+        changed
     }
 
     /// Flags a waiting auto-send queue for a dispatch re-evaluation on the next
@@ -11965,9 +11993,27 @@ impl VibexWorkbench {
         {
             return;
         }
+        // One probe per revision per backoff window. A probe whose answer cannot
+        // be cached (the session moved on while it ran) would otherwise be
+        // re-issued by the next sync, which is how a single idle session kept a
+        // repaint loop alive.
+        if self
+            .auto_continue_probe_attempts
+            .get(session_id.as_str())
+            .is_some_and(|(revision, attempted_at)| {
+                *revision == session_updated_at_ms
+                    && attempted_at.elapsed() < AUTO_CONTINUE_PROBE_RETRY_BACKOFF
+            })
+        {
+            return;
+        }
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        self.auto_continue_probe_attempts.insert(
+            session_id.as_str().to_string(),
+            (session_updated_at_ms, Instant::now()),
+        );
         let probe_session_id = session_id.clone();
         let request_session_id = probe_session_id.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -12011,13 +12057,15 @@ impl VibexWorkbench {
                             .filter(|timeline_session_id| *timeline_session_id == &probe_session_id)
                             .map(|_| latest_timeline_turn_ended_normally(&this.timeline.items)),
                     };
-                    this.cache_auto_continue_turn_status(
+                    let changed = this.cache_auto_continue_turn_status(
                         &probe_session_id,
                         session_updated_at_ms,
                         ended_normally.flatten(),
                         cx,
                     );
-                    cx.notify();
+                    if changed {
+                        cx.notify();
+                    }
                 });
             },
         );
@@ -15583,23 +15631,35 @@ impl VibexWorkbench {
     /// A session group renders a composer per pane, and every pane whose session
     /// shares a selection wants the same projection. Deriving it allocates a
     /// label for every choice in the catalog, so it is worth sharing.
+    ///
+    /// The memo holds one entry per distinct selection a split is showing. A
+    /// single slot thrashed as soon as two panes selected different runtimes:
+    /// each pane replaced the other's entry and every pane rebuilt the whole
+    /// projection on every frame.
     fn runtime_cascade_projection_for(
         &mut self,
         catalog: &Rc<SessionRuntimeOptionCatalog>,
         selection: &SessionRuntimeSelection,
     ) -> Rc<RuntimeCascadeProjection> {
-        let cached = self.runtime_cascade_projection.as_ref().and_then(
-            |(cached_catalog, cached_selection, projection)| {
-                (Rc::ptr_eq(cached_catalog, catalog) && cached_selection == selection)
-                    .then(|| projection.clone())
+        if let Some(index) = self.runtime_cascade_projection.iter().position(
+            |(cached_catalog, cached_selection, _)| {
+                Rc::ptr_eq(cached_catalog, catalog) && cached_selection == selection
             },
-        );
-        if let Some(projection) = cached {
+        ) {
+            let entry = self.runtime_cascade_projection.remove(index);
+            let projection = entry.2.clone();
+            self.runtime_cascade_projection.push(entry);
             return projection;
         }
         let projection = Rc::new(RuntimeCascadeProjection::from_catalog(catalog, selection));
-        self.runtime_cascade_projection =
-            Some((catalog.clone(), selection.clone(), projection.clone()));
+        self.runtime_cascade_projection.push((
+            catalog.clone(),
+            selection.clone(),
+            projection.clone(),
+        ));
+        if self.runtime_cascade_projection.len() > RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT {
+            self.runtime_cascade_projection.remove(0);
+        }
         projection
     }
 
@@ -17486,13 +17546,26 @@ impl VibexWorkbench {
                     .iter()
                     .find(|existing| existing.id == session.id)
                     .is_none_or(|existing| existing != &session);
+                // A turn boundary is what auto-continue reacts to, and it belongs
+                // to the session that changed — not only to the selected one.
+                // The render path used to pick up a background session's
+                // finished turn because a pane happened to show it; that made a
+                // repaint decide whether a countdown started. The sync only
+                // reads cached state and probes on a backoff, so an ordinary
+                // field change costs a couple of map lookups.
+                let turn_revision_changed = previous_session.is_none_or(|existing| {
+                    existing.state != session.state
+                        || existing.updated_at_ms != session.updated_at_ms
+                });
                 if changed {
                     let session_id = session.id.clone();
                     self.upsert_session_snapshot(session);
                     if sidebar_changed {
                         self.reconcile_sidebar_state();
                     }
-                    if selected_projection_changed {
+                    if selected_projection_changed
+                        || (turn_revision_changed && self.auto_continue_enabled(&session_id))
+                    {
                         self.sync_auto_continue_for_session(&session_id, cx);
                     }
                 }
@@ -30952,6 +31025,7 @@ impl VibexWorkbench {
         self.auto_continue_paused_session_ids.clear();
         self.auto_continue_paused_turn_session_ids.clear();
         self.auto_continue_handled_turns.clear();
+        self.auto_continue_probe_attempts.clear();
         self.auto_continue_turn_statuses.clear();
         self.auto_continue_probe_tasks.clear();
         self.auto_continue_countdowns.clear();
@@ -34152,7 +34226,12 @@ impl VibexWorkbench {
         // where the keyboard goes; it never decides which conversation a pane
         // shows. Borrowing the pane's own view is what makes that true even
         // while another pane owns the selection.
-        let had_view = self.borrow_session_view(&pane_session_id);
+        // The workspace hands every pane's view back through one weighed
+        // release once the whole tree is built, so a pane borrows its own view
+        // without re-weighing either side: weighing here walked the previously
+        // borrowed view's whole timeline, summed the store and rebuilt the
+        // pinned set once per pane, per frame.
+        let had_view = self.borrow_session_view_unweighed(&pane_session_id);
         if !had_view && self.timeline.session_id.as_ref() != Some(&pane_session_id) {
             // The view exists but its timeline was never loaded. Ask for it and
             // show the loading surface until it lands.
@@ -37549,7 +37628,8 @@ impl VibexWorkbench {
         &mut self,
         menu_id: String,
         trigger: Button,
-        items: Vec<RuntimeChoiceMenuItem>,
+        choice_count: usize,
+        items: impl FnOnce() -> Vec<RuntimeChoiceMenuItem>,
         default_value: Option<String>,
         geometry: ComposerGeometry,
         max_height: f32,
@@ -37559,14 +37639,18 @@ impl VibexWorkbench {
         let menu_placement = composer_runtime_menu_placement(
             geometry.runtime_trigger_bounds,
             self.last_visibility.layout.viewport_height as f32,
-            composer_runtime_choice_menu_height(items.len(), max_height),
+            composer_runtime_choice_menu_height(choice_count, max_height),
             max_height,
         );
         let rest_background = runtime_menu_rest_background(cx);
         let highlight_background = runtime_menu_highlight_background(cx);
         let selected_background = runtime_menu_selected_background(cx);
         let selected_shadows = runtime_menu_selected_shadows(cx);
-        let rows = items
+        // A closed menu mounts no rows. Building one element per choice on every
+        // frame cost a split one full menu per pane for a surface that is not on
+        // screen — the same reason the turn preview rail only mounts its list
+        // while it is hovered.
+        let rows = if menu_open { items() } else { Vec::new() }
             .into_iter()
             .map(|item| {
                 let row_id = format!("{menu_id}:{}", item.id);
@@ -37678,19 +37762,23 @@ impl VibexWorkbench {
             .tooltip(tooltip)
             .child(content)
             .disabled(choices_empty || self.agent_action_pending);
-        let items = choices
-            .into_iter()
-            .map(|choice| RuntimeChoiceMenuItem {
-                selected: choice.value == selected_value,
-                id: choice.value,
-                label: choice.label,
-                action: RuntimeChoiceMenuAction::NewSession(choice.selection),
-            })
-            .collect::<Vec<_>>();
+        let choice_count = choices.len();
+        let items_selected_value = selected_value.clone();
         self.render_runtime_choice_popover(
             menu_id,
             trigger,
-            items,
+            choice_count,
+            move || {
+                choices
+                    .into_iter()
+                    .map(|choice| RuntimeChoiceMenuItem {
+                        selected: choice.value == items_selected_value,
+                        id: choice.value,
+                        label: choice.label,
+                        action: RuntimeChoiceMenuAction::NewSession(choice.selection),
+                    })
+                    .collect()
+            },
             default_value,
             self.new_session_composer_geometry,
             NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT,
@@ -37810,23 +37898,26 @@ impl VibexWorkbench {
                         .tooltip(tooltip)
                         .child(content)
                         .disabled(values_empty || controls_pending);
-                let items = values
-                    .into_iter()
-                    .map(|value| RuntimeChoiceMenuItem {
-                        selected: value.value == current_value,
-                        id: value.value.clone(),
-                        label: value.label.unwrap_or_else(|| value.value.clone()),
-                        action: RuntimeChoiceMenuAction::Feature {
-                            target,
-                            feature_id: feature_id.clone(),
-                            value: value.value,
-                        },
-                    })
-                    .collect::<Vec<_>>();
+                let choice_count = values.len();
                 self.render_runtime_choice_popover(
                     menu_id,
                     trigger,
-                    items,
+                    choice_count,
+                    move || {
+                        values
+                            .into_iter()
+                            .map(|value| RuntimeChoiceMenuItem {
+                                selected: value.value == current_value,
+                                id: value.value.clone(),
+                                label: value.label.unwrap_or_else(|| value.value.clone()),
+                                action: RuntimeChoiceMenuAction::Feature {
+                                    target,
+                                    feature_id: feature_id.clone(),
+                                    value: value.value,
+                                },
+                            })
+                            .collect()
+                    },
                     None,
                     geometry,
                     menu_max_height,
@@ -41698,19 +41789,23 @@ impl VibexWorkbench {
             .tooltip(tooltip)
             .child(content)
             .disabled(choices_empty || controls_pending);
-        let items = choices
-            .into_iter()
-            .map(|choice| RuntimeChoiceMenuItem {
-                selected: choice.value == selected_value,
-                id: choice.value,
-                label: choice.label,
-                action: RuntimeChoiceMenuAction::ActiveSession(choice.selection),
-            })
-            .collect::<Vec<_>>();
+        let choice_count = choices.len();
+        let items_selected_value = selected_value.clone();
         self.render_runtime_choice_popover(
             menu_id,
             trigger,
-            items,
+            choice_count,
+            move || {
+                choices
+                    .into_iter()
+                    .map(|choice| RuntimeChoiceMenuItem {
+                        selected: choice.value == items_selected_value,
+                        id: choice.value,
+                        label: choice.label,
+                        action: RuntimeChoiceMenuAction::ActiveSession(choice.selection),
+                    })
+                    .collect()
+            },
             default_value,
             self.composer_geometry,
             menu_max_height,
@@ -50329,9 +50424,15 @@ impl VibexWorkbench {
             && (!composer_input.read(cx).value().trim().is_empty()
                 || !self.composer_attachments.is_empty());
         let session_state = self.live_agent_session_state();
-        if let Some(session_id) = self.view_session_id.clone() {
-            self.sync_auto_continue_for_session(&session_id, cx);
-        }
+        // Auto-continue is *not* synced here. Syncing can start a completion
+        // probe, and a probe is an asynchronous backend round trip whose answer
+        // repaints the window. A session group renders a composer per pane, so
+        // syncing from the render path re-entered that probe once per pane per
+        // frame: the workbench never reached an idle frame, and the wasted work
+        // grew with the number of panes. The probe is driven by the events that
+        // can actually change its inputs — a session snapshot, an adopted
+        // timeline, a preference toggle, a countdown tick, a submitted message —
+        // and this surface only reads what they cached.
         let auto_continue_turn_status = self.view_session().and_then(|session| {
             self.cached_auto_continue_turn_status(&session.id, session.updated_at_ms)
         });
@@ -74122,6 +74223,22 @@ mod tests {
         assert!(composer.contains("continuation_available"));
         assert!(composer.contains("auto_continue_remaining.is_none()"));
         assert!(composer.contains("this.activate_continue_button(cx)"));
+        // Rendering reads what the event paths cached; it never drives the
+        // probe itself. A session group renders a composer per pane, so syncing
+        // here re-entered the probe once per pane, per frame, and the probe's
+        // completion repainted the window — the workbench never reached an idle
+        // frame and the wasted work grew with the number of panes.
+        assert!(!composer.contains("sync_auto_continue_for_session"));
+        assert!(composer.contains("cached_auto_continue_turn_status"));
+        let probe = source
+            .split_once("    fn probe_auto_continue_turn_status(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn set_auto_continue_enabled("))
+            .map(|(body, _)| body)
+            .expect("the completion probe should remain inspectable");
+        // A probe that cannot answer for a revision is retried on a backoff,
+        // not once per sync.
+        assert!(probe.contains("auto_continue_probe_attempts"));
+        assert!(probe.contains("AUTO_CONTINUE_PROBE_RETRY_BACKOFF"));
 
         let sidebar = source
             .split_once("    fn render_sidebar_session(")
@@ -77088,6 +77205,33 @@ mod tests {
         );
         assert!(!panel.contains("strings.model_provider_label"));
         assert!(!panel.contains("strings.model_label"));
+    }
+
+    /// A session group renders one composer per pane, so the derived pieces of
+    /// the runtime cascade must be shared and mounted lazily. Both were once
+    /// paid per pane, per frame.
+    #[test]
+    fn split_composers_share_the_runtime_cascade_and_mount_closed_menus_lazily() {
+        let source = include_str!("app.rs");
+        let memo = source
+            .split_once("    fn runtime_cascade_projection_for(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn selected_runtime_selection("))
+            .map(|(body, _)| body)
+            .expect("the cascade memo should remain inspectable");
+        // One entry per distinct selection, not a single slot two panes thrash.
+        assert!(memo.contains("RUNTIME_CASCADE_PROJECTION_MEMO_LIMIT"));
+        assert!(memo.contains(".position("));
+        assert!(!memo.contains("Option<("));
+
+        let popover = source
+            .split_once("    fn render_runtime_choice_popover(")
+            .and_then(|(_, tail)| tail.split_once("\n    #[allow(clippy::too_many_arguments)]"))
+            .map(|(body, _)| body)
+            .expect("the runtime choice popover should remain inspectable");
+        // A closed menu builds no rows; the row count still sizes the menu.
+        assert!(popover.contains("let rows = if menu_open { items() } else { Vec::new() }"));
+        assert!(popover.contains("composer_runtime_choice_menu_height(choice_count, max_height)"));
+        assert!(popover.contains("items: impl FnOnce() -> Vec<RuntimeChoiceMenuItem>"));
     }
 
     #[test]
@@ -80858,7 +81002,12 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group pane content should remain inspectable");
-        assert!(content.contains("self.borrow_session_view(&pane_session_id)"));
+        // A pane borrows its own view for the render pass without re-weighing
+        // it: the workspace hands every pane back through one weighed release
+        // once the tree is built, and weighing per pane walked the previously
+        // borrowed view's whole timeline once per pane, per frame.
+        assert!(content.contains("self.borrow_session_view_unweighed(&pane_session_id)"));
+        assert!(!content.contains("self.borrow_session_view(&pane_session_id)"));
         assert!(content.contains("self.render_agent_workbench_for(false, window, cx)"));
         // The composer is built while the pane's own view is borrowed, and the
         // borrow is handed back by the workspace once every pane has rendered.

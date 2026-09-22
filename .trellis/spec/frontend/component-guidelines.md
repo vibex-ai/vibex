@@ -405,6 +405,21 @@ bottom, and the focused pane stops following for a reason the user never asked
 for. Mouse-down interactions do not need this: the pane focuses itself on
 mouse-down before the click handler runs.
 
+A pane's render pass must be free of asynchronous side effects, and it must not
+re-weigh the view it borrows. Rendering runs once per pane per frame, so anything
+a pane starts there is multiplied by the split: syncing auto-continue from the
+composer re-entered the completion probe — a backend round trip whose answer
+repaints the window — once per pane, per frame, and the workbench never reached an
+idle frame. Drive such work from the events that change its inputs (a session
+snapshot, an adopted timeline, a preference toggle, a countdown tick, a submitted
+message) and let the pane read only what those cached. The same multiplication
+applies to derived values and to elements that are not on screen: share a
+projection per distinct runtime selection instead of memoizing one slot a split
+thrashes, and build a closed dropdown's rows only while it is open. The pane's own
+borrow is unweighed (`borrow_session_view_unweighed`); the workspace hands every
+pane back through one weighed release once the tree is built, so weighing per pane
+walked the previously borrowed view's whole timeline once per pane, per frame.
+
 Project headers in the session sidebar should display the project name only,
 not the workspace root path, to keep the rail scannable. Project-header clicks
 that expand/collapse sessions or activate a project are internal sidebar
