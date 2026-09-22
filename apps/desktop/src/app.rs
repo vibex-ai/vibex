@@ -6886,6 +6886,13 @@ pub struct VibexWorkbench {
     /// looks like it is still making progress.
     pending_user_request_ids: BTreeMap<String, BTreeSet<String>>,
     notification_suppressed_session_ids: BTreeSet<String>,
+    /// The highest timeline sequence already announced for each session.
+    ///
+    /// The same committed item reaches the workbench twice: once over the live
+    /// event stream and once from the timeline polling fallback. The timeline
+    /// dedups the second copy, but the notification path runs before that, so
+    /// without this watermark a single completion raises two identical hints.
+    notified_timeline_sequences: BTreeMap<String, i64>,
     auto_continue_default_project_ids: BTreeSet<String>,
     auto_continue_session_ids: BTreeSet<String>,
     auto_continue_paused_session_ids: BTreeSet<String>,
@@ -7779,6 +7786,7 @@ impl VibexWorkbench {
             unread_agent_completion_session_ids: BTreeSet::new(),
             pending_user_request_ids: BTreeMap::new(),
             notification_suppressed_session_ids: BTreeSet::new(),
+            notified_timeline_sequences: BTreeMap::new(),
             auto_continue_default_project_ids,
             auto_continue_session_ids,
             auto_continue_paused_session_ids,
@@ -11653,6 +11661,8 @@ impl VibexWorkbench {
             .retain(|id| valid_session_ids.contains(id));
         self.pending_agent_turn_session_ids
             .retain(|id| valid_session_ids.contains(id));
+        self.notified_timeline_sequences
+            .retain(|id, _| valid_session_ids.contains(id));
         self.composer_queue
             .retain(|message| valid_session_ids.contains(message.session_id.as_str()));
         self.composer_queue_manual_session_ids
@@ -17621,28 +17631,40 @@ impl VibexWorkbench {
         self.load_session_group_view(session_id, true, cx);
     }
 
-    fn notify_for_timeline_events(&self, events: &[TimelineLiveEvent], cx: &mut Context<Self>) {
-        if !self.ui_state.desktop_behavior.notifications_enabled {
-            return;
-        }
+    fn notify_for_timeline_events(&mut self, events: &[TimelineLiveEvent], cx: &mut Context<Self>) {
         let Some(session_id) = events.first().map(|event| event.session_id.as_str()) else {
             return;
         };
-        if self
-            .notification_suppressed_session_ids
-            .contains(session_id)
+        let session_id = session_id.to_string();
+        // The same committed item reaches the workbench twice: once over the
+        // live event stream and once from the polling fallback. The timeline
+        // dedups the second copy, but this path runs before that, so the same
+        // high-water mark has to be kept here or one completion raises two
+        // identical hints. The mark advances even while notifications are off
+        // so re-enabling them cannot replay an already-seen completion.
+        let (fresh, watermark) = new_timeline_notification_events(
+            events,
+            self.notified_timeline_sequences.get(&session_id).copied(),
+        );
+        if let Some(watermark) = watermark {
+            self.notified_timeline_sequences
+                .insert(session_id.clone(), watermark);
+        }
+        if fresh.is_empty()
+            || !self.ui_state.desktop_behavior.notifications_enabled
+            || self.notification_suppressed_session_ids.contains(&session_id)
         {
             return;
         }
         let agent_id = self
             .sessions
             .iter()
-            .find(|session| session.id.as_str() == session_id)
+            .find(|session| session.id.as_str() == session_id.as_str())
             .map(|session| &session.agent_id);
         let agent_label = agent_id
             .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
             .unwrap_or_else(|| "Agent".to_string());
-        let kind = timeline_notification_kind(events, &self.ui_state.desktop_behavior);
+        let kind = timeline_notification_kind(&fresh, &self.ui_state.desktop_behavior);
         let Some(body) = timeline_notification_body(kind, &agent_label) else {
             return;
         };
@@ -58562,8 +58584,29 @@ fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str)
     }
 }
 
+/// Splits a batch into the events past `previous` (the session's last announced
+/// sequence) and the watermark that batch advances to. The live event stream
+/// and the polling fallback both deliver the same committed item, so only the
+/// first delivery is past the mark.
+fn new_timeline_notification_events<'a>(
+    events: &'a [TimelineLiveEvent],
+    previous: Option<i64>,
+) -> (Vec<&'a TimelineLiveEvent>, Option<i64>) {
+    let max_sequence = events.iter().map(|event| event.sequence).max();
+    let fresh = events
+        .iter()
+        .filter(|event| previous.is_none_or(|previous| event.sequence > previous))
+        .collect();
+    let watermark = match (previous, max_sequence) {
+        (Some(previous), Some(max_sequence)) => Some(previous.max(max_sequence)),
+        (None, max_sequence) => max_sequence,
+        (previous, None) => previous,
+    };
+    (fresh, watermark)
+}
+
 fn timeline_notification_kind(
-    events: &[TimelineLiveEvent],
+    events: &[&TimelineLiveEvent],
     preferences: &DesktopBehaviorUiState,
 ) -> Option<NotificationKind> {
     if preferences.notify_agent_failed
@@ -66354,7 +66397,7 @@ mod tests {
         };
         let preferences = DesktopBehaviorUiState::default();
         assert_eq!(
-            timeline_notification_kind(&[streaming_event], &preferences),
+            timeline_notification_kind(&[&streaming_event], &preferences),
             None
         );
 
@@ -66365,9 +66408,41 @@ mod tests {
             item: final_item,
         };
         assert_eq!(
-            timeline_notification_kind(&[final_event], &preferences),
+            timeline_notification_kind(&[&final_event], &preferences),
             Some(NotificationKind::Completed)
         );
+    }
+
+    #[test]
+    fn a_redelivered_timeline_item_does_not_raise_a_second_notification() {
+        let session_id = VibexSessionId::new();
+        let event = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 7,
+            item: indexed_timeline_item(&session_id, 7, "done"),
+        };
+        let first = [event.clone()];
+        let (fresh, watermark) = new_timeline_notification_events(&first, None);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(watermark, Some(7));
+
+        // The polling fallback redelivers the same committed item. It is not
+        // past the watermark, so it cannot raise the completion a second time.
+        let replay = [event];
+        let (fresh, watermark) = new_timeline_notification_events(&replay, watermark);
+        assert!(fresh.is_empty());
+        assert_eq!(watermark, Some(7));
+
+        // A genuinely newer item still gets through.
+        let newer = TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 8,
+            item: indexed_timeline_item(&session_id, 8, "again"),
+        };
+        let later = [newer];
+        let (fresh, watermark) = new_timeline_notification_events(&later, watermark);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(watermark, Some(8));
     }
 
     #[test]
