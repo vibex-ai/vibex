@@ -837,10 +837,6 @@ pub struct ManagementCenter {
     mcp_market_has_more: bool,
     mcp_market_loading: bool,
     mcp_market_error: Option<String>,
-    /// Registry entries the runtime has indexed so far.
-    mcp_market_catalog_size: usize,
-    /// How many indexed entries matched the current query.
-    mcp_market_total_matches: usize,
     /// Bumped for every market request, so a reply that lost the race cannot
     /// overwrite a newer one, and so the indexing poll stops with the view.
     mcp_market_generation: u64,
@@ -1642,8 +1638,6 @@ impl ManagementCenter {
             mcp_market_has_more: false,
             mcp_market_loading: false,
             mcp_market_error: None,
-            mcp_market_catalog_size: 0,
-            mcp_market_total_matches: 0,
             mcp_market_generation: 0,
             mcp_market_index_task: None,
             mcp_market_install_target: None,
@@ -7764,26 +7758,13 @@ impl ManagementCenter {
         self.mcp_market_install_env.clear();
         self.mcp_market_install_agents = self.market_default_agents();
         // The index lives in the runtime and outlives this view, so what is
-        // shown here is whatever it has already walked; the counters are reset
-        // only so the first reply is what fills them in.
+        // shown here is whatever it has already walked; the window is cleared
+        // only so the first reply is what fills it in.
         self.mcp_market_entries.clear();
-        self.mcp_market_catalog_size = 0;
-        self.mcp_market_total_matches = 0;
         self.mcp_market_page = 1;
         // Opening the view must not wait on the registry: whatever the runtime
         // has already indexed is enough to paint, and the poll fills the rest.
         self.request_mcp_market(McpMarketRequest::Open, cx);
-    }
-
-    fn close_mcp_market(&mut self, cx: &mut Context<Self>) {
-        self.mcp_market_open = false;
-        self.mcp_market_install_target = None;
-        self.mcp_market_install_env.clear();
-        // Stop the indexing poll with the view: the runtime keeps filling its
-        // index on its own schedule, but nothing here needs to watch it.
-        self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
-        self.mcp_market_index_task = None;
-        cx.notify();
     }
 
     /// Load one window of the registry for the current query.
@@ -7839,8 +7820,6 @@ impl ManagementCenter {
                     Ok(Ok(response)) => {
                         this.mcp_market_entries = response.entries;
                         this.mcp_market_has_more = response.has_more;
-                        this.mcp_market_catalog_size = response.catalog_size;
-                        this.mcp_market_total_matches = response.total_matches;
                         this.schedule_mcp_market_index_poll(cx);
                     }
                     Ok(Err(error)) => {
@@ -8060,13 +8039,6 @@ impl ManagementCenter {
         self.skill_market_document = None;
         self.skill_market_install_agents = self.market_default_agents();
         self.search_skill_market(window, cx);
-    }
-
-    fn close_skill_market(&mut self, cx: &mut Context<Self>) {
-        self.skill_market_open = false;
-        self.skill_market_install_target = None;
-        self.skill_market_document = None;
-        cx.notify();
     }
 
     fn search_skill_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -10666,7 +10638,9 @@ impl ManagementCenter {
     }
 
     /// The MCP market, rendered in the section body rather than as an overlay.
-    /// The MCP market, rendered in the section body rather than as an overlay.
+    ///
+    /// The pane carries no back affordance of its own: the sidebar buttons are
+    /// the only way this section switches between its views.
     fn render_mcp_market(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let loading = self.mcp_market_loading;
@@ -10674,13 +10648,10 @@ impl ManagementCenter {
         let entries = self.mcp_market_entries.clone();
         let install_target = self.mcp_market_install_target.clone();
         let query_input = self.mcp_market_query.clone();
-        let catalog_size = self.mcp_market_catalog_size;
-        let total_matches = self.mcp_market_total_matches;
         // The pager is drawn against the window in hand, so a page that no
         // longer exists after a search falls back to the last one.
         let page = self.mcp_market_page.min(market_page_count(entries.len()));
         let page_entries = market_page_slice(&entries, page);
-        let has_more = self.mcp_market_has_more;
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
         content =
@@ -10689,18 +10660,6 @@ impl ManagementCenter {
                     .w_full()
                     .flex_none()
                     .gap_2()
-                    .child(
-                        Button::new("management-mcp-market-back")
-                            .xsmall()
-                            .ghost()
-                            .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                            .label(management_locale_text(
-                                "My MCP servers",
-                                "我的 MCP 服务",
-                                "我的 MCP 服務",
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_mcp_market(cx))),
-                    )
                     .child(
                         v_flex()
                             .w_full()
@@ -10892,15 +10851,6 @@ impl ManagementCenter {
                     "management-mcp-market-pagination",
                     page,
                     entries.len(),
-                    // The window is capped but the index is not, so the footer
-                    // reports how much of the registry the search covered
-                    // instead of implying this is all of it.
-                    Some(market_index_progress_label(
-                        entries.len(),
-                        total_matches,
-                        catalog_size,
-                        !has_more,
-                    )),
                     move |page, _, cx| {
                         let _ = entity.update(cx, |this, cx| {
                             this.mcp_market_page = *page;
@@ -10927,22 +10877,6 @@ impl ManagementCenter {
             .w_full()
             .min_h_0()
             .gap_3()
-            .child(
-                Button::new("management-mcp-market-install-back")
-                    .xsmall()
-                    .ghost()
-                    .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                    .label(management_locale_text(
-                        "Back to the market",
-                        "返回市场",
-                        "返回市場",
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.mcp_market_install_target = None;
-                        this.mcp_market_install_env.clear();
-                        cx.notify();
-                    })),
-            )
             .child(
                 v_flex()
                     .w_full()
@@ -11101,14 +11035,6 @@ impl ManagementCenter {
                 .flex_none()
                 .gap_2()
                 .child(
-                    Button::new("management-skill-market-back")
-                        .xsmall()
-                        .ghost()
-                        .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                        .label(management_locale_text("My Skills", "我的技能", "我的技能"))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_skill_market(cx))),
-                )
-                .child(
                     v_flex()
                         .w_full()
                         .gap_1()
@@ -11174,43 +11100,23 @@ impl ManagementCenter {
         }
 
         if let Some(target) = install_target {
-            let mut form = v_flex()
-                .w_full()
-                .min_h_0()
-                .gap_3()
-                .child(
-                    Button::new("management-skill-market-install-back")
-                        .xsmall()
-                        .ghost()
-                        .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                        .label(management_locale_text(
-                            "Back to the market",
-                            "返回市场",
-                            "返回市場",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.skill_market_install_target = None;
-                            this.skill_market_document = None;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(management_locale_text("Install", "安装", "安裝")),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(target.name.clone()),
-                        ),
-                );
+            let mut form = v_flex().w_full().min_h_0().gap_3().child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(management_locale_text("Install", "安装", "安裝")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(target.name.clone()),
+                    ),
+            );
 
             if preview_loading {
                 form = form.child(management_market_loading_row(cx));
@@ -11425,9 +11331,6 @@ impl ManagementCenter {
                     "management-skill-market-pagination",
                     page,
                     entries.len(),
-                    // The index reports no total and serves no second page, so
-                    // the pager covers exactly the window that was fetched.
-                    None,
                     move |page, _, cx| {
                         let _ = entity.update(cx, |this, cx| {
                             this.skill_market_page = *page;
@@ -20698,40 +20601,6 @@ fn market_entry_badges(entry: &vibex_core::McpMarketEntry, installed: bool) -> V
     badges
 }
 
-/// How much of the registry the runtime has indexed, so a short list is never
-/// mistaken for a short catalog.
-///
-/// The window a card list shows is capped, but the index behind it is not, so
-/// the two facts are reported separately rather than letting a capped list
-/// imply the search covered everything.
-fn market_index_progress_label(
-    shown: usize,
-    total_matches: usize,
-    catalog_size: usize,
-    exhausted: bool,
-) -> String {
-    let index = match (locale::current_locale(), exhausted) {
-        (ResolvedLocale::ZhCn, true) => format!("已索引 {catalog_size} 个服务（已全部载入）"),
-        (ResolvedLocale::ZhCn, false) => format!("已索引 {catalog_size} 个服务，仍在继续载入"),
-        (ResolvedLocale::ZhTw, true) => format!("已索引 {catalog_size} 個服務（已全部載入）"),
-        (ResolvedLocale::ZhTw, false) => format!("已索引 {catalog_size} 個服務，仍在繼續載入"),
-        (ResolvedLocale::En, true) => format!("Indexed all {catalog_size} registry servers"),
-        (ResolvedLocale::En, false) => {
-            format!("Indexed {catalog_size} registry servers, still loading")
-        }
-    };
-    let hidden = total_matches.saturating_sub(shown);
-    if hidden == 0 {
-        return index;
-    }
-    let more = match locale::current_locale() {
-        ResolvedLocale::ZhCn => format!("另有 {hidden} 个匹配未显示"),
-        ResolvedLocale::ZhTw => format!("另有 {hidden} 個符合未顯示"),
-        ResolvedLocale::En => format!("{hidden} more matches not shown"),
-    };
-    format!("{index} · {more}")
-}
-
 /// Turn the entry the user was shown plus the form's answers into a create
 /// request. Values the form supplied win over the catalog's defaults, because
 /// the form is where a credential the catalog could not know about is entered.
@@ -20936,65 +20805,33 @@ fn market_page_slice<T>(entries: &[T], page: usize) -> &[T] {
     entries.get(start..end).unwrap_or_default()
 }
 
-/// The range of the fetched window the current page is showing.
-fn market_page_range_label(page: usize, total: usize) -> String {
-    if total == 0 {
-        return management_locale_text("No entries", "没有条目", "沒有條目").to_string();
-    }
-    let first = (page.saturating_sub(1)) * MARKET_PAGE_SIZE + 1;
-    let last = (first + MARKET_PAGE_SIZE - 1).min(total);
-    match locale::current_locale() {
-        ResolvedLocale::En => format!("{first}–{last} of {total}"),
-        ResolvedLocale::ZhCn => format!("第 {first}–{last} 项，共 {total} 项"),
-        ResolvedLocale::ZhTw => format!("第 {first}–{last} 項，共 {total} 項"),
-    }
-}
-
-/// The pager under a market grid.
+/// The pager strip along the bottom of a market pane.
 ///
-/// `note` carries whatever the upstream said about entries beyond the fetched
-/// window, so a capped list is never mistaken for the whole catalog.
+/// The pager owns the whole footer: the strip spans the pane's width and the
+/// controls sit at its trailing edge, so nothing competes with them for the
+/// space the grid scrolls above.
 fn management_market_pager(
     id: &'static str,
     page: usize,
     total: usize,
-    note: Option<String>,
     on_page: impl Fn(&usize, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    let mut summary = v_flex().min_w_0().gap_0p5().child(
-        div()
-            .min_w_0()
-            .truncate()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(market_page_range_label(page, total)),
-    );
-    if let Some(note) = note {
-        summary = summary.child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(note),
-        );
-    }
     h_flex()
         .w_full()
         .min_w_0()
         .flex_none()
         .items_center()
-        .justify_between()
-        .gap_3()
         .border_t_1()
         .border_color(cx.theme().border)
         .pt_2()
-        .child(summary)
         .child(
             Pagination::new(id)
                 .small()
                 // The row already supplies the separation from the grid.
                 .py_0()
+                .w_full()
+                .justify_end()
                 .current_page(page)
                 .total_pages(market_page_count(total))
                 .visible_pages(5)
@@ -22992,15 +22829,6 @@ mod tests {
         assert!(market_page_slice::<usize>(&[], 1).is_empty());
     }
 
-    #[test]
-    fn market_range_label_names_the_visible_window() {
-        assert!(market_page_range_label(1, 100).contains("1–12"));
-        assert!(market_page_range_label(1, 100).contains("100"));
-        // The final page stops at the window's end rather than at the page size.
-        assert!(market_page_range_label(9, 100).contains("97–100"));
-        assert!(!market_page_range_label(1, 0).is_empty());
-    }
-
     fn market_entry_for_display() -> vibex_core::McpMarketEntry {
         vibex_core::McpMarketEntry {
             id: "io.example/server".to_string(),
@@ -23088,19 +22916,6 @@ mod tests {
                 .any(|badge| badge == "deprecated"),
             "a deprecated entry must not look healthy"
         );
-    }
-
-    /// A capped window must not read as a complete catalog.
-    #[test]
-    fn market_progress_reports_the_index_behind_the_window() {
-        let loading = market_index_progress_label(12, 12, 1_200, false);
-        assert!(loading.contains("1200") || loading.contains("1_200") || loading.contains("1200"));
-        let exhausted = market_index_progress_label(12, 12, 1_200, true);
-        assert_ne!(loading, exhausted);
-        // Matches the window cannot show are reported rather than dropped
-        // silently.
-        let hidden = market_index_progress_label(12, 40, 1_200, false);
-        assert!(hidden.contains("28"), "{hidden}");
     }
 
     #[test]
