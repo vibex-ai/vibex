@@ -13,8 +13,8 @@ use std::time::Duration;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, Context, DragMoveEvent, Empty, Entity, EventEmitter,
     FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render,
-    Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, Window, div,
-    prelude::*, px,
+    Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
+    div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -149,6 +149,35 @@ enum ProfileModelEditField {
     Id,
     Reasoning,
     Limits,
+}
+
+/// Why the MCP market is asking the runtime for a window of the registry.
+///
+/// The runtime indexes the registry in the background, so most asks are just
+/// "what do you have now" — only a search the user actually pressed is worth
+/// waiting on, and only a fresh result set may move the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpMarketRequest {
+    /// First paint: a fresh result set, answered from whatever is indexed.
+    Open,
+    /// The user pressed Search or Enter: a fresh result set, and the runtime
+    /// is asked to widen its index before answering.
+    Search,
+    /// A poll that picks up entries the index gained since the last reply. The
+    /// result set is the same one, so the page in view must not move.
+    Poll,
+}
+
+impl McpMarketRequest {
+    /// Whether the runtime should widen its index before answering.
+    fn waits_for_a_wider_index(self) -> bool {
+        matches!(self, McpMarketRequest::Search)
+    }
+
+    /// Whether this starts a new result set, which is what resets the page.
+    fn starts_a_new_result_set(self) -> bool {
+        !matches!(self, McpMarketRequest::Poll)
+    }
 }
 
 /// What one Model editor renders, resolved from the Agent projection once per
@@ -808,6 +837,16 @@ pub struct ManagementCenter {
     mcp_market_has_more: bool,
     mcp_market_loading: bool,
     mcp_market_error: Option<String>,
+    /// Registry entries the runtime has indexed so far.
+    mcp_market_catalog_size: usize,
+    /// How many indexed entries matched the current query.
+    mcp_market_total_matches: usize,
+    /// Bumped for every market request, so a reply that lost the race cannot
+    /// overwrite a newer one, and so the indexing poll stops with the view.
+    mcp_market_generation: u64,
+    /// The pending re-query that picks up entries the index gained since the
+    /// last reply.
+    mcp_market_index_task: Option<Task<()>>,
     /// Entry the install form is configuring; `None` while browsing.
     mcp_market_install_target: Option<vibex_core::McpMarketEntry>,
     mcp_market_install_agents: BTreeSet<String>,
@@ -1256,6 +1295,18 @@ impl ManagementCenter {
         let subscriptions = vec![
             cx.subscribe(&agent_search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_search, |_, _, _: &InputEvent, cx| cx.notify()),
+            // Enter runs the market search, so a query does not need a trip to
+            // the button.
+            cx.subscribe_in(
+                &mcp_market_query,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.search_mcp_market(window, cx);
+                        cx.stop_propagation();
+                    }
+                },
+            ),
             cx.subscribe(&mcp_name_draft, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_command_draft, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&mcp_args_draft, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -1591,6 +1642,10 @@ impl ManagementCenter {
             mcp_market_has_more: false,
             mcp_market_loading: false,
             mcp_market_error: None,
+            mcp_market_catalog_size: 0,
+            mcp_market_total_matches: 0,
+            mcp_market_generation: 0,
+            mcp_market_index_task: None,
             mcp_market_install_target: None,
             mcp_market_install_agents: BTreeSet::new(),
             mcp_market_install_env: BTreeMap::new(),
@@ -7698,7 +7753,7 @@ impl ManagementCenter {
     ///
     /// The market is a view of the section rather than an overlay, so it can
     /// keep the sidebar and section chrome the user navigated from.
-    fn open_mcp_market(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.mutation.is_some() {
             return;
         }
@@ -7708,29 +7763,56 @@ impl ManagementCenter {
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
         self.mcp_market_install_agents = self.market_default_agents();
-        self.search_mcp_market(window, cx);
+        // The index lives in the runtime and outlives this view, so what is
+        // shown here is whatever it has already walked; the counters are reset
+        // only so the first reply is what fills them in.
+        self.mcp_market_entries.clear();
+        self.mcp_market_catalog_size = 0;
+        self.mcp_market_total_matches = 0;
+        self.mcp_market_page = 1;
+        // Opening the view must not wait on the registry: whatever the runtime
+        // has already indexed is enough to paint, and the poll fills the rest.
+        self.request_mcp_market(McpMarketRequest::Open, cx);
     }
 
     fn close_mcp_market(&mut self, cx: &mut Context<Self>) {
         self.mcp_market_open = false;
         self.mcp_market_install_target = None;
         self.mcp_market_install_env.clear();
+        // Stop the indexing poll with the view: the runtime keeps filling its
+        // index on its own schedule, but nothing here needs to watch it.
+        self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
+        self.mcp_market_index_task = None;
         cx.notify();
     }
 
     /// Load one window of the registry for the current query.
     ///
-    /// Entries live in the authoritative runtime rather than this view, so a
-    /// paired device sees the same catalog the desktop does.
+    /// The runtime indexes the registry a page at a time rather than asking the
+    /// registry to search, because the registry's own search takes tens of
+    /// seconds. So a reply describes how much of the catalog it covered, and
+    /// this keeps asking while that is still growing — which is what makes
+    /// results appear as the index fills instead of stopping at whatever the
+    /// first page happened to hold.
     fn search_mcp_market(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.request_mcp_market(McpMarketRequest::Search, cx);
+    }
+
+    fn request_mcp_market(&mut self, request: McpMarketRequest, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
             return;
         };
         let query = self.mcp_market_query.read(cx).value().trim().to_string();
-        self.mcp_market_loading = true;
+        // A poll is not something the user did, so it must not put the Search
+        // button into a spinner every few seconds.
+        if request.starts_a_new_result_set() {
+            self.mcp_market_loading = true;
+            self.mcp_market_page = 1;
+        }
         self.mcp_market_error = None;
-        // A new search is a new result set, so it starts at its first page.
-        self.mcp_market_page = 1;
+        self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
+        let generation = self.mcp_market_generation;
+        let extend = request.waits_for_a_wider_index();
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
@@ -7739,6 +7821,7 @@ impl ManagementCenter {
                     query: (!query.is_empty()).then_some(query),
                     limit: Some(MARKET_FETCH_LIMIT),
                     offset: None,
+                    extend: Some(extend),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -7746,20 +7829,76 @@ impl ManagementCenter {
         self.mutation_task = Some(cx.spawn(async move |_, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
+                // A reply from a request the user has already moved past would
+                // otherwise replace the list under them.
+                if this.mcp_market_generation != generation {
+                    return;
+                }
                 this.mcp_market_loading = false;
                 match outcome {
                     Ok(Ok(response)) => {
                         this.mcp_market_entries = response.entries;
                         this.mcp_market_has_more = response.has_more;
+                        this.mcp_market_catalog_size = response.catalog_size;
+                        this.mcp_market_total_matches = response.total_matches;
+                        this.schedule_mcp_market_index_poll(cx);
                     }
                     Ok(Err(error)) => {
-                        this.mcp_market_error = Some(format!("{}: {}", error.code, error.message));
+                        this.mcp_market_error =
+                            Some(management_market_error_text(&error.code, &error.message));
                     }
                     Err(error) => this.mcp_market_error = Some(format!("{error}")),
                 }
                 cx.notify();
             });
         }));
+    }
+
+    /// Re-query once the index has had time to gain another page.
+    ///
+    /// The delay is longer than a page takes to land, so this settles into a
+    /// poll that adds a page every few seconds rather than one that spins. It
+    /// stops as soon as there is nothing left worth streaming: the registry is
+    /// exhausted, or the window the view shows is already full.
+    fn schedule_mcp_market_index_poll(&mut self, cx: &mut Context<Self>) {
+        let window_full = self.mcp_market_entries.len() >= MARKET_FETCH_LIMIT as usize;
+        if !self.mcp_market_has_more || window_full || !self.mcp_market_open {
+            self.mcp_market_index_task = None;
+            return;
+        }
+        let generation = self.mcp_market_generation;
+        self.mcp_market_index_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                cx.background_executor()
+                    .timer(MCP_MARKET_INDEX_POLL_INTERVAL)
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    // The view may have closed, or the user may have searched
+                    // again, while this was waiting.
+                    if this.mcp_market_generation != generation || !this.mcp_market_open {
+                        return;
+                    }
+                    this.request_mcp_market(McpMarketRequest::Poll, cx);
+                });
+            },
+        ));
+    }
+
+    /// Open an entry's own page in the browser.
+    ///
+    /// The URL comes out of a registry record, so it is validated before it
+    /// reaches the platform opener exactly like every other external link.
+    fn open_mcp_market_link(&mut self, url: String, cx: &mut Context<Self>) {
+        match validate_external_open_url(&url)
+            .and_then(|validated| crate::platform::open_external_url(&validated.url))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.mcp_market_error =
+                    Some(management_market_error_text(&error.code, &error.message));
+                cx.notify();
+            }
+        }
     }
 
     /// Open the install form for one entry, seeding an input per declared
@@ -7867,7 +8006,7 @@ impl ManagementCenter {
                                 if skipped == 0 {
                                     String::new()
                                 } else {
-                                    format!(", skipped {skipped} that cannot host this transport")
+                                    format!(", skipped {skipped} that cannot receive MCP")
                                 }
                             ),
                             ResolvedLocale::ZhCn => format!(
@@ -7876,7 +8015,7 @@ impl ManagementCenter {
                                 if skipped == 0 {
                                     String::new()
                                 } else {
-                                    format!("，跳过 {skipped} 个不支持该传输方式的 Agent")
+                                    format!("，跳过 {skipped} 个无法接收 MCP 的 Agent")
                                 }
                             ),
                             ResolvedLocale::ZhTw => format!(
@@ -7885,7 +8024,7 @@ impl ManagementCenter {
                                 if skipped == 0 {
                                     String::new()
                                 } else {
-                                    format!("，跳過 {skipped} 個不支援該傳輸方式的 Agent")
+                                    format!("，跳過 {skipped} 個無法接收 MCP 的 Agent")
                                 }
                             ),
                         });
@@ -10535,6 +10674,8 @@ impl ManagementCenter {
         let entries = self.mcp_market_entries.clone();
         let install_target = self.mcp_market_install_target.clone();
         let query_input = self.mcp_market_query.clone();
+        let catalog_size = self.mcp_market_catalog_size;
+        let total_matches = self.mcp_market_total_matches;
         // The pager is drawn against the window in hand, so a page that no
         // longer exists after a search falls back to the last one.
         let page = self.mcp_market_page.min(market_page_count(entries.len()));
@@ -10572,9 +10713,9 @@ impl ManagementCenter {
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(management_locale_text(
-                                        "The exact command is shown before anything is saved.",
-                                        "保存前会完整展示将要执行的命令。",
-                                        "儲存前會完整展示將要執行的命令。",
+                                        "Every entry is read from the official registry, and the exact command is shown before anything is saved.",
+                                        "所有条目均来自官方注册表，保存前会完整展示将要执行的命令。",
+                                        "所有條目均來自官方登錄表，儲存前會完整展示將要執行的命令。",
                                     )),
                             ),
                     )
@@ -10634,23 +10775,82 @@ impl ManagementCenter {
                     .clone()
                     .unwrap_or_else(|| management_unconfigured_label().to_string());
                 let command_line = market_entry_command_line(entry);
-                let mut badges = Vec::new();
-                if entry.verified {
-                    badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
-                }
-                if installed_mcp_names.contains(&entry.name) {
-                    badges
-                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
-                }
-                if let Some(version) = entry.version.as_deref() {
-                    badges.push(version.to_string());
-                }
-                badges.push(market_transport_label(entry.transport));
+                let publisher = market_entry_publisher_line(entry);
+                let env_summary = market_entry_env_summary(entry);
+                let badges = market_entry_badges(entry, installed_mcp_names.contains(&entry.name));
+                // The registry publishes a website, a repository, or both; a
+                // card links to whichever it has rather than showing neither.
+                let link = entry.homepage.clone().or_else(|| entry.repository.clone());
                 let install_entry = entry.clone();
+
+                let mut details = v_flex().min_w_0().flex_1().gap_1().child(
+                    h_flex()
+                        .min_w_0()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name))
+                        .children(
+                            badges
+                                .into_iter()
+                                .map(|badge| management_market_badge(badge, cx)),
+                        ),
+                );
+                if let Some(publisher) = publisher {
+                    details = details.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(publisher),
+                    );
+                }
+                details = details
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(command_line),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
+                    );
+                if let Some(env_summary) = env_summary {
+                    // A server that needs a credential before it runs is not a
+                    // one-click install, and saying so on the card is fairer
+                    // than saying it only once the form is open.
+                    details = details.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().warning)
+                            .child(env_summary),
+                    );
+                }
+                if let Some(link) = link {
+                    let open_link = link.clone();
+                    let entry_id = install_entry.id.clone();
+                    details = details.child(
+                        Button::new(SharedString::from(format!(
+                            "management-mcp-market-link-{entry_id}"
+                        )))
+                        .xsmall()
+                        .link()
+                        .icon(IconName::ExternalLink)
+                        .label(management_locale_text("Homepage", "主页", "首頁"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_mcp_market_link(open_link.clone(), cx)
+                        })),
+                    );
+                }
+
                 grid = grid.child(
                     h_flex()
                         .min_w(px(340.0))
                         .flex_1()
+                        .items_start()
                         .gap_3()
                         .rounded(px(8.0))
                         .border_1()
@@ -10660,42 +10860,7 @@ impl ManagementCenter {
                             market_transport_icon_path(entry.transport),
                             cx,
                         ))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .flex_wrap()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(name),
-                                        )
-                                        .children(
-                                            badges
-                                                .into_iter()
-                                                .map(|badge| management_market_badge(badge, cx)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .truncate()
-                                        .child(command_line),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(description),
-                                ),
-                        )
+                        .child(details)
                         .child(
                             Button::new(SharedString::from(format!(
                                 "management-mcp-market-install-{}",
@@ -10727,16 +10892,15 @@ impl ManagementCenter {
                     "management-mcp-market-pagination",
                     page,
                     entries.len(),
-                    // The registry pages by cursor, so a fetched window is a
-                    // prefix of a longer catalog rather than all of it.
-                    has_more.then(|| {
-                        management_locale_text(
-                            "The registry holds more servers than this page window; narrow the search to reach them.",
-                            "注册表中还有更多服务，请缩小搜索范围以查看。",
-                            "註冊表中還有更多服務，請縮小搜尋範圍以查看。",
-                        )
-                        .to_string()
-                    }),
+                    // The window is capped but the index is not, so the footer
+                    // reports how much of the registry the search covered
+                    // instead of implying this is all of it.
+                    Some(market_index_progress_label(
+                        entries.len(),
+                        total_matches,
+                        catalog_size,
+                        !has_more,
+                    )),
                     move |page, _, cx| {
                         let _ = entity.update(cx, |this, cx| {
                             this.mcp_market_page = *page;
@@ -20440,6 +20604,134 @@ fn market_entry_command_line(entry: &vibex_core::McpMarketEntry) -> String {
     }
 }
 
+/// The date part of an RFC3339 timestamp, which is all a card needs.
+///
+/// The registry publishes timestamps with sub-second precision and a `Z`; a
+/// market card only wants to say roughly how current an entry is, so anything
+/// that is not plainly `YYYY-MM-DD` is dropped rather than shown raw.
+fn market_timestamp_date(timestamp: &str) -> Option<String> {
+    let date = timestamp.trim().get(..10)?;
+    let bytes = date.as_bytes();
+    let shaped = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    shaped.then(|| date.to_string())
+}
+
+/// The publisher and freshness line under an entry's name.
+///
+/// A registry name is reverse-DNS, so its first segment is the publisher, and
+/// the registry's own `updatedAt` says whether the entry is maintained. Both
+/// were being thrown away, which is most of why the cards read as bare.
+fn market_entry_publisher_line(entry: &vibex_core::McpMarketEntry) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(author) = entry
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(author.to_string());
+    }
+    if let Some(updated) = entry.updated_at.as_deref().and_then(market_timestamp_date) {
+        parts.push(format!(
+            "{} {updated}",
+            management_locale_text("Updated", "更新于", "更新於")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// What the install form is going to ask for, said before the form does.
+///
+/// An entry with required credentials should not look like a one-click install
+/// until the user is already in the form.
+fn market_entry_env_summary(entry: &vibex_core::McpMarketEntry) -> Option<String> {
+    let total = entry.env.len();
+    if total == 0 {
+        return None;
+    }
+    let required = entry
+        .env
+        .iter()
+        .filter(|variable| variable.required)
+        .count();
+    Some(match (locale::current_locale(), required) {
+        (ResolvedLocale::ZhCn, 0) => format!("{total} 个可选变量"),
+        (ResolvedLocale::ZhCn, required) => format!("{total} 个变量，其中 {required} 个必填"),
+        (ResolvedLocale::ZhTw, 0) => format!("{total} 個選用變數"),
+        (ResolvedLocale::ZhTw, required) => format!("{total} 個變數，其中 {required} 個必填"),
+        (ResolvedLocale::En, 0) => format!("{total} optional variables"),
+        (ResolvedLocale::En, required) => format!("{required} of {total} variables required"),
+    })
+}
+
+/// The chips a card shows: what the entry is, and what state it is in.
+fn market_entry_badges(entry: &vibex_core::McpMarketEntry, installed: bool) -> Vec<String> {
+    let mut badges = Vec::new();
+    // A deprecated entry stays listed — it may still be the one that works —
+    // but it must not look like a healthy one.
+    if let Some(status) = entry
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty() && *status != "active")
+    {
+        badges.push(status.to_string());
+    }
+    if entry.verified {
+        badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
+    }
+    if installed {
+        badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
+    }
+    if let Some(kind) = entry.package_kind.as_deref() {
+        badges.push(kind.to_string());
+    }
+    if let Some(version) = entry.version.as_deref() {
+        badges.push(version.to_string());
+    }
+    badges.push(market_transport_label(entry.transport));
+    badges
+}
+
+/// How much of the registry the runtime has indexed, so a short list is never
+/// mistaken for a short catalog.
+///
+/// The window a card list shows is capped, but the index behind it is not, so
+/// the two facts are reported separately rather than letting a capped list
+/// imply the search covered everything.
+fn market_index_progress_label(
+    shown: usize,
+    total_matches: usize,
+    catalog_size: usize,
+    exhausted: bool,
+) -> String {
+    let index = match (locale::current_locale(), exhausted) {
+        (ResolvedLocale::ZhCn, true) => format!("已索引 {catalog_size} 个服务（已全部载入）"),
+        (ResolvedLocale::ZhCn, false) => format!("已索引 {catalog_size} 个服务，仍在继续载入"),
+        (ResolvedLocale::ZhTw, true) => format!("已索引 {catalog_size} 個服務（已全部載入）"),
+        (ResolvedLocale::ZhTw, false) => format!("已索引 {catalog_size} 個服務，仍在繼續載入"),
+        (ResolvedLocale::En, true) => format!("Indexed all {catalog_size} registry servers"),
+        (ResolvedLocale::En, false) => {
+            format!("Indexed {catalog_size} registry servers, still loading")
+        }
+    };
+    let hidden = total_matches.saturating_sub(shown);
+    if hidden == 0 {
+        return index;
+    }
+    let more = match locale::current_locale() {
+        ResolvedLocale::ZhCn => format!("另有 {hidden} 个匹配未显示"),
+        ResolvedLocale::ZhTw => format!("另有 {hidden} 個符合未顯示"),
+        ResolvedLocale::En => format!("{hidden} more matches not shown"),
+    };
+    format!("{index} · {more}")
+}
+
 /// Turn the entry the user was shown plus the form's answers into a create
 /// request. Values the form supplied win over the catalog's defaults, because
 /// the form is where a credential the catalog could not know about is entered.
@@ -20517,6 +20809,36 @@ fn management_market_badge(label: impl Into<SharedString>, cx: &App) -> AnyEleme
         .into_any_element()
 }
 
+/// Turn a market failure into something a person can act on.
+///
+/// The registry is slow and sometimes unreachable, and the raw transport error
+/// for both reads the same — "error sending request" — which tells a user
+/// nothing about whether to wait or check their network.
+fn management_market_error_text(code: &str, message: &str) -> String {
+    let hint = match code {
+        "market_unreachable" => Some(management_locale_text(
+            "The registry could not be reached. It is slow under load, so retrying often works; check the network if it keeps failing.",
+            "无法连接注册表。注册表在负载高时响应较慢，重试通常可以成功；若持续失败请检查网络。",
+            "無法連線登錄表。登錄表在負載高時回應較慢，重試通常可以成功；若持續失敗請檢查網路。",
+        )),
+        "market_rejected" => Some(management_locale_text(
+            "The registry refused the request. It may be rate limiting; try again shortly.",
+            "注册表拒绝了请求，可能正在限流，请稍后重试。",
+            "登錄表拒絕了請求，可能正在限流，請稍後重試。",
+        )),
+        "market_response_too_large" | "market_malformed" => Some(management_locale_text(
+            "The registry returned something this build cannot read.",
+            "注册表返回了当前版本无法解析的内容。",
+            "登錄表傳回了目前版本無法解析的內容。",
+        )),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => format!("{hint} ({code})"),
+        None => format!("{code}: {message}"),
+    }
+}
+
 fn management_market_banner(message: String, is_error: bool, cx: &App) -> AnyElement {
     let tone = if is_error {
         cx.theme().danger
@@ -20586,9 +20908,18 @@ const MARKET_PAGE_SIZE: usize = 12;
 
 /// Entries one search fetches, and so the most the pager can ever show.
 ///
-/// Both markets clamp the limit to this value, so asking for more would only
-/// pretend to.
-const MARKET_FETCH_LIMIT: u32 = 100;
+/// The MCP market's limit is a window into an index that keeps growing, so a
+/// larger value here means the view holds more of the registry at once; the
+/// Skill index clamps to its own page size and ignores anything larger.
+const MARKET_FETCH_LIMIT: u32 = 500;
+
+/// How long the MCP market waits before asking again for a wider index.
+///
+/// The runtime indexes the registry a page at a time in the background, and a
+/// page takes a few seconds to land. Polling slower than that keeps the view
+/// filling without spinning, and the poll stops as soon as the registry is
+/// exhausted or the view closes.
+const MCP_MARKET_INDEX_POLL_INTERVAL: Duration = Duration::from_millis(2500);
 
 /// Pages a fetched window divides into.
 ///
@@ -22639,7 +22970,12 @@ mod tests {
         assert_eq!(market_page_count(1), 1);
         assert_eq!(market_page_count(MARKET_PAGE_SIZE), 1);
         assert_eq!(market_page_count(MARKET_PAGE_SIZE + 1), 2);
-        assert_eq!(market_page_count(MARKET_FETCH_LIMIT as usize), 9);
+        // The count follows the fetch limit rather than a fixed number, so
+        // raising the window does not silently leave pages unreachable.
+        assert_eq!(
+            market_page_count(MARKET_FETCH_LIMIT as usize),
+            (MARKET_FETCH_LIMIT as usize).div_ceil(MARKET_PAGE_SIZE)
+        );
 
         let entries: Vec<usize> = (0..MARKET_FETCH_LIMIT as usize).collect();
         // Paging through the window visits every entry exactly once and in
@@ -22663,6 +22999,108 @@ mod tests {
         // The final page stops at the window's end rather than at the page size.
         assert!(market_page_range_label(9, 100).contains("97–100"));
         assert!(!market_page_range_label(1, 0).is_empty());
+    }
+
+    fn market_entry_for_display() -> vibex_core::McpMarketEntry {
+        vibex_core::McpMarketEntry {
+            id: "io.example/server".to_string(),
+            name: "Example".to_string(),
+            description: Some("Does a thing".to_string()),
+            homepage: Some("https://example.com".to_string()),
+            repository: Some("https://github.com/example/server".to_string()),
+            author: Some("io.example".to_string()),
+            status: Some("active".to_string()),
+            updated_at: Some("2026-07-27T15:34:57.496953Z".to_string()),
+            transport: vibex_core::McpServerTransportKind::Stdio,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "example@1.0.0".to_string()],
+            url: None,
+            env: Vec::new(),
+            verified: true,
+            version: Some("1.0.0".to_string()),
+            package_kind: Some("npm".to_string()),
+        }
+    }
+
+    /// The registry publishes a full RFC3339 instant; a card only wants the day.
+    #[test]
+    fn market_timestamps_reduce_to_a_date() {
+        assert_eq!(
+            market_timestamp_date("2026-07-27T15:34:57.496953Z").as_deref(),
+            Some("2026-07-27")
+        );
+        assert_eq!(
+            market_timestamp_date("2026-07-27").as_deref(),
+            Some("2026-07-27")
+        );
+        // Anything that is not plainly a date is dropped rather than shown raw.
+        assert!(market_timestamp_date("").is_none());
+        assert!(market_timestamp_date("not a date").is_none());
+        assert!(market_timestamp_date("2026/07/27T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn market_cards_say_who_published_an_entry_and_what_it_needs() {
+        let mut entry = market_entry_for_display();
+        let publisher = market_entry_publisher_line(&entry).expect("a publisher line");
+        assert!(publisher.contains("io.example"));
+        assert!(publisher.contains("2026-07-27"));
+
+        // A variable the registry marked required is called out before the
+        // install form is ever opened.
+        entry.env = vec![
+            vibex_core::MarketEnvRequirement {
+                name: "API_KEY".to_string(),
+                description: None,
+                required: true,
+                secret: true,
+                default_value: None,
+                placeholder: None,
+            },
+            vibex_core::MarketEnvRequirement {
+                name: "REGION".to_string(),
+                description: None,
+                required: false,
+                secret: false,
+                default_value: None,
+                placeholder: None,
+            },
+        ];
+        let summary = market_entry_env_summary(&entry).expect("a variable summary");
+        assert!(summary.contains('1') && summary.contains('2'), "{summary}");
+        assert!(market_entry_env_summary(&market_entry_for_display()).is_none());
+    }
+
+    #[test]
+    fn market_badges_mark_state_and_hide_a_healthy_status() {
+        let entry = market_entry_for_display();
+        let badges = market_entry_badges(&entry, false);
+        // `active` is the normal state and is not worth a chip.
+        assert!(!badges.iter().any(|badge| badge == "active"));
+        assert!(badges.iter().any(|badge| badge == "npm"));
+        assert!(badges.iter().any(|badge| badge == "1.0.0"));
+
+        let mut deprecated = market_entry_for_display();
+        deprecated.status = Some("deprecated".to_string());
+        assert!(
+            market_entry_badges(&deprecated, true)
+                .iter()
+                .any(|badge| badge == "deprecated"),
+            "a deprecated entry must not look healthy"
+        );
+    }
+
+    /// A capped window must not read as a complete catalog.
+    #[test]
+    fn market_progress_reports_the_index_behind_the_window() {
+        let loading = market_index_progress_label(12, 12, 1_200, false);
+        assert!(loading.contains("1200") || loading.contains("1_200") || loading.contains("1200"));
+        let exhausted = market_index_progress_label(12, 12, 1_200, true);
+        assert_ne!(loading, exhausted);
+        // Matches the window cannot show are reported rather than dropped
+        // silently.
+        let hidden = market_index_progress_label(12, 40, 1_200, false);
+        assert!(hidden.contains("28"), "{hidden}");
     }
 
     #[test]

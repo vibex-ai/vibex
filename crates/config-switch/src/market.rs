@@ -16,6 +16,19 @@
 //! **A market never invents an entry.** Everything the UI shows came out of an
 //! upstream response; an entry the upstream did not publish cannot be listed.
 //!
+//! ## Why the MCP catalog is indexed rather than queried
+//!
+//! The registry's own `search` parameter is not usable interactively: measured
+//! against the live registry a single `?search=` request took 9–90 seconds,
+//! while walking one cursor page of the same catalog takes 2–6. A market that
+//! searched upstream would time out far more often than it answered.
+//!
+//! So the runtime walks the registry itself, one cursor page at a time, into a
+//! process-wide cache, and every query is answered by filtering that cache.
+//! Indexing continues in the background while the market is in use, which is
+//! what lets a search cover thousands of entries without ever waiting on the
+//! registry's own scan.
+//!
 //! ## Network boundary
 //!
 //! Both upstreams are fixed, but a Skill entry names a repository and the
@@ -34,16 +47,18 @@
 //! the resolved address into the socket, which the blocking client used here
 //! does not expose.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use vibex_core::{
     AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
     McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest, SkillMarketDocument,
-    SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
+    McpMarketSearchResponse, McpServerTransportKind, SkillCreateRequest,
+    SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
     SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillScopeKind,
     SkillSourceKind, SkillStatus, VibexError, VibexResult,
 };
@@ -77,12 +92,37 @@ const JSDELIVR_DATA: &str = "https://data.jsdelivr.com/v1/packages/gh";
 const JSDELIVR_CDN: &str = "https://cdn.jsdelivr.net/gh";
 
 /// One request may not take longer than this, including every redirect.
-const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// The registry is not fast: walking its pages measured between 2 and 28
+/// seconds each. A ten-second ceiling — what this used to be — turned every
+/// slow-but-fine page into a reported outage, so the ceiling is set above the
+/// slowest page observed rather than at a comfortable interactive latency.
+const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Redirect hops followed before the fetch is refused.
 const MAX_MARKET_REDIRECTS: usize = 5;
 /// Entries a single response may contribute, so one huge catalog cannot flood
 /// the list.
-const MAX_ENTRIES_PER_SEARCH: usize = 200;
+const MAX_ENTRIES_PER_SEARCH: usize = 500;
+/// Attempts one registry page gets before the indexer gives up on it.
+const MCP_PAGE_ATTEMPTS: usize = 2;
+/// Registry page size. The API caps `limit` here, so asking for more only
+/// pretends to.
+const MCP_REGISTRY_PAGE_SIZE: u32 = 100;
+/// How long a request may wait for the catalog to reach what it asked for.
+const MCP_CATALOG_WAIT: Duration = Duration::from_secs(12);
+/// Pause between background pages, so indexing stays a polite trickle.
+const MCP_CATALOG_FILL_PAUSE: Duration = Duration::from_millis(250);
+/// Entries the cache will hold before the indexer stops walking.
+const MCP_CATALOG_MAX_ENTRIES: usize = 4_000;
+/// A catalog older than this is walked again from the registry's first page.
+const MCP_CATALOG_TTL: Duration = Duration::from_secs(30 * 60);
+/// The indexer stops once nothing has asked for the market for this long, so
+/// closing the view ends the network activity rather than leaving it running.
+const MCP_CATALOG_IDLE: Duration = Duration::from_secs(120);
+/// Longest query the market will filter on.
+const MCP_CATALOG_MAX_QUERY_CHARS: usize = 120;
+/// How often a waiting request re-checks the cache.
+const MCP_CATALOG_POLL: Duration = Duration::from_millis(120);
 /// A Skill document is markdown; anything past this is not one.
 const MAX_SKILL_DOCUMENT_FETCH_BYTES: u64 = MAX_SKILL_MARKET_DOCUMENT_BYTES + 1;
 /// Branches tried when resolving a skill's document. The index does not publish
@@ -324,6 +364,24 @@ struct RegistryMetadata {
 struct RegistryServerRecord {
     #[serde(default)]
     server: Option<RegistryServer>,
+    /// Registry-owned metadata. The lifecycle status lives here rather than on
+    /// the server itself, so a deprecated entry can be marked as such.
+    #[serde(default, rename = "_meta")]
+    meta: Option<RegistryRecordMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRecordMeta {
+    #[serde(default, rename = "io.modelcontextprotocol.registry/official")]
+    official: Option<RegistryOfficialMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryOfficialMeta {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,9 +396,35 @@ struct RegistryServer {
     #[serde(default, rename = "websiteUrl")]
     website_url: Option<String>,
     #[serde(default)]
+    repository: Option<RegistryRepository>,
+    #[serde(default)]
     packages: Vec<RegistryPackage>,
     #[serde(default)]
     remotes: Vec<RegistryRemote>,
+}
+
+/// The registry publishes `repository` as an object, but older records carry a
+/// bare URL string; both spellings name the same thing.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RegistryRepository {
+    Url(String),
+    Detail(RegistryRepositoryDetail),
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRepositoryDetail {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+impl RegistryRepository {
+    fn url(&self) -> Option<&str> {
+        match self {
+            RegistryRepository::Url(url) => Some(url.as_str()),
+            RegistryRepository::Detail(detail) => detail.url.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,6 +447,10 @@ struct RegistryPackage {
 
 #[derive(Debug, Deserialize)]
 struct RegistryArgument {
+    #[serde(default, rename = "type")]
+    argument_type: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     value: Option<String>,
 }
@@ -375,6 +463,11 @@ struct RegistryEnvVar {
     description: Option<String>,
     #[serde(default, rename = "isRequired")]
     is_required: Option<bool>,
+    /// The registry labels credentials itself. This is authoritative where it
+    /// is present; the name heuristic is only a fallback for records that omit
+    /// it.
+    #[serde(default, rename = "isSecret")]
+    is_secret: Option<bool>,
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]
@@ -423,14 +516,39 @@ fn registry_entry_id(name: &str) -> String {
     }
 }
 
+/// Flatten published arguments into launcher words.
+///
+/// A `named` argument contributes its name and then its value, so `--port 8080`
+/// survives as the flag the publisher meant; a positional one contributes only
+/// its value. Keeping just the value would hand the server a bare word where it
+/// expects a flag.
 fn registry_arg_values(args: Option<&Vec<RegistryArgument>>) -> Vec<String> {
-    args.into_iter()
-        .flatten()
-        .filter_map(|argument| argument.value.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut out = Vec::new();
+    for argument in args.into_iter().flatten() {
+        let name = argument
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let value = argument
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let named = argument.argument_type.as_deref() == Some("named")
+            || (name.is_some() && argument.argument_type.as_deref() != Some("positional"));
+        if named {
+            if let Some(name) = name {
+                out.push(name.to_string());
+            }
+            if let Some(value) = value {
+                out.push(value.to_string());
+            }
+        } else if let Some(value) = value {
+            out.push(value.to_string());
+        }
+    }
+    out
 }
 
 /// Package identifier with the published version pinned, so an install resolves
@@ -446,9 +564,7 @@ fn registry_package_identifier(package: &RegistryPackage, runtime: &str) -> Opti
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "latest");
     match (runtime, version) {
-        ("uvx", Some(version)) if package.registry_type.as_deref() == Some("pypi") => {
-            Some(format!("{identifier}=={version}"))
-        }
+        ("uvx", Some(version)) => Some(format!("{identifier}=={version}")),
         // A scoped name (`@scope/pkg`) carries a leading `@` that is not a
         // version separator, so only a second `@` means "already pinned".
         ("npx", Some(version)) if !identifier[1.min(identifier.len())..].contains('@') => {
@@ -456,6 +572,36 @@ fn registry_package_identifier(package: &RegistryPackage, runtime: &str) -> Opti
         }
         _ => Some(identifier.to_string()),
     }
+}
+
+/// The launcher a package is started with.
+fn registry_package_runtime(package: &RegistryPackage, registry_type: &str) -> String {
+    package
+        .runtime_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match registry_type {
+            "pypi" => "uvx".to_string(),
+            _ => "npx".to_string(),
+        })
+}
+
+/// Launcher arguments for one package.
+///
+/// The specifier goes directly after the launcher — `npx -y pkg`, `uvx pkg` —
+/// and the arguments the registry published follow it. `-y` is npx's own flag
+/// for skipping its install prompt; `uvx` has no equivalent, and handing it one
+/// would make the launcher reject the command outright.
+fn registry_package_args(package: &RegistryPackage, runtime: &str, specifier: &str) -> Vec<String> {
+    let mut args = registry_arg_values(package.runtime_arguments.as_ref());
+    if runtime == "npx" {
+        args.push("-y".to_string());
+    }
+    args.push(specifier.to_string());
+    args.extend(registry_arg_values(package.package_arguments.as_ref()));
+    args
 }
 
 fn registry_env_requirements(package: &RegistryPackage) -> Vec<MarketEnvRequirement> {
@@ -478,9 +624,12 @@ fn registry_env_requirements(package: &RegistryPackage) -> Vec<MarketEnvRequirem
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
                 required: variable.is_required.unwrap_or(false),
-                // A registry does not label secrets; the install form masks
-                // anything whose name reads like a credential.
-                secret: env_name_looks_secret(name),
+                // The registry labels credentials itself. Where it does, that
+                // label wins; the name heuristic only covers older records
+                // that predate the field.
+                secret: variable
+                    .is_secret
+                    .unwrap_or_else(|| env_name_looks_secret(name)),
                 default_value: variable
                     .value
                     .as_deref()
@@ -494,54 +643,62 @@ fn registry_env_requirements(package: &RegistryPackage) -> Vec<MarketEnvRequirem
         .collect()
 }
 
-fn registry_server_to_entry(server: &RegistryServer) -> Option<McpMarketEntry> {
-    let display = server
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(server.name.as_str())
-        .to_string();
-    let homepage = server
-        .homepage
-        .clone()
-        .or_else(|| server.website_url.clone());
+/// Package registries whose published form this product can actually start, in
+/// the order it prefers them.
+///
+/// The registry also publishes `oci` and `mcpb` packages. There is no container
+/// runner behind the market, so an entry built from one would install a command
+/// that cannot start — an oci-first record used to become `npx <image>`, which
+/// fails at launch. Those records fall through to their remote form, or are
+/// dropped when they have none.
+const MCP_PACKAGE_REGISTRIES: [&str; 2] = ["npm", "pypi"];
 
-    // Prefer a stdio package: it is the form every agent can host.
-    if let Some(package) = server.packages.first() {
-        let runtime = package
-            .runtime_hint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| match package.registry_type.as_deref() {
-                Some("pypi") => "uvx".to_string(),
-                _ => "npx".to_string(),
-            });
-        let identifier = registry_package_identifier(package, &runtime)?;
-        let mut args = registry_arg_values(package.runtime_arguments.as_ref());
-        args.push("-y".to_string());
-        args.extend(registry_arg_values(package.package_arguments.as_ref()));
-        args.push(identifier);
-        return Some(McpMarketEntry {
-            id: registry_entry_id(&server.name),
-            name: display,
-            description: server.description.clone(),
-            homepage,
-            transport: McpServerTransportKind::Stdio,
-            command: Some(runtime),
-            args,
-            url: None,
+/// The runnable form one registry record resolves to.
+enum RegistryLaunchForm {
+    Stdio {
+        runtime: String,
+        args: Vec<String>,
+        env: Vec<MarketEnvRequirement>,
+        version: Option<String>,
+        kind: &'static str,
+    },
+    Remote {
+        url: String,
+    },
+}
+
+/// Pick the form an install would actually start.
+///
+/// npm wins over pypi over a remote: the first two are the stdio forms every
+/// Agent can host. A record with neither a runnable package nor a public
+/// streamable-http remote resolves to `None`, because the market must never
+/// list something it cannot start.
+fn registry_launch_form(server: &RegistryServer) -> Option<RegistryLaunchForm> {
+    for registry_type in MCP_PACKAGE_REGISTRIES {
+        let Some(package) = server.packages.iter().find(|package| {
+            package.registry_type.as_deref() == Some(registry_type)
+                && package
+                    .identifier
+                    .as_deref()
+                    .is_some_and(|identifier| !identifier.trim().is_empty())
+        }) else {
+            continue;
+        };
+        let runtime = registry_package_runtime(package, registry_type);
+        let Some(specifier) = registry_package_identifier(package, &runtime) else {
+            continue;
+        };
+        return Some(RegistryLaunchForm::Stdio {
+            args: registry_package_args(package, &runtime, &specifier),
             env: registry_env_requirements(package),
-            verified: true,
             version: package.version.clone(),
-            author: server.name.split('/').next().map(str::to_string),
+            runtime,
+            kind: registry_type,
         });
     }
 
-    // Otherwise fall back to a remote, and only to the streamable-http form:
-    // an install must not resolve to a transport the product cannot start.
+    // Only the streamable-http remote is installable: an install must not
+    // resolve to a transport the product cannot start.
     let remote = server.remotes.iter().find(|remote| {
         remote.remote_type.as_deref() == Some("streamable-http")
             && remote
@@ -549,46 +706,415 @@ fn registry_server_to_entry(server: &RegistryServer) -> Option<McpMarketEntry> {
                 .as_deref()
                 .is_some_and(|url| market_url_policy(url).is_ok())
     })?;
-    Some(McpMarketEntry {
-        id: registry_entry_id(&server.name),
-        name: display,
-        description: server.description.clone(),
-        homepage,
-        transport: McpServerTransportKind::Http,
-        command: None,
-        args: Vec::new(),
-        url: remote.url.clone(),
-        env: Vec::new(),
-        verified: true,
-        version: None,
-        author: server.name.split('/').next().map(str::to_string),
+    Some(RegistryLaunchForm::Remote {
+        url: remote.url.clone()?,
     })
 }
 
-fn search_mcp_registry(
-    client: &reqwest::blocking::Client,
-    query: Option<&str>,
-    limit: u32,
-) -> VibexResult<(Vec<McpMarketEntry>, bool)> {
-    let mut url = format!("{MCP_REGISTRY_BASE}/v0.1/servers?version=latest&limit={limit}");
-    if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
-        url.push_str("&search=");
-        url.push_str(&urlencode(query));
+fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEntry> {
+    let server = record.server.as_ref()?;
+    if server.name.trim().is_empty() {
+        return None;
     }
-    let response: RegistryListResponse = fetch_market_json(client, &url)?;
-    let has_more = response
-        .metadata
+    let form = registry_launch_form(server)?;
+    let official = record.meta.as_ref().and_then(|meta| meta.official.as_ref());
+
+    let display = server
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(server.name.as_str())
+        .to_string();
+    let text = |value: Option<&String>| {
+        value
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let repository = server
+        .repository
         .as_ref()
-        .and_then(|metadata| metadata.next_cursor.as_deref())
-        .is_some_and(|cursor| !cursor.is_empty());
-    let entries = response
-        .servers
-        .iter()
-        .filter_map(|record| record.server.as_ref())
-        .filter_map(registry_server_to_entry)
-        .take(MAX_ENTRIES_PER_SEARCH)
-        .collect();
-    Ok((entries, has_more))
+        .and_then(RegistryRepository::url)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let homepage = text(server.homepage.as_ref())
+        .or_else(|| text(server.website_url.as_ref()))
+        .or_else(|| repository.clone());
+
+    let (transport, command, args, url, env, version, package_kind) = match form {
+        RegistryLaunchForm::Stdio {
+            runtime,
+            args,
+            env,
+            version,
+            kind,
+        } => (
+            McpServerTransportKind::Stdio,
+            Some(runtime),
+            args,
+            None,
+            env,
+            version,
+            Some(kind.to_string()),
+        ),
+        RegistryLaunchForm::Remote { url } => (
+            McpServerTransportKind::Http,
+            None,
+            Vec::new(),
+            Some(url),
+            Vec::new(),
+            None,
+            Some("remote".to_string()),
+        ),
+    };
+
+    Some(McpMarketEntry {
+        id: registry_entry_id(&server.name),
+        name: display,
+        description: text(server.description.as_ref()),
+        homepage,
+        repository,
+        author: server.name.split('/').next().map(str::to_string),
+        status: official.and_then(|meta| text(meta.status.as_ref())),
+        updated_at: official.and_then(|meta| text(meta.updated_at.as_ref())),
+        transport,
+        command,
+        args,
+        url,
+        env,
+        verified: true,
+        version,
+        package_kind,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// MCP registry index
+// ---------------------------------------------------------------------------
+
+/// The registry as this process has walked it so far.
+///
+/// The cache is process-wide rather than per-service because there is exactly
+/// one authoritative runtime per process, and the catalog it walks is the same
+/// one every caller — local window or paired device — is asking about.
+#[derive(Default)]
+struct McpCatalogIndex {
+    entries: Vec<McpMarketEntry>,
+    /// Ids already held, so a record the registry lists twice is stored once.
+    ids: HashSet<String>,
+    /// Cursor for the next page, absent once the registry is exhausted.
+    cursor: Option<String>,
+    exhausted: bool,
+    /// True while the background walker is running.
+    filling: bool,
+    /// Last time a caller asked for the market, which is what keeps the
+    /// walker alive.
+    used_at: Option<Instant>,
+    /// When the first page landed, which is what staleness is measured from.
+    fetched_at: Option<Instant>,
+    /// The last page failure, reported when a request finds nothing to answer
+    /// with. Kept here rather than returned immediately because the walker
+    /// runs on its own thread and has no caller to return to.
+    error: Option<VibexError>,
+}
+
+static MCP_CATALOG: LazyLock<Mutex<McpCatalogIndex>> =
+    LazyLock::new(|| Mutex::new(McpCatalogIndex::default()));
+
+/// Lock the index, ignoring poisoning.
+///
+/// A panic in the walker must not turn the market into a permanently dead
+/// feature: the worst a poisoned lock can mean here is that a half-written
+/// page is visible, and the next walk repairs that.
+fn mcp_catalog_lock() -> std::sync::MutexGuard<'static, McpCatalogIndex> {
+    MCP_CATALOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn mcp_registry_page_url(cursor: Option<&str>) -> String {
+    let mut url =
+        format!("{MCP_REGISTRY_BASE}/v0.1/servers?version=latest&limit={MCP_REGISTRY_PAGE_SIZE}");
+    if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
+        url.push_str("&cursor=");
+        url.push_str(&urlencode(cursor));
+    }
+    url
+}
+
+/// Walk one registry page into the index and report how many entries it added.
+///
+/// The registry's `version=latest` view is what the market installs from, so
+/// that is the view it indexes: a page of it is one request, and the response's
+/// own cursor is the only way forward.
+fn mcp_catalog_fetch_page(client: &reqwest::blocking::Client) -> VibexResult<usize> {
+    let cursor = mcp_catalog_lock().cursor.clone();
+    let response: RegistryListResponse =
+        fetch_market_json(client, &mcp_registry_page_url(cursor.as_deref()))?;
+
+    let mut index = mcp_catalog_lock();
+    let mut added = 0usize;
+    for record in &response.servers {
+        if index.entries.len() >= MCP_CATALOG_MAX_ENTRIES {
+            break;
+        }
+        let Some(entry) = registry_server_to_entry(record) else {
+            continue;
+        };
+        if !index.ids.insert(entry.id.clone()) {
+            continue;
+        }
+        index.entries.push(entry);
+        added += 1;
+    }
+
+    let next = response
+        .metadata
+        .and_then(|metadata| metadata.next_cursor)
+        .filter(|cursor| !cursor.is_empty());
+    match next {
+        // A cursor that does not move would loop the walker forever on the same
+        // page, so a repeated cursor is treated as the end of the catalog.
+        Some(next)
+            if Some(&next) != cursor.as_ref() && index.entries.len() < MCP_CATALOG_MAX_ENTRIES =>
+        {
+            index.cursor = Some(next);
+        }
+        _ => index.exhausted = true,
+    }
+    index.fetched_at.get_or_insert_with(Instant::now);
+    index.error = None;
+    Ok(added)
+}
+
+/// Walk pages until one lands, retrying a page the registry drops.
+///
+/// A single slow page used to be indistinguishable from an outage. The walker
+/// is not on anyone's critical path, so it can afford a second attempt.
+fn mcp_catalog_fetch_page_with_retry(client: &reqwest::blocking::Client) -> VibexResult<usize> {
+    let mut last = None;
+    for _ in 0..MCP_PAGE_ATTEMPTS {
+        match mcp_catalog_fetch_page(client) {
+            Ok(added) => return Ok(added),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        VibexError::provider("market_unreachable", "the registry could not be reached")
+    }))
+}
+
+/// Start the background walker unless it is already running or has finished.
+///
+/// The registry answers one cursor page at a time and the catalog holds
+/// thousands of entries, so indexing continues in the background while the
+/// market is in use. Every call refreshes the activity stamp; the walker stops
+/// on its own once the registry is exhausted, the entry cap is reached, or the
+/// market has been closed long enough that continuing would be work nobody
+/// asked for.
+fn mcp_catalog_ensure_walker() {
+    {
+        let mut index = mcp_catalog_lock();
+        index.used_at = Some(Instant::now());
+        if index.filling || index.exhausted || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES {
+            return;
+        }
+        index.filling = true;
+    }
+
+    let spawned = std::thread::Builder::new()
+        .name("mcp-catalog".to_string())
+        .spawn(|| {
+            let client = match market_http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let mut index = mcp_catalog_lock();
+                    index.error = Some(error);
+                    index.filling = false;
+                    return;
+                }
+            };
+            loop {
+                {
+                    let index = mcp_catalog_lock();
+                    if index.exhausted
+                        || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES
+                        || index
+                            .used_at
+                            .is_some_and(|at| at.elapsed() > MCP_CATALOG_IDLE)
+                    {
+                        break;
+                    }
+                }
+                if let Err(error) = mcp_catalog_fetch_page_with_retry(&client) {
+                    mcp_catalog_lock().error = Some(error);
+                    break;
+                }
+                std::thread::sleep(MCP_CATALOG_FILL_PAUSE);
+            }
+            mcp_catalog_lock().filling = false;
+        });
+
+    if spawned.is_err() {
+        mcp_catalog_lock().filling = false;
+    }
+}
+
+/// Drop a catalog that has gone stale, so the next request re-walks it.
+fn mcp_catalog_expire_if_stale() {
+    let mut index = mcp_catalog_lock();
+    let stale = index
+        .fetched_at
+        .is_some_and(|at| at.elapsed() > MCP_CATALOG_TTL);
+    if stale {
+        index.entries.clear();
+        index.ids.clear();
+        index.cursor = None;
+        index.exhausted = false;
+        index.fetched_at = None;
+    }
+}
+
+/// What one request needs to know about the index.
+struct McpCatalogWindow {
+    /// The matching entries the caller asked for, already cut to its limit.
+    entries: Vec<McpMarketEntry>,
+    /// How many indexed entries matched, before the limit.
+    total_matches: usize,
+    /// How many entries the index holds in total.
+    catalog_size: usize,
+    exhausted: bool,
+    error: Option<VibexError>,
+}
+
+/// Wait for the index to satisfy `ready`, then cut the window the caller asked
+/// for while still holding the lock.
+///
+/// Polling rather than a condition variable: a page takes seconds, so the
+/// poll's own cost is noise, and this keeps the walker free to update the index
+/// without any handshake to get wrong.
+fn mcp_catalog_wait_for_window(
+    deadline: Instant,
+    query: &str,
+    limit: usize,
+    mut ready: impl FnMut(&McpCatalogIndex) -> bool,
+) -> McpCatalogWindow {
+    loop {
+        {
+            let index = mcp_catalog_lock();
+            if ready(&index) || Instant::now() >= deadline {
+                let total_matches = index
+                    .entries
+                    .iter()
+                    .filter(|entry| mcp_entry_matches(entry, query))
+                    .count();
+                let entries = index
+                    .entries
+                    .iter()
+                    .filter(|entry| mcp_entry_matches(entry, query))
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                return McpCatalogWindow {
+                    entries,
+                    total_matches,
+                    catalog_size: index.entries.len(),
+                    exhausted: index.exhausted,
+                    error: index.error.clone(),
+                };
+            }
+        }
+        std::thread::sleep(MCP_CATALOG_POLL);
+    }
+}
+
+/// Whether one entry matches a lowercased query.
+///
+/// The registry's own search matches names only, which is why a query for what
+/// a server does — "database", "screenshot" — finds nothing there. Matching the
+/// description and publisher too is what makes the market's search worth using.
+fn mcp_entry_matches(entry: &McpMarketEntry, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystacks = [
+        Some(entry.name.as_str()),
+        entry.description.as_deref(),
+        entry.author.as_deref(),
+        entry.version.as_deref(),
+        entry.package_kind.as_deref(),
+    ];
+    haystacks
+        .into_iter()
+        .flatten()
+        .any(|text| text.to_lowercase().contains(query))
+}
+
+/// Answer one market request from the index, walking further when asked to.
+fn search_mcp_catalog(request: &McpMarketSearchRequest) -> VibexResult<McpMarketSearchResponse> {
+    let query = request
+        .query
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_lowercase();
+    let query = query
+        .chars()
+        .take(MCP_CATALOG_MAX_QUERY_CHARS)
+        .collect::<String>();
+    let limit = request
+        .limit
+        .unwrap_or(MCP_REGISTRY_PAGE_SIZE)
+        .clamp(1, MAX_ENTRIES_PER_SEARCH as u32) as usize;
+    let extend = request.extend.unwrap_or(false);
+
+    // A caller that did not ask to extend only needs the index to hold
+    // something worth showing, so a cold start waits for one page and an
+    // already-warm index answers at once. A caller that did ask to extend —
+    // someone who pressed Search — waits for the window it asked for.
+    let wanted = if extend {
+        limit
+    } else {
+        (MCP_REGISTRY_PAGE_SIZE as usize).min(limit)
+    };
+
+    mcp_catalog_expire_if_stale();
+    // The walker is what fills the index, so it has to be running before there
+    // is anything to wait for.
+    mcp_catalog_ensure_walker();
+
+    let deadline = Instant::now() + MCP_CATALOG_WAIT;
+    let window = mcp_catalog_wait_for_window(deadline, &query, limit, |index| {
+        index.exhausted
+            || index.entries.len() >= wanted
+            || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES
+    });
+
+    // An index that holds nothing and recorded a failure is an outage, not a
+    // search that found nothing. Reporting the difference is the whole reason
+    // the walker keeps the error instead of dropping it.
+    if window.catalog_size == 0
+        && let Some(error) = window.error
+    {
+        return Err(error);
+    }
+
+    // A search that ran out of indexed entries has not finished searching, so
+    // it keeps the walker going rather than reporting an answer it knows is
+    // incomplete.
+    if !window.exhausted && (query.is_empty() || window.total_matches < limit) {
+        mcp_catalog_ensure_walker();
+    }
+
+    Ok(McpMarketSearchResponse {
+        entries: window.entries,
+        has_more: !window.exhausted,
+        catalog_size: window.catalog_size,
+        catalog_exhausted: window.exhausted,
+        total_matches: window.total_matches,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -848,14 +1374,18 @@ fn render_skill_document(name: &str, description: Option<&str>, body: &str) -> S
 // ---------------------------------------------------------------------------
 
 impl ProviderConfigService {
+    /// Answer one market query from the registry index.
+    ///
+    /// The index is walked in the background instead of queried upstream: the
+    /// registry's own `search` takes tens of seconds, which no interactive
+    /// view can wait for. This returns as soon as the index holds enough to
+    /// answer, and reports how much of the registry it covered when it could
+    /// not answer in full.
     pub fn search_mcp_market(
         &self,
         request: McpMarketSearchRequest,
     ) -> VibexResult<McpMarketSearchResponse> {
-        let client = market_http_client()?;
-        let limit = request.limit.unwrap_or(30).clamp(1, 100);
-        let (entries, has_more) = search_mcp_registry(&client, request.query.as_deref(), limit)?;
-        Ok(McpMarketSearchResponse { entries, has_more })
+        search_mcp_catalog(&request)
     }
 
     pub fn search_skill_market(
@@ -903,12 +1433,13 @@ impl ProviderConfigService {
 /// Whether an agent can host this transport.
 ///
 /// Codex and DeepSeek read MCP descriptors but reject SSE, so a market install
-/// must not claim to have enabled a server the agent cannot start.
+/// must not claim to have enabled a server the agent cannot start. The DeepSeek
+/// Agent's id is `deepseek-harness`; matching a bare `deepseek` never fired.
 fn agent_can_host_transport(agent_id: &AgentId, transport: McpServerTransportKind) -> bool {
     if transport != McpServerTransportKind::Sse {
         return true;
     }
-    !matches!(agent_id.as_str(), "codex" | "deepseek")
+    !matches!(agent_id.as_str(), "codex" | "deepseek-harness")
 }
 
 impl ProviderConfigService {
@@ -984,6 +1515,7 @@ impl ProviderConfigService {
                 "the installed MCP server could not be read back",
             )
         })?;
+
         if !skipped.is_empty() {
             diagnostics.push(diagnostic(
                 "marketInstallTransportSkipped",
@@ -1186,6 +1718,424 @@ mod tests {
         assert_eq!(registry_entry_id("com.pulsemcp/foo"), "com-pulsemcp-foo");
         assert_eq!(registry_entry_id("///"), "mcp-server");
         assert!(registry_entry_id(&"a/".repeat(200)).len() <= 60);
+    }
+
+    fn registry_package_of(
+        registry_type: &str,
+        identifier: &str,
+        version: &str,
+    ) -> RegistryPackage {
+        RegistryPackage {
+            registry_type: Some(registry_type.to_string()),
+            identifier: Some(identifier.to_string()),
+            version: Some(version.to_string()),
+            runtime_hint: None,
+            runtime_arguments: None,
+            package_arguments: None,
+            environment_variables: None,
+        }
+    }
+
+    fn registry_record(name: &str, packages: Vec<RegistryPackage>) -> RegistryServerRecord {
+        RegistryServerRecord {
+            server: Some(RegistryServer {
+                name: name.to_string(),
+                title: None,
+                description: None,
+                homepage: None,
+                website_url: None,
+                repository: None,
+                packages,
+                remotes: Vec::new(),
+            }),
+            meta: None,
+        }
+    }
+
+    /// The registry lists packages in publisher order, and that order is not a
+    /// statement about which one this product can run: an oci-first record used
+    /// to install `npx <image>`, a command that cannot start.
+    #[test]
+    fn registry_launch_form_prefers_a_runnable_package() {
+        let entry = registry_server_to_entry(&registry_record(
+            "io.example/docker-first",
+            vec![
+                registry_package_of("oci", "docker.io/example/server:1.0.0", "1.0.0"),
+                registry_package_of("npm", "example-server", "1.2.3"),
+            ],
+        ))
+        .expect("an npm package is installable");
+        assert_eq!(entry.command.as_deref(), Some("npx"));
+        assert_eq!(entry.package_kind.as_deref(), Some("npm"));
+        assert_eq!(
+            entry.args.last().map(String::as_str),
+            Some("example-server@1.2.3")
+        );
+        assert!(
+            !entry.args.iter().any(|arg| arg.contains("docker.io")),
+            "the container image must not reach the launcher: {:?}",
+            entry.args
+        );
+
+        // pypi is the second preference, ahead of any remote.
+        let entry = registry_server_to_entry(&registry_record(
+            "io.example/pypi",
+            vec![registry_package_of("pypi", "example-mcp", "2.0.0")],
+        ))
+        .expect("a pypi package is installable");
+        assert_eq!(entry.command.as_deref(), Some("uvx"));
+        assert_eq!(entry.package_kind.as_deref(), Some("pypi"));
+
+        // A record with only a container package and no remote is not
+        // installable, so it must not be listed at all.
+        assert!(
+            registry_server_to_entry(&registry_record(
+                "io.example/oci-only",
+                vec![registry_package_of(
+                    "oci",
+                    "docker.io/example/only:1.0.0",
+                    "1.0.0"
+                )],
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn registry_launcher_arguments_keep_flags_and_npx_only_switches() {
+        let mut npm = registry_package_of("npm", "example-server", "1.2.3");
+        npm.runtime_arguments = Some(vec![RegistryArgument {
+            argument_type: Some("named".to_string()),
+            name: Some("--registry".to_string()),
+            value: Some("https://registry.example".to_string()),
+        }]);
+        npm.package_arguments = Some(vec![
+            RegistryArgument {
+                argument_type: Some("named".to_string()),
+                name: Some("--port".to_string()),
+                value: Some("8080".to_string()),
+            },
+            // A flag with no value keeps its name and adds nothing else.
+            RegistryArgument {
+                argument_type: Some("named".to_string()),
+                name: Some("--verbose".to_string()),
+                value: None,
+            },
+        ]);
+        let entry = registry_server_to_entry(&registry_record("io.example/npm", vec![npm]))
+            .expect("the npm package is installable");
+        assert_eq!(
+            entry.args,
+            vec![
+                "--registry",
+                "https://registry.example",
+                "-y",
+                "example-server@1.2.3",
+                "--port",
+                "8080",
+                "--verbose",
+            ]
+        );
+
+        // `-y` is npx's own flag. uvx has no equivalent, so handing it one
+        // would make the launcher reject the command.
+        let entry = registry_server_to_entry(&registry_record(
+            "io.example/pypi",
+            vec![registry_package_of("pypi", "example-mcp", "2.0.0")],
+        ))
+        .expect("the pypi package is installable");
+        assert_eq!(entry.args, vec!["example-mcp==2.0.0"]);
+    }
+
+    /// The registry labels credentials itself; the name heuristic only covers
+    /// records that predate the label.
+    #[test]
+    fn registry_env_secrets_follow_the_published_label() {
+        let mut package = registry_package_of("npm", "example-server", "1.0.0");
+        package.environment_variables = Some(vec![
+            RegistryEnvVar {
+                name: Some("REGION".to_string()),
+                description: None,
+                is_required: Some(true),
+                is_secret: Some(true),
+                value: None,
+                default: None,
+            },
+            RegistryEnvVar {
+                name: Some("PUBLIC_LABEL".to_string()),
+                description: None,
+                is_required: Some(false),
+                is_secret: Some(false),
+                value: None,
+                default: None,
+            },
+            RegistryEnvVar {
+                name: Some("API_KEY".to_string()),
+                description: None,
+                is_required: None,
+                is_secret: None,
+                value: None,
+                default: None,
+            },
+        ]);
+        let requirements = registry_env_requirements(&package);
+        let secret = |name: &str| {
+            requirements
+                .iter()
+                .find(|requirement| requirement.name == name)
+                .expect("the variable is declared")
+                .secret
+        };
+        // An explicit `isSecret` wins in both directions.
+        assert!(secret("REGION"));
+        assert!(!secret("PUBLIC_LABEL"));
+        // Without one, a credential-shaped name is still masked.
+        assert!(secret("API_KEY"));
+    }
+
+    #[test]
+    fn registry_entries_carry_repository_status_and_package_kind() {
+        let mut record = registry_record(
+            "io.github.example/airtable",
+            vec![registry_package_of("npm", "airtable-mcp-server", "1.14.0")],
+        );
+        record.server.as_mut().expect("server").repository =
+            Some(RegistryRepository::Detail(RegistryRepositoryDetail {
+                url: Some("https://github.com/example/airtable-mcp-server.git".to_string()),
+            }));
+        record.meta = Some(RegistryRecordMeta {
+            official: Some(RegistryOfficialMeta {
+                status: Some("deprecated".to_string()),
+                updated_at: Some("2026-07-27T15:34:57Z".to_string()),
+            }),
+        });
+
+        let entry = registry_server_to_entry(&record).expect("the record is installable");
+        assert_eq!(
+            entry.repository.as_deref(),
+            Some("https://github.com/example/airtable-mcp-server.git")
+        );
+        // A record with no homepage or website falls back to its repository,
+        // so the UI always has something to link to.
+        assert_eq!(entry.homepage, entry.repository);
+        assert_eq!(entry.author.as_deref(), Some("io.github.example"));
+        assert_eq!(entry.status.as_deref(), Some("deprecated"));
+        assert_eq!(entry.updated_at.as_deref(), Some("2026-07-27T15:34:57Z"));
+    }
+
+    /// The registry's own search matches names only, so a query for what a
+    /// server does finds nothing there. The market's search has to look wider.
+    #[test]
+    fn market_search_matches_more_than_the_name() {
+        let entry = McpMarketEntry {
+            id: "io.example/browser".to_string(),
+            name: "Browser Tool".to_string(),
+            description: Some("Capture a screenshot of any page".to_string()),
+            homepage: None,
+            repository: None,
+            author: Some("io.example".to_string()),
+            status: None,
+            updated_at: None,
+            transport: McpServerTransportKind::Http,
+            command: None,
+            args: Vec::new(),
+            url: Some("https://example.com/mcp".to_string()),
+            env: Vec::new(),
+            verified: true,
+            version: Some("1.0.0".to_string()),
+            package_kind: Some("remote".to_string()),
+        };
+        assert!(mcp_entry_matches(&entry, ""));
+        assert!(mcp_entry_matches(&entry, "browser"));
+        assert!(mcp_entry_matches(&entry, "screenshot"));
+        assert!(mcp_entry_matches(&entry, "io.example"));
+        assert!(!mcp_entry_matches(&entry, "database"));
+    }
+
+    #[test]
+    fn registry_page_url_walks_the_cursor_and_encodes_it() {
+        assert_eq!(
+            mcp_registry_page_url(None),
+            "https://registry.modelcontextprotocol.io/v0.1/servers?version=latest&limit=100"
+        );
+        // A cursor is `name:version`, and the slash in a name has to survive
+        // the round trip.
+        let url = mcp_registry_page_url(Some("ai.example/server:1.0.0"));
+        assert!(
+            url.ends_with("&cursor=ai.example%2Fserver%3A1.0.0"),
+            "{url}"
+        );
+        assert!(!mcp_registry_page_url(Some("")).contains("cursor"));
+    }
+
+    /// A real page of the registry, captured from the live API.
+    ///
+    /// The record carries fields this adapter deliberately ignores (`icons`,
+    /// each package's own `transport`), so it also pins that unknown fields
+    /// stay harmless. It is the shape a page actually has, not the shape the
+    /// schema suggests it might have.
+    const REGISTRY_FIXTURE: &str = r#"{
+      "servers": [
+        {
+          "server": {
+            "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+            "name": "io.github.domdomegg/airtable-mcp-server",
+            "description": "Read and write access to Airtable database schemas, tables, and records.",
+            "title": "Airtable",
+            "repository": {"url": "https://github.com/domdomegg/airtable-mcp-server.git", "source": "github"},
+            "version": "1.14.0",
+            "websiteUrl": "https://github.com/domdomegg/airtable-mcp-server#readme",
+            "icons": [{"src": "https://example.com/icon.png", "mimeType": "image/png"}],
+            "packages": [
+              {
+                "registryType": "npm",
+                "identifier": "airtable-mcp-server",
+                "version": "1.14.0",
+                "runtimeHint": "npx",
+                "transport": {"type": "stdio"},
+                "environmentVariables": [
+                  {
+                    "description": "Airtable personal access token.",
+                    "isRequired": true,
+                    "isSecret": true,
+                    "name": "AIRTABLE_API_KEY"
+                  }
+                ]
+              },
+              {
+                "registryType": "oci",
+                "identifier": "docker.io/domdomegg/airtable-mcp-server:1.14.0",
+                "transport": {"type": "stdio"}
+              }
+            ]
+          },
+          "_meta": {
+            "io.modelcontextprotocol.registry/official": {
+              "status": "active",
+              "updatedAt": "2026-07-27T15:34:57.496953Z",
+              "isLatest": true
+            }
+          }
+        },
+        {
+          "server": {
+            "name": "ac.tandem/docs-mcp",
+            "description": "Remote MCP server for Tandem docs.",
+            "repository": {"url": "https://github.com/frumu-ai/tandem", "source": "github"},
+            "version": "0.3.2",
+            "websiteUrl": "https://tandem.ac/docs-mcp",
+            "remotes": [{"type": "streamable-http", "url": "https://tandem.ac/mcp"}]
+          },
+          "_meta": {
+            "io.modelcontextprotocol.registry/official": {
+              "status": "active",
+              "updatedAt": "2026-04-22T21:06:34.500049Z"
+            }
+          }
+        }
+      ],
+      "metadata": {"nextCursor": "ac.tandem/docs-mcp:0.3.2", "count": 2}
+    }"#;
+
+    #[test]
+    fn real_registry_page_maps_to_installable_entries() {
+        let page: RegistryListResponse =
+            serde_json::from_str(REGISTRY_FIXTURE).expect("the captured page parses");
+        assert_eq!(page.servers.len(), 2);
+        assert_eq!(
+            page.metadata
+                .and_then(|metadata| metadata.next_cursor)
+                .as_deref(),
+            Some("ac.tandem/docs-mcp:0.3.2")
+        );
+
+        let npm = registry_server_to_entry(&page.servers[0]).expect("npm record is installable");
+        assert_eq!(npm.name, "Airtable");
+        assert_eq!(npm.command.as_deref(), Some("npx"));
+        // The npm package wins over the oci one that follows it.
+        assert_eq!(npm.args, vec!["-y", "airtable-mcp-server@1.14.0"]);
+        assert_eq!(npm.package_kind.as_deref(), Some("npm"));
+        assert_eq!(npm.version.as_deref(), Some("1.14.0"));
+        // `isSecret` is published, so the install form masks the token without
+        // having to guess from the name.
+        assert_eq!(npm.env.len(), 1);
+        assert!(npm.env[0].secret && npm.env[0].required);
+        assert_eq!(npm.env[0].name, "AIRTABLE_API_KEY");
+
+        let remote = registry_server_to_entry(&page.servers[1]).expect("remote is installable");
+        assert_eq!(remote.transport, McpServerTransportKind::Http);
+        assert_eq!(remote.url.as_deref(), Some("https://tandem.ac/mcp"));
+        assert_eq!(remote.package_kind.as_deref(), Some("remote"));
+        // The website wins over the repository, which is only the fallback.
+        assert_eq!(
+            remote.homepage.as_deref(),
+            Some("https://tandem.ac/docs-mcp")
+        );
+        assert_eq!(
+            remote.repository.as_deref(),
+            Some("https://github.com/frumu-ai/tandem")
+        );
+    }
+
+    /// Walks the real registry. Ignored by default because it needs the
+    /// network; run it with `cargo test -p vibex-config-switch -- --ignored`
+    /// when the registry's shape or latency is in question.
+    ///
+    /// This is the check that the market answers at all: the registry's own
+    /// `search` parameter used to be the only way to search, and it takes tens
+    /// of seconds, so the thing worth proving is that a page lands quickly and
+    /// that a query is answered from what landed.
+    #[test]
+    #[ignore = "hits the live MCP registry"]
+    fn live_registry_index_fills_and_searches() {
+        let started = Instant::now();
+        let browse = search_mcp_catalog(&McpMarketSearchRequest {
+            query: None,
+            limit: Some(100),
+            offset: None,
+            extend: Some(true),
+        })
+        .expect("the live registry answers a browse");
+        let elapsed = started.elapsed();
+        assert!(
+            browse.entries.len() >= 100,
+            "a browse window should hold a full page, got {}",
+            browse.entries.len()
+        );
+        assert!(browse.catalog_size >= browse.entries.len());
+        assert!(
+            elapsed < MCP_CATALOG_WAIT + MARKET_REQUEST_TIMEOUT,
+            "a browse should answer inside one wait, took {elapsed:?}"
+        );
+
+        // Searching for something the index actually holds must find it. A
+        // term from deeper in the catalog may legitimately miss: the index is
+        // filled one page at a time, so a cold search only covers what has
+        // landed so far.
+        let needle = browse.entries[0].name.to_lowercase();
+        let needle = needle
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let search = search_mcp_catalog(&McpMarketSearchRequest {
+            query: Some(needle.clone()),
+            limit: Some(50),
+            offset: None,
+            extend: Some(true),
+        })
+        .expect("the live registry answers a search");
+        assert!(
+            search.total_matches >= 1,
+            "searching {needle:?} found nothing among {} indexed entries",
+            search.catalog_size
+        );
+        assert!(
+            search
+                .entries
+                .iter()
+                .any(|entry| mcp_entry_matches(entry, &needle))
+        );
     }
 
     #[test]

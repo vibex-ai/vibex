@@ -66,6 +66,21 @@ pub struct McpMarketEntry {
     pub version: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    /// Source repository the publisher named, when it named one.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Which published form the launcher was built from: `npm`, `pypi`, or
+    /// `remote`. The registry also publishes `oci` and `mcpb` packages, but the
+    /// product cannot start those, so an entry is only ever built from a form
+    /// the Agent can actually run.
+    #[serde(default)]
+    pub package_kind: Option<String>,
+    /// Registry lifecycle status: `active`, `deprecated`, or `deleted`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// RFC3339 timestamp of the registry's last update to this version.
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// One installable Skill as the public index lists it.
@@ -115,14 +130,34 @@ pub struct McpMarketSearchRequest {
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+    /// Ask the runtime to walk further into the registry before answering.
+    ///
+    /// The registry is browsed one cursor page at a time and the pages are
+    /// cached, so a browse view can answer from what is already indexed. A
+    /// search — and a caller that pressed "load more" — sets this so the
+    /// request waits for the cache to grow instead of answering from a window
+    /// that is known to be too small.
+    #[serde(default)]
+    pub extend: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpMarketSearchResponse {
     pub entries: Vec<McpMarketEntry>,
-    /// True when the registry reported another page.
+    /// True when the registry reported another page beyond what is indexed.
     pub has_more: bool,
+    /// Registry entries the runtime currently holds, across every page it has
+    /// walked. Reported so the UI can say how much of the registry a search
+    /// actually covered instead of implying the list is the whole catalog.
+    #[serde(default)]
+    pub catalog_size: usize,
+    /// True once the runtime has walked the registry to its last page.
+    #[serde(default)]
+    pub catalog_exhausted: bool,
+    /// How many indexed entries matched the query, before the page limit.
+    #[serde(default)]
+    pub total_matches: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
