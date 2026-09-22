@@ -715,10 +715,21 @@ mod tests {
     }
 
     fn temp_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "vibex-git-{label}-{}",
-            vibex_core::RequestId::new().as_str()
-        ))
+        std::env::temp_dir().join(format!("vibex-git-{label}-{}", temp_suffix()))
+    }
+
+    /// A short, collision-resistant directory suffix.
+    ///
+    /// Git for Windows enforces the 260 character `MAX_PATH` budget, and a
+    /// linked worktree nests its state under
+    /// `.git/worktrees/<name>/...`. Spending 40 characters of that budget on a
+    /// full `request_<32 hex>` suffix leaves too little room for Git's own
+    /// files.
+    fn temp_suffix() -> String {
+        let request_id = vibex_core::RequestId::new();
+        let request_id = request_id.as_str().to_string();
+        let hex = request_id.rsplit('_').next().unwrap_or(&request_id);
+        hex.chars().take(12).collect()
     }
 
     fn init_repo_with_commit(root: &Path) {

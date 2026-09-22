@@ -2936,7 +2936,7 @@ mod tests {
     fn stage_unstage_revert_and_commit_in_temp_repo() {
         let root = temp_repo("ops");
         std::fs::create_dir_all(&root).unwrap();
-        run_raw(&root, &["init"]).unwrap();
+        init_test_repo(&root);
         run_raw(&root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
         run_raw(&root, &["config", "user.name", "Vibex Test"]).unwrap();
         std::fs::write(root.join("README.md"), "hello\n").unwrap();
@@ -2979,7 +2979,7 @@ mod tests {
     fn selected_file_commit_leaves_unchecked_staged_paths_staged() {
         let root = temp_repo("selected-commit");
         std::fs::create_dir_all(&root).unwrap();
-        run_raw(&root, &["init"]).unwrap();
+        init_test_repo(&root);
         run_raw(&root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
         run_raw(&root, &["config", "user.name", "Vibex Test"]).unwrap();
         std::fs::write(root.join("a.txt"), "a1\n").unwrap();
@@ -3410,7 +3410,7 @@ mod tests {
     fn history_filters_by_message_hash_and_authored_date() {
         let root = temp_repo("history-search-date");
         std::fs::create_dir_all(&root).unwrap();
-        run_raw(&root, &["init"]).unwrap();
+        init_test_repo(&root);
         run_raw(&root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
         run_raw(&root, &["config", "user.name", "Vibex Test"]).unwrap();
         commit_file_at(
@@ -4216,10 +4216,22 @@ mod tests {
     }
 
     fn temp_repo(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "vibex-git-{label}-{}",
-            vibex_core::RequestId::new().as_str()
-        ))
+        std::env::temp_dir().join(format!("vibex-git-{label}-{}", temp_suffix()))
+    }
+
+    /// A short, collision-resistant directory suffix.
+    ///
+    /// Git for Windows enforces the 260 character `MAX_PATH` budget, and nested
+    /// state such as
+    /// `.git/worktrees/<name>/rebase-merge/git-rebase-todo.backup` adds well
+    /// over a hundred characters on top of the worktree path. A full
+    /// `request_<32 hex>` suffix spends a quarter of that budget on nothing,
+    /// which pushed the rebase tests past the limit.
+    fn temp_suffix() -> String {
+        let request_id = vibex_core::RequestId::new();
+        let request_id = request_id.as_str().to_string();
+        let hex = request_id.rsplit('_').next().unwrap_or(&request_id);
+        hex.chars().take(12).collect()
     }
 
     fn prepare_conflict(
@@ -4229,7 +4241,7 @@ mod tests {
         target: Option<&[u8]>,
     ) -> (String, String, String, String) {
         std::fs::create_dir_all(root).unwrap();
-        run_raw(root, &["init"]).unwrap();
+        init_test_repo(root);
         run_raw(root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
         run_raw(root, &["config", "user.name", "Vibex Test"]).unwrap();
         std::fs::write(root.join("seed.txt"), b"seed\n").unwrap();
@@ -4265,6 +4277,18 @@ mod tests {
         run_raw(root, &["commit", "-m", "target"]).unwrap();
         let target_head = resolve_head(root).unwrap();
         (source_branch, source_head, target_branch, target_head)
+    }
+
+    /// Creates a test repository whose line endings do not depend on the
+    /// machine-level `core.autocrlf` setting.
+    ///
+    /// Git for Windows defaults `core.autocrlf` to `true` system-wide, which
+    /// makes every checkout of a text file produce CRLF. Tests here assert
+    /// exact file bytes, so they have to pin the conversion off rather than
+    /// inherit whatever the developer's machine happens to be configured with.
+    fn init_test_repo(root: &Path) {
+        run_raw(root, &["init"]).unwrap();
+        run_raw(root, &["config", "core.autocrlf", "false"]).unwrap();
     }
 
     fn run_raw(root: &Path, args: &[&str]) -> std::io::Result<()> {
@@ -4317,7 +4341,7 @@ mod tests {
     }
 
     fn init_repo_with_commit(root: &Path, file: &str, content: &str, message: &str) {
-        run_raw(root, &["init"]).unwrap();
+        init_test_repo(root);
         run_raw(root, &["config", "user.email", "vibex@example.invalid"]).unwrap();
         run_raw(root, &["config", "user.name", "Vibex Test"]).unwrap();
         std::fs::write(root.join(file), content).unwrap();
