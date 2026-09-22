@@ -34727,7 +34727,11 @@ impl VibexWorkbench {
                             .text_sm()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.48))
                             .when_some(collapsed_status, |this, status| {
-                                this.child(sidebar_aggregate_status_indicator(status, cx))
+                                this.child(sidebar_aggregate_status_indicator(
+                                    status,
+                                    auto_continue == Some(true),
+                                    cx,
+                                ))
                             })
                             .when(collapsed_status.is_none(), |this| {
                                 this.child(
@@ -34739,13 +34743,6 @@ impl VibexWorkbench {
                                     sidebar_icon("icons/vibex/pin.svg")
                                         .size(px(12.0))
                                         .text_color(cx.theme().warning),
-                                )
-                            })
-                            .when(auto_continue.is_some(), |this| {
-                                this.child(
-                                    sidebar_icon("icons/vibex/rotate-ccw.svg")
-                                        .size(px(12.0))
-                                        .text_color(cx.theme().sidebar_foreground.opacity(0.60)),
                                 )
                             }),
                     ),
@@ -36198,7 +36195,10 @@ impl VibexWorkbench {
             awaiting_user,
             turn_pending,
         );
-        let status_indicator = sidebar_aggregate_status_indicator(workspace_status, cx);
+        // A worktree row stands for sessions whose auto-continue preferences can
+        // disagree, so it never claims the green ring; only a group, which
+        // carries one flag for all of its members, can.
+        let status_indicator = sidebar_aggregate_status_indicator(workspace_status, false, cx);
         let workspace_menu_entity = cx.weak_entity();
         let workspace_menu_branch = branch.clone();
         let workspace_menu_project_id = project_for_folder.clone();
@@ -57263,11 +57263,25 @@ fn sidebar_workspace_status(
 /// A workspace row and a collapsed group row answer the same question — "what
 /// is the most actionable thing among my sessions" — so they draw it the same
 /// way.
-fn sidebar_aggregate_status_indicator(status: SidebarWorkspaceStatus, cx: &App) -> AnyElement {
+///
+/// `auto_continue_enabled` recolors only the running ring, the same way a
+/// session row's spinner turns green when that session continues on its own.
+/// The other states keep their own colors: the ring is the one mark that says
+/// "still working", so it is also the one mark that can say "and it will keep
+/// going by itself".
+fn sidebar_aggregate_status_indicator(
+    status: SidebarWorkspaceStatus,
+    auto_continue_enabled: bool,
+    cx: &App,
+) -> AnyElement {
     match status {
         SidebarWorkspaceStatus::Running => Spinner::new()
             .icon(Icon::new(IconName::LoaderCircle))
-            .color(cx.theme().primary)
+            .color(if auto_continue_enabled {
+                cx.theme().success
+            } else {
+                cx.theme().primary
+            })
             .xsmall()
             .into_any_element(),
         SidebarWorkspaceStatus::Error => sidebar_status_dot(cx.theme().danger),
@@ -80129,7 +80143,9 @@ mod tests {
             "SIDEBAR_WORKSPACE_SESSION_INDENT - SIDEBAR_WORKSPACE_SESSION_CARD_OVERHANG"
         ));
         assert!(workspace.contains(".gap(px(0.0))"));
-        assert!(workspace.contains("sidebar_aggregate_status_indicator(workspace_status, cx)"));
+        assert!(
+            workspace.contains("sidebar_aggregate_status_indicator(workspace_status, false, cx)")
+        );
         let aggregate = source
             .split_once("fn sidebar_aggregate_status_indicator(")
             .and_then(|(_, tail)| tail.split_once("\nfn sidebar_session_status_indicator("))
@@ -80439,7 +80455,7 @@ mod tests {
         // same one a session row uses.
         assert!(group_row.contains(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))"));
         let status_slot = group_row
-            .find("sidebar_aggregate_status_indicator(status, cx)")
+            .find("sidebar_aggregate_status_indicator(")
             .expect("the group row should render the aggregate status");
         let count_slot = group_row
             .find("format!(\"{member_count}\")")
@@ -80447,6 +80463,12 @@ mod tests {
         assert!(status_slot < count_slot);
         assert!(group_row.contains(".when_some(collapsed_status, |this, status| {"));
         assert!(group_row.contains(".when(collapsed_status.is_none(), |this| {"));
+        // The group's auto-continue rides the ring's color instead of a second
+        // glyph in the trailing column, which keeps the column holding one mark
+        // at a time.
+        assert!(group_row.contains("auto_continue == Some(true)"));
+        assert!(!group_row.contains("rotate-ccw.svg"));
+
         assert_eq!(
             source
                 .matches("\nconst SIDEBAR_STATUS_COLUMN_WIDTH: f32 = 76.0;")
