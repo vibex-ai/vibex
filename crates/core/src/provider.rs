@@ -2267,6 +2267,14 @@ pub struct ProviderNativeImportItem {
     pub default_model: Option<String>,
     pub small_model: Option<String>,
     pub large_model: Option<String>,
+    /// Models the native source declares, when it names them.
+    ///
+    /// Empty means the imported profile is built from `default_model` /
+    /// `small_model` / `large_model` alone. A source that also knows each
+    /// Model's wire protocol or display name fills this in so the profile does
+    /// not have to guess.
+    #[serde(default)]
+    pub configured_models: Vec<ProviderConfiguredModel>,
     pub reasoning_effort: Option<String>,
     pub provider_options: ProviderOptions,
     pub secret_references: Vec<ProviderSecretReferenceCreateRequest>,

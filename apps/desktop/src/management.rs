@@ -22648,6 +22648,7 @@ mod tests {
             default_model: None,
             small_model: None,
             large_model: None,
+            configured_models: Vec::new(),
             reasoning_effort: None,
             provider_options: options,
             secret_references: Vec::new(),

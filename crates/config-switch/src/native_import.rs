@@ -6,15 +6,16 @@ use serde_json::Value as JsonValue;
 use toml::Value as TomlValue;
 use vibex_core::{
     AcpProcessStrategy, AcpProviderConfig, AcpProviderEnvReference, AcpProviderEnvSource,
-    AgentCommandConfig, AgentId, ProviderBindingMetadata, ProviderKind, ProviderNativeConfigFile,
-    ProviderNativeConfigFileKind, ProviderNativeConfigFileStatus,
-    ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
-    ProviderNativeImportDiagnostic, ProviderNativeImportItem, ProviderNativeImportItemStatus,
-    ProviderNativeImportPreview, ProviderNativeImportPreviewRequest,
-    ProviderNativeImportRedactedField, ProviderNativeImportSource, ProviderOptions,
-    ProviderProfile, ProviderProfileCreateRequest, ProviderSecretBackend, ProviderSecretKind,
-    ProviderSecretReferenceCreateRequest, ProviderSecretSetupState, RequestId, VibexError,
-    VibexResult, builtin_agent_definitions, supports_native_provider_import, unix_timestamp_ms,
+    AgentCommandConfig, AgentId, ProviderBindingMetadata, ProviderKind, ProviderModelCapabilities,
+    ProviderModelWireApi, ProviderNativeConfigFile, ProviderNativeConfigFileKind,
+    ProviderNativeConfigFileStatus, ProviderNativeImportCreateRequest,
+    ProviderNativeImportCreateResult, ProviderNativeImportDiagnostic, ProviderNativeImportItem,
+    ProviderNativeImportItemStatus, ProviderNativeImportPreview,
+    ProviderNativeImportPreviewRequest, ProviderNativeImportRedactedField,
+    ProviderNativeImportSource, ProviderOptions, ProviderProfile, ProviderProfileCreateRequest,
+    ProviderSecretBackend, ProviderSecretKind, ProviderSecretReferenceCreateRequest,
+    ProviderSecretSetupState, RequestId, VibexError, VibexResult, builtin_agent_definitions,
+    supports_native_provider_import, unix_timestamp_ms,
 };
 use vibex_db::ProviderProfileRepository;
 
@@ -576,6 +577,7 @@ fn codex_import_item(input: CodexImportItemInput<'_>) -> ProviderNativeImportIte
         default_model,
         small_model: None,
         large_model: None,
+        configured_models: Vec::new(),
         reasoning_effort: None,
         provider_options: ProviderOptions {
             schema_version: 1,
@@ -809,6 +811,9 @@ fn cc_switch_import_item(
             "ANTHROPIC_API_KEY",
             "Claude auth token from CC Switch provider",
         )),
+        ProviderKind::Acp if mapping.agent_id.as_str() == "grok" => {
+            cc_switch_grok_import_item(db_path, row, mapping, settings, diagnostics)
+        }
         ProviderKind::Acp => {
             cc_switch_acp_import_item(db_path, row, mapping, settings, diagnostics)
         }
@@ -963,6 +968,7 @@ fn cc_switch_simple_import_item(
         default_model,
         small_model: None,
         large_model: None,
+        configured_models: Vec::new(),
         reasoning_effort: None,
         provider_options,
         secret_references,
@@ -1125,6 +1131,20 @@ pub(crate) fn hydrate_cc_switch_claude_profile_config(
     Ok(true)
 }
 
+/// The ACP feature set a CC Switch provider starts from when it declares none.
+fn cc_switch_acp_default_features() -> Vec<String> {
+    [
+        "agent_messages",
+        "tool_calls",
+        "permission_requests",
+        "slash_commands",
+        "skills",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn cc_switch_acp_import_item(
     db_path: &Path,
     row: CcSwitchProviderRow,
@@ -1145,15 +1165,7 @@ fn cc_switch_acp_import_item(
         .unwrap_or_else(|| vec!["default".to_string()]);
     let features = cc_switch_json_string_list(&settings, &["features"])
         .filter(|features| !features.is_empty())
-        .unwrap_or_else(|| {
-            vec![
-                "agent_messages".to_string(),
-                "tool_calls".to_string(),
-                "permission_requests".to_string(),
-                "slash_commands".to_string(),
-                "skills".to_string(),
-            ]
-        });
+        .unwrap_or_else(cc_switch_acp_default_features);
     let command = cc_switch_json_string(
         &settings,
         &["command", "cliCommand", "binary", "executable"],
@@ -1236,6 +1248,324 @@ fn cc_switch_acp_import_item(
         default_model,
         small_model: None,
         large_model: None,
+        configured_models: Vec::new(),
+        reasoning_effort: None,
+        provider_options,
+        secret_references,
+        status,
+        redacted_fields,
+        diagnostics: Vec::new(),
+    })
+}
+
+/// The env var CC Switch's Grok Build form falls back to when the config TOML
+/// names no `env_key`.
+const GROK_DEFAULT_SECRET_ENV_KEY: &str = "XAI_API_KEY";
+
+/// Fields a `[model.<id>]` table has to carry to count as a Model profile.
+const GROK_MODEL_FIELDS: &[&str] = &[
+    "model",
+    "base_url",
+    "api_key",
+    "env_key",
+    "api_backend",
+    "name",
+    "context_window",
+];
+
+/// One `[model.<id>]` profile of a CC Switch Grok Build config.
+struct CcSwitchGrokModel {
+    /// The `[model.<id>]` key that `[models].default` selects.
+    profile_id: String,
+    /// The upstream model id the CLI sends. Vibex keys a Model by that id so
+    /// the re-exported config keeps talking to the same upstream model.
+    upstream_model: Option<String>,
+    base_url: Option<String>,
+    env_key: Option<String>,
+    api_key: Option<String>,
+    wire_api: Option<ProviderModelWireApi>,
+    context_tokens: Option<u32>,
+}
+
+impl CcSwitchGrokModel {
+    fn model_id(&self) -> &str {
+        self.upstream_model.as_deref().unwrap_or(&self.profile_id)
+    }
+}
+
+fn cc_switch_grok_config_text(settings: &JsonValue) -> Option<&str> {
+    settings
+        .get("config")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn cc_switch_grok_config(settings: &JsonValue) -> Option<TomlValue> {
+    cc_switch_grok_config_text(settings)?
+        .parse::<TomlValue>()
+        .ok()
+}
+
+fn cc_switch_grok_default_profile_id(config: &TomlValue) -> Option<String> {
+    config
+        .get("models")
+        .and_then(|models| toml_string(models.get("default")))
+}
+
+fn cc_switch_grok_models(config: &TomlValue) -> Vec<CcSwitchGrokModel> {
+    let table = config.get("model").and_then(TomlValue::as_table);
+    let default_profile_id = cc_switch_grok_default_profile_id(config);
+    let mut profile_ids = Vec::new();
+    if let Some(default_id) = default_profile_id.clone() {
+        profile_ids.push(default_id);
+    }
+    if let Some(table) = table {
+        let mut keys = table.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if !profile_ids.iter().any(|profile_id| profile_id == &key) {
+                profile_ids.push(key);
+            }
+        }
+    }
+
+    let mut models: Vec<CcSwitchGrokModel> = Vec::new();
+    for profile_id in profile_ids {
+        let entry = table.and_then(|table| cc_switch_grok_model_entry(table, &profile_id));
+        if entry.is_none() && default_profile_id.as_deref() != Some(profile_id.as_str()) {
+            continue;
+        }
+        let model = CcSwitchGrokModel {
+            profile_id,
+            upstream_model: entry.and_then(|entry| toml_string(entry.get("model"))),
+            base_url: entry.and_then(|entry| toml_string(entry.get("base_url"))),
+            env_key: entry.and_then(|entry| toml_string(entry.get("env_key"))),
+            api_key: entry.and_then(|entry| toml_string(entry.get("api_key"))),
+            wire_api: entry
+                .and_then(|entry| toml_string(entry.get("api_backend")))
+                .as_deref()
+                .and_then(grok_wire_api),
+            context_tokens: entry
+                .and_then(|entry| entry.get("context_window"))
+                .and_then(TomlValue::as_integer)
+                .and_then(|value| u32::try_from(value).ok()),
+        };
+        if models
+            .iter()
+            .any(|existing| existing.model_id() == model.model_id())
+        {
+            continue;
+        }
+        models.push(model);
+    }
+    models
+}
+
+/// Resolves the `[model.<id>]` table for one profile id.
+///
+/// CC Switch quotes an id that contains a dot (`[model."grok-4.5"]`), but its
+/// deep-link import writes the id unquoted, which TOML parses as nested tables
+/// (`model.grok-4` -> `5`). Walk the split path as a fallback so both spellings
+/// map. A table with no Model field at all is an intermediate step of that
+/// split, not a Model.
+fn cc_switch_grok_model_entry<'a>(
+    table: &'a toml::map::Map<String, TomlValue>,
+    profile_id: &str,
+) -> Option<&'a toml::map::Map<String, TomlValue>> {
+    let entry = table
+        .get(profile_id)
+        .and_then(TomlValue::as_table)
+        .or_else(|| {
+            let mut current = table;
+            for segment in profile_id.split('.') {
+                current = current.get(segment).and_then(TomlValue::as_table)?;
+            }
+            Some(current)
+        })?;
+    entry
+        .keys()
+        .any(|key| GROK_MODEL_FIELDS.contains(&key.as_str()))
+        .then_some(entry)
+}
+
+/// Maps grok's `api_backend` spellings onto Vibex's wire protocols.
+fn grok_wire_api(api_backend: &str) -> Option<ProviderModelWireApi> {
+    match api_backend
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "responses" | "openai_responses" => Some(ProviderModelWireApi::OpenaiResponses),
+        "messages" | "anthropic" | "anthropic_messages" => {
+            Some(ProviderModelWireApi::AnthropicMessages)
+        }
+        "chat" | "chat_completions" | "openai_chat_completions" => {
+            Some(ProviderModelWireApi::OpenaiChatCompletions)
+        }
+        _ => None,
+    }
+}
+
+/// CC Switch stores a Grok Build provider as `{"config": "<grok config.toml>"}`.
+///
+/// The TOML has the shape Vibex projects into `~/.grok/config.toml`:
+/// `[models].default` selects one of the `[model.<id>]` profiles, and that
+/// profile carries the endpoint, the upstream model id, the credential and the
+/// `api_backend` protocol.
+fn cc_switch_grok_import_item(
+    db_path: &Path,
+    row: CcSwitchProviderRow,
+    mapping: CcSwitchAgentMapping,
+    settings: JsonValue,
+    diagnostics: &mut Vec<ProviderNativeImportDiagnostic>,
+) -> Option<ProviderNativeImportItem> {
+    let mut blocked_by_parse_error = false;
+    let config = match cc_switch_grok_config_text(&settings) {
+        Some(text) => match text.parse::<TomlValue>() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                blocked_by_parse_error = true;
+                diagnostics.push(diagnostic(
+                    ProviderNativeImportSource::CcSwitch,
+                    Some(ProviderNativeConfigFileKind::CcSwitchDatabase),
+                    "provider_native_import_parse_failed",
+                    "failed to parse CC Switch Grok Build provider TOML config",
+                    vec![
+                        option_entry(CC_SWITCH_PROVIDER_ID_OPTION_KEY, row.provider_id.clone()),
+                        option_entry("error", error.to_string()),
+                    ],
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+    let models = config
+        .as_ref()
+        .map(cc_switch_grok_models)
+        .unwrap_or_default();
+    let default_profile_id = config.as_ref().and_then(cc_switch_grok_default_profile_id);
+    let active_model = default_profile_id
+        .as_deref()
+        .and_then(|profile_id| models.iter().find(|model| model.profile_id == profile_id))
+        .or_else(|| models.first());
+
+    let base_url = active_model
+        .and_then(|model| model.base_url.clone())
+        .or_else(|| models.iter().find_map(|model| model.base_url.clone()));
+    let default_model = active_model.map(|model| model.model_id().to_string());
+    let env_key = active_model
+        .and_then(|model| model.env_key.clone())
+        .unwrap_or_else(|| GROK_DEFAULT_SECRET_ENV_KEY.to_string());
+    let secret_references = if active_model
+        .and_then(|model| model.api_key.as_ref())
+        .is_some()
+    {
+        vec![placeholder_secret(
+            ProviderSecretKind::ApiKey,
+            env_key.clone(),
+            "Grok Build API key from CC Switch provider",
+        )]
+    } else {
+        Vec::new()
+    };
+    let mut redacted_fields = Vec::new();
+    for model in &models {
+        if model.api_key.is_some() {
+            redacted_fields.push(ProviderNativeImportRedactedField {
+                key: format!("model.{}.api_key", model.profile_id),
+                source: ProviderNativeImportSource::CcSwitch,
+                file_kind: ProviderNativeConfigFileKind::CcSwitchDatabase,
+                hint: "present".to_string(),
+            });
+        }
+    }
+
+    // Vibex launches the grok CLI through ACP, so the profile carries the
+    // Agent's catalog command instead of a config-derived one. The credential
+    // is not an ACP env var: grok reads `env_key` from the `config.toml` the
+    // Grok projection writes, and that projection injects the secret under its
+    // own env key.
+    let command = builtin_agent_definitions()
+        .into_iter()
+        .find(|definition| definition.id == mapping.agent_id)
+        .and_then(|definition| definition.command)
+        .unwrap_or_else(|| AgentCommandConfig {
+            command: mapping.agent_id.as_str().to_string(),
+            args: Vec::new(),
+        });
+    let acp_config = AcpProviderConfig {
+        command: command.command,
+        args: command.args,
+        env: Vec::new(),
+        cwd_template: Some("{workspaceRoot}".to_string()),
+        process_strategy: AcpProcessStrategy::default(),
+        terminal_tools: false,
+        terminal_auth: false,
+        models: models
+            .iter()
+            .map(|model| model.model_id().to_string())
+            .collect(),
+        modes: vec!["default".to_string()],
+        features: cc_switch_acp_default_features(),
+        disabled_tools: Vec::new(),
+    };
+    let mut provider_options = match crate::acp_config_to_options(&acp_config) {
+        Ok(options) => options,
+        Err(error) => {
+            diagnostics.push(diagnostic(
+                ProviderNativeImportSource::CcSwitch,
+                Some(ProviderNativeConfigFileKind::CcSwitchDatabase),
+                "provider_native_import_cc_switch_acp_config_invalid",
+                "CC Switch Grok Build settings could not be converted to a Vibex ACP profile",
+                vec![
+                    option_entry(CC_SWITCH_PROVIDER_ID_OPTION_KEY, row.provider_id),
+                    option_entry(CC_SWITCH_APP_TYPE_OPTION_KEY, row.app_type),
+                    option_entry("error", error.to_string()),
+                ],
+            ));
+            return None;
+        }
+    };
+    provider_options
+        .entries
+        .extend(cc_switch_metadata_entries(db_path, &row, &mapping));
+
+    let status = if blocked_by_parse_error {
+        ProviderNativeImportItemStatus::BlockedByParseError
+    } else if secret_references.is_empty() {
+        ProviderNativeImportItemStatus::Partial
+    } else {
+        ProviderNativeImportItemStatus::NeedsSecretSetup
+    };
+    let configured_models = models
+        .iter()
+        .map(|model| vibex_core::ProviderConfiguredModel {
+            id: model.model_id().to_string(),
+            display_name: (model.profile_id != model.model_id()).then(|| model.profile_id.clone()),
+            enabled: true,
+            wire_api: model.wire_api,
+            capabilities: ProviderModelCapabilities {
+                context_tokens: model.context_tokens,
+                ..Default::default()
+            },
+        })
+        .collect();
+
+    Some(ProviderNativeImportItem {
+        import_item_id: deterministic_request_id(&cc_switch_import_suffix(&mapping, &row)),
+        source: ProviderNativeImportSource::CcSwitch,
+        provider_kind: ProviderKind::Acp,
+        agent_id: Some(mapping.agent_id),
+        display_name: cc_switch_display_name(&row),
+        account_alias: Some(row.provider_id.clone()),
+        base_url,
+        default_model,
+        small_model: None,
+        large_model: None,
+        configured_models,
         reasoning_effort: None,
         provider_options,
         secret_references,
@@ -1717,6 +2047,7 @@ fn collect_claude_preview(
         default_model: model,
         small_model: None,
         large_model: None,
+        configured_models: Vec::new(),
         reasoning_effort: None,
         provider_options: ProviderOptions {
             schema_version: 1,
@@ -1732,19 +2063,22 @@ fn collect_claude_preview(
 }
 
 fn profile_request_from_item(item: ProviderNativeImportItem) -> ProviderProfileCreateRequest {
-    let configured_models = item
-        .default_model
-        .iter()
-        .chain(item.small_model.iter())
-        .chain(item.large_model.iter())
-        .map(|model| vibex_core::ProviderConfiguredModel {
-            id: model.clone(),
-            display_name: None,
-            enabled: true,
-            wire_api: None,
-            capabilities: Default::default(),
-        })
-        .collect();
+    let configured_models = if item.configured_models.is_empty() {
+        item.default_model
+            .iter()
+            .chain(item.small_model.iter())
+            .chain(item.large_model.iter())
+            .map(|model| vibex_core::ProviderConfiguredModel {
+                id: model.clone(),
+                display_name: None,
+                enabled: true,
+                wire_api: None,
+                capabilities: Default::default(),
+            })
+            .collect()
+    } else {
+        item.configured_models
+    };
 
     ProviderProfileCreateRequest {
         agent_id: item.agent_id,
@@ -1881,10 +2215,23 @@ fn cc_switch_secret_for_import_item(
     };
     let Some(secret_value) = cc_switch_secret_value(&settings, &default_env_key)
         .or_else(|| cc_switch_first_secret(&settings).map(|(_key, value)| value))
+        .or_else(|| cc_switch_grok_secret_value(&settings))
     else {
         return Ok(None);
     };
     Ok(Some((default_env_key, secret_kind, secret_value)))
+}
+
+/// Grok Build keeps its credential inside the config TOML instead of an
+/// `auth`/`env` map, so the JSON-only lookup cannot see it.
+fn cc_switch_grok_secret_value(settings: &JsonValue) -> Option<String> {
+    let config = cc_switch_grok_config(settings)?;
+    let models = cc_switch_grok_models(&config);
+    cc_switch_grok_default_profile_id(&config)
+        .as_deref()
+        .and_then(|profile_id| models.iter().find(|model| model.profile_id == profile_id))
+        .and_then(|model| model.api_key.clone())
+        .or_else(|| models.iter().find_map(|model| model.api_key.clone()))
 }
 
 fn read_cc_switch_provider_settings(
@@ -2642,6 +2989,238 @@ wire_api = "responses"
                 "unsupported CC Switch app type {app_type} must stay unmapped"
             );
         }
+    }
+
+    fn insert_grokbuild_provider(connection: &Connection, settings_config: &str) {
+        connection
+            .execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, website_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    "grok-alpha",
+                    "grokbuild",
+                    "Grok Alpha",
+                    settings_config,
+                    Option::<String>::None,
+                ),
+            )
+            .unwrap();
+    }
+
+    const GROK_BUILD_SETTINGS: &str = r#"{"config":"[models]\ndefault = \"grok-4.5\"\n\n[model.\"grok-4.5\"]\nmodel = \"grok-4.5-20260101\"\nname = \"Grok\"\nbase_url = \"https://grok.example.invalid/v1\"\napi_key = \"grok-secret\"\nenv_key = \"XAI_API_KEY\"\napi_backend = \"responses\"\ncontext_window = 500000\n\n[model.grok-fast]\nmodel = \"grok-4.5-fast\"\nbase_url = \"https://grok.example.invalid/v1\"\napi_backend = \"chat_completions\"\n"}"#;
+
+    fn grokbuild_providers_table(connection: &Connection) {
+        connection
+            .execute(
+                "CREATE TABLE providers (
+                    id TEXT PRIMARY KEY,
+                    app_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    settings_config TEXT NOT NULL,
+                    website_url TEXT
+                )",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn native_import_cc_switch_grokbuild_preview_maps_the_grok_toml() {
+        let cc_switch_dir = tempdir().unwrap();
+        let db_path = cc_switch_dir.path().join("cc-switch.db");
+        let connection = Connection::open(&db_path).unwrap();
+        grokbuild_providers_table(&connection);
+        insert_grokbuild_provider(&connection, GROK_BUILD_SETTINGS);
+
+        let preview = preview_native_import_with_roots(
+            ProviderNativeImportPreviewRequest {
+                sources: vec![ProviderNativeImportSource::CcSwitch],
+            },
+            NativeImportRoots {
+                cc_switch_db_paths: Some(vec![db_path]),
+                ..NativeImportRoots::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(preview.items.len(), 1);
+        let item = &preview.items[0];
+        assert_eq!(item.source, ProviderNativeImportSource::CcSwitch);
+        assert_eq!(item.provider_kind, ProviderKind::Acp);
+        assert_eq!(item.agent_id.as_ref().map(|id| id.as_str()), Some("grok"));
+        assert_eq!(
+            item.base_url.as_deref(),
+            Some("https://grok.example.invalid/v1")
+        );
+        assert_eq!(item.default_model.as_deref(), Some("grok-4.5-20260101"));
+        assert_eq!(
+            item.status,
+            ProviderNativeImportItemStatus::NeedsSecretSetup
+        );
+        assert_eq!(
+            item.configured_models
+                .iter()
+                .map(|model| (model.id.as_str(), model.wire_api))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "grok-4.5-20260101",
+                    Some(ProviderModelWireApi::OpenaiResponses)
+                ),
+                (
+                    "grok-4.5-fast",
+                    Some(ProviderModelWireApi::OpenaiChatCompletions)
+                ),
+            ]
+        );
+        assert_eq!(
+            item.configured_models[0].display_name.as_deref(),
+            Some("grok-4.5")
+        );
+        assert_eq!(
+            item.configured_models[0].capabilities.context_tokens,
+            Some(500_000)
+        );
+        assert_eq!(item.secret_references.len(), 1);
+        assert_eq!(
+            item.secret_references[0].secret_kind,
+            ProviderSecretKind::ApiKey
+        );
+        assert_eq!(item.secret_references[0].lookup_key, "XAI_API_KEY");
+        assert!(
+            item.redacted_fields
+                .iter()
+                .any(|field| field.key == "model.grok-4.5.api_key")
+        );
+        let config = acp_config_from_options(&item.provider_options)
+            .unwrap()
+            .expect("grokbuild import should carry a typed ACP config");
+        assert_eq!(config.command, "grok");
+        assert_eq!(config.args, vec!["agent".to_string(), "stdio".to_string()]);
+        assert_eq!(config.models, vec!["grok-4.5-20260101", "grok-4.5-fast"]);
+        assert!(!format!("{preview:?}").contains("grok-secret"));
+    }
+
+    #[test]
+    fn native_import_cc_switch_grokbuild_accepts_an_unquoted_model_table() {
+        // CC Switch's deep-link import writes the profile id unquoted, which
+        // TOML parses as nested tables (`model.grok-4` -> `5`).
+        let cc_switch_dir = tempdir().unwrap();
+        let db_path = cc_switch_dir.path().join("cc-switch.db");
+        let connection = Connection::open(&db_path).unwrap();
+        grokbuild_providers_table(&connection);
+        insert_grokbuild_provider(
+            &connection,
+            r#"{"config":"[models]\ndefault = \"grok-4.5\"\n\n[model.grok-4.5]\nmodel = \"grok-4.5\"\nbase_url = \"https://grok.example.invalid/v1\"\napi_key = \"grok-secret\"\napi_backend = \"responses\"\n"}"#,
+        );
+
+        let preview = preview_native_import_with_roots(
+            ProviderNativeImportPreviewRequest {
+                sources: vec![ProviderNativeImportSource::CcSwitch],
+            },
+            NativeImportRoots {
+                cc_switch_db_paths: Some(vec![db_path]),
+                ..NativeImportRoots::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(preview.items.len(), 1);
+        let item = &preview.items[0];
+        assert_eq!(item.default_model.as_deref(), Some("grok-4.5"));
+        assert_eq!(
+            item.base_url.as_deref(),
+            Some("https://grok.example.invalid/v1")
+        );
+        assert_eq!(
+            item.configured_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grok-4.5"]
+        );
+        assert_eq!(
+            item.configured_models[0].wire_api,
+            Some(ProviderModelWireApi::OpenaiResponses)
+        );
+        assert_eq!(
+            item.status,
+            ProviderNativeImportItemStatus::NeedsSecretSetup
+        );
+    }
+
+    #[test]
+    fn native_import_create_cc_switch_grokbuild_profile_migrates_its_secret() {
+        let cc_switch_dir = tempdir().unwrap();
+        let db_path = cc_switch_dir.path().join("cc-switch.db");
+        let connection = Connection::open(&db_path).unwrap();
+        grokbuild_providers_table(&connection);
+        insert_grokbuild_provider(&connection, GROK_BUILD_SETTINGS);
+
+        let roots = NativeImportRoots {
+            cc_switch_db_paths: Some(vec![db_path]),
+            ..NativeImportRoots::default()
+        };
+        let preview = preview_native_import_with_roots(
+            ProviderNativeImportPreviewRequest {
+                sources: vec![ProviderNativeImportSource::CcSwitch],
+            },
+            roots.clone(),
+        )
+        .unwrap();
+        let item = preview.items[0].clone();
+
+        let vibex_dir = tempdir().unwrap();
+        let service = ProviderConfigService::new(vibex_dir.path().join("vibex.db"));
+        let result = service
+            .create_profile_from_import_with_roots(
+                ProviderNativeImportCreateRequest {
+                    preview_request: ProviderNativeImportPreviewRequest {
+                        sources: vec![ProviderNativeImportSource::CcSwitch],
+                    },
+                    import_item_id: item.import_item_id,
+                },
+                roots,
+            )
+            .unwrap();
+
+        let profile = result.profile;
+        assert_eq!(profile.agent_id.as_str(), "grok");
+        assert_eq!(profile.kind, ProviderKind::Acp);
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("https://grok.example.invalid/v1")
+        );
+        assert_eq!(profile.default_model.as_deref(), Some("grok-4.5-20260101"));
+        assert_eq!(
+            profile
+                .configured_models
+                .iter()
+                .map(|model| (model.id.as_str(), model.wire_api))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "grok-4.5-20260101",
+                    Some(ProviderModelWireApi::OpenaiResponses)
+                ),
+                (
+                    "grok-4.5-fast",
+                    Some(ProviderModelWireApi::OpenaiChatCompletions)
+                ),
+            ]
+        );
+        assert_eq!(profile.secrets.len(), 1);
+        assert_eq!(
+            profile.secrets[0].backend,
+            ProviderSecretBackend::OsKeychain
+        );
+        assert_eq!(
+            secrets::resolve_provider_secret(&profile.secrets[0])
+                .unwrap()
+                .as_deref(),
+            Some("grok-secret")
+        );
+        assert!(!format!("{profile:?}").contains("grok-secret"));
     }
 
     #[test]
