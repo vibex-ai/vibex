@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Entity, Global, QuitMode,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px, size,
+    SystemNotificationResponse, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, px, size,
 };
 use gpui_component::{Root, TitleBar};
 use image::ImageReader;
@@ -196,6 +197,26 @@ impl SystemTray {
         let _ = window_handle.update(cx, move |_, window, cx| action(&workbench, window, cx));
     }
 
+    /// Brings the workbench forward and selects the session named by a clicked
+    /// system notification. The notification tag is the session id (see
+    /// `VibexWorkbench::notify_for_timeline_events`), so a click lands the user
+    /// on the agent that raised the notification.
+    fn focus_session_from_notification(&mut self, session_id: &str, cx: &mut App) {
+        self.restore(cx);
+        let Some(window_handle) = self.visible_window else {
+            return;
+        };
+        let workbench = self.workbench.clone();
+        let session_id = session_id.to_string();
+        if let Err(error) = window_handle.update(cx, move |_, _window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.focus_session_from_notification(&session_id, cx);
+            });
+        }) {
+            eprintln!("failed to focus the session for a system notification: {error}");
+        }
+    }
+
     fn handle_menu_event(&mut self, event: MenuEvent, cx: &mut App) {
         match event.id.as_ref() {
             OPEN_ID => self.restore(cx),
@@ -236,6 +257,7 @@ pub(crate) fn initialize(
     let resolved_locale = workbench.read(cx).resolved_locale_for_tray();
     let tray = SystemTray::new(workbench, application_id, window, resolved_locale)?;
     cx.set_global(tray);
+    cx.on_system_notification_response(handle_notification_response);
     cx.set_quit_mode(QuitMode::Explicit);
     poll_events(cx);
     Ok(())
@@ -258,6 +280,21 @@ pub fn handle_reopen(cx: &mut App) {
         return;
     }
     cx.update_global::<SystemTray, _>(|tray, cx| tray.restore(cx));
+}
+
+/// Handles a click on a system notification by bringing the workbench forward
+/// and selecting the session that produced it. The tag a notification was
+/// posted with is its session id, so a click returns the user to the agent that
+/// raised it. The tray global owns the window that has to be restored; without
+/// a menu bar entry there is nothing to focus.
+pub fn handle_notification_response(response: SystemNotificationResponse, cx: &mut App) {
+    if !cx.has_global::<SystemTray>() {
+        return;
+    }
+    let session_id = response.tag.to_string();
+    cx.update_global::<SystemTray, _>(|tray, cx| {
+        tray.focus_session_from_notification(&session_id, cx)
+    });
 }
 
 pub(crate) fn update_locale(locale: ResolvedLocale, cx: &mut App) {
@@ -402,6 +439,49 @@ mod tests {
     #[gpui::test]
     fn reopen_without_a_tray_global_is_ignored(cx: &mut gpui::TestAppContext) {
         cx.update(handle_reopen);
+    }
+
+    /// A click on a system notification has to bring the workbench forward and
+    /// select the session it names, which is only possible while the tray
+    /// global owns the window.
+    #[test]
+    fn the_tray_registers_the_notification_response_handler() {
+        let source = include_str!("system_tray.rs");
+        let initialize = source
+            .split_once("pub(crate) fn initialize(")
+            .and_then(|(_, tail)| tail.split_once("\npub(crate) fn handle_window_close("))
+            .map(|(body, _)| body)
+            .expect("the tray initializer should remain inspectable");
+        assert!(
+            initialize
+                .contains("cx.on_system_notification_response(handle_notification_response);"),
+            "the tray initializer must register the notification response handler"
+        );
+
+        let handler = source
+            .split_once("pub fn handle_notification_response(")
+            .and_then(|(_, tail)| tail.split_once("\npub(crate) fn update_locale("))
+            .map(|(body, _)| body)
+            .expect("the notification response handler should remain inspectable");
+        assert!(
+            handler.contains("focus_session_from_notification"),
+            "the notification response handler must focus the session it names"
+        );
+    }
+
+    /// Without a menu bar entry there is no window for the handler to restore,
+    /// so a notification click is ignored rather than panicking.
+    #[gpui::test]
+    fn notification_response_without_a_tray_global_is_ignored(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            handle_notification_response(
+                SystemNotificationResponse {
+                    tag: "session_0123456789abcdef".into(),
+                    action_id: None,
+                },
+                cx,
+            );
+        });
     }
 
     #[test]

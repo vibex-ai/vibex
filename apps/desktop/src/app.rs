@@ -16323,6 +16323,24 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Selects the session named by a clicked system notification. The
+    /// notification tag carries the session id, so a click returns the user to
+    /// the agent that raised it. Unknown ids (for example a session closed
+    /// after the notification was posted) are ignored.
+    pub(crate) fn focus_session_from_notification(
+        &mut self,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(session_id) = VibexSessionId::parse(session_id) else {
+            return;
+        };
+        if !self.sessions.iter().any(|session| session.id == session_id) {
+            return;
+        }
+        self.select_session(session_id, cx);
+    }
+
     fn clear_child_agent_context(&mut self) {
         self.child_agent_timelines.clear();
         self.child_agent_expanded_delegations.clear();
