@@ -26,10 +26,10 @@ use gpui::{
     ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
     ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
-    Subscription, Task, TitlebarOptions, Unbind, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowId, WindowOptions,
-    canvas, deferred, div, fill, img, linear_color_stop, linear_gradient, point, prelude::*, px,
-    relative, rgb, size,
+    Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowId, WindowOptions, canvas, deferred, div, fill, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -195,7 +195,7 @@ use crate::motion::{self, hover_blend, hover_listener};
 use crate::performance_log;
 use crate::platform::{
     StorageUsage, launch_at_login_enabled, open_external_url, reveal_path_in_file_manager,
-    send_system_notification, set_launch_at_login, storage_usage, ui_state_path,
+    set_launch_at_login, storage_usage, ui_state_path,
 };
 use crate::remote_access_pairing::open_remote_access_pairing;
 use crate::remote_client::{
@@ -17378,7 +17378,7 @@ impl VibexWorkbench {
                 .push(event);
         }
         for batch in batches.values() {
-            self.notify_for_timeline_events(batch);
+            self.notify_for_timeline_events(batch, cx);
         }
         let selected_session_id = self.selected_session_id.clone();
         if defer_streaming_work {
@@ -17603,7 +17603,7 @@ impl VibexWorkbench {
         self.load_session_group_view(session_id, true, cx);
     }
 
-    fn notify_for_timeline_events(&self, events: &[TimelineLiveEvent]) {
+    fn notify_for_timeline_events(&self, events: &[TimelineLiveEvent], cx: &mut Context<Self>) {
         if !self.ui_state.desktop_behavior.notifications_enabled {
             return;
         }
@@ -17624,15 +17624,37 @@ impl VibexWorkbench {
         let agent_label = agent_id
             .map(|agent_id| runtime_agent_label(&self.agent_snapshots, agent_id))
             .unwrap_or_else(|| "Agent".to_string());
-        let body = timeline_notification_body(
-            timeline_notification_kind(events, &self.ui_state.desktop_behavior),
-            &agent_label,
-        );
-        if let Some(body) = body
-            && let Err(error) = send_system_notification("Vibex", &body)
+        let kind = timeline_notification_kind(events, &self.ui_state.desktop_behavior);
+        let Some(body) = timeline_notification_body(kind, &agent_label) else {
+            return;
+        };
+        // Route by window focus: an app the user is already looking at gets an
+        // in-app hint instead of an OS-level toast, while a backgrounded or
+        // minimized app raises a system notification that can reach the user
+        // outside the window. Windows Focus Assist (and the macOS/Linux
+        // equivalents) still suppress the system notification on their own.
+        if let Some(kind) = kind
+            && let Some(handle) = cx.active_window()
         {
-            eprintln!("system notification failed: {}", error.code);
+            let tone = timeline_notification_tone(kind);
+            let message = SharedString::from(body.clone());
+            let delivered = cx
+                .update_window(handle, move |_, window, cx| {
+                    window.push_notification(hint_notification(tone, message, cx), cx);
+                })
+                .is_ok();
+            if delivered {
+                return;
+            }
         }
+        // Reusing the session id as the tag makes a newer notification for the
+        // same session replace the older one instead of stacking up.
+        cx.show_system_notification(SystemNotification {
+            tag: SharedString::from(session_id),
+            title: SharedString::from("Vibex"),
+            body: SharedString::from(body),
+            actions: Vec::new(),
+        });
     }
 
     fn apply_desktop_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) -> bool {
@@ -58491,6 +58513,14 @@ enum NotificationKind {
     Failed,
 }
 
+fn timeline_notification_tone(kind: NotificationKind) -> NotificationType {
+    match kind {
+        NotificationKind::Completed => NotificationType::Success,
+        NotificationKind::NeedsInput => NotificationType::Info,
+        NotificationKind::Failed => NotificationType::Error,
+    }
+}
+
 fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str) -> Option<String> {
     let locale = locale::current_locale();
     match kind {
@@ -65039,6 +65069,10 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
     bind_terminal_keys(cx);
     let application_id = release_application_id()
         .map_err(|error| format!("release channel configuration failed ({})", error.code))?;
+    // Register the process identity the OS notification centers key on: the
+    // Windows AppUserModelID and the Linux application name. Windows needs this
+    // before the first toast from an unpackaged build.
+    cx.set_app_identity(application_id, "Vibex");
     let bounds = Bounds::centered(
         None,
         size(px(DEFAULT_WIDTH as f32), px(DEFAULT_HEIGHT as f32)),
@@ -66331,6 +66365,22 @@ mod tests {
         assert!(needs_input.starts_with("Claude Code "));
         assert!(failed.starts_with("Codex "));
         assert_eq!(timeline_notification_body(None, "Codex"), None);
+    }
+
+    #[test]
+    fn timeline_notification_tone_maps_each_kind() {
+        assert!(matches!(
+            timeline_notification_tone(NotificationKind::Completed),
+            NotificationType::Success
+        ));
+        assert!(matches!(
+            timeline_notification_tone(NotificationKind::NeedsInput),
+            NotificationType::Info
+        ));
+        assert!(matches!(
+            timeline_notification_tone(NotificationKind::Failed),
+            NotificationType::Error
+        ));
     }
 
     #[test]

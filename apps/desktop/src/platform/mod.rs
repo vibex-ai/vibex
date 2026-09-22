@@ -328,61 +328,6 @@ fn windows_batch_escape(value: &str) -> String {
     value.replace('%', "%%")
 }
 
-pub fn send_system_notification(title: &str, body: &str) -> VibexResult<()> {
-    let title = bounded_notification_text(title, 80)?;
-    let body = bounded_notification_text(body, 240)?;
-    #[cfg(target_os = "linux")]
-    {
-        spawn_open_command(
-            Command::new("notify-send").args(["--app-name=Vibex", &title, &body]),
-            "desktop_notification_failed",
-            "failed to show a system notification",
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let script = format!(
-            "display notification {} with title {}",
-            apple_script_string(&body),
-            apple_script_string(&title)
-        );
-        return spawn_open_command(
-            Command::new("osascript").args(["-e", &script]),
-            "desktop_notification_failed",
-            "failed to show a system notification",
-        );
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let script = format!(
-            "$w=New-Object -ComObject WScript.Shell;$w.Popup('{}',8,'{}',64)",
-            body.replace('\'', "''"),
-            title.replace('\'', "''")
-        );
-        return spawn_open_command(
-            Command::new("powershell.exe").args(["-NoProfile", "-Command", &script]),
-            "desktop_notification_failed",
-            "failed to show a system notification",
-        );
-    }
-}
-
-fn bounded_notification_text(value: &str, limit: usize) -> VibexResult<String> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(VibexError::validation(
-            "desktop_notification_text_invalid",
-            "notification text is invalid",
-        ));
-    }
-    Ok(value.chars().take(limit).collect())
-}
-
-#[cfg(target_os = "macos")]
-fn apple_script_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 pub fn platform_font_fallbacks() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
