@@ -21,7 +21,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
-    spinner::Spinner,
     tooltip::Tooltip,
     v_flex,
 };
@@ -29,6 +28,7 @@ use vibex_backend::BackendFacade;
 use vibex_desktop_model::{LocaleMode, PROJECT_DIRECTORY_FAVORITE_LIMIT};
 
 use crate::locale::{self, ResolvedLocale};
+use crate::spinner::Spinner;
 
 /// One browsable entry of the current directory.
 #[derive(Debug, Clone, PartialEq, Eq)]

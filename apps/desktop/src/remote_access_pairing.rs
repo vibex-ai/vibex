@@ -15,7 +15,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     notification::Notification,
     pagination::Pagination,
-    spinner::Spinner,
     tab::{Tab, TabBar},
     tag::Tag,
     v_flex,
@@ -40,7 +39,7 @@ use vibex_desktop_runtime::{
 
 use crate::{
     gpui_ext::{DOCS_REMOTE_MOBILE_URL, docs_help_button},
-    locale, theme,
+    locale, spinner::Spinner, theme,
 };
 
 const PAIRING_OFFER_TTL_MS: u32 = 90_000;

@@ -24,6 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -523,6 +524,40 @@ pub fn speed_scale() -> f32 {
 /// set (end state for oneshots, rest state for loops) and schedules no frames.
 pub fn reduced_motion(cx: &App) -> bool {
     cx.reduce_motion()
+}
+
+/// The user's reduced-motion preference, kept apart from the effective
+/// `App::reduce_motion` flag so the workbench can pause animations for a
+/// second reason — the window not being active — without forgetting the
+/// setting.
+static USER_REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
+
+/// Whether the workbench window is currently inactive (unfocused, minimized,
+/// or hidden). A window nobody is looking at gains nothing from an animation
+/// running, and a repeating one keeps the compositor busy for as long as it is
+/// mounted.
+static WINDOW_INACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Record the user's reduced-motion preference and re-derive the effective
+/// flag. Called whenever the appearance settings are applied.
+pub fn set_user_reduced_motion(reduced: bool, cx: &mut App) {
+    USER_REDUCED_MOTION.store(reduced, Ordering::Relaxed);
+    sync_reduce_motion(cx);
+}
+
+/// Record whether the workbench window is active. While it is not, every
+/// `with_animation` element snaps to its rest state and schedules no frames —
+/// gpui already implements that behind `App::reduce_motion`, so the gate
+/// reuses it rather than tracking each animation individually.
+pub fn set_window_active(active: bool, cx: &mut App) {
+    WINDOW_INACTIVE.store(!active, Ordering::Relaxed);
+    sync_reduce_motion(cx);
+}
+
+fn sync_reduce_motion(cx: &mut App) {
+    let reduced =
+        USER_REDUCED_MOTION.load(Ordering::Relaxed) || WINDOW_INACTIVE.load(Ordering::Relaxed);
+    cx.set_reduce_motion(reduced);
 }
 
 #[cfg(test)]

@@ -21,7 +21,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     popover::Popover,
     scroll::ScrollableElement as _,
-    spinner::Spinner,
     v_flex,
 };
 use vibex_core::{
@@ -36,6 +35,7 @@ use crate::app::VibexWorkbench;
 use crate::assets::agent_brand_icon;
 use crate::locale::{self, ResolvedLocale};
 use crate::skeleton;
+use crate::spinner::Spinner;
 
 /// One folder header row, and one session row beneath it. The scan placeholder
 /// reads the same two figures so the dialog does not reflow when the scan lands.

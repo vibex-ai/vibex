@@ -64,18 +64,70 @@ const NPM_WINDOWS_CHILD_PROCESS_HOOK_NAME: &str = "vibex-windows-child-process.c
 const NPM_WINDOWS_CHILD_PROCESS_HOOK_SOURCE: &str = r#""use strict";
 if (process.platform === "win32") {
   const childProcess = require("node:child_process");
+  const fs = require("node:fs");
+  const path = require("node:path");
   const { syncBuiltinESMExports } = require("node:module");
   const hiddenOptions = (options) => ({ ...(options ?? {}), windowsHide: true });
+
+  // npm installs every Windows command as a `.cmd` shim that re-runs `node`
+  // on the package's entry script. Spawning the shim makes Node go through
+  // `cmd.exe`, which allocates a console host per child and adds a process
+  // and a shell parse to every launch. The shim's script path is stable, so
+  // resolve it once and spawn `process.execPath` directly instead.
+  const shimCache = new Map();
+  const nodeShim = (command) => {
+    if (typeof command !== "string") return null;
+    const lower = command.toLowerCase();
+    if (!lower.endsWith(".cmd") && !lower.endsWith(".bat")) return null;
+    if (shimCache.has(command)) return shimCache.get(command);
+    let resolved = null;
+    try {
+      const source = fs.readFileSync(command, "utf8");
+      const match = source.match(/"(%dp0%[^"]*\.(?:c|m)?js)"/i);
+      if (match) {
+        const script = path.resolve(
+          path.dirname(command),
+          match[1].replace(/%dp0%/gi, "."),
+        );
+        if (fs.existsSync(script)) {
+          resolved = { command: process.execPath, args: [script] };
+        }
+      }
+    } catch {
+      // A shim that cannot be read or is not a Node launcher keeps the
+      // original command; the caller falls back to the shell path.
+    }
+    shimCache.set(command, resolved);
+    return resolved;
+  };
+  const withNodeShim = (command, args, options) => {
+    const shim = nodeShim(command);
+    if (!shim) return null;
+    return {
+      command: shim.command,
+      args: shim.args.concat(Array.isArray(args) ? args : []),
+      options: { ...hiddenOptions(options), shell: false },
+    };
+  };
+
   const wrapSpawn = (original) => function(command, args, options) {
     if (Array.isArray(args)) {
+      const shim = withNodeShim(command, args, options);
+      if (shim) return original.call(this, shim.command, shim.args, shim.options);
       return original.call(this, command, args, hiddenOptions(options));
     }
+    const shim = withNodeShim(command, [], args);
+    if (shim) return original.call(this, shim.command, shim.args, shim.options);
     return original.call(this, command, hiddenOptions(args));
   };
   const wrapExecFileSync = (original) => function(file, args, options) {
     if (Array.isArray(args)) {
+      const shim = withNodeShim(file, args, options);
+      if (shim) return original.call(this, shim.command, shim.args, shim.options);
       return original.call(this, file, args, hiddenOptions(options));
     }
+    const shim = withNodeShim(file, [], args);
+    if (shim) return original.call(this, shim.command, shim.args, shim.options);
     return original.call(this, file, hiddenOptions(args));
   };
 
@@ -96,13 +148,21 @@ if (process.platform === "win32") {
   childProcess.execFile = function(file, args, options, callback) {
     if (Array.isArray(args)) {
       if (typeof options === "function") {
+        const shim = withNodeShim(file, args, undefined);
+        if (shim) return originalExecFile.call(this, shim.command, shim.args, shim.options, options);
         return originalExecFile.call(this, file, args, hiddenOptions(), options);
       }
+      const shim = withNodeShim(file, args, options);
+      if (shim) return originalExecFile.call(this, shim.command, shim.args, shim.options, callback);
       return originalExecFile.call(this, file, args, hiddenOptions(options), callback);
     }
     if (typeof args === "function") {
+      const shim = withNodeShim(file, [], undefined);
+      if (shim) return originalExecFile.call(this, shim.command, shim.args, shim.options, args);
       return originalExecFile.call(this, file, [], hiddenOptions(), args);
     }
+    const shim = withNodeShim(file, [], args);
+    if (shim) return originalExecFile.call(this, shim.command, shim.args, shim.options, options);
     return originalExecFile.call(this, file, [], hiddenOptions(args), options);
   };
 

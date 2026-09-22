@@ -41,7 +41,6 @@ use gpui_component::{
     scroll::{ScrollableElement as _, ScrollbarAxis},
     searchable_list::SearchableListItem,
     select::{Select, SelectEvent, SelectState},
-    spinner::Spinner,
     tooltip::Tooltip,
     v_flex,
 };
@@ -99,6 +98,7 @@ use crate::platform::{
 };
 use crate::resize_seam;
 use crate::skeleton;
+use crate::spinner::Spinner;
 use crate::terminal_surface::TerminalSurface;
 
 const FILE_ROW_HEIGHT: f32 = 28.0;

@@ -13,7 +13,7 @@ use vibex_ui::{
     RADII, SHADOWS_ENABLED, default_theme, semantic_token as catalog_token, theme_index,
 };
 
-use crate::motion::mix;
+use crate::motion::{mix, set_user_reduced_motion};
 
 pub use vibex_ui::{
     TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
@@ -211,8 +211,11 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     // Keep gpui's global animation flag in step with the user preference: the
     // vendored gpui snaps every `with_animation` element (modal slides, menu
     // fades, entrance lifts) to its end state and schedules no frames while it
-    // is set — the app-side `Transition` checks stay as a second guard.
-    cx.set_reduce_motion(appearance.reduced_motion);
+    // is set — the app-side `Transition` checks stay as a second guard. The
+    // workbench window ORs in its own "not active" pause through the same
+    // helper, so a background window stops animating without losing the
+    // preference.
+    set_user_reduced_motion(appearance.reduced_motion, cx);
     let theme = Theme::global_mut(cx);
     theme.font_family = appearance
         .interface_font

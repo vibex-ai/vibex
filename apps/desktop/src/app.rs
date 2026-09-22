@@ -64,7 +64,6 @@ use gpui_component::{
     searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectDelegate, SelectEvent, SelectState},
     shimmer::ShimmerText,
-    spinner::Spinner,
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -205,6 +204,7 @@ use crate::remote_client::{
 };
 use crate::responsive::WorkbenchVisibility;
 use crate::skeleton;
+use crate::spinner::Spinner;
 use crate::terminal_surface::{TerminalSurface, available_shells, bind_terminal_keys};
 use crate::typography as type_scale;
 use crate::usage::UsageView;
@@ -501,6 +501,14 @@ const TIMELINE_STREAMING_MARKDOWN_REFRESH_INTERVAL: Duration = Duration::from_mi
 const TIMELINE_STREAMING_MARKDOWN_REFRESH_BYTES: usize = 8 * 1024;
 const STARTUP_WORDMARK_SHIMMER_DURATION: Duration = Duration::from_secs(12);
 const SHIMMER_SCAN_PASSES: f32 = 10.0;
+/// Frame rate cap for the app's own repeating animations.
+///
+/// A repeating `with_animation` otherwise asks for a frame on every display
+/// refresh for as long as it is mounted, and the workbench repaints as a whole.
+/// These sweeps are slow enough that sampling them 30 times a second is
+/// visually identical while cutting the repaints by more than half on a 75Hz
+/// panel.
+const REPEATING_ANIMATION_MAX_FPS: f32 = 30.0;
 /// One complete sweep of the collapsed thinking label's shimmer. The
 /// hand-rolled indicator ran ten passes through a twelve-second loop, so keep
 /// the same pace now that the kit's `ShimmerText` measures one sweep per
@@ -6925,6 +6933,7 @@ pub struct VibexWorkbench {
     startup_loading_indicator_task: Option<Task<()>>,
     startup_loading_release_task: Option<Task<()>>,
     appearance_subscription: Option<Subscription>,
+    window_activation_subscription: Option<Subscription>,
     quit_subscription: Option<Subscription>,
     _agent_subscriptions: Vec<Subscription>,
 }
@@ -7808,6 +7817,7 @@ impl VibexWorkbench {
             startup_loading_indicator_task: None,
             startup_loading_release_task: None,
             appearance_subscription: None,
+            window_activation_subscription: None,
             quit_subscription: None,
             _agent_subscriptions: agent_subscriptions,
         };
@@ -7898,6 +7908,16 @@ impl VibexWorkbench {
                     cx.notify();
                 }
             }));
+        // A window nobody is looking at does not need to animate: pausing
+        // repeating animations while it is inactive keeps a backgrounded
+        // workbench from repainting at the panel rate. The helper ORs this in
+        // with the user's reduced-motion preference, so the setting survives.
+        self.window_activation_subscription = Some(cx.observe_window_activation(
+            window,
+            |_this, window, cx| {
+                motion::set_window_active(window.is_window_active(), cx);
+            },
+        ));
         let focus = self.focus_handle.clone();
         window.defer(cx, move |window, cx| {
             if window.focused(cx).is_none() {
@@ -7915,6 +7935,7 @@ impl VibexWorkbench {
         }
         self.settings_open = false;
         self.appearance_subscription = None;
+        self.window_activation_subscription = None;
         cx.notify();
     }
 
@@ -58378,7 +58399,9 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
         .h(height)
         .child(div().absolute().inset_0().rounded(radius).with_animation(
             "mobile-pair-gradient",
-            Animation::new(MOBILE_PAIR_GRADIENT_DURATION).repeat(),
+            Animation::new(MOBILE_PAIR_GRADIENT_DURATION)
+                .repeat()
+                .with_max_fps(REPEATING_ANIMATION_MAX_FPS),
             move |this, delta| {
                 let position = delta * MOBILE_PAIR_GRADIENT.len() as f32;
                 this.bg(linear_gradient(
@@ -64618,7 +64641,9 @@ fn startup_loading_wordmark(show_shimmer: bool, cx: &App) -> AnyElement {
     container
         .with_animation(
             "startup-wordmark-shimmer",
-            Animation::new(STARTUP_WORDMARK_SHIMMER_DURATION).repeat(),
+            Animation::new(STARTUP_WORDMARK_SHIMMER_DURATION)
+                .repeat()
+                .with_max_fps(REPEATING_ANIMATION_MAX_FPS),
             move |this, delta| this.child(wordmark(Some(shimmer_scan_position(delta, 0.0, 1.0)))),
         )
         .into_any_element()

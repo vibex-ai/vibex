@@ -34,7 +34,6 @@ use gpui_component::{
     notification::NotificationType,
     pagination::Pagination,
     scroll::ScrollableElement as _,
-    spinner::Spinner,
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -78,6 +77,7 @@ use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::resize_seam;
 use crate::skeleton;
+use crate::spinner::Spinner;
 use crate::terminal_surface::TerminalSurface;
 use crate::terminal_transport::{
     LocalTerminalTransport, RemoteTerminalTransport, TerminalTransport,

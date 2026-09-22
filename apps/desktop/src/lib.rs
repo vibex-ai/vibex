@@ -24,6 +24,7 @@ pub mod remote_client;
 pub mod resize_seam;
 pub mod responsive;
 pub mod skeleton;
+pub mod spinner;
 pub mod system_tray;
 pub mod terminal_surface;
 pub mod terminal_transport;
