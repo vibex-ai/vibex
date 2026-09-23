@@ -1682,6 +1682,39 @@ impl CodeWorkbench {
         self.sync_terminal_surface_activity(cx);
     }
 
+    /// The editor that holds the keyboard right now, if one does.
+    ///
+    /// Focus is per surface, and find is too: the chord belongs to the file the
+    /// user is looking at, not to the conversation behind it. Only the host that
+    /// draws the panel answers for it — a detached panel lives in its own window
+    /// — and a panel that is not on screen answers for nobody, even while a
+    /// stale focus handle still names one of its editors. The window keeps that
+    /// handle until something else takes focus, so focus alone would let a panel
+    /// the user just closed swallow the chord.
+    pub(crate) fn focused_editor(&self, window: &Window, cx: &App) -> Option<Entity<EditorState>> {
+        if self.preview_detached || !self.preview_visible {
+            return None;
+        }
+        self.editor_bindings
+            .values()
+            .find(|binding| binding.input.read(cx).focus_handle(cx).is_focused(window))
+            .map(|binding| binding.input.clone())
+    }
+
+    /// Opens the focused editor's own find panel. Returns whether one took the
+    /// request; `false` leaves the chord to whoever asked.
+    pub(crate) fn open_focused_editor_find(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(input) = self.focused_editor(window, cx) else {
+            return false;
+        };
+        input.update(cx, |input, cx| input.open_search(false, cx));
+        true
+    }
+
     pub(crate) fn set_workspace_surface_visibility(
         &mut self,
         files_visible: bool,
@@ -4435,6 +4468,14 @@ impl CodeWorkbench {
         let input = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(language)
+                // The file's own find is part of the contract: the workbench
+                // hands the find chord to the focused editor instead of opening
+                // the conversation's, and `open_search` is a no-op on an editor
+                // that is not searchable. A read-only file still searches —
+                // `replaceable` below decides whether the panel may rewrite
+                // matches, and the state reports itself unreplaceable while the
+                // editor is not editable.
+                .searchable(true)
                 .replaceable(true)
                 .soft_wrap(self.editor_soft_wrap)
                 .show_whitespaces(self.editor_show_whitespaces)
@@ -17575,6 +17616,109 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(500));
         cx.run_until_parked();
         assert!(workbench.read_with(cx, |this, _| this.autosave_task.is_none()));
+    }
+
+    /// The file editor owns the find shortcut while it holds the keyboard.
+    ///
+    /// A file editor and a conversation are usually on screen together, and the
+    /// workbench claims the same chord for finding in the conversation. The
+    /// editor's own binding has to answer that chord, so the file's find opens
+    /// instead of the session's.
+    #[gpui::test]
+    fn the_file_editor_owns_the_find_shortcut(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        // The fixture's README opens as a rendered Markdown preview. Find
+        // belongs to the editor, so the tab has to show its source first.
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        cx.run_until_parked();
+
+        input.read_with(cx, |input, _| {
+            assert!(
+                input.search_session().open,
+                "the editor must open its own find, not hand the chord to the workbench"
+            );
+        });
+    }
+
+    /// The workbench's find chord reaches the focused editor and nobody else.
+    ///
+    /// This is the workbench's side of the hand-off: a focused editor takes the
+    /// request, while a panel that is off screen or holds no keyboard leaves it
+    /// to the conversation behind it. A stale focus handle outlives a panel the
+    /// user closed, so focus alone is not enough to claim the chord.
+    #[gpui::test]
+    fn the_find_chord_reaches_the_focused_editor(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+            this.set_preview_visible(true, cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        });
+        assert!(delegated, "a focused editor takes the find chord");
+        input.read_with(cx, |input, _| {
+            assert!(input.search_session().open, "the file's find opens");
+        });
+
+        // A panel the user closed keeps the focus handle until something else
+        // takes focus; the chord must go back to the conversation then.
+        workbench.update(cx, |this, cx| {
+            this.set_preview_visible(false, cx);
+        });
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        });
+        assert!(
+            !delegated,
+            "a panel that is not on screen never answers the chord"
+        );
+
+        // A detached panel is drawn by its own window, so this column must not
+        // answer for it either — and the app keeps `preview_visible` set while
+        // the panel is detached, so that flag alone cannot tell the two apart.
+        workbench.update(cx, |this, cx| {
+            this.set_preview_visible(true, cx);
+            this.set_preview_detached(true, cx);
+        });
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        });
+        assert!(!delegated, "the detached host answers for its own panel");
+
+        // And neither does a visible panel that does not hold the keyboard.
+        workbench.update(cx, |this, cx| {
+            this.set_preview_detached(false, cx);
+            this.set_preview_visible(true, cx);
+        });
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
+        });
+        assert!(!delegated, "an unfocused editor leaves the chord alone");
     }
 
     #[test]

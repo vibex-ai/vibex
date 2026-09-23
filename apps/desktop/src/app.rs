@@ -28662,7 +28662,21 @@ impl VibexWorkbench {
             && self.selected_session_id.is_some()
     }
 
+    /// Opens find on whichever surface holds the keyboard.
+    ///
+    /// The file editor binds the same chord for its own find, but a workbench
+    /// binding is registered after the component's and so outranks it: with a
+    /// file editor focused, the conversation's find opened over the file the
+    /// user was reading. Find follows focus — the editor answers for itself
+    /// here, and only a conversation that actually has the keyboard falls
+    /// through to the session search.
     fn open_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let code_workbench = self.code_workbench.clone();
+        if code_workbench.update(cx, |workbench, cx| {
+            workbench.open_focused_editor_find(window, cx)
+        }) {
+            return;
+        }
         if !self.conversation_context_active() {
             return;
         }
@@ -34979,13 +34993,18 @@ impl VibexWorkbench {
             self.prune_elicitation_forms();
         }
         let conversation = self.render_agent_workbench_for(false, window, cx);
+        // The find bar belongs to the focused pane alone: it searches the
+        // conversation that pane shows, and this is where that pane's view is
+        // the borrowed one. Rendering it in every pane would search the same
+        // timeline twice and put two live inputs on screen for one query.
+        let conversation_find = focused.then(|| self.render_conversation_find(cx)).flatten();
         // The composer is part of this pane's view, so it has to be built while
         // that view is still borrowed. The borrow itself is handed back by the
         // workspace once every pane has rendered, not here: re-borrowing the
         // primary between panes would store and reload a view per pane for
         // nothing.
         let composer = self.render_composer(window, cx, focused);
-        self.session_group_pane_with_composer(conversation, composer, window, cx)
+        self.session_group_pane_with_composer(conversation, conversation_find, composer, window, cx)
     }
 
     /// Puts a pane's own composer under its conversation.
@@ -34995,9 +35014,15 @@ impl VibexWorkbench {
     /// runtime controls. Only the focused pane's composer is enabled: a pane
     /// that does not hold the keyboard shows its session's draft but cannot be
     /// typed into until it is clicked.
+    ///
+    /// `conversation_find` is the focused pane's find bar, if find is open. It
+    /// sits between the conversation and the composer, exactly where the
+    /// single-session workbench puts it, so the bar that searches a pane is
+    /// visibly the one that belongs to that pane.
     fn session_group_pane_with_composer(
         &mut self,
         content: AnyElement,
+        conversation_find: Option<AnyElement>,
         composer: AnyElement,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -35016,6 +35041,7 @@ impl VibexWorkbench {
                     .overflow_hidden()
                     .child(content),
             )
+            .when_some(conversation_find, |this, find| this.child(find))
             .child(composer)
             .into_any_element()
     }
@@ -35216,6 +35242,14 @@ impl VibexWorkbench {
             && self.selected_session_id.as_ref() != Some(&session_id)
         {
             self.select_session(session_id, cx);
+            // The find bar follows the focused pane, so the match it was on
+            // belonged to the pane that just lost the keyboard. Re-anchor on the
+            // conversation it now searches instead of leaving an index that
+            // points into the other pane's timeline.
+            if self.conversation_find_open {
+                self.conversation_find_active_index = 0;
+                self.reveal_active_conversation_find_match(cx);
+            }
             return;
         }
         if changed {
@@ -45908,7 +45942,13 @@ impl VibexWorkbench {
         &self,
         rows: &[TimelineRow],
     ) -> Option<SessionSearchHighlight> {
-        if self.conversation_find_open && !self.conversation_find_query.is_empty() {
+        // The bar searches the focused pane's conversation, so only that pane
+        // highlights: a split would otherwise tint every pane's copy of the
+        // query while the count and the active match describe one of them.
+        if self.conversation_find_open
+            && !self.conversation_find_query.is_empty()
+            && self.timeline.session_id.as_ref() == self.selected_session_id.as_ref()
+        {
             let query = self.conversation_find_query.as_str();
             let matched_text = rows.iter().find_map(|row| {
                 if !timeline_row_is_search_text(row.kind) {
@@ -68573,6 +68613,23 @@ mod tests {
         assert!(workbench.contains("modifiers.control || modifiers.platform"));
         assert!(workbench.contains("this.open_conversation_find(window, cx)"));
 
+        // Find follows the keyboard. The file editor binds the same chord for
+        // its own find, but this workbench's binding is registered after the
+        // component's and therefore outranks it, so the editor has to be asked
+        // first or the conversation's find opens over the file being read.
+        let opener = source
+            .split_once("    fn open_conversation_find(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn close_conversation_find("))
+            .map(|(body, _)| body)
+            .expect("conversation find opener should remain inspectable");
+        let delegate = opener
+            .find("workbench.open_focused_editor_find(window, cx)")
+            .expect("the opener should offer the chord to the focused editor");
+        let context = opener
+            .find("if !self.conversation_context_active() {")
+            .expect("the opener should still require a conversation");
+        assert!(delegate < context);
+
         let renderer = source
             .split_once("    fn render_conversation_find(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_timeline_turn("))
@@ -68603,6 +68660,12 @@ mod tests {
         // Tool activity is not searchable, so a query that only appears in it
         // must not tint the row.
         assert!(highlights.contains("timeline_row_is_search_text(row.kind)"));
+        // A group pane highlights only when it is the conversation the bar
+        // searches, which is the one the borrowed view belongs to.
+        assert!(
+            highlights
+                .contains("self.timeline.session_id.as_ref() == self.selected_session_id.as_ref()")
+        );
 
         let reveal = source
             .split_once("    fn highlight_session_search_rows(")
@@ -82370,10 +82433,16 @@ mod tests {
         // Re-borrowing the primary between panes made a split store and reload a
         // view twice for every pane, every frame.
         assert!(content.contains("let composer = self.render_composer(window, cx, focused);"));
+        // The find bar is built in the same borrow, and only for the focused
+        // pane: it searches that pane's conversation, so a bar in every pane
+        // would put two live inputs on one query.
+        assert!(content.contains("let conversation_find = focused"));
+        assert!(content.contains(".then(|| self.render_conversation_find(cx))"));
         assert!(!content.contains("self.release_session_view();"));
         assert!(
-            content
-                .contains("session_group_pane_with_composer(conversation, composer, window, cx)")
+            content.contains(
+                "session_group_pane_with_composer(conversation, conversation_find, composer, window, cx)"
+            )
         );
         // The pane owns its element tree behind a cached view boundary, so it
         // also hands its own borrow back; the workspace only drops the views of
