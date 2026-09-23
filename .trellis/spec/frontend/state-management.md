@@ -1423,6 +1423,15 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   row paints at every frame of the hover wash. Do not reserve the action-slot
   width on the status column: that truncates long titles while the buttons are
   hidden and leaves dead space next to the title.
+- A pinned session row keeps reporting its own state. The compact state mark —
+  spinner while the Agent works, attention glyph while it is parked on the user,
+  dot for the states a dot can carry — renders in the lane left of the pin mark,
+  and the pin mark owns the column's trailing slot. Pinning a session must never
+  hide whether it is still working. The wide members of the column (the state
+  chip and the relative time) stay unpinned-only so the pin does not push them
+  into the title. The whole column yields to the hover action cluster in every
+  row, pinned included: that cluster's own pin button carries the pinned mark in
+  the warning color while the pointer is on the row.
 - Session-row drag/drop carries the typed session id, project id, and pin band. A
   direct row-to-row reorder may target only another session in the same project
   and pin band; a folder drop may change the parent only inside that same project.

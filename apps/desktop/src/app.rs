@@ -37250,6 +37250,29 @@ impl VibexWorkbench {
         let state_label = (display_state != AgentSessionState::Error)
             .then(|| sidebar_session_state_label(display_state, strings))
             .flatten();
+        // The compact mark every row shows for the session's own state: a
+        // spinner while the Agent works, the attention glyph while it is parked
+        // on the user, a dot for the states a dot can carry. A pinned row keeps
+        // it too, drawn in the lane left of the pin mark, so pinning a session
+        // never hides whether it is still working.
+        let session_status_mark = if session_awaiting_user {
+            Some(sidebar_attention_icon(
+                format!("sidebar-session-attention-{session_id_string}"),
+                strings.sidebar_needs_input,
+                cx,
+            ))
+        } else if !has_unread_completion
+            && !session_has_error
+            && display_state != AgentSessionState::Idle
+        {
+            Some(sidebar_session_status_indicator(
+                display_state,
+                auto_continue_enabled,
+                cx,
+            ))
+        } else {
+            None
+        };
         let time_label = format_sidebar_session_time(
             session.last_message_at_ms,
             self.resolved_locale(),
@@ -37683,19 +37706,13 @@ impl VibexWorkbench {
                             .gap(px(6.0))
                             .text_sm()
                             .text_color(cx.theme().sidebar_foreground.opacity(0.48))
-                            .when(!self.sidebar_batch_mode && !pinned, |this| {
+                            // The hover action cluster paints over this exact
+                            // column, so the whole column yields to it in every
+                            // row. A pinned row yields too: the cluster's own
+                            // pin button carries the pinned mark in the warning
+                            // color while the pointer is on the row.
+                            .when(!self.sidebar_batch_mode, |this| {
                                 this.group_hover(&hover_group, |style| style.invisible())
-                            })
-                            .when(pinned, |this| {
-                                this.child(
-                                    div()
-                                        .group_hover(&hover_group, |style| style.invisible())
-                                        .child(
-                                            sidebar_icon("icons/vibex/pin.svg")
-                                                .size(px(14.0))
-                                                .text_color(cx.theme().warning),
-                                        ),
-                                )
                             })
                             .when(auto_continue_paused, |this| {
                                 this.child(
@@ -37704,7 +37721,6 @@ impl VibexWorkbench {
                                             "sidebar-session-auto-continue-paused-{session_id_string}"
                                         ))
                                         .flex_none()
-                                        .group_hover(&hover_group, |style| style.invisible())
                                         .tooltip(move |window, cx| {
                                             Tooltip::new(auto_continue_paused_label)
                                                 .build(window, cx)
@@ -37716,27 +37732,7 @@ impl VibexWorkbench {
                                         ),
                                 )
                             })
-                            .when(
-                                !pinned
-                                    && !session_awaiting_user
-                                    && !has_unread_completion
-                                    && !session_has_error
-                                    && display_state != AgentSessionState::Idle,
-                                |this| {
-                                    this.child(sidebar_session_status_indicator(
-                                        display_state,
-                                        auto_continue_enabled,
-                                        cx,
-                                    ))
-                                },
-                            )
-                            .when(!pinned && session_awaiting_user, |this| {
-                                this.child(sidebar_attention_icon(
-                                    format!("sidebar-session-attention-{session_id_string}"),
-                                    strings.sidebar_needs_input,
-                                    cx,
-                                ))
-                            })
+                            .when_some(session_status_mark, |this, mark| this.child(mark))
                             .when(
                                 !pinned && !session_awaiting_user && !session_generating,
                                 |this| {
@@ -37774,6 +37770,16 @@ impl VibexWorkbench {
                             })
                             .when(session_has_error, |this| {
                                 this.child(sidebar_status_dot(cx.theme().danger))
+                            })
+                            // The pin mark owns the column's trailing slot, so a
+                            // pinned session reports its state to the mark's
+                            // left instead of losing it to the pin.
+                            .when(pinned, |this| {
+                                this.child(
+                                    sidebar_icon("icons/vibex/pin.svg")
+                                        .size(px(14.0))
+                                        .text_color(cx.theme().warning),
+                                )
                             }),
                     ),
             )
@@ -73091,9 +73097,10 @@ mod tests {
             sidebar_session
                 .contains("let session_has_error = display_state == AgentSessionState::Error")
         );
-        assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                                        display_state,\n                                        auto_continue_enabled,\n                                        cx,\n                                    )"));
+        assert!(sidebar_session.contains("sidebar_session_status_indicator(\n                display_state,\n                auto_continue_enabled,\n                cx,\n            )"));
         assert!(source.contains(".color(if auto_continue_enabled {"));
         assert!(source.contains("cx.theme().success"));
+        assert!(sidebar_session.contains("let session_status_mark = if session_awaiting_user {"));
         assert!(sidebar_session.contains("!session_awaiting_user"));
         assert!(sidebar_session.contains("!has_unread_completion"));
         assert!(sidebar_session.contains("display_state != AgentSessionState::Idle"));
@@ -73101,16 +73108,35 @@ mod tests {
         assert!(sidebar_session.contains(".when(pinned, |this|"));
         assert!(sidebar_session.contains("icons/vibex/pin.svg"));
         assert!(sidebar_session.contains(".icon(if pinned {"));
-        assert!(sidebar_session.contains(
-            "div()\n                                        .group_hover(&hover_group, |style| style.invisible())"
-        ));
-        assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode && !pinned, |this|"));
+        assert!(sidebar_session.contains(".when(!self.sidebar_batch_mode, |this|"));
+        assert!(
+            sidebar_session
+                .contains(".when_some(session_status_mark, |this, mark| this.child(mark))")
+        );
+        // The pin mark owns the trailing slot of the status column: a pinned
+        // session reports its own state in the lane to the mark's left, and the
+        // column yields to the hover action cluster in every row.
+        let status_column = sidebar_session
+            .split_once(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))")
+            .and_then(|(_, tail)| tail.split_once(".when(self.sidebar_batch_mode, |this| {"))
+            .map(|(column, _)| column)
+            .expect("the session status column should remain inspectable");
+        let status_mark = status_column
+            .find(".when_some(session_status_mark, |this, mark| this.child(mark))")
+            .expect("the status column should draw the session state mark");
+        let pin_mark = status_column
+            .find(".when(pinned, |this| {")
+            .expect("the status column should draw the pin mark");
+        assert!(pin_mark > status_mark);
+        assert!(status_column[pin_mark..].contains("icons/vibex/pin.svg"));
+        assert!(status_column[..pin_mark].contains(".when(has_unread_completion, |this| {"));
+        assert!(status_column[..pin_mark].contains(".when(session_has_error, |this| {"));
         assert!(sidebar_session.contains("sidebar_attention_icon("));
         assert!(sidebar_session.contains("strings.sidebar_needs_input"));
         assert!(!sidebar_session.contains("Icon::new(IconName::LoaderCircle)"));
         assert!(!sidebar_session.contains("sidebar-session-error-{session_id_string}"));
         assert!(!sidebar_session.contains(".child(strings.sidebar_state_error)"));
-        assert!(sidebar_session.contains("&& !session_has_error\n                                    && display_state != AgentSessionState::Idle"));
+        assert!(sidebar_session.contains("} else if !has_unread_completion\n            && !session_has_error\n            && display_state != AgentSessionState::Idle"));
         assert!(sidebar_session.contains(
             "&& !session_has_error\n                                            && !auto_continue_paused,\n                                        |this| this.child(time_label)"
         ));
