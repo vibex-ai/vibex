@@ -28,6 +28,11 @@ NativeBackend/WebRemoteBackend boundary.
 - Loading, empty, streaming, error, reconnecting, and permission-pending states
   are handled.
 - Components are keyboard accessible where interaction exists.
+- Rendering that pauses itself because the window is inactive (paused repeating
+  animations, skipped repaints) is an opt-in appearance preference, never an
+  unconditional default: it saves power, but it freezes the window the user
+  returns to. Record the preference in `AppearanceUiState` and apply it through
+  `theme::apply_appearance`.
 
 ## Responsive Requirements
 
