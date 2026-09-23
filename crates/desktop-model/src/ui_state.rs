@@ -327,6 +327,15 @@ pub struct AppearanceUiState {
     pub interface_font: FontSetting,
     pub code_font: FontSetting,
     pub reduced_motion: bool,
+    /// Whether the workbench stops animating — and stops asking for the
+    /// repaints those animations drive — while its window is not active.
+    ///
+    /// Off by default. The pause is a power optimization, and it costs the user
+    /// something visible: a backgrounded window freezes mid-animation and looks
+    /// stale the moment it is brought back, so it is a deliberate choice rather
+    /// than an unconditional behavior.
+    #[serde(default)]
+    pub pause_inactive_animation: bool,
     pub high_contrast: bool,
     /// Independently selected light and dark palettes. An absent slot resolves
     /// to the catalog default for that appearance, so state written before
@@ -437,6 +446,7 @@ impl Default for AppearanceUiState {
             interface_font: FontSetting::interface_default(),
             code_font: FontSetting::code_default(),
             reduced_motion: false,
+            pause_inactive_animation: false,
             high_contrast: false,
             theme_selection: ThemeSelection::default(),
         }
@@ -3478,6 +3488,25 @@ mod tests {
         );
         assert_eq!(migrated.appearance.theme_selection.light(), None);
         assert_eq!(migrated.appearance.theme_selection.dark(), None);
+    }
+
+    /// State written before the inactive-window pause existed must keep
+    /// loading, and must land on "keep animating" rather than on the pause.
+    #[test]
+    fn inactive_animation_pause_defaults_when_state_predates_it() {
+        assert!(!AppearanceUiState::default().pause_inactive_animation);
+
+        let mut value = serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        value
+            .get_mut("appearance")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("appearance state should serialize as an object")
+            .remove("pauseInactiveAnimation");
+        let decoded = decode_and_migrate(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            !decoded.appearance.pause_inactive_animation,
+            "an older file must not opt into the pause"
+        );
     }
 
     #[test]

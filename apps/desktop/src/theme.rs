@@ -13,7 +13,7 @@ use vibex_ui::{
     RADII, SHADOWS_ENABLED, default_theme, semantic_token as catalog_token, theme_index,
 };
 
-use crate::motion::{mix, set_user_reduced_motion};
+use crate::motion::{mix, set_pause_inactive_animation, set_user_reduced_motion};
 
 pub use vibex_ui::{
     TOKEN_PRODUCT_VISUAL_SOURCE, TOKEN_SCHEMA_VERSION, TOKEN_SOURCE_PATH, TOKEN_SOURCE_SHA256,
@@ -213,9 +213,10 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     // fades, entrance lifts) to its end state and schedules no frames while it
     // is set — the app-side `Transition` checks stay as a second guard. The
     // workbench window ORs in its own "not active" pause through the same
-    // helper, so a background window stops animating without losing the
-    // preference.
+    // helper, but only when the user asked for that pause, so a background
+    // window keeps animating by default.
     set_user_reduced_motion(appearance.reduced_motion, cx);
+    set_pause_inactive_animation(appearance.pause_inactive_animation, cx);
     let theme = Theme::global_mut(cx);
     theme.font_family = appearance
         .interface_font

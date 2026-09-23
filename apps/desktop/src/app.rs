@@ -7994,10 +7994,11 @@ impl VibexWorkbench {
                     cx.notify();
                 }
             }));
-        // A window nobody is looking at does not need to animate: pausing
-        // repeating animations while it is inactive keeps a backgrounded
-        // workbench from repainting at the panel rate. The helper ORs this in
-        // with the user's reduced-motion preference, so the setting survives.
+        // A window nobody is looking at does not need to animate, but pausing
+        // it is visible — a backgrounded workbench freezes until it is focused
+        // again — so the motion gate only applies the pause when the appearance
+        // setting asks for it. Recording the activation state here keeps that
+        // decision in the motion layer.
         self.window_activation_subscription = Some(cx.observe_window_activation(
             window,
             |_this, window, cx| {
@@ -31249,6 +31250,18 @@ impl VibexWorkbench {
 
     fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.appearance.reduced_motion = enabled;
+        self.queue_ui_state();
+        cx.notify();
+    }
+
+    /// Toggle the power optimization that freezes a backgrounded workbench.
+    ///
+    /// The gate lives in `motion`, and it is applied directly rather than
+    /// through a full appearance reload: nothing about the theme changes here,
+    /// only whether an inactive window keeps asking for frames.
+    fn set_pause_inactive_animation(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.ui_state.appearance.pause_inactive_animation = enabled;
+        motion::set_pause_inactive_animation(enabled, cx);
         self.queue_ui_state();
         cx.notify();
     }
@@ -59159,6 +59172,31 @@ fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> 
         ),
         settings_search_candidate(
             SettingsSection::Appearance,
+            locale::text(
+                "Pause animation when inactive",
+                "失焦时暂停动画",
+                "失焦時暫停動畫",
+            ),
+            locale::text(
+                "Stop animating, and stop the repaints those animations drive, while the Vibex window is not active. Saves power, but a backgrounded window looks frozen until it is focused again.",
+                "Vibex 窗口失焦后停止动画及其驱动的重绘。更省电，但窗口重新获得焦点前画面会保持静止。",
+                "Vibex 視窗失焦後停止動畫及其驅動的重繪。更省電，但視窗重新取得焦點前畫面會保持靜止。",
+            ),
+            &[
+                "animation",
+                "inactive",
+                "background",
+                "unfocused",
+                "power",
+                "动画",
+                "動畫",
+                "失焦",
+                "后台",
+                "後台",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Appearance,
             locale::text("High contrast", "高对比度", "高對比度"),
             locale::text(
                 "Increase borders and focus contrast.",
@@ -61481,6 +61519,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_pause_inactive_animation(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_pause_inactive_animation(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn set_high_contrast(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self
             .workbench
@@ -62574,6 +62619,26 @@ impl FoundationSettings {
                                 .checked(appearance.reduced_motion)
                                 .on_click(cx.listener(|this, enabled, _, cx| {
                                     this.set_reduced_motion(*enabled, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                        setting_row(
+                            locale::text(
+                                "Pause animation when inactive",
+                                "失焦时暂停动画",
+                                "失焦時暫停動畫",
+                            ),
+                            locale::text(
+                                "Stop animating, and stop the repaints those animations drive, while the Vibex window is not active. Saves power, but a backgrounded window looks frozen until it is focused again.",
+                                "Vibex 窗口失焦后停止动画及其驱动的重绘。更省电，但窗口重新获得焦点前画面会保持静止。",
+                                "Vibex 視窗失焦後停止動畫及其驅動的重繪。更省電，但視窗重新取得焦點前畫面會保持靜止。",
+                            ),
+                            Switch::new("pause-inactive-animation")
+                                .small()
+                                .checked(appearance.pause_inactive_animation)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_pause_inactive_animation(*enabled, cx)
                                 })),
                             stacked,
                             cx,

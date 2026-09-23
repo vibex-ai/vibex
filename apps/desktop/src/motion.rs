@@ -15,7 +15,10 @@
 //! Reduced motion: gpui's `App::reduce_motion` flag is honored automatically by
 //! every `with_animation` element — oneshots snap to their end state, repeating
 //! ones to their start state, and no frames are scheduled. The hover fades read
-//! the same flag in [`hover_listener`] and snap instead of tweening.
+//! the same flag in [`hover_listener`] and snap instead of tweening. The
+//! effective flag is the OR of the user's reduced-motion preference and — only
+//! while the "pause animation when inactive" setting is on — the window not
+//! being active.
 //!
 //! translateY is implemented as a `top` inset: taffy applies relative insets
 //! after layout, so — like a CSS transform — siblings never move. Entrances
@@ -538,6 +541,12 @@ static USER_REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 /// mounted.
 static WINDOW_INACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether an inactive window should also stop animating.
+///
+/// Off by default: the pause saves power, but it freezes a backgrounded
+/// workbench mid-animation, so it is opt-in through the appearance settings.
+static PAUSE_INACTIVE_ANIMATION: AtomicBool = AtomicBool::new(false);
+
 /// Record the user's reduced-motion preference and re-derive the effective
 /// flag. Called whenever the appearance settings are applied.
 pub fn set_user_reduced_motion(reduced: bool, cx: &mut App) {
@@ -545,19 +554,42 @@ pub fn set_user_reduced_motion(reduced: bool, cx: &mut App) {
     sync_reduce_motion(cx);
 }
 
-/// Record whether the workbench window is active. While it is not, every
-/// `with_animation` element snaps to its rest state and schedules no frames —
-/// gpui already implements that behind `App::reduce_motion`, so the gate
-/// reuses it rather than tracking each animation individually.
+/// Record whether an inactive window should pause its animations, and
+/// re-derive the effective flag. Called whenever the appearance settings are
+/// applied.
+pub fn set_pause_inactive_animation(enabled: bool, cx: &mut App) {
+    PAUSE_INACTIVE_ANIMATION.store(enabled, Ordering::Relaxed);
+    sync_reduce_motion(cx);
+}
+
+/// Record whether the workbench window is active. While it is not — and the
+/// setting asks for it — every `with_animation` element snaps to its rest state
+/// and schedules no frames; gpui already implements that behind
+/// `App::reduce_motion`, so the gate reuses it rather than tracking each
+/// animation individually.
 pub fn set_window_active(active: bool, cx: &mut App) {
     WINDOW_INACTIVE.store(!active, Ordering::Relaxed);
     sync_reduce_motion(cx);
 }
 
 fn sync_reduce_motion(cx: &mut App) {
-    let reduced =
-        USER_REDUCED_MOTION.load(Ordering::Relaxed) || WINDOW_INACTIVE.load(Ordering::Relaxed);
+    let reduced = effective_reduced_motion(
+        USER_REDUCED_MOTION.load(Ordering::Relaxed),
+        PAUSE_INACTIVE_ANIMATION.load(Ordering::Relaxed),
+        WINDOW_INACTIVE.load(Ordering::Relaxed),
+    );
     cx.set_reduce_motion(reduced);
+}
+
+/// The three inputs to [`sync_reduce_motion`], as a pure function so the truth
+/// table — in particular that an inactive window only pauses when the setting
+/// asks for it — is testable without an `App`.
+fn effective_reduced_motion(
+    user_reduced_motion: bool,
+    pause_inactive_animation: bool,
+    window_inactive: bool,
+) -> bool {
+    user_reduced_motion || (pause_inactive_animation && window_inactive)
 }
 
 #[cfg(test)]
@@ -736,6 +768,33 @@ mod tests {
         assert_eq!(fades.value_at("row", t0), 1.0, "enter snaps to 1");
         fades.set_at("row", false, true, t0);
         assert_eq!(fades.value_at("row", t0), 0.0, "leave snaps to 0");
+    }
+
+    /// An inactive window only stops animating when the setting asks for it.
+    ///
+    /// The default must leave a backgrounded workbench animating: the pause is
+    /// a power optimization, and it froze the window in a way the user could
+    /// see, so it is now opt-in.
+    #[test]
+    fn inactive_window_pauses_only_when_the_setting_is_on() {
+        assert!(
+            !effective_reduced_motion(false, false, true),
+            "an inactive window keeps animating by default"
+        );
+        assert!(!effective_reduced_motion(false, false, false));
+        assert!(
+            effective_reduced_motion(false, true, true),
+            "the setting pauses an inactive window"
+        );
+        assert!(
+            !effective_reduced_motion(false, true, false),
+            "the setting says nothing about an active window"
+        );
+        assert!(
+            effective_reduced_motion(true, false, false),
+            "the user's own preference still snaps animations"
+        );
+        assert!(effective_reduced_motion(true, true, true));
     }
 
     #[test]
