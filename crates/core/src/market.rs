@@ -61,8 +61,6 @@ pub struct McpMarketEntry {
     #[serde(default)]
     pub env: Vec<MarketEnvRequirement>,
     #[serde(default)]
-    pub verified: bool,
-    #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
     pub author: Option<String>,

@@ -13,8 +13,8 @@ use std::time::Duration;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task,
-    WeakEntity, Window, div, prelude::*, px,
+    Orientation, Rems, Render, Role, SharedString, StatefulInteractiveElement as _, Subscription,
+    Task, WeakEntity, Window, div, prelude::*, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -122,9 +122,15 @@ const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
 ///
 /// One band for the commands, the market entry and the search field. The kit's
 /// medium button size would be the obvious lever, but it also steps the label
-/// up to 16px — a size no other sidebar text uses — so these stay on the small
-/// type scale and take the height explicitly instead.
-const MANAGEMENT_SIDEBAR_CONTROL_HEIGHT: f32 = 32.0;
+/// up to the base body size — a size no other sidebar text uses — so these stay
+/// on the small type scale and take the height explicitly instead.
+///
+/// It is the kit's medium control frame expressed in `rem` (`h_8`), not a raw
+/// pixel count. A hand-pinned `32.0` was two pixels taller than the medium
+/// `Input` these controls share a row with, which left a visible step under
+/// every sidebar button, and it stayed at 32 px while the rest of the interface
+/// followed the text-scale setting.
+const MANAGEMENT_SIDEBAR_CONTROL_HEIGHT: Rems = rems(2.0);
 /// The height the Skill preview keeps before it starts scrolling.
 ///
 /// The body is shown in full rather than summarised, but it must not push the
@@ -10750,7 +10756,7 @@ impl ManagementCenter {
 
             grid = grid.child(management_market_card(
                 entry_id,
-                management_market_glyph(market_transport_icon_path(entry.transport), cx),
+                market_transport_icon_path(entry.transport),
                 name,
                 state,
                 meta,
@@ -11192,7 +11198,7 @@ impl ManagementCenter {
             let install_id = entry.id.clone();
             grid = grid.child(management_market_card(
                 entry_id,
-                management_market_glyph("icons/vibex/book-open.svg", cx),
+                "icons/vibex/book-open.svg",
                 entry.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
                 Some(entry.source.clone()),
@@ -20624,14 +20630,27 @@ struct MarketCardEndpoint {
 
 /// One market result, as a card.
 ///
-/// Every card in a row is the same height and puts its actions on the same
+/// The card is a chooser, not a container. It answers one question — "is this
+/// the server I want?" — so its reading order follows that question: identity
+/// first, then what the entry does, then the facts that tell it apart from a
+/// neighbour. Everything that did not answer the question was removed: the
+/// transport glyph is drawn at its own size instead of on a plate, the address
+/// is a line of text instead of a panel inside the panel, and the footer has no
+/// rule of its own because the card's boundary already separates it from the
+/// grid.
+///
+/// The card is also not a control. It used to blend its background under the
+/// pointer while offering no click, which promised an action that did not
+/// exist; the Install button is the card's only affordance and says so.
+///
+/// Every card in a row keeps the same height and puts its actions on the same
 /// baseline: the description and metadata take the slack, and the footer is
 /// pinned to the bottom, so a short entry does not leave its Install button
 /// floating halfway up the row.
 #[allow(clippy::too_many_arguments)]
 fn management_market_card(
     id: String,
-    glyph: AnyElement,
+    glyph_path: &'static str,
     name: String,
     state: Option<MarketEntryState>,
     meta: Option<String>,
@@ -20644,13 +20663,23 @@ fn management_market_card(
     install: AnyElement,
     cx: &App,
 ) -> AnyElement {
+    // Identity owns the strongest type on the card. The grid is a name picker,
+    // so the name takes the step above the body text rather than sitting on it.
     let identity = div()
         .min_w_0()
         .flex_1()
         .truncate()
-        .text_sm()
-        .font_medium()
+        .text_base()
+        .font_semibold()
         .child(name);
+
+    // Who published the entry, how current it is, and which package it pins are
+    // one class of fact. They share a single muted line instead of claiming a
+    // row each and pushing the description down the card.
+    let facts_line = match (meta, quiet_meta) {
+        (Some(meta), Some(quiet)) => Some(format!("{meta} · {quiet}")),
+        (meta, quiet) => meta.or(quiet),
+    };
 
     let mut body = v_flex()
         .min_w_0()
@@ -20660,7 +20689,15 @@ fn management_market_card(
             h_flex()
                 .w_full()
                 .min_w_0()
+                .items_center()
                 .gap_2()
+                .child(
+                    Icon::default()
+                        .path(glyph_path)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(cx.theme().muted_foreground),
+                )
                 .child(identity)
                 .children(
                     state
@@ -20668,30 +20705,41 @@ fn management_market_card(
                         .map(|state| management_market_state_tag(state, cx)),
                 ),
         )
-        .children(meta.map(|meta| {
+        .children(facts_line.map(|facts| {
             div()
                 .w_full()
                 .min_w_0()
                 .truncate()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(meta)
+                .child(facts)
         }))
-        .children(endpoint.map(|endpoint| {
-            // The launcher or address the install would write, on the card
-            // rather than only inside the form: it is the one fact that tells
-            // two similarly named entries apart before anything is opened. The
-            // leading glyph is what makes it read as an address rather than as
-            // another line of metadata.
-            h_flex()
+        // What the server does is what decides the click, so it is read before
+        // the address it happens to run on.
+        .children(description.map(|description| {
+            div()
                 .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_1p5()
-                .rounded(px(6.0))
-                .bg(cx.theme().muted.opacity(0.30))
-                .px_2()
-                .py_1()
+                .text_sm()
+                // `line_clamp` on its own clips the last line at the wrap point,
+                // so a long description ended mid-word with no mark that
+                // anything was missing. The ellipsis is what makes the clamp
+                // read as a summary rather than as a broken string.
+                .line_clamp(2)
+                .text_ellipsis()
+                .text_color(cx.theme().muted_foreground)
+                .child(description)
+        }));
+
+    // The transport and the address are one line: the chip classifies the entry
+    // and the monospace value identifies it. The leading glyph is what makes the
+    // value read as an address rather than as another line of metadata.
+    if chip.is_some() || endpoint.is_some() {
+        let mut endpoint_row = h_flex().w_full().min_w_0().items_center().gap_2();
+        if let Some(chip) = chip {
+            endpoint_row = endpoint_row.child(management_market_chip(chip, cx));
+        }
+        if let Some(endpoint) = endpoint {
+            endpoint_row = endpoint_row
                 .child(
                     Icon::default()
                         .path(endpoint.icon_path)
@@ -20708,32 +20756,11 @@ fn management_market_card(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(endpoint.text),
-                )
-        }))
-        .children(description.map(|description| {
-            div()
-                .w_full()
-                .text_sm()
-                .line_clamp(2)
-                .text_color(cx.theme().muted_foreground)
-                .child(description)
-        }));
+                );
+        }
+        body = body.child(endpoint_row);
+    }
 
-    let mut facts = h_flex().w_full().min_w_0().gap_2();
-    if let Some(chip) = chip {
-        facts = facts.child(management_market_chip(chip, cx));
-    }
-    if let Some(quiet_meta) = quiet_meta {
-        facts = facts.child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(quiet_meta),
-        );
-    }
-    body = body.child(facts);
     if let Some(caution) = caution {
         // A server that needs a credential before it runs is not a one-click
         // install, and saying so on the card is fairer than saying it only once
@@ -20758,20 +20785,12 @@ fn management_market_card(
     footer = footer.child(div().flex_1()).child(install);
     body = body
         // Absorbs whatever height the tallest card in the row adds, so the
-        // footer lands on the bottom edge instead of floating mid-card.
+        // footer lands on the bottom edge instead of floating mid-card. The gap
+        // is what separates it from the content; a rule here would repeat the
+        // card's own boundary one line above itself.
         .child(div().flex_1())
-        .child(
-            div()
-                .w_full()
-                .border_t_1()
-                .border_color(cx.theme().border.opacity(0.70))
-                .pt_2p5()
-                .child(footer),
-        );
+        .child(footer.pt_2());
 
-    let hover_key = crate::motion::hover_key("management-market-card", &id);
-    let rest = theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72);
-    let background = crate::motion::hover_blend(&hover_key, rest, cx.theme().accent.opacity(0.35));
     v_flex()
         .id(SharedString::from(format!("management-market-entry-{id}")))
         .min_w(px(MANAGEMENT_MARKET_CARD_MIN_WIDTH))
@@ -20780,23 +20799,9 @@ fn management_market_card(
         .rounded(cx.theme().radius_lg)
         .border_1()
         .border_color(cx.theme().border.opacity(0.80))
-        .bg(background)
+        .bg(theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72))
         .p_3()
-        .on_hover(hover_listener(hover_key))
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                // The body takes the card's whole height so its trailing spacer
-                // can push the footer onto the bottom edge; without this the
-                // slack lands under the footer as an empty band. The glyph has
-                // its own size, so stretching the row leaves it where it is.
-                .flex_1()
-                .items_stretch()
-                .gap_2p5()
-                .child(glyph)
-                .child(body),
-        )
+        .child(body)
         .into_any_element()
 }
 
@@ -21403,7 +21408,7 @@ fn management_market_toolbar(
                         // place the user pressed.
                         .small()
                         .outline()
-                        .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
+                        .h(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT)
                         .px_4()
                         .icon(IconName::Search)
                         .label(management_locale_text("Search", "搜索", "搜尋"))
@@ -21993,7 +21998,7 @@ fn management_sidebar_action(
         Button::new(id)
             .small()
             .outline()
-            .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
+            .h(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT)
             .px_3()
             // The glyph is drawn as content rather than through `icon()`: the
             // kit derives that slot from the button size, which would pin it to
@@ -22028,7 +22033,7 @@ fn management_market_entry_button(
         // search field below: one height, one type scale.
         .small()
         .w_full()
-        .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
+        .h(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT)
         .px_3()
         .child(
             // The button's own content row centers what it is given, so the

@@ -400,6 +400,8 @@ impl Render for OfficeSurface {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scrollbar()
+                        // No gutter: every body below already insets its own
+                        // content by at least the bar's lane.
                         .child(body)
                         .into_any_element()
                 }

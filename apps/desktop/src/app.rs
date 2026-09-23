@@ -181,8 +181,8 @@ use crate::directory_picker::{
     DirectoryBrowseTarget, DirectoryFavoritesHandler, DirectoryPickHandler, DirectoryPickerDialog,
 };
 use crate::gpui_ext::{
-    DOCS_SELF_HOSTED_SERVER_URL, button_with_aria_label, docs_help_button, hint_notification,
-    solid_empty_border,
+    DOCS_SELF_HOSTED_SERVER_URL, ScrollGutter as _, button_with_aria_label, docs_help_button,
+    hint_notification, solid_empty_border,
 };
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
@@ -38525,6 +38525,7 @@ impl VibexWorkbench {
             .border_color(cx.theme().border.opacity(0.70))
             .bg(cx.theme().popover)
             .p(px(6.0))
+            .scroll_gutter()
             .shadow_lg()
             .children(rows);
         let open_menu_id = menu_id.clone();
@@ -38958,6 +38959,7 @@ impl VibexWorkbench {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
+                    .scroll_gutter()
                     .when(loading && rows.is_empty(), |this| {
                         // Two sequential ACP calls report the methods, and the
                         // rows region is otherwise suppressed while they run,
@@ -40096,6 +40098,7 @@ impl VibexWorkbench {
                             .min_h_0()
                             .flex_1()
                             .overflow_y_scrollbar()
+                            .scroll_gutter()
                             .when(rows.is_empty(), |this| {
                                 this.child(runtime_menu_empty_state(
                                     self.runtime_provider_favorites_view,
@@ -40513,6 +40516,7 @@ impl VibexWorkbench {
             .min_h_0()
             .flex_1()
             .overflow_y_scrollbar()
+            .scroll_gutter()
             .when(project_rows.is_empty(), |this| {
                 this.child(
                     div()
@@ -41080,6 +41084,7 @@ impl VibexWorkbench {
             .border_color(border_color)
             .bg(popover_color)
             .p_2()
+            .scroll_gutter()
             .text_color(popover_foreground)
             .shadow_lg()
             .children(workspace_rows)
@@ -42916,6 +42921,7 @@ impl VibexWorkbench {
                             .min_h_0()
                             .flex_1()
                             .overflow_y_scrollbar()
+                            .scroll_gutter()
                             .when(rows.is_empty(), |this| {
                                 this.child(runtime_menu_empty_state(
                                     self.runtime_provider_favorites_view,
@@ -48563,6 +48569,7 @@ impl VibexWorkbench {
             .bg(cx.theme().muted.opacity(0.55))
             .px(px(10.0))
             .py_2()
+            .scroll_gutter()
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
             .font_weight(code_font_weight(cx))
@@ -48876,6 +48883,7 @@ impl VibexWorkbench {
                             .bg(output_surface)
                             .px_2p5()
                             .py_2()
+                            .scroll_gutter()
                             .font_family(cx.theme().mono_font_family.clone())
                             .font_weight(code_font_weight(cx))
                             .text_size(cx.theme().mono_font_size)
@@ -50080,7 +50088,8 @@ impl VibexWorkbench {
                         }),
                 )
             })
-            .overflow_y_scrollbar();
+            .overflow_y_scrollbar()
+            .scroll_gutter();
 
         // Quick opacity pop on mount; stays mounted while typing so the fade
         // does not replay per keystroke.
@@ -50208,6 +50217,7 @@ impl VibexWorkbench {
             .min_w_0()
             .max_h(px(180.0))
             .overflow_y_scrollbar()
+            .scroll_gutter()
             .gap_1()
             .children(rows);
         let header = h_flex()
@@ -61748,6 +61758,7 @@ impl FoundationSettings {
                 .max_h(px(SETTINGS_SEARCH_RESULT_MAX_HEIGHT))
                 .track_scroll(&self.search_scroll)
                 .overflow_y_scrollbar()
+                .scroll_gutter()
                 .gap_0()
                 .py_1()
                 .children(rendered)

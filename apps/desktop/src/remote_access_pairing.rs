@@ -39,7 +39,9 @@ use vibex_desktop_runtime::{
 
 use crate::{
     gpui_ext::{DOCS_REMOTE_MOBILE_URL, docs_help_button},
-    locale, spinner::Spinner, theme,
+    locale,
+    spinner::Spinner,
+    theme,
 };
 
 const PAIRING_OFFER_TTL_MS: u32 = 90_000;

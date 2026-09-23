@@ -787,7 +787,6 @@ fn registry_server_to_entry(record: &RegistryServerRecord) -> Option<McpMarketEn
         args,
         url,
         env,
-        verified: true,
         version,
         package_kind,
     })
@@ -2027,7 +2026,6 @@ mod tests {
             args: Vec::new(),
             url: Some("https://example.com/mcp".to_string()),
             env: Vec::new(),
-            verified: true,
             version: Some("1.0.0".to_string()),
             package_kind: Some("remote".to_string()),
         };

@@ -15,8 +15,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Hsla, IntoElement, ParentElement as _, RenderOnce,
-    Styled as _, Transformation, Window, div, ease_in_out, percentage,
-    prelude::FluentBuilder as _,
+    Styled as _, Transformation, Window, div, ease_in_out, percentage, prelude::FluentBuilder as _,
 };
 use gpui_component::{Icon, IconName, Sizable, Size};
 

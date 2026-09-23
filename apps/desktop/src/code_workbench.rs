@@ -87,7 +87,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
-use crate::gpui_ext::{hint_notification, solid_empty_border};
+use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -14155,6 +14155,9 @@ impl CodeRightRail {
                     .overflow_y_scrollbar()
                     .px_2()
                     .py_2()
+                    // The tree rows run edge to edge, so the region itself has
+                    // to keep the bar off their trailing end.
+                    .scroll_gutter()
                     .children(rows.into_iter().map(|(row, change)| {
                         self.render_git_tree_row(row, change, context.clone(), cx)
                     }))
