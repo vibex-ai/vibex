@@ -59246,10 +59246,10 @@ fn timeline_notification_body(kind: Option<NotificationKind>, agent_label: &str)
 /// sequence) and the watermark that batch advances to. The live event stream
 /// and the polling fallback both deliver the same committed item, so only the
 /// first delivery is past the mark.
-fn new_timeline_notification_events<'a>(
-    events: &'a [TimelineLiveEvent],
+fn new_timeline_notification_events(
+    events: &[TimelineLiveEvent],
     previous: Option<i64>,
-) -> (Vec<&'a TimelineLiveEvent>, Option<i64>) {
+) -> (Vec<&TimelineLiveEvent>, Option<i64>) {
     let max_sequence = events.iter().map(|event| event.sequence).max();
     let fresh = events
         .iter()
