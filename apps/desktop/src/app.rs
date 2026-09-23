@@ -14610,6 +14610,7 @@ impl VibexWorkbench {
         &mut self,
         workspace_id: &str,
         session_id: &VibexSessionId,
+        landed_on: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let valid_drag = self
@@ -14632,11 +14633,21 @@ impl VibexWorkbench {
             .cloned()
             .map(SidebarOrganizationItem::Session)
             .collect::<Vec<_>>();
-        // Resolved before the drop consumes the target: a member row inside the
-        // group is the one landing zone that keeps the sessions in it.
-        let keep_group = self.sidebar_session_drop_keep_group(direct_target.as_ref());
+        // The row the pointer released on decides which group keeps the
+        // sessions, not the last row the pointer happened to hover: a drop on
+        // one of the dragged rows themselves never updates the hover target, so
+        // reading it there kept a member of the group the sessions just left and
+        // turned "leave the group" into a no-op join.
+        let keep_group = landed_on.and_then(|session_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .group_of_session(session_id)
+                .map(str::to_string)
+        });
+        let group_ids = self.dragged_group_session_ids(&state.session_ids);
         if self.apply_sidebar_organization_drop(&moving, cx) {
-            self.apply_sidebar_session_group_drop(&state.session_ids, keep_group.as_deref(), cx);
+            self.apply_sidebar_session_group_drop(&group_ids, keep_group.as_deref(), cx);
             return;
         }
         let fallback_target = direct_target
@@ -14650,7 +14661,7 @@ impl VibexWorkbench {
             });
         if let Some((target_id, after)) = fallback_target {
             self.move_session_order_relative(&state.session_ids, &target_id, after, cx);
-            self.apply_sidebar_session_group_drop(&state.session_ids, keep_group.as_deref(), cx);
+            self.apply_sidebar_session_group_drop(&group_ids, keep_group.as_deref(), cx);
         } else {
             cx.notify();
         }
@@ -14707,39 +14718,31 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// The group a session drop lands inside, when it lands inside one.
+    /// The sessions a drop applies to the group it joins or leaves.
     ///
-    /// A group lists its members under its own row and nowhere else, so a drop
-    /// anywhere but a member of the same group is the user taking the sessions
-    /// out of it. `None` therefore means "outside every group".
-    fn sidebar_session_drop_keep_group(
-        &self,
-        direct_target: Option<&SidebarSessionDropTarget>,
-    ) -> Option<String> {
-        if let Some(target) = direct_target {
-            return self
-                .ui_state
-                .sidebar
-                .organization
-                .group_of_session(target.session_id.as_str())
-                .map(str::to_string);
+    /// The drag payload is captured when the row renders, so it can be older
+    /// than the selection on screen; the drop is the moment that matters. Every
+    /// selected session of the primary's project belongs to this drag, and
+    /// `start_sidebar_session_drag` narrows the selection to the row the drag
+    /// began on when that row was not part of it — so this cannot widen a drag
+    /// the user did not make.
+    fn dragged_group_session_ids(&self, payload_ids: &[String]) -> Vec<String> {
+        let Some(primary) = payload_ids.first() else {
+            return Vec::new();
+        };
+        let primary_item = SidebarOrganizationItem::Session(primary.clone());
+        let mut ids = payload_ids.to_vec();
+        for selected in &self.sidebar_move_selected_items {
+            let SidebarOrganizationItem::Session(session_id) = selected else {
+                continue;
+            };
+            if !ids.iter().any(|id| id == session_id)
+                && self.sidebar_move_selection_scope_matches(&primary_item, selected)
+            {
+                ids.push(session_id.clone());
+            }
         }
-        match self
-            .sidebar_organization_drop_target
-            .as_ref()
-            .map(|target| &target.target)
-        {
-            Some(SidebarOrganizationItem::Group(group_id)) => Some(group_id.clone()),
-            Some(SidebarOrganizationItem::Session(session_id)) => self
-                .ui_state
-                .sidebar
-                .organization
-                .group_of_session(session_id)
-                .map(str::to_string),
-            Some(SidebarOrganizationItem::Folder(_))
-            | Some(SidebarOrganizationItem::Project(_))
-            | None => None,
-        }
+        ids
     }
 
     /// Takes dragged sessions out of whatever group holds them.
@@ -14881,9 +14884,10 @@ impl VibexWorkbench {
             return;
         }
         let session_workspaces = self.sidebar_session_workspaces();
+        let session_ids = self.dragged_group_session_ids(session_ids);
         if !self.ui_state.sidebar.organization.add_sessions_to_group(
             group_id,
-            session_ids,
+            &session_ids,
             &session_workspaces,
         ) {
             return;
@@ -33092,6 +33096,7 @@ impl VibexWorkbench {
                                 this.finish_sidebar_session_drag(
                                     &drag.workspace_id,
                                     &drag.session_id,
+                                    None,
                                     cx,
                                 );
                                 cx.stop_propagation();
@@ -35366,7 +35371,7 @@ impl VibexWorkbench {
             .group(group_id)
             .is_some_and(|group| group.contains(session_id));
         if !already_member {
-            let mut joining = dragged_session_ids.to_vec();
+            let mut joining = self.dragged_group_session_ids(dragged_session_ids);
             if !joining.iter().any(|id| id == session_id) {
                 joining.push(session_id.to_string());
             }
@@ -36092,7 +36097,7 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }))
             .on_drop(cx.listener(|this, drag: &SidebarSessionDrag, _, cx| {
-                this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
+                this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, None, cx);
                 cx.stop_propagation();
             }))
             .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
@@ -37013,7 +37018,7 @@ impl VibexWorkbench {
                 cx.stop_propagation();
             }))
             .on_drop(cx.listener(|this, drag: &SidebarSessionDrag, _, cx| {
-                this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
+                this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, None, cx);
                 cx.stop_propagation();
             }))
             .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
@@ -37879,6 +37884,11 @@ impl VibexWorkbench {
         let release_workspace_id = session.workspace_id.as_str().to_string();
         let release_out_session_id = session.id.clone();
         let release_out_workspace_id = session.workspace_id.as_str().to_string();
+        // This row is the landing zone for its own drop, and for a mouse-up that
+        // never reached another row. The row the pointer released on decides
+        // which group keeps the sessions, so both carry this row's id.
+        let drop_landed_on = session_id_string.clone();
+        let release_landed_on = session_id_string.clone();
         let selection_indicator_state = if batch_selected {
             SidebarSelectionState::Checked
         } else {
@@ -37920,6 +37930,7 @@ impl VibexWorkbench {
                         this.finish_sidebar_session_drag(
                             &release_workspace_id,
                             &release_session_id,
+                            Some(release_landed_on.as_str()),
                             cx,
                         );
                     }),
@@ -37927,9 +37938,13 @@ impl VibexWorkbench {
                 .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
+                        // Released away from this row: whatever the pointer was
+                        // over handled the drop, so this only runs when it landed
+                        // on nothing — outside every group.
                         this.finish_sidebar_session_drag(
                             &release_out_workspace_id,
                             &release_out_session_id,
+                            None,
                             cx,
                         );
                     }),
@@ -37998,8 +38013,13 @@ impl VibexWorkbench {
                     },
                 ))
             })
-            .on_drop(cx.listener(|this, drag: &SidebarSessionDrag, _, cx| {
-                this.finish_sidebar_session_drag(&drag.workspace_id, &drag.session_id, cx);
+            .on_drop(cx.listener(move |this, drag: &SidebarSessionDrag, _, cx| {
+                this.finish_sidebar_session_drag(
+                    &drag.workspace_id,
+                    &drag.session_id,
+                    Some(drop_landed_on.as_str()),
+                    cx,
+                );
                 cx.stop_propagation();
             }))
             .on_drop(cx.listener(|this, drag: &SidebarFolderDrag, _, cx| {
@@ -82681,8 +82701,23 @@ mod tests {
             .map(|(body, _)| body)
             .expect("session drag finish should remain inspectable");
 
-        assert!(finish.contains("sidebar_session_drop_keep_group("));
+        // The row the pointer released on decides which group keeps the
+        // sessions. Reading the hover target instead kept a member of the group
+        // the drag was leaving whenever the drop landed on one of the dragged
+        // rows, which never updates that target — "leave the group" turned into
+        // a no-op join.
+        assert!(finish.contains("landed_on: Option<&str>"));
+        assert!(finish.contains("let keep_group = landed_on.and_then(|session_id|"));
         assert!(finish.contains("apply_sidebar_session_group_drop("));
+        assert!(!finish.contains("sidebar_session_drop_keep_group"));
+
+        let session_row = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+        assert!(session_row.contains("Some(drop_landed_on.as_str())"));
+        assert!(session_row.contains("Some(release_landed_on.as_str())"));
 
         let release = source
             .split_once("    fn release_dragged_sessions_from_groups(")
@@ -82692,6 +82727,55 @@ mod tests {
         assert!(release.contains("remove_sessions_from_group("));
         assert!(release.contains("release_group_session_views("));
         assert!(release.contains("group_of_session(session_id)"));
+    }
+
+    /// A drop changes the group for every session the user selected, not just
+    /// the one the payload the row happened to carry.
+    #[test]
+    fn a_group_drop_covers_the_whole_selection() {
+        let source = include_str!("app.rs");
+        let resolver = source
+            .split_once("    fn dragged_group_session_ids(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Takes dragged sessions out of whatever group holds them.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("group drop resolution should remain inspectable");
+        assert!(resolver.contains("for selected in &self.sidebar_move_selected_items"));
+        assert!(
+            resolver.contains("self.sidebar_move_selection_scope_matches(&primary_item, selected)")
+        );
+
+        let finish = source
+            .split_once("    fn finish_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Applies the group half"))
+            .map(|(body, _)| body)
+            .expect("session drag finish should remain inspectable");
+        assert!(
+            finish.contains("let group_ids = self.dragged_group_session_ids(&state.session_ids);")
+        );
+        assert!(finish.contains("self.apply_sidebar_session_group_drop(&group_ids,"));
+        assert!(!finish.contains("apply_sidebar_session_group_drop(&state.session_ids"));
+
+        let into_group = source
+            .split_once("    fn finish_sidebar_session_drag_into_group(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Adds one session to a group from the session's own menu.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("group row drop should remain inspectable");
+        assert!(
+            into_group.contains("let session_ids = self.dragged_group_session_ids(session_ids);")
+        );
+        assert!(
+            into_group.contains(
+                "add_sessions_to_group(\n            group_id,\n            &session_ids,"
+            )
+        );
     }
 
     #[test]
