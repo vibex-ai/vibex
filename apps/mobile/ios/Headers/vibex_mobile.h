@@ -19,6 +19,10 @@ void vibex_mobile_notification_activated(
 
 void vibex_mobile_pairing_qr_scanned(const char *value);
 
+// Opens this app's page in the system settings, where a denied local-network
+// permission can be re-granted.
+void vibex_ios_open_app_settings(void);
+
 void vibex_mobile_lan_discovery_event(const char *value);
 
 #ifdef __cplusplus

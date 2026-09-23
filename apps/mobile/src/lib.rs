@@ -111,6 +111,7 @@ pub fn android_main(android_app: android_activity::AndroidApp) {
     discovery::initialize_android(&android_app);
     notifications::initialize_android(&android_app);
     power::initialize_android(&android_app);
+    platform::initialize_android(&android_app);
     scanner::initialize_android(&android_app);
 
     // `Application::run` blocks by driving the Android event loop, and defers

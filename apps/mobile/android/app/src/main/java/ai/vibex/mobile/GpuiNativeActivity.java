@@ -206,6 +206,26 @@ public final class GpuiNativeActivity extends dev.gpui.mobile.GpuiInputActivity 
                 startActivity(new Intent(this, PairingQrScannerActivity.class)));
     }
 
+    /**
+     * Opens this app's page in the system settings.
+     *
+     * A denied local-network permission can only be re-granted there, and the
+     * pairing screen that reports the denial has no other way to send the user
+     * to it. A missing settings app is swallowed: the caller already explained
+     * the problem, and there is nothing else the user could do from here.
+     */
+    public void openAppSettings() {
+        runOnUiThread(() -> {
+            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            try {
+                startActivity(intent);
+            } catch (ActivityNotFoundException ignored) {
+                // No settings app to open.
+            }
+        });
+    }
+
     public void startLanPairingDiscovery() {
         runOnUiThread(() -> {
             if (Build.VERSION.SDK_INT >= 33

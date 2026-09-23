@@ -30,6 +30,9 @@ targets:
       - sdk: Security.framework
       - sdk: Network.framework
       - sdk: UserNotifications.framework
+      # The pairing scanner decodes a QR code out of an image the user picks
+      # from the photo library.
+      - sdk: Vision.framework
       # gpui-pre-mobile's package modules declare these frameworks with
       # `#[link(name = ...)]`, so the binary has to link them even though Vibex
       # only uses the platform layer.

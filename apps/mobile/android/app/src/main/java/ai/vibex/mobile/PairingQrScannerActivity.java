@@ -1,10 +1,14 @@
 package ai.vibex.mobile;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -13,6 +17,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -34,10 +39,24 @@ import com.google.mlkit.vision.barcode.BarcodeScanning;
 import com.google.mlkit.vision.barcode.common.Barcode;
 import com.google.mlkit.vision.common.InputImage;
 
+import java.io.IOException;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Full-screen camera scanner for the one-time Vibex desktop pairing QR code. */
+/**
+ * Full-screen scanner for the one-time Vibex pairing entry.
+ *
+ * Both pairing targets reach the phone as a {@code vibex://} link — a desktop
+ * advertises {@code #/pair/}, a headless runtime prints {@code #/code/} — so
+ * one scanner covers both and the user never has to say which one they hold.
+ *
+ * The camera is the primary input, but not the only one: the code is often
+ * already on the device as a screenshot, or the camera is unavailable, so the
+ * same ML Kit reader also decodes an image the user picks from their gallery.
+ * The gallery path needs no runtime permission because it goes through the
+ * system document picker, which grants read access to the single picked item.
+ */
 public final class PairingQrScannerActivity extends AppCompatActivity {
     static {
         // This Activity may be restored directly after process death, without
@@ -46,6 +65,7 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
     }
 
     private static final int CAMERA_PERMISSION_REQUEST = 100;
+    private static final int PICK_IMAGE_REQUEST = 101;
     private static final String PAIRING_PREFIX = "vibex://open/";
     // A vibex-server console prints a connection string and a QR rendering of
     // it; the same scanner accepts both pairing entry points.
@@ -78,7 +98,7 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
         close.setImageResource(android.R.drawable.ic_menu_close_clear_cancel);
         close.setColorFilter(Color.WHITE);
         close.setBackgroundColor(Color.TRANSPARENT);
-        close.setContentDescription("Close scanner");
+        close.setContentDescription(tr("Close scanner", "关闭扫码", "關閉掃描"));
         close.setOnClickListener(view -> finish());
         FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(dp(48), dp(48));
         closeParams.gravity = Gravity.TOP | Gravity.END;
@@ -86,19 +106,48 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
         closeParams.rightMargin = dp(12);
         root.addView(close, closeParams);
 
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.VERTICAL);
+        footer.setGravity(Gravity.CENTER_HORIZONTAL);
+
         TextView hint = new TextView(this);
-        hint.setText("Scan the pairing QR code in Vibex desktop");
+        hint.setText(tr(
+                "Scan the pairing QR code shown by Vibex, or pick a screenshot",
+                "扫描 Vibex 显示的配对二维码，或选择一张截图",
+                "掃描 Vibex 顯示的配對 QR Code，或選擇一張截圖"));
         hint.setTextColor(0xEEFFFFFF);
         hint.setTextSize(15);
         hint.setGravity(Gravity.CENTER);
-        FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(
+        footer.addView(hint);
+
+        TextView pickImage = new TextView(this);
+        pickImage.setText(tr("Choose from photos", "从相册选择", "從相簿選擇"));
+        pickImage.setTextColor(Color.WHITE);
+        pickImage.setTextSize(15);
+        pickImage.setGravity(Gravity.CENTER);
+        pickImage.setPadding(dp(24), dp(12), dp(24), dp(12));
+        GradientDrawable pill = new GradientDrawable();
+        pill.setColor(0x33FFFFFF);
+        pill.setCornerRadius(dp(24));
+        pill.setStroke(dp(1), 0x66FFFFFF);
+        pickImage.setBackground(pill);
+        pickImage.setClickable(true);
+        pickImage.setFocusable(true);
+        pickImage.setOnClickListener(view -> pickImage());
+        LinearLayout.LayoutParams pickParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        pickParams.topMargin = dp(16);
+        footer.addView(pickImage, pickParams);
+
+        FrameLayout.LayoutParams footerParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT);
-        hintParams.gravity = Gravity.BOTTOM;
-        hintParams.leftMargin = dp(24);
-        hintParams.rightMargin = dp(24);
-        hintParams.bottomMargin = dp(80);
-        root.addView(hint, hintParams);
+        footerParams.gravity = Gravity.BOTTOM;
+        footerParams.leftMargin = dp(24);
+        footerParams.rightMargin = dp(24);
+        footerParams.bottomMargin = dp(56);
+        root.addView(footer, footerParams);
 
         setContentView(root);
 
@@ -131,9 +180,16 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
         if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startCamera();
         } else {
-            Toast.makeText(this, "Camera access is required to scan the pairing code", Toast.LENGTH_LONG)
+            // The gallery path still works without the camera, so the scanner
+            // stays open instead of closing on a denial.
+            Toast.makeText(
+                            this,
+                            tr(
+                                    "Camera access is off. Pick a screenshot instead",
+                                    "没有相机权限，请改用从相册选择",
+                                    "沒有相機權限，請改從相簿選擇"),
+                            Toast.LENGTH_LONG)
                     .show();
-            finish();
         }
     }
 
@@ -161,8 +217,14 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
                         preview,
                         analysis);
             } catch (Exception error) {
-                Toast.makeText(this, "The camera could not be opened", Toast.LENGTH_LONG).show();
-                finish();
+                Toast.makeText(
+                                this,
+                                tr(
+                                        "The camera could not be opened. Pick a screenshot instead",
+                                        "无法打开相机，请改用从相册选择",
+                                        "無法開啟相機，請改從相簿選擇"),
+                                Toast.LENGTH_LONG)
+                        .show();
             }
         }, ContextCompat.getMainExecutor(this));
     }
@@ -187,6 +249,93 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
                     }
                 })
                 .addOnCompleteListener(task -> imageProxy.close());
+    }
+
+    /**
+     * Opens the system document picker for a single image.
+     *
+     * The modern photo picker is not used because it is absent on some devices
+     * this app still supports, and it would add a dependency for a picker the
+     * document UI already provides. Neither path needs a runtime permission.
+     */
+    private void pickImage() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        try {
+            startActivityForResult(intent, PICK_IMAGE_REQUEST);
+            return;
+        } catch (ActivityNotFoundException ignored) {
+            // Fall through to the older gallery picker.
+        }
+        Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+        fallback.addCategory(Intent.CATEGORY_OPENABLE);
+        fallback.setType("image/*");
+        try {
+            startActivityForResult(fallback, PICK_IMAGE_REQUEST);
+        } catch (ActivityNotFoundException ignored) {
+            Toast.makeText(
+                            this,
+                            tr(
+                                    "No photo picker is available on this device",
+                                    "此设备上没有可用的图片选择器",
+                                    "此裝置上沒有可用的圖片選擇器"),
+                            Toast.LENGTH_LONG)
+                    .show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_IMAGE_REQUEST || resultCode != RESULT_OK || data == null) {
+            return;
+        }
+        Uri uri = data.getData();
+        if (uri != null) {
+            scanPickedImage(uri);
+        }
+    }
+
+    /** Decodes a pairing entry out of an image the user picked. */
+    private void scanPickedImage(Uri uri) {
+        InputImage image;
+        try {
+            image = InputImage.fromFilePath(this, uri);
+        } catch (IOException error) {
+            showNoPairingCodeFound();
+            return;
+        }
+        barcodeScanner.process(image)
+                .addOnSuccessListener(barcodes -> {
+                    for (Barcode barcode : barcodes) {
+                        String value = barcode.getRawValue();
+                        if (value != null && isPairingEntry(value)) {
+                            finishScan(value);
+                            return;
+                        }
+                    }
+                    showNoPairingCodeFound();
+                })
+                .addOnFailureListener(error -> showNoPairingCodeFound());
+    }
+
+    /**
+     * Reports an image that carries no usable entry.
+     *
+     * Staying on the scanner is the point: the user almost always picked the
+     * wrong screenshot, and closing would make them reopen the scanner to try
+     * the right one.
+     */
+    private void showNoPairingCodeFound() {
+        Toast.makeText(
+                        this,
+                        tr(
+                                "No Vibex pairing code in that image",
+                                "这张图片里没有 Vibex 配对码",
+                                "這張圖片裡沒有 Vibex 配對碼"),
+                        Toast.LENGTH_LONG)
+                .show();
     }
 
     private void finishScan(String value) {
@@ -220,6 +369,23 @@ public final class PairingQrScannerActivity extends AppCompatActivity {
             cameraExecutor.shutdown();
         }
         super.onDestroy();
+    }
+
+    /** Picks the copy for the device language, matching the in-app locales. */
+    private String tr(String en, String zhCn, String zhTw) {
+        Locale locale = getResources().getConfiguration().getLocales().get(0);
+        if (!"zh".equals(locale.getLanguage())) {
+            return en;
+        }
+        String region = locale.getCountry();
+        boolean traditional = "TW".equalsIgnoreCase(region)
+                || "HK".equalsIgnoreCase(region)
+                || "MO".equalsIgnoreCase(region);
+        if (!traditional) {
+            String script = locale.getScript();
+            traditional = "Hant".equalsIgnoreCase(script);
+        }
+        return traditional ? zhTw : zhCn;
     }
 
     private FrameLayout.LayoutParams matchParent() {

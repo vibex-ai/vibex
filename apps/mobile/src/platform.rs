@@ -208,3 +208,78 @@ pub fn install_diagnostics() {
         gpui_mobile::android::jni::install_panic_hook();
     }
 }
+
+/// Opens this app's page in the OS settings.
+///
+/// A denied local-network permission can only be re-granted there, and the
+/// nearby-pairing panel that reports the denial has no other way to send the
+/// user to it. Returns `false` when the platform refused to open it.
+pub fn open_app_settings() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        android::open_app_settings()
+    }
+    #[cfg(target_os = "ios")]
+    {
+        unsafe { vibex_ios_open_app_settings() };
+        true
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "ios")]
+unsafe extern "C" {
+    fn vibex_ios_open_app_settings();
+}
+
+/// The Android half of [`open_app_settings`].
+///
+/// Mirrors `scanner.rs`: the host activity is the only object that can start an
+/// intent, so the app handle is captured once at startup and the call is made
+/// through JNI by method name.
+#[cfg(target_os = "android")]
+mod android {
+    use std::sync::{Mutex, OnceLock};
+
+    use android_activity::AndroidApp;
+    use jni::{EnvUnowned, JavaVM, objects::JObject, refs::Global};
+
+    fn android_app() -> &'static Mutex<Option<AndroidApp>> {
+        static APP: OnceLock<Mutex<Option<AndroidApp>>> = OnceLock::new();
+        APP.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn initialize(app: &AndroidApp) {
+        if let Ok(mut current) = android_app().lock() {
+            *current = Some(app.clone());
+        }
+    }
+
+    pub fn open_app_settings() -> bool {
+        let Some(app) = android_app().lock().ok().and_then(|app| app.clone()) else {
+            return false;
+        };
+        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+        vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+            let raw_activity = app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+            let result = env.call_method(
+                activity,
+                jni::jni_str!("openAppSettings"),
+                jni::jni_sig!(() -> ()),
+                &[],
+            );
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
+            Ok(result.is_ok())
+        })
+        .unwrap_or(false)
+    }
+}
+
+#[cfg(target_os = "android")]
+pub use android::initialize as initialize_android;

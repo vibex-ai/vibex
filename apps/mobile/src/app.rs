@@ -57,8 +57,8 @@ use vibex_ui::{
 use crate::discovery::{LanDiscoveryCandidate, LanDiscoveryEvent, LanDiscoveryMode};
 use crate::lifecycle::MobileLifecycleEvent;
 use crate::pairing::{
-    MobileCredentialBundle, MobilePairedRuntime, claim_pairing_code_link, claim_pairing_link,
-    claim_server_pairing_code, claim_zero_config_lan_pairing,
+    MobileCredentialBundle, MobilePairedRuntime, claim_pairing_link, claim_server_pairing_code,
+    claim_zero_config_lan_pairing,
 };
 use crate::platform::WindowInsetsExt as _;
 use crate::selection_menu::SelectionMenu;
@@ -204,6 +204,97 @@ enum NearbyPairingState {
     Failed {
         message: String,
     },
+}
+
+/// Which pairing fallback is open underneath its own row.
+///
+/// The pairing page is one screen: a primary action plus two fallbacks that
+/// expand in place, so pairing never pushes a page, opens an overlay, or needs
+/// a back gesture. Only one can be open at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingPanel {
+    None,
+    /// "Find on this network" — local-network discovery and its result.
+    Nearby,
+    /// "Paste a code or link" — the manual entry form.
+    Manual,
+}
+
+/// Which pairing action is in flight.
+///
+/// `pairing_busy` alone cannot say which control should show a spinner, and a
+/// page where every action claims to be working tells the user nothing about
+/// what is actually happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingAction {
+    /// A scanned or pasted link is being claimed.
+    Scan,
+    /// The manual form is being submitted.
+    Manual,
+}
+
+/// True when the text is a complete pairing link rather than a bare code.
+///
+/// Both entry shapes a phone can be handed are links: the desktop advertises
+/// `vibex://open/<transport>#/pair/<offer>` and `vibex-server` prints
+/// `vibex://pair#/code/<payload>`. Only the address-plus-6-digit-code form
+/// needs the operator to type the server address separately.
+fn is_pairing_link_entry(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("vibex://") || value.contains("#/pair/") || value.contains("#/code/")
+}
+
+/// Recovery copy for the pairing failures a user can actually act on.
+///
+/// Pairing errors cross the network, so their messages describe the protocol
+/// rather than the next step; the pairing page shows this instead and keeps the
+/// raw message out of the UI. An unmapped code falls through to the transport
+/// message.
+fn pairing_error_copy(code: &str) -> Option<&'static str> {
+    match code {
+        "remote_pairing_code_invalid" | "remote_pairing_code_expired" => Some(locale::text(
+            "That pairing code is wrong or has expired. Generate a new one on the cloud runtime",
+            "配对码不正确或已过期，请在云端运行时重新生成",
+            "配對碼不正確或已過期，請在雲端執行階段重新產生",
+        )),
+        "remote_pairing_entry_invalid"
+        | "remote_pairing_entry_untrusted"
+        | "remote_pairing_fragment_invalid" => Some(locale::text(
+            "That is not a Vibex pairing entry. Paste the whole line that starts with vibex://",
+            "无法识别这段内容，请粘贴以 vibex:// 开头的完整一行",
+            "無法辨識這段內容，請貼上以 vibex:// 開頭的完整一行",
+        )),
+        "remote_pairing_offer_expired"
+        | "remote_pairing_offer_canceled"
+        | "remote_pairing_offer_already_claimed" => Some(locale::text(
+            "The pairing request is no longer active. Generate a new QR code on the computer",
+            "配对请求已失效，请在电脑上重新生成二维码",
+            "配對請求已失效，請在電腦上重新產生 QR Code",
+        )),
+        "remote_pairing_route_missing"
+        | "remote_pairing_entry_hint_incompatible"
+        | "remote_pairing_entry_route_mismatch" => Some(locale::text(
+            "This pairing entry does not offer a route this phone can use",
+            "这个配对入口没有手机可用的连接方式",
+            "這個配對入口沒有手機可用的連線方式",
+        )),
+        "mobile_pairing_scanner_unavailable" | "mobile_pairing_scanner_launch_failed" => {
+            Some(locale::text(
+                "The camera scanner could not be opened. Paste the pairing code or link instead",
+                "无法打开相机扫码，请改用粘贴配对码或链接",
+                "無法開啟相機掃描，請改用貼上配對碼或連結",
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Rewrites a pairing failure so the page can show the recovery step.
+fn describe_pairing_error(mut error: BackendError) -> BackendError {
+    if let Some(message) = pairing_error_copy(&error.code) {
+        error.message = message.to_string();
+    }
+    error
 }
 
 enum LanPairingOutcome {
@@ -416,7 +507,6 @@ enum DrawerPage {
 enum InputField {
     PairingServerUrl,
     PairingCode,
-    PairingLink,
     NewSessionTitle,
     NewSessionPrompt,
     SidebarName,
@@ -853,9 +943,14 @@ pub struct MobileApp {
     elicitation_draft: Option<ElicitationFormDraft>,
     pending_input_writes: Vec<(InputField, String)>,
     pairing_busy: bool,
+    pairing_action: Option<PairingAction>,
+    /// The server address, shown only when the pasted text is a bare pairing
+    /// code — a link already carries its own address and certificate.
     pairing_server_url_input: Entity<InputState>,
+    /// The single manual field: a `vibex://` link or a bare one-time code.
     pairing_code_input: Entity<InputState>,
-    pairing_link_input: Entity<InputState>,
+    pairing_panel: PairingPanel,
+    pairing_scroll: ScrollHandle,
     nearby_pairing_state: NearbyPairingState,
     nearby_candidates: BTreeMap<String, LanDiscoveryCandidate>,
     nearby_discovery_generation: u64,
@@ -1136,6 +1231,7 @@ impl MobileApp {
             elicitation_draft: None,
             pending_input_writes: Vec::new(),
             pairing_busy: false,
+            pairing_action: None,
             pairing_server_url_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
                     "Server URL",
@@ -1145,18 +1241,13 @@ impl MobileApp {
             }),
             pairing_code_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(locale::text(
-                    "Pairing code",
-                    "配对码",
-                    "配對碼",
+                    "Pairing code or link",
+                    "配对码或链接",
+                    "配對碼或連結",
                 ))
             }),
-            pairing_link_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(locale::text(
-                    "Connection string (vibex://pair#/code/…)",
-                    "连接串（vibex://pair#/code/…）",
-                    "連接串（vibex://pair#/code/…）",
-                ))
-            }),
+            pairing_panel: PairingPanel::None,
+            pairing_scroll: ScrollHandle::new(),
             nearby_pairing_state: NearbyPairingState::Idle,
             nearby_candidates: BTreeMap::new(),
             nearby_discovery_generation: 0,
@@ -1961,6 +2052,10 @@ impl MobileApp {
     }
 
     fn start_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.begin_nearby_discovery(cx);
+    }
+
+    fn begin_nearby_discovery(&mut self, cx: &mut Context<Self>) {
         self.stop_nearby_pairing();
         self.error = None;
         self.nearby_pairing_state = NearbyPairingState::Discovering;
@@ -1991,8 +2086,77 @@ impl MobileApp {
         cx.notify();
     }
 
-    fn cancel_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.stop_nearby_pairing();
+    /// Opens or closes the local-network fallback in place.
+    ///
+    /// Opening starts discovery immediately: the row the user tapped is the
+    /// only thing that changed, so a second "find" tap would be a step with no
+    /// decision behind it.
+    fn toggle_nearby_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pairing_busy {
+            return;
+        }
+        if self.pairing_panel == PairingPanel::Nearby {
+            self.pairing_panel = PairingPanel::None;
+            self.stop_nearby_pairing();
+        } else {
+            self.pairing_panel = PairingPanel::Nearby;
+            self.begin_nearby_discovery(cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens or closes the manual-entry fallback in place.
+    fn toggle_manual_pairing(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pairing_busy {
+            return;
+        }
+        self.pairing_panel = if self.pairing_panel == PairingPanel::Manual {
+            PairingPanel::None
+        } else {
+            self.stop_nearby_pairing();
+            PairingPanel::Manual
+        };
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Sends the user to the OS page where a denied local-network permission
+    /// can be re-granted. The nearby panel already explains why it is needed.
+    fn open_pairing_settings(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        crate::platform::open_app_settings();
+        cx.notify();
+    }
+
+    /// Copies the clipboard into the manual field.
+    ///
+    /// Pasting is the main gesture on a phone: the pairing line is produced on
+    /// another machine and reaches this one through the clipboard or a chat
+    /// app, not by typing.
+    fn paste_pairing_entry(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pairing_busy {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.error = Some(BackendError::failed(
+                "remote_pairing_clipboard_empty",
+                locale::text(
+                    "The clipboard is empty",
+                    "剪贴板里没有内容",
+                    "剪貼簿裡沒有內容",
+                ),
+            ));
+            cx.notify();
+            return;
+        };
+        self.error = None;
+        self.pairing_code_input.update(cx, |input, cx| {
+            input.set_value(text.trim().to_string(), window, cx)
+        });
         cx.notify();
     }
 
@@ -2003,6 +2167,7 @@ impl MobileApp {
         self.nearby_candidates.clear();
         self.nearby_pairing_state = NearbyPairingState::Idle;
         self.pairing_busy = false;
+        self.pairing_action = None;
     }
 
     fn select_nearby_candidate(&mut self, key: String, cx: &mut Context<Self>) {
@@ -2199,6 +2364,7 @@ impl MobileApp {
             return;
         }
         self.pairing_busy = true;
+        self.pairing_action = Some(PairingAction::Scan);
         self.error = None;
         let identity = self.storage.load_client_identity();
         let runner =
@@ -2207,6 +2373,7 @@ impl MobileApp {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.pairing_busy = false;
+                this.pairing_action = None;
                 match outcome {
                     Ok(Ok(MobilePairedRuntime {
                         bundle,
@@ -2236,12 +2403,30 @@ impl MobileApp {
         cx.notify();
     }
 
-    /// Pairs with a headless `vibex-server` deployment from the address and
-    /// the one-time numeric code its operator printed at startup.  The code
-    /// travels only inside the bounded HTTPS claim body and the resulting
-    /// credential is validated and pinned before it is stored.
-    fn claim_entered_server_pairing_code(&mut self, cx: &mut Context<Self>) {
+    /// Pairs from whatever the operator handed over: a `vibex://` link or a
+    /// bare one-time code.
+    ///
+    /// One field serves both because the shape is unambiguous, and the address
+    /// field only appears once the text turns out to be a bare code — a link
+    /// already carries its address and, for a self-signed runtime, its
+    /// certificate. Asking the user which of the two they hold would be asking
+    /// them to read our protocol.
+    fn claim_entered_pairing_entry(&mut self, cx: &mut Context<Self>) {
         if self.pairing_busy || self.mode != RootMode::Pairing {
+            return;
+        }
+        let entry = self.pairing_code_input.read(cx).value().trim().to_string();
+        if entry.is_empty() {
+            self.error = Some(BackendError::failed(
+                "remote_pairing_code_request_invalid",
+                locale::text(
+                    "Paste the pairing code or link from the computer or the cloud runtime.",
+                    "请粘贴电脑或云端运行时给出的配对码或链接。",
+                    "請貼上電腦或雲端執行階段提供的配對碼或連結。",
+                )
+                .to_string(),
+            ));
+            cx.notify();
             return;
         }
         let server_url = self
@@ -2250,14 +2435,13 @@ impl MobileApp {
             .value()
             .trim()
             .to_string();
-        let pairing_code = self.pairing_code_input.read(cx).value().trim().to_string();
-        if server_url.is_empty() || pairing_code.is_empty() {
+        if !is_pairing_link_entry(&entry) && server_url.is_empty() {
             self.error = Some(BackendError::failed(
                 "remote_pairing_code_request_invalid",
                 locale::text(
-                    "Enter the server address and the pairing code.",
-                    "请输入服务器地址和配对码。",
-                    "請輸入伺服器位址和配對碼。",
+                    "Enter the server address as well as the pairing code.",
+                    "请同时填写服务器地址和配对码。",
+                    "請同時填寫伺服器位址和配對碼。",
                 )
                 .to_string(),
             ));
@@ -2265,15 +2449,21 @@ impl MobileApp {
             return;
         }
         self.pairing_busy = true;
+        self.pairing_action = Some(PairingAction::Manual);
         self.error = None;
         let identity = self.storage.load_client_identity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            claim_server_pairing_code(server_url, pairing_code, identity).await
+            if is_pairing_link_entry(&entry) {
+                claim_pairing_link(entry, identity).await
+            } else {
+                claim_server_pairing_code(server_url, entry, identity).await
+            }
         });
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.pairing_busy = false;
+                this.pairing_action = None;
                 match outcome {
                     Ok(Ok(MobilePairedRuntime {
                         bundle,
@@ -2288,73 +2478,7 @@ impl MobileApp {
                             Err(error) => this.error = Some(error),
                         }
                     }
-                    Ok(Err(error)) => this.error = Some(error),
-                    Err(_) => {
-                        this.error = Some(BackendError::failed(
-                            "remote_pairing_task_failed",
-                            locale::text(
-                                "Pairing stopped unexpectedly.",
-                                "配对意外停止。",
-                                "配對意外停止。",
-                            ),
-                        ))
-                    }
-                }
-                cx.notify();
-            });
-        });
-        self.tasks.push(task);
-        cx.notify();
-    }
-
-    /// Pairs from the connection string a `vibex-server` operator printed —
-    /// the same string the QR code on that console encodes. It carries the
-    /// address, the one-time code, and the server's own certificate when it
-    /// serves one, which is what lets a phone reach a LAN runtime without a
-    /// public CA.
-    fn claim_entered_pairing_link(&mut self, cx: &mut Context<Self>) {
-        if self.pairing_busy || self.mode != RootMode::Pairing {
-            return;
-        }
-        let link = self.pairing_link_input.read(cx).value().trim().to_string();
-        if link.is_empty() {
-            self.error = Some(BackendError::failed(
-                "remote_pairing_code_request_invalid",
-                locale::text(
-                    "Paste the connection string printed by vibex-server.",
-                    "请粘贴 vibex-server 打印的连接串。",
-                    "請貼上 vibex-server 列印的連接串。",
-                )
-                .to_string(),
-            ));
-            cx.notify();
-            return;
-        }
-        self.pairing_busy = true;
-        self.error = None;
-        let identity = self.storage.load_client_identity();
-        let runner =
-            gpui_tokio::Tokio::spawn(
-                cx,
-                async move { claim_pairing_code_link(link, identity).await },
-            );
-        let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
-            let outcome = runner.await;
-            let _ = entity.update(cx, |this, cx| {
-                this.pairing_busy = false;
-                match outcome {
-                    Ok(Ok(MobilePairedRuntime {
-                        bundle,
-                        server_kind,
-                    })) => {
-                        this.pending_input_writes
-                            .push((InputField::PairingLink, String::new()));
-                        match this.save_paired_bundle(&bundle) {
-                            Ok(()) => this.install_bundle(bundle, server_kind, cx),
-                            Err(error) => this.error = Some(error),
-                        }
-                    }
-                    Ok(Err(error)) => this.error = Some(error),
+                    Ok(Err(error)) => this.error = Some(describe_pairing_error(error)),
                     Err(_) => {
                         this.error = Some(BackendError::failed(
                             "remote_pairing_task_failed",
@@ -6193,302 +6317,466 @@ impl MobileApp {
         cx.notify();
     }
 
+    /// The pairing page: one primary action and two fallbacks.
+    ///
+    /// The three entries are not peers. Scanning is the only one that reaches
+    /// both a desktop and a headless cloud runtime, because both publish a
+    /// `vibex://` link; the other two cover the cases where scanning is not
+    /// possible. Leading with one action and hiding the fallbacks behind a
+    /// single question is what keeps the page to three decisions.
     fn render_pairing(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let retry = matches!(
-            self.nearby_pairing_state,
-            NearbyPairingState::PermissionDenied
-                | NearbyPairingState::Rejected
-                | NearbyPairingState::Expired
-                | NearbyPairingState::Failed { .. }
-        );
-        let qr_enabled = !self.pairing_busy || self.lan_pairing_task.is_some();
+        let scan_busy = self.pairing_action == Some(PairingAction::Scan);
+        let scan_enabled = !self.pairing_busy;
+        let error_here = (self.pairing_panel != PairingPanel::Manual)
+            .then(|| self.pairing_error_line())
+            .flatten();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .px(px(theme::SPACING_XL))
             .track_focus(&self.root_focus)
             .on_action(cx.listener(Self::handle_navigate_back))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .mb(px(theme::SPACING_LG))
+                    .id("pairing-scroll")
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(&self.pairing_scroll)
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .px(px(theme::SPACING_XL))
                     .child(
-                        svg()
-                            .path("brand/logo.svg")
-                            .size(px(44.0))
-                            .text_color(theme::text_primary())
-                            .mb(px(theme::SPACING_SM)),
-                    )
+                        div().w_full().flex().flex_col().items_center().child(
+                            div()
+                                .w_full()
+                                .max_w(px(theme::CARD_WIDTH))
+                                .flex()
+                                .flex_col()
+                                .pt(px(PAIRING_PAGE_TOP_PAD))
+                                .pb(px(theme::SPACING_XL))
+                                .child(self.render_pairing_brand())
+                                .child(self.render_pairing_scan_action(scan_busy, scan_enabled, cx))
+                                .when_some(error_here, |page, line| {
+                                    page.child(div().mt(px(theme::SPACING_MD)).child(line))
+                                })
+                                .child(
+                                    div()
+                                        .mt(px(theme::SPACING_XL))
+                                        .mb(px(theme::SPACING_SM))
+                                        .text_size(px(theme::FONT_DETAIL))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text_muted())
+                                        .child(locale::text(
+                                            "Can't scan?",
+                                            "扫码不方便？",
+                                            "不方便掃描？",
+                                        )),
+                                )
+                                .child(self.render_pairing_fallbacks(cx))
+                                .when(self.pairing_from_hosts, |page| {
+                                    page.child(
+                                        div()
+                                            .id("back-to-mobile-hosts")
+                                            .mt(px(theme::SPACING_LG))
+                                            .h(px(theme::TOUCH_TARGET))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .text_color(theme::text_muted())
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.7))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(Self::cancel_pairing_host),
+                                            )
+                                            .child(locale::common("Back to hosts")),
+                                    )
+                                }),
+                        ),
+                    ),
+            )
+    }
+
+    /// The logo and the page title. The page carries no subtitle: the sentence
+    /// that explains the primary action sits inside that action instead.
+    fn render_pairing_brand(&self) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .mb(px(theme::SPACING_XL))
+            .child(
+                svg()
+                    .path("brand/logo.svg")
+                    .size(px(34.0))
+                    .text_color(theme::text_primary())
+                    .mb(px(theme::SPACING_SM)),
+            )
+            .child(
+                div()
+                    .text_size(px(24.0))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_color(theme::text_primary())
+                    .child(locale::text("Add a device", "添加设备", "新增裝置")),
+            )
+    }
+
+    /// The one action that covers both kinds of runtime.
+    ///
+    /// `busy` and `enabled` are separate because the button has to be inert
+    /// while a *different* pairing action runs without claiming that it is the
+    /// one doing the work.
+    fn render_pairing_scan_action(
+        &self,
+        busy: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("scan-pairing-qr")
+            .w_full()
+            .py(px(theme::SPACING_MD))
+            .rounded(px(theme::RADIUS_CARD))
+            .bg(theme::text_primary())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme::SPACING_XS))
+            .when(busy, |button| button.opacity(0.6))
+            .when(!busy && !enabled, |button| button.opacity(0.4))
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .active(|style| style.opacity(0.85))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::scan_pairing_code))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .when(busy, |row| row.child(pairing_spinner(theme::bg_primary())))
+                    .when(!busy, |row| {
+                        row.child(
+                            svg()
+                                .path("icons/scan-line.svg")
+                                .size(px(20.0))
+                                .text_color(theme::bg_primary()),
+                        )
+                    })
                     .child(
                         div()
-                            .text_size(px(theme::FONT_APP_TITLE))
-                            .font_weight(FontWeight::EXTRA_BOLD)
-                            .text_color(theme::text_primary())
-                            .child("Vibex"),
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::bg_primary())
+                            .child(if busy {
+                                locale::common("Pairing...")
+                            } else {
+                                locale::text("Scan QR code", "扫描二维码", "掃描 QR Code")
+                            }),
                     ),
             )
             .child(
                 div()
-                    .w_full()
-                    .max_w(px(theme::CARD_WIDTH))
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .child(self.render_nearby_pairing(cx))
-                    .when(retry, |panel| {
-                        panel.child(
-                            div()
-                                .id("retry-nearby-pairing")
-                                .h(px(theme::TOUCH_TARGET))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .border_1()
-                                .border_color(theme::border_default())
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .active(|style| style.bg(theme::row_pressed_bg()))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::start_nearby_pairing),
-                                )
-                                .child(locale::common("Try Again")),
-                        )
-                    })
-                    .when_some(self.error.as_ref(), |panel, error| {
-                        panel.child(
-                            div()
-                                .rounded(px(theme::RADIUS_CARD))
-                                .border_1()
-                                .border_color(theme::accent_red())
-                                .p(px(theme::SPACING_MD))
-                                .text_size(px(theme::FONT_DETAIL))
-                                .text_color(theme::accent_red())
-                                .child(error.message.clone()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("scan-pairing-qr")
-                            .h(px(theme::TOUCH_TARGET))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .border_1()
-                            .border_color(theme::border_default())
-                            .text_color(theme::text_primary())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(theme::FONT_HEADING))
-                            .gap(px(theme::SPACING_SM))
-                            .when(qr_enabled, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .active(|style| style.opacity(0.7))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::scan_pairing_code),
-                                    )
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/scan-line.svg")
-                                    .size(px(theme::ICON_MD))
-                                    .text_color(theme::text_primary()),
-                            )
-                            .child(if self.pairing_busy && self.lan_pairing_task.is_none() {
-                                locale::common("Pairing...")
-                            } else {
-                                locale::common("Use QR Code")
-                            }),
-                    )
-                    .child(self.render_server_pairing_code_entry(cx))
-                    .when(self.pairing_from_hosts, |panel| {
-                        panel.child(
-                            div()
-                                .id("back-to-mobile-hosts")
-                                .h(px(theme::TOUCH_TARGET))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .text_color(theme::text_muted())
-                                .cursor_pointer()
-                                .active(|style| style.opacity(0.7))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::cancel_pairing_host),
-                                )
-                                .child(locale::common("Back to hosts")),
-                        )
-                    }),
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::bg_primary())
+                    .opacity(0.75)
+                    .child(locale::text(
+                        "Works for a computer or a cloud runtime",
+                        "电脑和云端运行时都能扫",
+                        "電腦和雲端執行階段都能掃",
+                    )),
             )
     }
 
-    /// Manual headless-server pairing: the operator reads the server address
-    /// and one-time numeric code off the `vibex-server` console and enters
-    /// them here. The code never goes into a URL, so it stays out of proxy
-    /// logs and history.
-    fn render_server_pairing_code_entry(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let ready = !self.pairing_busy;
+    /// The two fallbacks, in one bordered group so they read as the answer to
+    /// the question above them rather than as two more primary actions.
+    ///
+    /// The group is not dimmed as a whole while something is running: the panel
+    /// that owns the running action stays legible and dims only its sibling, so
+    /// a busy page never hides the code the user is waiting on.
+    fn render_pairing_fallbacks(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w_full()
+            .rounded(px(theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme::border_default())
+            .flex()
+            .flex_col()
+            .child(self.render_nearby_pairing_section(cx))
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mx(px(theme::SPACING_MD))
+                    .bg(theme::border_subtle()),
+            )
+            .child(self.render_manual_pairing_section(cx))
+    }
+
+    fn render_nearby_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let title = locale::text("Find on this network", "在同一网络查找", "在同一網路上尋找");
+        if self.pairing_panel != PairingPanel::Nearby {
+            return div()
+                .id("pairing-nearby-row")
+                .min_h(px(62.0))
+                .px(px(theme::SPACING_MD))
+                .py(px(theme::SPACING_SM))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACING_SM))
+                .when(self.pairing_busy, |row| row.opacity(0.4))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_nearby_pairing))
+                .child(pairing_fallback_labels(
+                    title,
+                    locale::text(
+                        "Only computers on this Wi-Fi",
+                        "仅限同一 Wi-Fi 下的电脑",
+                        "僅限同一個 Wi-Fi 的電腦",
+                    ),
+                ))
+                .child(pairing_chevron())
+                .into_any_element();
+        }
+        let retry = matches!(
+            self.nearby_pairing_state,
+            NearbyPairingState::Empty
+                | NearbyPairingState::PermissionDenied
+                | NearbyPairingState::Rejected
+                | NearbyPairingState::Expired
+                | NearbyPairingState::Failed { .. }
+        );
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .min_h(px(48.0))
+                    .px(px(theme::SPACING_MD))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("pairing-nearby-action")
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_SM))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_DETAIL))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text_primary())
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.7))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(if retry {
+                                    Self::start_nearby_pairing
+                                } else {
+                                    Self::toggle_nearby_pairing
+                                }),
+                            )
+                            .child(if retry {
+                                locale::common("Try Again")
+                            } else {
+                                locale::common("Stop")
+                            }),
+                    ),
+            )
+            .child(self.render_nearby_pairing(cx))
+            .into_any_element()
+    }
+
+    fn render_manual_pairing_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let title = locale::text(
+            "Paste a code or link",
+            "粘贴配对码或链接",
+            "貼上配對碼或連結",
+        );
+        if self.pairing_panel != PairingPanel::Manual {
+            return div()
+                .id("pairing-manual-row")
+                .min_h(px(62.0))
+                .px(px(theme::SPACING_MD))
+                .py(px(theme::SPACING_SM))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::SPACING_SM))
+                .when(self.pairing_busy, |row| row.opacity(0.4))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::toggle_manual_pairing))
+                .child(pairing_fallback_labels(
+                    title,
+                    locale::text(
+                        "Your cloud runtime prints it at startup",
+                        "云端运行时启动时会打印",
+                        "雲端執行階段啟動時會列印",
+                    ),
+                ))
+                .child(pairing_chevron())
+                .into_any_element();
+        }
+        let entry = self.pairing_code_input.read(cx).value().trim().to_string();
+        // A link already carries its address and certificate, so the address
+        // field only earns its place once the text is a bare code.
+        let needs_address = !entry.is_empty() && !is_pairing_link_entry(&entry);
+        let busy = self.pairing_action == Some(PairingAction::Manual);
+        let error = self.pairing_error_line();
+        let has_error = error.is_some();
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap(px(theme::SPACING_SM))
+            .px(px(theme::SPACING_MD))
+            .py(px(theme::SPACING_MD))
             .child(
                 div()
-                    .text_size(px(theme::FONT_DETAIL))
+                    .text_size(px(14.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_primary())
-                    .child(locale::text(
-                        "Pair with a Cloud Server",
-                        "连接云端服务器",
-                        "連線雲端伺服器",
-                    )),
+                    .child(title),
             )
+            .when(needs_address, |panel| {
+                panel
+                    .child(pairing_field_label(locale::text(
+                        "Server address",
+                        "服务器地址",
+                        "伺服器位址",
+                    )))
+                    .child(
+                        div()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .border_1()
+                            .border_color(theme::border_default())
+                            .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
+                            .child(Input::new(&self.pairing_server_url_input).appearance(false)),
+                    )
+            })
+            .child(pairing_field_label(if needs_address {
+                locale::text("Pairing code", "配对码", "配對碼")
+            } else {
+                title
+            }))
             .child(
                 div()
                     .rounded(px(theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme::border_default())
+                    .flex()
+                    .items_center()
                     .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                    .child(Input::new(&self.pairing_server_url_input).appearance(false)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.pairing_code_input).appearance(false)),
+                    )
+                    .child(
+                        div()
+                            .id("paste-pairing-entry")
+                            .h(px(theme::TOUCH_TARGET))
+                            .px(px(theme::SPACING_MD))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(theme::FONT_DETAIL))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.7))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::paste_pairing_entry))
+                            .child(locale::text("Paste", "粘贴", "貼上")),
+                    ),
             )
+            .when_some(error, |panel, line| panel.child(line))
+            .when(!has_error, |panel| {
+                panel.child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .text_color(theme::text_muted())
+                        .child(locale::text(
+                            "Paste the whole line, including the vibex:// prefix",
+                            "请粘贴完整的一行，包含 vibex:// 前缀",
+                            "請貼上完整的一行，包含 vibex:// 前綴",
+                        )),
+                )
+            })
             .child(
                 div()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                    .child(Input::new(&self.pairing_code_input).appearance(false)),
-            )
-            .child(
-                div()
-                    .id("claim-server-pairing-code")
+                    .id("claim-pairing-entry")
                     .h(px(theme::TOUCH_TARGET))
                     .rounded(px(theme::RADIUS_CONTROL))
                     .bg(theme::text_primary())
-                    .text_color(theme::bg_primary())
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(theme::FONT_HEADING))
-                    .when(ready, |button| {
+                    .gap(px(theme::SPACING_SM))
+                    .when(busy, |button| button.opacity(0.6))
+                    .when(!busy, |button| {
                         button
                             .cursor_pointer()
-                            .active(|style| style.opacity(0.7))
+                            .active(|style| style.opacity(0.85))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                    this.claim_entered_server_pairing_code(cx);
+                                cx.listener(|this, _, _, cx| {
+                                    this.claim_entered_pairing_entry(cx);
                                 }),
                             )
                     })
-                    .child(if self.pairing_busy {
-                        locale::common("Pairing...")
-                    } else {
-                        locale::text("Pair with Code", "使用配对码连接", "使用配對碼連線")
-                    }),
-            )
-            .child(
-                div()
-                    .pt(px(theme::SPACING_XS))
-                    .text_size(px(theme::FONT_DETAIL))
-                    .text_color(theme::text_muted())
-                    .child(locale::text(
-                        "Or paste the vibex:// connection string from the server console. It also carries the certificate of a server that serves its own, so no public CA is needed.",
-                        "或粘贴服务器控制台打印的 vibex:// 连接串。自签证书的服务器也通过它携带证书，无需公共 CA。",
-                        "或貼上伺服器主控台列印的 vibex:// 連接串。自簽憑證的伺服器也透過它攜帶憑證，無需公共 CA。",
-                    )),
-            )
-            .child(
-                div()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .on_mouse_down(MouseButton::Left, resume_keyboard_on_tap)
-                    .child(Input::new(&self.pairing_link_input).appearance(false)),
-            )
-            .child(
-                div()
-                    .id("claim-server-pairing-link")
-                    .h(px(theme::TOUCH_TARGET))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_default())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(theme::FONT_HEADING))
-                    .text_color(theme::text_primary())
-                    .when(ready, |button| {
-                        button
-                            .cursor_pointer()
-                            .active(|style| style.opacity(0.7))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                    this.claim_entered_pairing_link(cx);
-                                }),
-                            )
+                    .when(busy, |button| {
+                        button.child(pairing_spinner(theme::bg_primary()))
                     })
-                    .child(if self.pairing_busy {
-                        locale::common("Pairing...")
-                    } else {
-                        locale::text(
-                            "Pair with Connection String",
-                            "使用连接串连接",
-                            "使用連接串連線",
-                        )
-                    }),
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::bg_primary())
+                            .child(if busy {
+                                locale::text("Connecting…", "连接中…", "連線中…")
+                            } else {
+                                locale::text("Connect", "连接", "連線")
+                            }),
+                    ),
             )
             .into_any_element()
     }
 
+    /// The failure line, shown under whichever surface produced it.
+    fn pairing_error_line(&self) -> Option<gpui::AnyElement> {
+        self.error.as_ref().map(|error| {
+            div()
+                .w_full()
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::accent_red())
+                .child(error.message.clone())
+                .into_any_element()
+        })
+    }
+
+    /// The result of the local-network fallback, rendered underneath the row
+    /// that started it.
     fn render_nearby_pairing(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         match &self.nearby_pairing_state {
-            NearbyPairingState::Idle => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap(px(theme::SPACING_SM))
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_DETAIL))
-                        .text_color(theme::text_muted())
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_primary())
-                        .child(locale::common("Local Network Pairing")),
-                )
-                .child(
-                    div()
-                        .id("find-nearby-desktops")
-                        .h(px(theme::TOUCH_TARGET))
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .bg(theme::text_primary())
-                        .text_color(theme::bg_primary())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(theme::SPACING_SM))
-                        .text_size(px(theme::FONT_HEADING))
-                        .cursor_pointer()
-                        .active(|style| style.opacity(0.7))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::start_nearby_pairing))
-                        .child(
-                            svg()
-                                .path("icons/refresh.svg")
-                                .size(px(theme::ICON_MD))
-                                .text_color(theme::bg_primary()),
-                        )
-                        .child(locale::common("Find Desktops")),
-                )
-                .into_any_element(),
+            NearbyPairingState::Idle => div().into_any_element(),
             NearbyPairingState::Discovering | NearbyPairingState::Empty => {
                 let candidates = self.nearby_candidates.values().cloned().collect::<Vec<_>>();
                 let empty = matches!(self.nearby_pairing_state, NearbyPairingState::Empty);
@@ -6496,43 +6784,12 @@ impl MobileApp {
                     .w_full()
                     .flex()
                     .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_HEADING))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::common("Nearby desktops")),
-                            )
-                            .child(
-                                div()
-                                    .id("stop-nearby-discovery")
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::cancel_nearby_pairing),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path("icons/x.svg")
-                                            .size(px(theme::ICON_MD))
-                                            .text_color(theme::text_muted()),
-                                    ),
-                            ),
-                    )
+                    .px(px(theme::SPACING_MD))
+                    .pb(px(theme::SPACING_SM))
                     .when(candidates.is_empty(), |panel| {
                         panel.child(
                             div()
-                                .h(px(64.0))
+                                .h(px(56.0))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -6545,52 +6802,71 @@ impl MobileApp {
                                 }),
                         )
                     })
-                    .children(candidates.into_iter().map(|candidate| {
-                        let key = candidate.key();
-                        div()
-                            .id(format!("nearby:{key}"))
-                            .min_h(px(58.0))
-                            .px(px(theme::SPACING_MD))
-                            .border_b_1()
-                            .border_color(theme::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .cursor_pointer()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.select_nearby_candidate(key.clone(), cx)
-                                }),
-                            )
-                            .child(
+                    .children(
+                        candidates
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, candidate)| {
+                                let key = candidate.key();
+                                let last = index + 1 == self.nearby_candidates.len();
                                 div()
-                                    .min_w_0()
+                                    .id(format!("nearby:{key}"))
+                                    .min_h(px(58.0))
                                     .flex()
-                                    .flex_col()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_MD))
+                                    .when(!last, |row| {
+                                        row.border_b_1().border_color(theme::border_subtle())
+                                    })
+                                    .cursor_pointer()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.select_nearby_candidate(key.clone(), cx)
+                                        }),
+                                    )
                                     .child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(theme::FONT_HEADING))
-                                            .text_color(theme::text_primary())
-                                            .child(candidate.display_name),
+                                        svg()
+                                            .path("icons/monitor.svg")
+                                            .size(px(theme::ICON_MD))
+                                            .flex_shrink_0()
+                                            .text_color(theme::text_primary()),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(theme::FONT_MICRO))
-                                            .text_color(theme::text_muted())
-                                            .child(locale::common("Vibex Remote v2")),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(locale::common("Pair")),
-                            )
-                    }))
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(14.0))
+                                                    .text_color(theme::text_primary())
+                                                    .child(candidate.display_name),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(theme::FONT_MICRO))
+                                                    .text_color(theme::text_muted())
+                                                    .child(locale::text(
+                                                        "Same Wi-Fi",
+                                                        "同一 Wi-Fi",
+                                                        "同一個 Wi-Fi",
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(theme::FONT_DETAIL))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text_primary())
+                                            .child(locale::common("Pair")),
+                                    )
+                            }),
+                    )
                     .into_any_element()
             }
             NearbyPairingState::Validating { display_name } => self.render_nearby_message(
@@ -6619,10 +6895,12 @@ impl MobileApp {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(theme::SPACING_SM))
+                    .gap(px(theme::SPACING_XS))
+                    .px(px(theme::SPACING_MD))
+                    .pb(px(theme::SPACING_MD))
                     .child(
                         div()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(px(14.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text_primary())
                             .child(format!(
@@ -6635,14 +6913,14 @@ impl MobileApp {
                             .text_size(px(theme::FONT_DETAIL))
                             .text_color(theme::text_muted())
                             .child(locale::text(
-                                "Confirm the same code is shown on the desktop.",
-                                "请确认桌面端显示了相同的验证码。",
-                                "請確認桌面版顯示了相同的驗證碼。",
+                                "Confirm the same code on the computer",
+                                "请在电脑上确认相同的验证码",
+                                "請在電腦上確認相同的驗證碼",
                             )),
                     )
                     .child(
                         div()
-                            .h(px(58.0))
+                            .h(px(56.0))
                             .flex()
                             .items_center()
                             .text_size(px(30.0))
@@ -6661,27 +6939,54 @@ impl MobileApp {
                     )
                     .into_any_element()
             }
-            NearbyPairingState::PermissionDenied => self.render_nearby_message(
-                locale::text(
-                    "Local network access is required to find nearby desktops.",
-                    "查找附近的桌面端需要局域网访问权限。",
-                    "尋找附近的桌面版需要區域網路存取權限。",
-                ),
-                true,
-            ),
+            NearbyPairingState::PermissionDenied => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .px(px(theme::SPACING_MD))
+                .pb(px(theme::SPACING_MD))
+                .child(self.render_nearby_message(
+                    locale::text(
+                        "Local network access is needed to find nearby computers",
+                        "查找附近的电脑需要局域网权限",
+                        "尋找附近的電腦需要區域網路權限",
+                    ),
+                    true,
+                ))
+                .child(
+                    div()
+                        .id("open-pairing-settings")
+                        .h(px(theme::TOUCH_TARGET))
+                        .px(px(theme::SPACING_LG))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::border_default())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(theme::FONT_HEADING))
+                        .text_color(theme::text_primary())
+                        .cursor_pointer()
+                        .active(|style| style.opacity(0.7))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::open_pairing_settings))
+                        .child(locale::text("Open settings", "打开设置", "開啟設定")),
+                )
+                .into_any_element(),
             NearbyPairingState::Rejected => self.render_nearby_message(
                 locale::text(
-                    "The desktop rejected this pairing request.",
-                    "桌面端拒绝了此次配对请求。",
-                    "桌面版拒絕了此次配對請求。",
+                    "The computer rejected this pairing request",
+                    "电脑端拒绝了此次配对请求",
+                    "電腦版拒絕了此次配對請求",
                 ),
                 true,
             ),
             NearbyPairingState::Expired => self.render_nearby_message(
                 locale::text(
-                    "The nearby pairing window expired.",
-                    "附近配对窗口已过期。",
-                    "附近配對視窗已過期。",
+                    "The nearby pairing window expired",
+                    "附近配对窗口已过期",
+                    "附近配對視窗已過期",
                 ),
                 true,
             ),
@@ -6694,8 +6999,8 @@ impl MobileApp {
     fn render_nearby_message(&self, message: impl Into<String>, error: bool) -> gpui::AnyElement {
         div()
             .w_full()
-            .min_h(px(72.0))
-            .p(px(theme::SPACING_MD))
+            .px(px(theme::SPACING_MD))
+            .pb(px(theme::SPACING_MD))
             .flex()
             .items_center()
             .justify_center()
@@ -13921,7 +14226,6 @@ impl Render for MobileApp {
             let input = match field {
                 InputField::PairingServerUrl => &self.pairing_server_url_input,
                 InputField::PairingCode => &self.pairing_code_input,
-                InputField::PairingLink => &self.pairing_link_input,
                 InputField::NewSessionTitle => &self.new_session_title_input,
                 InputField::NewSessionPrompt => &self.new_session_prompt_input,
                 InputField::SidebarName => &self.sidebar_name_input,
@@ -16781,6 +17085,76 @@ fn sidebar_running_indicator(color: gpui::Hsla) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Top spacing of the pairing page.
+///
+/// Fixed rather than centered: expanding a fallback has to grow downward, and
+/// a vertically centered page would shift every control under the user's finger
+/// each time one opened.
+const PAIRING_PAGE_TOP_PAD: f32 = 88.0;
+
+/// The busy indicator the pairing actions share.
+fn pairing_spinner(color: gpui::Hsla) -> gpui::AnyElement {
+    svg()
+        .path("icons/loader-circle.svg")
+        .size(px(18.0))
+        .flex_shrink_0()
+        .text_color(color)
+        .with_animation(
+            "mobile-pairing-spinner",
+            Animation::new(Duration::from_millis(800))
+                .repeat()
+                .with_easing(ease_in_out),
+            |this, delta| this.with_transformation(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
+/// The two-line label every pairing fallback carries: what the user does, then
+/// where it applies. The second line is what lets the two rows sit as equals
+/// without the user having to guess which one is theirs.
+fn pairing_fallback_labels(title: &'static str, sub: &'static str) -> gpui::AnyElement {
+    div()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .truncate()
+                .text_size(px(15.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::text_primary())
+                .child(title),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_muted())
+                .child(sub),
+        )
+        .into_any_element()
+}
+
+fn pairing_chevron() -> gpui::AnyElement {
+    svg()
+        .path("icons/chevron-right.svg")
+        .size(px(theme::ICON_SM))
+        .flex_shrink_0()
+        .text_color(theme::text_muted())
+        .into_any_element()
+}
+
+fn pairing_field_label(label: &'static str) -> gpui::AnyElement {
+    div()
+        .mb(px(theme::SPACING_XS))
+        .text_size(px(theme::FONT_CAPTION))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::text_muted())
+        .child(label)
+        .into_any_element()
+}
+
 fn sidebar_session_running_color(auto_continue_enabled: bool) -> gpui::Hsla {
     if auto_continue_enabled {
         theme::accent_green()
@@ -18471,6 +18845,76 @@ mod tests {
             app.read_with(cx, |app, _| app.back_stack.clone()),
             Vec::<BackScreen>::new()
         );
+    }
+
+    #[test]
+    fn pairing_entry_routing_distinguishes_links_from_bare_codes() {
+        for link in [
+            "vibex://open/direct#/pair/encoded-offer",
+            "vibex://pair#/code/eyJzY2hlbWE",
+            "#/pair/encoded-offer",
+            "  #/code/eyJzY2hlbWE  ",
+        ] {
+            assert!(is_pairing_link_entry(link), "{link} is a complete link");
+        }
+        // A bare code is the only shape that needs the server address typed
+        // separately, which is what decides whether that field is shown.
+        for code in ["482913", "4829 13", ""] {
+            assert!(!is_pairing_link_entry(code), "{code} needs an address");
+        }
+    }
+
+    #[test]
+    fn pairing_failure_copy_names_the_recovery_step() {
+        let expired = describe_pairing_error(BackendError::failed(
+            "remote_pairing_code_expired",
+            "pairing claim rejected",
+        ));
+        assert_eq!(
+            expired.message,
+            pairing_error_copy("remote_pairing_code_expired").expect("mapped")
+        );
+        // An unmapped failure keeps the transport's own message rather than
+        // being replaced by a guess.
+        let unmapped = describe_pairing_error(BackendError::failed(
+            "remote_transport_unreachable",
+            "no route to host",
+        ));
+        assert_eq!(unmapped.message, "no route to host");
+    }
+
+    #[gpui::test]
+    fn pairing_page_renders_each_fallback_expanded(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        init_kit_globals(cx);
+        let data_dir = tempfile::tempdir().expect("temporary mobile data directory");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            MobileApp::new(data_dir.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+
+        // The denied-permission state is the one that used to leave the user
+        // with an explanation and no way out, so it is worth painting.
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Nearby;
+            app.nearby_pairing_state = NearbyPairingState::PermissionDenied;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        app.update(cx, |app, cx| {
+            app.pairing_panel = PairingPanel::Manual;
+            app.error = Some(BackendError::failed(
+                "remote_pairing_code_expired",
+                "pairing claim rejected",
+            ));
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
     }
 
     #[gpui::test]
