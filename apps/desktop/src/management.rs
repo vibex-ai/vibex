@@ -11,17 +11,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, Context, DragMoveEvent, Empty, Entity, EventEmitter,
-    FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Orientation, Render,
-    Role, SharedString, StatefulInteractiveElement as _, Subscription, Task, WeakEntity, Window,
-    div, prelude::*, px,
+    AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
+    EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Orientation, Render, Role, SharedString, StatefulInteractiveElement as _, Subscription, Task,
+    WeakEntity, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
     StyledExt as _, Theme, WindowExt as _,
+    alert::Alert,
     animation::{EffectTransition as Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _, Toggle},
     checkbox::Checkbox,
+    clipboard::Clipboard,
     collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList, DescriptionText},
     empty::{
@@ -72,7 +74,9 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 
 use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
-use crate::gpui_ext::{button_with_aria_label, hint_notification, solid_empty_border};
+use crate::gpui_ext::{
+    ScrollGutter as _, button_with_aria_label, hint_notification, solid_empty_border,
+};
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::resize_seam;
@@ -114,6 +118,22 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+/// The height the Skill preview keeps before it starts scrolling.
+///
+/// The body is shown in full rather than summarised, but it must not push the
+/// install actions off the pane, so it scrolls inside its own box instead.
+const MANAGEMENT_SKILL_DOCUMENT_MAX_HEIGHT: f32 = 260.0;
+/// The height of a sidebar search field.
+///
+/// The field is a primary control in these sidebars rather than a filter strip,
+/// so it sits at the same medium height as the buttons beside it instead of the
+/// compact toolbar size.
+const MANAGEMENT_SEARCH_INPUT_HEIGHT: f32 = 36.0;
+/// The height of the commands that add a resource to a sidebar.
+///
+/// The same as the search field under them, so the two rows read as one band of
+/// controls rather than two densities.
+const MANAGEMENT_SIDEBAR_ACTION_HEIGHT: f32 = 36.0;
 /// Agent cards the loading placeholder stands in for. The catalog arrives with
 /// the aggregated snapshot, so its size is unknown until then; the placeholder
 /// fills the list rather than guessing it.
@@ -782,8 +802,14 @@ pub struct ManagementCenter {
     mcp_market_open: bool,
     mcp_market_query: Entity<InputState>,
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
-    /// 1-based page the MCP market grid is showing.
+    /// How many of the fetched entries the grid is revealing.
+    ///
+    /// The registry is paged by a forward-only cursor and the fetch already
+    /// holds a whole window, so browsing is a matter of showing more of what is
+    /// in hand rather than asking for a page number nobody can honour.
     mcp_market_page: usize,
+    /// Transport the grid is filtered to; `None` shows every kind.
+    mcp_market_transport: Option<MarketTransportFilter>,
     /// True when the registry holds entries beyond the fetched window.
     mcp_market_has_more: bool,
     mcp_market_loading: bool,
@@ -802,7 +828,7 @@ pub struct ManagementCenter {
     skill_market_open: bool,
     skill_market_query: Entity<InputState>,
     skill_market_entries: Vec<vibex_core::SkillMarketEntry>,
-    /// 1-based page the Skill market grid is showing.
+    /// How many of the fetched entries the grid is revealing.
     skill_market_page: usize,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
@@ -1581,6 +1607,7 @@ impl ManagementCenter {
             mcp_market_query,
             mcp_market_entries: Vec::new(),
             mcp_market_page: 1,
+            mcp_market_transport: None,
             mcp_market_has_more: false,
             mcp_market_loading: false,
             mcp_market_error: None,
@@ -7707,6 +7734,7 @@ impl ManagementCenter {
         // only so the first reply is what fills it in.
         self.mcp_market_entries.clear();
         self.mcp_market_page = 1;
+        self.mcp_market_transport = None;
         // Opening the view must not wait on the registry: whatever the runtime
         // has already indexed is enough to paint, and the poll fills the rest.
         self.request_mcp_market(McpMarketRequest::Open, cx);
@@ -7993,7 +8021,7 @@ impl ManagementCenter {
         let query = self.skill_market_query.read(cx).value().trim().to_string();
         self.skill_market_loading = true;
         self.skill_market_error = None;
-        // A new search is a new result set, so it starts at its first page.
+        // A new search is a new result set, so it starts from the first screen.
         self.skill_market_page = 1;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
@@ -9760,7 +9788,7 @@ impl ManagementCenter {
         TabBar::new("management-section-nav")
             .h(px(42.0))
             .w_full()
-            .segmented()
+            .pill()
             .selected_index(selected_index)
             .children(items.into_iter().map(|(_, label, icon)| {
                 // `Tab` renders its `icon` *instead of* its label when both are
@@ -10401,15 +10429,7 @@ impl ManagementCenter {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let resource_count = servers.len();
-        let mut rows = v_flex()
-            .w_full()
-            .gap(px(6.0))
-            .child(management_resource_sidebar_header(
-                management_mcp_resources_title(),
-                resource_count,
-                cx,
-            ));
+        let mut rows = v_flex().w_full().gap_1();
         if servers.is_empty() {
             if self.loading && self.snapshot.mcp_servers.is_empty() {
                 // This list has no loading gate of its own, so without this it
@@ -10433,86 +10453,22 @@ impl ManagementCenter {
                 .iter()
                 .filter(|entry| entry.enabled)
                 .count();
-            let title = server.display_name;
-            let subtitle = format!(
-                "{} · {}",
-                server.transport_kind,
-                management_mcp_scope_label(server.scope_kind)
-            );
-            let status = management_resource_status_key(
-                server.status == vibex_core::McpServerStatus::Enabled,
-            );
-            let enabled_count_label = management_enabled_agent_count(enabled_count);
-            let accessible_label = format!("{title}, {status}, {subtitle}, {enabled_count_label}");
-            rows = rows.child(button_with_aria_label(
-                Button::new(SharedString::from(format!(
-                    "management-mcp-select-{select_id}"
-                )))
-                .small()
-                .ghost()
-                .w_full()
-                .h(px(72.0))
-                .justify_start()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(if selected {
-                    cx.theme().ring.opacity(0.60)
-                } else {
-                    cx.theme().border.opacity(0.70)
-                })
-                .bg(if selected {
-                    cx.theme().accent.opacity(0.35)
-                } else {
-                    cx.theme().background.opacity(0.70)
-                })
-                .px(px(10.0))
-                .py_2()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .child(management_resource_sidebar_glyph(
-                            "icons/vibex/boxes.svg",
-                            cx,
-                        ))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap(px(2.0))
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .truncate()
-                                                .text_sm()
-                                                .font_medium()
-                                                .child(title),
-                                        )
-                                        .child(management_status_badge(status.to_string(), cx)),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(subtitle),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(enabled_count_label),
-                                ),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
+            let enabled = server.status == vibex_core::McpServerStatus::Enabled;
+            rows = rows.child(management_resource_row(
+                SharedString::from(format!("management-mcp-select-{select_id}")),
+                "icons/vibex/boxes.svg",
+                ManagementResourceRowText {
+                    title: server.display_name.clone(),
+                    subtitle: format!(
+                        "{} · {}",
+                        market_transport_kind_label(server.transport_kind),
+                        management_mcp_scope_label(server.scope_kind)
+                    ),
+                    enabled_count: management_enabled_agent_count(enabled_count),
+                },
+                enabled,
+                selected,
+                move |this: &mut ManagementCenter, _window, cx| {
                     this.selected_mcp_id = Some(select_id.clone());
                     // The list is the way back to a resource: picking one has to
                     // dismiss whichever other pane the right side was showing.
@@ -10522,64 +10478,48 @@ impl ManagementCenter {
                     this.mcp_market_install_target = None;
                     this.mcp_discovery = None;
                     cx.notify();
-                })),
-                accessible_label,
+                },
+                cx,
             ));
         }
         v_flex()
             .size_full()
             .min_h_0()
-            .gap(px(10.0))
-            .child(
-                Button::new("management-mcp-new")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/file-plus.svg"))
-                    .label(management_locale_text(
-                        "New MCP server",
-                        "新建 MCP 服务",
-                        "新建 MCP 服務",
-                    ))
-                    .on_click(
+            .gap_3()
+            .child(management_resource_sidebar_actions(
+                management_mcp_resources_title(),
+                vec![
+                    management_sidebar_action(
+                        "management-mcp-new",
+                        Icon::new(IconName::Plus),
+                        management_locale_text("New", "新建", "新建"),
+                        management_locale_text("New MCP server", "新建 MCP 服务", "新建 MCP 服務"),
                         cx.listener(|this, _, window, cx| this.open_mcp_editor(None, window, cx)),
                     ),
-            )
-            .child(
-                Button::new("management-mcp-market")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/package.svg"))
-                    .label(management_locale_text(
-                        "Browse MCP market",
-                        "浏览 MCP 市场",
-                        "瀏覽 MCP 市場",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_mcp_market(window, cx))),
-            )
-            .child(
-                Button::new("management-mcp-import-sidebar")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/import.svg"))
-                    .label(copy.import_mcp)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_mcp_import(window, cx))),
-            )
+                    management_sidebar_action(
+                        "management-mcp-import-sidebar",
+                        Icon::default().path("icons/vibex/import.svg"),
+                        management_locale_text("Import", "导入", "匯入"),
+                        copy.import_mcp,
+                        cx.listener(|this, _, window, cx| this.open_mcp_import(window, cx)),
+                    ),
+                ],
+                cx,
+            ))
+            .child(management_market_entry_button(
+                "management-mcp-market",
+                management_locale_text("Browse MCP market", "浏览 MCP 市场", "瀏覽 MCP 市場"),
+                self.mcp_market_open,
+                cx.listener(|this, _, window, cx| this.open_mcp_market(window, cx)),
+                cx,
+            ))
             .child(management_search_input(&self.mcp_search, cx))
             .child(
                 div()
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .pr_1()
+                    .scroll_gutter()
                     .child(rows),
             )
             .into_any_element()
@@ -10596,222 +10536,285 @@ impl ManagementCenter {
         let entries = self.mcp_market_entries.clone();
         let install_target = self.mcp_market_install_target.clone();
         let query_input = self.mcp_market_query.clone();
-        // The pager is drawn against the window in hand, so a page that no
-        // longer exists after a search falls back to the last one.
-        let page = self.mcp_market_page.min(market_page_count(entries.len()));
-        let page_entries = market_page_slice(&entries, page);
-
-        let mut content = v_flex().size_full().min_h_0().gap_3();
-        content =
-            content.child(
-                v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_1()
-                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                                management_locale_text("MCP market", "MCP 市场", "MCP 市場"),
-                            ))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(management_locale_text(
-                                        "Every entry is read from the official registry, and the exact command is shown before anything is saved.",
-                                        "所有条目均来自官方注册表，保存前会完整展示将要执行的命令。",
-                                        "所有條目均來自官方登錄表，儲存前會完整展示將要執行的命令。",
-                                    )),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(
-                                div().min_w_0().flex_1().child(
-                                    Input::new(&query_input).small().w_full().cleanable(true),
-                                ),
-                            )
-                            .child(
-                                Button::new("management-mcp-market-search")
-                                    .small()
-                                    .outline()
-                                    .label(management_locale_text("Search", "搜索", "搜尋"))
-                                    .loading(loading)
-                                    .disabled(pending)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.search_mcp_market(window, cx)
-                                    })),
-                            ),
-                    ),
-            );
-
-        if let Some(error) = &error {
-            content = content.child(management_market_banner(error.clone(), true, cx));
-        }
+        let transport_filter = self.mcp_market_transport;
+        // A server the user already saved is marked rather than hidden:
+        // reinstalling is a legitimate way to pick up a changed command.
+        let installed_mcp_names: BTreeSet<String> = self
+            .snapshot
+            .mcp_servers
+            .iter()
+            .map(|server| server.display_name.clone())
+            .collect();
 
         if let Some(target) = install_target {
-            content = content.child(self.render_mcp_market_install_form(&target, pending, cx));
-        } else {
-            let mut grid = h_flex().w_full().flex_wrap().gap_2();
-            if loading && entries.is_empty() {
-                grid = grid.child(management_market_loading_row(cx));
-            } else if entries.is_empty() {
-                grid = grid.child(management_market_empty_row(
-                    "No MCP servers found",
-                    "没有找到 MCP 服务",
-                    "沒有找到 MCP 服務",
-                    cx,
-                ));
-            }
-            // A server the user already saved is marked rather than hidden:
-            // reinstalling is a legitimate way to pick up a changed command.
-            let installed_mcp_names: BTreeSet<String> = self
-                .snapshot
-                .mcp_servers
-                .iter()
-                .map(|server| server.display_name.clone())
-                .collect();
-            for entry in page_entries {
-                let name = entry.name.clone();
-                let description = entry
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| management_unconfigured_label().to_string());
-                let command_line = market_entry_command_line(entry);
-                let publisher = market_entry_publisher_line(entry);
-                let env_summary = market_entry_env_summary(entry);
-                let badges = market_entry_badges(entry, installed_mcp_names.contains(&entry.name));
-                // The registry publishes a website, a repository, or both; a
-                // card links to whichever it has rather than showing neither.
-                let link = entry.homepage.clone().or_else(|| entry.repository.clone());
-                let install_entry = entry.clone();
+            return self.render_mcp_market_install_form(&target, pending, cx);
+        }
 
-                let mut details = v_flex().min_w_0().flex_1().gap_1().child(
-                    h_flex()
-                        .min_w_0()
-                        .flex_wrap()
-                        .gap_1()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name))
-                        .children(
-                            badges
-                                .into_iter()
-                                .map(|badge| management_market_badge(badge, cx)),
-                        ),
-                );
-                if let Some(publisher) = publisher {
-                    details = details.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(publisher),
-                    );
-                }
-                details = details
+        // The filter narrows what is in hand rather than re-querying: the
+        // registry's search cannot filter by transport, and the fetched window
+        // is already the whole result set the view can address.
+        let matching: Vec<vibex_core::McpMarketEntry> = entries
+            .iter()
+            .filter(|entry| transport_filter.is_none_or(|filter| filter.matches(entry.transport)))
+            .cloned()
+            .collect();
+        let total = matching.len();
+        let page = market_page(self.mcp_market_page, total);
+        let shown = market_page_slice(&matching, page).to_vec();
+        let shown_count = shown.len();
+        let filtered = transport_filter.is_some();
+
+        let mut content = v_flex().size_full().min_h_0().gap_3();
+
+        let mut heading = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_start()
+            .gap_3()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(2.0))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(command_line),
+                            .text_lg()
+                            .font_semibold()
+                            .child(management_locale_text("MCP market", "MCP 市场", "MCP 市場")),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(description),
-                    );
-                if let Some(env_summary) = env_summary {
-                    // A server that needs a credential before it runs is not a
-                    // one-click install, and saying so on the card is fairer
-                    // than saying it only once the form is open.
-                    details = details.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().warning)
-                            .child(env_summary),
-                    );
-                }
-                if let Some(link) = link {
-                    let open_link = link.clone();
-                    let entry_id = install_entry.id.clone();
-                    details = details.child(
-                        Button::new(SharedString::from(format!(
-                            "management-mcp-market-link-{entry_id}"
-                        )))
-                        .xsmall()
-                        .link()
-                        .icon(IconName::ExternalLink)
-                        .label(management_locale_text("Homepage", "主页", "首頁"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_mcp_market_link(open_link.clone(), cx)
-                        })),
-                    );
-                }
-
-                grid = grid.child(
-                    h_flex()
-                        .min_w(px(340.0))
-                        .flex_1()
-                        .items_start()
-                        .gap_3()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_3()
-                        .child(management_market_glyph(
-                            market_transport_icon_path(entry.transport),
-                            cx,
-                        ))
-                        .child(details)
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-mcp-market-install-{}",
-                                install_entry.id
-                            )))
-                            .small()
-                            .outline()
-                            .label(management_locale_text("Install", "安装", "安裝"))
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.begin_mcp_market_install(install_entry.clone(), window, cx)
-                                },
+                            .child(management_locale_text(
+                                "Browse the official registry. The exact command is shown before anything is saved.",
+                                "浏览官方注册表，保存前会完整展示将要执行的命令。",
+                                "瀏覽官方登錄表，儲存前會完整展示將要執行的命令。",
                             )),
-                        ),
-                );
-            }
-            content = content.child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(grid),
+                    ),
             );
-            if !entries.is_empty() {
-                let entity = cx.weak_entity();
-                content = content.child(management_market_pager(
-                    "management-mcp-market-pagination",
-                    page,
-                    entries.len(),
-                    move |page, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.mcp_market_page = *page;
-                            cx.notify();
-                        });
-                    },
-                    cx,
-                ));
-            }
+        if loading {
+            // A poll keeps the index filling for as long as the view is open,
+            // so the spinner belongs beside the title rather than over the
+            // results the user is already reading.
+            heading = heading.child(Spinner::new().small());
+        }
+        content = content.child(heading);
+
+        content = content.child(management_market_toolbar(
+            "management-mcp-market-search",
+            &query_input,
+            loading,
+            pending,
+            cx.listener(|this, _, window, cx| this.search_mcp_market(window, cx)),
+            Some(management_market_transport_filters(
+                "management-mcp-market-filter",
+                transport_filter,
+                pending,
+                cx.listener(|this, transport, _, cx| {
+                    this.mcp_market_transport = *transport;
+                    // Narrowing the grid is a new reading position, so the
+                    // pager starts over instead of opening mid-list.
+                    this.mcp_market_page = 1;
+                    cx.notify();
+                }),
+                cx,
+            )),
+            cx,
+        ));
+
+        if let Some(error) = &error {
+            content = content.child(management_market_banner(
+                "management-mcp-market-error",
+                error.clone(),
+            ));
+        }
+
+        let first_load = loading && entries.is_empty();
+        if !first_load && (total > 0 || filtered) {
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(management_market_result_count(shown_count, total)),
+                    )
+                    .when(self.mcp_market_has_more, |row| {
+                        // The registry indexes in the background, so the count
+                        // keeps growing under the grid; saying so is friendlier
+                        // than a number that silently changes.
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(management_locale_text(
+                                    "Still indexing the registry…",
+                                    "仍在索引注册表…",
+                                    "仍在索引登錄表…",
+                                )),
+                        )
+                    }),
+            );
+        }
+
+        let mut grid = h_flex().w_full().flex_wrap().items_stretch().gap_3();
+        if first_load {
+            grid = grid.children(management_market_placeholders(MARKET_PAGE_SIZE / 2, cx));
+        } else if shown.is_empty() {
+            let action = filtered.then(|| {
+                Button::new("management-mcp-market-clear-filter")
+                    .small()
+                    .outline()
+                    .label(management_locale_text(
+                        "Clear filter",
+                        "清除筛选",
+                        "清除篩選",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.mcp_market_transport = None;
+                        this.mcp_market_page = 1;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            });
+            grid = grid.child(management_market_empty_row(
+                management_locale_text(
+                    "No MCP servers found",
+                    "没有找到 MCP 服务",
+                    "沒有找到 MCP 服務",
+                ),
+                if filtered {
+                    management_locale_text(
+                        "Nothing in the fetched results uses this transport. Clear the filter to see the rest.",
+                        "已获取的结果中没有使用该连接方式的服务，清除筛选即可查看其余条目。",
+                        "已取得的結果中沒有使用該連線方式的服務，清除篩選即可查看其餘條目。",
+                    )
+                } else {
+                    management_locale_text(
+                        "Try a different name, or search for what the server does.",
+                        "换一个名称试试，或搜索该服务的用途。",
+                        "換一個名稱試試，或搜尋該服務的用途。",
+                    )
+                },
+                action,
+                cx,
+            ));
+        }
+
+        for entry in shown {
+            let installed = installed_mcp_names.contains(&entry.name);
+            let name = entry.name.clone();
+            let description = entry
+                .description
+                .clone()
+                .filter(|description| !description.trim().is_empty())
+                .unwrap_or_else(|| management_unconfigured_label().to_string());
+            let meta = market_entry_publisher_line(&entry);
+            let quiet_meta = market_entry_meta_line(&entry);
+            let state = market_entry_state(&entry, installed);
+            // What the card is actually offering: the launcher it would run or
+            // the address it would connect to.
+            let endpoint = market_entry_command_line(&entry);
+            // The registry publishes a website, a repository, or both; a card
+            // links to whichever it has rather than showing neither.
+            let link = entry.homepage.clone().or_else(|| entry.repository.clone());
+            let entry_id = entry.id.clone();
+            let install_entry = entry.clone();
+            let install_id = entry.id.clone();
+
+            let link_element = link.clone().map(|url| {
+                let open_link = url.clone();
+                let entry_id = entry_id.clone();
+                (
+                    url,
+                    Button::new(SharedString::from(format!(
+                        "management-mcp-market-link-{entry_id}"
+                    )))
+                    .xsmall()
+                    .link()
+                    .icon(IconName::ExternalLink)
+                    .label(management_locale_text("Homepage", "主页", "首頁"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_mcp_market_link(open_link.clone(), cx)
+                    }))
+                    .into_any_element(),
+                )
+            });
+
+            grid = grid.child(management_market_card(
+                entry_id,
+                management_market_glyph(market_transport_icon_path(entry.transport), cx),
+                name,
+                state,
+                meta,
+                Some(description),
+                Some(market_transport_label(entry.transport)),
+                quiet_meta,
+                market_entry_env_summary(&entry),
+                (!endpoint.trim().is_empty()).then_some(endpoint),
+                link_element,
+                Button::new(SharedString::from(format!(
+                    "management-mcp-market-install-{install_id}"
+                )))
+                .small()
+                .outline()
+                .label(if installed {
+                    management_locale_text("Reinstall", "重新安装", "重新安裝")
+                } else {
+                    management_locale_text("Install", "安装", "安裝")
+                })
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.begin_mcp_market_install(install_entry.clone(), window, cx)
+                }))
+                .into_any_element(),
+                cx,
+            ));
+        }
+
+        content = content.child(
+            div()
+                .min_h_0()
+                .flex_1()
+                .overflow_y_scrollbar()
+                .scroll_gutter()
+                .child(grid),
+        );
+
+        if !first_load && total > 0 {
+            let entity = cx.weak_entity();
+            content = content.child(management_market_pager(
+                "management-mcp-market-pager",
+                page,
+                total,
+                move |page, _, cx| {
+                    let page = *page;
+                    let _ = entity.update(cx, |this, cx| {
+                        this.mcp_market_page = page;
+                        cx.notify();
+                    });
+                },
+                cx,
+            ));
         }
         content.into_any_element()
     }
 
+    /// The install panel for one market entry.
+    ///
+    /// It replaces the grid rather than floating over it, so the entry being
+    /// configured is the only thing on the pane; the header keeps the entry's
+    /// own identity in view and carries the way back to the results.
     fn render_mcp_market_install_form(
         &mut self,
         target: &vibex_core::McpMarketEntry,
@@ -10821,128 +10824,208 @@ impl ManagementCenter {
         let agents = self.snapshot.agents.clone();
         let selected = self.mcp_market_install_agents.clone();
         let inputs = self.mcp_market_install_env.clone();
-        let mut form = v_flex()
-            .w_full()
-            .min_h_0()
-            .gap_3()
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(management_locale_text("Install", "安装", "安裝")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(target.name.clone()),
-                    ),
+        let installed = self
+            .snapshot
+            .mcp_servers
+            .iter()
+            .any(|server| server.display_name == target.name);
+        let state = market_entry_state(target, installed);
+        let link = target
+            .homepage
+            .clone()
+            .or_else(|| target.repository.clone());
+        let link_element = link.map(|url| {
+            let open_link = url.clone();
+            let entry_id = target.id.clone();
+            Button::new(SharedString::from(format!(
+                "management-mcp-market-detail-link-{entry_id}"
+            )))
+            .xsmall()
+            .link()
+            .icon(IconName::ExternalLink)
+            .label(management_locale_text("Homepage", "主页", "首頁"))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.open_mcp_market_link(open_link.clone(), cx)),
             )
-            .child(management_market_command_preview(
-                &market_entry_command_line(target),
-                cx,
+            .into_any_element()
+        });
+
+        let heading = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .child(management_market_back_button(
+                "management-mcp-market-install-back",
+                management_locale_text("Back to results", "返回结果", "返回結果"),
+                cx.listener(|this, _, _, cx| {
+                    this.mcp_market_install_target = None;
+                    this.mcp_market_install_env.clear();
+                    cx.notify();
+                }),
             ))
             .child(
                 div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Choose the Agents to enable this for",
-                        "选择要启用的 Agent",
-                        "選擇要啟用的 Agent",
-                    )),
+                    .font_medium()
+                    .child(management_locale_text("Install", "安装", "安裝")),
             );
 
-        let mut agent_rows = v_flex().w_full().gap_1();
-        for agent in agents.into_iter().filter(|agent| agent.added) {
-            let agent_id = agent.id.as_str().to_string();
-            let checked = selected.contains(&agent_id);
-            let toggle_id = agent_id.clone();
-            agent_rows = agent_rows.child(
-                h_flex()
+        let mut form = v_flex()
+            .w_full()
+            .min_h_0()
+            .gap_4()
+            .child(heading)
+            .child(management_market_detail_header(
+                management_market_glyph(market_transport_icon_path(target.transport), cx),
+                target.name.clone(),
+                state,
+                market_entry_publisher_line(target),
+                target
+                    .description
+                    .clone()
+                    .filter(|description| !description.trim().is_empty()),
+                link_element,
+                cx,
+            ))
+            .child(management_market_section(
+                management_locale_text("Command to be saved", "将要保存的命令", "將要儲存的命令"),
+                Some(management_locale_text(
+                    "This is exactly what Vibex will run or connect to.",
+                    "Vibex 将执行的启动命令或连接地址。",
+                    "Vibex 將執行的啟動命令或連線位址。",
+                )),
+                None,
+                v_flex()
                     .w_full()
                     .gap_2()
+                    .child(management_market_command_preview(
+                        &market_entry_command_line(target),
+                        cx,
+                    ))
                     .child(
-                        Checkbox::new(SharedString::from(format!(
-                            "management-mcp-market-agent-{agent_id}"
-                        )))
-                        .small()
-                        .checked(checked)
-                        .accessibility_label(SharedString::from(agent.label.clone()))
-                        .disabled(pending)
-                        .on_click(cx.listener(
-                            move |this, checked, _, cx| {
-                                let checked = *checked;
-                                if checked {
-                                    this.mcp_market_install_agents.insert(toggle_id.clone());
-                                } else {
-                                    this.mcp_market_install_agents.remove(&toggle_id);
-                                }
-                                cx.notify();
-                            },
-                        )),
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {}",
+                                market_transport_kind_label(target.transport),
+                                market_transport_label(target.transport)
+                            )),
                     )
-                    .child(div().text_sm().child(agent.label.clone())),
-            );
-        }
-        form = form.child(agent_rows);
+                    .into_any_element(),
+                cx,
+            ));
 
+        // Credentials come before the scope: what the server needs to run is
+        // part of deciding whether to install it, while who may use it is the
+        // answer to that decision.
         if !target.env.is_empty() {
-            let mut env_rows = v_flex().w_full().gap_1();
+            let mut env_rows = v_flex().w_full().gap_3();
             for requirement in &target.env {
                 if let Some(input) = inputs.get(&requirement.name) {
+                    let mut label = h_flex().min_w_0().gap_1p5().child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .child(requirement.name.clone()),
+                    );
+                    if requirement.required {
+                        label = label.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(management_locale_text("Required", "必填", "必填")),
+                        );
+                    }
                     env_rows = env_rows.child(
-                        h_flex()
+                        v_flex()
                             .w_full()
-                            .gap_2()
-                            .child(
+                            .min_w_0()
+                            .gap_1()
+                            .child(label)
+                            .children(requirement.description.clone().map(|description| {
                                 div()
-                                    .w(px(180.0))
-                                    .flex_none()
-                                    .text_sm()
-                                    .child(requirement.name.clone()),
-                            )
+                                    .w_full()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(description)
+                            }))
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(Input::new(input).small().w_full()),
+                                Input::new(input)
+                                    .small()
+                                    .w_full()
+                                    .when(requirement.secret, |input| input.mask_toggle()),
                             ),
                     );
                 }
             }
-            form = form.child(
-                v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(management_locale_text(
-                                "Environment variables",
-                                "环境变量",
-                                "環境變數",
-                            )),
-                    )
-                    .child(env_rows),
-            );
+            form = form.child(management_market_section(
+                management_locale_text("Environment variables", "环境变量", "環境變數"),
+                Some(management_locale_text(
+                    "Stored with the server and passed to it when it starts.",
+                    "将随服务一起保存，并在其启动时传入。",
+                    "將隨服務一起儲存，並在其啟動時傳入。",
+                )),
+                None,
+                env_rows.into_any_element(),
+                cx,
+            ));
         }
+
+        form = form.child(management_market_enablement_section(
+            "management-mcp-market",
+            agents,
+            &selected,
+            pending,
+            |this: &mut ManagementCenter, agent_id, checked, _window, cx| {
+                if checked {
+                    this.mcp_market_install_agents.insert(agent_id.to_string());
+                } else {
+                    this.mcp_market_install_agents.remove(agent_id);
+                }
+                cx.notify();
+            },
+            |this: &mut ManagementCenter, enable, _window, cx| {
+                if enable {
+                    let all = this.market_default_agents();
+                    this.mcp_market_install_agents = all;
+                } else {
+                    this.mcp_market_install_agents.clear();
+                }
+                cx.notify();
+            },
+            cx,
+        ));
 
         form.child(
             h_flex()
                 .w_full()
                 .flex_none()
+                .items_center()
                 .justify_end()
                 .gap_2()
                 .border_t_1()
-                .border_color(cx.theme().border)
+                .border_color(cx.theme().border.opacity(0.70))
                 .pt_3()
+                .child(
+                    Button::new("management-mcp-market-install-cancel")
+                        .small()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mcp_market_install_target = None;
+                            this.mcp_market_install_env.clear();
+                            cx.notify();
+                        })),
+                )
                 .child(
                     Button::new("management-mcp-market-install-confirm")
                         .small()
@@ -10959,6 +11042,10 @@ impl ManagementCenter {
     }
 
     /// The Skill market, rendered in the section body rather than as an overlay.
+    ///
+    /// It shares the MCP market's shape — toolbar, result grid, one footer —
+    /// because they are the same task against two registries, and a user who
+    /// has learned one should not have to learn the other.
     fn render_skills_market(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.mutation.is_some();
         let loading = self.skill_market_loading;
@@ -10971,326 +11058,383 @@ impl ManagementCenter {
         // The index cannot search for fewer than two characters, so a shorter
         // query shows the browse list rather than an empty result.
         let browsing = query_input.read(cx).value().trim().chars().count() < 2;
-        // The pager is drawn against the window in hand, so a page that no
-        // longer exists after a search falls back to the last one.
-        let page = self.skill_market_page.min(market_page_count(entries.len()));
-        let page_entries = market_page_slice(&entries, page);
-
-        let mut content = v_flex().size_full().min_h_0().gap_3();
-        content = content.child(
-            v_flex()
-                .w_full()
-                .flex_none()
-                .gap_2()
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
-                            management_locale_text("Skill market", "技能市场", "技能市場"),
-                        ))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(management_locale_text(
-                                    "The full text is previewed before install.",
-                                    "安装前可预览技能全文。",
-                                    "安裝前可預覽技能全文。",
-                                )),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .child(Input::new(&query_input).small().w_full().cleanable(true)),
-                        )
-                        .child(
-                            Button::new("management-skill-market-search")
-                                .small()
-                                .outline()
-                                .label(management_locale_text("Search", "搜索", "搜尋"))
-                                .loading(loading)
-                                .disabled(pending)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.search_skill_market(window, cx)
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if browsing {
-                            management_locale_text(
-                                "Showing the most installed Skills. Type at least 2 characters to search.",
-                                "当前显示安装量最高的技能；输入至少 2 个字符即可搜索。",
-                                "目前顯示安裝量最高的技能；輸入至少 2 個字元即可搜尋。",
-                            )
-                        } else {
-                            management_locale_text(
-                                "Results are ranked by install count.",
-                                "结果按安装量排序。",
-                                "結果按安裝量排序。",
-                            )
-                        }),
-                ),
-        );
-
-        if let Some(error) = &error {
-            content = content.child(management_market_banner(error.clone(), true, cx));
-        }
 
         if let Some(target) = install_target {
-            let mut form = v_flex().w_full().min_h_0().gap_3().child(
+            return self.render_skill_market_install_form(
+                &target,
+                document.as_ref(),
+                preview_loading,
+                pending,
+                cx,
+            );
+        }
+
+        let total = entries.len();
+        let page = market_page(self.skill_market_page, total);
+        let shown = market_page_slice(&entries, page).to_vec();
+        let shown_count = shown.len();
+        let installed_skill_uris: BTreeSet<String> = self
+            .snapshot
+            .skills
+            .iter()
+            .filter_map(|skill| skill.source_uri.clone())
+            .collect();
+
+        let mut content = v_flex().size_full().min_h_0().gap_3();
+        let mut heading = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_start()
+            .gap_3()
+            .child(
                 v_flex()
-                    .w_full()
-                    .gap_1()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(2.0))
                     .child(
                         div()
                             .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(management_locale_text("Install", "安装", "安裝")),
+                            .font_semibold()
+                            .child(management_locale_text("Skill market", "技能市场", "技能市場")),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(target.name.clone()),
-                    ),
-            );
-
-            if preview_loading {
-                form = form.child(management_market_loading_row(cx));
-            } else if let Some(document) = &document {
-                form = form
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text(
-                                "The instructions below are what will be written",
-                                "以下内容将被写入技能",
-                                "以下內容將被寫入技能",
+                                "Browse published Skills. The full text is previewed before install.",
+                                "浏览已发布的技能，安装前可预览全文。",
+                                "瀏覽已發佈的技能，安裝前可預覽全文。",
                             )),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .max_h(px(240.0))
-                            .overflow_y_scrollbar()
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .p_3()
-                            .text_sm()
-                            .child(document.body.clone()),
-                    );
-                if document.too_large {
-                    form = form.child(management_market_banner(
-                        management_locale_text(
-                            "This document is too large to install",
-                            "该文档过大，无法安装",
-                            "該文件過大，無法安裝",
-                        )
-                        .to_string(),
-                        true,
-                        cx,
-                    ));
-                }
-            }
-
-            form = form.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(management_locale_text(
-                        "Choose the Agents to enable this for",
-                        "选择要启用的 Agent",
-                        "選擇要啟用的 Agent",
-                    )),
-            );
-
-            let agents = self.snapshot.agents.clone();
-            let selected = self.skill_market_install_agents.clone();
-            let mut agent_rows = v_flex().w_full().gap_1();
-            for agent in agents.into_iter().filter(|agent| agent.added) {
-                let agent_id = agent.id.as_str().to_string();
-                let checked = selected.contains(&agent_id);
-                let toggle_id = agent_id.clone();
-                agent_rows = agent_rows.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            Checkbox::new(SharedString::from(format!(
-                                "management-skill-market-agent-{agent_id}"
-                            )))
-                            .small()
-                            .checked(checked)
-                            .accessibility_label(SharedString::from(agent.label.clone()))
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, checked, _, cx| {
-                                    let checked = *checked;
-                                    if checked {
-                                        this.skill_market_install_agents.insert(toggle_id.clone());
-                                    } else {
-                                        this.skill_market_install_agents.remove(&toggle_id);
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                        .child(div().text_sm().child(agent.label.clone())),
-                );
-            }
-            form = form.child(agent_rows);
-
-            let can_install = document
-                .as_ref()
-                .is_some_and(|document| !document.too_large);
-            form = form.child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .justify_end()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .child(
-                        Button::new("management-skill-market-install-confirm")
-                            .small()
-                            .primary()
-                            .label(management_locale_text("Install", "安装", "安裝"))
-                            .loading(pending)
-                            .disabled(pending || !can_install)
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.confirm_skill_market_install(cx)),
-                            ),
                     ),
             );
-            content = content.child(form);
-        } else {
-            let mut grid = h_flex().w_full().flex_wrap().gap_2();
-            if loading && entries.is_empty() {
-                grid = grid.child(management_market_loading_row(cx));
-            } else if entries.is_empty() {
-                grid = grid.child(management_market_empty_row(
+        if loading {
+            heading = heading.child(Spinner::new().small());
+        }
+        content = content.child(heading);
+
+        content = content.child(management_market_toolbar(
+            "management-skill-market-search",
+            &query_input,
+            loading,
+            pending,
+            cx.listener(|this, _, window, cx| this.search_skill_market(window, cx)),
+            // The Skill index has nothing to narrow by: it is ranked by install
+            // count, not classified, so it carries no filter row.
+            None,
+            cx,
+        ));
+
+        if let Some(error) = &error {
+            content = content.child(management_market_banner(
+                "management-skill-market-error",
+                error.clone(),
+            ));
+        }
+
+        let first_load = loading && entries.is_empty();
+        if !first_load && total > 0 {
+            content = content.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} · {}",
+                        management_market_result_count(shown_count, total),
+                        if browsing {
+                            management_locale_text(
+                                "Ranked by installs. Type 2 or more characters to search.",
+                                "按安装量排序，输入 2 个及以上字符即可搜索。",
+                                "按安裝量排序，輸入 2 個及以上字元即可搜尋。",
+                            )
+                        } else {
+                            management_locale_text(
+                                "Ranked by install count.",
+                                "按安装量排序。",
+                                "按安裝量排序。",
+                            )
+                        }
+                    )),
+            );
+        }
+
+        let mut grid = h_flex().w_full().flex_wrap().items_stretch().gap_3();
+        if first_load {
+            grid = grid.children(management_market_placeholders(MARKET_PAGE_SIZE / 2, cx));
+        } else if shown.is_empty() {
+            grid = grid.child(management_market_empty_row(
+                management_locale_text(
                     "No Skills match this search",
                     "没有匹配的技能",
                     "沒有匹配的技能",
-                    cx,
-                ));
-            }
-            let installed_skill_uris: BTreeSet<String> = self
-                .snapshot
-                .skills
-                .iter()
-                .filter_map(|skill| skill.source_uri.clone())
-                .collect();
-            for entry in page_entries {
-                let name = entry.name.clone();
-                let mut badges = Vec::new();
-                if installed_skill_uris.contains(&format!("market:{}", entry.id)) {
-                    badges
-                        .push(management_locale_text("Installed", "已安装", "已安裝").to_string());
-                }
-                badges.push(entry.source.clone());
-                if entry.installs > 0 {
-                    badges.push(market_installs_label(entry.installs));
-                }
-                let install_entry = entry.clone();
-                grid = grid.child(
-                    h_flex()
-                        .min_w(px(340.0))
-                        .flex_1()
-                        .gap_3()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p_3()
-                        .child(management_market_glyph("icons/vibex/book-open.svg", cx))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .flex_wrap()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(name),
-                                        )
-                                        .children(
-                                            badges
-                                                .into_iter()
-                                                .map(|badge| management_market_badge(badge, cx)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .truncate()
-                                        .child(entry.skill_id.clone()),
-                                ),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "management-skill-market-install-{}",
-                                install_entry.id
-                            )))
-                            .small()
-                            .outline()
-                            .label(management_locale_text("Install", "安装", "安裝"))
-                            .disabled(pending)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.begin_skill_market_install(install_entry.clone(), cx)
-                                },
-                            )),
-                        ),
-                );
-            }
-            content = content.child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .pr_1()
-                    .child(grid),
-            );
-            if !entries.is_empty() {
-                let entity = cx.weak_entity();
-                content = content.child(management_market_pager(
-                    "management-skill-market-pagination",
-                    page,
-                    entries.len(),
-                    move |page, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.skill_market_page = *page;
-                            cx.notify();
-                        });
-                    },
-                    cx,
-                ));
-            }
+                ),
+                management_locale_text(
+                    "Try a shorter query, or a word from the Skill's name.",
+                    "换一个更短的查询，或使用技能名称中的词。",
+                    "換一個更短的查詢，或使用技能名稱中的詞。",
+                ),
+                None,
+                cx,
+            ));
+        }
+
+        for entry in shown {
+            let installed = installed_skill_uris.contains(&format!("market:{}", entry.id));
+            let entry_id = entry.id.clone();
+            let install_entry = entry.clone();
+            let install_id = entry.id.clone();
+            grid = grid.child(management_market_card(
+                entry_id,
+                management_market_glyph("icons/vibex/book-open.svg", cx),
+                entry.name.clone(),
+                installed.then_some(MarketEntryState::Installed),
+                Some(entry.source.clone()),
+                // A Skill carries no description in the index; the directory it
+                // installs as is what tells two Skills of one repository apart.
+                None,
+                None,
+                (entry.installs > 0).then(|| market_installs_label(entry.installs)),
+                None,
+                Some(entry.skill_id.clone()),
+                None,
+                Button::new(SharedString::from(format!(
+                    "management-skill-market-install-{install_id}"
+                )))
+                .small()
+                .outline()
+                .label(if installed {
+                    management_locale_text("Reinstall", "重新安装", "重新安裝")
+                } else {
+                    management_locale_text("Install", "安装", "安裝")
+                })
+                .disabled(pending)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.begin_skill_market_install(install_entry.clone(), cx)
+                }))
+                .into_any_element(),
+                cx,
+            ));
+        }
+
+        content = content.child(
+            div()
+                .min_h_0()
+                .flex_1()
+                .overflow_y_scrollbar()
+                .scroll_gutter()
+                .child(grid),
+        );
+
+        if !first_load && total > 0 {
+            let entity = cx.weak_entity();
+            content = content.child(management_market_pager(
+                "management-skill-market-pager",
+                page,
+                total,
+                move |page, _, cx| {
+                    let page = *page;
+                    let _ = entity.update(cx, |this, cx| {
+                        this.skill_market_page = page;
+                        cx.notify();
+                    });
+                },
+                cx,
+            ));
         }
         content.into_any_element()
     }
+
+    /// The preview and confirmation panel for one Skill.
+    ///
+    /// The document is what will be written, so it is shown in full before the
+    /// commit rather than summarised: the install is only honest if the user
+    /// could have read what they agreed to.
+    fn render_skill_market_install_form(
+        &mut self,
+        target: &vibex_core::SkillMarketEntry,
+        document: Option<&vibex_core::SkillMarketDocument>,
+        preview_loading: bool,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let installed = self
+            .snapshot
+            .skills
+            .iter()
+            .any(|skill| skill.source_uri.as_deref() == Some(&format!("market:{}", target.id)));
+
+        let heading = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .child(management_market_back_button(
+                "management-skill-market-install-back",
+                management_locale_text("Back to results", "返回结果", "返回結果"),
+                cx.listener(|this, _, _, cx| {
+                    this.skill_market_install_target = None;
+                    this.skill_market_document = None;
+                    cx.notify();
+                }),
+            ))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_sm()
+                    .font_medium()
+                    .child(management_locale_text("Install", "安装", "安裝")),
+            );
+
+        let mut form = v_flex().w_full().min_h_0().gap_4().child(heading).child(
+            management_market_detail_header(
+                management_market_glyph("icons/vibex/book-open.svg", cx),
+                target.name.clone(),
+                installed.then_some(MarketEntryState::Installed),
+                Some(target.source.clone()),
+                Some(target.skill_id.clone()),
+                None,
+                cx,
+            ),
+        );
+
+        let preview: AnyElement = if preview_loading {
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(skeleton::skeleton_bar(12.0, 0.85, cx))
+                .child(skeleton::skeleton_bar(12.0, 0.94, cx))
+                .child(skeleton::skeleton_bar(12.0, 0.62, cx))
+                .child(skeleton::skeleton_bar(12.0, 0.78, cx))
+                .into_any_element()
+        } else if let Some(document) = document {
+            div()
+                // The body is the one thing on this pane that can outgrow its
+                // box, so it scrolls on its own. The id is what gives the
+                // region a scroll offset to keep: without it the wheel has
+                // nowhere to move the text to.
+                .id("management-skill-market-document")
+                .w_full()
+                .max_h(px(MANAGEMENT_SKILL_DOCUMENT_MAX_HEIGHT))
+                .overflow_y_scrollbar()
+                .scroll_gutter()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted.opacity(0.20))
+                .p_3()
+                .text_sm()
+                .child(document.body.clone())
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "The Skill text could not be loaded.",
+                    "无法加载技能内容。",
+                    "無法載入技能內容。",
+                ))
+                .into_any_element()
+        };
+
+        form = form.child(management_market_section(
+            management_locale_text("Skill body", "skill 正文", "skill 正文"),
+            Some(management_locale_text(
+                "This is the whole document the Skill will contain. Scroll to read it.",
+                "以下即为该技能将包含的完整内容，滚动即可查看全文。",
+                "以下即為該技能將包含的完整內容，捲動即可查看全文。",
+            )),
+            None,
+            preview,
+            cx,
+        ));
+
+        if document.is_some_and(|document| document.too_large) {
+            form = form.child(management_market_banner(
+                "management-skill-market-too-large",
+                management_locale_text(
+                    "This document is too large to install",
+                    "该文档过大，无法安装",
+                    "該文件過大，無法安裝",
+                )
+                .to_string(),
+            ));
+        }
+
+        let agents = self.snapshot.agents.clone();
+        let selected = self.skill_market_install_agents.clone();
+        form = form.child(management_market_enablement_section(
+            "management-skill-market",
+            agents,
+            &selected,
+            pending,
+            |this: &mut ManagementCenter, agent_id, checked, _window, cx| {
+                if checked {
+                    this.skill_market_install_agents
+                        .insert(agent_id.to_string());
+                } else {
+                    this.skill_market_install_agents.remove(agent_id);
+                }
+                cx.notify();
+            },
+            |this: &mut ManagementCenter, enable, _window, cx| {
+                if enable {
+                    let all = this.market_default_agents();
+                    this.skill_market_install_agents = all;
+                } else {
+                    this.skill_market_install_agents.clear();
+                }
+                cx.notify();
+            },
+            cx,
+        ));
+
+        let can_install = document.is_some_and(|document| !document.too_large);
+        form.child(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .pt_3()
+                .child(
+                    Button::new("management-skill-market-install-cancel")
+                        .small()
+                        .ghost()
+                        .label(management_locale_text("Cancel", "取消", "取消"))
+                        .disabled(pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.skill_market_install_target = None;
+                            this.skill_market_document = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("management-skill-market-install-confirm")
+                        .small()
+                        .primary()
+                        .label(management_locale_text("Install", "安装", "安裝"))
+                        .loading(pending)
+                        .disabled(pending || !can_install)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.confirm_skill_market_install(cx)),
+                        ),
+                ),
+        )
+        .into_any_element()
+    }
+
     /// The native-import view, rendered in the section body rather than as an
     /// overlay. `mcp` picks which discovery response it lists.
     fn render_import_view(&mut self, mcp: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -11455,27 +11599,6 @@ impl ManagementCenter {
             .min_h_0()
             .gap_3()
             .child(
-                Button::new("management-import-back")
-                    .xsmall()
-                    .ghost()
-                    .icon(Icon::default().path("icons/vibex/chevrons-left.svg"))
-                    .label(if mcp {
-                        management_locale_text("My MCP servers", "我的 MCP 服务", "我的 MCP 服務")
-                    } else {
-                        management_locale_text("My Skills", "我的技能", "我的技能")
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if mcp {
-                            this.mcp_import_open = false;
-                            this.mcp_discovery = None;
-                        } else {
-                            this.skill_import_open = false;
-                            this.skill_discovery = None;
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -11486,7 +11609,7 @@ impl ManagementCenter {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .pr_1()
+                    .scroll_gutter()
                     .child(rows),
             )
             .child(
@@ -11548,15 +11671,7 @@ impl ManagementCenter {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let resource_count = skills.len();
-        let mut rows = v_flex()
-            .w_full()
-            .gap(px(6.0))
-            .child(management_resource_sidebar_header(
-                management_skills_title(),
-                resource_count,
-                cx,
-            ));
+        let mut rows = v_flex().w_full().gap_1();
         if skills.is_empty() {
             if self.loading && self.snapshot.skills.is_empty() {
                 // Same as the MCP list: no loading gate of its own, so it would
@@ -11579,85 +11694,22 @@ impl ManagementCenter {
                 .iter()
                 .filter(|entry| entry.enabled)
                 .count();
-            let title = skill.display_name;
-            let subtitle = format!(
-                "{} · {}",
-                management_skill_source_kind_label(skill.source_kind),
-                management_skill_scope_label(skill.scope_kind)
-            );
-            let status =
-                management_resource_status_key(skill.status == vibex_core::SkillStatus::Enabled);
-            let enabled_count_label = management_enabled_agent_count(enabled_count);
-            let accessible_label = format!("{title}, {status}, {subtitle}, {enabled_count_label}");
-            rows = rows.child(button_with_aria_label(
-                Button::new(SharedString::from(format!(
-                    "management-skill-select-{select_id}"
-                )))
-                .small()
-                .ghost()
-                .w_full()
-                .h(px(72.0))
-                .justify_start()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(if selected {
-                    cx.theme().ring.opacity(0.60)
-                } else {
-                    cx.theme().border.opacity(0.70)
-                })
-                .bg(if selected {
-                    cx.theme().accent.opacity(0.35)
-                } else {
-                    cx.theme().background.opacity(0.70)
-                })
-                .px(px(10.0))
-                .py_2()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_2()
-                        .child(management_resource_sidebar_glyph(
-                            "icons/vibex/library.svg",
-                            cx,
-                        ))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap(px(2.0))
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .truncate()
-                                                .text_sm()
-                                                .font_medium()
-                                                .child(title),
-                                        )
-                                        .child(management_status_badge(status.to_string(), cx)),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(subtitle),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(enabled_count_label),
-                                ),
-                        ),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
+            let enabled = skill.status == vibex_core::SkillStatus::Enabled;
+            rows = rows.child(management_resource_row(
+                SharedString::from(format!("management-skill-select-{select_id}")),
+                "icons/vibex/library.svg",
+                ManagementResourceRowText {
+                    title: skill.display_name.clone(),
+                    subtitle: format!(
+                        "{} · {}",
+                        management_skill_source_kind_label(skill.source_kind),
+                        management_skill_scope_label(skill.scope_kind)
+                    ),
+                    enabled_count: management_enabled_agent_count(enabled_count),
+                },
+                enabled,
+                selected,
+                move |this: &mut ManagementCenter, _window, cx| {
                     this.selected_skill_id = Some(select_id.clone());
                     this.skill_market_open = false;
                     this.skill_import_open = false;
@@ -11666,64 +11718,48 @@ impl ManagementCenter {
                     this.skill_market_document = None;
                     this.skill_discovery = None;
                     cx.notify();
-                })),
-                accessible_label,
+                },
+                cx,
             ));
         }
         v_flex()
             .size_full()
             .min_h_0()
-            .gap(px(10.0))
-            .child(
-                Button::new("management-skill-new")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/file-plus.svg"))
-                    .label(management_locale_text("New Skill", "新建技能", "新建技能"))
-                    .on_click(
+            .gap_3()
+            .child(management_resource_sidebar_actions(
+                management_skills_title(),
+                vec![
+                    management_sidebar_action(
+                        "management-skill-new",
+                        Icon::new(IconName::Plus),
+                        management_locale_text("New", "新建", "新建"),
+                        management_locale_text("New Skill", "新建技能", "新建技能"),
                         cx.listener(|this, _, window, cx| this.open_skill_editor(None, window, cx)),
                     ),
-            )
-            .child(
-                Button::new("management-skill-market")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/package.svg"))
-                    .label(management_locale_text(
-                        "Browse Skill market",
-                        "浏览技能市场",
-                        "瀏覽技能市場",
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_skill_market(window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("management-skill-import-sidebar")
-                    .small()
-                    .secondary()
-                    .w_full()
-                    .h(px(32.0))
-                    .justify_start()
-                    .icon(Icon::default().path("icons/vibex/import.svg"))
-                    .label(copy.import_skill)
-                    .on_click(
+                    management_sidebar_action(
+                        "management-skill-import-sidebar",
+                        Icon::default().path("icons/vibex/import.svg"),
+                        management_locale_text("Import", "导入", "匯入"),
+                        copy.import_skill,
                         cx.listener(|this, _, window, cx| this.open_skill_import(window, cx)),
                     ),
-            )
+                ],
+                cx,
+            ))
+            .child(management_market_entry_button(
+                "management-skill-market",
+                management_locale_text("Browse Skill market", "浏览技能市场", "瀏覽技能市場"),
+                self.skill_market_open,
+                cx.listener(|this, _, window, cx| this.open_skill_market(window, cx)),
+                cx,
+            ))
             .child(management_search_input(&self.skill_search, cx))
             .child(
                 div()
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .pr_1()
+                    .scroll_gutter()
                     .child(rows),
             )
             .into_any_element()
@@ -11802,7 +11838,7 @@ impl ManagementCenter {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .pr_1()
+                    .scroll_gutter()
                     .child(sidebar),
             )
             .into_any_element()
@@ -12014,11 +12050,14 @@ impl ManagementCenter {
         }
 
         let list = if bounded {
-            body.min_h_0().flex_1().overflow_y_scrollbar().pr_1()
+            body.min_h_0()
+                .flex_1()
+                .overflow_y_scrollbar()
+                .scroll_gutter()
         } else {
             body.max_h(px(MANAGEMENT_PROFILE_PANE_MAX_HEIGHT))
                 .overflow_y_scrollbar()
-                .pr_1()
+                .scroll_gutter()
         };
 
         // A hand-typed Model is a row the catalogue did not offer, so the field
@@ -12347,7 +12386,7 @@ impl ManagementCenter {
                 .min_h_0()
                 .flex_1()
                 .overflow_y_scrollbar()
-                .pr_1()
+                .scroll_gutter()
                 .child(body)
                 .into_any_element()
         } else {
@@ -13140,7 +13179,7 @@ impl ManagementCenter {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .pr_1()
+                    .scroll_gutter()
                     .child(stacked),
             );
         }
@@ -16721,6 +16760,7 @@ impl ManagementCenter {
                                 .rounded(px(6.0))
                                 .bg(cx.theme().muted.opacity(0.45))
                                 .p_2()
+                                .scroll_gutter()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .font_weight(code_font_weight(cx))
@@ -20238,15 +20278,30 @@ fn profile_pane_shell(
 /// takes the primary tint, a primary boundary, and the heavier label weight, so
 /// the answer is legible from shape and weight as well as from color.
 ///
-/// Category label for the MCP market chips and card badges.
-/// The transport a market entry would install as, named for a badge.
-fn market_transport_label(transport: vibex_core::McpServerTransportKind) -> String {
+/// What a market entry costs the machine it is installed on.
+///
+/// The registry's transport is the one classification that changes the
+/// decision: a `stdio` server runs a process here, a remote one only opens a
+/// connection. It is the single chip a card carries, so it says the
+/// consequence rather than repeating the protocol's own name.
+fn market_transport_label(transport: vibex_core::McpServerTransportKind) -> &'static str {
+    match transport {
+        vibex_core::McpServerTransportKind::Stdio => {
+            management_locale_text("Local process", "本地进程", "本機程序")
+        }
+        vibex_core::McpServerTransportKind::Http | vibex_core::McpServerTransportKind::Sse => {
+            management_locale_text("Remote service", "远程服务", "遠端服務")
+        }
+    }
+}
+
+/// The protocol behind the chip, for the tooltip and the detail panel.
+fn market_transport_kind_label(transport: vibex_core::McpServerTransportKind) -> &'static str {
     match transport {
         vibex_core::McpServerTransportKind::Stdio => "stdio",
         vibex_core::McpServerTransportKind::Http => "http",
         vibex_core::McpServerTransportKind::Sse => "sse",
     }
-    .to_string()
 }
 
 /// One glyph per transport, so a card is identifiable before it is read.
@@ -20257,12 +20312,51 @@ fn market_transport_icon_path(transport: vibex_core::McpServerTransportKind) -> 
     }
 }
 
-/// An install count is only worth showing when it is large enough to rank on.
+/// What a market grid can be narrowed to, in filter order.
+///
+/// The filter names the consequence rather than the protocol, so `http` and
+/// `sse` share one answer: from a user's side both are a remote service, and
+/// two chips with the same label would be a worse filter than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarketTransportFilter {
+    Local,
+    Remote,
+}
+
+const MARKET_TRANSPORT_FILTERS: [MarketTransportFilter; 2] =
+    [MarketTransportFilter::Local, MarketTransportFilter::Remote];
+
+impl MarketTransportFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Local => management_locale_text("Local process", "本地进程", "本機程序"),
+            Self::Remote => management_locale_text("Remote service", "远程服务", "遠端服務"),
+        }
+    }
+
+    fn matches(&self, transport: vibex_core::McpServerTransportKind) -> bool {
+        match self {
+            Self::Local => transport == vibex_core::McpServerTransportKind::Stdio,
+            Self::Remote => transport != vibex_core::McpServerTransportKind::Stdio,
+        }
+    }
+}
+
+/// An install count, shortened the way a ranking number is read.
+///
+/// The index returns raw totals that reach into the millions; a card fitting
+/// the figure beside a repository name does not need the last six digits to
+/// make its point.
 fn market_installs_label(installs: u64) -> String {
+    let compact = match installs {
+        0..=999 => installs.to_string(),
+        1_000..=999_999 => format!("{:.1}k", installs as f64 / 1_000.0),
+        _ => format!("{:.1}M", installs as f64 / 1_000_000.0),
+    };
     match locale::current_locale() {
-        ResolvedLocale::En => format!("{installs} installs"),
-        ResolvedLocale::ZhCn => format!("{installs} 次安装"),
-        ResolvedLocale::ZhTw => format!("{installs} 次安裝"),
+        ResolvedLocale::En => format!("{compact} installs"),
+        ResolvedLocale::ZhCn => format!("{compact} 次安装"),
+        ResolvedLocale::ZhTw => format!("{compact} 次安裝"),
     }
 }
 
@@ -20345,33 +20439,75 @@ fn market_entry_env_summary(entry: &vibex_core::McpMarketEntry) -> Option<String
     })
 }
 
-/// The chips a card shows: what the entry is, and what state it is in.
-fn market_entry_badges(entry: &vibex_core::McpMarketEntry, installed: bool) -> Vec<String> {
-    let mut badges = Vec::new();
-    // A deprecated entry stays listed — it may still be the one that works —
-    // but it must not look like a healthy one.
-    if let Some(status) = entry
+/// The one state a market card calls out, or `None` for a healthy entry.
+///
+/// The registry publishes several independent facts about an entry and the
+/// card used to print all of them, which made every result look equally
+/// urgent. Only a fact the user has to act on earns a tag, and only one of
+/// them: the lifecycle a publisher declared outranks the local install,
+/// because a deprecated server is exactly the case where "you already have
+/// this" is the less important half of the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarketEntryState {
+    Removed,
+    Deprecated,
+    Installed,
+}
+
+impl MarketEntryState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Removed => management_locale_text("Removed", "已下架", "已下架"),
+            Self::Deprecated => management_locale_text("Deprecated", "已弃用", "已棄用"),
+            Self::Installed => management_locale_text("Installed", "已安装", "已安裝"),
+        }
+    }
+}
+
+/// Classify an entry into the single state its card shows.
+fn market_entry_state(
+    entry: &vibex_core::McpMarketEntry,
+    installed: bool,
+) -> Option<MarketEntryState> {
+    match entry
         .status
         .as_deref()
         .map(str::trim)
         .filter(|status| !status.is_empty() && *status != "active")
     {
-        badges.push(status.to_string());
+        Some(status) if status.eq_ignore_ascii_case("deleted") => {
+            return Some(MarketEntryState::Removed);
+        }
+        Some(_) => return Some(MarketEntryState::Deprecated),
+        None => {}
     }
-    if entry.verified {
-        badges.push(management_locale_text("Verified", "已验证", "已驗證").to_string());
+    installed.then_some(MarketEntryState::Installed)
+}
+
+/// The quiet facts about an entry, gathered into one line.
+///
+/// What published the launcher and which version it pins are how a person
+/// tells two similarly named servers apart; they are metadata, not state, so
+/// they read as muted text beside the transport chip instead of as more tags.
+fn market_entry_meta_line(entry: &vibex_core::McpMarketEntry) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(kind) = entry
+        .package_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty() && !kind.eq_ignore_ascii_case("remote"))
+    {
+        parts.push(kind.to_string());
     }
-    if installed {
-        badges.push(management_locale_text("Installed", "已安装", "已安裝").to_string());
+    if let Some(version) = entry
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        parts.push(version.to_string());
     }
-    if let Some(kind) = entry.package_kind.as_deref() {
-        badges.push(kind.to_string());
-    }
-    if let Some(version) = entry.version.as_deref() {
-        badges.push(version.to_string());
-    }
-    badges.push(market_transport_label(entry.transport));
-    badges
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Turn the entry the user was shown plus the form's answers into a create
@@ -20425,29 +20561,210 @@ fn market_entry_to_candidate(
     }
 }
 
+/// The rounded plate an entry's transport glyph sits on.
 fn management_market_glyph(icon_path: &str, cx: &App) -> AnyElement {
     h_flex()
-        .w(px(34.0))
-        .h(px(34.0))
+        .size(px(34.0))
         .flex_none()
         .items_center()
         .justify_center()
-        .rounded(px(8.0))
-        .bg(cx.theme().muted.opacity(0.35))
-        .child(Icon::default().path(icon_path))
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.60))
+        .bg(cx.theme().muted.opacity(0.30))
+        .child(
+            Icon::default()
+                .path(icon_path)
+                .size(px(16.0))
+                .text_color(cx.theme().muted_foreground),
+        )
         .into_any_element()
 }
 
-fn management_market_badge(label: impl Into<SharedString>, cx: &App) -> AnyElement {
-    div()
-        .flex_none()
-        .rounded(px(4.0))
-        .border_1()
-        .border_color(cx.theme().border)
-        .px_1p5()
-        .text_xs()
+/// A classification chip: the transport an entry installs as.
+///
+/// Outline-only and muted on purpose. A card carries at most one of these, so
+/// the tag that reports state is the only thing on it allowed to be loud.
+fn management_market_chip(label: &'static str, cx: &App) -> AnyElement {
+    Tag::secondary()
+        .outline()
+        .xsmall()
         .text_color(cx.theme().muted_foreground)
-        .child(label.into())
+        .child(label)
+        .into_any_element()
+}
+
+/// The state tag on a market card, in the one tone its meaning deserves.
+fn management_market_state_tag(state: &MarketEntryState, _cx: &App) -> AnyElement {
+    let tag = match state {
+        // "You already have this" is information, not a warning, so it keeps
+        // the quieter outline treatment.
+        MarketEntryState::Installed => Tag::success().outline(),
+        MarketEntryState::Deprecated => Tag::warning(),
+        MarketEntryState::Removed => Tag::danger(),
+    };
+    tag.xsmall().child(state.label()).into_any_element()
+}
+
+/// One market result, as a card.
+///
+/// Every card in a row is the same height and puts its actions on the same
+/// baseline: the description and metadata take the slack, and the footer is
+/// pinned to the bottom, so a short entry does not leave its Install button
+/// floating halfway up the row.
+#[allow(clippy::too_many_arguments)]
+fn management_market_card(
+    id: String,
+    glyph: AnyElement,
+    name: String,
+    state: Option<MarketEntryState>,
+    meta: Option<String>,
+    description: Option<String>,
+    chip: Option<&'static str>,
+    quiet_meta: Option<String>,
+    caution: Option<String>,
+    endpoint: Option<String>,
+    link: Option<(String, AnyElement)>,
+    install: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    let identity = div()
+        .min_w_0()
+        .flex_1()
+        .truncate()
+        .text_sm()
+        .font_medium()
+        .child(name);
+
+    let mut body = v_flex()
+        .min_w_0()
+        .flex_1()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .child(identity)
+                .children(
+                    state
+                        .as_ref()
+                        .map(|state| management_market_state_tag(state, cx)),
+                ),
+        )
+        .children(meta.map(|meta| {
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(meta)
+        }))
+        .children(endpoint.map(|endpoint| {
+            // The launcher or address the install would write, on the card
+            // rather than only inside the form: it is the one fact that tells
+            // two similarly named entries apart before anything is opened.
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .rounded(px(6.0))
+                .bg(cx.theme().muted.opacity(0.30))
+                .px_2()
+                .py_1()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(endpoint)
+        }))
+        .children(description.map(|description| {
+            div()
+                .w_full()
+                .text_sm()
+                .line_clamp(2)
+                .text_color(cx.theme().muted_foreground)
+                .child(description)
+        }));
+
+    let mut facts = h_flex().w_full().min_w_0().gap_2();
+    if let Some(chip) = chip {
+        facts = facts.child(management_market_chip(chip, cx));
+    }
+    if let Some(quiet_meta) = quiet_meta {
+        facts = facts.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(quiet_meta),
+        );
+    }
+    body = body.child(facts);
+    if let Some(caution) = caution {
+        // A server that needs a credential before it runs is not a one-click
+        // install, and saying so on the card is fairer than saying it only once
+        // the form is open.
+        body = body.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1p5()
+                .text_xs()
+                .text_color(cx.theme().warning)
+                .child(Icon::new(IconName::TriangleAlert).size(px(12.0)))
+                .child(div().min_w_0().child(caution)),
+        );
+    }
+
+    let mut footer = h_flex().w_full().min_w_0().items_center().gap_2();
+    match link {
+        Some((_, element)) => footer = footer.child(element),
+        None => footer = footer.child(div()),
+    }
+    footer = footer.child(div().flex_1()).child(install);
+    body = body
+        // Absorbs whatever height the tallest card in the row adds, so the
+        // footer lands on the bottom edge instead of floating mid-card.
+        .child(div().flex_1())
+        .child(
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .pt_2p5()
+                .child(footer),
+        );
+
+    let hover_key = crate::motion::hover_key("management-market-card", &id);
+    let rest = theme::semantic_color("card", cx.theme().is_dark()).opacity(0.72);
+    let background = crate::motion::hover_blend(&hover_key, rest, cx.theme().accent.opacity(0.35));
+    v_flex()
+        .id(SharedString::from(format!("management-market-entry-{id}")))
+        .min_w(px(320.0))
+        .flex_1()
+        .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border.opacity(0.80))
+        .bg(background)
+        .p_3()
+        .on_hover(hover_listener(hover_key))
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                // The body takes the card's whole height so its trailing spacer
+                // can push the footer onto the bottom edge; without this the
+                // slack lands under the footer as an empty band. The glyph has
+                // its own size, so stretching the row leaves it where it is.
+                .flex_1()
+                .items_stretch()
+                .gap_2p5()
+                .child(glyph)
+                .child(body),
+        )
         .into_any_element()
 }
 
@@ -20481,79 +20798,166 @@ fn management_market_error_text(code: &str, message: &str) -> String {
     }
 }
 
-fn management_market_banner(message: String, is_error: bool, cx: &App) -> AnyElement {
-    let tone = if is_error {
-        cx.theme().danger
-    } else {
-        cx.theme().warning
-    };
-    div()
-        .w_full()
-        .flex_none()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(tone.opacity(0.35))
-        .bg(tone.opacity(0.08))
-        .p_3()
-        .text_sm()
-        .text_color(tone)
-        .child(message)
+/// A market failure, said in the kit's own alert rather than a hand-rolled box.
+///
+/// The banner is dismissible so a stale failure does not sit over a grid that
+/// has since loaded, and it keeps the registry's own code in the title where a
+/// bug report can quote it.
+fn management_market_banner(id: &'static str, message: String) -> AnyElement {
+    Alert::error(id, message)
+        .small()
+        .icon(IconName::TriangleAlert)
+        .title(management_locale_text(
+            "The market could not be read",
+            "无法读取市场",
+            "無法讀取市場",
+        ))
         .into_any_element()
 }
 
+/// The placeholders a market grid shows on its first load.
+///
+/// Cards, not rows: the placeholder has to occupy the same grid the results
+/// will, or the pane resizes the moment they land.
+fn management_market_placeholders(count: usize, cx: &App) -> Vec<AnyElement> {
+    (0..count)
+        .map(|index| {
+            v_flex()
+                .id(("management-market-placeholder", index))
+                .min_w(px(320.0))
+                .flex_1()
+                .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
+                .gap_3()
+                .rounded(cx.theme().radius_lg)
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.70))
+                .p_3()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2p5()
+                        .child(skeleton::skeleton_bar(34.0, 0.11, cx))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_2()
+                                .child(skeleton::skeleton_bar(12.0, 0.55, cx))
+                                .child(skeleton::skeleton_bar(10.0, 0.38, cx))
+                                .child(skeleton::skeleton_bar(10.0, 0.92, cx)),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(skeleton::skeleton_bar(10.0, 0.30, cx))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .child(skeleton::skeleton_bar(12.0, 0.18, cx))
+                                .child(skeleton::skeleton_bar(12.0, 0.20, cx)),
+                        ),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// A one-line progress row for a view that has no grid to stand in for.
+///
+/// The markets use card placeholders instead; this is for the import views,
+/// which have nothing to size a placeholder against.
 fn management_market_loading_row(cx: &App) -> AnyElement {
     h_flex()
         .w_full()
+        .flex_none()
+        .items_center()
         .gap_2()
-        .rounded(px(6.0))
+        .rounded(cx.theme().radius)
         .border_1()
         .border_color(cx.theme().border.opacity(0.70))
         .bg(cx.theme().muted.opacity(0.25))
         .p_3()
         .text_sm()
         .text_color(cx.theme().muted_foreground)
-        .child(Spinner::new())
+        .child(Spinner::new().small())
         .child(management_locale_text(
-            "Searching the market...",
-            "正在搜索市场...",
-            "正在搜尋市場...",
+            "Searching the market…",
+            "正在搜索市场…",
+            "正在搜尋市場…",
         ))
         .into_any_element()
 }
 
+/// The grid's empty state: what happened, and the one thing that changes it.
 fn management_market_empty_row(
-    en: &'static str,
-    zh_cn: &'static str,
-    zh_tw: &'static str,
+    title: &'static str,
+    description: &'static str,
+    action: Option<AnyElement>,
     cx: &App,
 ) -> AnyElement {
-    div()
+    let mut empty = EmptyState::new()
         .w_full()
-        .rounded(px(6.0))
+        .min_h(px(220.0))
+        .gap_1p5()
+        .rounded(cx.theme().radius_lg)
         .border_1()
-        .border_color(cx.theme().border)
-        .p_4()
-        .text_sm()
-        .text_color(cx.theme().muted_foreground)
-        .child(management_locale_text(en, zh_cn, zh_tw))
-        .into_any_element()
+        .border_color(cx.theme().border.opacity(0.70))
+        .header(
+            EmptyHeader::new()
+                .media(
+                    EmptyMedia::new()
+                        .with_variant(EmptyMediaVariant::Icon)
+                        .mb_0()
+                        .size(px(34.0))
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().muted.opacity(0.45))
+                        .child(
+                            Icon::default()
+                                .path("icons/vibex/package.svg")
+                                .size(px(17.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+                .title(EmptyTitle::new().font_semibold().child(title))
+                .description(
+                    EmptyDescription::new()
+                        .max_w(px(360.0))
+                        .text_xs()
+                        .child(description),
+                ),
+        );
+    if let Some(action) = action {
+        empty = empty.child(EmptyContent::new().child(action));
+    }
+    empty.into_any_element()
 }
 
-/// Market cards one page shows.
+/// Entries a market grid shows on one page.
 ///
-/// Both markets fetch a single window of entries and page through it locally.
-/// Neither upstream can answer "show me page 5": the MCP registry pages by an
-/// opaque cursor that only walks forward, and the Skill index ignores the
-/// offset outright. A page number is therefore only meaningful against a list
-/// already in hand.
+/// Both markets fetch a single window of entries. Neither upstream can answer
+/// "show me page 5": the MCP registry pages by an opaque cursor that only walks
+/// forward, and the Skill index ignores the offset outright. The pager is
+/// therefore applied to the list already in hand, which is also why it is the
+/// only navigation the grid offers.
 const MARKET_PAGE_SIZE: usize = 12;
 
-/// Entries one search fetches, and so the most the pager can ever show.
+/// Entries one search fetches, and so the most a grid can ever page through.
 ///
 /// The MCP market's limit is a window into an index that keeps growing, so a
 /// larger value here means the view holds more of the registry at once; the
 /// Skill index clamps to its own page size and ignores anything larger.
 const MARKET_FETCH_LIMIT: u32 = 500;
+
+/// The height a market card keeps even when an entry has little to say.
+///
+/// Cards in a row stretch to the tallest one, so this is a floor rather than a
+/// size: it stops a one-line entry from collapsing into a strip beside its
+/// neighbours.
+const MANAGEMENT_MARKET_CARD_MIN_HEIGHT: f32 = 184.0;
 
 /// How long the MCP market waits before asking again for a wider index.
 ///
@@ -20571,6 +20975,14 @@ fn market_page_count(entries: usize) -> usize {
     entries.div_ceil(MARKET_PAGE_SIZE).max(1)
 }
 
+/// The page a view should show, clamped to the window it is paging through.
+///
+/// A search that shrinks the results, or a window that closes under the pager,
+/// cannot leave the view pointing past the last page.
+fn market_page(page: usize, total: usize) -> usize {
+    page.clamp(1, market_page_count(total))
+}
+
 /// The slice of a fetched window that one page shows.
 fn market_page_slice<T>(entries: &[T], page: usize) -> &[T] {
     let start = page.saturating_sub(1).saturating_mul(MARKET_PAGE_SIZE);
@@ -20578,11 +20990,20 @@ fn market_page_slice<T>(entries: &[T], page: usize) -> &[T] {
     entries.get(start..end).unwrap_or_default()
 }
 
+/// The count line above a market grid.
+fn management_market_result_count(shown: usize, total: usize) -> String {
+    match locale::current_locale() {
+        ResolvedLocale::En => format!("Showing {shown} of {total}"),
+        ResolvedLocale::ZhCn => format!("已显示 {shown} / {total}"),
+        ResolvedLocale::ZhTw => format!("已顯示 {shown} / {total}"),
+    }
+}
+
 /// The pager strip along the bottom of a market pane.
 ///
-/// The pager owns the whole footer: the strip spans the pane's width and the
-/// controls sit at its trailing edge, so nothing competes with them for the
-/// space the grid scrolls above.
+/// The strip owns the whole footer: it spans the pane's width with the grid's
+/// own top border, and the control sits centered in it, so the results above
+/// are the only thing competing for the reader's attention.
 fn management_market_pager(
     id: &'static str,
     page: usize,
@@ -20596,15 +21017,15 @@ fn management_market_pager(
         .flex_none()
         .items_center()
         .border_t_1()
-        .border_color(cx.theme().border)
-        .pt_2()
+        .border_color(cx.theme().border.opacity(0.70))
+        .pt_2p5()
         .child(
             Pagination::new(id)
                 .small()
-                // The row already supplies the separation from the grid.
+                // The strip already supplies the separation from the grid.
                 .py_0()
                 .w_full()
-                .justify_end()
+                .justify_center()
                 .current_page(page)
                 .total_pages(market_page_count(total))
                 .visible_pages(5)
@@ -20614,18 +21035,419 @@ fn management_market_pager(
 }
 
 /// The exact launcher the install would save, shown before it is saved.
+///
+/// Monospace, on a recessed surface, with the copy affordance attached to the
+/// value rather than to the section: the command is the one thing on this pane
+/// a user may need to paste somewhere else.
 fn management_market_command_preview(command: &str, cx: &App) -> AnyElement {
-    div()
+    h_flex()
         .w_full()
+        .min_w_0()
         .flex_none()
-        .rounded(px(6.0))
+        .items_start()
+        .gap_2()
+        .rounded(cx.theme().radius)
         .border_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().muted.opacity(0.25))
-        .p_3()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(command.to_string())
+        .py_2()
+        .pl_3()
+        .pr_1()
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .font_family(cx.theme().mono_font_family.clone())
+                .font_weight(code_font_weight(cx))
+                .text_xs()
+                .text_color(cx.theme().foreground.opacity(0.85))
+                .child(command.to_string()),
+        )
+        .child(
+            Clipboard::new("management-market-command-copy")
+                .value(command.to_string())
+                .tooltip(management_locale_text(
+                    "Copy command",
+                    "复制命令",
+                    "複製命令",
+                )),
+        )
+        .into_any_element()
+}
+
+/// A section heading inside the market's detail panel.
+///
+/// `actions` are shortcuts that answer the whole section at once — they sit on
+/// the heading's trailing edge rather than under the list, because they act on
+/// the section as a whole and the list is what deserves the vertical space.
+fn management_market_section(
+    title: &'static str,
+    description: Option<&'static str>,
+    actions: Option<AnyElement>,
+    content: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(div().text_sm().font_semibold().child(title))
+                        .children(description.map(|description| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(description)
+                        })),
+                )
+                .children(actions),
+        )
+        .child(content)
+        .into_any_element()
+}
+
+/// The enable-for section both market install forms share.
+///
+/// The rows are the ones the resource's own detail panel draws — the Agent's
+/// glyph, its label, its id, and a switch — so a scope chosen during install
+/// reads exactly like the one edited afterwards. The two shortcuts on the
+/// heading are the whole answer in one click, which is what most installs want.
+fn management_market_enablement_section(
+    id_prefix: &'static str,
+    agents: Vec<AgentSnapshotEntry>,
+    selected: &BTreeSet<String>,
+    pending: bool,
+    on_toggle: impl Fn(&mut ManagementCenter, &str, bool, &mut Window, &mut Context<ManagementCenter>)
+    + Clone
+    + 'static,
+    on_set_all: impl Fn(&mut ManagementCenter, bool, &mut Window, &mut Context<ManagementCenter>)
+    + Clone
+    + 'static,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let mut rows = v_flex().w_full().gap_1();
+    let mut any_agent = false;
+    for agent in agents.into_iter().filter(|agent| agent.added) {
+        any_agent = true;
+        let agent_id = agent.id.as_str().to_string();
+        let checked = selected.contains(&agent_id);
+        let toggle = on_toggle.clone();
+        let toggle_id = agent_id.clone();
+        rows = rows.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.60))
+                .px_2()
+                .py_2()
+                .child(management_agent_glyph(
+                    agent.id.as_str(),
+                    &agent.label,
+                    false,
+                    cx,
+                ))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                .child(agent.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                // A scope chosen here is the user's own answer,
+                                // which is the same thing the detail panel calls
+                                // `manual` once it is saved.
+                                .child(format!("{} · manual", agent.id)),
+                        ),
+                )
+                .child(
+                    Switch::new(SharedString::from(format!("{id_prefix}-agent-{agent_id}")))
+                        .small()
+                        .checked(checked)
+                        .disabled(pending)
+                        .on_click(cx.listener(move |this, checked, window, cx| {
+                            toggle(this, &toggle_id, *checked, window, cx);
+                        })),
+                ),
+        );
+    }
+
+    let enable_all = on_set_all.clone();
+    let disable_all = on_set_all;
+    let actions = h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new(SharedString::from(format!("{id_prefix}-enable-all")))
+                .xsmall()
+                .ghost()
+                .label(management_locale_text("Enable all", "全部启用", "全部啟用"))
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| enable_all(this, true, window, cx)),
+                ),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id_prefix}-disable-all")))
+                .xsmall()
+                .ghost()
+                .label(management_locale_text(
+                    "Disable all",
+                    "全部取消",
+                    "全部取消",
+                ))
+                .disabled(pending)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| disable_all(this, false, window, cx)),
+                ),
+        );
+
+    management_market_section(
+        management_locale_text("Enable for", "启用范围", "啟用範圍"),
+        Some(management_locale_text(
+            "The Agents that may use this once it is saved.",
+            "保存后可以使用该资源的 Agent。",
+            "儲存後可以使用該資源的 Agent。",
+        )),
+        Some(actions.into_any_element()),
+        if any_agent {
+            rows.into_any_element()
+        } else {
+            div()
+                .w_full()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(management_locale_text(
+                    "No Agent has been added yet, so this will be saved without one.",
+                    "尚未添加任何 Agent，该资源将不带启用范围保存。",
+                    "尚未新增任何 Agent，該資源將不帶啟用範圍儲存。",
+                ))
+                .into_any_element()
+        },
+        cx,
+    )
+}
+
+/// The identity band at the top of a market detail panel.
+///
+/// The link to the entry's own page rides on the title row rather than under
+/// the description: it belongs to the entry's identity, and putting it there
+/// keeps the description free to be read on its own.
+#[allow(clippy::too_many_arguments)]
+fn management_market_detail_header(
+    glyph: AnyElement,
+    name: String,
+    state: Option<MarketEntryState>,
+    meta: Option<String>,
+    description: Option<String>,
+    link: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    let identity = div()
+        .min_w_0()
+        .flex_1()
+        .truncate()
+        .text_lg()
+        .font_semibold()
+        .child(name);
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_3()
+                .child(glyph)
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(2.0))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .child(identity)
+                                .children(
+                                    state
+                                        .as_ref()
+                                        .map(|state| management_market_state_tag(state, cx)),
+                                ),
+                        )
+                        .children(meta.map(|meta| {
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(meta)
+                        })),
+                )
+                .children(link),
+        )
+        .children(description.map(|description| {
+            div()
+                .w_full()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(description)
+        }))
+        .into_any_element()
+}
+
+/// The toolbar above a market grid: a query field, the one command that re-runs
+/// the search, and the filters that narrow the result underneath.
+///
+/// The filters sit on their own line rather than beside the field: they narrow
+/// the answer the query already produced, so they read as a second, quieter
+/// decision under the search instead of competing with it for the same row.
+fn management_market_toolbar(
+    search_id: &'static str,
+    query_input: &Entity<InputState>,
+    loading: bool,
+    disabled: bool,
+    on_search: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    filters: Option<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    div().min_w(px(220.0)).flex_1().child(
+                        Input::new(query_input)
+                            .small()
+                            .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
+                            .w_full()
+                            .cleanable(true)
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    ),
+                )
+                .child(
+                    Button::new(search_id)
+                        // The icon slot is what shows the button's progress: while
+                        // the request is in flight the spinner takes the place of
+                        // the glyph, so the search says it is working in the same
+                        // place the user pressed.
+                        .with_size(Size::Medium)
+                        .outline()
+                        .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
+                        .px_4()
+                        .icon(IconName::Search)
+                        .label(management_locale_text("Search", "搜索", "搜尋"))
+                        .loading(loading)
+                        .disabled(disabled)
+                        .on_click(on_search),
+                ),
+        )
+        .children(filters)
+        .into_any_element()
+}
+
+/// The transport filter as a row of mutually exclusive chips.
+///
+/// "All" is a chip of its own rather than an absence of selection, so the
+/// current narrowing is always visible and always reversible from the same
+/// place it was applied.
+fn management_market_transport_filters(
+    id_prefix: &'static str,
+    selected: Option<MarketTransportFilter>,
+    disabled: bool,
+    on_select: impl Fn(&Option<MarketTransportFilter>, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let on_select = std::rc::Rc::new(on_select);
+    let mut row = h_flex()
+        .min_w_0()
+        .flex_none()
+        .gap_1()
+        .child(management_option_chip(
+            SharedString::from(format!("{id_prefix}-all")),
+            SharedString::from(management_locale_text("All", "全部", "全部")),
+            selected.is_none(),
+            disabled,
+            None,
+            {
+                let on_select = on_select.clone();
+                move |_, window, cx| on_select(&None, window, cx)
+            },
+            cx,
+        ));
+    for filter in MARKET_TRANSPORT_FILTERS {
+        let checked = selected == Some(filter);
+        row = row.child(management_option_chip(
+            SharedString::from(format!("{id_prefix}-{filter:?}")),
+            SharedString::from(filter.label()),
+            checked,
+            disabled,
+            None,
+            {
+                let on_select = on_select.clone();
+                move |_, window, cx| on_select(&Some(filter), window, cx)
+            },
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// The way back out of a market view.
+///
+/// The market replaces the section body, so it owns the affordance that
+/// returns to whatever the sidebar had selected rather than leaving the
+/// sidebar buttons as the only exit.
+fn management_market_back_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    Button::new(id)
+        .small()
+        .ghost()
+        .icon(IconName::ArrowLeft)
+        .label(label)
+        .on_click(on_click)
         .into_any_element()
 }
 fn management_option_chip(
@@ -20967,37 +21789,246 @@ fn provider_protocol_url_override_label(wire_api: vibex_core::ProviderModelWireA
     }
 }
 
-fn management_resource_sidebar_header(title: &'static str, count: usize, cx: &App) -> AnyElement {
-    h_flex()
+/// The three lines a management sidebar row can say about its resource.
+struct ManagementResourceRowText {
+    /// The resource's own name.
+    title: String,
+    /// Where it came from and how it connects.
+    subtitle: String,
+    /// How many Agents have it turned on.
+    enabled_count: String,
+}
+
+/// One installed resource in a management sidebar.
+///
+/// It is the card the Agent sidebar draws — 8px radius, hairline border, a
+/// leading glyph, a title line, and one muted line under it — so the three
+/// sidebars read as one list instead of three separate designs. Selection is a
+/// tinted surface rather than an outline box, which keeps the eye on one spine
+/// down the rows.
+fn management_resource_row(
+    id: SharedString,
+    glyph_path: &'static str,
+    text: ManagementResourceRowText,
+    enabled: bool,
+    selected: bool,
+    on_activate: impl Fn(&mut ManagementCenter, &mut Window, &mut Context<ManagementCenter>)
+    + Clone
+    + 'static,
+    cx: &mut Context<ManagementCenter>,
+) -> AnyElement {
+    let ManagementResourceRowText {
+        title,
+        subtitle,
+        enabled_count: enabled_count_label,
+    } = text;
+    // "Enabled" is the expected state, so it stays quiet; only a resource that
+    // cannot be used says so. The label is localized: the row used to print the
+    // projection's own `enabled`/`disabled` key.
+    let status_tag = (!enabled).then(|| {
+        Tag::warning()
+            .xsmall()
+            .child(management_locale_text("Disabled", "已停用", "已停用"))
+    });
+    let accessible_label = format!(
+        "{title}, {}, {subtitle}, {enabled_count_label}",
+        if enabled {
+            management_locale_text("Enabled", "已启用", "已啟用")
+        } else {
+            management_locale_text("Disabled", "已停用", "已停用")
+        }
+    );
+
+    let click = on_activate.clone();
+    let keyboard = on_activate;
+    v_flex()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(accessible_label)
+        .focusable()
+        .tab_index(0)
+        .cursor_pointer()
+        .relative()
         .w_full()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .px_1()
-        .text_xs()
-        .font_medium()
-        .text_color(cx.theme().muted_foreground)
-        .child(title)
-        .child(management_status_badge(count.to_string(), cx))
+        .min_w_0()
+        .gap_1()
+        .overflow_hidden()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
+        .bg(if selected {
+            cx.theme().primary.opacity(0.08)
+        } else {
+            cx.theme().background.opacity(0.70)
+        })
+        .px_2()
+        .py_2()
+        .hover(|style| {
+            style.bg(if selected {
+                cx.theme().primary.opacity(0.08)
+            } else {
+                cx.theme().accent
+            })
+        })
+        .on_click(cx.listener(move |this, _, window, cx| click(this, window, cx)))
+        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            if event.keystroke.key == "enter" || event.keystroke.key == "space" {
+                keyboard(this, window, cx);
+                cx.stop_propagation();
+            }
+        }))
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .child(management_resource_sidebar_glyph(glyph_path, selected, cx))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(28.0))
+                        .px_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_medium()
+                                .child(title),
+                        )
+                        .children(status_tag)
+                        .child(div().flex_1()),
+                ),
+        )
+        .child(
+            div()
+                .pl(px(40.0))
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{subtitle} · {enabled_count_label}")),
+        )
         .into_any_element()
 }
 
-fn management_resource_sidebar_glyph(path: &'static str, cx: &App) -> AnyElement {
+/// The header of a management sidebar: the resource name and the commands that
+/// add one.
+///
+/// The commands are labelled buttons rather than icon-only controls: creating
+/// and importing are the two ways a resource enters the list, and a glyph alone
+/// does not say which is which. The count that used to sit beside the title is
+/// gone — the list under it already answers how many there are.
+fn management_resource_sidebar_actions(
+    title: &'static str,
+    actions: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_xs()
+                .font_medium()
+                .text_color(cx.theme().muted_foreground)
+                .child(title),
+        )
+        .children(actions)
+        .into_any_element()
+}
+
+/// A sidebar command: an icon and the verb it performs, sized to the control
+/// band it sits in rather than to the toolbar scale.
+///
+/// The visible label is the short verb; the tooltip and the accessible name
+/// carry the full object, because "New" in a sidebar says which sidebar and
+/// "New MCP server" says what is about to be created.
+fn management_sidebar_action(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    accessible_label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let accessible_label = SharedString::from(accessible_label);
+    button_with_aria_label(
+        Button::new(id)
+            // Medium keeps icons at 16px; the explicit height keeps the button
+            // in the same band as the search field below it.
+            .with_size(Size::Medium)
+            .outline()
+            .h(px(MANAGEMENT_SIDEBAR_ACTION_HEIGHT))
+            .px_3()
+            .icon(icon)
+            .label(label)
+            .tooltip(accessible_label.clone())
+            .on_click(on_click),
+        accessible_label,
+    )
+    .into_any_element()
+}
+
+/// The one button that opens a market from its sidebar.
+///
+/// It stays visibly engaged while the market is showing, so the sidebar always
+/// answers which view the section body is on.
+fn management_market_entry_button(
+    id: &'static str,
+    label: &'static str,
+    open: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    Button::new(id)
+        // The same control band as the New and Import commands above it and the
+        // search field below: one height, one icon size.
+        .with_size(Size::Medium)
+        .w_full()
+        .h(px(MANAGEMENT_SIDEBAR_ACTION_HEIGHT))
+        .justify_start()
+        .icon(Icon::default().path("icons/vibex/package.svg"))
+        .label(label)
+        .when(open, |button| {
+            button
+                .border_1()
+                .border_color(cx.theme().primary.opacity(0.45))
+                .bg(cx.theme().primary.opacity(0.12))
+        })
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn management_resource_sidebar_glyph(path: &'static str, selected: bool, cx: &App) -> AnyElement {
+    let (surface, foreground) = if selected {
+        (
+            cx.theme().primary.opacity(0.16),
+            cx.theme().foreground.opacity(0.92),
+        )
+    } else {
+        (cx.theme().muted.opacity(0.30), cx.theme().muted_foreground)
+    };
     div()
+        // The same 36px plate the Agent cards lead with, so the glyphs of all
+        // three sidebars land on one vertical line.
         .size(px(36.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.70))
-        .bg(cx.theme().muted.opacity(0.35))
+        .rounded(cx.theme().radius)
+        .bg(surface)
         .child(
             Icon::default()
                 .path(path)
                 .size(px(16.0))
-                .text_color(cx.theme().muted_foreground),
+                .text_color(foreground),
         )
         .into_any_element()
 }
@@ -21026,9 +22057,11 @@ fn management_search_input(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     // `Input` owns its border, background and focus ring; the search field only
-    // adds the leading glyph and a clear affordance.
+    // adds the leading glyph, a clear affordance, and the height that keeps it
+    // from reading as a squeezed strip above the list.
     Input::new(state)
         .small()
+        .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
         .w_full()
         .cleanable(true)
         .prefix(
@@ -21215,9 +22248,9 @@ fn management_agent_card_placeholders(cx: &App) -> Vec<AnyElement> {
 
 /// Placeholder rows for the MCP and Skill sidebars while the snapshot loads.
 ///
-/// Both lists are full-width select buttons at
-/// [`MANAGEMENT_PROVIDER_ROW_HEIGHT`] with an 8px radius, a hairline border,
-/// and a leading glyph beside a title and a subtitle line, so the rows that
+/// Both lists are cards at [`MANAGEMENT_PROVIDER_ROW_HEIGHT`] with an 8px
+/// radius, a hairline border, and a 36px leading glyph beside a title and a
+/// subtitle line — the same shape the Agent sidebar uses — so the rows that
 /// replace these land on the same pitch.
 fn management_resource_placeholders(cx: &App) -> Vec<AnyElement> {
     (0..MANAGEMENT_RESOURCE_LOADING_ROWS)
@@ -21235,7 +22268,7 @@ fn management_resource_placeholders(cx: &App) -> Vec<AnyElement> {
                 .bg(cx.theme().background.opacity(0.70))
                 .px(px(10.0))
                 .py_2()
-                .child(skeleton::skeleton_bar(28.0, 0.09, cx))
+                .child(skeleton::skeleton_bar(36.0, 0.09, cx))
                 .child(
                     v_flex()
                         .min_w_0()
@@ -21419,10 +22452,6 @@ fn management_mcp_resources_title() -> &'static str {
 
 fn management_skills_title() -> &'static str {
     management_locale_text("SKILLS", "技能", "技能")
-}
-
-fn management_resource_status_key(enabled: bool) -> &'static str {
-    if enabled { "enabled" } else { "disabled" }
 }
 
 fn management_agent_enablement_label() -> &'static str {
@@ -22576,30 +23605,36 @@ mod tests {
 
     #[test]
     fn market_pages_cover_the_fetched_window_without_gaps() {
-        assert_eq!(market_page_count(0), 1);
-        assert_eq!(market_page_count(1), 1);
-        assert_eq!(market_page_count(MARKET_PAGE_SIZE), 1);
-        assert_eq!(market_page_count(MARKET_PAGE_SIZE + 1), 2);
-        // The count follows the fetch limit rather than a fixed number, so
-        // raising the window does not silently leave pages unreachable.
-        assert_eq!(
-            market_page_count(MARKET_FETCH_LIMIT as usize),
-            (MARKET_FETCH_LIMIT as usize).div_ceil(MARKET_PAGE_SIZE)
-        );
-
         let entries: Vec<usize> = (0..MARKET_FETCH_LIMIT as usize).collect();
-        // Paging through the window visits every entry exactly once and in
-        // order, so no card can be skipped or shown twice.
+        let pages = market_page_count(entries.len());
+
+        // Every page is a distinct, contiguous window and together they cover
+        // the whole result set, so no card is skipped or shown twice.
         let mut seen = Vec::new();
-        for page in 1..=market_page_count(entries.len()) {
-            seen.extend_from_slice(market_page_slice(&entries, page));
+        for page in 1..=pages {
+            let slice = market_page_slice(&entries, page);
+            let expected = if page == pages {
+                entries.len() - (pages - 1) * MARKET_PAGE_SIZE
+            } else {
+                MARKET_PAGE_SIZE
+            };
+            assert_eq!(slice.len(), expected);
+            seen.extend_from_slice(slice);
         }
         assert_eq!(seen, entries);
-        assert_eq!(market_page_slice(&entries, 1).len(), MARKET_PAGE_SIZE);
-        // A page past the end is empty rather than a panic, which is what the
-        // renderer relies on when a search shrinks the window underneath it.
-        assert!(market_page_slice(&entries, 99).is_empty());
+
+        // The last page holds the remainder rather than a whole step.
+        let short: Vec<usize> = (0..MARKET_PAGE_SIZE + 3).collect();
+        assert_eq!(market_page_count(short.len()), 2);
+        assert_eq!(market_page_slice(&short, 2), &short[MARKET_PAGE_SIZE..]);
+
+        // An empty window still reports one page so the control has a value,
+        // and a page past the end resolves to the last one that exists.
+        assert_eq!(market_page_count(0), 1);
         assert!(market_page_slice::<usize>(&[], 1).is_empty());
+        assert_eq!(market_page(9, short.len()), 2);
+        assert_eq!(market_page(0, short.len()), 1);
+        assert_eq!(market_page(2, 0), 1);
     }
 
     fn market_entry_for_display() -> vibex_core::McpMarketEntry {
@@ -22617,7 +23652,6 @@ mod tests {
             args: vec!["-y".to_string(), "example@1.0.0".to_string()],
             url: None,
             env: Vec::new(),
-            verified: true,
             version: Some("1.0.0".to_string()),
             package_kind: Some("npm".to_string()),
         }
@@ -22673,26 +23707,52 @@ mod tests {
     }
 
     #[test]
-    fn market_badges_mark_state_and_hide_a_healthy_status() {
+    fn market_cards_call_out_at_most_one_state() {
         let entry = market_entry_for_display();
-        let badges = market_entry_badges(&entry, false);
-        // `active` is the normal state and is not worth a chip.
-        assert!(!badges.iter().any(|badge| badge == "active"));
-        assert!(badges.iter().any(|badge| badge == "npm"));
-        assert!(badges.iter().any(|badge| badge == "1.0.0"));
+        // A healthy, uninstalled entry says nothing: `active` is the normal
+        // state and is not worth a tag.
+        assert_eq!(market_entry_state(&entry, false), None);
+        assert_eq!(
+            market_entry_state(&entry, true),
+            Some(MarketEntryState::Installed)
+        );
 
+        // The publisher's lifecycle outranks the local install, because a
+        // deprecated server is exactly where "you already have this" matters
+        // less than "it is deprecated".
         let mut deprecated = market_entry_for_display();
         deprecated.status = Some("deprecated".to_string());
-        assert!(
-            market_entry_badges(&deprecated, true)
-                .iter()
-                .any(|badge| badge == "deprecated"),
-            "a deprecated entry must not look healthy"
+        assert_eq!(
+            market_entry_state(&deprecated, true),
+            Some(MarketEntryState::Deprecated)
         );
+        // The lifecycle tags are the ones that shout; "installed" stays quiet.
+        assert_ne!(
+            MarketEntryState::Installed.label(),
+            MarketEntryState::Deprecated.label()
+        );
+
+        let mut deleted = market_entry_for_display();
+        deleted.status = Some("deleted".to_string());
+        assert_eq!(
+            market_entry_state(&deleted, false),
+            Some(MarketEntryState::Removed)
+        );
+
+        // Classification and metadata are separate lanes: what published the
+        // launcher and which version it pins never become tags.
+        assert_eq!(
+            market_entry_meta_line(&entry).as_deref(),
+            Some("npm · 1.0.0")
+        );
+        let mut remote = market_entry_for_display();
+        remote.package_kind = Some("remote".to_string());
+        remote.version = None;
+        assert_eq!(market_entry_meta_line(&remote), None);
     }
 
     #[test]
-    fn market_pagers_use_the_kit_pagination_component() {
+    fn market_grids_page_the_fetched_window() {
         let source = include_str!("management.rs");
         for (open, close) in [
             (
@@ -22710,13 +23770,21 @@ mod tests {
                 .map(|(body, _)| body)
                 .unwrap_or_else(|| panic!("{open} should remain inspectable"));
             assert!(
-                render.contains("market_page_slice(&entries, page)"),
-                "{open} should render one page of the fetched window"
+                render.contains("market_page_slice("),
+                "{open} should render the page of the fetched window it is on"
+            );
+            assert!(
+                render.contains("market_page("),
+                "{open} should clamp its page to the window in hand"
             );
             assert!(
                 render.contains("management_market_pager("),
                 "{open} should draw the pager under its grid"
             );
+            // The registries cannot answer a page number, so the pager is the
+            // only navigation the grid may offer; a "show more" button would be
+            // a second, competing one.
+            assert!(!render.contains("Show more"), "{open} still reveals more");
         }
 
         let pager = source
@@ -22724,10 +23792,12 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n/// The exact launcher"))
             .map(|(body, _)| body)
             .expect("the market pager should remain inspectable");
+        // The kit's own pager, spanning the strip rather than a lone button.
         assert!(pager.contains("Pagination::new(id)"));
         assert!(pager.contains(".current_page(page)"));
         assert!(pager.contains(".total_pages(market_page_count(total))"));
         assert!(pager.contains(".on_click(on_page)"));
+        assert!(pager.contains(".w_full()"));
     }
 
     fn provider_options(entries: &[(&str, &str)]) -> vibex_core::ProviderOptions {
@@ -22908,11 +23978,27 @@ mod tests {
         // `Tab` renders `icon` *instead of* `label` when both are set, which
         // silently dropped these captions once. The caption has to stay in the
         // children slot (with `aria_label` carrying the accessible name) and the
-        // tabs have to keep `flex_1()` so the bar still fills its width.
+        // tabs have to keep `flex_1()` so the pills stay equal width and the bar
+        // still fills its width.
         assert!(renderer.contains(".aria_label(label)"));
         assert!(renderer.contains(".child(label)"));
         assert!(!renderer.contains(".label(label)"));
         assert!(renderer.contains("Tab::new().flex_1()"));
+    }
+
+    #[test]
+    fn management_primary_navigation_uses_pill_tabs() {
+        let source = include_str!("management.rs");
+        let renderer = source
+            .split_once("    fn render_nav(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
+            .map(|(body, _)| body)
+            .expect("management primary navigation should remain inspectable");
+
+        // The primary navigation is a row of pill tabs: the bar paints no
+        // track, and the active section is the filled pill itself.
+        assert!(renderer.contains(".pill()"));
+        assert!(!renderer.contains(".segmented()"));
     }
 
     #[test]
