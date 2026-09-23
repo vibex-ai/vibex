@@ -9418,9 +9418,12 @@ impl ManagementCenter {
                         target_agent_id,
                     );
                     if import_item_ids.is_empty() {
-                        let (code, message) =
-                            native_import_empty_reason(&preview, target_agent_id, active_locale);
-                        return Err(VibexError::validation(code, message));
+                        return native_import_empty_reason(
+                            &preview,
+                            target_agent_id,
+                            active_locale,
+                        )
+                        .into_task_result();
                     }
                     let mut imported_count = 0usize;
                     let mut missing_secret_count = 0usize;
@@ -20091,15 +20094,40 @@ fn pending_cc_switch_import_item_ids(
 
 /// Explains why a cc-switch import produced no work for `target_agent_id`.
 ///
-/// A single `provider_native_import_no_candidate` covered three unrelated
-/// situations, so the UI could only say "operation failed". Naming them lets
-/// the user see whether CC Switch is missing, has nothing for this Agent, has
-/// already been imported, or has a config Vibex cannot parse.
+/// A single `provider_native_import_no_candidate` covered four unrelated
+/// situations, so the UI could only say "operation failed". Most of them are
+/// ordinary states rather than failures — CC Switch is not installed, has no
+/// record for this Agent, or has nothing left to import — and the user asked
+/// for those to read as plain notices instead of error alerts. Only candidates
+/// that exist but cannot be parsed are a real failure.
+enum NativeImportEmptyReason {
+    /// Nothing to import; reported as an informational notice.
+    Notice { code: &'static str, message: String },
+    /// Candidates exist, but none of them can be imported.
+    Failure { code: &'static str, message: String },
+}
+
+impl NativeImportEmptyReason {
+    /// The task outcome the UI should show for this reason.
+    fn into_task_result(self) -> VibexResult<ManagementTaskSuccess> {
+        match self {
+            Self::Notice { code, message } => {
+                tracing::debug!(
+                    code,
+                    "native provider import found nothing to import; reporting a notice"
+                );
+                Ok(ManagementTaskSuccess::from(message))
+            }
+            Self::Failure { code, message } => Err(VibexError::validation(code, message)),
+        }
+    }
+}
+
 fn native_import_empty_reason(
     preview: &vibex_core::ProviderNativeImportPreview,
     target_agent_id: &AgentId,
     locale: ResolvedLocale,
-) -> (&'static str, String) {
+) -> NativeImportEmptyReason {
     let label = vibex_core::builtin_agent_definitions()
         .into_iter()
         .find(|definition| &definition.id == target_agent_id)
@@ -20122,48 +20150,48 @@ fn native_import_empty_reason(
             .iter()
             .any(|diagnostic| diagnostic.code == "provider_native_import_cc_switch_missing")
         {
-            return (
-                "provider_native_import_cc_switch_missing",
-                match locale {
+            return NativeImportEmptyReason::Notice {
+                code: "provider_native_import_cc_switch_missing",
+                message: match locale {
                     ResolvedLocale::En => {
                         "The CC Switch provider database was not found".to_string()
                     }
                     ResolvedLocale::ZhCn => "未找到 CC Switch 数据库，无法导入配置".to_string(),
                     ResolvedLocale::ZhTw => "未找到 CC Switch 資料庫，無法匯入設定".to_string(),
                 },
-            );
+            };
         }
-        return (
-            "provider_native_import_agent_not_in_cc_switch",
-            match locale {
+        return NativeImportEmptyReason::Notice {
+            code: "provider_native_import_agent_not_in_cc_switch",
+            message: match locale {
                 ResolvedLocale::En => {
                     format!("CC Switch has no provider configuration for {label}")
                 }
                 ResolvedLocale::ZhCn => format!("CC Switch 中没有 {label} 的供应商配置"),
                 ResolvedLocale::ZhTw => format!("CC Switch 中沒有 {label} 的供應商設定"),
             },
-        );
+        };
     }
 
     if cc_switch_items
         .iter()
         .any(|item| native_import_status_is_eligible(item.status))
     {
-        return (
-            "provider_native_import_already_imported",
-            match locale {
+        return NativeImportEmptyReason::Notice {
+            code: "provider_native_import_already_imported",
+            message: match locale {
                 ResolvedLocale::En => {
                     format!("Every {label} provider in CC Switch is already imported")
                 }
                 ResolvedLocale::ZhCn => format!("{label} 的 CC Switch 供应商配置已全部导入"),
                 ResolvedLocale::ZhTw => format!("{label} 的 CC Switch 供應商設定已全部匯入"),
             },
-        );
+        };
     }
 
-    (
-        "provider_native_import_blocked",
-        match locale {
+    NativeImportEmptyReason::Failure {
+        code: "provider_native_import_blocked",
+        message: match locale {
             ResolvedLocale::En => {
                 format!("Every {label} provider in CC Switch is blocked by a parse error")
             }
@@ -20174,7 +20202,7 @@ fn native_import_empty_reason(
                 format!("{label} 在 CC Switch 中的供應商設定存在解析錯誤，無法匯入")
             }
         },
-    )
+    }
 }
 
 fn management_agent_icon(identity: &str, label: &str, active: bool, cx: &App) -> AnyElement {
@@ -23454,7 +23482,7 @@ mod tests {
     }
 
     #[test]
-    fn native_import_empty_reason_names_each_missing_case() {
+    fn native_import_empty_reason_classifies_notices_and_failures() {
         let grok = AgentId::parse("grok").expect("valid Agent id");
         let options = provider_options(&[
             (PROVIDER_OPTION_NATIVE_SOURCE, "cc-switch"),
@@ -23471,9 +23499,15 @@ mod tests {
             created_at_ms: 1,
         };
 
-        let (code, message) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        assert_eq!(code, "provider_native_import_agent_not_in_cc_switch");
+        // Nothing to import is an ordinary state, so the UI must receive a
+        // notice instead of an error alert.
+        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        let NativeImportEmptyReason::Notice { code, message } = &reason else {
+            panic!("a missing cc-switch record is a notice, not a failure");
+        };
+        assert_eq!(*code, "provider_native_import_agent_not_in_cc_switch");
         assert!(message.contains("Grok Build"));
+        assert!(reason.into_task_result().is_ok());
 
         preview
             .diagnostics
@@ -23484,8 +23518,12 @@ mod tests {
                 file_kind: None,
                 redacted_details: Vec::new(),
             });
-        let (code, _) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        assert_eq!(code, "provider_native_import_cc_switch_missing");
+        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        let NativeImportEmptyReason::Notice { code, .. } = &reason else {
+            panic!("a missing cc-switch database is a notice, not a failure");
+        };
+        assert_eq!(*code, "provider_native_import_cc_switch_missing");
+        assert!(reason.into_task_result().is_ok());
         preview.diagnostics.clear();
 
         preview.items.push(native_import_item(
@@ -23495,13 +23533,24 @@ mod tests {
             vibex_core::ProviderNativeImportItemStatus::NeedsSecretSetup,
             options,
         ));
-        let (code, message) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        assert_eq!(code, "provider_native_import_already_imported");
+        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        let NativeImportEmptyReason::Notice { code, message } = &reason else {
+            panic!("an already imported provider is a notice, not a failure");
+        };
+        assert_eq!(*code, "provider_native_import_already_imported");
         assert!(message.contains("Grok Build"));
+        assert!(reason.into_task_result().is_ok());
 
         preview.items[0].status = vibex_core::ProviderNativeImportItemStatus::BlockedByParseError;
-        let (code, _) = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
-        assert_eq!(code, "provider_native_import_blocked");
+        let reason = native_import_empty_reason(&preview, &grok, ResolvedLocale::ZhCn);
+        let NativeImportEmptyReason::Failure { code, .. } = &reason else {
+            panic!("a candidate blocked by a parse error stays a failure");
+        };
+        assert_eq!(*code, "provider_native_import_blocked");
+        let Err(error) = reason.into_task_result() else {
+            panic!("a blocked candidate must surface as an error");
+        };
+        assert_eq!(error.code, "provider_native_import_blocked");
     }
 
     #[test]
