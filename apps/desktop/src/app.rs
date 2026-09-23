@@ -6092,6 +6092,7 @@ impl Render for SidebarGroupDrag {
 
 #[derive(Clone)]
 struct SessionGroupTabDrag {
+    group_id: String,
     session_id: String,
     label: SharedString,
     agent_id: String,
@@ -6197,6 +6198,18 @@ enum SessionGroupPaneDropRegion {
 struct SessionGroupPaneDropTarget {
     pane_id: String,
     region: SessionGroupPaneDropRegion,
+}
+
+/// Which tab of which pane a dragged session tab would land next to.
+///
+/// The preview panel resolves the same question with its own
+/// `PreviewTabDropTarget`; a group pane keeps a separate one because the two
+/// surfaces hold different tab sets and never share a strip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionGroupTabDropTarget {
+    pane_id: String,
+    session_id: String,
+    after: bool,
 }
 
 /// The region of `pane_bounds` a drag at `position` asks for, or `None` when
@@ -6794,6 +6807,18 @@ pub struct VibexWorkbench {
     sidebar_folder_drag_state: Option<SidebarFolderDragState>,
     sidebar_group_drag_state: Option<SidebarGroupDragState>,
     session_group_pane_drop_target: Option<SessionGroupPaneDropTarget>,
+    /// Horizontal scroll state of each group pane's tab strip, keyed by pane id.
+    session_group_tab_scrolls: BTreeMap<String, ScrollHandle>,
+    /// The tab each pane's strip last revealed, so a repaint that changed
+    /// nothing does not yank the strip back to the active tab.
+    session_group_revealed_tab_ids: BTreeMap<String, String>,
+    /// Where a session tab dragged inside a group pane would land.
+    session_group_tab_drop_target: Option<SessionGroupTabDropTarget>,
+    /// Whether a session tab dragged out of its group is hovering the sidebar.
+    ///
+    /// Dropping it there is the gesture that removes a session from its group,
+    /// so the sidebar has to say that it will accept the drop.
+    session_group_tab_removal_active: bool,
     /// Where a dragged right-rail activity button would land.
     right_rail_activity_drop_target: Option<RightRailActivityDropTarget>,
     /// Group members whose parked view is being fetched.
@@ -7763,6 +7788,10 @@ impl VibexWorkbench {
             sidebar_folder_drag_state: None,
             sidebar_group_drag_state: None,
             session_group_pane_drop_target: None,
+            session_group_tab_scrolls: BTreeMap::new(),
+            session_group_revealed_tab_ids: BTreeMap::new(),
+            session_group_tab_drop_target: None,
+            session_group_tab_removal_active: false,
             right_rail_activity_drop_target: None,
             session_group_view_loads: BTreeSet::new(),
             session_group_pane_views: BTreeMap::new(),
@@ -7999,12 +8028,10 @@ impl VibexWorkbench {
         // again — so the motion gate only applies the pause when the appearance
         // setting asks for it. Recording the activation state here keeps that
         // decision in the motion layer.
-        self.window_activation_subscription = Some(cx.observe_window_activation(
-            window,
-            |_this, window, cx| {
+        self.window_activation_subscription =
+            Some(cx.observe_window_activation(window, |_this, window, cx| {
                 motion::set_window_active(window.is_window_active(), cx);
-            },
-        ));
+            }));
         let focus = self.focus_handle.clone();
         window.defer(cx, move |window, cx| {
             if window.focused(cx).is_none() {
@@ -12845,14 +12872,38 @@ impl VibexWorkbench {
     /// A group is single-Worktree, so a selection spanning Worktrees cannot
     /// become one group; the action stays disabled instead of splitting it.
     fn sidebar_group_creation_candidates(&self) -> Option<(String, String, Vec<String>)> {
-        if self.sidebar_state.selected_ids.is_empty() {
+        self.sidebar_group_creation_candidates_for(&self.sidebar_state.selected_ids)
+    }
+
+    /// The shift/ctrl selection as one group, when it can form one.
+    ///
+    /// The multi-select a plain click builds is the same selection the drag
+    /// gesture carries, so a right click on it can offer the group directly
+    /// instead of sending the user through batch mode first.
+    fn sidebar_move_group_creation_candidates(&self) -> Option<(String, String, Vec<String>)> {
+        let selected = self
+            .sidebar_move_selected_items
+            .iter()
+            .filter_map(|item| match item {
+                SidebarOrganizationItem::Session(session_id) => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.sidebar_group_creation_candidates_for(&selected)
+    }
+
+    fn sidebar_group_creation_candidates_for(
+        &self,
+        selected_ids: &BTreeSet<String>,
+    ) -> Option<(String, String, Vec<String>)> {
+        if selected_ids.is_empty() {
             return None;
         }
         let mut scope: Option<(String, String)> = None;
         let mut session_ids = Vec::new();
         for session in &self.sessions {
             let session_id = session.id.as_str();
-            if !self.sidebar_state.selected_ids.contains(session_id) {
+            if !selected_ids.contains(session_id) {
                 continue;
             }
             let candidate = (
@@ -12876,30 +12927,54 @@ impl VibexWorkbench {
         else {
             return;
         };
+        self.create_session_group(&project_id, &workspace_id, &session_ids, window, cx);
+    }
+
+    /// Turns the shift/ctrl selection into a session group.
+    fn create_session_group_from_move_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((project_id, workspace_id, session_ids)) =
+            self.sidebar_move_group_creation_candidates()
+        else {
+            return;
+        };
+        self.create_session_group(&project_id, &workspace_id, &session_ids, window, cx);
+    }
+
+    fn create_session_group(
+        &mut self,
+        project_id: &str,
+        workspace_id: &str,
+        session_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let name = self
             .ui_state
             .sidebar
             .organization
-            .next_available_group_name(
-                &project_id,
-                &workspace_id,
-                self.strings().sidebar_group_stem,
-            );
+            .next_available_group_name(project_id, workspace_id, self.strings().sidebar_group_stem);
         let group_id = RequestId::new().to_string();
         let session_workspaces = self.sidebar_session_workspaces();
         if !self.ui_state.sidebar.organization.create_group(
             &group_id,
             name,
-            &project_id,
-            &workspace_id,
-            &session_ids,
+            project_id,
+            workspace_id,
+            session_ids,
             &session_workspaces,
             None,
         ) {
             return;
         }
+        // Either selection may have started the group, and both stop meaning
+        // anything once their sessions belong to it.
         self.sidebar_batch_mode = false;
         self.sidebar_state.clear_selection();
+        self.clear_sidebar_move_selection();
         self.queue_ui_state();
         self.publish_sidebar_invalidation();
         // Naming happens in place: the new group is the only row the user is
@@ -13955,6 +14030,7 @@ impl VibexWorkbench {
         cursor_offset_y: f32,
         cx: &mut Context<Self>,
     ) {
+        self.session_group_tab_removal_active = false;
         let groups = self.sidebar_workspace_groups("");
         let Some(group) = groups
             .iter()
@@ -14116,6 +14192,7 @@ impl VibexWorkbench {
         source_was_collapsed: bool,
         cx: &mut Context<Self>,
     ) {
+        self.session_group_tab_removal_active = false;
         let project_id = drag.project_id.as_str();
         if !self
             .sidebar_move_selected_items
@@ -14308,6 +14385,9 @@ impl VibexWorkbench {
         cursor_offset_y: f32,
         cx: &mut Context<Self>,
     ) {
+        // A new drag owns the sidebar's drop affordances; a tab drag that ended
+        // somewhere else must not keep claiming them.
+        self.session_group_tab_removal_active = false;
         let primary = SidebarOrganizationItem::Session(drag.session_id.as_str().to_string());
         if !self.sidebar_move_selected_items.contains(&primary) {
             self.update_sidebar_move_selection(primary.clone(), false, false, cx);
@@ -14524,7 +14604,11 @@ impl VibexWorkbench {
             .cloned()
             .map(SidebarOrganizationItem::Session)
             .collect::<Vec<_>>();
+        // Resolved before the drop consumes the target: a member row inside the
+        // group is the one landing zone that keeps the sessions in it.
+        let keep_group = self.sidebar_session_drop_keep_group(direct_target.as_ref());
         if self.apply_sidebar_organization_drop(&moving, cx) {
+            self.apply_sidebar_session_group_drop(&state.session_ids, keep_group.as_deref(), cx);
             return;
         }
         let fallback_target = direct_target
@@ -14538,12 +14622,145 @@ impl VibexWorkbench {
             });
         if let Some((target_id, after)) = fallback_target {
             self.move_session_order_relative(&state.session_ids, &target_id, after, cx);
+            self.apply_sidebar_session_group_drop(&state.session_ids, keep_group.as_deref(), cx);
         } else {
             cx.notify();
         }
     }
 
+    /// Applies the group half of a session drop: sessions dropped inside a group
+    /// join it, sessions dropped outside the group they came from leave it.
+    ///
+    /// A group lists its members under its own row and nowhere else, so the
+    /// landing zone is the whole answer — there is no third case to weigh.
+    fn apply_sidebar_session_group_drop(
+        &mut self,
+        session_ids: &[String],
+        keep_group_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        // A drop inside a group either joins it or is refused — a group holds
+        // one Worktree — and neither outcome takes the sessions out of the
+        // group they came from. Only a drop outside every group does that.
+        if let Some(group_id) = keep_group_id {
+            self.join_dragged_sessions_to_group(group_id, session_ids, cx);
+            return;
+        }
+        self.release_dragged_sessions_from_groups(session_ids, cx);
+    }
+
+    /// Adds dragged sessions to the group the drop landed in.
+    ///
+    /// The group row is a small target, and a collapsed group shows nothing but
+    /// that row, so a member row accepts the drop too: both mean "these sessions
+    /// belong to this group". A group holds one Worktree, so a drop from another
+    /// one is refused and leaves every session where it was.
+    fn join_dragged_sessions_to_group(
+        &mut self,
+        group_id: &str,
+        session_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let session_workspaces = self.sidebar_session_workspaces();
+        if !self.ui_state.sidebar.organization.add_sessions_to_group(
+            group_id,
+            session_ids,
+            &session_workspaces,
+        ) {
+            return;
+        }
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_group_ids
+            .remove(group_id);
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+        cx.notify();
+    }
+
+    /// The group a session drop lands inside, when it lands inside one.
+    ///
+    /// A group lists its members under its own row and nowhere else, so a drop
+    /// anywhere but a member of the same group is the user taking the sessions
+    /// out of it. `None` therefore means "outside every group".
+    fn sidebar_session_drop_keep_group(
+        &self,
+        direct_target: Option<&SidebarSessionDropTarget>,
+    ) -> Option<String> {
+        if let Some(target) = direct_target {
+            return self
+                .ui_state
+                .sidebar
+                .organization
+                .group_of_session(target.session_id.as_str())
+                .map(str::to_string);
+        }
+        match self
+            .sidebar_organization_drop_target
+            .as_ref()
+            .map(|target| &target.target)
+        {
+            Some(SidebarOrganizationItem::Group(group_id)) => Some(group_id.clone()),
+            Some(SidebarOrganizationItem::Session(session_id)) => self
+                .ui_state
+                .sidebar
+                .organization
+                .group_of_session(session_id)
+                .map(str::to_string),
+            Some(SidebarOrganizationItem::Folder(_))
+            | Some(SidebarOrganizationItem::Project(_))
+            | None => None,
+        }
+    }
+
+    /// Takes dragged sessions out of whatever group holds them.
+    ///
+    /// Dropping a member row outside its group is the drag path for "leave the
+    /// session group", so it runs after the drop resolved rather than as part of
+    /// the organization move: the placement move says where the row lands, this
+    /// says which group it stops belonging to.
+    fn release_dragged_sessions_from_groups(
+        &mut self,
+        session_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let mut leaving: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for session_id in session_ids {
+            let Some(group_id) = self
+                .ui_state
+                .sidebar
+                .organization
+                .group_of_session(session_id)
+            else {
+                continue;
+            };
+            leaving
+                .entry(group_id.to_string())
+                .or_default()
+                .push(session_id.clone());
+        }
+        let mut changed = false;
+        for (group_id, members) in leaving {
+            if self
+                .ui_state
+                .sidebar
+                .organization
+                .remove_sessions_from_group(&group_id, &members)
+            {
+                self.release_group_session_views(&members);
+                changed = true;
+            }
+        }
+        if changed {
+            self.queue_ui_state();
+            self.publish_sidebar_invalidation();
+            cx.notify();
+        }
+    }
+
     fn start_sidebar_folder_drag(&mut self, drag: &SidebarFolderDrag, cx: &mut Context<Self>) {
+        self.session_group_tab_removal_active = false;
         if self
             .ui_state
             .sidebar
@@ -14577,6 +14794,7 @@ impl VibexWorkbench {
     }
 
     fn start_sidebar_group_drag(&mut self, drag: &SidebarGroupDrag, cx: &mut Context<Self>) {
+        self.session_group_tab_removal_active = false;
         let Some(scope) = self
             .ui_state
             .sidebar
@@ -17731,7 +17949,9 @@ impl VibexWorkbench {
         }
         if fresh.is_empty()
             || !self.ui_state.desktop_behavior.notifications_enabled
-            || self.notification_suppressed_session_ids.contains(&session_id)
+            || self
+                .notification_suppressed_session_ids
+                .contains(&session_id)
         {
             return;
         }
@@ -32528,6 +32748,10 @@ impl VibexWorkbench {
         let usage_selected = self.ui_state.workbench.active_tab == "usage";
         let root_drop_active =
             self.sidebar_organization_root_drop_active(&SidebarOrganizationScope::Root);
+        // Only a live drag may light the sidebar up: the flag outlives a drag
+        // that ended somewhere the sidebar never heard about.
+        let session_group_tab_removal_active =
+            cx.has_active_drag() && self.session_group_tab_removal_active;
         let root_menu_entity = cx.weak_entity();
         let toolbar_more_entity = cx.weak_entity();
         let toolbar_more_state = SidebarToolbarMoreMenuState {
@@ -32823,6 +33047,8 @@ impl VibexWorkbench {
                             .overflow_y_scroll()
                             .bg(if root_drop_active {
                                 cx.theme().sidebar_accent.opacity(0.20)
+                            } else if session_group_tab_removal_active {
+                                cx.theme().tokens.drop_target.into()
                             } else {
                                 cx.theme().transparent
                             })
@@ -32846,6 +33072,29 @@ impl VibexWorkbench {
                                 this.finish_sidebar_workspace_drag(
                                     &drag.project_id,
                                     &drag.workspace_id,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }))
+                            // A group pane's tab dragged onto the sidebar leaves
+                            // the group: the sidebar is the surface the group's
+                            // members also live on, so dragging a tab out of the
+                            // workspace and dropping it here is the gesture that
+                            // takes the session back out.
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
+                                    let inside = event.bounds.contains(&event.event.position);
+                                    if this.session_group_tab_removal_active != inside {
+                                        this.session_group_tab_removal_active = inside;
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                            .on_drop(cx.listener(|this, drag: &SessionGroupTabDrag, _, cx| {
+                                this.session_group_tab_removal_active = false;
+                                this.remove_session_from_group_from_menu(
+                                    &drag.group_id,
+                                    &drag.session_id,
                                     cx,
                                 );
                                 cx.stop_propagation();
@@ -33994,6 +34243,13 @@ impl VibexWorkbench {
         let live_panes = group.layout.pane_ids();
         self.session_group_pane_views
             .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
+        // The strip's scroll and reveal state belong to the panes too: a pane
+        // the layout dropped must not keep its offset alive for the next pane
+        // that reuses the id.
+        self.session_group_tab_scrolls
+            .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
+        self.session_group_revealed_tab_ids
+            .retain(|pane_id, _| live_panes.iter().any(|live| live == pane_id));
         let strings = self.strings();
         v_flex()
             .id("session-group-workspace")
@@ -34198,46 +34454,142 @@ impl VibexWorkbench {
                 ))
             })
             .collect::<Vec<_>>();
+        // The strip is the preview panel's strip with session tabs in it: same
+        // height, same horizontal scroll, same drag-to-reorder. A group pane can
+        // hold more tabs than fit, and the tabs are the only way to reach the
+        // ones the pane is not showing, so the strip has to scroll rather than
+        // clip them.
+        let tab_scroll = self
+            .session_group_tab_scrolls
+            .entry(pane_id.clone())
+            .or_default()
+            .clone();
+        if let Some(active) = active_session_id.as_ref() {
+            if self.session_group_revealed_tab_ids.get(&pane_id) != Some(active)
+                && let Some(index) = pane.session_ids.iter().position(|id| id == active)
+            {
+                tab_scroll.scroll_to_item(index);
+                self.session_group_revealed_tab_ids
+                    .insert(pane_id.clone(), active.clone());
+            }
+        } else {
+            self.session_group_revealed_tab_ids.remove(&pane_id);
+        }
+        let wheel_scroll = tab_scroll.clone();
+        // The whole strip lights up while a tab would merge into it, exactly
+        // like the preview strip: the tabs themselves are the drop zone.
+        let tab_group_drop_active = cx.has_active_drag()
+            && self
+                .session_group_pane_drop_target
+                .as_ref()
+                .is_some_and(|target| {
+                    target.pane_id == pane_id
+                        && target.region == SessionGroupPaneDropRegion::TabGroup
+                });
         // A pane always offers a split: a pane with more than one tab moves the
         // tab into the new pane, and a pane with one tab opens an empty pane
         // beside it. That is what lets a workspace grow past two panes.
-        let mut tab_strip = h_flex()
+        let mut tab_strip = h_flex();
+        tab_strip.style().restrict_scroll_to_axis = Some(true);
+        let strip_pane_id = pane_id.clone();
+        let mut tab_strip = tab_strip
             .id(format!("session-group-tabs-{pane_id}"))
             .flex_none()
-            .h(px(30.0))
+            .h(px(36.0))
             .min_w_0()
             .items_center()
-            .gap(px(2.0))
-            .px_1()
+            .overflow_x_scroll()
+            .overflow_y_hidden()
+            .track_scroll(&tab_scroll)
+            .on_scroll_wheel(cx.listener(move |_, event: &ScrollWheelEvent, window, cx| {
+                let max_x = wheel_scroll.max_offset().x;
+                let delta = event.delta.pixel_delta(window.line_height());
+                if max_x > px(0.0) && delta.y.abs() > delta.x.abs() {
+                    let offset = wheel_scroll.offset();
+                    // GPUI applies delta.x before custom bubble listeners run.
+                    let next_x = (offset.x - delta.x + delta.y).clamp(-max_x, px(0.0));
+                    if next_x != offset.x {
+                        wheel_scroll.set_offset(point(next_x, offset.y));
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .border_b_1()
-            .border_color(cx.theme().border);
+            .border_color(if tab_group_drop_active {
+                cx.theme().primary.opacity(0.60)
+            } else {
+                cx.theme().border
+            })
+            .bg(if tab_group_drop_active {
+                cx.theme().primary.opacity(0.10)
+            } else {
+                cx.theme().muted.opacity(0.30)
+            })
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    let next = SessionGroupPaneDropTarget {
+                        pane_id: strip_pane_id.clone(),
+                        region: SessionGroupPaneDropRegion::TabGroup,
+                    };
+                    if this.session_group_pane_drop_target.as_ref() != Some(&next)
+                        || this.session_group_tab_drop_target.is_some()
+                    {
+                        this.session_group_pane_drop_target = Some(next);
+                        this.session_group_tab_drop_target = None;
+                        cx.notify();
+                    }
+                },
+            ));
         for (session_id, title, agent_id, state) in tabs {
             let selected = active_session_id.as_deref() == Some(session_id.as_str());
             let click_entity = cx.weak_entity();
             let click_group_id = group_id.to_string();
             let click_pane_id = pane_id.clone();
             let click_session_id = session_id.clone();
+            // The reorder target is the tab the pointer is over, so the dragged
+            // tab lands before or after it depending on which half it left.
+            let reorder_pane_id = pane_id.clone();
+            let reorder_target_id = session_id.clone();
+            let drop_group_id = group_id.to_string();
+            let drop_pane_id = pane_id.clone();
+            let drag_entity = cx.weak_entity();
             tab_strip = tab_strip.child(
                 h_flex()
                     .id(format!("session-group-tab-{session_id}"))
+                    .relative()
+                    .h_full()
                     .flex_none()
                     .max_w(px(200.0))
                     .min_w_0()
                     .items_center()
                     .gap_1()
                     .px_2()
-                    .h(px(24.0))
-                    .rounded(px(6.0))
+                    .text_xs()
+                    .border_r_1()
+                    .border_color(cx.theme().border)
                     .cursor_pointer()
                     .when(selected, |this| {
-                        this.bg(cx.theme().secondary)
+                        this.bg(cx.theme().background)
                             .text_color(cx.theme().foreground)
                     })
                     .when(!selected, |this| {
                         this.text_color(cx.theme().muted_foreground)
                     })
+                    .hover(|style| {
+                        style
+                            .bg(if selected {
+                                cx.theme().background
+                            } else {
+                                cx.theme().muted.opacity(0.45)
+                            })
+                            .text_color(cx.theme().foreground)
+                    })
                     .child(sidebar_agent_logo(&agent_id, selected, cx))
-                    .child(div().min_w_0().truncate().text_xs().child(title.clone()))
+                    .child(div().min_w_0().truncate().child(title.clone()))
                     .child(
                         div()
                             .flex_none()
@@ -34245,6 +34597,18 @@ impl VibexWorkbench {
                             .rounded_full()
                             .bg(sidebar_session_status_color(state, cx)),
                     )
+                    .when(selected, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top_0()
+                                .h(px(2.0))
+                                .rounded_full()
+                                .bg(cx.theme().primary.opacity(0.80)),
+                        )
+                    })
                     .on_click(move |_, _, cx| {
                         let _ = click_entity.update(cx, |this, cx| {
                             this.focus_session_group_tab(
@@ -34255,13 +34619,78 @@ impl VibexWorkbench {
                             )
                         });
                     })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<SessionGroupTabDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let next = (drag.session_id != reorder_target_id).then_some(
+                                SessionGroupTabDropTarget {
+                                    pane_id: reorder_pane_id.clone(),
+                                    session_id: reorder_target_id.clone(),
+                                    after: event.event.position.x >= event.bounds.center().x,
+                                },
+                            );
+                            if this.session_group_tab_drop_target != next {
+                                this.session_group_tab_drop_target = next;
+                                this.session_group_pane_drop_target =
+                                    Some(SessionGroupPaneDropTarget {
+                                        pane_id: reorder_pane_id.clone(),
+                                        region: SessionGroupPaneDropRegion::TabGroup,
+                                    });
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, drag: &SessionGroupTabDrag, _, cx| {
+                        this.session_group_pane_drop_target = None;
+                        this.session_group_tab_removal_active = false;
+                        // A tab is always a landing slot for the strip it lives
+                        // in, so a drop on one never falls through to the pane:
+                        // it either lands next to this tab or, with no resolved
+                        // slot, at the end of this pane.
+                        let target = this
+                            .session_group_tab_drop_target
+                            .take()
+                            .filter(|target| target.pane_id == drop_pane_id);
+                        if let Some(target) = target {
+                            this.reorder_session_group_tab(
+                                &drop_group_id,
+                                &target.pane_id,
+                                &drag.session_id,
+                                &target.session_id,
+                                target.after,
+                                cx,
+                            );
+                        } else {
+                            this.drop_session_group_tab(
+                                &drop_group_id,
+                                &drop_pane_id,
+                                &drag.session_id,
+                                SessionGroupPaneDropRegion::TabGroup,
+                                cx,
+                            );
+                        }
+                    }))
                     .on_drag(
                         SessionGroupTabDrag {
+                            group_id: group_id.to_string(),
                             session_id: session_id.clone(),
                             label: title.clone().into(),
                             agent_id: agent_id.clone(),
                         },
-                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        move |drag, _, _, cx| {
+                            // A fresh drag starts with no target: the previous
+                            // drag's hover must not decide where this one lands.
+                            let _ = drag_entity.update(cx, |this, cx| {
+                                this.session_group_tab_drop_target = None;
+                                this.session_group_pane_drop_target = None;
+                                this.session_group_tab_removal_active = false;
+                                cx.notify();
+                            });
+                            cx.new(|_| drag.clone())
+                        },
                     )
                     .context_menu({
                         let menu_entity = cx.weak_entity();
@@ -34281,16 +34710,13 @@ impl VibexWorkbench {
                             let leave_entity = menu_entity.clone();
                             let leave_group_id = menu_group_id.clone();
                             let leave_session_id = menu_session_id.clone();
-                            let maximize_entity = menu_entity.clone();
-                            let maximize_group_id = menu_group_id.clone();
-                            let maximize_pane_id = menu_pane_id.clone();
                             menu.item(
                                 PopupMenuItem::new(locale::text(
                                     "Split right",
                                     "向右分屏",
                                     "向右分割",
                                 ))
-                                .icon(sidebar_icon("icons/vibex/columns-2.svg"))
+                                .icon(sidebar_icon("icons/vibex/chevrons-right.svg"))
                                 .disabled(false)
                                 .on_click(move |_, _, cx| {
                                     let _ = split_entity.update(cx, |this, cx| {
@@ -34310,7 +34736,7 @@ impl VibexWorkbench {
                                     "向下分屏",
                                     "向下分割",
                                 ))
-                                .icon(sidebar_icon("icons/vibex/mosaic.svg"))
+                                .icon(sidebar_icon("icons/vibex/chevrons-down-up.svg"))
                                 .disabled(false)
                                 .on_click(move |_, _, cx| {
                                     let _ = down_entity.update(cx, |this, cx| {
@@ -34325,23 +34751,6 @@ impl VibexWorkbench {
                                 }),
                             )
                             .separator()
-                            .item(
-                                PopupMenuItem::new(locale::text(
-                                    "Maximize this pane",
-                                    "最大化此分屏",
-                                    "最大化此分割",
-                                ))
-                                .icon(sidebar_icon("icons/vibex/rectangle-outline.svg"))
-                                .on_click(move |_, _, cx| {
-                                    let _ = maximize_entity.update(cx, |this, cx| {
-                                        this.toggle_session_group_pane_maximized(
-                                            &maximize_group_id,
-                                            &maximize_pane_id,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                            )
                             .item(
                                 PopupMenuItem::new(locale::text(
                                     "Remove from session group",
@@ -34475,6 +34884,8 @@ impl VibexWorkbench {
                 let pane_id = pane_id.clone();
                 move |this, drag: &SessionGroupTabDrag, _, cx| {
                     let target = this.session_group_pane_drop_target.take();
+                    this.session_group_tab_drop_target = None;
+                    this.session_group_tab_removal_active = false;
                     let region = target
                         .filter(|target| target.pane_id == pane_id)
                         .map(|target| target.region)
@@ -34808,16 +35219,57 @@ impl VibexWorkbench {
         }
     }
 
+    /// Lands a dragged session tab next to the tab it was dropped on.
+    ///
+    /// The target pane is the strip the tab was dropped into, so this covers
+    /// both halves of one gesture: a reorder inside a pane, and a move into
+    /// another pane's strip that also picks the landing slot.
+    fn reorder_session_group_tab(
+        &mut self,
+        group_id: &str,
+        pane_id: &str,
+        session_id: &str,
+        anchor_session_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = self
+            .ui_state
+            .sidebar
+            .organization
+            .group_mut(group_id)
+            .is_some_and(|group| {
+                group.layout.move_session_to_pane(session_id, pane_id)
+                    | group.layout.reorder_pane_session(
+                        pane_id,
+                        session_id,
+                        anchor_session_id,
+                        after,
+                    )
+                    | group.layout.focus_session(pane_id, session_id)
+                    | group.focus_pane(pane_id)
+            });
+        self.session_group_tab_drop_target = None;
+        self.session_group_pane_drop_target = None;
+        if changed {
+            self.queue_ui_state();
+            self.publish_sidebar_invalidation();
+        }
+        cx.notify();
+        changed
+    }
+
     /// Records which edge of which pane a drag is hovering, so the drop overlay
     /// can show where the session will land.
     ///
     /// `dragged_session_id` is the tab being dragged, when the drag started in a
     /// pane. A drag that has not left the pane it came from cannot reorder
-    /// anything — tab reordering is not implemented — so anywhere below the tab
-    /// strip is a request to split that pane, on the axis the pointer moved
-    /// along. Without this the middle of the pane resolved to "move into this
-    /// pane", which is a no-op for the source pane, and the only way to split
-    /// was to drag the tab onto a different pane.
+    /// anything below the strip — a tab lands next to a sibling tab, which the
+    /// tab's own drop handler resolves — so anywhere below the tab strip is a
+    /// request to split that pane, on the axis the pointer moved along. Without
+    /// this the middle of the pane resolved to "move into this pane", which is a
+    /// no-op for the source pane, and the only way to split was to drag the tab
+    /// onto a different pane.
     ///
     /// Only the pane the pointer is inside may claim the target; the region and
     /// that ownership check both live in [`session_group_pane_drop_region`].
@@ -34847,6 +35299,17 @@ impl VibexWorkbench {
             }
             return;
         };
+        // A tab target is only meaningful while the pointer is on the strip; a
+        // move into the conversation below has to drop it, or the next drop
+        // would still reorder against a tab the pointer already left.
+        if region != SessionGroupPaneDropRegion::TabGroup
+            && self
+                .session_group_tab_drop_target
+                .as_ref()
+                .is_some_and(|target| target.pane_id == pane_id)
+        {
+            self.session_group_tab_drop_target = None;
+        }
         let next = SessionGroupPaneDropTarget {
             pane_id: pane_id.to_string(),
             region,
@@ -34963,25 +35426,6 @@ impl VibexWorkbench {
     }
 
     /// Shows one pane alone, or restores the whole split.
-    fn toggle_session_group_pane_maximized(
-        &mut self,
-        group_id: &str,
-        pane_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let changed = self
-            .ui_state
-            .sidebar
-            .organization
-            .group_mut(group_id)
-            .is_some_and(|group| group.toggle_maximized_pane(pane_id));
-        if changed {
-            self.queue_ui_state();
-            self.publish_sidebar_invalidation();
-        }
-        cx.notify();
-    }
-
     fn merge_session_group_panes(&mut self, group_id: &str, cx: &mut Context<Self>) {
         let changed = self
             .ui_state
@@ -37146,6 +37590,17 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>()
         };
+        // A right click on one row of a shift/ctrl selection offers the whole
+        // selection as a group, which is the click path for what the selection
+        // already means. A right click on a row outside it keeps the per-session
+        // menu, so the action never appears for a selection the user cannot see.
+        let selection_group_creation = (self.sidebar_move_selected_items.len() > 1
+            && self.sidebar_move_selected_items.contains(&session_item))
+        .then(|| self.sidebar_move_group_creation_candidates())
+        .flatten()
+        .map(|(_, _, session_ids)| session_ids)
+        .filter(|session_ids| session_ids.len() > 1);
+        let resolved_locale = self.resolved_locale();
         let row_background = if selected {
             sidebar_selected_session_background(cx.theme().sidebar_accent, cx.theme().is_dark())
         } else if move_selected {
@@ -37625,6 +38080,21 @@ impl VibexWorkbench {
                                             &leave_session_id,
                                             cx,
                                         )
+                                    });
+                                }),
+                            );
+                        }
+                        if let Some(selected_ids) = selection_group_creation.clone() {
+                            let create_entity = context_entity.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(sidebar_group_creation_menu_label(
+                                    resolved_locale,
+                                    selected_ids.len(),
+                                ))
+                                .icon(sidebar_icon("icons/vibex/layers.svg"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = create_entity.update(cx, |this, cx| {
+                                        this.create_session_group_from_move_selection(window, cx)
                                     });
                                 }),
                             );
@@ -57692,6 +58162,17 @@ fn sidebar_selected_count_label(
     }
 }
 
+/// The menu entry that turns a shift/ctrl selection into a group. The count is
+/// in the label because the selection can be scrolled out of sight by the time
+/// the menu is open.
+fn sidebar_group_creation_menu_label(locale: locale::ResolvedLocale, count: usize) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("Create session group ({count})"),
+        locale::ResolvedLocale::ZhCn => format!("创建会话组（{count}）"),
+        locale::ResolvedLocale::ZhTw => format!("建立會話組（{count}）"),
+    }
+}
+
 fn sidebar_project_actions_label(locale: locale::ResolvedLocale, project_name: &str) -> String {
     match locale {
         locale::ResolvedLocale::En => format!("Project actions for {project_name}"),
@@ -58576,20 +59057,22 @@ fn mobile_pair_icon(hovered: bool, cx: &App) -> AnyElement {
         .relative()
         .w(width)
         .h(height)
-        .child(div().absolute().inset_0().rounded(radius).with_animation(
-            "mobile-pair-gradient",
-            Animation::new(MOBILE_PAIR_GRADIENT_DURATION)
-                .repeat()
-                .with_max_fps(REPEATING_ANIMATION_MAX_FPS),
-            move |this, delta| {
-                let position = delta * MOBILE_PAIR_GRADIENT.len() as f32;
-                this.bg(linear_gradient(
-                    135.0,
-                    linear_color_stop(mobile_pair_gradient_color(position), 0.0),
-                    linear_color_stop(mobile_pair_gradient_color(position + 1.0), 1.0),
-                ))
-            },
-        ))
+        .child(
+            div().absolute().inset_0().rounded(radius).with_animation(
+                "mobile-pair-gradient",
+                Animation::new(MOBILE_PAIR_GRADIENT_DURATION)
+                    .repeat()
+                    .with_max_fps(REPEATING_ANIMATION_MAX_FPS),
+                move |this, delta| {
+                    let position = delta * MOBILE_PAIR_GRADIENT.len() as f32;
+                    this.bg(linear_gradient(
+                        135.0,
+                        linear_color_stop(mobile_pair_gradient_color(position), 0.0),
+                        linear_color_stop(mobile_pair_gradient_color(position + 1.0), 1.0),
+                    ))
+                },
+            ),
+        )
         .child(
             div()
                 .absolute()
@@ -81996,6 +82479,128 @@ mod tests {
             .expect("group pane renderer should remain inspectable");
         assert!(pane.contains("active_session_id.as_deref() == Some(selected.as_str())"));
         assert!(!pane.contains("pane.session_ids\n                .iter()\n                .any"));
+    }
+
+    /// A group pane's strip is the preview strip's sibling: the same metrics,
+    /// the same horizontal scroll and the same drag-to-reorder. A pane can hold
+    /// more tabs than fit, and the tabs are the only way to reach the ones it is
+    /// not showing.
+    #[test]
+    fn group_pane_tab_strip_scrolls_and_reorders_like_the_preview_strip() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+
+        assert!(strip.contains(".overflow_x_scroll()"));
+        assert!(strip.contains(".track_scroll(&tab_scroll)"));
+        assert!(strip.contains("restrict_scroll_to_axis"));
+        // The active tab has to be reachable without the user scrolling for it.
+        assert!(strip.contains("tab_scroll.scroll_to_item(index)"));
+        // A tab dropped on a sibling tab names its landing slot.
+        assert!(strip.contains("SessionGroupTabDropTarget"));
+        assert!(strip.contains("this.reorder_session_group_tab("));
+
+        let reorder = source
+            .split_once("    fn reorder_session_group_tab(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Records which edge of which pane a drag is hovering")
+            })
+            .map(|(body, _)| body)
+            .expect("group tab reorder should remain inspectable");
+        // One gesture covers both a reorder inside a pane and a move into
+        // another pane's strip.
+        assert!(reorder.contains("move_session_to_pane(session_id, pane_id)"));
+        assert!(reorder.contains("reorder_pane_session("));
+        assert!(reorder.contains("self.queue_ui_state();"));
+    }
+
+    /// The group pane's tab menu is the preview tab's menu minus the pane-only
+    /// maximize, so the two split entries read the same in both surfaces.
+    #[test]
+    fn group_pane_tab_menu_matches_the_preview_tab_menu() {
+        let source = include_str!("app.rs");
+        let strip = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+
+        assert!(strip.contains("icons/vibex/chevrons-right.svg"));
+        assert!(strip.contains("icons/vibex/chevrons-down-up.svg"));
+        assert!(!strip.contains("Maximize this pane"));
+        assert!(!strip.contains("toggle_session_group_pane_maximized("));
+    }
+
+    /// A tab dragged out of the workspace and dropped on the sidebar takes its
+    /// session out of the group, which is the gesture the sidebar advertises
+    /// while the drag is over it.
+    #[test]
+    fn dragging_a_group_tab_to_the_sidebar_removes_it_from_the_group() {
+        let source = include_str!("app.rs");
+        let sidebar = source
+            .split_once("    fn render_agent_sidebar(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_sidebar_root_children("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer should remain inspectable");
+
+        assert!(sidebar.contains("session_group_tab_removal_active"));
+        assert!(sidebar.contains("DragMoveEvent<SessionGroupTabDrag>"));
+        assert!(sidebar.contains("this.remove_session_from_group_from_menu("));
+        assert!(source.contains("session_group_tab_removal_active: bool"));
+    }
+
+    /// A shift/ctrl selection offers the group in the session menu, and the
+    /// sessions it holds are the ones the group is created from.
+    #[test]
+    fn multi_selected_sessions_offer_group_creation_in_the_menu() {
+        let source = include_str!("app.rs");
+        let session = source
+            .split_once("    fn render_sidebar_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
+            .map(|(body, _)| body)
+            .expect("session row renderer should remain inspectable");
+
+        assert!(session.contains("self.sidebar_move_group_creation_candidates()"));
+        assert!(session.contains("this.create_session_group_from_move_selection(window, cx)"));
+        assert!(session.contains("sidebar_group_creation_menu_label("));
+
+        let candidates = source
+            .split_once("    fn sidebar_move_group_creation_candidates(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn sidebar_group_creation_candidates_for(")
+            })
+            .map(|(body, _)| body)
+            .expect("selection candidates should remain inspectable");
+        // The click path and the batch path have to agree on what can become a
+        // group, so both read the same scope check.
+        assert!(candidates.contains("sidebar_group_creation_candidates_for(&selected)"));
+    }
+
+    /// Dropping a dragged session anywhere but inside the group it came from is
+    /// how the drag gesture removes it from that group.
+    #[test]
+    fn dragging_members_out_of_a_group_releases_them() {
+        let source = include_str!("app.rs");
+        let finish = source
+            .split_once("    fn finish_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Applies the group half"))
+            .map(|(body, _)| body)
+            .expect("session drag finish should remain inspectable");
+
+        assert!(finish.contains("sidebar_session_drop_keep_group("));
+        assert!(finish.contains("apply_sidebar_session_group_drop("));
+
+        let release = source
+            .split_once("    fn release_dragged_sessions_from_groups(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn start_sidebar_folder_drag("))
+            .map(|(body, _)| body)
+            .expect("group release should remain inspectable");
+        assert!(release.contains("remove_sessions_from_group("));
+        assert!(release.contains("release_group_session_views("));
+        assert!(release.contains("group_of_session(session_id)"));
     }
 
     #[test]
