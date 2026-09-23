@@ -61381,14 +61381,16 @@ impl FoundationSettings {
             proxy_url: Some(self.proxy_input.read(cx).value().to_string()),
             bypass: self.proxy_bypass_input.read(cx).value().to_string(),
         };
-        let probe = cx.background_spawn(async move {
+        // The probe drives the async HTTP client, which resolves DNS and opens
+        // sockets through the Tokio reactor. A GPUI background task has no
+        // reactor, so the work belongs on the Tokio runtime the desktop owns.
+        let probe = gpui_tokio::Tokio::spawn(cx, async move {
             vibex_desktop_runtime::network_proxy::test_connection(&draft).await
         });
         let workbench = self.workbench.clone();
         self.proxy_test_task = Some(cx.spawn(async move |entity, cx| {
-            let outcome = probe.await;
-            let notice = match outcome {
-                Ok(latency) => SettingsOperationNotice::success(format!(
+            let notice = match probe.await {
+                Ok(Ok(latency)) => SettingsOperationNotice::success(format!(
                     "{} ({} ms)",
                     locale::text(
                         "Proxy connection succeeded.",
@@ -61397,8 +61399,14 @@ impl FoundationSettings {
                     ),
                     latency.as_millis()
                 )),
-                Err(error) => {
+                Ok(Err(error)) => {
                     SettingsOperationNotice::error(localize_network_proxy_test_error(&error))
+                }
+                Err(error) => {
+                    eprintln!("network proxy connection test task failed: {error}");
+                    SettingsOperationNotice::error(localize_network_proxy_test_error(
+                        "the connection test failed",
+                    ))
                 }
             };
             let _ = workbench.update(cx, |workbench, cx| {
@@ -79383,6 +79391,11 @@ mod tests {
         assert!(test.contains("self.proxy_test_task.is_some()"));
         assert!(test.contains("test_connection(&draft)"));
         assert!(!test.contains("configure("));
+        // The probe awaits the async HTTP client, which needs the Tokio
+        // reactor. A GPUI background task has none and panics with "there is
+        // no reactor running", so the probe must stay on the Tokio runtime.
+        assert!(test.contains("gpui_tokio::Tokio::spawn(cx"));
+        assert!(!test.contains("background_spawn"));
     }
 
     #[test]

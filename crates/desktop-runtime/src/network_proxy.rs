@@ -429,6 +429,10 @@ pub fn current_proxy_url() -> Result<Option<Url>, String> {
 /// The test never touches the process-wide snapshot or the environment, so a
 /// failed attempt leaves the running configuration exactly as it was. A URL
 /// that does not build is reported before any network work starts.
+///
+/// The client it builds is the async one, so the caller must drive this future
+/// from a Tokio runtime. A bare GPUI background task has no reactor and panics
+/// with "there is no reactor running" on the first DNS or socket operation.
 pub async fn test_connection(settings: &NetworkProxyUiState) -> Result<Duration, String> {
     let normalized = normalize_settings(settings)?;
     if normalized.mode == NetworkProxyMode::Custom && normalized.proxy_url.is_none() {

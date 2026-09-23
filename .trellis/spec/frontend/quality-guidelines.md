@@ -473,6 +473,17 @@ vibex-foundation: runtime-stopped
 - The preview shell stays provider-free: managed ACP adapter installation must not
   block lifecycle tests (`VIBEX_FOUNDATION_SKIP_ADAPTER_INSTALL=1`); real adapter
   installation is covered by the ACP bridge smoke gates.
+- The two executors are not interchangeable. `cx.background_spawn` runs on GPUI
+  `Worker-N` threads that have no Tokio reactor; `gpui_tokio::Tokio::spawn` runs on
+  the process runtime `gpui_tokio::init` installs. A future that touches a
+  reactor-backed Tokio API — the async `reqwest::Client`, `tokio::net`,
+  `tokio::time`, `tokio::spawn`, `tokio::task::spawn_blocking`, `tokio::process` —
+  must be spawned with `gpui_tokio::Tokio::spawn`. Polling one from
+  `cx.background_spawn` panics with `there is no reactor running, must be called
+  from the context of a Tokio 1.x runtime` on the worker thread and takes the
+  workbench down with it. `cx.background_spawn` stays for reactor-free work: CPU
+  parsing and rendering, `reqwest::blocking` calls, filesystem walks, and process
+  spawns.
 
 ### 4. Validation & Error Matrix
 
@@ -484,6 +495,10 @@ vibex-foundation: runtime-stopped
 - A second process acquires the home while GPUI runs -> fail runtime exclusivity.
 - The lock remains unavailable after exit -> fail shutdown ownership/release.
 - Process exits non-zero or before runtime-ready -> fail the affected scenario.
+- A reactor-backed future is awaited from `cx.background_spawn` -> reject it: the
+  first DNS lookup, socket, timer, or `tokio::spawn` panics on a `Worker-N` thread.
+  Check every settings action that reaches the network against this row, not only
+  its happy path.
 
 ### 5. Good/Base/Bad Cases
 
@@ -499,6 +514,9 @@ vibex-foundation: runtime-stopped
 - `cargo test -p vibex-desktop --locked` covers the shell contract, responsive
   viewports, settings, primitives, fonts, locales, and source-compatible platform
   branches.
+- A source-inspection test in `apps/desktop` pins every network probe to
+  `gpui_tokio::Tokio::spawn`, so the executor boundary is asserted without opening a
+  socket.
 
 ### 7. Wrong vs Correct
 
@@ -534,6 +552,27 @@ cx.on_app_quit(|app, cx| {
 ```
 
 One app-level owner completes persistence and runtime cleanup before exit.
+
+#### Wrong (network probe on the GPUI background executor)
+
+```rust
+// `test_connection` awaits the async `reqwest::Client`. A GPUI `Worker-N`
+// thread has no Tokio reactor, so this panics the worker and the app.
+let probe = cx.background_spawn(async move {
+    vibex_desktop_runtime::network_proxy::test_connection(&draft).await
+});
+```
+
+#### Correct (network probe on the Tokio runtime)
+
+```rust
+let probe = gpui_tokio::Tokio::spawn(cx, async move {
+    vibex_desktop_runtime::network_proxy::test_connection(&draft).await
+});
+```
+
+The probe still leaves the running configuration untouched; only the executor
+changes. Reactor-free work stays on `cx.background_spawn`.
 
 ## Scenario: GPUI Native Content Surfaces
 
