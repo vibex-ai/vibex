@@ -7,7 +7,7 @@ plugins {
 // that has to be remembered. Android orders installs by this integer alone, so
 // a prerelease has to sort below the release it leads up to: preview < rc <
 // final, with the sequence number separating successive prereleases.
-def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.0-rc.5'
+def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.0-rc.6'
 
 def vibexVersionCode = {
     def matcher = (vibexVersionName =~ /^(\d+)\.(\d+)\.(\d+)(?:-(preview|rc)\.(\d+))?$/)

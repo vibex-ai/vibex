@@ -37,7 +37,7 @@ write-only), and device permissions gate every management operation.
 The image is published for every release, so the common path is a pull:
 
 ```bash
-export VIBEX_SERVER_IMAGE=ghcr.io/vibex-ai/vibex-server:v0.1.0-rc.5
+export VIBEX_SERVER_IMAGE=ghcr.io/vibex-ai/vibex-server:v0.1.0-rc.6
 docker compose -f deploy/server/docker-compose.yml pull vibex-server
 docker compose -f deploy/server/docker-compose.yml up -d --no-build vibex-server
 docker logs vibex-server | grep pairing_code=
@@ -88,7 +88,7 @@ built natively on GitHub-hosted x64 and arm64 runners and merged by digest, so
 
 | Trigger | Published tags |
 | --- | --- |
-| Release tag `v0.1.0-rc.5` | `0.1.0-rc.5`, `v0.1.0-rc.5`, `rc` |
+| Release tag `v0.1.0-rc.6` | `0.1.0-rc.6`, `v0.1.0-rc.6`, `rc` |
 | Stable tag `v0.2.0` | `0.2.0`, `v0.2.0`, `latest` |
 | Push to the default branch | `edge`, `sha-<commit>` |
 | Manual workflow run | `edge`, `sha-<commit>` |

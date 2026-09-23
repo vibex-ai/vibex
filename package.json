@@ -1,6 +1,6 @@
 {
   "name": "vibex-workspace",
-  "version": "0.1.0-rc.5",
+  "version": "0.1.0-rc.6",
   "license": "AGPL-3.0-or-later",
   "private": true,
   "type": "module",
