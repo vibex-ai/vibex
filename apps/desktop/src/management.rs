@@ -118,22 +118,18 @@ const MANAGEMENT_COMPACT_RESIZE_STEP: f32 = 16.0;
 const MANAGEMENT_DETAIL_ACTION_HEIGHT: f32 = 42.0;
 const MANAGEMENT_PROVIDER_ROW_HEIGHT: f32 = 72.0;
 const MANAGEMENT_PROVIDER_ROW_GAP: f32 = 8.0;
+/// The height of the controls in a resource sidebar.
+///
+/// One band for the commands, the market entry and the search field. The kit's
+/// medium button size would be the obvious lever, but it also steps the label
+/// up to 16px — a size no other sidebar text uses — so these stay on the small
+/// type scale and take the height explicitly instead.
+const MANAGEMENT_SIDEBAR_CONTROL_HEIGHT: f32 = 32.0;
 /// The height the Skill preview keeps before it starts scrolling.
 ///
 /// The body is shown in full rather than summarised, but it must not push the
 /// install actions off the pane, so it scrolls inside its own box instead.
 const MANAGEMENT_SKILL_DOCUMENT_MAX_HEIGHT: f32 = 260.0;
-/// The height of a sidebar search field.
-///
-/// The field is a primary control in these sidebars rather than a filter strip,
-/// so it sits at the same medium height as the buttons beside it instead of the
-/// compact toolbar size.
-const MANAGEMENT_SEARCH_INPUT_HEIGHT: f32 = 36.0;
-/// The height of the commands that add a resource to a sidebar.
-///
-/// The same as the search field under them, so the two rows read as one band of
-/// controls rather than two densities.
-const MANAGEMENT_SIDEBAR_ACTION_HEIGHT: f32 = 36.0;
 /// Agent cards the loading placeholder stands in for. The catalog arrives with
 /// the aggregated snapshot, so its size is unknown until then; the placeholder
 /// fills the list rather than guessing it.
@@ -10570,8 +10566,9 @@ impl ManagementCenter {
             .w_full()
             .min_w_0()
             .flex_none()
-            .items_start()
+            .items_center()
             .gap_3()
+            .child(management_market_glyph("icons/vibex/package.svg", cx))
             .child(
                 v_flex()
                     .min_w_0()
@@ -10761,7 +10758,10 @@ impl ManagementCenter {
                 Some(market_transport_label(entry.transport)),
                 quiet_meta,
                 market_entry_env_summary(&entry),
-                (!endpoint.trim().is_empty()).then_some(endpoint),
+                (!endpoint.trim().is_empty()).then(|| MarketCardEndpoint {
+                    text: endpoint,
+                    icon_path: market_transport_icon_path(entry.transport),
+                }),
                 link_element,
                 Button::new(SharedString::from(format!(
                     "management-mcp-market-install-{install_id}"
@@ -10958,8 +10958,10 @@ impl ManagementCenter {
                                     .child(description)
                             }))
                             .child(
+                                // A credential is typed, not scanned, so the
+                                // field takes the same comfortable height as the
+                                // market's own controls.
                                 Input::new(input)
-                                    .small()
                                     .w_full()
                                     .when(requirement.secret, |input| input.mask_toggle()),
                             ),
@@ -11085,8 +11087,9 @@ impl ManagementCenter {
             .w_full()
             .min_w_0()
             .flex_none()
-            .items_start()
+            .items_center()
             .gap_3()
+            .child(management_market_glyph("icons/vibex/book-open.svg", cx))
             .child(
                 v_flex()
                     .min_w_0()
@@ -11199,7 +11202,10 @@ impl ManagementCenter {
                 None,
                 (entry.installs > 0).then(|| market_installs_label(entry.installs)),
                 None,
-                Some(entry.skill_id.clone()),
+                Some(MarketCardEndpoint {
+                    text: entry.skill_id.clone(),
+                    icon_path: "icons/vibex/book-open.svg",
+                }),
                 None,
                 Button::new(SharedString::from(format!(
                     "management-skill-market-install-{install_id}"
@@ -20606,6 +20612,16 @@ fn management_market_state_tag(state: &MarketEntryState, _cx: &App) -> AnyElemen
     tag.xsmall().child(state.label()).into_any_element()
 }
 
+/// The launcher or address a market card puts under its title.
+///
+/// The glyph is the entry's transport, so the reader can tell an address from a
+/// command before parsing the text, and it is one of the paths already bundled
+/// with the app rather than a new asset.
+struct MarketCardEndpoint {
+    text: String,
+    icon_path: &'static str,
+}
+
 /// One market result, as a card.
 ///
 /// Every card in a row is the same height and puts its actions on the same
@@ -20623,7 +20639,7 @@ fn management_market_card(
     chip: Option<&'static str>,
     quiet_meta: Option<String>,
     caution: Option<String>,
-    endpoint: Option<String>,
+    endpoint: Option<MarketCardEndpoint>,
     link: Option<(String, AnyElement)>,
     install: AnyElement,
     cx: &App,
@@ -20664,19 +20680,35 @@ fn management_market_card(
         .children(endpoint.map(|endpoint| {
             // The launcher or address the install would write, on the card
             // rather than only inside the form: it is the one fact that tells
-            // two similarly named entries apart before anything is opened.
-            div()
+            // two similarly named entries apart before anything is opened. The
+            // leading glyph is what makes it read as an address rather than as
+            // another line of metadata.
+            h_flex()
                 .w_full()
                 .min_w_0()
-                .truncate()
+                .items_center()
+                .gap_1p5()
                 .rounded(px(6.0))
                 .bg(cx.theme().muted.opacity(0.30))
                 .px_2()
                 .py_1()
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(endpoint)
+                .child(
+                    Icon::default()
+                        .path(endpoint.icon_path)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(endpoint.text),
+                )
         }))
         .children(description.map(|description| {
             div()
@@ -20742,7 +20774,7 @@ fn management_market_card(
     let background = crate::motion::hover_blend(&hover_key, rest, cx.theme().accent.opacity(0.35));
     v_flex()
         .id(SharedString::from(format!("management-market-entry-{id}")))
-        .min_w(px(320.0))
+        .min_w(px(MANAGEMENT_MARKET_CARD_MIN_WIDTH))
         .flex_1()
         .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
         .rounded(cx.theme().radius_lg)
@@ -20824,7 +20856,7 @@ fn management_market_placeholders(count: usize, cx: &App) -> Vec<AnyElement> {
         .map(|index| {
             v_flex()
                 .id(("management-market-placeholder", index))
-                .min_w(px(320.0))
+                .min_w(px(MANAGEMENT_MARKET_CARD_MIN_WIDTH))
                 .flex_1()
                 .min_h(px(MANAGEMENT_MARKET_CARD_MIN_HEIGHT))
                 .gap_3()
@@ -20952,12 +20984,20 @@ const MARKET_PAGE_SIZE: usize = 12;
 /// Skill index clamps to its own page size and ignores anything larger.
 const MARKET_FETCH_LIMIT: u32 = 500;
 
+/// The width a market card refuses to go under.
+///
+/// The pane is whatever the sidebar leaves, so the grid has to fit two cards at
+/// a common window width and three at a wide one; a card narrower than this
+/// cannot hold its glyph, its address and its action on one line.
+const MANAGEMENT_MARKET_CARD_MIN_WIDTH: f32 = 260.0;
+
 /// The height a market card keeps even when an entry has little to say.
 ///
-/// Cards in a row stretch to the tallest one, so this is a floor rather than a
-/// size: it stops a one-line entry from collapsing into a strip beside its
-/// neighbours.
-const MANAGEMENT_MARKET_CARD_MIN_HEIGHT: f32 = 184.0;
+/// Cards in a row stretch to the tallest one, so this is only a floor: it stops
+/// a row of one-line entries from collapsing into a strip. The body's trailing
+/// spacer is what actually pins the footer once a taller neighbour sets the
+/// height.
+const MANAGEMENT_MARKET_CARD_MIN_HEIGHT: f32 = 150.0;
 
 /// How long the MCP market waits before asking again for a wider index.
 ///
@@ -21350,29 +21390,20 @@ fn management_market_toolbar(
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(
-                    div().min_w(px(220.0)).flex_1().child(
-                        Input::new(query_input)
-                            .small()
-                            .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
-                            .w_full()
-                            .cleanable(true)
-                            .prefix(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(cx.theme().muted_foreground),
-                            ),
+                .child(div().min_w(px(220.0)).flex_1().child(
+                    Input::new(query_input).w_full().cleanable(true).prefix(
+                        Icon::new(IconName::Search).text_color(cx.theme().muted_foreground),
                     ),
-                )
+                ))
                 .child(
                     Button::new(search_id)
                         // The icon slot is what shows the button's progress: while
                         // the request is in flight the spinner takes the place of
                         // the glyph, so the search says it is working in the same
                         // place the user pressed.
-                        .with_size(Size::Medium)
+                        .small()
                         .outline()
-                        .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
+                        .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
                         .px_4()
                         .icon(IconName::Search)
                         .label(management_locale_text("Search", "搜索", "搜尋"))
@@ -21960,14 +21991,20 @@ fn management_sidebar_action(
     let accessible_label = SharedString::from(accessible_label);
     button_with_aria_label(
         Button::new(id)
-            // Medium keeps icons at 16px; the explicit height keeps the button
-            // in the same band as the search field below it.
-            .with_size(Size::Medium)
+            .small()
             .outline()
-            .h(px(MANAGEMENT_SIDEBAR_ACTION_HEIGHT))
+            .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
             .px_3()
-            .icon(icon)
-            .label(label)
+            // The glyph is drawn as content rather than through `icon()`: the
+            // kit derives that slot from the button size, which would pin it to
+            // the small 14px while the label already owns that scale.
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(icon.size(px(16.0)))
+                    .child(div().text_sm().child(label)),
+            )
             .tooltip(accessible_label.clone())
             .on_click(on_click),
         accessible_label,
@@ -21988,13 +22025,26 @@ fn management_market_entry_button(
 ) -> AnyElement {
     Button::new(id)
         // The same control band as the New and Import commands above it and the
-        // search field below: one height, one icon size.
-        .with_size(Size::Medium)
+        // search field below: one height, one type scale.
+        .small()
         .w_full()
-        .h(px(MANAGEMENT_SIDEBAR_ACTION_HEIGHT))
-        .justify_start()
-        .icon(Icon::default().path("icons/vibex/package.svg"))
-        .label(label)
+        .h(px(MANAGEMENT_SIDEBAR_CONTROL_HEIGHT))
+        .px_3()
+        .child(
+            // The button's own content row centers what it is given, so the
+            // left alignment has to be claimed by a full-width child rather
+            // than by `justify_start` on the button itself.
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    Icon::default()
+                        .path("icons/vibex/package.svg")
+                        .size(px(16.0)),
+                )
+                .child(div().text_sm().child(label)),
+        )
         .when(open, |button| {
             button
                 .border_1()
@@ -22057,18 +22107,14 @@ fn management_search_input(
     cx: &mut Context<ManagementCenter>,
 ) -> AnyElement {
     // `Input` owns its border, background and focus ring; the search field only
-    // adds the leading glyph, a clear affordance, and the height that keeps it
-    // from reading as a squeezed strip above the list.
+    // adds the leading glyph and a clear affordance. It keeps the kit's medium
+    // size rather than the compact one: a search field is the primary control in
+    // these sidebars, and `Input::h` is a multi-line-only setter, so the size is
+    // the only honest way to make it taller than a toolbar strip.
     Input::new(state)
-        .small()
-        .h(px(MANAGEMENT_SEARCH_INPUT_HEIGHT))
         .w_full()
         .cleanable(true)
-        .prefix(
-            Icon::new(IconName::Search)
-                .small()
-                .text_color(cx.theme().muted_foreground),
-        )
+        .prefix(Icon::new(IconName::Search).text_color(cx.theme().muted_foreground))
         .into_any_element()
 }
 
