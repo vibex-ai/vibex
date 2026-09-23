@@ -13084,6 +13084,14 @@ impl VibexWorkbench {
             .is_some()
     }
 
+    /// Whether two sidebar rows may be moved together.
+    ///
+    /// Only the project has to agree: a move is a placement inside one project,
+    /// and the pinned band is an order the sidebar paints rather than a boundary
+    /// a move cannot cross. Requiring the same pinned state here made a range
+    /// that started on a pinned row and ended below it collapse to the row the
+    /// user clicked last, so a multi-selection silently became one row — and
+    /// only one session joined or left a group.
     fn sidebar_move_selection_scope_matches(
         &self,
         left: &SidebarOrganizationItem,
@@ -13106,8 +13114,7 @@ impl VibexWorkbench {
                     .find(|session| session.id.as_str() == right_id);
                 left.zip(right).is_some_and(|(left, right)| {
                     project_scopes.get(left_id) == project_scopes.get(right_id)
-                        && self.sidebar_state.pinned_ids.contains(left.id.as_str())
-                            == self.sidebar_state.pinned_ids.contains(right.id.as_str())
+                        && left.project_id == right.project_id
                 })
             }
             _ => false,
@@ -13295,6 +13302,15 @@ impl VibexWorkbench {
         }
     }
 
+    /// The items a drag carries: the whole selection, in sidebar order.
+    ///
+    /// The order comes from the placement tree, which does not list every row the
+    /// sidebar paints — a group draws its members from the group, so a member
+    /// whose placement sits inside a collapsed folder is on screen without being
+    /// in that order. Reading the payload out of the order alone therefore
+    /// dropped those rows and shrank a multi-selection to the one row the drag
+    /// started on, so only one session joined or left the group. Anything the
+    /// order does not know is appended instead.
     fn sidebar_drag_items(
         &self,
         primary: &SidebarOrganizationItem,
@@ -13310,6 +13326,13 @@ impl VibexWorkbench {
                     && self.sidebar_move_selection_scope_matches(primary, item)
             })
             .collect::<Vec<_>>();
+        for selected in &self.sidebar_move_selected_items {
+            if !items.contains(selected)
+                && self.sidebar_move_selection_scope_matches(primary, selected)
+            {
+                items.push(selected.clone());
+            }
+        }
         if !items.iter().any(|item| item == primary) {
             items.insert(0, primary.clone());
         }
@@ -14400,7 +14423,7 @@ impl VibexWorkbench {
             .map(SidebarOrganizationItem::Session)
             .collect::<Vec<_>>();
         let parent = self.ui_state.sidebar.organization.parent_of(&primary);
-        let (original_ids, flat_preview_enabled) = if parent.is_some() {
+        let (mut original_ids, flat_preview_enabled) = if parent.is_some() {
             groups
                 .iter()
                 .find(|group| group.project.id.as_str() == drag.project_id)
@@ -14477,7 +14500,12 @@ impl VibexWorkbench {
             (ids, flat_preview_enabled)
         };
         if !original_ids.iter().any(|id| id == drag.session_id.as_str()) {
-            return;
+            // The sibling order can be missing the row the drag started on: a
+            // group paints its members from the group, and the placement tree
+            // does not list a session whose placement sits in a collapsed
+            // folder. Returning here would drop the drag on the floor, and the
+            // drop is what takes the session out of its group.
+            original_ids.push(drag.session_id.as_str().to_string());
         }
         let flat_preview_enabled = flat_preview_enabled
             && drag
@@ -73145,6 +73173,69 @@ mod tests {
         assert!(source.contains("move_many_relative("));
         assert!(source.contains("move_many_into("));
         assert!(source.contains("sidebar_drag_count_badge("));
+    }
+
+    /// A multi-selection is a multi-selection: the drag has to carry every row
+    /// the user picked, whatever the sidebar's sibling order happens to know.
+    #[test]
+    fn sidebar_drag_carries_the_whole_selection() {
+        let source = include_str!("app.rs");
+        let drag_items = source
+            .split_once("    fn sidebar_drag_items(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_sidebar_move_selection("))
+            .map(|(body, _)| body)
+            .expect("drag payload builder should remain inspectable");
+
+        // The sibling order is a placement walk; anything it does not list is
+        // appended instead of dropped, or a group member whose placement sits in
+        // a collapsed folder would shrink the drag to the row it started on.
+        let order_filter = drag_items
+            .find(".sidebar_move_selection_order(primary)")
+            .expect("the payload should follow the sidebar order");
+        let union = drag_items
+            .find("for selected in &self.sidebar_move_selected_items {")
+            .expect("the payload should fall back to the selection itself");
+        assert!(order_filter < union);
+        assert!(drag_items.contains("items.push(selected.clone());"));
+        assert!(drag_items.contains("items.insert(0, primary.clone());"));
+
+        // The drag itself has to start even when the sibling order does not know
+        // the row it started on, or the drop that leaves a group never runs.
+        let drag_start = source
+            .split_once("    fn start_sidebar_session_drag(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_sidebar_session_drag("))
+            .map(|(body, _)| body)
+            .expect("session drag setup should remain inspectable");
+        let missing_primary = drag_start
+            .find("if !original_ids.iter().any(|id| id == drag.session_id.as_str()) {")
+            .expect("the sibling order may be missing the dragged row");
+        let guard = &drag_start[missing_primary..];
+        let body_start = guard.find('{').expect("the guard should open a block") + 1;
+        let body_end = guard[body_start..]
+            .find('}')
+            .expect("the guard should close its block")
+            + body_start;
+        assert!(
+            guard[body_start..body_end].contains("original_ids.push(drag.session_id.as_str()"),
+            "a missing primary must be appended, not dropped"
+        );
+    }
+
+    /// The pinned band is an order the sidebar paints, not a boundary a move
+    /// cannot cross: a range that starts on a pinned row and ends below it used
+    /// to collapse to one row, which left a multi-selection moving one session.
+    #[test]
+    fn sidebar_move_selection_scope_ignores_the_pinned_band() {
+        let source = include_str!("app.rs");
+        let scope = source
+            .split_once("    fn sidebar_move_selection_scope_matches(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn collect_sidebar_move_selection_items("))
+            .map(|(body, _)| body)
+            .expect("selection scope should remain inspectable");
+
+        assert!(scope.contains("project_scopes.get(left_id) == project_scopes.get(right_id)"));
+        assert!(scope.contains("left.project_id == right.project_id"));
+        assert!(!scope.contains("pinned_ids"));
     }
 
     #[test]
