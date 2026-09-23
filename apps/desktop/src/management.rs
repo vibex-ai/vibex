@@ -23986,19 +23986,73 @@ mod tests {
         assert!(renderer.contains("Tab::new().flex_1()"));
     }
 
-    #[test]
-    fn management_primary_navigation_uses_pill_tabs() {
-        let source = include_str!("management.rs");
-        let renderer = source
-            .split_once("    fn render_nav(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_content("))
-            .map(|(body, _)| body)
-            .expect("management primary navigation should remain inspectable");
+    #[gpui::test]
+    fn management_primary_navigation_paints_pill_tabs(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(ManagementCenter::new);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let scale = cx.update(|window, _| window.scale_factor());
+        let (primary, track) = cx.update(|_, cx| {
+            (
+                cx.theme().primary,
+                gpui::Background::from(cx.theme().tokens.tab_bar_segmented),
+            )
+        });
+        let quads = cx.update(|window, _| window.painted_quads());
 
-        // The primary navigation is a row of pill tabs: the bar paints no
-        // track, and the active section is the filled pill itself.
-        assert!(renderer.contains(".pill()"));
-        assert!(!renderer.contains(".segmented()"));
+        // The primary navigation is the first row of the wide-layout sidebar
+        // (the test window is maximized), so only quads in that band matter.
+        let band = quads
+            .iter()
+            .filter(|quad| {
+                let top = quad.bounds.origin.y.as_f32() / scale;
+                let left = quad.bounds.origin.x.as_f32() / scale;
+                (12.0..54.0).contains(&top) && left < MANAGEMENT_SIDEBAR_WIDTH
+            })
+            .collect::<Vec<_>>();
+
+        // Pill tabs paint no track, and only the active section is a filled
+        // capsule; the other two stay transparent.
+        let pills = band
+            .iter()
+            .filter(|quad| quad.background.as_solid() == Some(primary))
+            .map(|quad| {
+                (
+                    quad.bounds.origin.x.as_f32() / scale,
+                    quad.bounds.size.width.as_f32() / scale,
+                    quad.bounds.size.height.as_f32() / scale,
+                    quad.corner_radii.top_left.as_f32() / scale,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pills.len(),
+            1,
+            "one filled pill for the active tab: {pills:?}"
+        );
+        let (left, width, height, radius) = pills[0];
+        assert!(
+            (left - 12.0).abs() < 0.5,
+            "pill starts at the sidebar padding: {left}"
+        );
+        assert!((height - 32.0).abs() < 0.5, "pill height: {height}");
+        assert!(
+            (radius - height / 2.0).abs() < 0.5,
+            "the pill is fully rounded rather than a rectangle: {radius}"
+        );
+        // Three equal tabs and two 4px gaps fill the 368px sidebar inside its
+        // 12px padding.
+        let expected_width = (MANAGEMENT_SIDEBAR_WIDTH - 24.0 - 8.0) / 3.0;
+        assert!(
+            (width - expected_width).abs() < 1.0,
+            "pill width {width} should be a third of the bar ({expected_width})"
+        );
+        assert!(
+            !band.iter().any(|quad| quad.background == track),
+            "pill tabs paint no segmented track"
+        );
     }
 
     #[test]
