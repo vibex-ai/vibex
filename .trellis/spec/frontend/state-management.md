@@ -1319,11 +1319,20 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
   the same source synchronously before deciding which disclosure state to show.
 - A GPUI User bubble uses one full-width `flex + justify_end` wrapper and an
   intrinsic-width, non-shrinking bubble with a bounded maximum width. Keep its
-  text body as a plain intrinsic child: do not put `min_w_0` on it and do not
-  apply `gpui_component::ScrollableElement::overflow_y_scrollbar`. That wrapper
-  projects `size_full`, so an auto-width bubble can collapse to a padding-only
+  text body as an intrinsic child and do not apply
+  `gpui_component::ScrollableElement::overflow_y_scrollbar`; a `size_full`
+  wrapper around the body lets an auto-width bubble collapse to a padding-only
   vertical pill even while the virtual Turn reserves the expected height. Do
-  not wrap the bubble in a second full-width horizontal flex either.
+  not wrap the bubble in a second full-width horizontal flex either. Cap the
+  body at the width the pill's content box settles on
+  (`user_message_body_max_width`): the pill hugs its content, so an
+  unconstrained body lets taffy resolve the pill's height from an intrinsic
+  pass that wraps at a different width than the content box the text finally
+  paints in, leaving the pill one wrapped line short and the library's content
+  surface clipping it. A definite cap keeps `min(max-content, cap)` identical
+  in both passes. Unknown widths — the first frame before the timeline reports
+  its layout, and the child-agent panel, which owns its own width — stay
+  uncapped.
 - Opened sessions use a bounded 6-entry LRU presentation cache. Before a switch,
   snapshot the current `TimelineModel`, runtime selection, follow/scroll state,
   and disclosure state; restore a cached target synchronously with no loading

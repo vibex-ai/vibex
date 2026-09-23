@@ -565,6 +565,15 @@ const AGENT_PERMISSION_REVEAL_AIM: f32 = 0.0;
 /// Top padding of the virtual timeline list before the first render reports the
 /// window's rem size. The list's `py_4` resolves to one rem.
 const AGENT_TIMELINE_LIST_PADDING_TOP_PX: f32 = 16.0;
+/// Horizontal padding of the virtual timeline list (`px_4`), on each side.
+const AGENT_TIMELINE_LIST_PADDING_X_PX: f32 = 16.0;
+/// Share of a timeline row a user message column occupies.
+const USER_MESSAGE_COLUMN_WIDTH_RATIO: f32 = 0.78;
+/// The pill's horizontal padding (`px(14)`) plus its 1px library border.
+const USER_MESSAGE_PILL_HORIZONTAL_INSET_PX: f32 = 30.0;
+/// Narrower timelines than this stay uncapped: the pill is unusable there
+/// anyway, and a cap would only wrap its text one character per line.
+const USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX: f32 = 80.0;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 /// Settle window before a repeatable smaller intrinsic measurement may replace
@@ -2568,6 +2577,32 @@ fn session_content_max_width(mode: SessionContentWidthMode) -> Option<f32> {
         SessionContentWidthMode::Standard => Some(AGENT_CONTENT_STANDARD_MAX_WIDTH),
         SessionContentWidthMode::Full => None,
     }
+}
+
+/// The definite width a user message body may wrap at, in pixels.
+///
+/// The pill hugs its content, so taffy resolves its height from an intrinsic
+/// pass that can wrap the body at a different width than the content box the
+/// text finally paints in. When the intrinsic pass wraps wider, the pill ends
+/// up a wrapped line short and the library's content surface clips that line.
+/// Capping the body at the width the pill settles on keeps the measured height
+/// and the painted wrap at one width, which is what the cap guarantees: the
+/// body's width is `min(max-content, cap)` in every pass.
+///
+/// `None` means the width is unknown — the timeline has not reported its first
+/// layout yet, or the child-agent panel owns its own width — and the body stays
+/// unconstrained, exactly as it was before the cap existed.
+fn user_message_body_max_width(timeline_width: f32, content_max_width: Option<f32>) -> Option<f32> {
+    if !timeline_width.is_finite() || timeline_width <= 0.0 {
+        return None;
+    }
+    let row_width = (timeline_width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0)
+        .min(content_max_width.unwrap_or(f32::INFINITY));
+    // One pixel of slack keeps the cap inside the content box once taffy
+    // rounds the fractional percentage widths on the way down.
+    let body_width =
+        row_width * USER_MESSAGE_COLUMN_WIDTH_RATIO - USER_MESSAGE_PILL_HORIZONTAL_INSET_PX - 1.0;
+    (body_width >= USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX).then_some(body_width)
 }
 
 fn sidebar_panel_max_width(viewport_width: u32) -> f32 {
@@ -46316,6 +46351,7 @@ impl VibexWorkbench {
                 row.body.clone(),
                 attachments,
                 search_highlight,
+                self.user_message_body_max_width(),
                 cx,
             )
         };
@@ -46358,7 +46394,7 @@ impl VibexWorkbench {
                 v_flex()
                     .id(row.id.clone())
                     .min_w_0()
-                    .w(relative(0.78))
+                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
                     .items_end()
                     .gap_1()
                     .child(render_user_message_bubble(
@@ -46463,6 +46499,7 @@ impl VibexWorkbench {
             row.body.clone(),
             attachments,
             search_highlight,
+            None,
             cx,
         );
         div()
@@ -46473,7 +46510,7 @@ impl VibexWorkbench {
                 v_flex()
                     .id(row.id.clone())
                     .min_w_0()
-                    .w(relative(0.78))
+                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
                     .items_end()
                     .gap_1()
                     .child(render_user_message_bubble(
@@ -46485,6 +46522,20 @@ impl VibexWorkbench {
                     )),
             )
             .into_any_element()
+    }
+
+    /// The definite width this view's user message bodies may wrap at.
+    ///
+    /// The child-agent panel tracks its own width, and a timeline that has not
+    /// painted yet has none, so both stay uncapped.
+    fn user_message_body_max_width(&self) -> Option<f32> {
+        if self.rendering_child_agent_timeline() {
+            return None;
+        }
+        user_message_body_max_width(
+            self.timeline_layout_width?,
+            session_content_max_width(self.ui_state.session.content_width),
+        )
     }
 
     fn render_agent_message_row(
@@ -49223,6 +49274,7 @@ impl VibexWorkbench {
         text: String,
         attachments: Vec<MessageAttachment>,
         search_highlight: Option<SessionSearchHighlight>,
+        body_max_width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if attachments.is_empty() {
@@ -49230,6 +49282,7 @@ impl VibexWorkbench {
                 format!("user-message-text:{message_id}"),
                 text,
                 search_highlight,
+                body_max_width,
             )
             .into_any_element();
         }
@@ -49272,6 +49325,7 @@ impl VibexWorkbench {
             .w_auto()
             .min_w_0()
             .max_w_full()
+            .when_some(body_max_width, |this, width| this.max_w(px(width)))
             .whitespace_normal()
             .into_any_element()
     }
@@ -65932,10 +65986,17 @@ fn agent_file_operation_preview_path(path: &str, workspace_root: Option<&str>) -
     (!relative.is_empty()).then_some(relative)
 }
 
+/// Renders the user message body inside the pill.
+///
+/// `body_max_width` is the definite width the pill will give the text (see
+/// [`user_message_body_max_width`]). Capping the body there keeps the wrap width
+/// identical in the intrinsic pass that sizes the pill and in the final layout
+/// that paints it, so the pill can never end up a wrapped line short.
 fn render_user_message_text_segment(
     id: impl Into<ElementId>,
     value: String,
     search_highlight: Option<SessionSearchHighlight>,
+    body_max_width: Option<f32>,
 ) -> MarkdownView {
     MarkdownView::plain_text(id, MarkdownInput::new(value, "", 0))
         .presentation(MarkdownPresentation::Agent)
@@ -65952,6 +66013,7 @@ fn render_user_message_text_segment(
         .w_auto()
         .min_w_0()
         .max_w_full()
+        .when_some(body_max_width, |this, width| this.max_w(px(width)))
         .flex_shrink(1.0)
         .whitespace_normal()
 }
@@ -68436,6 +68498,7 @@ mod tests {
                                     "user-message-layout-probe",
                                     self.body.clone(),
                                     None,
+                                    None,
                                 )
                                 .into_any_element(),
                                 None,
@@ -68447,6 +68510,145 @@ mod tests {
                     // The hidden hover actions still participate in the row's intrinsic width.
                     .child(div().w(px(132.0)).h(px(24.0))),
             )
+        }
+    }
+
+    /// Measures the user bubble against the text it contains.
+    ///
+    /// The row renders through a real virtual list, so the pill is laid out the
+    /// way the timeline lays it out. The probe reports the height the pill
+    /// settled on next to the height the same body needs as a plain text
+    /// element at the pill's own content width, so a wrapped line the pill
+    /// clips shows up as a pill shorter than its text.
+    struct UserMessageBubbleTextFitProbe {
+        body: String,
+        list_width: f32,
+        row_height: f32,
+        content_max_width: Option<f32>,
+        body_max_width: Option<f32>,
+        measured_column: Rc<Cell<(f32, f32, f32)>>,
+        measured_reference: Rc<Cell<f32>>,
+    }
+
+    /// The hover action row the rendered user row always reserves.
+    const USER_MESSAGE_FIT_PROBE_ACTIONS_HEIGHT: f32 = 24.0;
+    /// The gap between the pill and that row.
+    const USER_MESSAGE_FIT_PROBE_COLUMN_GAP: f32 = 4.0;
+
+    /// The user message row, mirrored from `render_user_message_row`.
+    fn user_message_fit_row(
+        body: String,
+        body_max_width: Option<f32>,
+        measured_column: Rc<Cell<(f32, f32, f32)>>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .w_full()
+            .justify_end()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))
+                    .items_end()
+                    .gap_1()
+                    .on_prepaint(move |bounds, _, _| {
+                        measured_column.set((
+                            f32::from(bounds.origin.y),
+                            f32::from(bounds.origin.y + bounds.size.height),
+                            f32::from(bounds.size.width),
+                        ));
+                    })
+                    .child(render_user_message_bubble(
+                        render_user_message_text_segment(
+                            "user-message-fit-probe",
+                            body,
+                            None,
+                            body_max_width,
+                        )
+                        .into_any_element(),
+                        None,
+                        theme::semantic_color("muted", true),
+                        theme::semantic_color("foreground", true),
+                        false,
+                    ))
+                    .child(
+                        h_flex()
+                            .h(px(USER_MESSAGE_FIT_PROBE_ACTIONS_HEIGHT))
+                            .w(px(132.0)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    impl Render for UserMessageBubbleTextFitProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let list_width = self.list_width;
+            let row_height = self.row_height;
+            let content_max_width = self.content_max_width;
+            let body_max_width = self.body_max_width;
+            let row_body = self.body.clone();
+            let row_column = self.measured_column.clone();
+            let measured_reference = self.measured_reference.clone();
+            let (_, _, column_width) = self.measured_column.get();
+            // Without a cap the body fills the pill's content box; with one the
+            // cap is exactly the width the text was given.
+            let reference_width = body_max_width.unwrap_or_else(|| {
+                (column_width - USER_MESSAGE_PILL_HORIZONTAL_INSET_PX).max(40.0)
+            });
+            let row_sizes = Rc::new(vec![size(px(list_width), px(row_height))]);
+            v_flex()
+                .w(px(list_width))
+                .child(
+                    v_virtual_list(
+                        cx.entity(),
+                        "user-message-fit-list",
+                        row_sizes,
+                        move |_this, _range, _window, _cx| {
+                            let row = user_message_fit_row(
+                                row_body.clone(),
+                                body_max_width,
+                                row_column.clone(),
+                            );
+                            vec![
+                                h_flex()
+                                    .w_full()
+                                    .h(px(row_height))
+                                    .justify_center()
+                                    .items_start()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .when_some(content_max_width, |this, max_width| {
+                                                this.max_w(px(max_width))
+                                            })
+                                            .child(v_flex().w_full().min_w_0().gap_3().child(row)),
+                                    )
+                                    .into_any_element(),
+                            ]
+                        },
+                    )
+                    .w_full()
+                    .h(px(row_height + 32.0))
+                    .px_4()
+                    .py_4(),
+                )
+                .child(
+                    // Ground truth for the wrapped height: the same body as a
+                    // plain text element at a definite width, with the Markdown
+                    // root's own typography.
+                    div()
+                        .w(px(reference_width))
+                        .min_w_0()
+                        .text_sm()
+                        .line_height(px(22.0))
+                        .whitespace_normal()
+                        .on_prepaint(move |bounds, _, _| {
+                            measured_reference.set(f32::from(bounds.size.height));
+                        })
+                        .child(gpui::Text::new_inaccessible(self.body.clone().into())),
+                )
         }
     }
 
@@ -82139,6 +82341,113 @@ mod tests {
         );
     }
 
+    /// The pill must never be shorter than the text it wraps.
+    ///
+    /// The pill hugs its content, so its height comes from an intrinsic pass
+    /// that can wrap the body at a different width than the content box the
+    /// text finally paints in; the library's content surface then clips the
+    /// difference, which is exactly the reported "last line is cut" bubble.
+    /// [`user_message_body_max_width`] pins both passes to one width, and this
+    /// test holds the invariant against a plain text element measured at the
+    /// pill's own content width.
+    #[gpui::test]
+    fn user_message_bubble_covers_its_wrapped_text(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let json_line = format!(
+            "{{\"code\":\"fail_to_fetch_task\",\"message\":\"{}\"}}",
+            "0123456789abcdef".repeat(6)
+        );
+        let bodies = [
+            "那就试下吧".to_string(),
+            format!(
+                "渠道 1\n就绪\n提供商:\nsinon\n上游引用:\n{json_line}\n最后同步:2026-09-23 10:29:37\n那就试下吧"
+            ),
+            format!(
+                "我在 ssh cc_hyper_api host 里部署的 new-api，素材管理里上传了 asset_MJa3FlR1l1P10FxK1mP3b4OqenCqOgwq 这个素材，其显示的渠道为：\n{}\n然后我用：\ncurl -sS \"https://www.ccshort.cn/v1/videos\" \\\n -H \"Content-Type: application/json\" \\\n测试了三个渠道，其中 mints 报错：\n{json_line}\n那就试下吧",
+                (1..=3)
+                    .map(|index| format!(
+                        "渠道 {index}\n就绪\n提供商:\n{}\n上游引用:\n{json_line}\n最后同步:2026-09-23 10:2{index}:37",
+                        ["sinon", "url", "mint"][index - 1]
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        ];
+        for body in bodies {
+            for list_width in [1013.0_f32, 1400.0] {
+                for content_max_width in [None, Some(AGENT_CONTENT_NARROW_MAX_WIDTH)] {
+                    let body_max_width = user_message_body_max_width(list_width, content_max_width);
+                    let measured_column = Rc::new(Cell::new((0.0, 0.0, 0.0)));
+                    let measured_reference = Rc::new(Cell::new(0.0));
+                    let column_slot = measured_column.clone();
+                    let reference_slot = measured_reference.clone();
+                    let (_, cx) = cx.add_window_view(|_, _| UserMessageBubbleTextFitProbe {
+                        body: body.clone(),
+                        list_width,
+                        row_height: 400.0,
+                        content_max_width,
+                        body_max_width,
+                        measured_column: column_slot,
+                        measured_reference: reference_slot,
+                    });
+                    cx.run_until_parked();
+                    for _ in 0..3 {
+                        cx.update(|window, cx| {
+                            let _ = window.draw(cx);
+                        });
+                    }
+                    let (column_top, column_bottom, column_width) = measured_column.get();
+                    let reference = measured_reference.get();
+                    let pill_height = column_bottom
+                        - column_top
+                        - USER_MESSAGE_FIT_PROBE_ACTIONS_HEIGHT
+                        - USER_MESSAGE_FIT_PROBE_COLUMN_GAP;
+                    assert!(
+                        pill_height >= reference + 20.0 - 0.5,
+                        "pill {pill_height} is shorter than its text {reference} at list {list_width}, max width {content_max_width:?}"
+                    );
+                    if let Some(body_max_width) = body_max_width {
+                        assert!(
+                            body_max_width
+                                <= column_width - USER_MESSAGE_PILL_HORIZONTAL_INSET_PX + 0.5,
+                            "body cap {body_max_width} exceeds the pill's content box {column_width}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn user_message_body_cap_is_unknown_until_the_timeline_measures_itself() {
+        // The cap must stay inside the pill's content box: the pill is the 78%
+        // column, and its text sits inside the pill's px(14) padding and 1px
+        // border.
+        let list_width = 1013.0;
+        let column =
+            (list_width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0) * USER_MESSAGE_COLUMN_WIDTH_RATIO;
+        let cap = user_message_body_max_width(list_width, None).expect("timeline width is known");
+        assert!(
+            cap <= column - USER_MESSAGE_PILL_HORIZONTAL_INSET_PX,
+            "cap {cap} must stay inside the pill's content box"
+        );
+        assert!(cap > 0.0);
+
+        // A bounded content width caps the row before the column does.
+        let narrow = user_message_body_max_width(list_width, Some(AGENT_CONTENT_NARROW_MAX_WIDTH))
+            .expect("narrow content width still yields a cap");
+        assert!(narrow < cap);
+
+        // No timeline width means no cap: the first frame and the child-agent
+        // panel keep the body unconstrained rather than guessing a width.
+        assert_eq!(user_message_body_max_width(0.0, None), None);
+        assert_eq!(user_message_body_max_width(f32::NAN, None), None);
+        assert_eq!(
+            user_message_body_max_width(USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX, None),
+            None
+        );
+    }
+
     #[gpui::test]
     fn user_message_bubble_preserves_a_single_input_line_when_width_is_available(
         cx: &mut TestAppContext,
@@ -82228,6 +82537,7 @@ mod tests {
                     "user-message-delivery-probe",
                     "hi".to_string(),
                     None,
+                    None,
                 ));
             v_flex()
                 .w(px(320.0))
@@ -82301,6 +82611,7 @@ mod tests {
                 .child(render_user_message_text_segment(
                     "user-message-goal-probe",
                     "/goal hi".to_string(),
+                    None,
                     None,
                 ));
             v_flex().w(px(320.0)).items_end().gap_1().child(
@@ -82501,8 +82812,8 @@ mod tests {
 
         // The 78% width contract stays on the definite-width row wrapper;
         // the bubble hugs its content and shrinks under that constraint.
-        assert!(row.contains(".w(relative(0.78))"));
-        assert!(!row.contains(".max_w(relative(0.78))"));
+        assert!(row.contains(".w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))"));
+        assert!(!row.contains(".max_w(relative(USER_MESSAGE_COLUMN_WIDTH_RATIO))"));
         assert!(helper.contains("Bubble::new()"));
         assert!(helper.contains("MessageAlignment::End"));
         assert!(helper.contains("BubbleContent::new()"));
