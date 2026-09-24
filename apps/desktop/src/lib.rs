@@ -154,7 +154,11 @@ mod tests {
         // The bound exists to catch a probe that starts dumping state instead of
         // summarising it. It tracks the contract sections the runtime reports,
         // so adding a section raises it deliberately.
-        assert!(serialized.len() < 6_144, "probe grew to {} bytes", serialized.len());
+        assert!(
+            serialized.len() < 6_144,
+            "probe grew to {} bytes",
+            serialized.len()
+        );
         assert!(!serialized.contains("/home/"));
         assert!(!serialized.contains("\\Users\\"));
     }
