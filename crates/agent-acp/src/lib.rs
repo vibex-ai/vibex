@@ -54,6 +54,7 @@ mod adapter_activation;
 mod auth;
 mod bridge_contract;
 mod claude;
+mod claude_session;
 mod codex;
 mod dialect;
 mod events;

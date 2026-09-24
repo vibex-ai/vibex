@@ -379,6 +379,35 @@ with `runtime_switch_configuration_unavailable`, leaving the Logical Session
 stuck in `initializing`. Keep this alias capability scoped to CodeBuddy rather
 than exposing a provider-specific key in Core or UI contracts.
 
+### Claude Code model routing note
+
+Claude Code applies the `env` block of `~/.claude/settings.json` *after* the
+subprocess environment, so a Provider Profile's projected environment is
+ignored for every key the user's own Claude Code settings also define — the
+model catalog included. `claude-agent-acp` forwards
+`session/new | session/load | session/resume` `_meta.claudeCode.options` to the
+Claude Agent SDK, and that programmatic settings tier is applied last, so the
+Profile stays authoritative without editing any user file.
+
+The adapter resolves an ACP model value against the picker rows Claude Code
+derives from `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` and rejects a value
+that matches no row (`Invalid value for config option model`). A model probe
+therefore records `acp_rpc_error` and shows no runtime options, and the live
+path fails `apply_session_config` with
+`runtime_switch_configuration_unavailable`. Every configured model must own a
+row, so `claude_session` assigns configured models to distinct alias slots
+(family slot first, first free slot otherwise) and projects that mapping into
+the session settings tier. An alias is only a slot: Claude Code expands it
+locally, so a slot may point at any model.
+
+`ANTHROPIC_MODEL` is deliberately not projected when it names an assigned
+model. It would add a picker row spelling the raw id, that row wins the
+adapter's exact-match tier, and `setModel` would then ask the provider to
+confirm a raw spelling instead of the alias Claude Code expands. The channel is
+an adapter extension, present since `claude-agent-acp` 0.71.0, so it is only
+built for the `claude` Agent; the probe, live session, and runtime identity
+probe all read the same per-process value so their model catalogs cannot drift.
+
 ### DeepSeek Harness ACP compatibility note
 
 DeepSeek Harness (`deepseek-harness-acp`) is a catalog-only Agent with no

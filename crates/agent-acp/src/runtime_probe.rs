@@ -539,6 +539,7 @@ impl AcpRuntimeClient {
             ));
         }
         let probe_id = record.id.clone();
+        let claude_session_settings = process.claude_session_settings();
         let operation = async {
             self.transition_probe_stage(record, AgentRuntimeProbeStage::InitializingAcp)?;
             let initialize = process
@@ -570,7 +571,10 @@ impl AcpRuntimeClient {
             let session = process
                 .request(
                     AcpOperation::SessionNew.method(),
-                    build_session_new_params(cwd, json!([])),
+                    claude_session_request(
+                        build_session_new_params(cwd, json!([])),
+                        claude_session_settings,
+                    ),
                     timeout_duration.min(ACP_PROBE_TIMEOUT),
                 )
                 .await?;
@@ -723,6 +727,7 @@ impl AcpRuntimeClient {
                 _native_session_id_guard,
                 cwd,
                 timeout_duration.min(ACP_PROBE_TIMEOUT),
+                claude_session_settings,
             )
             .await;
             facts.push(resume_fact);
@@ -1031,12 +1036,19 @@ fn is_probe_environment_key(name: &str) -> bool {
         .any(|protected| name.eq_ignore_ascii_case(protected))
 }
 
+/// Attaches the Claude session settings tier to one probe request.
+fn claude_session_request(mut params: Value, meta: Option<&Value>) -> Value {
+    crate::claude_session::attach_session_settings_meta(&mut params, meta);
+    params
+}
+
 async fn probe_session_resume(
     initialize: &Value,
     process: &Arc<AcpProcess>,
     native_session_id: &str,
     cwd: &Path,
     request_timeout: Duration,
+    claude_session_settings: Option<&Value>,
 ) -> AgentRuntimeProbeFact {
     let Some(capabilities) = initialize.get("agentCapabilities") else {
         return AgentRuntimeProbeFact {
@@ -1074,12 +1086,14 @@ async fn probe_session_resume(
             continue;
         }
         let params = match operation {
-            AcpOperation::SessionResume => {
-                build_session_resume_params(native_session_id, cwd, json!([]))
-            }
-            AcpOperation::SessionLoad => {
-                build_session_load_params(native_session_id, cwd, &[], json!([]))
-            }
+            AcpOperation::SessionResume => claude_session_request(
+                build_session_resume_params(native_session_id, cwd, json!([])),
+                claude_session_settings,
+            ),
+            AcpOperation::SessionLoad => claude_session_request(
+                build_session_load_params(native_session_id, cwd, &[], json!([])),
+                claude_session_settings,
+            ),
             _ => unreachable!("session restore probe only uses restore operations"),
         };
         match process

@@ -112,6 +112,7 @@ use vibex_db::{
 
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
 use crate::claude::{claude_config_home, find_claude_transcript};
+use crate::claude_session;
 use crate::dialect::{
     AgentHostRequestDialect, LaunchArgPlacement, McpWireDelivery, agent_dialect_profile,
 };
@@ -715,8 +716,14 @@ fn parse_operation_capability(
     (support, encoding)
 }
 
-fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServerDescriptor]) -> Value {
-    protocol::build_session_new_params(cwd, mcp_servers_json(mcp_servers))
+fn build_session_new_params(
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServerDescriptor],
+    session_settings: Option<&Value>,
+) -> Value {
+    let mut params = protocol::build_session_new_params(cwd, mcp_servers_json(mcp_servers));
+    claude_session::attach_session_settings_meta(&mut params, session_settings);
+    params
 }
 
 fn build_session_fork_params(
@@ -732,13 +739,31 @@ fn build_session_load_params(
     cwd: &Path,
     additional_directories: &[PathBuf],
     mcp_servers: &[AcpMcpServerDescriptor],
+    session_settings: Option<&Value>,
 ) -> Value {
-    protocol::build_session_load_params(
+    let mut params = protocol::build_session_load_params(
         native_session_id,
         cwd,
         additional_directories,
         mcp_servers_json(mcp_servers),
-    )
+    );
+    claude_session::attach_session_settings_meta(&mut params, session_settings);
+    params
+}
+
+fn build_session_resume_params(
+    native_session_id: &str,
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServerDescriptor],
+    session_settings: Option<&Value>,
+) -> Value {
+    let mut params = protocol::build_session_resume_params(
+        native_session_id,
+        cwd,
+        mcp_servers_json(mcp_servers),
+    );
+    claude_session::attach_session_settings_meta(&mut params, session_settings);
+    params
 }
 
 fn resolve_acp_mcp_descriptors(
@@ -2313,6 +2338,11 @@ pub(crate) struct AcpProcess {
     command_display: String,
     args_display: String,
     startup_model: Option<String>,
+    /// Claude-only `_meta` that carries the Profile's model routing into the
+    /// adapter's programmatic settings tier, which Claude Code applies after
+    /// `~/.claude/settings.json`. Built once per process so the probe and the
+    /// live session cannot disagree about the model catalog.
+    claude_session_settings: Option<Value>,
     /// Authentication method selected automatically for provider-backed
     /// processes. The method is still required by Antigravity even when the
     /// corresponding API key is already present in the process environment.
@@ -4685,6 +4715,43 @@ impl AcpSessionAttachment {
 impl AcpProcess {
     pub(crate) fn startup_model(&self) -> Option<&str> {
         self.startup_model.as_deref()
+    }
+
+    /// The Claude session `_meta` this process must attach to every
+    /// `session/new`, `session/load`, and `session/resume` request.
+    pub(crate) fn claude_session_settings(&self) -> Option<&Value> {
+        self.claude_session_settings.as_ref()
+    }
+
+    fn session_new_params(&self) -> Value {
+        build_session_new_params(
+            &self.workspace_root,
+            &self.wire_mcp_servers(),
+            self.claude_session_settings(),
+        )
+    }
+
+    fn session_load_params(
+        &self,
+        native_session_id: &str,
+        additional_directories: &[PathBuf],
+    ) -> Value {
+        build_session_load_params(
+            native_session_id,
+            &self.workspace_root,
+            additional_directories,
+            &self.wire_mcp_servers(),
+            self.claude_session_settings(),
+        )
+    }
+
+    fn session_resume_params(&self, native_session_id: &str) -> Value {
+        build_session_resume_params(
+            native_session_id,
+            &self.workspace_root,
+            &self.wire_mcp_servers(),
+            self.claude_session_settings(),
+        )
     }
 
     fn runtime_model_id(&self, product_model_id: &str) -> String {
@@ -12420,6 +12487,7 @@ impl AcpRuntimeClient {
         let agent_id = agent_id.clone();
         let adapter_identity = self.effective_adapter_identity(&agent_id, config)?;
         let startup_model = startup_model_from_config(config, agent_id.as_str());
+        let claude_session_settings = claude_session::session_settings_meta(&agent_id, config);
         let model_id_projection = match auth_source {
             RuntimeAuthSource::ProviderProfile {
                 provider_profile_id,
@@ -12609,6 +12677,7 @@ impl AcpRuntimeClient {
             command_display: config.command.clone(),
             args_display: redacted_args_summary(&process_args),
             startup_model,
+            claude_session_settings,
             provider_auth_method,
             outbound: Mutex::new(Some(outbound_tx)),
             next_request_id: AtomicU64::new(1),
@@ -12981,51 +13050,50 @@ impl AcpRuntimeClient {
         // that result, so the trailing update cannot be observed until after
         // runtime configuration has already been planned. Capture it on the
         // unbarriered path and fold it into the attachment's initial state.
-        let (result, registration_barrier, trailing_config_update) = if process.agent_id.as_str()
-            == "copilot"
-        {
-            let config_update = process.arm_initial_probe_config_update();
-            process
-                .unbarriered_session_registrations
-                .fetch_add(1, Ordering::AcqRel);
-            let result = process
-                .request(
-                    AcpOperation::SessionNew.method(),
-                    build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
-                    self.handshake_timeout,
-                )
-                .await;
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    process
-                        .unbarriered_session_registrations
-                        .fetch_sub(1, Ordering::AcqRel);
-                    process.disarm_initial_probe_config_update();
-                    return Err(error);
-                }
+        let (result, registration_barrier, trailing_config_update) =
+            if process.agent_id.as_str() == "copilot" {
+                let config_update = process.arm_initial_probe_config_update();
+                process
+                    .unbarriered_session_registrations
+                    .fetch_add(1, Ordering::AcqRel);
+                let result = process
+                    .request(
+                        AcpOperation::SessionNew.method(),
+                        process.session_new_params(),
+                        self.handshake_timeout,
+                    )
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        process
+                            .unbarriered_session_registrations
+                            .fetch_sub(1, Ordering::AcqRel);
+                        process.disarm_initial_probe_config_update();
+                        return Err(error);
+                    }
+                };
+                let update = match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
+                    Ok(Ok(update)) => Some(update),
+                    Ok(Err(_)) | Err(_) => {
+                        process.disarm_initial_probe_config_update();
+                        None
+                    }
+                };
+                process
+                    .unbarriered_session_registrations
+                    .fetch_sub(1, Ordering::AcqRel);
+                (result, None, update)
+            } else {
+                let (result, barrier) = process
+                    .request_with_registration_barrier(
+                        AcpOperation::SessionNew.method(),
+                        process.session_new_params(),
+                        self.handshake_timeout,
+                    )
+                    .await?;
+                (result, Some(barrier), None)
             };
-            let update = match timeout(ACP_PROBE_CONFIG_UPDATE_TIMEOUT, config_update).await {
-                Ok(Ok(update)) => Some(update),
-                Ok(Err(_)) | Err(_) => {
-                    process.disarm_initial_probe_config_update();
-                    None
-                }
-            };
-            process
-                .unbarriered_session_registrations
-                .fetch_sub(1, Ordering::AcqRel);
-            (result, None, update)
-        } else {
-            let (result, barrier) = process
-                .request_with_registration_barrier(
-                    AcpOperation::SessionNew.method(),
-                    build_session_new_params(&process.workspace_root, &process.wire_mcp_servers()),
-                    self.handshake_timeout,
-                )
-                .await?;
-            (result, Some(barrier), None)
-        };
         let native_session_id = result
             .get("sessionId")
             .and_then(Value::as_str)
@@ -13198,11 +13266,7 @@ impl AcpRuntimeClient {
         let (result, registration_barrier) = process
             .request_with_registration_barrier(
                 AcpOperation::SessionResume.method(),
-                protocol::build_session_resume_params(
-                    native_session_id,
-                    &process.workspace_root,
-                    mcp_servers_json(&process.wire_mcp_servers()),
-                ),
+                process.session_resume_params(native_session_id),
                 self.restore_timeout,
             )
             .await?;
@@ -13273,12 +13337,7 @@ impl AcpRuntimeClient {
         let request = process
             .request_with_registration_barrier(
                 AcpOperation::SessionLoad.method(),
-                build_session_load_params(
-                    native_session_id,
-                    &process.workspace_root,
-                    additional_directories,
-                    &process.wire_mcp_servers(),
-                ),
+                process.session_load_params(native_session_id, additional_directories),
                 self.restore_timeout,
             )
             .await;
@@ -17042,6 +17101,7 @@ async fn probe_runtime_session_configs_with_config(
     };
     let mut launch_config = config.clone();
     apply_startup_model_to_config(&mut launch_config, agent_id.as_str(), startup_model);
+    let claude_session_settings = claude_session::session_settings_meta(agent_id, &launch_config);
     let probe_cwd = std::env::var("HOME")
         .map(PathBuf::from)
         .ok()
@@ -17084,7 +17144,7 @@ async fn probe_runtime_session_configs_with_config(
         let session = process
             .request(
                 AcpOperation::SessionNew.method(),
-                build_session_new_params(&probe_cwd, &[]),
+                build_session_new_params(&probe_cwd, &[], claude_session_settings.as_ref()),
                 ACP_PROBE_TIMEOUT,
             )
             .await;
@@ -17183,6 +17243,7 @@ async fn probe_copilot_runtime_session_once(
     } = source;
     let mut launch_config = config.clone();
     apply_startup_model_to_config(&mut launch_config, agent_id.as_str(), target_model);
+    let claude_session_settings = claude_session::session_settings_meta(agent_id, &launch_config);
     let probe_cwd = std::env::var("HOME")
         .map(PathBuf::from)
         .ok()
@@ -17222,7 +17283,7 @@ async fn probe_copilot_runtime_session_once(
         let session = process
             .request(
                 AcpOperation::SessionNew.method(),
-                build_session_new_params(&probe_cwd, &[]),
+                build_session_new_params(&probe_cwd, &[], claude_session_settings.as_ref()),
                 ACP_PROBE_TIMEOUT,
             )
             .await;
@@ -21547,6 +21608,7 @@ mod tests {
             fs_write_roots: Mutex::new(vec![std::env::temp_dir()]),
             transcript_strategy: None,
             transcript_home: None,
+            claude_session_settings: None,
             fs_operation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ACP_FS_CONCURRENT_OPERATION_LIMIT,
             )),
@@ -22316,14 +22378,14 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         let cwd = PathBuf::from("/tmp/vibex-workspace");
 
         assert_eq!(
-            build_session_new_params(&cwd, &[]),
+            build_session_new_params(&cwd, &[], None),
             json!({
                 "cwd": "/tmp/vibex-workspace",
                 "mcpServers": []
             })
         );
         assert_eq!(
-            build_session_load_params("native-1", &cwd, &[], &[]),
+            build_session_load_params("native-1", &cwd, &[], &[], None),
             json!({
                 "sessionId": "native-1",
                 "cwd": "/tmp/vibex-workspace",
@@ -22370,7 +22432,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         // against the official schema and silently drop anything that does
         // not match, so only schema fields may be serialized.
         assert_eq!(
-            build_session_new_params(&cwd, &servers),
+            build_session_new_params(&cwd, &servers, None),
             json!({
                 "cwd": "/tmp/vibex-workspace",
                 "mcpServers": [
@@ -22396,8 +22458,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             })
         );
         assert_eq!(
-            build_session_load_params("native-1", &cwd, &[], &servers)["mcpServers"],
-            build_session_new_params(&cwd, &servers)["mcpServers"]
+            build_session_load_params("native-1", &cwd, &[], &servers, None)["mcpServers"],
+            build_session_new_params(&cwd, &servers, None)["mcpServers"]
         );
     }
 
@@ -30840,6 +30902,80 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_profile_models_reach_the_session_settings_tier() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "claude-session-settings",
+            Some(vibex_core::AgentId::parse(CLAUDE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.env.push(vibex_core::AcpProviderEnvReference {
+            key: "ANTHROPIC_MODEL".to_string(),
+            source: AcpProviderEnvSource::Literal,
+            value: Some("claude-opus-5[1m]".to_string()),
+            secret_lookup_key: None,
+            redacted_hint: "mock literal".to_string(),
+        });
+        config.env.push(vibex_core::AcpProviderEnvReference {
+            key: "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+            source: AcpProviderEnvSource::Literal,
+            value: Some("claude-fable-5[1M]".to_string()),
+            secret_lookup_key: None,
+            redacted_hint: "mock literal".to_string(),
+        });
+        config.models = vec![
+            "claude-opus-5[1m]".to_string(),
+            "claude-haiku-4-5".to_string(),
+        ];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+
+        let client = fixture.client();
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: Some("claude-opus-5[1m]".to_string()),
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+
+        let log = fixture.request_log();
+        let new_session = find_logged_request(&log, "session/new");
+        let env = &new_session["params"]["_meta"]["claudeCode"]["options"]["settings"]["env"];
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            json!("claude-opus-5[1m]")
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            json!("claude-haiku-4-5")
+        );
+        // A Profile alias that no configured model claims stays authoritative.
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            json!("claude-fable-5[1M]")
+        );
+        // A default-model row would shadow the alias with the raw id.
+        assert!(env.get("ANTHROPIC_MODEL").is_none());
+
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opencode_default_placeholder_does_not_request_model_switch() {
         let Some(fixture) = MockAcpFixture::create_for_agent(
             "opencode-default-model",
@@ -35656,6 +35792,42 @@ for line in sys.stdin:
             .expect("model-scoped probe must select its target model");
         assert_eq!(model_request["params"]["configId"], "model");
         assert_eq!(model_request["params"]["value"], "mock/model-2");
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_model_probe_projects_the_session_settings_tier() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "claude-model-probe",
+            Some(vibex_core::AgentId::parse(CLAUDE_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let service = fixture.service();
+        let mut config = service
+            .get_acp_profile_config(fixture.profile_id.clone())
+            .unwrap();
+        config.models = vec!["claude-opus-5[1m]".to_string()];
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: fixture.profile_id.clone(),
+                config,
+            })
+            .unwrap();
+
+        let client = fixture.client();
+        client
+            .probe_runtime_session_config_for_model(&fixture.profile_id, "claude-opus-5[1m]")
+            .await
+            .unwrap();
+
+        // The probe must see the same catalog as the live session, otherwise a
+        // model can carry runtime options while its session switch fails.
+        let new_session = find_logged_request(&fixture.request_log(), "session/new");
+        assert_eq!(
+            new_session["params"]["_meta"]["claudeCode"]["options"]["settings"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            json!("claude-opus-5[1m]")
+        );
         fixture.cleanup();
     }
 
