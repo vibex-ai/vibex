@@ -10601,12 +10601,10 @@ impl ManagementCenter {
         let shown_count = shown.len();
         let filtered = transport_filter.is_some();
 
-        // `max_h_full` is what pins the pager: the pane sits in a scroll
-        // container, which gives its child an auto height, so without a ceiling
-        // the whole market grows past the window and the pager rides off the
-        // bottom with it. Capped at the viewport, the grid is the only thing
-        // that scrolls and the pager stays where it is.
-        let mut content = v_flex().size_full().max_h_full().min_h_0().gap_3();
+        // `section_body_owns_its_scroll` keeps this pane out of the outer
+        // scroll container, so `size_full` is the window's height: the grid is
+        // the only thing that scrolls and the pager stays under it.
+        let mut content = v_flex().size_full().min_h_0().gap_3();
 
         let heading = h_flex()
             .w_full()
@@ -11148,9 +11146,9 @@ impl ManagementCenter {
             .filter_map(|skill| skill.source_uri.clone())
             .collect();
 
-        // Same ceiling as the MCP market, for the same reason: the pager has to
-        // stay on screen while the grid scrolls under it.
-        let mut content = v_flex().size_full().max_h_full().min_h_0().gap_3();
+        // Same contract as the MCP market: the pane does not scroll this view,
+        // so the pager stays on screen while the grid scrolls under it.
+        let mut content = v_flex().size_full().min_h_0().gap_3();
         let heading = h_flex()
             .w_full()
             .min_w_0()
@@ -11686,10 +11684,6 @@ impl ManagementCenter {
 
         v_flex()
             .size_full()
-            // Capped like the market panes: the pane it sits in scrolls, and
-            // without a ceiling the Detect footer would ride off the bottom of
-            // the window instead of staying under the list it acts on.
-            .max_h_full()
             .min_h_0()
             .gap_3()
             .child(
@@ -19027,14 +19021,28 @@ impl Render for ManagementCenter {
                             .child(context_sidebar),
                     ),
             );
-        let main = div()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_y_scrollbar()
-            .when(viewport_width < 640.0, |main| main.p_3())
-            .when(viewport_width >= 640.0, |main| main.p_4())
-            .child(content);
+        let pane = div().flex_1().min_h_0().min_w_0().child(content);
+        // A section body that scrolls its own list must not sit in a scroll
+        // container as well: the container hands its child an auto height, so
+        // the view grows past the window and takes its own footer — the market
+        // pager, the import view's Detect command — off the bottom with it.
+        // Left unscrolled, the pane's height is definite and the inner list is
+        // the only thing that moves.
+        //
+        // The padding is spelled out in both branches rather than applied
+        // before them: the pane's own inset is what keeps the overlay scrollbar
+        // off its content, so it has to sit on the same builder chain as the
+        // scroll wrapper — which is the chain a source check reads.
+        let main = if self.section_body_owns_its_scroll() {
+            pane.when(viewport_width < 640.0, |main| main.p_3())
+                .when(viewport_width >= 640.0, |main| main.p_4())
+                .into_any_element()
+        } else {
+            pane.when(viewport_width < 640.0, |main| main.p_3())
+                .when(viewport_width >= 640.0, |main| main.p_4())
+                .overflow_y_scrollbar()
+                .into_any_element()
+        };
         let layout = if wide {
             h_flex()
                 .size_full()
@@ -19087,6 +19095,39 @@ fn management_compact_sidebar_height_limits(viewport_height: f32) -> (f32, f32) 
 
 fn management_uses_wide_layout(viewport_width: f32) -> bool {
     viewport_width >= MANAGEMENT_WIDE_BREAKPOINT
+}
+
+impl ManagementCenter {
+    /// Whether the section body scrolls a list of its own.
+    fn section_body_owns_its_scroll(&self) -> bool {
+        match management_primary_section(self.navigation.active) {
+            ManagementSection::Mcp => management_section_body_scrolls_itself(
+                self.mcp_market_open,
+                self.mcp_market_install_target.is_some(),
+                self.mcp_import_open,
+            ),
+            ManagementSection::Skills => management_section_body_scrolls_itself(
+                self.skill_market_open,
+                self.skill_market_install_target.is_some(),
+                self.skill_import_open,
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// Whether a resource section's body scrolls a list of its own.
+///
+/// The market grid keeps a pager under a list that scrolls, and the import
+/// view keeps its Detect command under one; both are sized to the pane, so the
+/// pane must not scroll them as well. The market's install form replaces the
+/// grid and is a long form, so it goes back to the pane's own scrolling.
+fn management_section_body_scrolls_itself(
+    market_open: bool,
+    install_form_open: bool,
+    import_open: bool,
+) -> bool {
+    import_open || (market_open && !install_form_open)
 }
 
 fn management_primary_section(section: ManagementSection) -> ManagementSection {
@@ -24290,6 +24331,22 @@ mod tests {
             !band.iter().any(|quad| quad.background == track),
             "pill tabs paint no segmented track"
         );
+    }
+
+    /// A pane that scrolls a body which scrolls itself would take that body's
+    /// own footer off the bottom of the window: the outer container hands its
+    /// child an auto height, so the view grows past the pane and the pager —
+    /// or the import view's Detect command — goes with it.
+    #[test]
+    fn section_bodies_that_scroll_their_own_list_keep_the_pane_still() {
+        assert!(management_section_body_scrolls_itself(true, false, false));
+        assert!(management_section_body_scrolls_itself(false, false, true));
+        assert!(management_section_body_scrolls_itself(true, false, true));
+        // The install form replaces the grid and is a long form: the pane has
+        // to scroll it, or it would be clipped.
+        assert!(!management_section_body_scrolls_itself(true, true, false));
+        // Nothing that owns its own scrolling is open.
+        assert!(!management_section_body_scrolls_itself(false, false, false));
     }
 
     #[test]
