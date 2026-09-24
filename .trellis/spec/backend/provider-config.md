@@ -3770,14 +3770,16 @@ ProviderConfigService::{
   agent, `vibex-auto`, because `opencode acp` advertises every primary agent as
   an ACP session mode. That is the only config-only route to an auto-accept
   choice in Vibex's mode selector, since `opencode acp` rejects the TUI's
-  `--auto` flag. The agent allows `edit`, `bash`, `webfetch`, and `websearch`,
-  and deliberately leaves `read` (which carries the built-in `.env` deny),
-  `external_directory`, and `doom_loop` unset so their safety defaults survive.
-  OpenCode merges config sources, so the agent is added alongside — never in
-  place of — the user's own agents. Agent rules outrank global rules, so
-  selecting the mode overrides the user's `ask`/`deny` rules for those four
-  tools, which is a deliberate divergence from `--auto`'s respect for explicit
-  denies.
+  `--auto` flag. The agent allows `edit`, `bash`, `webfetch`, `websearch`, and
+  `external_directory`. `external_directory` must be listed explicitly because
+  it defaults to `ask`, and omitting it makes every workspace-external read — a
+  user config file, a sibling checkout — still prompt inside an "auto" mode.
+  `read` and `doom_loop` are deliberately left unset so the built-in `.env`
+  rules and the repeated-tool-call guard keep asking. OpenCode merges config
+  sources, so the agent is added alongside — never in place of — the user's own
+  agents. Agent rules outrank global rules, so selecting the mode overrides the
+  user's `ask`/`deny` rules for the listed permissions, which is a deliberate
+  divergence from `--auto`'s respect for explicit denies.
 - Product state uses `provider_model_id` as the canonical model identity. The
   projection engine is the only owner of configured product-model to
   Agent-runtime-model translation. For OpenCode it qualifies the model with

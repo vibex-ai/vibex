@@ -2199,20 +2199,23 @@ fn opencode_overlay(
         serde_json::to_value(enabled_providers).map_err(encode_error)?,
     );
     // OpenCode resolves permissions per agent and gives agent rules precedence
-    // over global rules. This agent only unlocks the tools that commonly prompt;
-    // `read` (which carries the built-in `.env` deny), `external_directory`, and
-    // `doom_loop` are intentionally left unset so their safety defaults survive.
+    // over global rules. `external_directory` has to be listed explicitly: it
+    // defaults to `ask`, so without it every workspace-external read (a user
+    // config file, a sibling checkout) still prompts in an "auto" mode.
+    // `read` and `doom_loop` stay unset so the built-in `.env` rules and the
+    // repeated-tool-call guard keep asking.
     let mut auto_accept_agent = serde_json::Map::new();
     auto_accept_agent.insert(
         OPENCODE_AUTO_ACCEPT_AGENT_ID.to_string(),
         serde_json::json!({
-            "description": "Auto-accept file edits and shell commands. Vibex-managed; paths outside the workspace and repeated-tool-loop guards still ask.",
+            "description": "Auto-accept file edits, shell commands, web access, and paths outside the workspace. Vibex-managed; .env reads and repeated-tool-loop guards still ask.",
             "mode": "primary",
             "permission": {
                 "edit": "allow",
                 "bash": "allow",
                 "webfetch": "allow",
-                "websearch": "allow"
+                "websearch": "allow",
+                "external_directory": "allow"
             }
         }),
     );
@@ -6401,11 +6404,13 @@ mod tests {
         assert_eq!(agent["permission"]["bash"], "allow");
         assert_eq!(agent["permission"]["webfetch"], "allow");
         assert_eq!(agent["permission"]["websearch"], "allow");
+        // `external_directory` defaults to `ask`, so an auto-accept mode that
+        // omits it still prompts on every workspace-external read.
+        assert_eq!(agent["permission"]["external_directory"], "allow");
 
-        // Safety guards and the `.env` read deny must keep their OpenCode
-        // defaults, so these keys must never be written.
+        // The built-in `.env` read rules and the repeated-tool-call guard must
+        // keep their OpenCode defaults, so these keys must never be written.
         assert!(agent["permission"].get("read").is_none());
-        assert!(agent["permission"].get("external_directory").is_none());
         assert!(agent["permission"].get("doom_loop").is_none());
     }
 
