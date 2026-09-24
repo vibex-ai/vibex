@@ -13302,24 +13302,57 @@ impl VibexWorkbench {
         }
     }
 
-    /// Whether this row moves with the current selection.
+    /// Whether a move selection is on screen.
+    ///
+    /// The current session only joins a move while a selection exists: on its
+    /// own it is just the session the workbench is showing, and dragging its row
+    /// moves that row alone.
+    fn sidebar_move_selection_is_active(&self) -> bool {
+        !self.sidebar_move_selected_items.is_empty()
+    }
+
+    /// Whether a row is part of the move the user is assembling.
     ///
     /// The current session's row carries a wash the user cannot tell apart from
     /// a move-selected row (`sidebar_selected_session_background` and
     /// `sidebar_move_selected_background` are the same accent at nearly the same
-    /// strength). A user who ctrl-clicks other rows therefore sees the current
-    /// row as part of the selection, and grabbing it has to move what looks
-    /// selected — otherwise the drag carries one row and the rest stay put.
-    fn sidebar_row_moves_with_selection(&self, item: &SidebarOrganizationItem) -> bool {
-        if self.sidebar_move_selected_items.is_empty() {
-            return false;
+    /// strength), so it counts as selected while a selection is on screen. The
+    /// rows the sidebar paints highlighted are exactly the rows a drag carries
+    /// and a group drop acts on.
+    fn sidebar_row_is_move_selected(&self, item: &SidebarOrganizationItem) -> bool {
+        if self.sidebar_move_selected_items.contains(item) {
+            return true;
         }
         let SidebarOrganizationItem::Session(session_id) = item else {
             return false;
         };
-        self.selected_session_id
-            .as_ref()
-            .is_some_and(|selected| selected.as_str() == session_id)
+        self.sidebar_move_selection_is_active()
+            && self
+                .selected_session_id
+                .as_ref()
+                .is_some_and(|selected| selected.as_str() == session_id)
+    }
+
+    /// The rows a move acts on, in a stable order.
+    ///
+    /// This is the shift/ctrl selection plus the current session's row while a
+    /// selection is on screen — the set the sidebar shows as selected. Reading
+    /// the clicked selection alone moved fewer rows than the user could see.
+    fn sidebar_move_selection_items(&self) -> Vec<SidebarOrganizationItem> {
+        let mut items = self
+            .sidebar_move_selected_items
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.sidebar_move_selection_is_active()
+            && let Some(selected) = self.selected_session_id.as_ref()
+        {
+            let item = SidebarOrganizationItem::Session(selected.as_str().to_string());
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+        items
     }
 
     /// The items a drag carries: the whole selection, in sidebar order.
@@ -13335,24 +13368,20 @@ impl VibexWorkbench {
         &self,
         primary: &SidebarOrganizationItem,
     ) -> Vec<SidebarOrganizationItem> {
-        if !self.sidebar_move_selected_items.contains(primary)
-            && !self.sidebar_row_moves_with_selection(primary)
-        {
+        if !self.sidebar_row_is_move_selected(primary) {
             return vec![primary.clone()];
         }
+        let selected = self.sidebar_move_selection_items();
         let mut items = self
             .sidebar_move_selection_order(primary)
             .into_iter()
             .filter(|item| {
-                self.sidebar_move_selected_items.contains(item)
-                    && self.sidebar_move_selection_scope_matches(primary, item)
+                selected.contains(item) && self.sidebar_move_selection_scope_matches(primary, item)
             })
             .collect::<Vec<_>>();
-        for selected in &self.sidebar_move_selected_items {
-            if !items.contains(selected)
-                && self.sidebar_move_selection_scope_matches(primary, selected)
-            {
-                items.push(selected.clone());
+        for item in &selected {
+            if !items.contains(item) && self.sidebar_move_selection_scope_matches(primary, item) {
+                items.push(item.clone());
             }
         }
         if !items.iter().any(|item| item == primary) {
@@ -14435,7 +14464,7 @@ impl VibexWorkbench {
         self.session_group_tab_removal_active = false;
         let primary = SidebarOrganizationItem::Session(drag.session_id.as_str().to_string());
         if !self.sidebar_move_selected_items.contains(&primary) {
-            if self.sidebar_row_moves_with_selection(&primary) {
+            if self.sidebar_row_is_move_selected(&primary) {
                 // The row is painted as part of the selection, so the drag has
                 // to keep the rest of it: adding the row is what the user sees.
                 self.sidebar_move_selected_items.insert(primary.clone());
@@ -14762,12 +14791,12 @@ impl VibexWorkbench {
         };
         let primary_item = SidebarOrganizationItem::Session(primary.clone());
         let mut ids = payload_ids.to_vec();
-        for selected in &self.sidebar_move_selected_items {
-            let SidebarOrganizationItem::Session(session_id) = selected else {
+        for selected in self.sidebar_move_selection_items() {
+            let SidebarOrganizationItem::Session(session_id) = &selected else {
                 continue;
             };
             if !ids.iter().any(|id| id == session_id)
-                && self.sidebar_move_selection_scope_matches(&primary_item, selected)
+                && self.sidebar_move_selection_scope_matches(&primary_item, &selected)
             {
                 ids.push(session_id.clone());
             }
@@ -37628,8 +37657,7 @@ impl VibexWorkbench {
         let session_item = SidebarOrganizationItem::Session(session_id_string.clone());
         // A row that moves with the selection is painted like one, so the wash
         // the user sees is exactly the set a drag carries.
-        let move_selected = self.sidebar_move_selected_items.contains(&session_item)
-            || self.sidebar_row_moves_with_selection(&session_item);
+        let move_selected = self.sidebar_row_is_move_selected(&session_item);
         let drag_session_ids = self
             .sidebar_drag_items(&session_item)
             .into_iter()
@@ -73377,14 +73405,14 @@ mod tests {
         // The sibling order is a placement walk; anything it does not list is
         // appended instead of dropped, or a group member whose placement sits in
         // a collapsed folder would shrink the drag to the row it started on.
+        let union = drag_items
+            .find("let selected = self.sidebar_move_selection_items();")
+            .expect("the payload should start from the rows the sidebar paints");
         let order_filter = drag_items
             .find(".sidebar_move_selection_order(primary)")
             .expect("the payload should follow the sidebar order");
-        let union = drag_items
-            .find("for selected in &self.sidebar_move_selected_items {")
-            .expect("the payload should fall back to the selection itself");
-        assert!(order_filter < union);
-        assert!(drag_items.contains("items.push(selected.clone());"));
+        assert!(union < order_filter);
+        assert!(drag_items.contains("items.push(item.clone());"));
         assert!(drag_items.contains("items.insert(0, primary.clone());"));
 
         // The drag itself has to start even when the sibling order does not know
@@ -82903,37 +82931,50 @@ mod tests {
         assert!(release.contains("group_of_session(session_id)"));
     }
 
-    /// The rows that look selected are the rows a drag carries: the current
-    /// session's row wears the same wash as a move-selected row, so grabbing it
-    /// has to move the selection instead of only itself.
+    /// The rows the sidebar paints as selected are the rows a move acts on: the
+    /// current session's row wears the same wash as a move-selected row, so a
+    /// drag from any highlighted row has to carry all of them.
     #[test]
-    fn the_current_sessions_row_moves_with_the_selection() {
+    fn the_rows_that_look_selected_are_the_rows_a_move_carries() {
         let source = include_str!("app.rs");
         let helper = source
-            .split_once("    fn sidebar_row_moves_with_selection(")
+            .split_once("    fn sidebar_row_is_move_selected(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The rows a move acts on, in a stable order.")
+            })
+            .map(|(body, _)| body)
+            .expect("the row/selection rule should remain inspectable");
+        assert!(helper.contains("if self.sidebar_move_selected_items.contains(item) {"));
+        assert!(helper.contains("self.sidebar_move_selection_is_active()"));
+        assert!(helper.contains(".selected_session_id"));
+
+        let effective = source
+            .split_once("    fn sidebar_move_selection_items(")
             .and_then(|(_, tail)| {
                 tail.split_once(
                     "\n    /// The items a drag carries: the whole selection, in sidebar order.",
                 )
             })
             .map(|(body, _)| body)
-            .expect("the row/selection rule should remain inspectable");
-        assert!(helper.contains("if self.sidebar_move_selected_items.is_empty() {"));
-        assert!(helper.contains("self.selected_session_id"));
+            .expect("the effective selection should remain inspectable");
+        assert!(effective.contains(".sidebar_move_selected_items"));
+        assert!(effective.contains("items.push(item);"));
 
         let drag_items = source
             .split_once("    fn sidebar_drag_items(")
             .and_then(|(_, tail)| tail.split_once("\n    fn update_sidebar_move_selection("))
             .map(|(body, _)| body)
             .expect("drag payload builder should remain inspectable");
-        assert!(drag_items.contains("&& !self.sidebar_row_moves_with_selection(primary)"));
+        assert!(drag_items.contains("if !self.sidebar_row_is_move_selected(primary) {"));
+        assert!(drag_items.contains("let selected = self.sidebar_move_selection_items();"));
+        assert!(!drag_items.contains("for selected in &self.sidebar_move_selected_items {"));
 
         let drag_start = source
             .split_once("    fn start_sidebar_session_drag(")
             .and_then(|(_, tail)| tail.split_once("\n    fn finish_sidebar_session_drag("))
             .map(|(body, _)| body)
             .expect("session drag setup should remain inspectable");
-        assert!(drag_start.contains("if self.sidebar_row_moves_with_selection(&primary) {"));
+        assert!(drag_start.contains("if self.sidebar_row_is_move_selected(&primary) {"));
         assert!(drag_start.contains("self.sidebar_move_selected_items.insert(primary.clone());"));
 
         let session_row = source
@@ -82941,7 +82982,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_choice_popover("))
             .map(|(body, _)| body)
             .expect("session row renderer should remain inspectable");
-        assert!(session_row.contains("|| self.sidebar_row_moves_with_selection(&session_item);"));
+        assert!(
+            session_row
+                .contains("let move_selected = self.sidebar_row_is_move_selected(&session_item);")
+        );
+
+        let group_drop = source
+            .split_once("    fn dragged_group_session_ids(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Takes dragged sessions out of whatever group holds them.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("group drop resolution should remain inspectable");
+        assert!(group_drop.contains("for selected in self.sidebar_move_selection_items() {"));
     }
 
     /// A drop changes the group for every session the user selected, not just
@@ -82958,9 +83013,10 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group drop resolution should remain inspectable");
-        assert!(resolver.contains("for selected in &self.sidebar_move_selected_items"));
+        assert!(resolver.contains("for selected in self.sidebar_move_selection_items() {"));
         assert!(
-            resolver.contains("self.sidebar_move_selection_scope_matches(&primary_item, selected)")
+            resolver
+                .contains("self.sidebar_move_selection_scope_matches(&primary_item, &selected)")
         );
 
         let finish = source
