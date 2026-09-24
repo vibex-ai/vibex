@@ -46,6 +46,7 @@ Read these files before backend work:
 | [Desktop Application Updates](./app-update.md) | Touching signed release discovery, artifact verification, update scheduling, installation recovery, or updater UI state. |
 | [Provider Configuration](./provider-config.md) | Touching Provider profiles, MCP, Skills, runtime injection, health checks, or config import/export. |
 | [Remote and Relay Protocol](./remote-relay-protocol.md) | Touching LAN access, WebSocket APIs, pairing, device permissions, Relay rooms, or E2EE transport. |
+| [Embedded Browser](./embedded-browser.md) | Touching the embedded browser panel, CDP integration, screencast frames, browser MCP tools, or browser navigation policy. |
 | [Database Guidelines](./database-guidelines.md) | Adding SQLite tables, migrations, persistence, or local file storage. |
 | [Error Handling](./error-handling.md) | Adding service errors, adapter failures, API errors, or user-visible diagnostics. |
 | [Logging Guidelines](./logging-guidelines.md) | Adding tracing, raw provider logs, audit logs, or diagnostics packages. |
@@ -92,3 +93,11 @@ Claude/Codex files are read only by offline import and parity tooling.
   dispatch path.
 - Product rollback uses published release artifacts and compatible data backups.
   Do not recreate the deleted Tauri shell or a source-level legacy UI fallback.
+- The embedded browser is a **tool panel**, not an application shell and not a
+  WebUI product. Its process, CDP connection, tab state, policy and audit ledger
+  belong to the runtime; clients subscribe through `BrowserBackend`.
+- Never spawn a browser from a stdio MCP sidecar. The sidecar is spawned by a
+  third-party Agent CLI, so the runtime has no handle on anything it starts.
+- Screen content, form values, cookies and frames are sensitive payloads of the
+  same rank as terminal bytes: they never enter `Debug` output, logs or audit
+  rows. See [Embedded Browser](./embedded-browser.md).
