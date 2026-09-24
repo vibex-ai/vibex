@@ -10461,9 +10461,13 @@ impl ManagementCenter {
                 "icons/vibex/boxes.svg",
                 ManagementResourceRowText {
                     title: server.display_name.clone(),
+                    // The same word the market card uses for the same fact. The
+                    // row used to print the protocol's own name (`http`) while
+                    // the card that installed it said "remote service", so one
+                    // server was described two ways in one section.
                     subtitle: format!(
                         "{} · {}",
-                        market_transport_kind_label(server.transport_kind),
+                        market_transport_label(server.transport_kind),
                         management_mcp_scope_label(server.scope_kind)
                     ),
                     enabled_count: management_enabled_agent_count(enabled_count),
@@ -10647,7 +10651,11 @@ impl ManagementCenter {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .text_xs()
+                            // The result summary is the answer the query
+                            // produced, so it reads at body size. At the caption
+                            // size it was quieter than the filter chips that
+                            // narrowed it.
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(management_market_result_count(shown_count, total)),
                     )
@@ -10658,7 +10666,7 @@ impl ManagementCenter {
                         row.child(
                             div()
                                 .flex_none()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(management_locale_text(
                                     "Still indexing the registry…",
@@ -11149,7 +11157,9 @@ impl ManagementCenter {
                     .w_full()
                     .min_w_0()
                     .flex_none()
-                    .text_xs()
+                    // Same size as the MCP market's summary line: the two
+                    // markets are the same task against two registries.
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
                         "{} · {}",
@@ -21891,9 +21901,18 @@ fn management_resource_row(
         .overflow_hidden()
         .rounded(px(8.0))
         .border_1()
-        .border_color(cx.theme().border.opacity(if selected { 0.0 } else { 0.65 }))
+        // One selected treatment for the whole sidebar: the market entry button
+        // and a chosen resource row both answer "which view is the body on", so
+        // they take the same primary boundary and wash. The row used to drop its
+        // border when chosen, which made the current row look less defined than
+        // the ones around it.
+        .border_color(if selected {
+            cx.theme().primary.opacity(0.45)
+        } else {
+            cx.theme().border.opacity(0.65)
+        })
         .bg(if selected {
-            cx.theme().primary.opacity(0.08)
+            cx.theme().primary.opacity(0.12)
         } else {
             cx.theme().background.opacity(0.70)
         })
@@ -21901,7 +21920,7 @@ fn management_resource_row(
         .py_2()
         .hover(|style| {
             style.bg(if selected {
-                cx.theme().primary.opacity(0.08)
+                cx.theme().primary.opacity(0.12)
             } else {
                 cx.theme().accent
             })
@@ -23800,6 +23819,52 @@ mod tests {
         remote.package_kind = Some("remote".to_string());
         remote.version = None;
         assert_eq!(market_entry_meta_line(&remote), None);
+    }
+
+    /// The card's own contract, asserted against its source.
+    ///
+    /// Each of these is a defect the card shipped with, and each one is
+    /// invisible in a diff but obvious on screen, so they are pinned here rather
+    /// than left to a screenshot.
+    #[test]
+    fn market_card_stays_a_chooser_rather_than_a_container() {
+        let source = include_str!("management.rs");
+        let card = source
+            .split_once("fn management_market_card(")
+            .and_then(|(_, tail)| tail.split_once("\nfn management_market_error_text("))
+            .map(|(body, _)| body)
+            .expect("market card renderer should remain inspectable");
+
+        // A clamped description without an ellipsis is cut at the wrap point, so
+        // the last line ended mid-word with no mark that anything was missing.
+        let clamp = card
+            .find(".line_clamp(")
+            .expect("the description is clamped to keep the grid even");
+        assert!(
+            card[clamp..].contains(".text_ellipsis()"),
+            "a clamped description needs an ellipsis, or it reads as a broken string"
+        );
+
+        // The card is not a control, so it must not advertise one. It used to
+        // blend its background under the pointer while offering no click.
+        assert!(
+            !card.contains("on_hover"),
+            "the card has no click, so it must not carry a hover state"
+        );
+
+        // The footer is separated by spacing. A rule there repeated the card's
+        // own boundary one line above itself.
+        assert!(
+            !card.contains("border_t_1"),
+            "the card's footer must not draw a second rule inside the card"
+        );
+
+        // Identity owns the strongest type step on the card, because the grid is
+        // a name picker.
+        assert!(
+            card.contains(".text_base()") && card.contains(".font_semibold()"),
+            "the entry's name should outrank its body text"
+        );
     }
 
     #[test]
