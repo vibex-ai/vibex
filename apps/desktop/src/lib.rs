@@ -4,6 +4,8 @@ pub mod actions;
 pub mod app;
 pub mod appearance_theme;
 pub mod assets;
+pub mod browser_surface;
+pub mod browser_transport;
 pub mod code_workbench;
 pub mod directory_picker;
 pub mod gpui_ext;
@@ -63,6 +65,7 @@ pub struct FirstFrameProbe {
     pub agent_workbench_contract: testing::AgentWorkbenchContractProbe,
     pub code_workbench_contract: testing::CodeWorkbenchContractProbe,
     pub management_contract: testing::ManagementContractProbe,
+    pub embedded_browser_contract: testing::EmbeddedBrowserContractProbe,
 }
 
 pub fn first_frame_probe() -> FirstFrameProbe {
@@ -91,6 +94,7 @@ pub fn first_frame_probe() -> FirstFrameProbe {
         agent_workbench_contract: testing::agent_workbench_contract_probe(),
         code_workbench_contract: testing::code_workbench_contract_probe(),
         management_contract: testing::management_contract_probe(),
+        embedded_browser_contract: testing::embedded_browser_contract_probe(),
     }
 }
 
@@ -147,7 +151,10 @@ mod tests {
     #[test]
     fn probe_json_is_bounded_and_contains_no_machine_path() {
         let serialized = serde_json::to_string(&first_frame_probe()).unwrap();
-        assert!(serialized.len() < 3_072);
+        // The bound exists to catch a probe that starts dumping state instead of
+        // summarising it. It tracks the contract sections the runtime reports,
+        // so adding a section raises it deliberately.
+        assert!(serialized.len() < 6_144, "probe grew to {} bytes", serialized.len());
         assert!(!serialized.contains("/home/"));
         assert!(!serialized.contains("\\Users\\"));
     }

@@ -13,6 +13,7 @@ native = ["dep:tokio", "dep:vibex-desktop-runtime"]
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+vibex-browser = { path = "../browser" }
 vibex-core = { path = "../core" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

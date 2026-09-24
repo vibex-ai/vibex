@@ -4,6 +4,7 @@ mod acp_terminal;
 mod agent_auth_context;
 mod agent_install;
 mod auth_catalog;
+mod browser;
 mod catalog;
 pub mod composer;
 mod events;
@@ -74,6 +75,8 @@ use vibex_terminal::TerminalManager;
 use acp_terminal::DesktopAcpTerminalHost;
 
 pub use agent_auth_context::AgentAuthContextService;
+pub use browser::BrowserRuntime;
+
 pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;
 pub use catalog::{
@@ -2114,6 +2117,10 @@ pub struct DesktopRuntime {
     config: DesktopRuntimeConfig,
     app_update: AppUpdateService,
     agent: AgentHandle,
+    /// Embedded-browser service plus its loopback MCP endpoint. The browser
+    /// process, the CDP connection and the audit ledger all belong to the
+    /// runtime; clients only subscribe.
+    browser: Arc<BrowserRuntime>,
     providers: ProviderHandle,
     workspace: WorkspaceHandle,
     files: FileHandle,
@@ -2133,6 +2140,15 @@ pub struct DesktopRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     home_lock: Mutex<Option<DesktopHomeLock>>,
     shutting_down: AtomicBool,
+}
+
+/// Where the embedded browser keeps its isolated profile.
+///
+/// The profile lives under the runtime's data directory, never inside the
+/// user's workspace: a browser profile is runtime state, not a project
+/// artifact, and writing it into the workspace would show up in `git status`.
+fn browser_home_dir(config: &DesktopRuntimeConfig) -> PathBuf {
+    config.home_dir.clone()
 }
 
 /// How long [`DesktopRuntime::start_with_home_lock_retry`] waits for a previous
@@ -2493,19 +2509,25 @@ impl DesktopRuntime {
             AppUpdateService::unavailable(app_update_config, error)
         });
         let (events, _) = broadcast::channel(config.event_capacity);
+        let agent = AgentHandle {
+            manager: manager.clone(),
+            runtime_selection,
+            runtime_lifecycle,
+            message_submission,
+            runtime_catalog,
+            auth_catalog,
+            auth_contexts,
+            install_service,
+        };
+        // The embedded browser is assembled here, before the runtime handle
+        // exists, because the runtime struct owns it. The endpoint and the MCP
+        // tool installation happen after the struct is built, so a failure in
+        // either degrades the browser only and never blocks startup.
+        let browser = BrowserRuntime::new(browser_home_dir(&config), agent.clone());
         let runtime = Arc::new(Self {
             config,
             app_update,
-            agent: AgentHandle {
-                manager: manager.clone(),
-                runtime_selection,
-                runtime_lifecycle,
-                message_submission,
-                runtime_catalog,
-                auth_catalog,
-                auth_contexts,
-                install_service,
-            },
+            agent,
             providers,
             workspace: WorkspaceHandle {
                 db_path: db_path.clone(),
@@ -2545,11 +2567,45 @@ impl DesktopRuntime {
             sidebar_organization,
             timeline_display_settings,
             polling: DesktopPollingPolicy::default(),
+            browser: browser.clone(),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
             shutting_down: AtomicBool::new(false),
         });
+        // The endpoint is bound synchronously: a session created before it is
+        // listening would otherwise be offered no browser tools at all, and the
+        // race would look like a capability gap rather than a startup ordering
+        // bug. Only a bind failure degrades, and it degrades loudly.
+        startup_stage_async("browser_mcp_endpoint_start", async {
+            let command = runtime.config.delegation_sidecar_command.clone();
+            match runtime.browser.start_endpoint().await {
+                Ok(_) => {
+                    runtime.browser.start_audit_consumer().await;
+                    if let Some(command) = command {
+                        let runtime = Arc::clone(&runtime);
+                        tokio::spawn(async move {
+                            if let Err(error) = runtime.browser.install_tool_config(command).await {
+                                tracing::warn!(
+                                    target: "vibex_browser",
+                                    error_code = %error.code,
+                                    "the browser MCP tool could not be installed; browser tools \
+                                     will not reach Agents"
+                                );
+                            }
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    target: "vibex_browser",
+                    error_code = %error.code,
+                    "the browser MCP endpoint could not be started; browser tools will not reach \
+                     Agents"
+                ),
+            }
+            Ok(())
+        })
+        .await?;
         if let Some(task) = delegation_broker_task {
             runtime
                 .tasks
@@ -3239,6 +3295,12 @@ impl DesktopRuntime {
         self.agent.clone()
     }
 
+    /// The embedded-browser runtime: the service, its loopback MCP endpoint and
+    /// the tool-delivery matrix.
+    pub fn browser(&self) -> Arc<BrowserRuntime> {
+        Arc::clone(&self.browser)
+    }
+
     pub fn providers(&self) -> ProviderHandle {
         self.providers.clone()
     }
@@ -3477,6 +3539,10 @@ impl DesktopRuntime {
             }
             Err(error) => record_shutdown_error(&mut first_error, error),
         }
+        // The browser goes down next to the terminals: both own a process tree
+        // that must not outlive the runtime, and both are cheap to stop
+        // explicitly. `kill_on_drop` is a net, not the plan.
+        self.browser.shutdown().await;
         if let Err(error) = self.agent.runtime_lifecycle.stop().await {
             record_shutdown_error(&mut first_error, error);
         }

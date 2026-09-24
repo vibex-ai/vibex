@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod agent;
+mod browser;
 mod capability;
 mod device;
 mod disconnected;
@@ -25,6 +26,7 @@ mod workspace;
 mod native;
 
 pub use agent::*;
+pub use browser::*;
 pub use capability::*;
 pub use device::*;
 pub use disconnected::*;

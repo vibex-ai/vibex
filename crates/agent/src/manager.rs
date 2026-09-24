@@ -87,6 +87,7 @@ pub struct AgentManager {
     message_submission: OnceLock<Weak<MessageSubmissionCoordinator>>,
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     delegation_tool: OnceLock<AgentDelegationToolConfig>,
+    browser_mcp_tool: OnceLock<BrowserMcpToolConfig>,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// One read connection shared by the paged timeline reads.
@@ -110,6 +111,19 @@ pub struct AgentManager {
 pub struct AgentDelegationToolConfig {
     pub command: PathBuf,
     pub broker_endpoint: String,
+    pub capability_token: String,
+}
+
+/// Per-desktop-process launch metadata for the built-in browser MCP server.
+///
+/// Like the delegation tool this is runtime-only and never persisted with user
+/// MCP configuration. `endpoint` is the runtime's own loopback MCP endpoint and
+/// `command` is the Vibex binary in `--browser-mcp` sidecar mode, used only as
+/// the fallback for Agents that cannot speak HTTP MCP.
+#[derive(Debug, Clone)]
+pub struct BrowserMcpToolConfig {
+    pub command: PathBuf,
+    pub endpoint: String,
     pub capability_token: String,
 }
 
@@ -288,6 +302,7 @@ impl AgentManager {
             message_submission: OnceLock::new(),
             usage_telemetry: OnceLock::new(),
             delegation_tool: OnceLock::new(),
+            browser_mcp_tool: OnceLock::new(),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
@@ -445,6 +460,36 @@ impl AgentManager {
         })
     }
 
+    /// Installs the built-in browser MCP launch configuration.
+    ///
+    /// Mirrors [`Self::install_delegation_tool`]: the loopback endpoint URL
+    /// must be a real `http://` URL, and the capability token must be long
+    /// enough and free of whitespace that it cannot be spoofed or truncated on
+    /// the wire.
+    pub fn install_browser_mcp_tool(&self, config: BrowserMcpToolConfig) -> VibexResult<()> {
+        if config.command.as_os_str().is_empty()
+            || !config.endpoint.starts_with("http://")
+            || config.capability_token.len() < 24
+            || config.capability_token.chars().any(char::is_whitespace)
+        {
+            return Err(VibexError::validation(
+                "browser_mcp_tool_config_invalid",
+                "browser MCP tool launch configuration is invalid",
+            ));
+        }
+        self.browser_mcp_tool.set(config).map_err(|_| {
+            VibexError::conflict(
+                "browser_mcp_tool_already_installed",
+                "the browser MCP tool is already installed",
+            )
+        })
+    }
+
+    /// The installed browser MCP launch configuration, if any.
+    pub fn browser_mcp_tool(&self) -> Option<&BrowserMcpToolConfig> {
+        self.browser_mcp_tool.get()
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.db_path
     }
@@ -501,6 +546,45 @@ impl AgentManager {
                         "VIBEX_AGENT_DELEGATION_PARENT_SESSION".to_string(),
                         session_id.as_str().to_string(),
                     ),
+                ],
+                url: None,
+                headers: Vec::new(),
+            });
+        }
+        if provider_kind == ProviderKind::Acp
+            && let Some(tool) = self.browser_mcp_tool.get()
+        {
+            let session_token = session_capability_token(&tool.capability_token, session_id);
+            // The HTTP descriptor is offered first and the stdio sidecar second.
+            // The ACP wire filter keeps the first entry whose transport the
+            // Agent actually supports and drops the later duplicate, so every
+            // Agent receives exactly one browser server: HTTP when it can use
+            // it, the sidecar otherwise. Sending both would double-register.
+            resources.mcp_servers.push(ProviderRuntimeMcpServer {
+                id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+                display_name: "Embedded browser".to_string(),
+                transport: ProviderRuntimeMcpTransport::Http,
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                url: Some(tool.endpoint.clone()),
+                headers: vec![(
+                    "Authorization".to_string(),
+                    format!("Bearer {session_token}"),
+                )],
+            });
+            resources.mcp_servers.push(ProviderRuntimeMcpServer {
+                id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+                display_name: "Embedded browser (sidecar)".to_string(),
+                transport: ProviderRuntimeMcpTransport::Stdio,
+                command: Some(tool.command.to_string_lossy().to_string()),
+                args: vec!["--browser-mcp".to_string()],
+                env: vec![
+                    (
+                        "VIBEX_BROWSER_MCP_ENDPOINT".to_string(),
+                        tool.endpoint.clone(),
+                    ),
+                    ("VIBEX_BROWSER_MCP_TOKEN".to_string(), session_token),
                 ],
                 url: None,
                 headers: Vec::new(),

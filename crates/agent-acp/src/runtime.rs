@@ -46,8 +46,8 @@ use vibex_agent::runtime_switch::{
     OP_RESOLVE_PENDING_PERMISSION, OP_RESTORE_SESSION,
 };
 use vibex_agent::{
-    AGENT_DELEGATION_MCP_SERVER_ID, ActiveWorkGate, ActiveWorkSnapshot, AgentManager,
-    AgentUsageTelemetryEvent, ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
+    ActiveWorkGate, ActiveWorkSnapshot, AgentManager, AgentUsageTelemetryEvent,
+    ContextBridgeService, JournaledOperation, OperationReconcileOutcome,
     PROVIDER_SELECTED_MODEL_METADATA_KEY, PreparedAttachment, PreparedProcess, ProviderEvent,
     ProviderRuntimeMcpServer, ProviderRuntimeMcpTransport, ProviderRuntimeResources,
     ProviderTurnAttachment, ProviderTurnExecutionIdentity, ResolvedInitialRuntimeSelection,
@@ -791,13 +791,17 @@ fn resolve_acp_mcp_descriptors(
     config: &AcpProviderConfig,
     resources: &ProviderRuntimeResources,
 ) -> VibexResult<Vec<AcpMcpServerDescriptor>> {
-    // The built-in delegation bridge is a product capability, not a user MCP
-    // server. It must be advertised even when a profile has no optional MCP
-    // feature flag; user-configured servers remain behind that opt-in gate.
+    // Built-in servers (the delegation bridge and the embedded browser) are
+    // product capabilities, not user MCP servers. They must be advertised even
+    // when a profile has no optional MCP feature flag; user-configured servers
+    // remain behind that opt-in gate. The check is against the built-in id set,
+    // not one id: a second built-in server compared against a single constant
+    // would fall into the user branch and be dropped on every profile that has
+    // not enabled the flag.
     let mut descriptors = resources
         .mcp_servers
         .iter()
-        .filter(|server| server.id == AGENT_DELEGATION_MCP_SERVER_ID)
+        .filter(|server| vibex_core::is_builtin_mcp_server_id(&server.id))
         .map(resolve_acp_mcp_descriptor)
         .collect::<VibexResult<Vec<_>>>()?;
     if acp_config_mcp_forwarding_enabled(config) {
@@ -805,7 +809,7 @@ fn resolve_acp_mcp_descriptors(
             resources
                 .mcp_servers
                 .iter()
-                .filter(|server| server.id != AGENT_DELEGATION_MCP_SERVER_ID)
+                .filter(|server| !vibex_core::is_builtin_mcp_server_id(&server.id))
                 .map(resolve_acp_mcp_descriptor)
                 .collect::<VibexResult<Vec<_>>>()?,
         );
@@ -5224,14 +5228,23 @@ impl AcpProcess {
             .lock()
             .map(|shared| (shared.supports_mcp_http, shared.supports_mcp_sse))
             .unwrap_or((false, false));
+        // A built-in server may be described more than once so the runtime can
+        // offer a preferred transport and a fallback. Keep the first entry whose
+        // transport the Agent supports and drop later entries with the same id:
+        // forwarding both would register the same server twice.
+        let mut seen_ids: Vec<String> = Vec::with_capacity(self.mcp_servers.len());
         let mut forwarded = Vec::with_capacity(self.mcp_servers.len());
         for server in &self.mcp_servers {
+            if seen_ids.contains(&server.id) {
+                continue;
+            }
             let allowed = match &server.transport {
                 AcpMcpTransportDescriptor::Stdio { .. } => true,
                 AcpMcpTransportDescriptor::Http { .. } => supports_http,
                 AcpMcpTransportDescriptor::Sse { .. } => supports_sse,
             };
             if allowed {
+                seen_ids.push(server.id.clone());
                 forwarded.push(server.clone());
                 continue;
             }

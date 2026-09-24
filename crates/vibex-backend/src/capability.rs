@@ -59,6 +59,19 @@ pub enum BackendOperation {
     TerminalInput,
     TerminalResize,
     TerminalClose,
+    // Browser domain: the embedded browser is a tool panel backed by the
+    // system Chromium-family install through CDP.
+    BrowserAvailability,
+    BrowserSessionList,
+    BrowserSessionOpen,
+    BrowserSessionSnapshot,
+    BrowserTabCreate,
+    BrowserTabClose,
+    BrowserTabSelect,
+    BrowserFrameSubscribe,
+    BrowserInput,
+    BrowserViewport,
+    BrowserDialogResolve,
     ManagementAgents,
     ManagementProfiles,
     ManagementProfileSelect,
@@ -129,6 +142,14 @@ impl DomainCapabilities {
         }
     }
 
+    pub fn unavailable() -> Self {
+        Self {
+            availability: CapabilityAvailability::Unsupported,
+            operations: BTreeSet::new(),
+            permission_required: BTreeSet::new(),
+        }
+    }
+
     pub fn supports(&self, operation: BackendOperation) -> bool {
         self.availability == CapabilityAvailability::Available
             && self.operations.contains(&operation)
@@ -138,6 +159,15 @@ impl DomainCapabilities {
     /// permission level denies it.
     pub fn requires_permission(&self, operation: BackendOperation) -> bool {
         self.permission_required.contains(&operation)
+    }
+}
+
+impl Default for DomainCapabilities {
+    /// A domain that was never reported is unsupported, so a payload written
+    /// before the domain existed never claims operations the authority may not
+    /// have.
+    fn default() -> Self {
+        Self::unavailable()
     }
 }
 
@@ -151,6 +181,8 @@ pub struct BackendCapabilitySnapshot {
     pub file: DomainCapabilities,
     pub git: DomainCapabilities,
     pub terminal: DomainCapabilities,
+    #[serde(default)]
+    pub browser: DomainCapabilities,
     pub management: DomainCapabilities,
     pub device: DomainCapabilities,
 }
@@ -170,6 +202,7 @@ impl BackendCapabilitySnapshot {
         ] {
             domain.availability = CapabilityAvailability::Offline;
         }
+        snapshot.browser = DomainCapabilities::unavailable();
         snapshot
     }
 
@@ -234,6 +267,19 @@ impl BackendCapabilitySnapshot {
                 TerminalResize,
                 TerminalClose,
             ]),
+            browser: DomainCapabilities::available([
+                BrowserAvailability,
+                BrowserSessionList,
+                BrowserSessionOpen,
+                BrowserSessionSnapshot,
+                BrowserTabCreate,
+                BrowserTabClose,
+                BrowserTabSelect,
+                BrowserFrameSubscribe,
+                BrowserInput,
+                BrowserViewport,
+                BrowserDialogResolve,
+            ]),
             management: DomainCapabilities::available([
                 ManagementAgents,
                 ManagementProfiles,
@@ -283,7 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_snapshot_exposes_seven_separate_domains() {
+    fn native_snapshot_exposes_eight_separate_domains() {
         let snapshot = BackendCapabilitySnapshot::desktop_native_v1();
         assert_eq!(snapshot.schema_version, BACKEND_CAPABILITY_SCHEMA_VERSION);
         assert!(
@@ -299,7 +345,53 @@ mod tests {
                 .git
                 .supports(BackendOperation::GitWorktreeLifecycleMutate)
         );
+        assert!(
+            snapshot
+                .browser
+                .supports(BackendOperation::BrowserFrameSubscribe)
+        );
         assert!(!snapshot.git.supports(BackendOperation::TerminalCreate));
+        assert!(!snapshot.browser.supports(BackendOperation::TerminalCreate));
+    }
+
+    #[test]
+    fn browser_domain_is_unsupported_while_disconnected_and_available_natively() {
+        let native = BackendCapabilitySnapshot::desktop_native_v1();
+        assert_eq!(
+            native.browser.availability,
+            CapabilityAvailability::Available
+        );
+        assert!(
+            native
+                .browser
+                .supports(BackendOperation::BrowserSessionOpen)
+        );
+        assert!(native.browser.supports(BackendOperation::BrowserInput));
+
+        let disconnected = BackendCapabilitySnapshot::disconnected_v1();
+        assert_eq!(
+            disconnected.browser.availability,
+            CapabilityAvailability::Unsupported
+        );
+        assert!(
+            !disconnected
+                .browser
+                .supports(BackendOperation::BrowserInput)
+        );
+        assert!(disconnected.browser.operations.is_empty());
+        // Legacy payloads written before the browser domain existed decode with
+        // the domain reported as unsupported rather than failing.
+        let mut legacy_payload = serde_json::to_value(&native).expect("snapshot converts to JSON");
+        legacy_payload
+            .as_object_mut()
+            .expect("snapshot is a JSON object")
+            .remove("browser");
+        let legacy: BackendCapabilitySnapshot =
+            serde_json::from_value(legacy_payload).expect("legacy payloads still decode");
+        assert_eq!(
+            legacy.browser.availability,
+            CapabilityAvailability::Unsupported
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AgentBackend, BackendCapabilitySnapshot, DeviceBackend, FileBackend, GitBackend,
-    ManagementBackend, TerminalBackend, WorkspaceBackend,
+    AgentBackend, BackendCapabilitySnapshot, BrowserBackend, DeviceBackend, FileBackend,
+    GitBackend, ManagementBackend, TerminalBackend, WorkspaceBackend,
 };
 
 #[derive(Clone)]
@@ -13,6 +13,7 @@ pub struct BackendFacade {
     file: Arc<dyn FileBackend>,
     git: Arc<dyn GitBackend>,
     terminal: Arc<dyn TerminalBackend>,
+    browser: Arc<dyn BrowserBackend>,
     management: Arc<dyn ManagementBackend>,
     device: Arc<dyn DeviceBackend>,
 }
@@ -26,6 +27,7 @@ impl BackendFacade {
         file: Arc<dyn FileBackend>,
         git: Arc<dyn GitBackend>,
         terminal: Arc<dyn TerminalBackend>,
+        browser: Arc<dyn BrowserBackend>,
         management: Arc<dyn ManagementBackend>,
         device: Arc<dyn DeviceBackend>,
     ) -> Self {
@@ -36,6 +38,7 @@ impl BackendFacade {
             file,
             git,
             terminal,
+            browser,
             management,
             device,
         )
@@ -49,6 +52,7 @@ impl BackendFacade {
         file: Arc<dyn FileBackend>,
         git: Arc<dyn GitBackend>,
         terminal: Arc<dyn TerminalBackend>,
+        browser: Arc<dyn BrowserBackend>,
         management: Arc<dyn ManagementBackend>,
         device: Arc<dyn DeviceBackend>,
     ) -> Self {
@@ -59,6 +63,7 @@ impl BackendFacade {
             file,
             git,
             terminal,
+            browser,
             management,
             device,
         }
@@ -96,6 +101,10 @@ impl BackendFacade {
 
     pub fn terminal(&self) -> &Arc<dyn TerminalBackend> {
         &self.terminal
+    }
+
+    pub fn browser(&self) -> &Arc<dyn BrowserBackend> {
+        &self.browser
     }
 
     pub fn management(&self) -> &Arc<dyn ManagementBackend> {

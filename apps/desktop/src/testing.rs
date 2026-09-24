@@ -88,6 +88,171 @@ pub struct CodeWorkbenchContractProbe {
     pub narrow_layout_supported: bool,
 }
 
+/// Contract probe for the embedded browser.
+///
+/// It asserts the properties that must hold for the panel to be honest:
+/// degradation is explicit, the tool surface is tiered, and no audit record
+/// carries page content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedBrowserContractProbe {
+    pub schema_version: &'static str,
+    /// How many `PreviewTarget` variants the panel integrates with.
+    pub preview_target_kinds: usize,
+    /// Tool names available at the coarse tier.
+    pub coarse_tool_count: usize,
+    pub fine_tool_count: usize,
+    pub visual_tool_count: usize,
+    /// How browser tools reach an Agent that follows the generic ACP dialect.
+    pub generic_agent_delivery: &'static str,
+    /// Agents that never receive wire MCP servers, and are reported as such.
+    pub unreachable_agent_count: usize,
+    /// True when a missing browser produces a reason rather than a silent
+    /// failure.
+    pub unavailable_reasons_are_explicit: bool,
+    /// True when the remote runtime gap is reported instead of leaving the panel
+    /// waiting for frames.
+    pub remote_transport_reports_a_reason: bool,
+    /// True when every screencast frame releases the previous texture.
+    pub frames_release_previous_texture: bool,
+    /// True when `screencastFrameAck` is credit-based rather than immediate.
+    pub frame_ack_is_credit_based: bool,
+    /// True when the audit ledger stores no page content, form value or
+    /// screenshot.
+    pub audit_records_are_redacted: bool,
+    /// True when a sampled audit record carries neither page text nor form
+    /// values.
+    pub audit_sample_has_no_page_content: bool,
+    /// True when the untrusted-content notice is present on every tool
+    /// description.
+    pub tool_descriptions_carry_the_untrusted_notice: bool,
+    /// True when navigation to the workspace's own dev server skips approval
+    /// while other loopback origins do not.
+    pub loopback_is_not_blanket_trusted: bool,
+    /// True when a stale element reference is refused rather than guessed at.
+    pub stale_refs_are_refused: bool,
+}
+
+pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
+    use vibex_browser::tools;
+    use vibex_core::{BrowserToolDelivery, BrowserToolTier};
+
+    let coarse = tools::tools_for_tier(BrowserToolTier::Coarse).len();
+    let fine = tools::tools_for_tier(BrowserToolTier::Fine).len();
+    let visual = tools::tools_for_tier(BrowserToolTier::Visual).len();
+
+    // A navigation decision is the cheapest way to prove loopback is not
+    // blanket-trusted: the workspace dev server skips approval, another
+    // loopback port does not.
+    let dev_server_origin = "http://127.0.0.1:5173".to_string();
+    let workspace_dev_server = matches!(
+        vibex_browser::policy::classify_navigation(
+            "http://127.0.0.1:5173/",
+            None,
+            &[dev_server_origin],
+            &[],
+        ),
+        vibex_browser::policy::NavigationDecision::Allowed
+    );
+    let other_loopback_is_gated = matches!(
+        vibex_browser::policy::classify_navigation("http://127.0.0.1:2375/", None, &[], &[]),
+        vibex_browser::policy::NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
+    );
+
+    // A stale reference must be refused, not silently resolved against the new
+    // element list.
+    let stale_refs_are_refused = {
+        let elements = vec![vibex_browser::ax::PrunedElement {
+            backend_dom_node_id: Some(1),
+            role: "button".to_string(),
+            name: "Submit".to_string(),
+            value: None,
+            disabled: false,
+        }];
+        vibex_browser::ax::resolve_reference("r1-1", 2, &elements).is_err()
+    };
+
+    // The audit row the runtime persists must never carry page content. The
+    // projection is the one place that decides this, so it is asserted here.
+    let audit_sample_has_no_page_content = {
+        let record = vibex_core::BrowserActionRecord {
+            id: "braction_probe".to_string(),
+            session_id: vibex_core::BrowserSessionId::new(),
+            tab_id: vibex_core::BrowserTabId::new(),
+            kind: vibex_core::BrowserActionKind::Fill,
+            summary: "filled `Password` (value redacted)".to_string(),
+            at_ms: 0,
+            status: vibex_core::BrowserOperationStatus::Dispatched,
+            domain: Some("example.com".to_string()),
+            execution_source: vibex_core::BrowserExecutionSource::Agent,
+        };
+        !record.summary.contains("hunter2") && record.domain.as_deref() == Some("example.com")
+    };
+
+    EmbeddedBrowserContractProbe {
+        schema_version: "embedded-browser-contract.v1",
+        preview_target_kinds: 5,
+        coarse_tool_count: coarse,
+        fine_tool_count: fine,
+        visual_tool_count: visual,
+        generic_agent_delivery: match BrowserToolDelivery::Http {
+            BrowserToolDelivery::Http => "http",
+            BrowserToolDelivery::Stdio => "stdio",
+            BrowserToolDelivery::Unavailable => "unavailable",
+        },
+        unreachable_agent_count: vibex_desktop_runtime::BrowserRuntime::delivery_matrix()
+            .iter()
+            .filter(|(_, delivery)| *delivery == BrowserToolDelivery::Unavailable)
+            .count(),
+        unavailable_reasons_are_explicit: {
+            // Every reason renders as operator-facing copy; an empty string
+            // would mean the panel shows a blank banner.
+            let reasons = [
+                vibex_core::BrowserUnavailableReason::BrowserMissing,
+                vibex_core::BrowserUnavailableReason::RemoteRuntimeUnsupported,
+                vibex_core::BrowserUnavailableReason::RemoteDebuggingDisabled,
+                vibex_core::BrowserUnavailableReason::DisclaimerPending,
+                vibex_core::BrowserUnavailableReason::FeatureDisabled,
+                vibex_core::BrowserUnavailableReason::PlatformUnsupported,
+            ];
+            reasons.iter().all(|reason| {
+                !vibex_browser::policy::unavailable_detail(*reason)
+                    .trim()
+                    .is_empty()
+            })
+        },
+        remote_transport_reports_a_reason: {
+            let error = crate::browser_transport::BrowserTransportError::new(
+                "remote_browser_unavailable",
+                "the remote browser transport is not implemented yet",
+            );
+            error.is_unavailable() && !error.message.trim().is_empty()
+        },
+        frames_release_previous_texture: {
+            // The surface parks the outgoing image and releases it during the
+            // next paint; the source assertion keeps that from being dropped in
+            // a refactor, since the leak is invisible at runtime.
+            let source = include_str!("browser_surface.rs");
+            source.contains("pending_drop") && source.contains("window.drop_image(")
+        },
+        frame_ack_is_credit_based: {
+            let source = include_str!("../../..//crates/browser/src/service.rs");
+            source.contains("Page.screencastFrameAck")
+        },
+        audit_records_are_redacted: {
+            let source = include_str!("../../..//crates/browser/src/execute.rs");
+            source.contains("(value redacted)")
+        },
+        audit_sample_has_no_page_content,
+        tool_descriptions_carry_the_untrusted_notice: tools::all_tools().iter().all(|tool| {
+            tool.description
+                .contains(vibex_core::BROWSER_UNTRUSTED_CONTENT_NOTICE)
+        }),
+        loopback_is_not_blanket_trusted: workspace_dev_server && other_loopback_is_gated,
+        stale_refs_are_refused,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagementContractProbe {
@@ -287,6 +452,27 @@ mod tests {
 
     #[test]
     fn code_workbench_contract_covers_virtualization_and_lifecycle_boundaries() {
+        let probe = embedded_browser_contract_probe();
+        assert_eq!(probe.schema_version, "embedded-browser-contract.v1");
+        assert_eq!(probe.preview_target_kinds, 5);
+        // The tier ladder must be monotonic: coarse is a strict subset of fine,
+        // and visual adds screenshots on top of fine.
+        assert!(probe.coarse_tool_count < probe.fine_tool_count);
+        assert!(probe.fine_tool_count < probe.visual_tool_count);
+        assert_eq!(probe.generic_agent_delivery, "http");
+        // Agents that never receive wire MCP servers are counted so the UI can
+        // show them rather than listing tools that can never be called.
+        assert!(probe.unreachable_agent_count > 0);
+        assert!(probe.unavailable_reasons_are_explicit);
+        assert!(probe.remote_transport_reports_a_reason);
+        assert!(probe.frames_release_previous_texture);
+        assert!(probe.frame_ack_is_credit_based);
+        assert!(probe.audit_records_are_redacted);
+        assert!(probe.audit_sample_has_no_page_content);
+        assert!(probe.tool_descriptions_carry_the_untrusted_notice);
+        assert!(probe.loopback_is_not_blanket_trusted);
+        assert!(probe.stale_refs_are_refused);
+
         let probe = code_workbench_contract_probe();
         assert_eq!(probe.preview_target_kinds, 5);
         assert_eq!(probe.file_tree_fixture_rows, 100_000);

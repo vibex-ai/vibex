@@ -14,6 +14,10 @@ pub enum PreviewTarget {
         #[serde(alias = "terminalId")]
         terminal_id: String,
     },
+    Browser {
+        #[serde(alias = "browserTabId")]
+        browser_tab_id: String,
+    },
     GitDiff {
         path: String,
         staged: bool,
@@ -38,6 +42,9 @@ impl PreviewTarget {
             Self::Terminal { terminal_id } => {
                 *terminal_id = normalized_text(terminal_id)?;
             }
+            Self::Browser { browser_tab_id } => {
+                *browser_tab_id = normalized_text(browser_tab_id)?;
+            }
             Self::GitCommit {
                 commit_hash,
                 subject,
@@ -56,6 +63,7 @@ impl PreviewTarget {
         match self {
             Self::File { path } => format!("file:{path}"),
             Self::Terminal { terminal_id } => format!("terminal:{terminal_id}"),
+            Self::Browser { browser_tab_id } => format!("browser:{browser_tab_id}"),
             Self::GitDiff { path, staged } => {
                 format!("git:{}:{path}", if *staged { "staged" } else { "unstaged" })
             }
@@ -96,6 +104,8 @@ impl PreviewTarget {
             Self::GitCommit { focus_path, .. } => focus_path
                 .as_deref()
                 .is_some_and(|target| path_is_equal_or_descendant(target, path)),
+            // Terminal and browser tabs are path-independent: moving or
+            // deleting a file never invalidates them.
             _ => false,
         }
     }
@@ -1027,6 +1037,12 @@ mod tests {
         }
     }
 
+    fn browser(browser_tab_id: &str) -> PreviewTarget {
+        PreviewTarget::Browser {
+            browser_tab_id: browser_tab_id.to_string(),
+        }
+    }
+
     #[test]
     fn tab_exists_in_exactly_one_pane_and_pinned_tabs_sort_first() {
         let mut state = PreviewState::default();
@@ -1249,5 +1265,74 @@ mod tests {
         state.normalize();
         assert_eq!(state.tabs.keys().collect::<Vec<_>>(), vec!["file:a.rs"]);
         assert_eq!(pane_containing_tab(&state.root, "file:a.rs"), Some("one"));
+    }
+
+    #[test]
+    fn browser_target_round_trips_through_its_camel_case_alias() {
+        let target: PreviewTarget =
+            serde_json::from_str(r#"{"kind":"browser","browserTabId":"browser_tab_x"}"#).unwrap();
+        assert_eq!(target, browser("browser_tab_x"));
+        assert_eq!(
+            serde_json::to_value(&target).unwrap(),
+            serde_json::json!({"kind": "browser", "browser_tab_id": "browser_tab_x"})
+        );
+    }
+
+    #[test]
+    fn browser_target_normalization_keeps_a_valid_id_and_drops_a_blank_one() {
+        assert_eq!(
+            browser(" browser_tab_x ").normalize(),
+            Some(browser("browser_tab_x"))
+        );
+        assert_eq!(browser("").normalize(), None);
+        assert_eq!(browser("   ").normalize(), None);
+    }
+
+    #[test]
+    fn browser_target_owns_its_own_tab_id_prefix() {
+        assert_eq!(browser("browser_tab_x").tab_id(), "browser:browser_tab_x");
+    }
+
+    #[test]
+    fn reopening_the_same_browser_tab_keeps_exactly_one_tab() {
+        let mut state = PreviewState::default();
+        let first = state.open(browser("browser_tab_x"), None, 10).unwrap();
+        let second = state.open(browser(" browser_tab_x "), None, 20).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            state.tabs.keys().collect::<Vec<_>>(),
+            vec!["browser:browser_tab_x"]
+        );
+        assert_eq!(
+            state.active_tab_id(PREVIEW_MAIN_PANE_ID),
+            Some(first.as_str())
+        );
+    }
+
+    #[test]
+    fn browser_tabs_survive_path_moves_and_deletes() {
+        let mut state = PreviewState::default();
+        let browser_id = state.open(browser("browser_tab_x"), None, 10).unwrap();
+        let file_id = state.open(file("src/old/lib.rs"), None, 20).unwrap();
+        assert!(state.set_fullscreen(Some(&browser_id)));
+
+        state.move_path("src/old", "src/new");
+        assert!(state.tabs.contains_key(&browser_id));
+        assert_eq!(
+            state.fullscreen_tab_id.as_deref(),
+            Some(browser_id.as_str())
+        );
+
+        state.delete_path("src/new");
+        assert_eq!(
+            state.tabs.keys().collect::<Vec<_>>(),
+            vec![browser_id.as_str()]
+        );
+        assert!(!state.tabs.contains_key(&file_id));
+        assert_eq!(
+            state.fullscreen_tab_id.as_deref(),
+            Some(browser_id.as_str())
+        );
     }
 }

@@ -50,13 +50,13 @@ use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, LogicalSurfaceBounds,
 };
 use vibex_core::{
-    FileEncoding, FileEntryKind, FileLineEnding, FileMutationRequest, FilePreviewKind,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, GitBranchSummary, GitChange, GitChangeKind,
-    GitCommitDetailRequest, GitCommitRequest, GitCommitSummary, GitDiffRequest, GitDiffResponse,
-    GitHistoryAuthor, GitHistoryRequest, GitManagedWorktreeStatus, GitRemoteActionKind,
-    GitRemoteActionRequest, GitRemoteSummary, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeConflictFile, GitWorktreeConflictKind,
+    BrowserSessionId, BrowserTabId, FileEncoding, FileEntryKind, FileLineEnding,
+    FileMutationRequest, FilePreviewKind, FileReadRequest, FileReadResponse, FileSearchRequest,
+    FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest, GitBranchSummary,
+    GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitCommitSummary,
+    GitDiffRequest, GitDiffResponse, GitHistoryAuthor, GitHistoryRequest, GitManagedWorktreeStatus,
+    GitRemoteActionKind, GitRemoteActionRequest, GitRemoteSummary, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile, GitWorktreeConflictKind,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeConflictVersion,
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
     GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeMergeStrategy,
@@ -87,6 +87,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
+use crate::browser_surface::BrowserSurface;
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
@@ -1029,6 +1030,47 @@ pub(crate) fn local_terminal_surface_transport(
     }
 }
 
+/// The runtime browser session behind one preview tab.
+#[derive(Clone, Debug)]
+struct BrowserTabBinding {
+    session_id: BrowserSessionId,
+}
+
+/// The browser transport slice of the desktop bundle.
+#[derive(Clone)]
+pub(crate) struct BrowserSurfaceTransport {
+    pub(crate) transport: Arc<dyn crate::browser_transport::BrowserTransport>,
+}
+
+impl BrowserSurfaceTransport {
+    pub(crate) fn transport(&self) -> Arc<dyn crate::browser_transport::BrowserTransport> {
+        Arc::clone(&self.transport)
+    }
+}
+
+/// Browser transport over the in-process runtime's browser service.
+pub(crate) fn local_browser_surface_transport(
+    service: vibex_browser::BrowserService,
+    executor: gpui::BackgroundExecutor,
+) -> BrowserSurfaceTransport {
+    BrowserSurfaceTransport {
+        transport: Arc::new(crate::browser_transport::LocalBrowserTransport::new(
+            service, executor,
+        )),
+    }
+}
+
+/// Browser transport over a paired authority's browser backend.
+pub(crate) fn remote_browser_surface_transport(
+    backend: Arc<dyn vibex_backend::BrowserBackend>,
+) -> BrowserSurfaceTransport {
+    BrowserSurfaceTransport {
+        transport: Arc::new(crate::browser_transport::RemoteBrowserTransport::new(
+            backend,
+        )),
+    }
+}
+
 /// Terminal transport over a paired authority's terminal backend.
 pub(crate) fn remote_terminal_surface_transport(
     backend: Arc<dyn vibex_backend::TerminalBackend>,
@@ -1060,6 +1102,12 @@ pub struct CodeWorkbench {
     parent: Option<WeakEntity<VibexWorkbench>>,
     backend: Option<BackendFacade>,
     terminal_transport: Option<TerminalSurfaceTransport>,
+    browser_transport: Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>>,
+    /// Which runtime browser session each preview tab is bound to. A preview tab
+    /// survives a restart but a runtime browser session does not, so this map is
+    /// deliberately in-memory: a persisted tab without a binding shows the
+    /// "reopen" boundary instead of guessing at a session.
+    browser_bindings: BTreeMap<String, BrowserTabBinding>,
     workspace: Option<WorkbenchWorkspace>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
@@ -1100,6 +1148,8 @@ pub struct CodeWorkbench {
     terminals: Vec<TerminalSession>,
     terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
     active_terminal_surface_ids: BTreeSet<String>,
+    browser_surfaces: BTreeMap<String, Entity<BrowserSurface>>,
+    active_browser_surface_ids: BTreeSet<String>,
     selected_file_path: Option<String>,
     selected_git_path: Option<String>,
     selected_terminal_id: Option<String>,
@@ -1241,6 +1291,8 @@ impl CodeWorkbench {
             parent,
             backend: None,
             terminal_transport: None,
+            browser_transport: None,
+            browser_bindings: BTreeMap::new(),
             workspace: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -1269,6 +1321,8 @@ impl CodeWorkbench {
             terminals: Vec::new(),
             terminal_surfaces: BTreeMap::new(),
             active_terminal_surface_ids: BTreeSet::new(),
+            browser_surfaces: BTreeMap::new(),
+            active_browser_surface_ids: BTreeSet::new(),
             selected_file_path,
             selected_git_path,
             selected_terminal_id,
@@ -1683,6 +1737,7 @@ impl CodeWorkbench {
         }
         self.preview_visible = visible;
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
     }
 
     /// The editor that holds the keyboard right now, if one does.
@@ -1769,6 +1824,48 @@ impl CodeWorkbench {
             .filter_map(|terminal_id| self.terminal_surfaces.get(terminal_id).cloned())
             .collect::<Vec<_>>();
         self.active_terminal_surface_ids = desired;
+
+        for surface in deactivated {
+            surface.update(cx, |surface, cx| surface.set_active(false, cx));
+        }
+        for surface in activated {
+            surface.update(cx, |surface, cx| surface.set_active(true, cx));
+        }
+    }
+
+    fn sync_browser_surface_activity(&mut self, cx: &mut Context<Self>) {
+        let desired = if self.preview_visible {
+            self.preview
+                .pane_ids()
+                .into_iter()
+                .filter_map(|pane_id| self.preview.active_tab_id(pane_id))
+                .filter_map(|tab_id| self.preview.tabs.get(tab_id))
+                .filter_map(|tab| match &tab.target {
+                    PreviewTarget::Browser { browser_tab_id }
+                        if self.browser_surfaces.contains_key(browser_tab_id) =>
+                    {
+                        Some(browser_tab_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if desired == self.active_browser_surface_ids {
+            return;
+        }
+
+        let deactivated = self
+            .active_browser_surface_ids
+            .difference(&desired)
+            .filter_map(|browser_tab_id| self.browser_surfaces.get(browser_tab_id).cloned())
+            .collect::<Vec<_>>();
+        let activated = desired
+            .difference(&self.active_browser_surface_ids)
+            .filter_map(|browser_tab_id| self.browser_surfaces.get(browser_tab_id).cloned())
+            .collect::<Vec<_>>();
+        self.active_browser_surface_ids = desired;
 
         for surface in deactivated {
             surface.update(cx, |surface, cx| surface.set_active(false, cx));
@@ -2037,6 +2134,7 @@ impl CodeWorkbench {
         self.autosave_task = None;
         self.pending_close_after_save.clear();
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
         cx.notify();
     }
 
@@ -2287,6 +2385,27 @@ impl CodeWorkbench {
         if self.terminal_transport.is_none() {
             self.terminal_surfaces.clear();
             self.active_terminal_surface_ids.clear();
+            self.browser_surfaces.clear();
+            self.active_browser_surface_ids.clear();
+        }
+        cx.notify();
+    }
+
+    /// Points the browser surfaces at whichever authority owns the browser.
+    ///
+    /// Mirrors [`Self::set_terminal_transport`]: when the transport goes away
+    /// every materialized surface is discarded, because a surface without an
+    /// authority can only render a stale frame.
+    pub(crate) fn set_browser_transport(
+        &mut self,
+        transport: Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.browser_transport = transport;
+        if self.browser_transport.is_none() {
+            self.browser_surfaces.clear();
+            self.active_browser_surface_ids.clear();
+            self.browser_bindings.clear();
         }
         cx.notify();
     }
@@ -2379,6 +2498,8 @@ impl CodeWorkbench {
         self.reconcile_terminal_selection();
         self.terminal_surfaces.clear();
         self.active_terminal_surface_ids.clear();
+        self.browser_surfaces.clear();
+        self.active_browser_surface_ids.clear();
         self.backend = Some(backend.clone());
         self.pending_workspace = None;
         self.presentations.clear();
@@ -2690,6 +2811,19 @@ impl CodeWorkbench {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let browser_tab_ids = self
+            .preview
+            .tabs
+            .values()
+            .filter_map(|tab| match &tab.target {
+                PreviewTarget::Browser { browser_tab_id }
+                    if !self.browser_surfaces.contains_key(browser_tab_id) =>
+                {
+                    Some(browser_tab_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let diff_keys = self
             .preview
             .tabs
@@ -2717,6 +2851,7 @@ impl CodeWorkbench {
             .collect::<BTreeSet<_>>();
         if paths.is_empty()
             && terminal_ids.is_empty()
+            && browser_tab_ids.is_empty()
             && diff_keys.is_empty()
             && commit_hashes.is_empty()
         {
@@ -2759,6 +2894,9 @@ impl CodeWorkbench {
                 this.reconcile_file_selection();
                 for terminal_id in terminal_ids {
                     this.ensure_terminal_surface(&terminal_id, window, cx);
+                }
+                for browser_tab_id in browser_tab_ids {
+                    this.ensure_browser_surface(&browser_tab_id, window, cx);
                 }
                 for key in diff_keys {
                     this.load_diff(key, cx);
@@ -4236,7 +4374,22 @@ impl CodeWorkbench {
                 .iter()
                 .any(|terminal| terminal.id.as_str() == terminal_id)
         });
+        // A browser surface is backed by the preview tab that opened it, and
+        // the preview is the workbench's only list of open browser tabs, so a
+        // surface whose tab is gone is dropped with it.
+        let open_browser_tab_ids = self
+            .preview
+            .tabs
+            .values()
+            .filter_map(|tab| match &tab.target {
+                PreviewTarget::Browser { browser_tab_id } => Some(browser_tab_id.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.browser_surfaces
+            .retain(|browser_tab_id, _| open_browser_tab_ids.contains(browser_tab_id.as_str()));
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
         if self.selected_terminal_id != previous_selection {
             self.persist(cx);
         }
@@ -4286,6 +4439,36 @@ impl CodeWorkbench {
             }),
         );
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
+        true
+    }
+
+    fn ensure_browser_surface(
+        &mut self,
+        browser_tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.browser_surfaces.contains_key(browser_tab_id) {
+            return true;
+        }
+        let entity = cx.new(|cx| BrowserSurface::new(browser_tab_id.to_string(), window, cx));
+        // The surface needs the authority and the runtime-side session before
+        // it can show anything; without them it renders the "waiting for the
+        // browser" state rather than an empty rectangle.
+        if let Some(transport) = self.browser_transport.clone()
+            && let Some(binding) = self.browser_bindings.get(browser_tab_id).cloned()
+        {
+            let tab_id = BrowserTabId::parse(browser_tab_id.to_string()).ok();
+            if let Some(tab_id) = tab_id {
+                entity.update(cx, |surface, cx| {
+                    surface.attach(transport, binding.session_id.clone(), tab_id, cx);
+                });
+            }
+        }
+        self.browser_surfaces
+            .insert(browser_tab_id.to_string(), entity);
+        self.sync_browser_surface_activity(cx);
         true
     }
 
@@ -4296,6 +4479,17 @@ impl CodeWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.open_terminal_in_pane(terminal_id, None, window, cx);
+    }
+
+    /// True when the focused preview tab is the embedded browser.
+    ///
+    /// The right-rail button uses this to decide between "show it" and "hide
+    /// it", exactly like the terminal activity does.
+    pub(crate) fn active_preview_is_browser(&self) -> bool {
+        self.preview
+            .active_tab_id(&self.preview.focused_pane_id)
+            .and_then(|tab_id| self.preview.tabs.get(tab_id))
+            .is_some_and(|tab| matches!(&tab.target, PreviewTarget::Browser { .. }))
     }
 
     pub(crate) fn active_preview_is_terminal(&self) -> bool {
@@ -4330,6 +4524,132 @@ impl CodeWorkbench {
             self.request_preview_panel(cx);
             cx.notify();
         }
+    }
+
+    /// Opens the embedded browser panel, reusing the existing tab when there is
+    /// one.
+    ///
+    /// The panel is a tool panel like the terminal and the document preview, not
+    /// an application shell: it exists so an Agent's browser work is watchable
+    /// and interruptible.
+    pub fn open_browser(
+        &mut self,
+        url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(transport) = self.browser_transport.clone() else {
+            self.error = Some(
+                locale::text(
+                    "The embedded browser needs a connected runtime.",
+                    "内嵌浏览器需要已连接的 runtime。",
+                    "內嵌瀏覽器需要已連接的 runtime。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(workspace_id) = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.id.clone())
+        else {
+            self.error = Some(
+                locale::text(
+                    "Select a workspace before opening the browser.",
+                    "请先选择工作区再打开浏览器。",
+                    "請先選擇工作區再開啟瀏覽器。",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let url = url.filter(|url| !url.trim().is_empty());
+        let existing = self
+            .browser_bindings
+            .keys()
+            .next()
+            .cloned()
+            .and_then(|tab_id| {
+                BrowserTabId::parse(tab_id.clone())
+                    .ok()
+                    .map(|id| (tab_id, id))
+            });
+        cx.spawn_in(window, async move |this, cx| {
+            let session_id = match transport.ensure_workspace_session(&workspace_id).await {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let _ = this.update(cx, |workbench, cx| {
+                        workbench.error = Some(error.message);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let (tab_string, tab_id) = match existing {
+                Some((tab_string, tab_id)) => (tab_string, tab_id),
+                None => match transport.create_tab(&session_id, url.as_deref()).await {
+                    Ok(tab) => (tab.tab_id.as_str().to_string(), tab.tab_id),
+                    Err(error) => {
+                        let _ = this.update(cx, |workbench, cx| {
+                            workbench.apply_browser_transport_error(&error);
+                            cx.notify();
+                        });
+                        return;
+                    }
+                },
+            };
+            let _ = this.update_in(cx, |workbench, window, cx| {
+                workbench.browser_bindings.insert(
+                    tab_string.clone(),
+                    BrowserTabBinding {
+                        session_id: session_id.clone(),
+                    },
+                );
+                if workbench.ensure_browser_surface(&tab_string, window, cx) {
+                    if let Some(surface) = workbench.browser_surfaces.get(&tab_string).cloned() {
+                        surface.update(cx, |surface, cx| {
+                            surface.attach(transport.clone(), session_id, tab_id, cx);
+                            surface.refresh_tab(cx);
+                        });
+                    }
+                    let tab_id_string = workbench.preview.open(
+                        PreviewTarget::Browser {
+                            browser_tab_id: tab_string.clone(),
+                        },
+                        None,
+                        unix_timestamp_ms(),
+                    );
+                    if let Some(tab_id_string) = tab_id_string {
+                        workbench.activate_tab(&tab_id_string, cx);
+                        workbench.persist(cx);
+                        workbench.request_preview_panel(cx);
+                    }
+                } else {
+                    workbench.apply_browser_transport_error(
+                        &crate::browser_transport::BrowserTransportError::new(
+                            "browser_unavailable",
+                            locale::text(
+                                "The embedded browser is unavailable.",
+                                "内嵌浏览器不可用。",
+                                "內嵌瀏覽器無法使用。",
+                            ),
+                        ),
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_browser_transport_error(
+        &mut self,
+        error: &crate::browser_transport::BrowserTransportError,
+    ) {
+        self.error = Some(error.message.clone());
     }
 
     fn open_pdf(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -4956,6 +5276,7 @@ impl CodeWorkbench {
             let _ = lifecycle.focus_entered(generation);
         }
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
     }
 
     fn update_lifecycle_bounds(
@@ -5043,6 +5364,10 @@ impl CodeWorkbench {
                     .first()
                     .map(|terminal| terminal.id.as_str().to_string());
             }
+        }
+        if let Some(browser_tab_id) = tab_id.strip_prefix("browser:") {
+            self.browser_surfaces.remove(browser_tab_id);
+            self.active_browser_surface_ids.remove(browser_tab_id);
         }
         if let Some(path) = tab_id.strip_prefix("file:") {
             self.editors.close(path, force);
@@ -5394,6 +5719,7 @@ impl CodeWorkbench {
                     self.activate_tab(&neighbor, cx);
                 }
                 self.sync_terminal_surface_activity(cx);
+                self.sync_browser_surface_activity(cx);
                 self.persist(cx);
                 self.persist_editor_recovery(cx);
                 self.close_preview_panel_if_empty(cx);
@@ -5405,9 +5731,15 @@ impl CodeWorkbench {
                 // With autosave on, the pending edit is already on its way to
                 // disk: queue the write and close once it lands instead of
                 // asking the user to save work they never meant to keep.
-                let queued = tab_id
-                    .strip_prefix("file:")
-                    .is_some_and(|path| self.autosave_before_close(path, cx));
+                // A browser tab holds no editor buffer, so it never queues
+                // anything and keeps its surface open.
+                let queued = if tab_id.starts_with("browser:") {
+                    false
+                } else {
+                    tab_id
+                        .strip_prefix("file:")
+                        .is_some_and(|path| self.autosave_before_close(path, cx))
+                };
                 if !queued {
                     self.error = Some("Save or discard the dirty editor before closing it".into());
                 }
@@ -5450,6 +5782,7 @@ impl CodeWorkbench {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
         self.persist(cx);
         self.persist_editor_recovery(cx);
         self.close_preview_panel_if_empty(cx);
@@ -5470,6 +5803,7 @@ impl CodeWorkbench {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
         self.persist(cx);
         self.persist_editor_recovery(cx);
         self.close_preview_panel_if_empty(cx);
@@ -5513,6 +5847,7 @@ impl CodeWorkbench {
             self.error = Some("Pinned or dirty tabs were kept open".into());
         }
         self.sync_terminal_surface_activity(cx);
+        self.sync_browser_surface_activity(cx);
         self.persist(cx);
         self.persist_editor_recovery(cx);
         self.close_preview_panel_if_empty(cx);
@@ -5549,6 +5884,7 @@ impl CodeWorkbench {
         };
         if split {
             self.sync_terminal_surface_activity(cx);
+            self.sync_browser_surface_activity(cx);
             self.persist(cx);
             cx.notify();
         }
@@ -5928,6 +6264,7 @@ impl CodeWorkbench {
                     Ok(Ok(())) => {
                         apply(this, cx);
                         this.sync_terminal_surface_activity(cx);
+                        this.sync_browser_surface_activity(cx);
                         this.note = Some("File operation completed".into());
                         this.load_tree(cx);
                         this.load_git_status(cx);
@@ -6678,6 +7015,7 @@ impl CodeWorkbench {
                     PreviewPaneDropRegion::TabGroup | PreviewPaneDropRegion::Content => {
                         if this.preview.move_to_pane(&drag.tab_id, &drop_pane_id) {
                             this.sync_terminal_surface_activity(cx);
+                            this.sync_browser_surface_activity(cx);
                             this.persist(cx);
                         }
                     }
@@ -7294,6 +7632,7 @@ impl CodeWorkbench {
                     this.preview.move_to_pane(&drag.tab_id, &pane_id);
                     this.preview.reorder_pane_tabs(&pane_id, &order);
                     this.sync_terminal_surface_activity(cx);
+                    this.sync_browser_surface_activity(cx);
                     this.persist(cx);
                     cx.notify();
                 }
@@ -7816,6 +8155,27 @@ impl CodeWorkbench {
                                 format!("終端機 {terminal_id} 已中斷連線")
                             }
                         },
+                        cx,
+                    )
+                }),
+            PreviewTarget::Browser { browser_tab_id } => self
+                .browser_surfaces
+                .get(&browser_tab_id)
+                .cloned()
+                .map(|surface| {
+                    surface
+                        .cached(StyleRefinement::default().size_full())
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| {
+                    self.render_native_boundary(
+                        IconName::Globe,
+                        locale::text("Embedded browser", "内嵌浏览器", "內嵌瀏覽器"),
+                        locale::text(
+                            "This browser tab is no longer open. Reopen it from the browser panel.",
+                            "该浏览器标签已关闭。请从浏览器面板重新打开。",
+                            "該瀏覽器分頁已關閉。請從瀏覽器面板重新開啟。",
+                        ),
                         cx,
                     )
                 }),
@@ -15477,6 +15837,7 @@ fn tab_label(target: &PreviewTarget) -> String {
         PreviewTarget::Terminal { terminal_id } => {
             format!("{} {terminal_id}", locale::text("Terminal", "终端", "終端"))
         }
+        PreviewTarget::Browser { .. } => locale::text("Browser", "浏览器", "瀏覽器").to_string(),
         PreviewTarget::GitCommit {
             commit_hash,
             subject,
@@ -15608,6 +15969,9 @@ fn preview_target_icon(target: &PreviewTarget, cx: &Context<CodeWorkbench>) -> A
         PreviewTarget::Terminal { .. } => Icon::new(IconName::SquareTerminal)
             .size(px(14.0))
             .into_any_element(),
+        PreviewTarget::Browser { .. } => {
+            Icon::new(IconName::Globe).size(px(14.0)).into_any_element()
+        }
     }
 }
 
@@ -15647,7 +16011,9 @@ fn preview_tab_visual_status(
                     }
             })
             .map(git_preview_visual_status),
-        PreviewTarget::GitCommit { .. } | PreviewTarget::Terminal { .. } => None,
+        PreviewTarget::GitCommit { .. }
+        | PreviewTarget::Terminal { .. }
+        | PreviewTarget::Browser { .. } => None,
     }
 }
 
@@ -15785,6 +16151,7 @@ fn surface_kind(target: &PreviewTarget) -> ContentSurfaceKind {
             ContentPreviewKind::UnsupportedBinary => ContentSurfaceKind::Text,
         },
         PreviewTarget::Terminal { .. } => ContentSurfaceKind::Terminal,
+        PreviewTarget::Browser { .. } => ContentSurfaceKind::Browser,
         PreviewTarget::GitDiff { .. } => ContentSurfaceKind::GitDiff,
         PreviewTarget::GitCommit { .. } => ContentSurfaceKind::GitCommit,
     }
@@ -16699,6 +17066,8 @@ fn preview_target_references_path(target: &PreviewTarget, path: &str) -> bool {
             .as_deref()
             .is_some_and(|target| path_is_equal_or_descendant(target, path)),
         PreviewTarget::Terminal { .. } => false,
+        // A browser tab names no workspace file, so no path operation owns it.
+        PreviewTarget::Browser { .. } => false,
     }
 }
 

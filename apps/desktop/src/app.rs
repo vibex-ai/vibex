@@ -2367,16 +2367,20 @@ enum RightRailActivity {
     Files,
     Git,
     Terminal,
+    /// Opens the embedded-browser tool panel. The browser is a tool panel of
+    /// the same rank as the terminal, not an application shell.
+    Browser,
     ChildAgents,
 }
 
 impl RightRailActivity {
     /// Every button, in the order a fresh install shows them.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Editor,
         Self::Files,
         Self::Git,
         Self::Terminal,
+        Self::Browser,
         Self::ChildAgents,
     ];
 
@@ -2386,6 +2390,7 @@ impl RightRailActivity {
             Self::Files => right_rail_activity_id(RightRailMode::Files),
             Self::Git => right_rail_activity_id(RightRailMode::Git),
             Self::Terminal => "rail_activity_terminal",
+            Self::Browser => "rail_activity_browser",
             Self::ChildAgents => "rail_activity_child_agents",
         }
     }
@@ -2396,6 +2401,7 @@ impl RightRailActivity {
             Self::Files => right_rail_mode_icon(RightRailMode::Files),
             Self::Git => right_rail_mode_icon(RightRailMode::Git),
             Self::Terminal => Icon::new(IconName::SquareTerminal),
+            Self::Browser => Icon::new(IconName::Globe),
             Self::ChildAgents => Icon::new(IconName::Bot),
         }
     }
@@ -9661,9 +9667,20 @@ impl VibexWorkbench {
             facade.terminal().clone(),
             cx.background_executor().clone(),
         );
+        // A paired runtime serves browser frames over Remote v2, which is not
+        // implemented yet; the transport reports that reason so the panel shows
+        // it instead of waiting for frames that never arrive.
+        let remote_browser_transport =
+            crate::code_workbench::remote_browser_surface_transport(facade.browser().clone());
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.set_backend(facade.clone(), cx);
             workbench.set_terminal_transport(Some(remote_terminal_transport), cx);
+            workbench.set_browser_transport(
+                Some(crate::code_workbench::BrowserSurfaceTransport::transport(
+                    &remote_browser_transport,
+                )),
+                cx,
+            );
         });
         self.management_view.update(cx, |management, cx| {
             management.set_backend(facade.clone(), cx)
@@ -9814,6 +9831,18 @@ impl VibexWorkbench {
                 Some(crate::code_workbench::local_terminal_surface_transport(
                     terminal_manager,
                 )),
+                cx,
+            );
+            // The browser panel renders frames the runtime encodes; the local
+            // authority serves them from the in-process service.
+            workbench.set_browser_transport(
+                Some(
+                    std::sync::Arc::new(crate::code_workbench::local_browser_surface_transport(
+                        runtime.browser().service().clone(),
+                        cx.background_executor().clone(),
+                    ))
+                    .transport(),
+                ),
                 cx,
             );
         });
@@ -30842,6 +30871,7 @@ impl VibexWorkbench {
         for activity in self.right_rail_activity_order() {
             let available = match activity {
                 RightRailActivity::Git => git_available,
+                RightRailActivity::Browser => true,
                 RightRailActivity::ChildAgents => child_agents_available,
                 _ => true,
             };
@@ -30903,6 +30933,26 @@ impl VibexWorkbench {
                     }
                 }))
                 .into_any_element(),
+                RightRailActivity::Browser => {
+                    right_rail_activity_button("activity-browser", Icon::new(IconName::Globe))
+                        .tooltip(locale::text("Embedded browser", "内嵌浏览器", "內嵌瀏覽器"))
+                        .selected(
+                            preview_open
+                                && self.code_workbench.read(cx).active_preview_is_browser(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let browser_preview_open = this.code_preview_visible
+                                && this.code_workbench.read(cx).active_preview_is_browser();
+                            if browser_preview_open {
+                                this.toggle_preview(cx);
+                            } else {
+                                this.code_workbench.update(cx, |workbench, cx| {
+                                    workbench.open_browser(None, window, cx)
+                                });
+                            }
+                        }))
+                        .into_any_element()
+                }
                 RightRailActivity::ChildAgents => {
                     right_rail_activity_button("activity-child-agents", Icon::new(IconName::Bot))
                         .tooltip(locale::text(
@@ -70817,6 +70867,7 @@ mod tests {
                 RightRailActivity::Git,
                 RightRailActivity::Editor,
                 RightRailActivity::Files,
+                RightRailActivity::Browser,
                 RightRailActivity::ChildAgents,
             ]
         );
@@ -70838,6 +70889,7 @@ mod tests {
                 RightRailActivity::Git,
                 RightRailActivity::Terminal,
                 RightRailActivity::Editor,
+                RightRailActivity::Browser,
                 RightRailActivity::ChildAgents,
             ]
         );
@@ -70854,6 +70906,7 @@ mod tests {
                 RightRailActivity::Files,
                 RightRailActivity::Git,
                 RightRailActivity::Terminal,
+                RightRailActivity::Browser,
             ]
         );
         assert_eq!(

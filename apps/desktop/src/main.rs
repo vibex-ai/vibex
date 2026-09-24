@@ -8,6 +8,7 @@ use gpui::{
 };
 use gpui_component::{Root, TitleBar};
 use vibex_agent::run_delegation_mcp_stdio;
+use vibex_browser::stdio::run_browser_mcp_stdio;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
@@ -48,9 +49,19 @@ enum LaunchMode {
 
 fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    // Both self-exec sidecar modes are dispatched here. They run before any
+    // GPUI setup, because the process that launches them is a third-party Agent
+    // CLI and it expects a plain stdio MCP server on the other end.
     if arguments.len() == 1 && arguments[0] == "--agent-delegation-mcp" {
         if let Err(error) = run_delegation_mcp_stdio() {
             eprintln!("Agent delegation MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if arguments.len() == 1 && arguments[0] == "--browser-mcp" {
+        if let Err(error) = run_browser_mcp_stdio() {
+            eprintln!("Browser MCP sidecar failed: {error}");
             std::process::exit(1);
         }
         return;

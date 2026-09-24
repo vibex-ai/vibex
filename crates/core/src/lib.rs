@@ -9,6 +9,7 @@ pub mod agent_auth;
 pub mod agent_config;
 pub mod agent_provider_runtime;
 pub mod automation_graph;
+pub mod browser;
 pub mod canonical_json;
 pub mod delegation;
 pub mod diagnostics;
@@ -98,6 +99,24 @@ pub use automation_graph::{
     AutomationRunStepUpdateRequest, AutomationRunTrigger, AutomationRunUpdateRequest,
     AutomationTerminalCheckConfig,
 };
+pub use browser::{
+    AGENT_DELEGATION_MCP_SERVER_ID, BROWSER_ACTION_HIGHLIGHT_MS, BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_EXTRACT_CHARS, BROWSER_MAX_FRAME_BYTES,
+    BROWSER_MAX_SCREENSHOT_BYTES, BROWSER_MAX_SCRIPT_CHARS, BROWSER_MAX_SCRIPT_RESULT_CHARS,
+    BROWSER_MAX_SCROLL_DELTA, BROWSER_MAX_SESSION_LEDGER_ITEMS, BROWSER_MAX_TAB_TRACE_ITEMS,
+    BROWSER_MAX_TABS, BROWSER_MCP_SERVER_ID, BROWSER_OBSERVE_AX_DEPTH,
+    BROWSER_OBSERVE_DEFAULT_MAX_ELEMENTS, BROWSER_OBSERVE_EXTENDED_AX_DEPTH,
+    BROWSER_OBSERVE_MAX_MAX_ELEMENTS, BROWSER_OBSERVE_MIN_MAX_ELEMENTS, BROWSER_OBSERVE_TIMEOUT_MS,
+    BROWSER_UNTRUSTED_CONTENT_NOTICE, BUILTIN_MCP_SERVER_IDS, BrowserActionKind,
+    BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserConsoleEntry,
+    BrowserDialogRequest, BrowserElement, BrowserElementSource, BrowserExecutionSource,
+    BrowserFrame, BrowserFrameFormat, BrowserFrameMetadata, BrowserInstallation,
+    BrowserNetworkEntry, BrowserObservation, BrowserOperationStatus, BrowserRecordingStep,
+    BrowserSession, BrowserSessionSnapshot, BrowserTab, BrowserTabOwner, BrowserTabStatus,
+    BrowserToolDelivery, BrowserToolTier, BrowserUnavailableReason, BrowserVisualDiff,
+    is_builtin_mcp_server_id, is_cross_origin, is_loopback_origin, redact_url_for_ledger,
+    url_host_redacted,
+};
 pub use canonical_json::canonical_json_vec;
 pub use delegation::{
     AgentDelegation, AgentDelegationStatus, CancelAgentDelegationRequest,
@@ -162,13 +181,13 @@ pub use ids::{
     AgentAuthContextId, AgentAuthenticationOperationId, AgentConfiguredModelBindingId,
     AgentDelegationId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
     AgentRuntimeProbeId, AgentRuntimeProfileId, AutomationEdgeId, AutomationGraphId,
-    AutomationNodeId, AutomationRunId, AutomationRunStepId, ChannelId, CorrelationId, DeviceId,
-    EventId, HookId, McpServerId, MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId,
-    ProjectId, PromptId, ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId,
-    RelayRoomId, RelaySessionId, RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId,
-    RuntimeProcessId, RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
-    ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
-    WorkspaceId,
+    AutomationNodeId, AutomationRunId, AutomationRunStepId, BrowserSessionId, BrowserTabId,
+    ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
+    ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
+    RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
+    RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId,
+    RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SkillId,
+    TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId, WorkspaceId,
 };
 pub use local_history::{
     LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,

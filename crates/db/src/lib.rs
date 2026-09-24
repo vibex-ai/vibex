@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 56;
+pub const CURRENT_SCHEMA_VERSION: i64 = 57;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1903,6 +1903,41 @@ pub struct WorktreeOperationRepository;
 pub struct RemoteDeviceRepository;
 pub struct RemotePairingCodeRepository;
 pub struct RemoteAuditRepository;
+pub struct BrowserAuditRepository;
+pub struct BrowserDomainGrantRepository;
+
+/// One entry in the embedded browser's redacted operation ledger.
+///
+/// The record carries no page content, form values, cookies or screenshots by
+/// construction; callers must redact before they insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserAuditRecord {
+    pub id: String,
+    pub session_id: String,
+    pub workspace_id: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub tab_id: String,
+    pub kind: String,
+    /// Already redacted by the caller; never raw page or form content.
+    pub summary: String,
+    pub domain: Option<String>,
+    pub execution_source: String,
+    pub status: String,
+    pub at_ms: i64,
+}
+
+/// One session-scoped embedded browser domain grant.
+///
+/// The runtime has no permission policy store, so `AlwaysAllowForSession` has
+/// to be remembered here by the browser layer itself. `expires_at_ms` is
+/// nullable so a future TTL needs no further migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserDomainGrant {
+    pub domain: String,
+    pub origin: Option<String>,
+    pub granted_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRuntimeOptionSnapshotRecord {
@@ -10586,6 +10621,197 @@ impl RemoteAuditRepository {
     }
 }
 
+impl BrowserAuditRepository {
+    pub fn insert(conn: &Connection, record: &BrowserAuditRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO browser_audit_records (
+                id, session_id, workspace_id, agent_session_id, tab_id, kind,
+                summary, domain, execution_source, status, at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                record.id.as_str(),
+                record.session_id.as_str(),
+                record.workspace_id.as_deref(),
+                record.agent_session_id.as_deref(),
+                record.tab_id.as_str(),
+                record.kind.as_str(),
+                record.summary.as_str(),
+                record.domain.as_deref(),
+                record.execution_source.as_str(),
+                record.status.as_str(),
+                record.at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "browser_audit_insert_failed",
+            "failed to insert browser audit record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_for_session(
+        conn: &Connection,
+        session_id: &str,
+        limit: i64,
+    ) -> VibexResult<Vec<BrowserAuditRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, session_id, workspace_id, agent_session_id, tab_id, kind,
+                    summary, domain, execution_source, status, at_ms
+                FROM browser_audit_records
+                WHERE session_id = ?1
+                ORDER BY at_ms DESC, id DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(storage_err(
+                "browser_audit_list_failed",
+                "failed to list browser audit records",
+            ))?;
+        let rows = stmt
+            .query_map(params![session_id, limit], map_browser_audit_record)
+            .map_err(storage_err(
+                "browser_audit_list_failed",
+                "failed to list browser audit records",
+            ))?;
+        collect_rows(
+            rows,
+            "browser_audit_decode_failed",
+            "failed to decode browser audit record",
+        )
+    }
+
+    pub fn delete_for_session(conn: &Connection, session_id: &str) -> VibexResult<usize> {
+        conn.execute(
+            "DELETE FROM browser_audit_records WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(storage_err(
+            "browser_audit_delete_failed",
+            "failed to delete browser audit records",
+        ))
+    }
+
+    pub fn prune(conn: &Connection, keep_per_session: i64) -> VibexResult<usize> {
+        conn.execute(
+            "
+            DELETE FROM browser_audit_records
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY at_ms DESC, id DESC
+                        ) AS session_rank
+                    FROM browser_audit_records
+                )
+                WHERE session_rank > ?1
+            )
+            ",
+            params![keep_per_session],
+        )
+        .map_err(storage_err(
+            "browser_audit_prune_failed",
+            "failed to prune browser audit records",
+        ))
+    }
+}
+
+impl BrowserDomainGrantRepository {
+    pub fn upsert(conn: &Connection, grant: &BrowserDomainGrant) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO browser_domain_grants (domain, origin, granted_at_ms, expires_at_ms)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(domain) DO UPDATE SET
+                origin = excluded.origin,
+                granted_at_ms = excluded.granted_at_ms,
+                expires_at_ms = excluded.expires_at_ms
+            ",
+            params![
+                grant.domain.to_ascii_lowercase(),
+                grant.origin.as_deref(),
+                grant.granted_at_ms,
+                grant.expires_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "browser_domain_grant_upsert_failed",
+            "failed to upsert browser domain grant",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list(conn: &Connection) -> VibexResult<Vec<BrowserDomainGrant>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT domain, origin, granted_at_ms, expires_at_ms
+                FROM browser_domain_grants
+                ORDER BY domain ASC
+                ",
+            )
+            .map_err(storage_err(
+                "browser_domain_grant_list_failed",
+                "failed to list browser domain grants",
+            ))?;
+        let rows = stmt
+            .query_map([], map_browser_domain_grant)
+            .map_err(storage_err(
+                "browser_domain_grant_list_failed",
+                "failed to list browser domain grants",
+            ))?;
+        collect_rows(
+            rows,
+            "browser_domain_grant_decode_failed",
+            "failed to decode browser domain grant",
+        )
+    }
+
+    pub fn is_granted(conn: &Connection, domain: &str) -> VibexResult<bool> {
+        let granted = conn
+            .query_row(
+                "
+                SELECT 1
+                FROM browser_domain_grants
+                WHERE domain = ?1
+                    AND (expires_at_ms IS NULL OR expires_at_ms > ?2)
+                ",
+                params![domain.to_ascii_lowercase(), unix_timestamp_ms()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "browser_domain_grant_lookup_failed",
+                "failed to look up browser domain grant",
+            ))?;
+        Ok(granted.is_some())
+    }
+
+    pub fn revoke(conn: &Connection, domain: &str) -> VibexResult<usize> {
+        conn.execute(
+            "DELETE FROM browser_domain_grants WHERE domain = ?1",
+            params![domain.to_ascii_lowercase()],
+        )
+        .map_err(storage_err(
+            "browser_domain_grant_revoke_failed",
+            "failed to revoke browser domain grant",
+        ))
+    }
+
+    pub fn clear(conn: &Connection) -> VibexResult<usize> {
+        conn.execute("DELETE FROM browser_domain_grants", [])
+            .map_err(storage_err(
+                "browser_domain_grant_clear_failed",
+                "failed to clear browser domain grants",
+            ))
+    }
+}
+
 /// The runtime's own published name.
 ///
 /// One row per database, so the store is a get-or-default read and an upsert
@@ -10746,6 +10972,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_local_history_import_index(conn, &mut applied)?;
     apply_skill_body_column(conn, &mut applied)?;
     apply_runtime_identity(conn, &mut applied)?;
+    apply_browser_audit(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -10859,6 +11086,64 @@ fn apply_runtime_identity(conn: &mut Connection, applied: &mut Vec<String>) -> V
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record the runtime identity migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Adds the embedded browser's redacted operation ledger and its session-scoped
+/// domain allowlist.
+///
+/// The browser layer has no shared permission policy store to lean on, so a
+/// remembered `AlwaysAllowForSession` decision has to be durable here instead.
+fn apply_browser_audit(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 57;
+    const NAME: &str = "browser_audit";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        -- The redacted browser operation ledger. Page content, form values,
+        -- cookies and screenshots are deliberately NOT stored here.
+        CREATE TABLE IF NOT EXISTS browser_audit_records (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            workspace_id TEXT NULL,
+            agent_session_id TEXT NULL,
+            tab_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            domain TEXT NULL,
+            execution_source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_browser_audit_records_session
+            ON browser_audit_records(session_id, at_ms);
+
+        -- Session-scoped domain allowlist. Domains are stored lowercase so a
+        -- lookup is case-insensitive without a collation. `expires_at_ms` is
+        -- nullable so a future TTL does not need another migration.
+        CREATE TABLE IF NOT EXISTS browser_domain_grants (
+            domain TEXT PRIMARY KEY,
+            origin TEXT NULL,
+            granted_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the embedded browser tables",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the embedded browser migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13164,6 +13449,31 @@ fn map_remote_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteAu
     })
 }
 
+fn map_browser_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserAuditRecord> {
+    Ok(BrowserAuditRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        agent_session_id: row.get(3)?,
+        tab_id: row.get(4)?,
+        kind: row.get(5)?,
+        summary: row.get(6)?,
+        domain: row.get(7)?,
+        execution_source: row.get(8)?,
+        status: row.get(9)?,
+        at_ms: row.get(10)?,
+    })
+}
+
+fn map_browser_domain_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserDomainGrant> {
+    Ok(BrowserDomainGrant {
+        domain: row.get(0)?,
+        origin: row.get(1)?,
+        granted_at_ms: row.get(2)?,
+        expires_at_ms: row.get(3)?,
+    })
+}
+
 fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
         id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
@@ -14230,7 +14540,8 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
-                "56:runtime_identity"
+                "56:runtime_identity",
+                "57:browser_audit"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14371,6 +14682,7 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
+                "57:browser_audit",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14491,7 +14803,8 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
-                "56:runtime_identity"
+                "56:runtime_identity",
+                "57:browser_audit"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -14650,7 +14963,8 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
-                "56:runtime_identity"
+                "56:runtime_identity",
+                "57:browser_audit"
             ]
         );
         assert_eq!(
@@ -16066,7 +16380,8 @@ mod tests {
                 "53:agent_session_title_lock",
                 "54:local_history_import_index",
                 "55:skill_body",
-                "56:runtime_identity"
+                "56:runtime_identity",
+                "57:browser_audit"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -18761,6 +19076,237 @@ mod tests {
 
         drop(conn);
         cleanup_db(temp);
+    }
+
+    #[test]
+    fn browser_audit_migration_reaches_version_57_and_is_idempotent() {
+        let temp = temp_db_path("browser-audit-migration");
+        let mut conn = open_database(&temp).unwrap();
+        let first = apply_migrations(&mut conn).unwrap();
+        assert!(first.iter().any(|entry| entry == "57:browser_audit"));
+        // A second run must be a no-op: the tables already exist and the
+        // migration row is already recorded.
+        let second = apply_migrations(&mut conn).unwrap();
+        assert!(second.is_empty(), "second run applied {second:?}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 57);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn browser_audit_list_for_session_is_most_recent_first_and_limited() {
+        let temp = temp_db_path("browser-audit-list");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        for (index, at_ms) in [1_000_i64, 2_000, 3_000].into_iter().enumerate() {
+            BrowserAuditRepository::insert(
+                &conn,
+                &sample_browser_audit_record(index, "session-a", at_ms),
+            )
+            .unwrap();
+        }
+        BrowserAuditRepository::insert(&conn, &sample_browser_audit_record(9, "session-b", 4_000))
+            .unwrap();
+
+        let listed = BrowserAuditRepository::list_for_session(&conn, "session-a", 10).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].at_ms, 3_000);
+        assert_eq!(listed[1].at_ms, 2_000);
+        assert_eq!(listed[2].at_ms, 1_000);
+
+        let limited = BrowserAuditRepository::list_for_session(&conn, "session-a", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].at_ms, 3_000);
+        assert_eq!(limited[1].at_ms, 2_000);
+
+        let other = BrowserAuditRepository::list_for_session(&conn, "session-b", 10).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].session_id, "session-b");
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn browser_audit_delete_for_session_and_prune_remove_expected_rows() {
+        let temp = temp_db_path("browser-audit-prune");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        for (index, at_ms) in [1_000_i64, 2_000, 3_000].into_iter().enumerate() {
+            BrowserAuditRepository::insert(
+                &conn,
+                &sample_browser_audit_record(index, "session-a", at_ms),
+            )
+            .unwrap();
+        }
+        for (index, at_ms) in [1_000_i64, 2_000].into_iter().enumerate() {
+            BrowserAuditRepository::insert(
+                &conn,
+                &sample_browser_audit_record(10 + index, "session-b", at_ms),
+            )
+            .unwrap();
+        }
+
+        // Keep only the newest record per session: three of the five go away.
+        let pruned = BrowserAuditRepository::prune(&conn, 1).unwrap();
+        assert_eq!(pruned, 3);
+        let remaining_a = BrowserAuditRepository::list_for_session(&conn, "session-a", 10).unwrap();
+        assert_eq!(remaining_a.len(), 1);
+        assert_eq!(remaining_a[0].at_ms, 3_000);
+        let remaining_b = BrowserAuditRepository::list_for_session(&conn, "session-b", 10).unwrap();
+        assert_eq!(remaining_b.len(), 1);
+        assert_eq!(remaining_b[0].at_ms, 2_000);
+        // Pruning again is a no-op once every session is already at the cap.
+        assert_eq!(BrowserAuditRepository::prune(&conn, 1).unwrap(), 0);
+
+        let deleted = BrowserAuditRepository::delete_for_session(&conn, "session-a").unwrap();
+        assert_eq!(deleted, 1);
+        assert!(
+            BrowserAuditRepository::list_for_session(&conn, "session-a", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            BrowserAuditRepository::list_for_session(&conn, "session-b", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            BrowserAuditRepository::delete_for_session(&conn, "session-a").unwrap(),
+            0
+        );
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn browser_audit_round_trips_missing_optional_columns_as_none() {
+        let temp = temp_db_path("browser-audit-none");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let record = BrowserAuditRecord {
+            id: "audit-none".to_string(),
+            session_id: "session-none".to_string(),
+            workspace_id: None,
+            agent_session_id: None,
+            tab_id: "tab-1".to_string(),
+            kind: "navigate".to_string(),
+            summary: "redacted navigation".to_string(),
+            domain: None,
+            execution_source: "agent".to_string(),
+            status: "ok".to_string(),
+            at_ms: 42,
+        };
+        BrowserAuditRepository::insert(&conn, &record).unwrap();
+
+        let listed = BrowserAuditRepository::list_for_session(&conn, "session-none", 10).unwrap();
+        assert_eq!(listed, vec![record]);
+        assert!(listed[0].workspace_id.is_none());
+        assert!(listed[0].agent_session_id.is_none());
+        assert!(listed[0].domain.is_none());
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn browser_domain_grants_upsert_lowercase_expiry_and_clear() {
+        let temp = temp_db_path("browser-domain-grants");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let first = BrowserDomainGrant {
+            domain: "Example.COM".to_string(),
+            origin: Some("https://example.com".to_string()),
+            granted_at_ms: 1_000,
+            expires_at_ms: None,
+        };
+        BrowserDomainGrantRepository::upsert(&conn, &first).unwrap();
+        // A second upsert of the same domain is an update, not a duplicate.
+        let second = BrowserDomainGrant {
+            domain: "example.com".to_string(),
+            origin: Some("https://docs.example.com".to_string()),
+            granted_at_ms: 2_000,
+            expires_at_ms: None,
+        };
+        BrowserDomainGrantRepository::upsert(&conn, &second).unwrap();
+        assert_eq!(
+            BrowserDomainGrantRepository::list(&conn).unwrap(),
+            vec![second]
+        );
+
+        assert!(BrowserDomainGrantRepository::is_granted(&conn, "EXAMPLE.com").unwrap());
+        assert!(BrowserDomainGrantRepository::is_granted(&conn, "example.com").unwrap());
+        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "other.example").unwrap());
+
+        let expired = BrowserDomainGrant {
+            domain: "stale.example".to_string(),
+            origin: None,
+            granted_at_ms: 1_000,
+            expires_at_ms: Some(unix_timestamp_ms() - 1_000),
+        };
+        BrowserDomainGrantRepository::upsert(&conn, &expired).unwrap();
+        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "stale.example").unwrap());
+
+        let future = BrowserDomainGrant {
+            domain: "fresh.example".to_string(),
+            origin: None,
+            granted_at_ms: 1_000,
+            expires_at_ms: Some(unix_timestamp_ms() + 60_000),
+        };
+        BrowserDomainGrantRepository::upsert(&conn, &future).unwrap();
+        assert!(BrowserDomainGrantRepository::is_granted(&conn, "fresh.example").unwrap());
+
+        assert_eq!(
+            BrowserDomainGrantRepository::revoke(&conn, "Stale.Example").unwrap(),
+            1
+        );
+        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "stale.example").unwrap());
+        assert_eq!(
+            BrowserDomainGrantRepository::revoke(&conn, "stale.example").unwrap(),
+            0
+        );
+
+        assert_eq!(BrowserDomainGrantRepository::clear(&conn).unwrap(), 2);
+        assert!(
+            BrowserDomainGrantRepository::list(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "example.com").unwrap());
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    fn sample_browser_audit_record(
+        index: usize,
+        session_id: &str,
+        at_ms: i64,
+    ) -> BrowserAuditRecord {
+        BrowserAuditRecord {
+            id: format!("audit-{index}"),
+            session_id: session_id.to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            agent_session_id: Some("agent-session-1".to_string()),
+            tab_id: "tab-1".to_string(),
+            kind: "navigate".to_string(),
+            summary: "redacted navigation".to_string(),
+            domain: Some("example.com".to_string()),
+            execution_source: "agent".to_string(),
+            status: "ok".to_string(),
+            at_ms,
+        }
     }
 
     fn temp_db_path(label: &str) -> PathBuf {

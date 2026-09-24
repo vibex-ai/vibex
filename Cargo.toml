@@ -15,6 +15,7 @@ members = [
   "crates/core",
   "crates/diagnostics",
   "crates/desktop-model",
+  "crates/browser",
   "crates/desktop-runtime",
   "crates/db",
   "crates/fs",

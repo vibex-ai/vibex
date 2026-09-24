@@ -13,6 +13,7 @@ pub enum ContentSurfaceKind {
     GitDiff,
     GitCommit,
     Terminal,
+    Browser,
     Pdf,
     Office,
 }
@@ -576,5 +577,16 @@ mod tests {
     #[test]
     fn physical_bounds_round_once_at_the_scale_boundary() {
         assert_eq!(bounds().physical_size(), (1200, 750));
+    }
+
+    #[test]
+    fn a_restored_browser_surface_starts_ready_to_load() {
+        let lifecycle = ContentSurfaceLifecycle::restored(
+            ContentSurfaceKind::Browser,
+            ContentSurfaceOrigin::Preview,
+        );
+        assert_eq!(lifecycle.kind(), ContentSurfaceKind::Browser);
+        assert_eq!(lifecycle.phase(), ContentSurfacePhase::ReadyToLoad);
+        assert!(!lifecycle.visible());
     }
 }

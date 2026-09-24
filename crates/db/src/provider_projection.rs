@@ -2185,6 +2185,7 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
+                "57:browser_audit",
             ]
         );
         assert_eq!(

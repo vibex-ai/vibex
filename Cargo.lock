@@ -10016,6 +10016,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "vibex-browser",
  "vibex-core",
  "vibex-desktop-runtime",
 ]
@@ -10030,6 +10031,30 @@ dependencies = [
  "sha2 0.10.9",
  "vibex-core",
  "vibex-db",
+]
+
+[[package]]
+name = "vibex-browser"
+version = "0.1.0-rc.6"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "command-group",
+ "futures-util",
+ "image",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "url",
+ "vibex-core",
 ]
 
 [[package]]
@@ -10133,6 +10158,7 @@ dependencies = [
  "vibex-agent-acp",
  "vibex-app-update",
  "vibex-backend",
+ "vibex-browser",
  "vibex-config-switch",
  "vibex-content",
  "vibex-core",
@@ -10191,6 +10217,7 @@ dependencies = [
  "vibex-agent-acp",
  "vibex-app-update",
  "vibex-backup",
+ "vibex-browser",
  "vibex-config-switch",
  "vibex-core",
  "vibex-db",
@@ -10413,6 +10440,7 @@ dependencies = [
  "qrcode",
  "tokio",
  "vibex-agent",
+ "vibex-browser",
  "vibex-core",
  "vibex-db",
  "vibex-desktop-runtime",

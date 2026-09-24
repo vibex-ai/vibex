@@ -33,6 +33,7 @@ url.workspace = true
 vibex-app-update = { path = "../app-update" }
 vibex-agent = { path = "../agent" }
 vibex-agent-acp = { path = "../agent-acp" }
+vibex-browser = { path = "../browser" }
 vibex-config-switch = { path = "../config-switch" }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }

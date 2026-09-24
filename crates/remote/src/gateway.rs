@@ -1611,6 +1611,11 @@ impl RemoteGateway {
                     RemoteAttachmentKind::Terminal
                     | RemoteAttachmentKind::FileTransfer
                     | RemoteAttachmentKind::Git => RemoteActionClass::ReadProject,
+                    // Watching the embedded browser is a project-scoped read.
+                    // The frame transport itself is not implemented yet, so an
+                    // attach is answered with an explicit resync requirement
+                    // rather than a silent no-op.
+                    RemoteAttachmentKind::Browser => RemoteActionClass::ReadProject,
                     RemoteAttachmentKind::Provider => RemoteActionClass::ReadProviderSettings,
                     RemoteAttachmentKind::Unknown => {
                         return Ok(vec![RemoteJsonMessageV2::Control(
@@ -1669,6 +1674,13 @@ impl RemoteGateway {
                         } else {
                             accepted.snapshot_required = true;
                         }
+                    }
+                    // Remote browser frames are a later phase: the attach is
+                    // accepted so the client can see the domain, and the
+                    // client is told a full resync is required instead of
+                    // waiting forever for frames that will not arrive.
+                    RemoteAttachmentKind::Browser => {
+                        accepted.snapshot_required = true;
                     }
                     RemoteAttachmentKind::AgentTimeline
                     | RemoteAttachmentKind::Git
@@ -3674,6 +3686,7 @@ async fn handle_control(
                 RemoteAttachmentKind::Terminal
                 | RemoteAttachmentKind::FileTransfer
                 | RemoteAttachmentKind::Git => Some(RemoteActionClass::ReadProject),
+                RemoteAttachmentKind::Browser => Some(RemoteActionClass::ReadProject),
                 RemoteAttachmentKind::Provider => Some(RemoteActionClass::ReadProviderSettings),
                 RemoteAttachmentKind::Unknown => None,
             };
@@ -4380,6 +4393,16 @@ async fn handle_active_binary(
             "remote_file_binary_upload_not_enabled",
             "binary file upload is not enabled by this server",
         )),
+        // Browser frames and input are a later phase. Rejecting them with an
+        // explicit capability error is the honest answer: the client learns the
+        // transport is not enabled instead of waiting for frames that never
+        // arrive.
+        RemoteBinaryFrameKind::BrowserFrame | RemoteBinaryFrameKind::BrowserInput => {
+            Err(VibexError::capability(
+                "remote_browser_transport_not_enabled",
+                "the remote browser frame transport is not enabled by this server",
+            ))
+        }
         RemoteBinaryFrameKind::TerminalOutput
         | RemoteBinaryFrameKind::TerminalSnapshot
         | RemoteBinaryFrameKind::FileDownloadChunk

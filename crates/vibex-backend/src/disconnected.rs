@@ -20,13 +20,15 @@ use vibex_core::{
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, GitBranchListResponse, GitCommitDetail,
-    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
-    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    BrowserActionRecord, BrowserAvailability, BrowserSession, BrowserSessionId,
+    BrowserSessionSnapshot, BrowserTab, BrowserTabId, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DiagnosticExportOutcome,
+    DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest, FileReadRequest,
+    FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest,
+    FileWriteRequest, GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest,
+    GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest,
+    GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
     GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
     GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
     GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
@@ -71,9 +73,12 @@ use vibex_core::{
 
 use crate::{
     AgentBackend, BackendCapabilitySnapshot, BackendError, BackendEventSubscription, BackendFacade,
-    BackendFuture, BackendResult, DeviceBackend, FileBackend, GitBackend, ManagementBackend,
-    ManagementProfileSelectionRequest, MutationRequest, RelayStatusSummary, TerminalBackend,
-    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    BackendFuture, BackendResult, BrowserBackend, BrowserDialogResolution, BrowserFrameBatch,
+    BrowserFrameSubscription, BrowserInputRequest, BrowserSessionOpenRequest,
+    BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest, DeviceBackend, FileBackend,
+    GitBackend, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
+    RelayStatusSummary, TerminalBackend, TerminalFrameSubscription, WorkspaceBackend,
+    WorkspaceSummary,
 };
 
 macro_rules! disconnected_future {
@@ -93,6 +98,7 @@ impl DisconnectedBackend {
         let backend = Arc::new(Self);
         BackendFacade::new(
             BackendCapabilitySnapshot::disconnected_v1(),
+            backend.clone(),
             backend.clone(),
             backend.clone(),
             backend.clone(),
@@ -580,6 +586,111 @@ impl TerminalBackend for DisconnectedBackend {
         &self,
         _request: MutationRequest<TerminalId>,
     ) -> BackendFuture<'_, TerminalSession> {
+        disconnected_future!()
+    }
+}
+
+/// Frame subscription for a disconnected client.
+///
+/// `subscribe_browser_frames` reports the shared offline error instead of
+/// handing one out, exactly like the terminal seam, so this type exists for the
+/// wiring that will stream frames once a connection is established. It ends
+/// immediately rather than blocking because there is nothing to wait for.
+pub struct DisconnectedBrowserSubscription {
+    tab_id: BrowserTabId,
+}
+
+impl DisconnectedBrowserSubscription {
+    /// The tab this subscription streams frames for.
+    pub fn tab_id(&self) -> &BrowserTabId {
+        &self.tab_id
+    }
+}
+
+impl BrowserFrameSubscription for DisconnectedBrowserSubscription {
+    fn next(&mut self) -> BackendFuture<'_, Option<BrowserFrameBatch>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+impl BrowserBackend for DisconnectedBackend {
+    fn browser_availability(&self) -> BackendFuture<'_, BrowserAvailability> {
+        disconnected_future!()
+    }
+
+    fn list_browser_sessions(&self) -> BackendFuture<'_, Vec<BrowserSession>> {
+        disconnected_future!()
+    }
+
+    fn browser_session_snapshot(
+        &self,
+        _session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, BrowserSessionSnapshot> {
+        disconnected_future!()
+    }
+
+    fn browser_ledger(
+        &self,
+        _session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, Vec<BrowserActionRecord>> {
+        disconnected_future!()
+    }
+
+    fn ensure_browser_session(
+        &self,
+        _request: MutationRequest<BrowserSessionOpenRequest>,
+    ) -> BackendFuture<'_, BrowserSessionId> {
+        disconnected_future!()
+    }
+
+    fn create_browser_tab(
+        &self,
+        _request: MutationRequest<BrowserTabOpenRequest>,
+    ) -> BackendFuture<'_, BrowserTab> {
+        disconnected_future!()
+    }
+
+    fn close_browser_tab(&self, _request: MutationRequest<BrowserTabId>) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn select_browser_tab(
+        &self,
+        _request: MutationRequest<BrowserTabSelection>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn subscribe_browser_frames(
+        &self,
+        _tab_id: BrowserTabId,
+        _next_sequence: u64,
+    ) -> BackendResult<Box<dyn BrowserFrameSubscription>> {
+        Err(Self::error())
+    }
+
+    fn set_browser_viewport(
+        &self,
+        _request: MutationRequest<BrowserViewportRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn send_browser_input(
+        &self,
+        _request: MutationRequest<BrowserInputRequest>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn resolve_browser_dialog(
+        &self,
+        _request: MutationRequest<BrowserDialogResolution>,
+    ) -> BackendFuture<'_, ()> {
+        disconnected_future!()
+    }
+
+    fn stop_browser_screencast(&self, _tab_id: BrowserTabId) -> BackendFuture<'_, ()> {
         disconnected_future!()
     }
 }
@@ -1386,7 +1497,7 @@ mod tests {
     use crate::CapabilityAvailability;
 
     #[test]
-    fn disconnected_facade_is_offline_in_every_domain() {
+    fn disconnected_facade_is_offline_in_every_remote_domain() {
         let facade = DisconnectedBackend::facade();
         let snapshot = facade.capabilities();
         assert!(
@@ -1402,10 +1513,42 @@ mod tests {
             .into_iter()
             .all(|availability| availability == CapabilityAvailability::Offline)
         );
+        assert_eq!(
+            snapshot.browser.availability,
+            CapabilityAvailability::Unsupported
+        );
         let error = match facade.agent().subscribe() {
             Ok(_) => panic!("disconnected backend unexpectedly subscribed"),
             Err(error) => error,
         };
         assert_eq!(error.code, "remote_runtime_not_configured");
+    }
+
+    #[test]
+    fn disconnected_browser_calls_report_the_shared_offline_error() {
+        let facade = DisconnectedBackend::facade();
+        let error = block_on(facade.browser().browser_availability())
+            .expect_err("disconnected browser availability fails");
+        assert_eq!(error.code, "remote_runtime_not_configured");
+        assert!(matches!(
+            facade
+                .browser()
+                .subscribe_browser_frames(BrowserTabId::new(), 0),
+            Err(error) if error.code == "remote_runtime_not_configured"
+        ));
+    }
+
+    /// Minimal executor so the disconnected seam can be asserted without
+    /// pulling a runtime into the crate's dev-dependencies.
+    fn block_on<T>(future: BackendFuture<'_, T>) -> BackendResult<T> {
+        use std::task::{Context, Poll, Waker};
+
+        let mut future = future;
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("disconnected futures must resolve immediately"),
+        }
     }
 }

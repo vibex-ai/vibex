@@ -25,6 +25,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
+    // The browser MCP stdio sidecar is a stateless bridge to the runtime's own
+    // loopback endpoint, so the headless server serves it from the same binary
+    // that hosts the endpoint.
+    if arguments.len() == 1 && arguments[0] == "--browser-mcp" {
+        if let Err(error) = vibex_browser::stdio::run_browser_mcp_stdio() {
+            eprintln!("Browser MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let command = Command::parse(arguments)?;
     match command {
         Command::Help => print_help(),

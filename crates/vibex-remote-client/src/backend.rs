@@ -7,7 +7,10 @@ use vibex_backend::{
     AgentBackend, AgentModelOwnedCatalogRequest, BACKEND_CAPABILITY_SCHEMA_VERSION,
     BackendCapabilitySnapshot, BackendError, BackendEvent, BackendEventStream,
     BackendEventSubscription, BackendFacade, BackendFuture, BackendOperation, BackendRefetch,
-    BackendResult, DeviceBackend, DomainCapabilities, FileBackend, GitBackend, ManagementBackend,
+    BackendResult, BrowserBackend, BrowserDialogResolution, BrowserFrameBatch,
+    BrowserFrameSubscription, BrowserInputRequest, BrowserSessionOpenRequest,
+    BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest, DeviceBackend,
+    DomainCapabilities, FileBackend, GitBackend, ManagementBackend,
     ManagementProfileSelectionRequest, MutationRequest, RelayStatusSummary, TerminalBackend,
     TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
@@ -34,23 +37,25 @@ use vibex_core::{
     AutomationRunCancelRequest, AutomationRunListRequest, AutomationRunResumeRequest,
     AutomationRunStartRequest, AutomationRunStep, AutomationRunStepListRequest,
     BackupCreateOutcome, BackupCreatePayload, BackupInspectOutcome, BackupInspectPayload,
-    BackupRestoreOutcome, BackupRestorePayload, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DiagnosticExportOutcome,
-    DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest, FileReadRequest,
-    FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest,
-    FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse,
-    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
-    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
-    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
-    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
-    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
-    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    BackupRestoreOutcome, BackupRestorePayload, BrowserActionRecord, BrowserAvailability,
+    BrowserSession, BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId,
+    BrowserUnavailableReason, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, DiagnosticExportOutcome, DiagnosticExportPayload,
+    FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
+    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
+    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
+    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
+    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
+    GitWorktreeRestoreRequest, ManagementSnapshotPayload, MessageSubmissionState,
+    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderConfiguredModel,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -644,6 +649,7 @@ impl WebRemoteBackend {
         let _ = self.capability_snapshot();
         BackendFacade::new_shared(
             self.capabilities.clone(),
+            self.clone(),
             self.clone(),
             self.clone(),
             self.clone(),
@@ -2920,6 +2926,126 @@ impl TerminalFrameSubscription for RemoteTerminalSubscription {
             }
         })
     }
+}
+
+/// The remote browser seam.
+///
+/// Browser frames and input over Remote v2 are an explicit later phase. Every
+/// call therefore reports `remote_browser_unavailable` with the reason, instead
+/// of pretending the operation ran or leaving the panel to wait for frames that
+/// will never arrive. Agent-side browser tools are unaffected: they run inside
+/// the runtime the client is paired with.
+impl BrowserBackend for WebRemoteBackend {
+    fn browser_availability(&self) -> BackendFuture<'_, BrowserAvailability> {
+        Box::pin(async {
+            Ok(BrowserAvailability::unavailable(
+                BrowserUnavailableReason::RemoteRuntimeUnsupported,
+                Some(
+                    "The paired runtime is remote; the live browser view over Remote v2 is not \
+                     implemented yet. Agent browser tools still work."
+                        .to_string(),
+                ),
+            ))
+        })
+    }
+
+    fn list_browser_sessions(&self) -> BackendFuture<'_, Vec<BrowserSession>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn browser_session_snapshot(
+        &self,
+        _session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, BrowserSessionSnapshot> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn browser_ledger(
+        &self,
+        _session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, Vec<BrowserActionRecord>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn ensure_browser_session(
+        &self,
+        _request: MutationRequest<BrowserSessionOpenRequest>,
+    ) -> BackendFuture<'_, BrowserSessionId> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn create_browser_tab(
+        &self,
+        _request: MutationRequest<BrowserTabOpenRequest>,
+    ) -> BackendFuture<'_, BrowserTab> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn close_browser_tab(&self, _request: MutationRequest<BrowserTabId>) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn select_browser_tab(
+        &self,
+        _request: MutationRequest<BrowserTabSelection>,
+    ) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn subscribe_browser_frames(
+        &self,
+        _tab_id: BrowserTabId,
+        _next_sequence: u64,
+    ) -> BackendResult<Box<dyn BrowserFrameSubscription>> {
+        Ok(Box::new(UnavailableBrowserSubscription))
+    }
+
+    fn set_browser_viewport(
+        &self,
+        _request: MutationRequest<BrowserViewportRequest>,
+    ) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn send_browser_input(
+        &self,
+        _request: MutationRequest<BrowserInputRequest>,
+    ) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn resolve_browser_dialog(
+        &self,
+        _request: MutationRequest<BrowserDialogResolution>,
+    ) -> BackendFuture<'_, ()> {
+        Box::pin(async { Err(remote_browser_unavailable()) })
+    }
+
+    fn stop_browser_screencast(&self, _tab_id: BrowserTabId) -> BackendFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A frame subscription that immediately reports there is nothing to stream.
+struct UnavailableBrowserSubscription;
+
+impl BrowserFrameSubscription for UnavailableBrowserSubscription {
+    fn next(&mut self) -> BackendFuture<'_, Option<BrowserFrameBatch>> {
+        // Yielding `None` once is what lets the panel show the reason rather
+        // than spin waiting for a frame.
+        Box::pin(async { Ok(None) })
+    }
+}
+
+fn remote_browser_unavailable() -> BackendError {
+    BackendError::unsupported(
+        "remote_browser_unavailable",
+        "the remote browser transport is not implemented yet",
+    )
+    .with_recovery_hint(
+        "The live browser panel requires a local runtime. Agent browser tools run inside the \
+         paired runtime and are unaffected.",
+    )
 }
 
 impl TerminalBackend for WebRemoteBackend {
@@ -6260,6 +6386,9 @@ fn remote_capabilities_for_grant(
     BackendCapabilitySnapshot {
         schema_version: BACKEND_CAPABILITY_SCHEMA_VERSION.to_string(),
         revision: 1,
+        // Remote browser frames are a later phase, so the domain is reported
+        // unsupported and the panel degrades with an explicit message.
+        browser: DomainCapabilities::unavailable(),
         agent: if has_agent {
             available_filtered([
                 (

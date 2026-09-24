@@ -28,14 +28,16 @@ use vibex_core::{
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
-    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
-    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
-    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    BrowserActionRecord, BrowserAvailability, BrowserSession, BrowserSessionId,
+    BrowserSessionSnapshot, BrowserTab, BrowserTabId, CancelAgentSessionRuntimeSwitchRequest,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DiagnosticExportOutcome,
+    DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest, FileReadRequest,
+    FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest,
+    FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse,
+    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
+    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
+    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -84,10 +86,12 @@ use vibex_desktop_runtime::{
 use crate::{
     AgentBackend, AgentModelOwnedCatalogRequest, BackendCapabilitySnapshot, BackendError,
     BackendEvent, BackendEventStream, BackendEventSubscription, BackendFacade, BackendFuture,
-    BackendOperation, BackendProjection, BackendRefetch, BackendResult, DeviceBackend, FileBackend,
-    GitBackend, ManagementBackend, ManagementProfileSelectionRequest, MutationRequest,
-    RelayConnectionState, RelayStatusSummary, TerminalBackend, TerminalFrame, TerminalFrameBatch,
-    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
+    BackendOperation, BackendProjection, BackendRefetch, BackendResult, BrowserBackend,
+    BrowserDialogResolution, BrowserFrameBatch, BrowserFrameSubscription, BrowserInputRequest,
+    BrowserSessionOpenRequest, BrowserTabOpenRequest, BrowserTabSelection, BrowserViewportRequest,
+    DeviceBackend, FileBackend, GitBackend, ManagementBackend, ManagementProfileSelectionRequest,
+    MutationRequest, RelayConnectionState, RelayStatusSummary, TerminalBackend, TerminalFrame,
+    TerminalFrameBatch, TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 
 #[derive(Clone)]
@@ -124,6 +128,7 @@ impl NativeBackend {
     pub fn facade(self: &Arc<Self>) -> BackendFacade {
         BackendFacade::new(
             self.capability_snapshot(),
+            self.clone(),
             self.clone(),
             self.clone(),
             self.clone(),
@@ -1636,6 +1641,287 @@ impl TerminalBackend for NativeBackend {
         Box::pin(async move {
             request.validate()?;
             runtime.kill_terminal(&request.payload).map_err(Into::into)
+        })
+    }
+}
+
+/// Frame subscription for the embedded browser.
+///
+/// This seam is not wired to `DesktopRuntime::browser()` yet, so the type is not
+/// handed out until that wiring lands; it is kept here so the seam already has
+/// the concrete subscription it will return. Once constructed it ends
+/// immediately instead of blocking, because a tab that is not screencasting has
+/// no frames to wait for.
+pub struct NativeBrowserSubscription {
+    runtime: Arc<DesktopRuntime>,
+    tab_id: BrowserTabId,
+    next_sequence: u64,
+    /// Held only while frames are being taken. The frame pump is cancelled by
+    /// dropping it, which is the same idiom the terminal subscription uses.
+    subscription: Option<vibex_browser::BrowserFrameSubscription>,
+    dropped_frames: u64,
+}
+
+impl NativeBrowserSubscription {
+    /// The tab this subscription streams frames for.
+    pub fn tab_id(&self) -> &BrowserTabId {
+        &self.tab_id
+    }
+}
+
+impl BrowserFrameSubscription for NativeBrowserSubscription {
+    fn next(&mut self) -> BackendFuture<'_, Option<BrowserFrameBatch>> {
+        Box::pin(async move {
+            if self.subscription.is_none() {
+                let service = self.runtime.browser().service().clone();
+                self.subscription = Some(service.subscribe_frames(&self.tab_id).await?);
+            }
+            let Some(subscription) = self.subscription.as_mut() else {
+                return Ok(None);
+            };
+            // Latest-value semantics: the caller always receives the freshest
+            // frame, and frames that arrived while it was busy are counted as
+            // dropped rather than queued. A client that fell behind therefore
+            // has to resynchronise, which `reset_required` reports.
+            let Some(frame) = subscription.next().await else {
+                self.subscription = None;
+                return Ok(None);
+            };
+            let reset_required =
+                frame.sequence > self.next_sequence.saturating_add(1) && self.next_sequence != 0;
+            self.next_sequence = frame.sequence;
+            self.dropped_frames = subscription.dropped_frames();
+            Ok(Some(BrowserFrameBatch {
+                tab_id: self.tab_id.clone(),
+                next_sequence: frame.sequence.saturating_add(1),
+                dropped_frames: self.dropped_frames,
+                reset_required,
+                frame: Some(frame),
+            }))
+        })
+    }
+}
+
+/// Browser seam for the desktop runtime.
+///
+/// The runtime owns the browser process, the CDP connection and the ledger;
+/// this block only forwards. Every method goes through `DesktopRuntime::browser`
+/// so the panel, the backend facade and the remote gateway all see one
+/// authority.
+impl BrowserBackend for NativeBackend {
+    fn browser_availability(&self) -> BackendFuture<'_, BrowserAvailability> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.browser().service().availability().await)
+        })
+    }
+
+    fn list_browser_sessions(&self) -> BackendFuture<'_, Vec<BrowserSession>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.browser().service().sessions().await)
+        })
+    }
+
+    fn browser_session_snapshot(
+        &self,
+        session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, BrowserSessionSnapshot> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .browser()
+                .service()
+                .session_snapshot(&session_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn browser_ledger(
+        &self,
+        session_id: BrowserSessionId,
+    ) -> BackendFuture<'_, Vec<BrowserActionRecord>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            Ok(runtime.browser().service().ledger(&session_id).await)
+        })
+    }
+
+    fn ensure_browser_session(
+        &self,
+        request: MutationRequest<BrowserSessionOpenRequest>,
+    ) -> BackendFuture<'_, BrowserSessionId> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            // The key is the isolation boundary: an Agent session and a
+            // workspace panel never share tabs by accident.
+            let key = match (&payload.agent_session_id, &payload.workspace_id) {
+                (Some(agent_session_id), _) => {
+                    vibex_browser::BrowserSessionKey::Agent(agent_session_id.clone())
+                }
+                (None, Some(workspace_id)) => {
+                    vibex_browser::BrowserSessionKey::Workspace(workspace_id.clone())
+                }
+                (None, None) => vibex_browser::BrowserSessionKey::Anonymous,
+            };
+            runtime
+                .browser()
+                .service()
+                .ensure_session(key, payload.workspace_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn create_browser_tab(
+        &self,
+        request: MutationRequest<BrowserTabOpenRequest>,
+    ) -> BackendFuture<'_, BrowserTab> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            let service = runtime.browser().service().clone();
+            let tab_id = service
+                .create_tab(
+                    &payload.session_id,
+                    payload.url.as_deref(),
+                    vibex_core::BrowserTabOwner::User,
+                )
+                .await?;
+            let snapshot = service.session_snapshot(&payload.session_id).await?;
+            snapshot
+                .session
+                .tabs
+                .into_iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .ok_or_else(|| {
+                    BackendError::failed(
+                        "browser_tab_missing",
+                        "the browser tab vanished immediately after it was created",
+                    )
+                })
+        })
+    }
+
+    fn close_browser_tab(&self, request: MutationRequest<BrowserTabId>) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .browser()
+                .service()
+                .close_tab(&request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn select_browser_tab(
+        &self,
+        request: MutationRequest<BrowserTabSelection>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            runtime
+                .browser()
+                .service()
+                .select_tab(&payload.session_id, &payload.tab_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn subscribe_browser_frames(
+        &self,
+        tab_id: BrowserTabId,
+        next_sequence: u64,
+    ) -> BackendResult<Box<dyn BrowserFrameSubscription>> {
+        Ok(Box::new(NativeBrowserSubscription {
+            runtime: self.runtime.clone(),
+            tab_id,
+            next_sequence,
+            subscription: None,
+            dropped_frames: 0,
+        }))
+    }
+
+    fn set_browser_viewport(
+        &self,
+        request: MutationRequest<BrowserViewportRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            runtime
+                .browser()
+                .service()
+                .set_viewport(
+                    &payload.tab_id,
+                    payload.width,
+                    payload.height,
+                    payload.device_scale_factor,
+                )
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn send_browser_input(
+        &self,
+        request: MutationRequest<BrowserInputRequest>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            let input = crate::browser::payload_to_browser_input(&payload.input);
+            runtime
+                .browser()
+                .service()
+                .dispatch_input(&payload.tab_id, input)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn resolve_browser_dialog(
+        &self,
+        request: MutationRequest<BrowserDialogResolution>,
+    ) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            let payload = request.payload;
+            runtime
+                .browser()
+                .service()
+                .handle_dialog(
+                    &payload.tab_id,
+                    payload.accept,
+                    payload.prompt_text.as_deref(),
+                )
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn stop_browser_screencast(&self, tab_id: BrowserTabId) -> BackendFuture<'_, ()> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime.browser().service().stop_screencast(&tab_id).await;
+            Ok(())
         })
     }
 }
