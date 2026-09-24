@@ -50032,7 +50032,7 @@ impl VibexWorkbench {
                 "/",
             ),
             Some(AgentCommandTrigger::Dollar) => (
-                locale::text("Skills", "技能", "技能"),
+                locale::text("Skills", "Skill", "Skill"),
                 IconName::BookOpen,
                 "$",
             ),
@@ -65136,19 +65136,10 @@ impl FoundationSettings {
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .child(format!(
-                                "{} {notes_version}",
-                                locale::text(
-                                    "What's new in Vibex",
-                                    "Vibex 更新内容",
-                                    "Vibex 更新內容"
-                                )
-                            )),
-                    )
+                    .child(div().text_xs().font_medium().child(format!(
+                        "{} {notes_version}",
+                        locale::text("What's new in Vibex", "Vibex 更新内容", "Vibex 更新內容")
+                    )))
                     .child(
                         div()
                             .id("about-release-notes")
