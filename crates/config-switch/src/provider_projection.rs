@@ -43,6 +43,11 @@ const PROJECTION_FINGERPRINT_DOMAIN: &str = "vibex/provider-projection-plan/v1";
 const PROJECTION_RUNTIME_DIR: &str = "provider-projections";
 const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_SECRET_ENV: &str = "VIBEX_OPENCODE_PROVIDER_API_KEY";
+/// Vibex-managed OpenCode primary agent. The `opencode acp` server advertises
+/// every primary agent as a session mode, so this is how Vibex exposes an
+/// explicit auto-accept choice in the Agent session mode selector. The name is
+/// namespaced to avoid colliding with user-defined agents.
+const OPENCODE_AUTO_ACCEPT_AGENT_ID: &str = "vibex-auto";
 const CODEX_MODEL_PROVIDER_ENV: &str = "MODEL_PROVIDER";
 const CODEX_DEFAULT_AUTH_REQUEST_ENV: &str = "DEFAULT_AUTH_REQUEST";
 const CODEX_DEFAULT_API_KEY_AUTH_REQUEST: &str = r#"{"methodId":"api-key"}"#;
@@ -2192,6 +2197,28 @@ fn opencode_overlay(
     root.insert(
         "enabled_providers".to_string(),
         serde_json::to_value(enabled_providers).map_err(encode_error)?,
+    );
+    // OpenCode resolves permissions per agent and gives agent rules precedence
+    // over global rules. This agent only unlocks the tools that commonly prompt;
+    // `read` (which carries the built-in `.env` deny), `external_directory`, and
+    // `doom_loop` are intentionally left unset so their safety defaults survive.
+    let mut auto_accept_agent = serde_json::Map::new();
+    auto_accept_agent.insert(
+        OPENCODE_AUTO_ACCEPT_AGENT_ID.to_string(),
+        serde_json::json!({
+            "description": "Auto-accept file edits and shell commands. Vibex-managed; paths outside the workspace and repeated-tool-loop guards still ask.",
+            "mode": "primary",
+            "permission": {
+                "edit": "allow",
+                "bash": "allow",
+                "webfetch": "allow",
+                "websearch": "allow"
+            }
+        }),
+    );
+    root.insert(
+        "agent".to_string(),
+        serde_json::Value::Object(auto_accept_agent),
     );
     if let Some(default_model) = provider.default_model_id.as_deref() {
         let qualified = binding
@@ -6354,6 +6381,48 @@ mod tests {
             overlay["provider"]["fake"]["models"]["model-a"]["name"],
             "Model A"
         );
+    }
+
+    #[test]
+    fn opencode_overlay_exposes_vibex_auto_accept_agent() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let agent = &overlay["agent"][OPENCODE_AUTO_ACCEPT_AGENT_ID];
+
+        // `opencode acp` advertises primary agents as session modes, so the
+        // agent must stay primary and carry a user-facing description.
+        assert_eq!(agent["mode"], "primary");
+        assert!(agent["description"].as_str().is_some_and(|v| !v.is_empty()));
+
+        assert_eq!(agent["permission"]["edit"], "allow");
+        assert_eq!(agent["permission"]["bash"], "allow");
+        assert_eq!(agent["permission"]["webfetch"], "allow");
+        assert_eq!(agent["permission"]["websearch"], "allow");
+
+        // Safety guards and the `.env` read deny must keep their OpenCode
+        // defaults, so these keys must never be written.
+        assert!(agent["permission"].get("read").is_none());
+        assert!(agent["permission"].get("external_directory").is_none());
+        assert!(agent["permission"].get("doom_loop").is_none());
+    }
+
+    #[test]
+    fn opencode_overlay_auto_accept_agent_coexists_with_provider_projection() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::OpenCodeInlineProvider);
+        let endpoint = provider.endpoints.first().unwrap();
+
+        let content = opencode_overlay(&provider, &binding, Some(endpoint)).unwrap();
+        let overlay: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // The overlay adds the agent alongside the provider projection instead
+        // of replacing any of it.
+        assert!(overlay["provider"]["fake"].is_object());
+        assert!(overlay["enabled_providers"].is_array());
+        assert_eq!(overlay["$schema"], "https://opencode.ai/config.json");
+        assert!(overlay["agent"][OPENCODE_AUTO_ACCEPT_AGENT_ID].is_object());
     }
 
     #[test]

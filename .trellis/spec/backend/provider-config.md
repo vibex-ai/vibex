@@ -3766,6 +3766,18 @@ ProviderConfigService::{
   configured model without a display name is emitted as an empty model object;
   OpenCode accepts `name: string | undefined` and rejects `name: null` before
   the ACP handshake.
+- The OpenCode inline-provider overlay also injects one Vibex-managed primary
+  agent, `vibex-auto`, because `opencode acp` advertises every primary agent as
+  an ACP session mode. That is the only config-only route to an auto-accept
+  choice in Vibex's mode selector, since `opencode acp` rejects the TUI's
+  `--auto` flag. The agent allows `edit`, `bash`, `webfetch`, and `websearch`,
+  and deliberately leaves `read` (which carries the built-in `.env` deny),
+  `external_directory`, and `doom_loop` unset so their safety defaults survive.
+  OpenCode merges config sources, so the agent is added alongside — never in
+  place of — the user's own agents. Agent rules outrank global rules, so
+  selecting the mode overrides the user's `ask`/`deny` rules for those four
+  tools, which is a deliberate divergence from `--auto`'s respect for explicit
+  denies.
 - Product state uses `provider_model_id` as the canonical model identity. The
   projection engine is the only owner of configured product-model to
   Agent-runtime-model translation. For OpenCode it qualifies the model with
