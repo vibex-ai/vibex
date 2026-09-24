@@ -31898,7 +31898,13 @@ impl VibexWorkbench {
             .size(px(32.0))
             .px_0()
             .tooltip(tooltip)
-            .child(Icon::new(IconName::ArrowDown).size(px(18.0)));
+            // Green marks the entry as "an update is waiting", which is the only
+            // state this trigger is rendered in.
+            .child(
+                Icon::new(IconName::ArrowDown)
+                    .size(px(18.0))
+                    .text_color(cx.theme().success),
+            );
         div()
             .flex_none()
             .child(
@@ -61033,6 +61039,12 @@ struct FoundationSettings {
     /// Release notes selected for the About page, kept across frames so the
     /// Markdown source is not re-selected and re-compared on every render.
     about_notes: Option<AboutReleaseNotes>,
+    /// Scroll state of the About release-notes box.
+    ///
+    /// The box is a nested scroll surface inside the settings page, so it has
+    /// to know whether it can scroll at all: when it can, its wheel handler
+    /// keeps the page from scrolling underneath it.
+    about_notes_scroll: ScrollHandle,
 }
 
 /// Localized release-notes source currently shown on the About page.
@@ -61339,6 +61351,7 @@ impl FoundationSettings {
                 shortcut_note: None,
                 active_section: SettingsSection::General,
                 about_notes: None,
+                about_notes_scroll: ScrollHandle::new(),
             }
         })
     }
@@ -61366,7 +61379,22 @@ impl FoundationSettings {
     /// The check is throttled so flipping between sections does not start one
     /// per visit, and it is skipped while a release is already known or an
     /// operation is in flight: those states own the page until the user acts.
+    ///
+    /// The work itself is deferred one tick: About can be activated while the
+    /// workbench entity is already being updated (the title-bar update panel
+    /// and the command palette both do), and reading or updating that entity
+    /// from inside its own update panics with "cannot read
+    /// `vibex_desktop::app::VibexWorkbench` while it is already being updated".
     fn request_about_update_check(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let _ = this.update(cx, |this, cx| this.run_about_update_check(cx));
+            },
+        )
+        .detach();
+    }
+
+    fn run_about_update_check(&mut self, cx: &mut Context<Self>) {
         const ABOUT_CHECK_THROTTLE_MS: i64 = 60_000;
         let Some((state, last_successful_check_ms)) = self
             .workbench
@@ -65018,6 +65046,7 @@ impl FoundationSettings {
         let card = theme::semantic_color("card", is_dark);
         let title = locale::text("Software update", "软件更新", "軟體更新");
         let (target_anchor, is_highlighted) = settings_row_anchor(title, cx);
+        let notes_scroll = self.about_notes_scroll.clone();
 
         let mut body = v_flex().w_full().min_w_0().gap_3();
         if let Some(release) = release {
@@ -65034,11 +65063,20 @@ impl FoundationSettings {
                     format!("{} · {}", format_bytes(artifact.size), artifact.package),
                 ));
             }
+            // The facts sit in a grid rather than a wrapping flex row. A wrap
+            // row's automatic minimum height is derived from its min-content
+            // width, where every label wraps onto its own line: the item then
+            // demanded a few hundred pixels of height and the card grew a blank
+            // band above the notes. Grid columns shrink instead, wrapping the
+            // text inside the cell, so the row is always as tall as its tallest
+            // cell.
+            let facts_columns = facts.len().max(1) as u16;
             body = body.child(
-                h_flex()
+                div()
                     .w_full()
                     .min_w_0()
-                    .flex_wrap()
+                    .grid()
+                    .grid_cols(facts_columns)
                     .gap_x_6()
                     .gap_y_2()
                     .children(facts.into_iter().map(|(label, value)| {
@@ -65070,17 +65108,40 @@ impl FoundationSettings {
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .child(div().text_xs().font_medium().child(format!(
-                        "{} {notes_version}",
-                        locale::text("What's new in Vibex", "Vibex 更新内容", "Vibex 更新內容")
-                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .child(format!(
+                                "{} {notes_version}",
+                                locale::text(
+                                    "What's new in Vibex",
+                                    "Vibex 更新内容",
+                                    "Vibex 更新內容"
+                                )
+                            )),
+                    )
                     .child(
                         div()
                             .id("about-release-notes")
                             .w_full()
                             .min_w_0()
                             .max_h(px(320.0))
+                            .track_scroll(&notes_scroll)
                             .overflow_y_scroll()
+                            .on_scroll_wheel({
+                                let notes_scroll = notes_scroll.clone();
+                                move |_, _, cx: &mut App| {
+                                    // The settings page is a scroll container
+                                    // above this box and GPUI bubbles a wheel
+                                    // event through every scrollable ancestor.
+                                    // Consume it while the box has somewhere to
+                                    // scroll so the page stays where it is.
+                                    if notes_scroll.max_offset().y > px(0.0) {
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            })
                             .rounded(px(8.0))
                             .border_1()
                             .border_color(border.opacity(0.5))
