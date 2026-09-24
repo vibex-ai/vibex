@@ -57,10 +57,11 @@ use serde::Deserialize;
 use vibex_core::{
     AgentId, MAX_MARKET_RESPONSE_BYTES, MAX_SKILL_MARKET_DOCUMENT_BYTES, MarketEnvRequirement,
     McpMarketEntry, McpMarketInstallRequest, McpMarketInstallResult, McpMarketSearchRequest,
-    McpMarketSearchResponse, McpServerTransportKind, ProviderKind, SkillCreateRequest,
-    SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry, SkillMarketInstallRequest,
-    SkillMarketInstallResult, SkillMarketSearchRequest, SkillMarketSearchResponse, SkillScopeKind,
-    SkillSourceKind, SkillStatus, VibexError, VibexResult,
+    McpMarketSearchResponse, McpMarketTransportFilter, McpServerTransportKind, ProviderKind,
+    SkillCreateRequest, SkillMarketDocument, SkillMarketDocumentRequest, SkillMarketEntry,
+    SkillMarketInstallRequest, SkillMarketInstallResult, SkillMarketSearchRequest,
+    SkillMarketSearchResponse, SkillScopeKind, SkillSourceKind, SkillStatus, VibexError,
+    VibexResult,
 };
 use vibex_db::{McpServerRepository, SkillRepository};
 
@@ -116,9 +117,22 @@ const MCP_CATALOG_WAIT: Duration = Duration::from_secs(12);
 /// Pause between background pages, so indexing stays a polite trickle.
 const MCP_CATALOG_FILL_PAUSE: Duration = Duration::from_millis(250);
 /// Entries the cache will hold before the indexer stops walking.
-const MCP_CATALOG_MAX_ENTRIES: usize = 4_000;
+///
+/// The registry publishes far more servers than a single response can carry —
+/// a walk of it passed 26,000 entries without reaching the end — and the market
+/// is supposed to answer from the whole catalog rather than from a sample of
+/// it. The ceiling is therefore set well above the registry's current size; the
+/// cost of the extra reach is memory in the index (roughly 30 MB at the cap)
+/// rather than latency in a request, because the walk is a background trickle.
+const MCP_CATALOG_MAX_ENTRIES: usize = 40_000;
 /// A catalog older than this is walked again from the registry's first page.
-const MCP_CATALOG_TTL: Duration = Duration::from_secs(30 * 60);
+///
+/// The TTL has to outlast a full walk, or the catalog would be thrown away
+/// almost as soon as it was complete: the registry answers about one page of
+/// 100 entries every few seconds, so covering tens of thousands of entries is
+/// a matter of tens of minutes. Six hours keeps a complete catalog usable for
+/// a working day without pretending a day-old one is current.
+const MCP_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// The indexer stops once nothing has asked for the market for this long, so
 /// closing the view ends the network activity rather than leaving it running.
 const MCP_CATALOG_IDLE: Duration = Duration::from_secs(120);
@@ -1000,6 +1014,8 @@ struct McpCatalogWindow {
 fn mcp_catalog_wait_for_window(
     deadline: Instant,
     query: &str,
+    transport: Option<McpMarketTransportFilter>,
+    offset: usize,
     limit: usize,
     mut ready: impl FnMut(&McpCatalogIndex) -> bool,
 ) -> McpCatalogWindow {
@@ -1007,18 +1023,22 @@ fn mcp_catalog_wait_for_window(
         {
             let index = mcp_catalog_lock();
             if ready(&index) || Instant::now() >= deadline {
-                let total_matches = index
+                // One pass: every match is counted, and the ones inside the
+                // requested window are cloned. The count is taken before the
+                // offset is applied because it is what the caller's pager
+                // divides into pages, not what is left after the skip.
+                let mut total_matches = 0usize;
+                let mut entries = Vec::new();
+                for entry in index
                     .entries
                     .iter()
-                    .filter(|entry| mcp_entry_matches(entry, query))
-                    .count();
-                let entries = index
-                    .entries
-                    .iter()
-                    .filter(|entry| mcp_entry_matches(entry, query))
-                    .take(limit)
-                    .cloned()
-                    .collect();
+                    .filter(|entry| mcp_entry_matches(entry, query, transport))
+                {
+                    if total_matches >= offset && entries.len() < limit {
+                        entries.push(entry.clone());
+                    }
+                    total_matches += 1;
+                }
                 return McpCatalogWindow {
                     entries,
                     total_matches,
@@ -1037,7 +1057,14 @@ fn mcp_catalog_wait_for_window(
 /// The registry's own search matches names only, which is why a query for what
 /// a server does — "database", "screenshot" — finds nothing there. Matching the
 /// description and publisher too is what makes the market's search worth using.
-fn mcp_entry_matches(entry: &McpMarketEntry, query: &str) -> bool {
+fn mcp_entry_matches(
+    entry: &McpMarketEntry,
+    query: &str,
+    transport: Option<McpMarketTransportFilter>,
+) -> bool {
+    if transport.is_some_and(|filter| !filter.matches(entry.transport)) {
+        return false;
+    }
     if query.is_empty() {
         return true;
     }
@@ -1070,6 +1097,8 @@ fn search_mcp_catalog(request: &McpMarketSearchRequest) -> VibexResult<McpMarket
         .limit
         .unwrap_or(MCP_REGISTRY_PAGE_SIZE)
         .clamp(1, MAX_ENTRIES_PER_SEARCH as u32) as usize;
+    let offset = request.offset.unwrap_or(0) as usize;
+    let transport = request.transport;
     let extend = request.extend.unwrap_or(false);
 
     // A caller that did not ask to extend only needs the index to hold
@@ -1088,7 +1117,7 @@ fn search_mcp_catalog(request: &McpMarketSearchRequest) -> VibexResult<McpMarket
     mcp_catalog_ensure_walker();
 
     let deadline = Instant::now() + MCP_CATALOG_WAIT;
-    let window = mcp_catalog_wait_for_window(deadline, &query, limit, |index| {
+    let window = mcp_catalog_wait_for_window(deadline, &query, transport, offset, limit, |index| {
         index.exhausted
             || index.entries.len() >= wanted
             || index.entries.len() >= MCP_CATALOG_MAX_ENTRIES
@@ -2029,11 +2058,23 @@ mod tests {
             version: Some("1.0.0".to_string()),
             package_kind: Some("remote".to_string()),
         };
-        assert!(mcp_entry_matches(&entry, ""));
-        assert!(mcp_entry_matches(&entry, "browser"));
-        assert!(mcp_entry_matches(&entry, "screenshot"));
-        assert!(mcp_entry_matches(&entry, "io.example"));
-        assert!(!mcp_entry_matches(&entry, "database"));
+        assert!(mcp_entry_matches(&entry, "", None));
+        assert!(mcp_entry_matches(&entry, "browser", None));
+        assert!(mcp_entry_matches(&entry, "screenshot", None));
+        assert!(mcp_entry_matches(&entry, "io.example", None));
+        assert!(!mcp_entry_matches(&entry, "database", None));
+        // The transport filter is a narrowing of its own: a remote entry is
+        // not a local one, whatever the query says.
+        assert!(mcp_entry_matches(
+            &entry,
+            "",
+            Some(McpMarketTransportFilter::Remote)
+        ));
+        assert!(!mcp_entry_matches(
+            &entry,
+            "",
+            Some(McpMarketTransportFilter::Local)
+        ));
     }
 
     #[test]
@@ -2177,6 +2218,7 @@ mod tests {
             query: None,
             limit: Some(100),
             offset: None,
+            transport: None,
             extend: Some(true),
         })
         .expect("the live registry answers a browse");
@@ -2206,6 +2248,7 @@ mod tests {
             query: Some(needle.clone()),
             limit: Some(50),
             offset: None,
+            transport: None,
             extend: Some(true),
         })
         .expect("the live registry answers a search");
@@ -2218,7 +2261,7 @@ mod tests {
             search
                 .entries
                 .iter()
-                .any(|entry| mcp_entry_matches(entry, &needle))
+                .any(|entry| mcp_entry_matches(entry, &needle, None))
         );
     }
 

@@ -128,6 +128,14 @@ pub struct McpMarketSearchRequest {
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+    /// Narrow the answer to one transport family, before the page is cut.
+    ///
+    /// The filter is applied by the index rather than by the caller because the
+    /// caller only ever holds one page: filtering a page after it was cut would
+    /// leave holes in the list and a count that does not match what is on
+    /// screen.
+    #[serde(default)]
+    pub transport: Option<McpMarketTransportFilter>,
     /// Ask the runtime to walk further into the registry before answering.
     ///
     /// The registry is browsed one cursor page at a time and the pages are
@@ -137,6 +145,29 @@ pub struct McpMarketSearchRequest {
     /// that is known to be too small.
     #[serde(default)]
     pub extend: Option<bool>,
+}
+
+/// Which transport family a market search is narrowed to.
+///
+/// `http` and `sse` share one answer: from a user's side both are a remote
+/// service, and two names for one decision would be a worse filter than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpMarketTransportFilter {
+    /// A server Vibex runs as a local process.
+    Local,
+    /// A server Vibex connects to over the network.
+    Remote,
+}
+
+impl McpMarketTransportFilter {
+    /// Whether an entry belongs to the filtered family.
+    pub fn matches(self, transport: McpServerTransportKind) -> bool {
+        match self {
+            Self::Local => transport == McpServerTransportKind::Stdio,
+            Self::Remote => transport != McpServerTransportKind::Stdio,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

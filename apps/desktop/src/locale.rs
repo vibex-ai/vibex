@@ -454,7 +454,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             open_workspace: "打开工作区",
             no_preview: "暂无预览",
             no_workspace_files: "暂无工作区文件",
-            message_agent: "输入 / 唤出命令，@ 引用工作区文件，$ 调用技能，↑/↓ 调取历史消息",
+            message_agent: "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill，↑/↓ 调取历史消息",
             agent_loading_session: "正在加载会话...",
             agent_start_conversation: "开始对话",
             agent_select_session: "创建或选择会话",
@@ -467,7 +467,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             agent_collapse_process: "收起推理过程",
             new_session_slogan: "开始新的工作",
             new_session_description: "从项目目录或临时工作区创建一个新的会话",
-            new_session_prompt_placeholder: "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用技能",
+            new_session_prompt_placeholder: "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用 Skill",
             new_session_project_label: "项目目录",
             new_session_project_placeholder: "可选：输入或粘贴项目目录路径",
             new_session_search_project: "搜索项目...",
@@ -649,7 +649,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             open_workspace: "開啟工作區",
             no_preview: "暫無預覽",
             no_workspace_files: "暫無工作區檔案",
-            message_agent: "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫技能，↑/↓ 調取歷史訊息",
+            message_agent: "輸入 / 喚出命令，@ 引用工作區檔案，$ 呼叫 Skill，↑/↓ 調取歷史訊息",
             agent_loading_session: "正在載入會話...",
             agent_start_conversation: "開始對話",
             agent_select_session: "建立或選擇會話",
@@ -662,7 +662,7 @@ pub fn strings(locale: ResolvedLocale) -> Strings {
             agent_collapse_process: "收起推理過程",
             new_session_slogan: "開始新的工作",
             new_session_description: "從專案目錄或臨時工作區建立一個新的會話。",
-            new_session_prompt_placeholder: "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫技能",
+            new_session_prompt_placeholder: "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫 Skill",
             new_session_project_label: "專案目錄",
             new_session_project_placeholder: "可選：輸入或貼上專案目錄路徑",
             new_session_search_project: "搜尋專案...",
@@ -1060,8 +1060,8 @@ const ERROR_MESSAGES: &[MessageTranslation] = &[
     },
     MessageTranslation {
         en: "Skill was not found",
-        zh_cn: "未找到技能",
-        zh_tw: "找不到技能",
+        zh_cn: "未找到 Skill",
+        zh_tw: "找不到 Skill",
     },
     MessageTranslation {
         en: "Select exactly two nodes to create an edge",
@@ -1393,8 +1393,8 @@ const ERROR_PREFIXES: &[MessageTranslation] = &[
     },
     MessageTranslation {
         en: "Skill validation task failed: ",
-        zh_cn: "技能验证任务失败：",
-        zh_tw: "技能驗證任務失敗：",
+        zh_cn: "Skill 验证任务失败：",
+        zh_tw: "Skill 驗證任務失敗：",
     },
     MessageTranslation {
         en: "management action failed: ",
@@ -1438,13 +1438,13 @@ const ERROR_PREFIXES: &[MessageTranslation] = &[
     },
     MessageTranslation {
         en: "Skill discovery failed: ",
-        zh_cn: "技能探测失败：",
-        zh_tw: "技能探測失敗：",
+        zh_cn: "Skill 探测失败：",
+        zh_tw: "Skill 探測失敗：",
     },
     MessageTranslation {
         en: "Skill import failed: ",
-        zh_cn: "技能导入失败：",
-        zh_tw: "技能匯入失敗：",
+        zh_cn: "Skill 导入失败：",
+        zh_tw: "Skill 匯入失敗：",
     },
     MessageTranslation {
         en: "Graph save failed: ",
@@ -1704,7 +1704,7 @@ mod tests {
         assert_eq!(strings(ResolvedLocale::ZhTw).undo_changes, "撤銷變更");
         assert_eq!(
             strings(ResolvedLocale::ZhCn).message_agent,
-            "输入 / 唤出命令，@ 引用工作区文件，$ 调用技能，↑/↓ 调取历史消息"
+            "输入 / 唤出命令，@ 引用工作区文件，$ 调用 Skill，↑/↓ 调取历史消息"
         );
         assert_eq!(
             strings(ResolvedLocale::En).message_agent,
@@ -1754,11 +1754,11 @@ mod tests {
         );
         assert_eq!(
             strings(ResolvedLocale::ZhCn).new_session_prompt_placeholder,
-            "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用技能"
+            "描述你的任务，或输入 / 唤出命令、@ 引用文件、$ 调用 Skill"
         );
         assert_eq!(
             strings(ResolvedLocale::ZhTw).new_session_prompt_placeholder,
-            "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫技能"
+            "描述你的任務，或輸入 / 喚出命令、@ 引用檔案、$ 呼叫 Skill"
         );
     }
 

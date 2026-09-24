@@ -13,8 +13,8 @@ use std::time::Duration;
 use gpui::{
     AccessibleAction, Anchor, AnyElement, App, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Rems, Render, Role, SharedString, StatefulInteractiveElement as _, Subscription,
-    Task, WeakEntity, Window, div, prelude::*, px, rems,
+    Orientation, Rems, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Subscription, Task, WeakEntity, Window, div, prelude::*, px, rems,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, Size,
@@ -185,6 +185,10 @@ enum McpMarketRequest {
     /// The user pressed Search or Enter: a fresh result set, and the runtime
     /// is asked to widen its index before answering.
     Search,
+    /// The user picked another page. The result set is the same one, so the
+    /// page stays where the user put it and the Search button keeps its rest
+    /// state rather than flashing for a request nobody typed.
+    Page,
     /// A poll that picks up entries the index gained since the last reply. The
     /// result set is the same one, so the page in view must not move.
     Poll,
@@ -198,7 +202,7 @@ impl McpMarketRequest {
 
     /// Whether this starts a new result set, which is what resets the page.
     fn starts_a_new_result_set(self) -> bool {
-        !matches!(self, McpMarketRequest::Poll)
+        matches!(self, McpMarketRequest::Open | McpMarketRequest::Search)
     }
 }
 
@@ -336,10 +340,10 @@ fn management_copy() -> ManagementCopy {
         ResolvedLocale::ZhCn => ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
-            skills: "技能",
+            skills: "Skill",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
-            search_skills: "搜索技能",
+            search_skills: "搜索 Skill",
             add_configuration: "添加配置",
             import_configuration: "导入已有配置",
             provider_configuration: "模型供应商配置",
@@ -348,15 +352,15 @@ fn management_copy() -> ManagementCopy {
             no_profiles: "暂无模型供应商配置",
             no_profiles_description: "为当前 Agent 添加或导入配置。",
             import_mcp: "导入已有 MCP",
-            import_skill: "导入已有技能",
+            import_skill: "导入已有 Skill",
         },
         ResolvedLocale::ZhTw => ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
-            skills: "技能",
+            skills: "Skill",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
-            search_skills: "搜尋技能",
+            search_skills: "搜尋 Skill",
             add_configuration: "新增配置",
             import_configuration: "匯入既有配置",
             provider_configuration: "模型供應商配置",
@@ -365,7 +369,7 @@ fn management_copy() -> ManagementCopy {
             no_profiles: "暫無模型供應商配置",
             no_profiles_description: "為目前 Agent 新增或匯入配置。",
             import_mcp: "匯入已有 MCP",
-            import_skill: "匯入已有技能",
+            import_skill: "匯入已有 Skill",
         },
     }
 }
@@ -803,17 +807,22 @@ pub struct ManagementCenter {
     /// Whether the MCP market view is showing in place of the server list.
     mcp_market_open: bool,
     mcp_market_query: Entity<InputState>,
+    /// The page of the index the grid is showing, as the runtime cut it.
     mcp_market_entries: Vec<vibex_core::McpMarketEntry>,
-    /// How many of the fetched entries the grid is revealing.
-    ///
-    /// The registry is paged by a forward-only cursor and the fetch already
-    /// holds a whole window, so browsing is a matter of showing more of what is
-    /// in hand rather than asking for a page number nobody can honour.
+    /// Which page the grid is on. The runtime is asked for this page by offset,
+    /// so the view never holds more than the screen it is showing.
     mcp_market_page: usize,
     /// Transport the grid is filtered to; `None` shows every kind.
     mcp_market_transport: Option<MarketTransportFilter>,
-    /// True when the registry holds entries beyond the fetched window.
+    /// True when the registry holds entries beyond what is indexed.
     mcp_market_has_more: bool,
+    /// How many entries the index matched for the current query and filter,
+    /// across every page. The grid pages through this number rather than
+    /// through whatever one request happened to return.
+    mcp_market_total: usize,
+    /// The MCP grid's scroll offset, so a page change can return to the top
+    /// instead of dropping the reader into the middle of the new page.
+    mcp_market_scroll: ScrollHandle,
     mcp_market_loading: bool,
     mcp_market_error: Option<String>,
     /// Bumped for every market request, so a reply that lost the race cannot
@@ -830,8 +839,10 @@ pub struct ManagementCenter {
     skill_market_open: bool,
     skill_market_query: Entity<InputState>,
     skill_market_entries: Vec<vibex_core::SkillMarketEntry>,
-    /// How many of the fetched entries the grid is revealing.
+    /// Which page of the fetched window the grid is showing.
     skill_market_page: usize,
+    /// The Skill grid's scroll offset, so a page change can return to the top.
+    skill_market_scroll: ScrollHandle,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
     /// Entry the install form is configuring; `None` while browsing.
@@ -1014,8 +1025,8 @@ impl ManagementCenter {
         let skill_market_query = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Search the Skill market",
-                "搜索技能市场",
-                "搜尋技能市場",
+                "搜索 Skill 市场",
+                "搜尋 Skill 市場",
             ))
         });
         let mcp_name_draft = cx.new(|cx| {
@@ -1065,8 +1076,8 @@ impl ManagementCenter {
         let skill_name_draft = cx.new(|cx| {
             InputState::new(window, cx).placeholder(management_locale_text(
                 "Skill name",
-                "技能名称",
-                "技能名稱",
+                "Skill 名称",
+                "Skill 名稱",
             ))
         });
         let skill_description_draft = cx.new(|cx| {
@@ -1079,8 +1090,8 @@ impl ManagementCenter {
         let skill_body_draft = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(management_locale_text(
                 "Skill instructions.",
-                "技能说明。",
-                "技能說明。",
+                "Skill 说明。",
+                "Skill 說明。",
             ))
         });
         let profile_name = cx.new(|cx| {
@@ -1611,6 +1622,8 @@ impl ManagementCenter {
             mcp_market_page: 1,
             mcp_market_transport: None,
             mcp_market_has_more: false,
+            mcp_market_total: 0,
+            mcp_market_scroll: ScrollHandle::new(),
             mcp_market_loading: false,
             mcp_market_error: None,
             mcp_market_generation: 0,
@@ -1622,6 +1635,7 @@ impl ManagementCenter {
             skill_market_query,
             skill_market_entries: Vec::new(),
             skill_market_page: 1,
+            skill_market_scroll: ScrollHandle::new(),
             skill_market_loading: false,
             skill_market_error: None,
             skill_market_install_target: None,
@@ -5869,8 +5883,8 @@ impl ManagementCenter {
                                             Ok(management_locale_text_for(
                                                 active_locale,
                                                 "Skill deleted",
-                                                "技能已删除",
-                                                "技能已刪除",
+                                                "Skill 已删除",
+                                                "Skill 已刪除",
                                             )
                                             .into())
                                         },
@@ -7526,7 +7540,7 @@ impl ManagementCenter {
         let display_name = self.skill_name_draft.read(cx).value().trim().to_string();
         if display_name.is_empty() {
             self.error = Some(
-                management_error_text("A Skill needs a name", "技能需要名称", "技能需要名稱")
+                management_error_text("A Skill needs a name", "Skill 需要名称", "Skill 需要名稱")
                     .into(),
             );
             cx.notify();
@@ -7543,8 +7557,8 @@ impl ManagementCenter {
             self.error = Some(
                 management_error_text(
                     "A Skill needs instructions",
-                    "技能需要说明内容",
-                    "技能需要說明內容",
+                    "Skill 需要说明内容",
+                    "Skill 需要說明內容",
                 )
                 .into(),
             );
@@ -7611,8 +7625,8 @@ impl ManagementCenter {
                 Ok(management_locale_text_for(
                     active_locale,
                     "Skill saved",
-                    "技能已保存",
-                    "技能已儲存",
+                    "Skill 已保存",
+                    "Skill 已儲存",
                 )
                 .to_string())
             },
@@ -7735,6 +7749,7 @@ impl ManagementCenter {
         // shown here is whatever it has already walked; the window is cleared
         // only so the first reply is what fills it in.
         self.mcp_market_entries.clear();
+        self.mcp_market_total = 0;
         self.mcp_market_page = 1;
         self.mcp_market_transport = None;
         // Opening the view must not wait on the registry: whatever the runtime
@@ -7769,14 +7784,22 @@ impl ManagementCenter {
         self.mcp_market_generation = self.mcp_market_generation.wrapping_add(1);
         let generation = self.mcp_market_generation;
         let extend = request.waits_for_a_wider_index();
+        // The index holds the whole registry, so the view asks for the page it
+        // is on rather than for a window it then has to page through itself.
+        let page = self.mcp_market_page.max(1);
+        let offset = page.saturating_sub(1).saturating_mul(MARKET_PAGE_SIZE);
+        let transport = self
+            .mcp_market_transport
+            .map(MarketTransportFilter::request_filter);
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
                 .management()
                 .search_mcp_market(vibex_core::McpMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    limit: Some(MARKET_FETCH_LIMIT),
-                    offset: None,
+                    limit: Some(MARKET_PAGE_SIZE as u32),
+                    offset: Some(offset.min(u32::MAX as usize) as u32),
+                    transport,
                     extend: Some(extend),
                 })
                 .await
@@ -7793,7 +7816,20 @@ impl ManagementCenter {
                 this.mcp_market_loading = false;
                 match outcome {
                     Ok(Ok(response)) => {
+                        // A page past the end can only happen when the result
+                        // set shrank under the pager; asking for the last page
+                        // that exists is better than showing an empty grid.
+                        let last_page = market_page_count(response.total_matches);
+                        if response.entries.is_empty()
+                            && this.mcp_market_page > last_page
+                            && response.total_matches > 0
+                        {
+                            this.mcp_market_page = last_page;
+                            this.request_mcp_market(McpMarketRequest::Page, cx);
+                            return;
+                        }
                         this.mcp_market_entries = response.entries;
+                        this.mcp_market_total = response.total_matches;
                         this.mcp_market_has_more = response.has_more;
                         this.schedule_mcp_market_index_poll(cx);
                     }
@@ -7811,12 +7847,11 @@ impl ManagementCenter {
     /// Re-query once the index has had time to gain another page.
     ///
     /// The delay is longer than a page takes to land, so this settles into a
-    /// poll that adds a page every few seconds rather than one that spins. It
-    /// stops as soon as there is nothing left worth streaming: the registry is
-    /// exhausted, or the window the view shows is already full.
+    /// poll that refreshes the count every few seconds rather than one that
+    /// spins. It stops once the registry has been walked to its end: the page
+    /// in view does not grow, but the number of pages behind it does.
     fn schedule_mcp_market_index_poll(&mut self, cx: &mut Context<Self>) {
-        let window_full = self.mcp_market_entries.len() >= MARKET_FETCH_LIMIT as usize;
-        if !self.mcp_market_has_more || window_full || !self.mcp_market_open {
+        if !self.mcp_market_has_more || !self.mcp_market_open {
             self.mcp_market_index_task = None;
             return;
         }
@@ -8031,7 +8066,7 @@ impl ManagementCenter {
                 .management()
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
-                    limit: Some(MARKET_FETCH_LIMIT),
+                    limit: Some(SKILL_MARKET_FETCH_LIMIT),
                     offset: None,
                 })
                 .await
@@ -8165,11 +8200,11 @@ impl ManagementCenter {
                                 result.enabled_agent_ids.len()
                             ),
                             ResolvedLocale::ZhCn => format!(
-                                "已为 {} 个 Agent 安装技能 {display_name}",
+                                "已为 {} 个 Agent 安装 Skill {display_name}",
                                 result.enabled_agent_ids.len()
                             ),
                             ResolvedLocale::ZhTw => format!(
-                                "已為 {} 個 Agent 安裝技能 {display_name}",
+                                "已為 {} 個 Agent 安裝 Skill {display_name}",
                                 result.enabled_agent_ids.len()
                             ),
                         });
@@ -8183,8 +8218,8 @@ impl ManagementCenter {
                             "{}: {error}",
                             management_error_text(
                                 "Skill market install failed",
-                                "技能市场安装失败",
-                                "技能市場安裝失敗",
+                                "Skill 市场安装失败",
+                                "Skill 市場安裝失敗",
                             )
                         ));
                     }
@@ -8446,10 +8481,10 @@ impl ManagementCenter {
                                 discovery.discoveries.len()
                             ),
                             ResolvedLocale::ZhCn => {
-                                format!("发现 {} 个技能候选项", discovery.discoveries.len())
+                                format!("发现 {} 个 Skill 候选项", discovery.discoveries.len())
                             }
                             ResolvedLocale::ZhTw => {
-                                format!("發現 {} 個技能候選項", discovery.discoveries.len())
+                                format!("發現 {} 個 Skill 候選項", discovery.discoveries.len())
                             }
                         });
                         this.skill_discovery = Some(discovery);
@@ -8462,8 +8497,8 @@ impl ManagementCenter {
                             "{}: {error}",
                             management_error_text(
                                 "Skill discovery failed",
-                                "技能探测失败",
-                                "技能探測失敗",
+                                "Skill 探测失败",
+                                "Skill 探測失敗",
                             )
                         ));
                     }
@@ -8525,11 +8560,11 @@ impl ManagementCenter {
                                 result.created_count, result.updated_count
                             ),
                             ResolvedLocale::ZhCn => format!(
-                                "已导入 {} 个技能，更新 {} 个",
+                                "已导入 {} 个 Skill，更新 {} 个",
                                 result.created_count, result.updated_count
                             ),
                             ResolvedLocale::ZhTw => format!(
-                                "已匯入 {} 個技能，更新 {} 個",
+                                "已匯入 {} 個 Skill，更新 {} 個",
                                 result.created_count, result.updated_count
                             ),
                         });
@@ -8544,8 +8579,8 @@ impl ManagementCenter {
                             "{}: {error}",
                             management_error_text(
                                 "Skill import failed",
-                                "技能导入失败",
-                                "技能匯入失敗",
+                                "Skill 导入失败",
+                                "Skill 匯入失敗",
                             )
                         ));
                         cx.notify();
@@ -8623,7 +8658,7 @@ impl ManagementCenter {
             })
         else {
             self.error = Some(
-                management_error_text("Skill was not found", "未找到技能", "找不到技能").into(),
+                management_error_text("Skill was not found", "未找到 Skill", "找不到 Skill").into(),
             );
             cx.notify();
             return;
@@ -10349,9 +10384,9 @@ impl ManagementCenter {
         let pending = self.mutation.is_some();
         let creating = self.editing_skill_id.is_none();
         let title = if creating {
-            management_locale_text("New Skill", "新建技能", "新建技能")
+            management_locale_text("New Skill", "新建 Skill", "新建 Skill")
         } else {
-            management_locale_text("Edit Skill", "编辑技能", "編輯技能")
+            management_locale_text("Edit Skill", "编辑 Skill", "編輯 Skill")
         };
         let content = v_flex()
             .w_full()
@@ -10374,8 +10409,8 @@ impl ManagementCenter {
                     .gap_1()
                     .child(management_field_label(management_locale_text(
                         "Instructions",
-                        "技能说明",
-                        "技能說明",
+                        "Skill 说明",
+                        "Skill 說明",
                     )))
                     .child(Textarea::new(&self.skill_body_draft).h(px(220.0)).w_full()),
             )
@@ -10556,23 +10591,18 @@ impl ManagementCenter {
             return self.render_mcp_market_install_form(&target, pending, cx);
         }
 
-        // The filter narrows what is in hand rather than re-querying: the
-        // registry's search cannot filter by transport, and the fetched window
-        // is already the whole result set the view can address.
-        let matching: Vec<vibex_core::McpMarketEntry> = entries
-            .iter()
-            .filter(|entry| transport_filter.is_none_or(|filter| filter.matches(entry.transport)))
-            .cloned()
-            .collect();
-        let total = matching.len();
+        // The runtime already cut the page and counted the matches: it holds
+        // the whole index, so the query and the transport filter are its job
+        // rather than something this view does to a window it fetched.
+        let total = self.mcp_market_total;
         let page = market_page(self.mcp_market_page, total);
-        let shown = market_page_slice(&matching, page).to_vec();
+        let shown = entries;
         let shown_count = shown.len();
         let filtered = transport_filter.is_some();
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
 
-        let mut heading = h_flex()
+        let heading = h_flex()
             .w_full()
             .min_w_0()
             .flex_none()
@@ -10601,12 +10631,10 @@ impl ManagementCenter {
                             )),
                     ),
             );
-        if loading {
-            // A poll keeps the index filling for as long as the view is open,
-            // so the spinner belongs beside the title rather than over the
-            // results the user is already reading.
-            heading = heading.child(Spinner::new().small());
-        }
+        // The Search button owns the only busy indicator on this pane. The
+        // title used to grow a second one whenever the view was loading, which
+        // put two spinners on screen for one request; what the title has to say
+        // about a still-filling index is said by the count line below.
         content = content.child(heading);
 
         content = content.child(management_market_toolbar(
@@ -10620,11 +10648,14 @@ impl ManagementCenter {
                 transport_filter,
                 pending,
                 cx.listener(|this, transport, _, cx| {
+                    if this.mcp_market_transport == *transport {
+                        return;
+                    }
                     this.mcp_market_transport = *transport;
                     // Narrowing the grid is a new reading position, so the
                     // pager starts over instead of opening mid-list.
                     this.mcp_market_page = 1;
-                    cx.notify();
+                    this.request_mcp_market(McpMarketRequest::Page, cx);
                 }),
                 cx,
             )),
@@ -10638,7 +10669,7 @@ impl ManagementCenter {
             ));
         }
 
-        let first_load = loading && entries.is_empty();
+        let first_load = loading && shown.is_empty();
         if !first_load && (total > 0 || filtered) {
             content = content.child(
                 h_flex()
@@ -10694,7 +10725,7 @@ impl ManagementCenter {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.mcp_market_transport = None;
                         this.mcp_market_page = 1;
-                        cx.notify();
+                        this.request_mcp_market(McpMarketRequest::Page, cx);
                     }))
                     .into_any_element()
             });
@@ -10706,9 +10737,9 @@ impl ManagementCenter {
                 ),
                 if filtered {
                     management_locale_text(
-                        "Nothing in the fetched results uses this transport. Clear the filter to see the rest.",
-                        "已获取的结果中没有使用该连接方式的服务，清除筛选即可查看其余条目。",
-                        "已取得的結果中沒有使用該連線方式的服務，清除篩選即可查看其餘條目。",
+                        "Nothing indexed so far uses this transport. Clear the filter to see the rest.",
+                        "已索引的服务中还没有使用该连接方式的服务，清除筛选即可查看其余条目。",
+                        "已索引的服務中還沒有使用該連線方式的服務，清除篩選即可查看其餘條目。",
                     )
                 } else {
                     management_locale_text(
@@ -10798,11 +10829,16 @@ impl ManagementCenter {
 
         content = content.child(
             div()
+                .id("management-mcp-market-grid")
                 .min_h_0()
                 .flex_1()
-                .overflow_y_scrollbar()
+                .track_scroll(&self.mcp_market_scroll)
+                .overflow_y_scroll()
                 .scroll_gutter()
-                .child(grid),
+                .child(grid)
+                // The bar is bound to the same handle the pager resets, so a
+                // page change moves the bar with the content.
+                .vertical_scrollbar(&self.mcp_market_scroll),
         );
 
         if !first_load && total > 0 {
@@ -10814,8 +10850,15 @@ impl ManagementCenter {
                 move |page, _, cx| {
                     let page = *page;
                     let _ = entity.update(cx, |this, cx| {
+                        if this.mcp_market_page == page {
+                            return;
+                        }
                         this.mcp_market_page = page;
-                        cx.notify();
+                        // A new page is a new reading position; keeping the old
+                        // offset would drop the reader into its middle.
+                        this.mcp_market_scroll
+                            .set_offset(gpui::point(px(0.0), px(0.0)));
+                        this.request_mcp_market(McpMarketRequest::Page, cx);
                     });
                 },
                 cx,
@@ -11097,7 +11140,7 @@ impl ManagementCenter {
             .collect();
 
         let mut content = v_flex().size_full().min_h_0().gap_3();
-        let mut heading = h_flex()
+        let heading = h_flex()
             .w_full()
             .min_w_0()
             .flex_none()
@@ -11113,7 +11156,7 @@ impl ManagementCenter {
                         div()
                             .text_lg()
                             .font_semibold()
-                            .child(management_locale_text("Skill market", "技能市场", "技能市場")),
+                            .child(management_locale_text("Skill market", "Skill 市场", "Skill 市場")),
                     )
                     .child(
                         div()
@@ -11121,14 +11164,13 @@ impl ManagementCenter {
                             .text_color(cx.theme().muted_foreground)
                             .child(management_locale_text(
                                 "Browse published Skills. The full text is previewed before install.",
-                                "浏览已发布的技能，安装前可预览全文。",
-                                "瀏覽已發佈的技能，安裝前可預覽全文。",
+                                "浏览已发布的 Skill，安装前可预览全文。",
+                                "瀏覽已發佈的 Skill，安裝前可預覽全文。",
                             )),
                     ),
             );
-        if loading {
-            heading = heading.child(Spinner::new().small());
-        }
+        // One busy indicator for the pane: the Search button's, exactly as in
+        // the MCP market.
         content = content.child(heading);
 
         content = content.child(management_market_toolbar(
@@ -11188,13 +11230,13 @@ impl ManagementCenter {
             grid = grid.child(management_market_empty_row(
                 management_locale_text(
                     "No Skills match this search",
-                    "没有匹配的技能",
-                    "沒有匹配的技能",
+                    "没有匹配的 Skill",
+                    "沒有匹配的 Skill",
                 ),
                 management_locale_text(
                     "Try a shorter query, or a word from the Skill's name.",
-                    "换一个更短的查询，或使用技能名称中的词。",
-                    "換一個更短的查詢，或使用技能名稱中的詞。",
+                    "换一个更短的查询，或使用 Skill 名称中的词。",
+                    "換一個更短的查詢，或使用 Skill 名稱中的詞。",
                 ),
                 None,
                 cx,
@@ -11244,11 +11286,16 @@ impl ManagementCenter {
 
         content = content.child(
             div()
+                .id("management-skill-market-grid")
                 .min_h_0()
                 .flex_1()
-                .overflow_y_scrollbar()
+                .track_scroll(&self.skill_market_scroll)
+                .overflow_y_scroll()
                 .scroll_gutter()
-                .child(grid),
+                .child(grid)
+                // The bar is bound to the same handle the pager resets, so a
+                // page change moves the bar with the content.
+                .vertical_scrollbar(&self.skill_market_scroll),
         );
 
         if !first_load && total > 0 {
@@ -11260,7 +11307,14 @@ impl ManagementCenter {
                 move |page, _, cx| {
                     let page = *page;
                     let _ = entity.update(cx, |this, cx| {
+                        if this.skill_market_page == page {
+                            return;
+                        }
                         this.skill_market_page = page;
+                        // The fetched window is paged locally, so the grid
+                        // itself has to return to the top of the new page.
+                        this.skill_market_scroll
+                            .set_offset(gpui::point(px(0.0), px(0.0)));
                         cx.notify();
                     });
                 },
@@ -11361,8 +11415,8 @@ impl ManagementCenter {
                 .text_color(cx.theme().muted_foreground)
                 .child(management_locale_text(
                     "The Skill text could not be loaded.",
-                    "无法加载技能内容。",
-                    "無法載入技能內容。",
+                    "无法加载 Skill 内容。",
+                    "無法載入 Skill 內容。",
                 ))
                 .into_any_element()
         };
@@ -11371,8 +11425,8 @@ impl ManagementCenter {
             management_locale_text("Skill body", "skill 正文", "skill 正文"),
             Some(management_locale_text(
                 "This is the whole document the Skill will contain. Scroll to read it.",
-                "以下即为该技能将包含的完整内容，滚动即可查看全文。",
-                "以下即為該技能將包含的完整內容，捲動即可查看全文。",
+                "以下即为该 Skill 将包含的完整内容，滚动即可查看全文。",
+                "以下即為該 Skill 將包含的完整內容，捲動即可查看全文。",
             )),
             None,
             preview,
@@ -11522,7 +11576,7 @@ impl ManagementCenter {
         let title = if mcp {
             management_locale_text("Import existing MCP", "导入已有 MCP", "匯入已有 MCP")
         } else {
-            management_locale_text("Import existing Skills", "导入已有技能", "匯入已有技能")
+            management_locale_text("Import existing Skills", "导入已有 Skill", "匯入已有 Skill")
         };
 
         let mut rows = v_flex().w_full().gap_2();
@@ -11755,7 +11809,7 @@ impl ManagementCenter {
                         "management-skill-new",
                         Icon::new(IconName::Plus),
                         management_locale_text("New", "新建", "新建"),
-                        management_locale_text("New Skill", "新建技能", "新建技能"),
+                        management_locale_text("New Skill", "新建 Skill", "新建 Skill"),
                         cx.listener(|this, _, window, cx| this.open_skill_editor(None, window, cx)),
                     ),
                     management_sidebar_action(
@@ -11770,7 +11824,7 @@ impl ManagementCenter {
             ))
             .child(management_market_entry_button(
                 "management-skill-market",
-                management_locale_text("Browse Skill market", "浏览技能市场", "瀏覽技能市場"),
+                management_locale_text("Browse Skill market", "浏览 Skill 市场", "瀏覽 Skill 市場"),
                 self.skill_market_open,
                 cx.listener(|this, _, window, cx| this.open_skill_market(window, cx)),
                 cx,
@@ -16680,7 +16734,7 @@ impl ManagementCenter {
             (vibex_core::ProviderNativeExportMode::Mcp, "MCP"),
             (
                 vibex_core::ProviderNativeExportMode::Skills,
-                management_locale_text("Skills", "技能", "技能"),
+                management_locale_text("Skills", "Skill", "Skill"),
             ),
             (
                 vibex_core::ProviderNativeExportMode::Prompts,
@@ -19365,8 +19419,8 @@ fn management_mcp_editor_description() -> &'static str {
 fn management_skill_editor_description() -> &'static str {
     management_locale_text(
         "Skills are stored once and enabled per Agent.",
-        "技能只存一份，按 Agent 启用。",
-        "技能只存一份，按 Agent 啟用。",
+        "Skill 只存一份，按 Agent 启用。",
+        "Skill 只存一份，按 Agent 啟用。",
     )
 }
 
@@ -20356,10 +20410,15 @@ impl MarketTransportFilter {
         }
     }
 
-    fn matches(&self, transport: vibex_core::McpServerTransportKind) -> bool {
+    /// The wire form the runtime filters the index by.
+    ///
+    /// The filter is applied there rather than here because the view only ever
+    /// holds one page: filtering after the page was cut would leave holes in
+    /// the list and a count that does not match what is on screen.
+    fn request_filter(self) -> vibex_core::McpMarketTransportFilter {
         match self {
-            Self::Local => transport == vibex_core::McpServerTransportKind::Stdio,
-            Self::Remote => transport != vibex_core::McpServerTransportKind::Stdio,
+            Self::Local => vibex_core::McpMarketTransportFilter::Local,
+            Self::Remote => vibex_core::McpMarketTransportFilter::Remote,
         }
     }
 }
@@ -20985,19 +21044,17 @@ fn management_market_empty_row(
 
 /// Entries a market grid shows on one page.
 ///
-/// Both markets fetch a single window of entries. Neither upstream can answer
-/// "show me page 5": the MCP registry pages by an opaque cursor that only walks
-/// forward, and the Skill index ignores the offset outright. The pager is
-/// therefore applied to the list already in hand, which is also why it is the
-/// only navigation the grid offers.
-const MARKET_PAGE_SIZE: usize = 12;
+/// The MCP market asks the runtime for exactly one page: its index holds the
+/// whole registry, and the reader only ever looks at one screen, so the page is
+/// addressed by offset rather than shipped whole. The Skill index ignores the
+/// offset outright, so that market fetches one window and pages it locally.
+const MARKET_PAGE_SIZE: usize = 20;
 
-/// Entries one search fetches, and so the most a grid can ever page through.
+/// Entries the Skill market fetches in one go.
 ///
-/// The MCP market's limit is a window into an index that keeps growing, so a
-/// larger value here means the view holds more of the registry at once; the
-/// Skill index clamps to its own page size and ignores anything larger.
-const MARKET_FETCH_LIMIT: u32 = 500;
+/// Its index caps `count` at its own page size and ignores `offset`, so this is
+/// the whole of what it will hand over; the grid pages through it locally.
+const SKILL_MARKET_FETCH_LIMIT: u32 = 500;
 
 /// The width a market card refuses to go under.
 ///
@@ -21990,8 +22047,11 @@ fn management_resource_sidebar_actions(
                 .min_w_0()
                 .flex_1()
                 .truncate()
-                .text_xs()
-                .font_medium()
+                // The section name sits on the same 14px scale as the commands
+                // beside it and the search field under it; at 12px it read as a
+                // caption for the row rather than the name of the list.
+                .text_sm()
+                .font_semibold()
                 .text_color(cx.theme().muted_foreground)
                 .child(title),
         )
@@ -22521,7 +22581,7 @@ fn management_mcp_resources_title() -> &'static str {
 }
 
 fn management_skills_title() -> &'static str {
-    management_locale_text("SKILLS", "技能", "技能")
+    management_locale_text("SKILLS", "Skill", "Skill")
 }
 
 fn management_agent_enablement_label() -> &'static str {
@@ -22677,14 +22737,14 @@ fn management_no_mcp_description() -> &'static str {
 }
 
 fn management_no_skills_title() -> &'static str {
-    management_locale_text("No Skills", "暂无技能", "暫無技能")
+    management_locale_text("No Skills", "暂无 Skill", "暫無 Skill")
 }
 
 fn management_no_skills_description() -> &'static str {
     management_locale_text(
         "Import or add a reusable Skill.",
-        "导入或添加一个可复用技能。",
-        "匯入或新增一個可重用技能。",
+        "导入或添加一个可复用 Skill。",
+        "匯入或新增一個可重用 Skill。",
     )
 }
 
@@ -22709,7 +22769,7 @@ fn management_delete_mcp_label() -> &'static str {
 }
 
 fn management_delete_skill_label() -> &'static str {
-    management_locale_text("Delete Skill", "删除技能", "刪除技能")
+    management_locale_text("Delete Skill", "删除 Skill", "刪除 Skill")
 }
 
 fn management_profile_status_label(status: vibex_core::ProviderProfileStatus) -> &'static str {
@@ -23011,8 +23071,8 @@ fn management_mcp_description() -> &'static str {
 fn management_skills_description() -> &'static str {
     management_locale_text(
         "Reusable Skills, discovery, and Agent enablement.",
-        "管理可复用技能、发现来源及 Agent 启用范围。",
-        "管理可重用技能、探索來源及 Agent 啟用範圍。",
+        "管理可复用 Skill、发现来源及 Agent 启用范围。",
+        "管理可重用 Skill、探索來源及 Agent 啟用範圍。",
     )
 }
 
@@ -23033,14 +23093,14 @@ fn management_no_mcp_selection_description() -> &'static str {
 }
 
 fn management_no_skill_selection_title() -> &'static str {
-    management_locale_text("No Skill selected", "未选择技能", "未選擇技能")
+    management_locale_text("No Skill selected", "未选择 Skill", "未選擇 Skill")
 }
 
 fn management_no_skill_selection_description() -> &'static str {
     management_locale_text(
         "Select or import a Skill to manage Agent enablement.",
-        "选择或导入技能以管理 Agent 启用状态。",
-        "選擇或匯入技能以管理 Agent 啟用狀態。",
+        "选择或导入 Skill 以管理 Agent 启用状态。",
+        "選擇或匯入 Skill 以管理 Agent 啟用狀態。",
     )
 }
 
@@ -23674,8 +23734,8 @@ mod tests {
     }
 
     #[test]
-    fn market_pages_cover_the_fetched_window_without_gaps() {
-        let entries: Vec<usize> = (0..MARKET_FETCH_LIMIT as usize).collect();
+    fn market_pages_cover_the_skill_window_without_gaps() {
+        let entries: Vec<usize> = (0..SKILL_MARKET_FETCH_LIMIT as usize).collect();
         let pages = market_page_count(entries.len());
 
         // Every page is a distinct, contiguous window and together they cover
@@ -23868,38 +23928,74 @@ mod tests {
     }
 
     #[test]
-    fn market_grids_page_the_fetched_window() {
+    fn market_grids_page_the_whole_result_set() {
         let source = include_str!("management.rs");
-        for (open, close) in [
-            (
-                "    fn render_mcp_market(",
-                "\n    fn render_mcp_market_install_form(",
-            ),
-            (
-                "    fn render_skills_market(",
-                "\n    /// The native-import view",
-            ),
-        ] {
-            let render = source
+        let renderer = |open: &str, close: &str| {
+            source
                 .split_once(open)
                 .and_then(|(_, tail)| tail.split_once(close))
                 .map(|(body, _)| body)
-                .unwrap_or_else(|| panic!("{open} should remain inspectable"));
-            assert!(
-                render.contains("market_page_slice("),
-                "{open} should render the page of the fetched window it is on"
-            );
-            assert!(
-                render.contains("market_page("),
-                "{open} should clamp its page to the window in hand"
-            );
+                .unwrap_or_else(|| panic!("{open} should remain inspectable"))
+        };
+        let mcp = renderer(
+            "    fn render_mcp_market(",
+            "\n    fn render_mcp_market_install_form(",
+        );
+        let skills = renderer(
+            "    fn render_skills_market(",
+            "\n    /// The native-import view",
+        );
+
+        // The MCP index holds the whole registry, so the view asks for one page
+        // at a time and never cuts a page out of a window it fetched: the count
+        // it pages through is the index's own match count.
+        assert!(
+            mcp.contains("self.mcp_market_total"),
+            "the MCP pager should count what the index matched"
+        );
+        assert!(
+            !mcp.contains("market_page_slice("),
+            "the MCP market should not slice a fetched window: it pages the index"
+        );
+        let request = renderer(
+            "    fn request_mcp_market(",
+            "\n    /// Re-query once the index",
+        );
+        assert!(
+            request.contains("offset: Some("),
+            "the MCP request should address the page by offset"
+        );
+        assert!(
+            request.contains("limit: Some(MARKET_PAGE_SIZE as u32)"),
+            "the MCP request should ask for exactly one page"
+        );
+        assert!(
+            request.contains("MarketTransportFilter::request_filter"),
+            "the transport filter belongs to the index, or paging under it would leave holes"
+        );
+
+        // The Skill index ignores the offset outright, so that market fetches
+        // one window and pages through it locally.
+        assert!(
+            skills.contains("market_page_slice("),
+            "the Skill market should page the window it fetched"
+        );
+        assert!(
+            skills.contains("market_page("),
+            "the Skill market should clamp its page to the window in hand"
+        );
+
+        for (open, render) in [("MCP market", mcp), ("Skill market", skills)] {
             assert!(
                 render.contains("management_market_pager("),
                 "{open} should draw the pager under its grid"
             );
-            // The registries cannot answer a page number, so the pager is the
-            // only navigation the grid may offer; a "show more" button would be
-            // a second, competing one.
+            assert!(
+                render.contains(".track_scroll("),
+                "{open} should return its grid to the top when the page changes"
+            );
+            // The pager is the only navigation a grid may offer; a "show more"
+            // button would be a second, competing one.
             assert!(!render.contains("Show more"), "{open} still reveals more");
         }
 
