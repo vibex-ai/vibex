@@ -75,7 +75,8 @@ use vibex_ui::{AgentProviderBindingEditorState, ProjectionCredentialSurface};
 use crate::app::TITLE_BAR_HEIGHT;
 use crate::assets::agent_brand_icon;
 use crate::gpui_ext::{
-    ScrollGutter as _, button_with_aria_label, hint_notification, solid_empty_border,
+    SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, hint_notification,
+    solid_empty_border,
 };
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
@@ -10600,7 +10601,12 @@ impl ManagementCenter {
         let shown_count = shown.len();
         let filtered = transport_filter.is_some();
 
-        let mut content = v_flex().size_full().min_h_0().gap_3();
+        // `max_h_full` is what pins the pager: the pane sits in a scroll
+        // container, which gives its child an auto height, so without a ceiling
+        // the whole market grows past the window and the pager rides off the
+        // bottom with it. Capped at the viewport, the grid is the only thing
+        // that scrolls and the pager stays where it is.
+        let mut content = v_flex().size_full().max_h_full().min_h_0().gap_3();
 
         let heading = h_flex()
             .w_full()
@@ -10677,6 +10683,9 @@ impl ManagementCenter {
                     .min_w_0()
                     .flex_none()
                     .items_center()
+                    // Same lane as the grid, so the trailing "still indexing"
+                    // note ends on the column's right edge.
+                    .pr(SCROLLBAR_GUTTER)
                     .gap_2()
                     .child(
                         div()
@@ -11139,7 +11148,9 @@ impl ManagementCenter {
             .filter_map(|skill| skill.source_uri.clone())
             .collect();
 
-        let mut content = v_flex().size_full().min_h_0().gap_3();
+        // Same ceiling as the MCP market, for the same reason: the pager has to
+        // stay on screen while the grid scrolls under it.
+        let mut content = v_flex().size_full().max_h_full().min_h_0().gap_3();
         let heading = h_flex()
             .w_full()
             .min_w_0()
@@ -11199,6 +11210,9 @@ impl ManagementCenter {
                     .w_full()
                     .min_w_0()
                     .flex_none()
+                    // Same lane as the grid below, so the column keeps one
+                    // right edge.
+                    .pr(SCROLLBAR_GUTTER)
                     // Same size as the MCP market's summary line: the two
                     // markets are the same task against two registries.
                     .text_sm()
@@ -11672,6 +11686,10 @@ impl ManagementCenter {
 
         v_flex()
             .size_full()
+            // Capped like the market panes: the pane it sits in scrolls, and
+            // without a ceiling the Detect footer would ride off the bottom of
+            // the window instead of staying under the list it acts on.
+            .max_h_full()
             .min_h_0()
             .gap_3()
             .child(
@@ -20912,6 +20930,9 @@ fn management_market_error_text(code: &str, message: &str) -> String {
 fn management_market_banner(id: &'static str, message: String) -> AnyElement {
     Alert::error(id, message)
         .small()
+        // The banner is part of the same column as the grid, so it stops where
+        // the cards stop rather than running under the scrollbar's lane.
+        .pr(SCROLLBAR_GUTTER)
         .icon(IconName::TriangleAlert)
         .title(management_locale_text(
             "The market could not be read",
@@ -21455,6 +21476,10 @@ fn management_market_toolbar(
         .w_full()
         .min_w_0()
         .flex_none()
+        // The grid below reserves the overlay scrollbar's lane, so this row
+        // reserves the same one: the search field and the cards share a right
+        // edge instead of ending 12px apart.
+        .pr(SCROLLBAR_GUTTER)
         .gap_2()
         .child(
             h_flex()
@@ -22577,11 +22602,11 @@ fn management_enabled_agent_count(count: usize) -> String {
 }
 
 fn management_mcp_resources_title() -> &'static str {
-    management_locale_text("MCP RESOURCES", "MCP 资源", "MCP 資源")
+    management_locale_text("MCP management", "MCP 管理", "MCP 管理")
 }
 
 fn management_skills_title() -> &'static str {
-    management_locale_text("SKILLS", "Skill", "Skill")
+    management_locale_text("Skill management", "Skill 管理", "Skill 管理")
 }
 
 fn management_agent_enablement_label() -> &'static str {
