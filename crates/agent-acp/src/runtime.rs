@@ -113,6 +113,7 @@ use vibex_db::{
 use crate::auth::{append_known_terminal_auth_fallback, parse_initialize_auth_catalog};
 use crate::claude::{claude_config_home, find_claude_transcript};
 use crate::claude_session;
+use crate::codex;
 use crate::dialect::{
     AgentHostRequestDialect, LaunchArgPlacement, McpWireDelivery, agent_dialect_profile,
 };
@@ -441,6 +442,26 @@ pub(crate) fn startup_model_from_config(
         }
     }
     None
+}
+
+/// The single model a Codex launch selected, if the launch carries one.
+///
+/// A runtime switch and a model-scoped probe narrow the launch config to the
+/// one model they target, while a profile-level discovery read keeps every
+/// configured model. Only the narrowed form names the model the process must
+/// start on, so the Codex model stays a startup selection instead of a
+/// catalogue-gated ACP switch.
+pub(crate) fn codex_launch_model<'a>(
+    agent_id: &AgentId,
+    config: &'a AcpProviderConfig,
+) -> Option<&'a str> {
+    if agent_id.as_str() != CODEX_AGENT_ID {
+        return None;
+    }
+    match config.models.as_slice() {
+        [model] => Some(model.trim()).filter(|model| !model.is_empty()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11489,6 +11510,16 @@ impl AcpRuntimeClient {
                 projection.fingerprint.clone(),
             );
         }
+        // A Codex launch must reach the app-server with its selected model
+        // already applied: codex-acp rejects an ACP model switch that is
+        // neither the session's current model nor part of the catalogue the
+        // app-server advertises. The override is per process, so concurrent
+        // sessions of one Profile can select different models.
+        if projection.is_some()
+            && let Some(model) = codex_launch_model(&profile.agent_id, config)
+        {
+            codex::upsert_codex_model_override(&mut overlays, model);
+        }
         Ok(ProcessEnvironmentMaterialization {
             env_overlays: overlays,
             projection,
@@ -11948,6 +11979,16 @@ impl AcpRuntimeClient {
             &mut non_secret_env,
             &mut secret_reference_versions,
         )?;
+        // The Codex model is applied when the process starts, so it belongs to
+        // process identity: selecting another model has to restart the process
+        // rather than mutate one whose startup override names the old model. A
+        // profile-level read carries every configured model and marks nothing.
+        if let Some(model) = codex_launch_model(&profile.agent_id, config) {
+            non_secret_env.insert(
+                codex::CODEX_LAUNCH_MODEL_SNAPSHOT_KEY.to_string(),
+                model.to_string(),
+            );
+        }
         if let Some(projection) = &legacy_projection
             && !non_secret_env.contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV)
         {
@@ -12075,11 +12116,13 @@ impl AcpRuntimeClient {
         // Copy only effective, non-secret values from the one launch
         // materialization. Generated OpenCode config contains model metadata
         // and secret placeholders, so it is represented by the bounded
-        // projection revision above instead of being copied here.
+        // projection revision above instead of being copied here. A generated
+        // Codex config override is launch-scoped the same way.
         if let Some(effective_env) = effective_env {
             for (key, value) in effective_env {
                 if key == OPENCODE_INLINE_CONFIG_ENV
                     || key == OPENCODE_PROVIDER_API_KEY_ENV
+                    || key == codex::CODEX_CONFIG_ENV_KEY
                     || secret_env_keys.contains(key)
                     || looks_sensitive(key)
                     || value.trim().is_empty()
@@ -31239,6 +31282,98 @@ for line in sys.stdin:
 
         let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
         client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn codex_launch_projects_the_selected_model_as_a_config_override() {
+        let Some(fixture) = MockAcpFixture::create_for_agent(
+            "codex-launch-model",
+            Some(vibex_core::AgentId::parse(CODEX_AGENT_ID).unwrap()),
+        ) else {
+            return;
+        };
+        let client = fixture.client();
+        let profile = client
+            .config_service
+            .get_profile(&fixture.profile_id)
+            .unwrap()
+            .unwrap();
+        let mut config = client.profile_config(&fixture.profile_id).unwrap();
+        let cwd =
+            AcpRuntimeClient::resolve_workspace_cwd(&config, &fixture.workspace.to_string_lossy())
+                .unwrap();
+
+        let snapshot_for = |config: &AcpProviderConfig, env: &[(String, String)]| {
+            client
+                .process_spawn_config_snapshot_from_profile(
+                    &profile.id,
+                    &profile,
+                    config,
+                    &cwd,
+                    &ProviderRuntimeResources::default(),
+                    ProcessSnapshotLaunchInputs {
+                        effective_env: Some(env),
+                        projection_args: None,
+                    },
+                )
+                .unwrap()
+        };
+
+        // A switch or model-scoped probe narrows the launch to one model, and
+        // codex-acp only accepts a switch to the session's current model.
+        config.models = vec!["gpt-5.4".to_string()];
+        let selected = client
+            .resolve_env_overlays_for_profile_with_projection(&profile, &config, &cwd)
+            .unwrap();
+        assert!(
+            selected.projection.is_some(),
+            "the Codex launch must be a real Provider projection"
+        );
+        let override_value = selected
+            .env_overlays
+            .iter()
+            .find(|(key, _)| key == codex::CODEX_CONFIG_ENV_KEY)
+            .map(|(_, value)| value.as_str());
+        assert_eq!(override_value, Some(r#"{"model":"gpt-5.4"}"#));
+        let first = snapshot_for(&config, &selected.env_overlays);
+        assert_eq!(
+            first
+                .non_secret_env
+                .get(codex::CODEX_LAUNCH_MODEL_SNAPSHOT_KEY)
+                .map(String::as_str),
+            Some("gpt-5.4")
+        );
+
+        // The launch model belongs to process identity, so selecting another
+        // model restarts the process instead of mutating one whose startup
+        // override names the old model.
+        config.models = vec!["gpt-5.5".to_string()];
+        let other = client
+            .resolve_env_overlays_for_profile_with_projection(&profile, &config, &cwd)
+            .unwrap();
+        assert_ne!(
+            first.process_spawn_fingerprint(),
+            snapshot_for(&config, &other.env_overlays).process_spawn_fingerprint()
+        );
+
+        // A profile-level discovery read keeps every configured model: there is
+        // no selection to apply.
+        config.models = vec!["gpt-5.4".to_string(), "gpt-5.5".to_string()];
+        let listed = client
+            .resolve_env_overlays_for_profile_with_projection(&profile, &config, &cwd)
+            .unwrap();
+        assert!(
+            !listed
+                .env_overlays
+                .iter()
+                .any(|(key, _)| key == codex::CODEX_CONFIG_ENV_KEY)
+        );
+        assert!(
+            !snapshot_for(&config, &listed.env_overlays)
+                .non_secret_env
+                .contains_key(codex::CODEX_LAUNCH_MODEL_SNAPSHOT_KEY)
+        );
         fixture.cleanup();
     }
 

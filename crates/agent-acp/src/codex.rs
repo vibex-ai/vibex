@@ -15,6 +15,52 @@ use crate::{
 
 pub const CODEX_FORK_EXTENSION_VERSION: u32 = 1;
 
+/// Environment key `codex-acp` reads as a Codex config override layer and hands
+/// to the Codex app-server for every session it opens.
+pub(crate) const CODEX_CONFIG_ENV_KEY: &str = "CODEX_CONFIG";
+
+/// Process-snapshot marker that keeps the launch model part of process
+/// identity. A Codex model is applied when the process starts, so selecting a
+/// different one has to restart the process instead of mutating a process whose
+/// startup override already named another model.
+pub(crate) const CODEX_LAUNCH_MODEL_SNAPSHOT_KEY: &str = "__vibex_codex_model";
+
+/// Merges a launch-selected model into the adapter's `CODEX_CONFIG` override.
+///
+/// Codex applies a model before the session exists: the Provider projection
+/// writes it into `config.toml`, and `codex-acp` then rejects an ACP model
+/// switch whose value is neither the session's current model nor part of the
+/// catalogue the Codex app-server advertises. Handing the selection to the
+/// adapter as a config override makes the app-server start on it, so the switch
+/// becomes a no-op instead of a catalogue-gated rejection. An existing object
+/// value is preserved so a Profile-supplied override keeps its other keys.
+pub(crate) fn codex_config_with_model(existing: Option<&str>, model: &str) -> String {
+    let mut config = existing
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| match value {
+            Value::Object(object) => Some(object),
+            _ => None,
+        })
+        .unwrap_or_default();
+    config.insert("model".to_string(), Value::String(model.to_string()));
+    Value::Object(config).to_string()
+}
+
+/// Applies a launch-selected model to a launch environment's `CODEX_CONFIG`.
+pub(crate) fn upsert_codex_model_override(env: &mut Vec<(String, String)>, model: &str) {
+    let existing = env
+        .iter()
+        .find(|(key, _)| key == CODEX_CONFIG_ENV_KEY)
+        .map(|(_, value)| value.clone());
+    let value = codex_config_with_model(existing.as_deref(), model);
+    match env.iter_mut().find(|(key, _)| key == CODEX_CONFIG_ENV_KEY) {
+        Some((_, current)) => *current = value,
+        None => env.push((CODEX_CONFIG_ENV_KEY.to_string(), value)),
+    }
+}
+
 /// Stable native state home. A process fingerprint may select a manifest
 /// inside this directory but must never become a path component here.
 pub fn codex_acp_runtime_home_path(
@@ -216,6 +262,27 @@ fn bounded(value: String, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::{AcpOperationStability, AgentEventEnricherKind, normalize_agent_event};
+
+    #[test]
+    fn model_override_creates_and_merges_the_codex_config_layer() {
+        let merged = |existing: Option<&str>| {
+            serde_json::from_str::<Value>(&codex_config_with_model(existing, "gpt-5.4")).unwrap()
+        };
+        assert_eq!(merged(None), json!({ "model": "gpt-5.4" }));
+        // A Profile-supplied override keeps its other keys.
+        assert_eq!(
+            merged(Some(r#"{"model_provider":"custom"}"#)),
+            json!({ "model_provider": "custom", "model": "gpt-5.4" })
+        );
+        // The selected model always wins over a stale one.
+        assert_eq!(
+            merged(Some(r#"{"model":"old"}"#)),
+            json!({ "model": "gpt-5.4" })
+        );
+        // Malformed overrides degrade to the model instead of failing a launch.
+        assert_eq!(merged(Some("not json")), json!({ "model": "gpt-5.4" }));
+        assert_eq!(merged(Some("[1]")), json!({ "model": "gpt-5.4" }));
+    }
 
     #[test]
     fn runtime_home_is_stable_across_fingerprints() {

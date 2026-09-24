@@ -408,6 +408,26 @@ an adapter extension, present since `claude-agent-acp` 0.71.0, so it is only
 built for the `claude` Agent; the probe, live session, and runtime identity
 probe all read the same per-process value so their model catalogs cannot drift.
 
+### Codex ACP model selection note
+
+`codex-acp` applies a session's model through the Codex app-server, and it
+rejects an ACP model switch whose value is neither the session's current model
+nor part of the catalogue that app-server advertises (`-32602 Invalid params`).
+A configured Codex model outside the built-in catalogue therefore made the
+model probe record `acp_rpc_error` and the live path fail `apply_session_config`
+with `runtime_switch_configuration_unavailable`, even though the same model runs
+fine as the profile's projected default.
+
+A Codex launch that carries exactly one model — a runtime switch selection, a
+model-scoped probe target, or a binding's restored selection — is therefore
+treated as a startup selection. Its model is merged into the adapter's
+`CODEX_CONFIG` override, which `codex-acp` hands to the Codex app-server as a
+config layer for that process, so the session starts on the selected model and
+the ACP switch becomes a no-op. The selection is also recorded in the process
+spawn snapshot, so choosing a different model restarts the process instead of
+mutating one whose startup override names another model. A profile-level read
+carries every configured model, names no selection, and marks nothing.
+
 ### DeepSeek Harness ACP compatibility note
 
 DeepSeek Harness (`deepseek-harness-acp`) is a catalog-only Agent with no

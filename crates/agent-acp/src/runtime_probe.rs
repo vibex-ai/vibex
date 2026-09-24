@@ -447,6 +447,13 @@ impl AcpRuntimeClient {
         if let Some(projection) = &projection_context.projection {
             env.extend(projection.child_environment());
         }
+        // This probe materializes its own launch environment, which bypasses
+        // the runtime's Codex startup model override, so apply it here too.
+        if projection_context.projection.is_some()
+            && let Some(model) = crate::runtime::codex_launch_model(&profile.agent_id, &config)
+        {
+            crate::codex::upsert_codex_model_override(&mut env, model);
+        }
         add_isolation_environment(
             &mut env,
             &home,
