@@ -19021,7 +19021,16 @@ impl Render for ManagementCenter {
                             .child(context_sidebar),
                     ),
             );
-        let pane = div().flex_1().min_h_0().min_w_0().child(content);
+        // `size_full` matters on the branch that does not scroll: the scroll
+        // wrapper used to bring its own full size, and without it the pane
+        // would size to its content — which pushes the section body down the
+        // window and leaves the list inside it no height at all.
+        let pane = div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .size_full()
+            .child(content);
         // A section body that scrolls its own list must not sit in a scroll
         // container as well: the container hands its child an auto height, so
         // the view grows past the window and takes its own footer — the market
@@ -24347,6 +24356,26 @@ mod tests {
         assert!(!management_section_body_scrolls_itself(true, true, false));
         // Nothing that owns its own scrolling is open.
         assert!(!management_section_body_scrolls_itself(false, false, false));
+    }
+
+    /// The pane has to bring its own full size on the branch that does not
+    /// scroll. The scroll wrapper used to supply it, and `h_flex` centers a
+    /// child that has no height — so a content-sized pane is centered in the
+    /// window and the list inside it, which is the flex remainder, collapses
+    /// to nothing.
+    #[test]
+    fn the_pane_that_does_not_scroll_still_fills_the_window() {
+        let source = include_str!("management.rs");
+        let pane = source
+            .split_once("let pane = div()")
+            .and_then(|(_, tail)| tail.split_once(".child(content);"))
+            .map(|(body, _)| body)
+            .expect("the management pane should remain inspectable");
+        assert!(pane.contains("flex_1()"), "the pane should take the width");
+        assert!(
+            pane.contains("size_full()"),
+            "the pane should take the window's height too, or the row centers it"
+        );
     }
 
     #[test]
