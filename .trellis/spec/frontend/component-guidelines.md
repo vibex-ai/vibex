@@ -605,6 +605,22 @@ parent with a non-zero vertical scroll range, dispatch a vertical
 `ScrollWheelEvent` over a laid-out table cell, then assert that the table's x
 offset changed and the parent's y offset remained zero.
 
+### Editor Selection Under Overlays
+
+The kit's editor paints its selection only while its own focus handle is focused,
+so any surface that takes focus — the right-click context menu, a dialog, a
+select — opens over text that no longer looks selected. The workbench mirrors
+the range into a `TextDecoration` background in the selection colour for as long
+as the editor is unfocused (`CodeWorkbench::sync_editor_selection_mirror`), and
+clears it on focus so the real highlight takes over. Do not "fix" this by
+refocusing the editor under an open menu: the menu owns the keyboard while it is
+open, and refocusing would send typing and Escape into the document.
+
+Cover it with a GPUI test that activates the window first — an inactive window
+strips the focus paths out of its focus events, so a blur would never be
+delivered — then focuses the editor with a selection, blurs the window, and
+asserts the mirrored range appears and clears again on focus.
+
 ### Empty States
 
 Empty-state cards rendered inside right rails, preview tabs, file panels, Git

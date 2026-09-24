@@ -10,7 +10,7 @@ use crate::terminal_transport::{
 };
 use gpui::{
     AccessibleAction, Anchor, AnyElement, AnyWindowHandle, App, ClipboardItem, Context,
-    DragMoveEvent, Entity, FocusHandle, Focusable as _, Hsla, Image, ImageFormat,
+    DragMoveEvent, Entity, FocusHandle, Focusable as _, HighlightStyle, Hsla, Image, ImageFormat,
     InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment,
     ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, MouseDownEvent, Orientation,
     ParentElement as _, PathBuilder, Render, RenderImage, Role, ScrollHandle, ScrollWheelEvent,
@@ -33,7 +33,7 @@ use gpui_component::{
     input::{
         Editor, EditorState, Input, InputEvent, InputGroup, InputGroupAddon,
         InputGroupAddonAlignment, InputGroupButton, InputGroupInput, InputState, Position,
-        Textarea, TextareaState,
+        TextDecoration, TextDecorationCollection, Textarea, TextareaState,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::NotificationType,
@@ -445,6 +445,9 @@ struct ParkedStateLayout {
 struct EditorBinding {
     id: u64,
     input: Entity<EditorState>,
+    /// Mirrors the selection while the editor is unfocused; see
+    /// [`editor_selection_mirror`].
+    selection_mirror: TextDecorationCollection,
 }
 
 struct GotoLineOverlay {
@@ -4483,32 +4486,37 @@ impl CodeWorkbench {
                 .cursor_surrounding_lines(Some(3))
                 .placeholder(locale::text("Loading file", "正在加载文件", "正在載入檔案"))
         });
+        let selection_mirror = input.update(cx, |state, cx| {
+            state.create_decorations_collection(Vec::new(), cx)
+        });
         self.editor_subscriptions
             .push(cx.observe(&input, |_, _, cx| cx.notify()));
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
-            }
-            let binding = this
-                .editor_bindings
-                .iter()
-                .find(|(_, binding)| binding.id == binding_id)
-                .map(|(path, binding)| (path.clone(), binding.input.clone()));
-            let Some((path, input)) = binding else {
-                return;
-            };
-            let value = input.read(cx).value().to_string();
-            if this
-                .editors
-                .buffers
-                .get_mut(&path)
-                .is_some_and(|buffer| buffer.update_content(value))
-            {
-                this.schedule_editor_autosave(path, cx);
-                this.persist_editor_recovery(cx);
-                cx.notify();
-            }
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, input, event, window, cx| {
+                this.sync_editor_selection_mirror(input, window, cx);
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let path = this
+                    .editor_bindings
+                    .iter()
+                    .find(|(_, binding)| binding.id == binding_id)
+                    .map(|(path, _)| path.clone());
+                let Some(path) = path else {
+                    return;
+                };
+                let value = input.read(cx).value().to_string();
+                if this
+                    .editors
+                    .buffers
+                    .get_mut(&path)
+                    .is_some_and(|buffer| buffer.update_content(value))
+                {
+                    this.schedule_editor_autosave(path, cx);
+                    this.persist_editor_recovery(cx);
+                    cx.notify();
+                }
+            });
         self.editor_subscriptions.push(subscription);
         let blur_path = path.to_string();
         let focus_handle = input.read(cx).focus_handle(cx);
@@ -4524,9 +4532,45 @@ impl CodeWorkbench {
             EditorBinding {
                 id: binding_id,
                 input: input.clone(),
+                selection_mirror,
             },
         );
         input
+    }
+
+    /// Keep the mirrored selection in step with the editor.
+    ///
+    /// The kit paints a selection only while its input is focused, so a context
+    /// menu — which takes focus to own the keyboard — would open over text that
+    /// no longer looks selected. The range is painted with a background
+    /// decoration while the editor is unfocused; focus hands it back to the
+    /// real highlight.
+    fn sync_editor_selection_mirror(
+        &mut self,
+        input: &Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(binding) = self
+            .editor_bindings
+            .values_mut()
+            .find(|binding| binding.input.entity_id() == input.entity_id())
+        else {
+            return;
+        };
+        let focused = input.read(cx).focus_handle(cx).is_focused(window);
+        let wanted = editor_selection_mirror(
+            input.read(cx).selected_range(),
+            focused,
+            cx.theme().selection,
+        );
+        let wanted_ranges = wanted
+            .iter()
+            .map(|decoration| decoration.range.clone())
+            .collect::<Vec<_>>();
+        if binding.selection_mirror.get_ranges(cx) != wanted_ranges {
+            binding.selection_mirror.set(wanted, cx);
+        }
     }
 
     fn open_web_external(&mut self, url: String, cx: &mut Context<Self>) {
@@ -15310,6 +15354,30 @@ fn editor_selection_summary(text: &Rope, range: std::ops::Range<usize>) -> Optio
     }
 }
 
+/// Decorations that keep the editor's selection visible while it is unfocused.
+///
+/// The kit's editor paints selections only while its own focus handle is
+/// focused, so any surface that takes focus — a right-click context menu, a
+/// dialog, another pane — hides the text the menu is about to act on. Painting
+/// the range as a text background keeps it visible until the editor is focused
+/// again, when the real selection highlight takes over.
+fn editor_selection_mirror(
+    selection: std::ops::Range<usize>,
+    focused: bool,
+    selection_color: Hsla,
+) -> Vec<TextDecoration> {
+    if focused || selection.is_empty() {
+        return Vec::new();
+    }
+    vec![TextDecoration::new(
+        selection,
+        HighlightStyle {
+            background_color: Some(selection_color),
+            ..Default::default()
+        },
+    )]
+}
+
 fn open_tool_element(tool_id: &str, size: gpui::Pixels, cx: &gpui::App) -> AnyElement {
     if let Some(icon) = open_tool_brand_icon(tool_id, size, cx.theme().foreground) {
         return icon;
@@ -17115,6 +17183,20 @@ mod tests {
     }
 
     #[test]
+    fn editor_selection_mirror_paints_only_an_unfocused_selection() {
+        let selection_color = gpui::red();
+        // Focused: the editor paints the real highlight, so nothing is mirrored.
+        assert!(editor_selection_mirror(2..5, true, selection_color).is_empty());
+        // Unfocused: the range stays visible in the selection colour.
+        let mirror = editor_selection_mirror(2..5, false, selection_color);
+        assert_eq!(mirror.len(), 1);
+        assert_eq!(mirror[0].range, 2..5);
+        assert_eq!(mirror[0].style.background_color, Some(selection_color));
+        // Unfocused with a bare caret: there is no range to keep visible.
+        assert!(editor_selection_mirror(3..3, false, selection_color).is_empty());
+    }
+
+    #[test]
     fn file_search_reveal_range_targets_the_requested_line_and_original_bytes() {
         let content = "other zed\r\n这里是 ZED 结果\r\nlast zed\r\n";
         let expected_start = content.find("ZED").unwrap();
@@ -17550,6 +17632,71 @@ mod tests {
             input.update(cx, |input, cx| input.insert(text, window, cx));
         });
         cx.run_until_parked();
+    }
+
+    fn mirrored_selection_ranges(
+        workbench: &Entity<CodeWorkbench>,
+        cx: &gpui::VisualTestContext,
+    ) -> Vec<std::ops::Range<usize>> {
+        workbench.read_with(cx, |this, cx| {
+            this.editor_bindings["README.md"]
+                .selection_mirror
+                .get_ranges(cx)
+        })
+    }
+
+    fn draw_window(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// A context menu takes focus to own the keyboard, which would otherwise
+    /// hide the very text it is about to act on: the kit paints a selection only
+    /// while its editor is focused.
+    #[gpui::test]
+    fn a_selection_stays_visible_while_the_editor_is_unfocused(cx: &mut gpui::TestAppContext) {
+        let (workbench, input, cx) = fixture_editor_input(cx);
+        // The fixture's README opens as a rendered Markdown preview; the mirror
+        // belongs to the source editor, so the tab has to show it first.
+        workbench.update(cx, |this, cx| {
+            this.toggle_markdown_source("README.md".to_string(), cx);
+        });
+        // An inactive window strips the focus paths out of its focus events, and
+        // the editor would never hear about the blur a menu causes.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        draw_window(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.set_selected_range(0..6, cx);
+            });
+        });
+        draw_window(cx);
+        assert!(
+            mirrored_selection_ranges(&workbench, cx).is_empty(),
+            "a focused editor paints its own selection"
+        );
+
+        // A menu owns the keyboard while it is open, which blurs the editor.
+        cx.update(|window, cx| window.blur(cx));
+        draw_window(cx);
+        assert_eq!(
+            mirrored_selection_ranges(&workbench, cx),
+            vec![0..6],
+            "the selection must stay painted while a menu holds focus"
+        );
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw_window(cx);
+        assert!(
+            mirrored_selection_ranges(&workbench, cx).is_empty(),
+            "the real highlight takes over again on focus"
+        );
     }
 
     #[gpui::test]
