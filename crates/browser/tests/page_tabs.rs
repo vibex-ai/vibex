@@ -71,11 +71,17 @@ async fn a_page_opened_tab_is_adopted_and_closed_like_any_other() {
             .expect("the click reaches the page");
     }
 
+    // The tab this test created announces itself first; the popup is the one
+    // after it.
+    let (created_session, created_tab) = wait_for_opened_tab(&mut events).await;
+    assert_eq!(created_session, session_id);
+    assert_eq!(created_tab, first);
     let (opened_session, opened) = wait_for_opened_tab(&mut events).await;
     assert_eq!(
         opened_session, session_id,
         "the page-opened tab belongs to the opener's session"
     );
+    assert_ne!(opened, first, "the popup is a tab of its own");
     let snapshot = service
         .session_snapshot(&session_id)
         .await
@@ -144,12 +150,18 @@ async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
     service.subscribe_frames(&opener).await.ok();
     tokio::time::sleep(Duration::from_millis(700)).await;
 
+    // The tab this test created announces itself first.
+    let (created_session, created_tab) = wait_for_opened_tab(&mut events).await;
+    assert_eq!(created_session, session_id);
+    assert_eq!(created_tab, opener);
     // The top half opens a tab; the bottom half navigates in this one.
     click_at(&service, &opener, 150.0).await;
-    assert!(
-        wait_for_opened_tab(&mut events).await.0 == session_id,
+    let (opened_session, opened_tab) = wait_for_opened_tab(&mut events).await;
+    assert_eq!(
+        opened_session, session_id,
         "the popup belongs to the opener's session"
     );
+    assert_ne!(opened_tab, opener);
     tokio::time::sleep(Duration::from_millis(300)).await;
     click_at(&service, &opener, 500.0).await;
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -228,4 +240,33 @@ fn serve_pages() -> u16 {
         }
     });
     port
+}
+
+/// A tab an Agent creates has to be announced too: the panel shows the tabs of
+/// a session it knows about, and without the event an Agent's pages lived in a
+/// session the panel never followed — which looks exactly like an Agent that
+/// lied about opening a browser.
+#[tokio::test]
+async fn a_tab_created_for_an_agent_is_announced() {
+    let home = tempfile::tempdir().expect("temp home");
+    let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
+    let session_id = match service
+        .ensure_session(BrowserSessionKey::Anonymous, None)
+        .await
+    {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            eprintln!("skipping the browser tab test: no usable browser ({error})");
+            return;
+        }
+    };
+    let mut events = service.subscribe();
+    let tab = service
+        .create_tab(&session_id, Some("about:blank"), BrowserTabOwner::Agent)
+        .await
+        .expect("a tab");
+    let (announced_session, announced_tab) = wait_for_opened_tab(&mut events).await;
+    assert_eq!(announced_session, session_id);
+    assert_eq!(announced_tab, tab, "the panel is told which tab appeared");
+    service.shutdown().await;
 }

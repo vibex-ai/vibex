@@ -18309,6 +18309,49 @@ mod tests {
         }
     }
 
+    // An Agent that opens a browser over MCP works in its own browser session.
+    // The panel has to follow it: otherwise the page exists in the runtime and
+    // nothing on screen says so, which reads as an Agent that lied.
+    #[gpui::test]
+    fn a_tab_an_agent_opens_becomes_a_preview_tab(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport: std::sync::Arc<dyn crate::browser_transport::BrowserTransport> =
+            std::sync::Arc::new(IdleBrowserTransport);
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx)
+        });
+        let session_id = BrowserSessionId::new();
+        let tab_id = BrowserTabId::new();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.apply_browser_event(
+                vibex_browser::BrowserServiceEvent::TabOpened {
+                    session_id: session_id.clone(),
+                    tab_id: tab_id.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let preview_key = format!("browser:{}", tab_id.as_str());
+        workbench.read_with(cx, |workbench, _| {
+            assert!(
+                workbench.preview.tabs.contains_key(&preview_key),
+                "the Agent's tab is a preview tab"
+            );
+            assert_eq!(
+                workbench
+                    .browser_bindings
+                    .get(tab_id.as_str())
+                    .map(|binding| binding.session_id.clone()),
+                Some(session_id),
+                "the preview tab is bound to the Agent's browser session"
+            );
+        });
+    }
+
     // Two browser tabs open at once: going back to the older one has to make its
     // surface active again, or the pane shows a page that never updates and never
     // answers the pointer.

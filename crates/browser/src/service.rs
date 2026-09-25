@@ -1586,6 +1586,15 @@ impl BrowserService {
             .inner
             .events
             .send(BrowserServiceEvent::SessionChanged(session_id.clone()));
+        // A tab an Agent created is still a tab the human should be able to
+        // watch: the panel owns a preview tab per runtime tab, and the binding
+        // carries whichever session it belongs to. Without this the Agent's
+        // pages lived in a session the panel never showed, which looks exactly
+        // like an Agent that lied about opening a browser.
+        let _ = self.inner.events.send(BrowserServiceEvent::TabOpened {
+            session_id: session_id.clone(),
+            tab_id: tab_id.clone(),
+        });
         Ok(tab_id)
     }
 
