@@ -212,6 +212,32 @@ pub trait BrowserTransport: Send + Sync + 'static {
         y: f64,
     ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>>;
 
+    /// One level of the DOM tree, for the inspector.
+    fn dom_children(
+        &self,
+        tab_id: &BrowserTabId,
+        node_id: Option<i64>,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_browser::BrowserDomNode>>;
+
+    /// Highlights a node and brings it into view.
+    fn select_node(
+        &self,
+        tab_id: &BrowserTabId,
+        backend_node_id: i64,
+    ) -> BrowserTransportFuture<'_, ()>;
+
+    /// The tab's captured console messages, oldest first.
+    fn console_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserConsoleEntry>>;
+
+    /// The tab's captured network requests, oldest first.
+    fn network_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserNetworkEntry>>;
+
     /// The page's icon, for the preview tab's own icon.
     fn favicon(
         &self,
@@ -527,6 +553,58 @@ impl BrowserTransport for LocalBrowserTransport {
         )
     }
 
+    fn dom_children(
+        &self,
+        tab_id: &BrowserTabId,
+        node_id: Option<i64>,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_browser::BrowserDomNode>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .dom_children(&tab_id, node_id)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn select_node(
+        &self,
+        tab_id: &BrowserTabId,
+        backend_node_id: i64,
+    ) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .select_node(&tab_id, backend_node_id)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn console_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserConsoleEntry>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(
+            self.run(async move { service.console_entries(&tab_id).await.map_err(Into::into) }),
+        )
+    }
+
+    fn network_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserNetworkEntry>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(
+            self.run(async move { service.network_entries(&tab_id).await.map_err(Into::into) }),
+        )
+    }
+
     fn favicon(
         &self,
         tab_id: &BrowserTabId,
@@ -751,6 +829,36 @@ impl BrowserTransport for RemoteBrowserTransport {
         _x: f64,
         _y: f64,
     ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn dom_children(
+        &self,
+        _tab_id: &BrowserTabId,
+        _node_id: Option<i64>,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_browser::BrowserDomNode>> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn select_node(
+        &self,
+        _tab_id: &BrowserTabId,
+        _backend_node_id: i64,
+    ) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn console_entries(
+        &self,
+        _tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserConsoleEntry>> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn network_entries(
+        &self,
+        _tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Vec<vibex_core::BrowserNetworkEntry>> {
         Box::pin(async move { Self::unavailable() })
     }
 
