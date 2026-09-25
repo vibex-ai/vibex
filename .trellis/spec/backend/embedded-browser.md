@@ -222,6 +222,18 @@ The `<select>` probe runs on hover rather than on click on purpose: a click that
 waited for a round trip would reach the page after its own release, and Chrome
 would never synthesize the click.
 
+Two input translations are easy to get wrong and are pinned by tests:
+
+- **The wheel sign differs.** GPUI reports a positive `y` when the user scrolls
+  *up* (its own list tests simulate scrolling up with `+100`); the DOM, which
+  `Input.dispatchMouseEvent` follows, scrolls *down* on a positive `deltaY`.
+  `wheel_delta_cdp` flips both axes and converts line deltas first. Passing the
+  GPUI value through inverts every page.
+- **A move must say which buttons are held.** CDP's `buttons` mask is what turns
+  a `mouseMoved` into a drag; without it a scrollbar drag, a text selection, a
+  slider and an HTML5 drop all die at the first move. `BrowserInput::MouseMove`
+  carries the mask, filled from `MouseMoveEvent::dragging()`.
+
 ## Approvals
 
 Domain approval reuses `PermissionRiskCategory::Network` and the existing
