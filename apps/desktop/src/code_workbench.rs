@@ -4787,6 +4787,31 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_browser_tab(url, None, true, window, cx);
+    }
+
+    /// Opens a browser tab the human asked for by name.
+    ///
+    /// The "+" menu and the empty preview panel mean "a new one", exactly like
+    /// the terminal's entry points: the runtime tab is created even when the
+    /// panel already shows another browser tab.
+    pub fn open_browser_new_tab(
+        &mut self,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_browser_tab(None, pane_id, false, window, cx);
+    }
+
+    fn open_browser_tab(
+        &mut self,
+        url: Option<String>,
+        pane_id: Option<String>,
+        reuse_existing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(transport) = self.browser_transport.clone() else {
             self.error = Some(
                 locale::text(
@@ -4816,16 +4841,23 @@ impl CodeWorkbench {
             return;
         };
         let url = url.filter(|url| !url.trim().is_empty());
-        let existing = self
-            .browser_bindings
-            .keys()
-            .next()
-            .cloned()
-            .and_then(|tab_id| {
-                BrowserTabId::parse(tab_id.clone())
-                    .ok()
-                    .map(|id| (tab_id, id))
-            });
+        // The right-rail entry point reuses the tab it opened before; an
+        // explicit "new browser" always makes another one.
+        let existing = reuse_existing
+            .then(|| {
+                self.browser_bindings
+                    .keys()
+                    .next()
+                    .cloned()
+                    .and_then(|tab_id| {
+                        BrowserTabId::parse(tab_id.clone())
+                            .ok()
+                            .map(|id| (tab_id, id))
+                    })
+            })
+            .flatten();
+        let pane_id =
+            pane_id.filter(|pane_id| self.preview.pane_ids().iter().any(|id| id == pane_id));
         cx.spawn_in(window, async move |this, cx| {
             let session_id = match transport.ensure_workspace_session(&workspace_id).await {
                 Ok(session_id) => session_id,
@@ -4868,7 +4900,7 @@ impl CodeWorkbench {
                         PreviewTarget::Browser {
                             browser_tab_id: tab_string.clone(),
                         },
-                        None,
+                        pane_id.as_deref(),
                         unix_timestamp_ms(),
                     );
                     if let Some(tab_id_string) = tab_id_string {
@@ -7205,11 +7237,16 @@ impl CodeWorkbench {
         let drag_pane_id = pane_id.clone();
         let new_terminal_entity = cx.weak_entity();
         let new_terminal_pane_id = pane_id.clone();
+        let new_browser_entity = cx.weak_entity();
+        let new_browser_pane_id = pane_id.clone();
         let empty_terminal_entity = cx.weak_entity();
         let empty_terminal_pane_id = pane_id.clone();
+        let empty_browser_entity = cx.weak_entity();
+        let empty_browser_pane_id = pane_id.clone();
         let tabs_menu_entity = cx.weak_entity();
         let tabs_menu_pane_id = pane_id.clone();
         let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
+        let browser_available = self.workspace.is_some() && self.browser_transport.is_some();
         let tab_group_drop_active = cx.has_active_drag()
             && self
                 .preview_pane_drop_target
@@ -7372,27 +7409,48 @@ impl CodeWorkbench {
                             .dropdown_menu(move |menu, _, _| {
                                 let terminal_entity = new_terminal_entity.clone();
                                 let terminal_pane_id = new_terminal_pane_id.clone();
-                                menu.min_w(px(176.0)).max_w(px(176.0)).item(
-                                    PopupMenuItem::new(locale::text(
-                                        "New terminal",
-                                        "新建终端",
-                                        "新增終端",
-                                    ))
-                                    .icon(IconName::SquareTerminal)
-                                    .disabled(!terminal_available)
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            let _ = terminal_entity.update(cx, |this, cx| {
-                                                this.request_new_preview_terminal(
-                                                    window.window_handle(),
-                                                    Some(terminal_pane_id.clone()),
-                                                    None,
+                                let browser_entity = new_browser_entity.clone();
+                                let browser_pane_id = new_browser_pane_id.clone();
+                                menu.min_w(px(176.0)).max_w(px(176.0))
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "New terminal",
+                                            "新建终端",
+                                            "新增終端",
+                                        ))
+                                        .icon(IconName::SquareTerminal)
+                                        .disabled(!terminal_available)
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                let _ = terminal_entity.update(cx, |this, cx| {
+                                                    this.request_new_preview_terminal(
+                                                        window.window_handle(),
+                                                        Some(terminal_pane_id.clone()),
+                                                        None,
+                                                        cx,
+                                                    )
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "New browser",
+                                            "新建浏览器",
+                                            "新增瀏覽器",
+                                        ))
+                                        .icon(IconName::Globe)
+                                        .disabled(!browser_available)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = browser_entity.update(cx, |this, cx| {
+                                                this.open_browser_new_tab(
+                                                    Some(browser_pane_id.clone()),
+                                                    window,
                                                     cx,
                                                 )
                                             });
-                                        },
-                                    ),
-                                )
+                                        }),
+                                    )
                             }),
                     )
                     .child(
@@ -7555,9 +7613,9 @@ impl CodeWorkbench {
                                         EmptyDescription::new()
                                             .line_height(gpui::relative(1.5))
                                             .child(locale::text(
-                                                "Open a file or terminal here while keeping the Agent visible.",
-                                                "在这里打开文件或终端，同时保留 Agent 对话。",
-                                                "在這裡開啟檔案或終端機，同時保留 Agent 對話。",
+                                                "Open a file, terminal or browser here while keeping the Agent visible.",
+                                                "在这里打开文件、终端或浏览器，同时保留 Agent 对话。",
+                                                "在這裡開啟檔案、終端機或瀏覽器，同時保留 Agent 對話。",
                                             )),
                                     ),
                             )
@@ -7586,6 +7644,31 @@ impl CodeWorkbench {
                                                             window.window_handle(),
                                                             Some(empty_terminal_pane_id.clone()),
                                                             None,
+                                                            cx,
+                                                        )
+                                                    },
+                                                );
+                                            }),
+                                        )
+                                        .child(
+                                            Button::new(format!(
+                                                "preview-empty-new-browser:{pane_id}"
+                                            ))
+                                            .outline()
+                                            .icon(IconName::Globe)
+                                            .label(locale::text(
+                                                "New browser",
+                                                "新建浏览器",
+                                                "新增瀏覽器",
+                                            ))
+                                            .disabled(!browser_available)
+                                            .on_click(move |_, window, cx| {
+                                                let _ = empty_browser_entity.update(
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.open_browser_new_tab(
+                                                            Some(empty_browser_pane_id.clone()),
+                                                            window,
                                                             cx,
                                                         )
                                                     },
@@ -18171,8 +18254,12 @@ mod tests {
         }
     }
 
-    /// A browser transport that never delivers frames.
-    struct IdleBrowserTransport;
+    /// A browser transport that never delivers frames, and hands out a fresh
+    /// runtime tab for every `create_tab`.
+    #[derive(Default)]
+    struct IdleBrowserTransport {
+        created_tabs: Arc<std::sync::Mutex<Vec<BrowserTabId>>>,
+    }
 
     impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -18216,12 +18303,23 @@ mod tests {
         fn create_tab(
             &self,
             _session_id: &BrowserSessionId,
-            _url: Option<&str>,
+            url: Option<&str>,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserTab> {
-            Box::pin(async {
-                Err(crate::browser_transport::BrowserTransportError::new(
-                    "test", "no tabs",
-                ))
+            let tab_id = BrowserTabId::new();
+            self.created_tabs.lock().unwrap().push(tab_id.clone());
+            let url = url.unwrap_or("about:blank").to_string();
+            Box::pin(async move {
+                Ok(vibex_core::BrowserTab {
+                    tab_id,
+                    url,
+                    title: String::new(),
+                    status: vibex_core::BrowserTabStatus::Loading,
+                    owner: vibex_core::BrowserTabOwner::User,
+                    agent_session_id: None,
+                    created_at_ms: 0,
+                    last_activity_at_ms: 0,
+                    generation: 0,
+                })
             })
         }
         fn close_tab(
@@ -18309,6 +18407,43 @@ mod tests {
         }
     }
 
+    // The "+" menu and the empty preview panel mean "a new browser", the same
+    // way the terminal's entry points do: each request gets its own runtime tab
+    // instead of reusing the one already on screen.
+    #[gpui::test]
+    fn each_new_browser_gets_its_own_runtime_tab(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let created = transport.created_tabs.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx)
+        });
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.open_browser_new_tab(None, window, cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_browser_new_tab(None, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            created.lock().unwrap().len(),
+            2,
+            "each request creates a runtime tab of its own"
+        );
+        let browser_previews = workbench.read_with(cx, |workbench, _| {
+            workbench
+                .preview
+                .tabs
+                .keys()
+                .filter(|key| key.starts_with("browser:"))
+                .count()
+        });
+        assert_eq!(browser_previews, 2, "both tabs are visible in the panel");
+    }
+
     // An Agent that opens a browser over MCP works in its own browser session.
     // The panel has to follow it: otherwise the page exists in the runtime and
     // nothing on screen says so, which reads as an Agent that lied.
@@ -18316,7 +18451,7 @@ mod tests {
     fn a_tab_an_agent_opens_becomes_a_preview_tab(cx: &mut gpui::TestAppContext) {
         let (workbench, cx) = fixture_workbench(cx);
         let transport: std::sync::Arc<dyn crate::browser_transport::BrowserTransport> =
-            std::sync::Arc::new(IdleBrowserTransport);
+            std::sync::Arc::new(IdleBrowserTransport::default());
         workbench.update(cx, |workbench, cx| {
             workbench.set_browser_transport(Some(transport), cx)
         });
@@ -18361,7 +18496,7 @@ mod tests {
     ) {
         let (workbench, cx) = fixture_workbench(cx);
         let transport: std::sync::Arc<dyn crate::browser_transport::BrowserTransport> =
-            std::sync::Arc::new(IdleBrowserTransport);
+            std::sync::Arc::new(IdleBrowserTransport::default());
         workbench.update(cx, |workbench, cx| {
             workbench.set_browser_transport(Some(transport), cx)
         });
