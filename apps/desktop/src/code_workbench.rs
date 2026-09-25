@@ -126,6 +126,9 @@ const GIT_COMMIT_MESSAGE_HEIGHT: f32 = 80.0;
 /// commit tab instead of widening with an arbitrarily long message.
 const COMMIT_TAB_LABEL_MAX_CHARS: usize = 48;
 const COMMIT_TAB_LABEL_MAX_WIDTH: f32 = 260.0;
+/// A page title is free-form and can run long, so its tab keeps a fixed share
+/// of the strip and ellipsizes like any browser tab.
+const BROWSER_TAB_LABEL_MAX_WIDTH: f32 = 168.0;
 const DIFF_ROW_MIN_HEIGHT: f32 = 22.0;
 const DIFF_LIST_OVERDRAW: f32 = 512.0;
 const DIFF_LINE_VERTICAL_PADDING: f32 = 2.0;
@@ -1041,6 +1044,8 @@ struct BrowserTabBinding {
 struct BrowserTabLabel {
     title: String,
     loading: bool,
+    /// The page's icon, decoded by the surface that owns the tab.
+    favicon: Option<Arc<RenderImage>>,
 }
 
 /// The browser transport slice of the desktop bundle.
@@ -4487,6 +4492,7 @@ impl CodeWorkbench {
                         BrowserTabLabel {
                             title: surface.read(cx).page_title().unwrap_or_default(),
                             loading: surface.read(cx).is_loading(),
+                            favicon: surface.read(cx).favicon(),
                         },
                     );
                     cx.notify();
@@ -7759,7 +7765,14 @@ impl CodeWorkbench {
             }
             _ => String::new(),
         };
-        let target_icon = preview_target_icon(&tab.target, cx);
+        let browser_favicon = match &tab.target {
+            PreviewTarget::Browser { browser_tab_id } => self
+                .browser_tab_labels
+                .get(browser_tab_id)
+                .and_then(|label| label.favicon.clone()),
+            _ => None,
+        };
+        let target_icon = preview_target_icon(&tab.target, browser_favicon, cx);
         let file_path = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
                 Some(path.clone())
@@ -8033,6 +8046,10 @@ impl CodeWorkbench {
                     .when(
                         matches!(tab.target, PreviewTarget::GitCommit { .. }),
                         |this| this.max_w(px(COMMIT_TAB_LABEL_MAX_WIDTH)).truncate(),
+                    )
+                    .when(
+                        matches!(tab.target, PreviewTarget::Browser { .. }),
+                        |this| this.max_w(px(BROWSER_TAB_LABEL_MAX_WIDTH)).truncate(),
                     )
                     .when_some(target_status_color, |this, color| this.text_color(color))
                     .when(target_deleted, |this| this.line_through())
@@ -16318,7 +16335,11 @@ fn git_commit_tab_id(hash: &str) -> String {
     format!("git-commit:{hash}")
 }
 
-fn preview_target_icon(target: &PreviewTarget, cx: &Context<CodeWorkbench>) -> AnyElement {
+fn preview_target_icon(
+    target: &PreviewTarget,
+    browser_favicon: Option<Arc<RenderImage>>,
+    cx: &Context<CodeWorkbench>,
+) -> AnyElement {
     match target {
         PreviewTarget::File { path } => {
             let name = Path::new(path)
@@ -16339,9 +16360,12 @@ fn preview_target_icon(target: &PreviewTarget, cx: &Context<CodeWorkbench>) -> A
         PreviewTarget::Terminal { .. } => Icon::new(IconName::SquareTerminal)
             .size(px(14.0))
             .into_any_element(),
-        PreviewTarget::Browser { .. } => {
-            Icon::new(IconName::Globe).size(px(14.0)).into_any_element()
-        }
+        // A browser tab shows the site's own icon, falling back to the globe
+        // until the page has one (or when the site has none at all).
+        PreviewTarget::Browser { .. } => match browser_favicon {
+            Some(favicon) => img(favicon).size(px(14.0)).into_any_element(),
+            None => Icon::new(IconName::Globe).size(px(14.0)).into_any_element(),
+        },
     }
 }
 
@@ -18401,6 +18425,15 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<
             '_,
             Option<vibex_browser::BrowserElementInspection>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn favicon(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserFavicon>,
         > {
             Box::pin(async { Ok(None) })
         }

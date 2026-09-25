@@ -109,6 +109,27 @@ pub struct BrowserElementInspection {
     pub height: i64,
 }
 
+/// A page's icon, for the panel's preview tab.
+///
+/// The bytes travel with the runtime's answer rather than the panel fetching
+/// them: on a paired runtime the panel cannot reach the site at all, and the
+/// icon is what makes a browser tab look like a browser tab.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserFavicon {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+
+impl std::fmt::Debug for BrowserFavicon {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserFavicon")
+            .field("mime", &self.mime)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Identifies the owner of a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BrowserSessionKey {
@@ -1993,6 +2014,37 @@ impl BrowserService {
         }))
     }
 
+    /// The page's icon, fetched by the runtime.
+    ///
+    /// The URL is read out of the page, but the bytes are fetched here: the
+    /// panel must not need network access to the site, and with a paired runtime
+    /// it has none. Every failure is a plain `None` — a missing icon is not an
+    /// error worth showing anybody.
+    pub async fn favicon(&self, tab_id: &BrowserTabId) -> BrowserResult<Option<BrowserFavicon>> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let located = cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "(() => { const link = document.querySelector('link[rel~=\"icon\"], link[rel=\"shortcut icon\"], link[rel=\"apple-touch-icon\"]'); return link && link.href ? link.href : ''; })()",
+                "returnByValue": true,
+            }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        let url = located
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            return Ok(None);
+        }
+        fetch_favicon(&url).await
+    }
+
     /// Reloads a tab.
     pub async fn reload(&self, tab_id: &BrowserTabId, ignore_cache: bool) -> BrowserResult<()> {
         let (_, session) = self.inner.tab_session(tab_id).await?;
@@ -2960,6 +3012,71 @@ async fn refresh_navigation_state(
         let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
     }
     Ok(())
+}
+
+/// Largest icon the runtime will carry back to the panel.
+const MAX_FAVICON_BYTES: usize = 512 * 1024;
+
+/// Fetches an icon URL the page named.
+async fn fetch_favicon(url: &str) -> BrowserResult<Option<BrowserFavicon>> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',').unwrap_or((rest, ""));
+        if !meta.contains("base64") {
+            return Ok(None);
+        }
+        let mime = meta
+            .split(';')
+            .next()
+            .filter(|mime| !mime.is_empty())
+            .unwrap_or("image/png")
+            .to_string();
+        let Ok(bytes) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())
+        else {
+            return Ok(None);
+        };
+        if bytes.is_empty() || bytes.len() > MAX_FAVICON_BYTES {
+            return Ok(None);
+        }
+        return Ok(Some(BrowserFavicon { bytes, mime }));
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return Ok(None);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return Ok(None);
+    };
+    let Ok(response) = client.get(parsed).send().await else {
+        return Ok(None);
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/png")
+        .split(';')
+        .next()
+        .unwrap_or("image/png")
+        .to_string();
+    let Ok(bytes) = response.bytes().await else {
+        return Ok(None);
+    };
+    if bytes.is_empty() || bytes.len() > MAX_FAVICON_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(BrowserFavicon {
+        bytes: bytes.to_vec(),
+        mime,
+    }))
 }
 
 /// Resolves the node under a viewport point, in viewport CSS pixels.

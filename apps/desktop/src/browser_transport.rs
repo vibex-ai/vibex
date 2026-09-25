@@ -212,6 +212,12 @@ pub trait BrowserTransport: Send + Sync + 'static {
         y: f64,
     ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>>;
 
+    /// The page's icon, for the preview tab's own icon.
+    fn favicon(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserFavicon>>;
+
     /// The page's current selection, for the panel's copy shortcut.
     ///
     /// Headless Chrome's clipboard is its own, so the panel reads the selection
@@ -521,6 +527,15 @@ impl BrowserTransport for LocalBrowserTransport {
         )
     }
 
+    fn favicon(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserFavicon>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.favicon(&tab_id).await.map_err(Into::into) }))
+    }
+
     fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {
         let tab_id = tab_id.clone();
         let service = self.service.clone();
@@ -737,6 +752,14 @@ impl BrowserTransport for RemoteBrowserTransport {
         _y: f64,
     ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>> {
         Box::pin(async move { Self::unavailable() })
+    }
+
+    fn favicon(
+        &self,
+        _tab_id: &BrowserTabId,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserFavicon>> {
+        // No frame channel either; a missing icon is not worth an error banner.
+        Box::pin(async { Ok(None) })
     }
 
     fn selection_text(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {

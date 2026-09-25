@@ -132,6 +132,10 @@ pub struct BrowserSurface {
     inspect_hover: Option<(f64, f64)>,
     /// What the inspector card is showing.
     inspect_card: Option<vibex_browser::BrowserElementInspection>,
+    /// The page's icon, once the runtime has fetched and this side decoded it.
+    favicon: Option<Arc<RenderImage>>,
+    /// The URL the current icon came from, so a repaint does not refetch it.
+    favicon_source: Option<String>,
     /// True while a hover probe is outstanding.
     select_probe_in_flight: bool,
     /// Who the runtime says is driving this tab.
@@ -199,6 +203,8 @@ impl BrowserSurface {
             inspecting: false,
             inspect_hover: None,
             inspect_card: None,
+            favicon: None,
+            favicon_source: None,
             select_probe_in_flight: false,
             execution_source: None,
             agent_paused: false,
@@ -251,6 +257,45 @@ impl BrowserSurface {
             return Some(tab.title.clone());
         }
         (!tab.url.trim().is_empty()).then(|| tab.url.clone())
+    }
+
+    /// The page's icon, for the preview tab.
+    pub fn favicon(&self) -> Option<Arc<RenderImage>> {
+        self.favicon.clone()
+    }
+
+    /// Fetches the page's icon once per URL.
+    ///
+    /// The bytes come from the runtime, so a paired client shows the icon even
+    /// though it cannot reach the site itself.
+    fn ensure_favicon(&mut self, url: String, cx: &mut Context<Self>) {
+        if url.trim().is_empty() || self.favicon_source.as_deref() == Some(url.as_str()) {
+            return;
+        }
+        self.favicon_source = Some(url);
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(favicon)) = transport.favicon(&tab_id).await else {
+                return;
+            };
+            let decoded = cx
+                .background_executor()
+                .spawn(async move { decode_frame(&favicon.bytes) })
+                .await;
+            let Ok(decoded) = decoded else {
+                return;
+            };
+            let _ = this.update(cx, |surface, cx| {
+                surface.favicon = Some(Arc::new(RenderImage::new(vec![Frame::new(decoded.image)])));
+                if let Some(tab_id) = surface.tab_id.clone() {
+                    cx.emit(BrowserSurfaceEvent::TabChanged { tab_id });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// True while the panel is showing this tab's frames.
@@ -350,6 +395,11 @@ impl BrowserSurface {
                     && let Some(tab_id) = surface.tab_id.clone()
                 {
                     cx.emit(BrowserSurfaceEvent::TabChanged { tab_id });
+                }
+                if let Some(tab) = surface.tab.as_ref()
+                    && tab.status == BrowserTabStatus::Ready
+                {
+                    surface.ensure_favicon(tab.url.clone(), cx);
                 }
                 if let Some(tab) = &surface.tab
                     && tab.status == BrowserTabStatus::Crashed
@@ -1225,7 +1275,7 @@ impl BrowserSurface {
                     )
                     .item(
                         PopupMenuItem::new(locale::text("Reload", "重新加载", "重新載入"))
-                            .icon(IconName::Redo)
+                            .icon(IconName::RotateCw)
                             .on_click(move |_, _, cx| {
                                 let _ = reload.update(cx, |this, cx| this.reload(cx));
                             }),
@@ -1386,7 +1436,7 @@ impl BrowserSurface {
             )
             .child(
                 Button::new("browser-reload")
-                    .icon(Icon::new(IconName::Redo))
+                    .icon(Icon::new(IconName::RotateCw))
                     .ghost()
                     .xsmall()
                     .tooltip(locale::text("Reload", "重新加载", "重新載入"))
@@ -3008,6 +3058,15 @@ mod tests {
                     height: 32,
                 }))
             })
+        }
+        fn favicon(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserFavicon>,
+        > {
+            Box::pin(async { Ok(None) })
         }
         fn selection_text(
             &self,
