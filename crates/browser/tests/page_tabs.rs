@@ -115,3 +115,117 @@ async fn wait_for_opened_tab(
     }
     panic!("the click never opened a tab");
 }
+
+/// The opener keeps working after its page opened a tab of its own. The tab an
+/// agent or a human is looking at must not go deaf because a second one
+/// appeared.
+#[tokio::test]
+async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_pages();
+    let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
+    let session_id = match service
+        .ensure_session(BrowserSessionKey::Anonymous, None)
+        .await
+    {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            eprintln!("skipping the browser tab test: no usable browser ({error})");
+            return;
+        }
+    };
+    let page = format!("http://127.0.0.1:{port}/");
+    let mut events = service.subscribe();
+    let opener = service
+        .create_tab(&session_id, Some(&page), BrowserTabOwner::User)
+        .await
+        .expect("a tab");
+    service.set_viewport(&opener, 800, 600, 1.0).await.ok();
+    service.subscribe_frames(&opener).await.ok();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // The top half opens a tab; the bottom half navigates in this one.
+    click_at(&service, &opener, 150.0).await;
+    assert!(
+        wait_for_opened_tab(&mut events).await.0 == session_id,
+        "the popup belongs to the opener's session"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    click_at(&service, &opener, 500.0).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let snapshot = service
+        .session_snapshot(&session_id)
+        .await
+        .expect("snapshot");
+    let url = snapshot
+        .session
+        .tabs
+        .iter()
+        .find(|tab| tab.tab_id == opener)
+        .map(|tab| tab.url.clone())
+        .unwrap_or_default();
+    assert!(
+        url.ends_with("/landed"),
+        "the opener ignored the click after its page opened a tab: {url}"
+    );
+    service.shutdown().await;
+}
+
+async fn click_at(service: &BrowserService, tab: &vibex_core::BrowserTabId, y: f64) {
+    for input in [
+        BrowserInput::MouseDown {
+            x: 60.0,
+            y,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+        BrowserInput::MouseUp {
+            x: 60.0,
+            y,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+    ] {
+        service
+            .dispatch_input(tab, input)
+            .await
+            .expect("the click reaches the page");
+    }
+}
+
+/// Serves a page whose top half opens a tab and whose bottom half navigates in
+/// place, plus the two destinations.
+fn serve_pages() -> u16 {
+    use std::io::{Read, Write};
+
+    const START: &str = "<title>start</title>\
+<a href='/popup' target='_blank' style='position:fixed;inset:0 0 50% 0;display:block'>popup</a>\
+<a href='/landed' style='position:fixed;inset:50% 0 0 0;display:block'>same tab</a>";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let request = String::from_utf8_lossy(&buffer);
+            let body = if request.contains("GET /landed") {
+                "<title>landed</title>landed"
+            } else if request.contains("GET /popup") {
+                "<title>popup</title>popup"
+            } else {
+                START
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}

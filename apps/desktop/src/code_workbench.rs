@@ -1869,26 +1869,18 @@ impl CodeWorkbench {
         } else {
             BTreeSet::new()
         };
-        if desired == self.active_browser_surface_ids {
-            return;
-        }
-
-        let deactivated = self
-            .active_browser_surface_ids
-            .difference(&desired)
-            .filter_map(|browser_tab_id| self.browser_surfaces.get(browser_tab_id).cloned())
+        // Re-assert every surface rather than diffing against the last set:
+        // `set_active` is a no-op when the flag already matches, and a drifting
+        // set must not be able to strand a tab with no frames and no input.
+        self.active_browser_surface_ids = desired.clone();
+        let surfaces = self
+            .browser_surfaces
+            .iter()
+            .map(|(browser_tab_id, surface)| (browser_tab_id.clone(), surface.clone()))
             .collect::<Vec<_>>();
-        let activated = desired
-            .difference(&self.active_browser_surface_ids)
-            .filter_map(|browser_tab_id| self.browser_surfaces.get(browser_tab_id).cloned())
-            .collect::<Vec<_>>();
-        self.active_browser_surface_ids = desired;
-
-        for surface in deactivated {
-            surface.update(cx, |surface, cx| surface.set_active(false, cx));
-        }
-        for surface in activated {
-            surface.update(cx, |surface, cx| surface.set_active(true, cx));
+        for (browser_tab_id, surface) in surfaces {
+            let active = desired.contains(&browser_tab_id);
+            surface.update(cx, |surface, cx| surface.set_active(active, cx));
         }
     }
 
@@ -18177,6 +18169,182 @@ mod tests {
                     &self.scroll,
                 ))
         }
+    }
+
+    /// A browser transport that never delivers frames.
+    struct IdleBrowserTransport;
+
+    impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn availability(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserAvailability>
+        {
+            Box::pin(async {
+                Ok(vibex_core::BrowserAvailability::unavailable(
+                    vibex_core::BrowserUnavailableReason::BrowserMissing,
+                    None,
+                ))
+            })
+        }
+        fn list_sessions(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_core::BrowserSession>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn session_snapshot(
+            &self,
+            _session_id: &BrowserSessionId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserSessionSnapshot>
+        {
+            Box::pin(async {
+                Err(crate::browser_transport::BrowserTransportError::new(
+                    "test",
+                    "no snapshot",
+                ))
+            })
+        }
+        fn ensure_workspace_session(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserSessionId> {
+            Box::pin(async { Ok(BrowserSessionId::new()) })
+        }
+        fn create_tab(
+            &self,
+            _session_id: &BrowserSessionId,
+            _url: Option<&str>,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserTab> {
+            Box::pin(async {
+                Err(crate::browser_transport::BrowserTransportError::new(
+                    "test", "no tabs",
+                ))
+            })
+        }
+        fn close_tab(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn select_tab(
+            &self,
+            _session_id: &BrowserSessionId,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_viewport(
+            &self,
+            _tab_id: &BrowserTabId,
+            _width: u32,
+            _height: u32,
+            _device_scale_factor: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dispatch_input(
+            &self,
+            _tab_id: &BrowserTabId,
+            _input: vibex_browser::BrowserInput,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn navigate(
+            &self,
+            _tab_id: &BrowserTabId,
+            _url: &str,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reload(
+            &self,
+            _tab_id: &BrowserTabId,
+            _ignore_cache: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn subscribe_frames(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            crate::browser_transport::BrowserFrameStream,
+        > {
+            Box::pin(async { Ok(crate::browser_transport::BrowserFrameStream::Unavailable) })
+        }
+        fn stop_screencast(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // Two browser tabs open at once: going back to the older one has to make its
+    // surface active again, or the pane shows a page that never updates and never
+    // answers the pointer.
+    #[gpui::test]
+    fn switching_between_two_browser_tabs_reactivates_the_older_surface(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport: std::sync::Arc<dyn crate::browser_transport::BrowserTransport> =
+            std::sync::Arc::new(IdleBrowserTransport);
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx)
+        });
+        let session_id = BrowserSessionId::new();
+        let first = BrowserTabId::new();
+        let second = BrowserTabId::new();
+        let open = |workbench: &mut CodeWorkbench,
+                    window: &mut Window,
+                    cx: &mut Context<CodeWorkbench>| {
+            workbench.set_preview_visible(true, cx);
+            workbench.adopt_browser_tab(session_id.clone(), first.clone(), window, cx);
+            workbench.adopt_browser_tab(session_id.clone(), second.clone(), window, cx);
+        };
+        workbench.update_in(cx, open);
+        cx.run_until_parked();
+
+        let active = |workbench: &Entity<CodeWorkbench>, cx: &gpui::VisualTestContext| {
+            workbench.read_with(cx, |workbench, _| {
+                workbench.active_browser_surface_ids.clone()
+            })
+        };
+        let surface_active = |key: &BrowserTabId, cx: &gpui::VisualTestContext| {
+            workbench.read_with(cx, |workbench, cx| {
+                workbench
+                    .browser_surfaces
+                    .get(key.as_str())
+                    .map(|surface| surface.read(cx).is_active())
+                    .unwrap_or(false)
+            })
+        };
+
+        assert!(
+            active(&workbench, cx).contains(second.as_str()),
+            "the newest tab is the one on screen"
+        );
+        assert!(!surface_active(&first, cx));
+        assert!(surface_active(&second, cx));
+
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.focus_tab(format!("browser:{}", first.as_str()), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            active(&workbench, cx).contains(first.as_str()),
+            "switching back re-activates the older surface"
+        );
+        assert!(
+            surface_active(&first, cx),
+            "the older surface is live again"
+        );
+        assert!(!surface_active(&second, cx));
     }
 
     #[gpui::test]

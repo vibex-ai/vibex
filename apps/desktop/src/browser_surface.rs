@@ -110,6 +110,10 @@ pub struct BrowserSurface {
     last_applied_viewport: Option<(u32, u32, u32)>,
     viewport_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
+    /// The stop-screencast call a deactivation sent. It is cancelled when the
+    /// tab is shown again, because a stop that arrives after the restart would
+    /// leave the panel with no frames at all.
+    stop_task: Option<Task<()>>,
     dialog: Option<BrowserDialogRequest>,
     prompt_input: String,
     file_chooser_pending: bool,
@@ -169,6 +173,7 @@ impl BrowserSurface {
             last_applied_viewport: None,
             viewport_task: None,
             frame_task: None,
+            stop_task: None,
             dialog: None,
             prompt_input: String::new(),
             file_chooser_pending: false,
@@ -225,6 +230,11 @@ impl BrowserSurface {
         (!tab.url.trim().is_empty()).then(|| tab.url.clone())
     }
 
+    /// True while the panel is showing this tab's frames.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// True while the page is still loading.
     pub fn is_loading(&self) -> bool {
         self.tab
@@ -242,6 +252,9 @@ impl BrowserSurface {
         }
         self.active = active;
         if active {
+            // A stop that is still on its way would cancel the screencast the
+            // pump is about to start.
+            self.stop_task = None;
             self.start_frame_pump(cx);
         } else {
             self.frame_task = None;
@@ -249,11 +262,9 @@ impl BrowserSurface {
             let transport = self.transport.clone();
             let tab_id = self.tab_id.clone();
             if let (Some(transport), Some(tab_id)) = (transport, tab_id) {
-                cx.background_executor()
-                    .spawn(async move {
-                        let _ = transport.stop_screencast(&tab_id).await;
-                    })
-                    .detach();
+                self.stop_task = Some(cx.background_executor().spawn(async move {
+                    let _ = transport.stop_screencast(&tab_id).await;
+                }));
             }
         }
         cx.notify();
