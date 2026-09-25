@@ -21,7 +21,8 @@ use std::{
 use tokio::runtime::Handle;
 use vibex_backend::{BackendError, BrowserBackend, BrowserInputPayload};
 use vibex_browser::{
-    BrowserFrameSubscription, BrowserInput, BrowserService, BrowserServiceEvent, BrowserSessionKey,
+    BrowserFrameSubscription, BrowserInput, BrowserSelectMenu, BrowserService, BrowserServiceEvent,
+    BrowserSessionKey,
 };
 use vibex_core::{
     BrowserAvailability, BrowserFrame, BrowserSession, BrowserSessionId, BrowserSessionSnapshot,
@@ -190,6 +191,22 @@ pub trait BrowserTransport: Send + Sync + 'static {
     /// Headless Chrome's clipboard is its own, so the panel reads the selection
     /// out and writes the system clipboard itself.
     fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String>;
+
+    /// A `<select>` under a viewport point, whose popup the panel has to draw.
+    fn select_menu_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<BrowserSelectMenu>>;
+
+    /// Applies an option the human picked from that menu.
+    fn choose_select_option(
+        &self,
+        tab_id: &BrowserTabId,
+        index: u32,
+        value: &str,
+    ) -> BrowserTransportFuture<'_, ()>;
 
     /// Opens the frame stream and turns the screencast on.
     fn subscribe_frames(
@@ -435,6 +452,39 @@ impl BrowserTransport for LocalBrowserTransport {
         Box::pin(self.run(async move { service.selection_text(&tab_id).await.map_err(Into::into) }))
     }
 
+    fn select_menu_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<BrowserSelectMenu>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .select_menu_at(&tab_id, x, y)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn choose_select_option(
+        &self,
+        tab_id: &BrowserTabId,
+        index: u32,
+        value: &str,
+    ) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let value = value.to_string();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .choose_select_option(&tab_id, index, &value)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
     fn subscribe_frames(
         &self,
         tab_id: &BrowserTabId,
@@ -585,6 +635,24 @@ impl BrowserTransport for RemoteBrowserTransport {
     }
 
     fn selection_text(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn select_menu_at(
+        &self,
+        _tab_id: &BrowserTabId,
+        _x: f64,
+        _y: f64,
+    ) -> BrowserTransportFuture<'_, Option<BrowserSelectMenu>> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn choose_select_option(
+        &self,
+        _tab_id: &BrowserTabId,
+        _index: u32,
+        _value: &str,
+    ) -> BrowserTransportFuture<'_, ()> {
         Box::pin(async move { Self::unavailable() })
     }
 
@@ -882,6 +950,47 @@ mod tests {
                 .await;
             let selection = transport.selection_text(&tab.tab_id).await?;
             assert_eq!(selection.trim(), "select me", "the selection is readable");
+
+            // A `<select>` popup is browser UI, so the panel draws its own; the
+            // transport has to find the element and apply the choice.
+            transport
+                .run(transport.service().call_tool(
+                    &vibex_browser::BrowserToolContext {
+                        session_id: session.clone(),
+                        agent_session_id: None,
+                        workspace_id: None,
+                        authorized_roots: Vec::new(),
+                        tier: BrowserToolTier::Fine,
+                    },
+                    "browser_evaluate",
+                    &serde_json::json!({
+                        "tab_id": tab.tab_id.as_str(),
+                        "script": "document.body.innerHTML = \
+                            '<select style=\"position:absolute;left:20px;top:20px\">' + \
+                            '<option value=\"a\">Alpha</option>' + \
+                            '<option value=\"b\">Beta</option></select>';",
+                    }),
+                ))
+                .await;
+            let menu = transport.select_menu_at(&tab.tab_id, 30.0, 30.0).await?;
+            let menu = menu.expect("the select under the point is found");
+            let labels: Vec<String> = menu.options.iter().map(|o| o.label.clone()).collect();
+            assert_eq!(labels, vec!["Alpha".to_string(), "Beta".to_string()]);
+            transport
+                .choose_select_option(&tab.tab_id, menu.index, "b")
+                .await?;
+            let after = transport
+                .select_menu_at(&tab.tab_id, 30.0, 30.0)
+                .await?
+                .expect("the select is still there");
+            assert_eq!(after.value, "b", "the choice reached the page");
+            assert!(
+                transport
+                    .select_menu_at(&tab.tab_id, 700.0, 500.0)
+                    .await?
+                    .is_none(),
+                "a point with no select is not a menu"
+            );
             transport.stop_screencast(&tab.tab_id).await?;
             transport.close_tab(&tab.tab_id).await?;
             Ok::<(), BrowserTransportError>(())

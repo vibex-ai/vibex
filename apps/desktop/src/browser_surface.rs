@@ -117,6 +117,16 @@ pub struct BrowserSurface {
     dialog: Option<BrowserDialogRequest>,
     prompt_input: String,
     file_chooser_pending: bool,
+    /// A `<select>` under the pointer, whose popup headless Chrome never paints.
+    ///
+    /// Probed on hover rather than on click: the panel forwards the click it
+    /// receives, and a click that arrived while the probe was in flight would
+    /// reach the page after its own release.
+    select_hint: Option<SelectHint>,
+    /// The open fallback menu, anchored where the click landed.
+    select_menu: Option<OpenSelectMenu>,
+    /// True while a hover probe is outstanding.
+    select_probe_in_flight: bool,
     /// Who the runtime says is driving this tab.
     execution_source: Option<BrowserExecutionSource>,
     /// True while a human's own input has paused the Agent on this tab, so the
@@ -177,6 +187,9 @@ impl BrowserSurface {
             dialog: None,
             prompt_input: String::new(),
             file_chooser_pending: false,
+            select_hint: None,
+            select_menu: None,
+            select_probe_in_flight: false,
             execution_source: None,
             agent_paused: false,
             focus: cx.focus_handle(),
@@ -571,6 +584,52 @@ impl BrowserSurface {
         cx.stop_propagation();
     }
 
+    /// Asks the page whether a `<select>` sits under the pointer.
+    ///
+    /// Fire and forget, and only one probe at a time: the answer is a hint for
+    /// the next click, so a late one is simply dropped.
+    fn probe_select_hint(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
+        if self.select_probe_in_flight {
+            return;
+        }
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        self.select_probe_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let menu = transport.select_menu_at(&tab_id, x, y).await.ok().flatten();
+            let _ = this.update(cx, |surface, cx| {
+                surface.select_probe_in_flight = false;
+                let next = menu.map(|menu| SelectHint { x, y, menu });
+                // A hover that found nothing clears a hint that no longer holds.
+                if surface.select_hint.is_some() || next.is_some() {
+                    surface.select_hint = next;
+                }
+                let _ = cx;
+            });
+        })
+        .detach();
+    }
+
+    /// Applies an option the human picked from the fallback menu.
+    fn choose_select_option(&mut self, value: String, cx: &mut Context<Self>) {
+        let Some(menu) = self.select_menu.take() else {
+            return;
+        };
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        self.select_hint = None;
+        cx.background_executor()
+            .spawn(async move {
+                let _ = transport
+                    .choose_select_option(&tab_id, menu.index, &value)
+                    .await;
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// Copies the page's selection into the system clipboard.
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
@@ -832,12 +891,8 @@ impl BrowserSurface {
         // A stalled or failed pump used to be invisible: the last frame stayed
         // on screen, so a frozen page looked like a live one that ignored the
         // pointer. Say it out loud instead.
-        let stalled = has_frame
-            && matches!(
-                self.phase,
-                SurfacePhase::Failed | SurfacePhase::Unavailable | SurfacePhase::Crashed
-            );
-        let stalled_message = stalled.then(|| phase_message.clone());
+        let stalled =
+            has_frame && matches!(self.phase, SurfacePhase::Failed | SurfacePhase::Unavailable);
         let image = self.frame_image.clone();
         div()
             .id("browser-frame")
@@ -856,9 +911,7 @@ impl BrowserSurface {
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .when(stalled, |this| {
-                            this.bg(cx.theme().background.opacity(0.85))
-                        })
+                        .when(stalled, |this| this.bg(cx.theme().background.opacity(0.85)))
                         .child(
                             Icon::new(IconName::Globe)
                                 .size(px(28.0))
@@ -880,6 +933,28 @@ impl BrowserSurface {
                     let Some((x, y)) = this.to_viewport_point(event.position) else {
                         return;
                     };
+                    // An open menu swallows the next click: that is how a popup
+                    // closes, and letting it through would also click the page
+                    // underneath.
+                    if this.select_menu.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    let hinted = this
+                        .select_hint
+                        .as_ref()
+                        .filter(|hint| select_hint_matches(hint, x, y))
+                        .map(|hint| hint.menu.clone());
+                    if let Some(menu) = hinted {
+                        this.select_menu = Some(OpenSelectMenu {
+                            anchor: event.position,
+                            index: menu.index,
+                            value: menu.value,
+                            options: menu.options,
+                        });
+                        cx.notify();
+                        return;
+                    }
                     this.dispatch(
                         vibex_browser::BrowserInput::MouseDown {
                             x,
@@ -915,6 +990,7 @@ impl BrowserSurface {
                     return;
                 };
                 this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y }, cx);
+                this.probe_select_hint(x, y, cx);
             }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
@@ -1073,6 +1149,17 @@ impl BrowserSurface {
                         .child(status),
                 )
             })
+            // TEMPORARY DIAGNOSTIC: the sequence of the frame on screen, so a
+            // frozen picture can be told apart from a stalled stream without
+            // attaching a debugger. Remove once the report is settled.
+            .when(self.frame_sequence > 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("#{}", self.frame_sequence)),
+                )
+            })
             .when(self.dropped_frames > 0, |this| {
                 this.child(
                     div()
@@ -1140,6 +1227,53 @@ impl BrowserSurface {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// The fallback menu for a page `<select>`.
+    ///
+    /// Chrome draws the real popup in browser UI, which a screencast never
+    /// carries: without this the click opened nothing the human could see.
+    fn render_select_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.select_menu.as_ref()?;
+        let selected = menu.value.clone();
+        let mut list = v_flex()
+            .id("browser-select-menu")
+            .absolute()
+            .left(menu.anchor.x)
+            .top(menu.anchor.y)
+            .w(px(260.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .shadow_md()
+            .occlude();
+        for option in menu.options.iter() {
+            let value = option.value.clone();
+            let is_selected = option.value == selected;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "browser-select-option-{}",
+                        option.value
+                    )))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .truncate()
+                    .cursor_pointer()
+                    .when(is_selected, |this| this.bg(cx.theme().accent))
+                    .hover(|this| this.bg(cx.theme().muted))
+                    .child(option.label.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose_select_option(value.clone(), cx);
+                    })),
+            );
+        }
+        Some(list.into_any_element())
     }
 
     fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1511,6 +1645,32 @@ fn character_page_key(keystroke: &Keystroke) -> Option<PageKey> {
 /// `EntityInputHandler` and `Input.insertText`. Sending them here as well would
 /// insert every character twice, and would push the raw letters of a CJK
 /// composition into the page. This mirrors how the terminal forwards keys.
+/// A `<select>` found under the pointer, with where it was found.
+struct SelectHint {
+    x: f64,
+    y: f64,
+    menu: vibex_browser::BrowserSelectMenu,
+}
+
+/// A fallback menu the panel is showing for a page `<select>`.
+struct OpenSelectMenu {
+    anchor: gpui::Point<Pixels>,
+    index: u32,
+    value: String,
+    options: Vec<vibex_browser::BrowserSelectOption>,
+}
+
+/// How close a click has to be to the probed point to trust the hint.
+///
+/// The page can move between the hover and the click; a stale hint only costs
+/// the popup the panel was trying to replace.
+const SELECT_HINT_TOLERANCE: f64 = 6.0;
+
+/// True when a click is close enough to a probed point to trust its hint.
+fn select_hint_matches(hint: &SelectHint, x: f64, y: f64) -> bool {
+    (hint.x - x).abs() <= SELECT_HINT_TOLERANCE && (hint.y - y).abs() <= SELECT_HINT_TOLERANCE
+}
+
 /// A clipboard shortcut the panel answers itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardCommand {
@@ -1696,6 +1856,7 @@ impl Render for BrowserSurface {
         let toolbar = self.render_toolbar(cx);
         let takeover = self.render_takeover(cx);
         let frame = self.render_frame(cx);
+        let select_menu = self.render_select_menu(cx);
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
         v_flex()
@@ -1726,6 +1887,7 @@ impl Render for BrowserSurface {
                 )
             })
             .child(div().relative().flex_1().min_h_0().child(frame))
+            .when_some(select_menu, |this, menu| this.child(menu))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
             .on_key_down(cx.listener(Self::on_page_key_down))
@@ -1810,6 +1972,32 @@ mod tests {
     #[test]
     fn empty_input_stays_blank() {
         assert_eq!(normalize_address("   "), "about:blank");
+    }
+
+    #[test]
+    fn a_select_hint_only_covers_the_click_it_was_probed_for() {
+        let hint = SelectHint {
+            x: 100.0,
+            y: 50.0,
+            menu: vibex_browser::BrowserSelectMenu {
+                index: 0,
+                value: "a".to_string(),
+                options: Vec::new(),
+            },
+        };
+        assert!(select_hint_matches(&hint, 100.0, 50.0));
+        assert!(select_hint_matches(
+            &hint,
+            100.0 + SELECT_HINT_TOLERANCE,
+            50.0
+        ));
+        // A click somewhere else must reach the page, not open a stale menu.
+        assert!(!select_hint_matches(
+            &hint,
+            100.0 + SELECT_HINT_TOLERANCE + 1.0,
+            50.0
+        ));
+        assert!(!select_hint_matches(&hint, 100.0, 200.0));
     }
 
     #[test]
@@ -2305,6 +2493,25 @@ mod tests {
             _tab_id: &BrowserTabId,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
             Box::pin(async { Ok(String::new()) })
+        }
+        fn select_menu_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserSelectMenu>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn choose_select_option(
+            &self,
+            _tab_id: &BrowserTabId,
+            _index: u32,
+            _value: &str,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
         }
         fn subscribe_frames(
             &self,

@@ -418,6 +418,25 @@ impl BrowserFrameSubscription {
     }
 }
 
+/// One option of a page `<select>`, as the panel's fallback menu shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSelectOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// A `<select>` the panel offers to drive itself.
+///
+/// `index` locates the element among the page's selects for the call that
+/// applies the choice; a live element handle cannot survive between two CDP
+/// evaluations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSelectMenu {
+    pub index: u32,
+    pub value: String,
+    pub options: Vec<BrowserSelectOption>,
+}
+
 /// The outcome of one tool call.
 #[derive(Debug, Clone)]
 pub struct BrowserToolOutcome {
@@ -1000,6 +1019,118 @@ impl BrowserService {
         if let Some(process) = process {
             process.shutdown().await;
         }
+    }
+
+    /// What a click at this viewport point would open, when it lands on a
+    /// single-choice `<select>`.
+    ///
+    /// Headless Chrome draws a select popup in browser UI, which the screencast
+    /// never carries: without this the panel would swallow the click and show
+    /// nothing. The element is located by its index among the page's selects so
+    /// the choice can be applied by a later call.
+    pub async fn select_menu_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserResult<Option<BrowserSelectMenu>> {
+        let (_connection, session) = self.inner.tab_session(tab_id).await?;
+        let script = format!(
+            "(() => {{
+               const el = document.elementFromPoint({x}, {y});
+               if (!el || el.tagName !== 'SELECT' || el.multiple) return null;
+               const index = Array.from(document.querySelectorAll('select')).indexOf(el);
+               if (index < 0) return null;
+               return {{
+                 index,
+                 value: el.value,
+                 options: Array.from(el.options).map((option) => ({{
+                   value: option.value,
+                   label: option.text,
+                 }})),
+               }};
+             }})()"
+        );
+        let result = cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({ "expression": script, "returnByValue": true }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let value = result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if value.is_null() {
+            return Ok(None);
+        }
+        let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let value_current = value
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let options = value
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|option| BrowserSelectOption {
+                        value: option
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        label: option
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(BrowserSelectMenu {
+            index,
+            value: value_current,
+            options,
+        }))
+    }
+
+    /// Chooses an option on the select a menu was opened for.
+    ///
+    /// The page sees the same `input` and `change` events a real pick sends, so
+    /// a form that listens for them reacts exactly as it would to a human.
+    pub async fn choose_select_option(
+        &self,
+        tab_id: &BrowserTabId,
+        index: u32,
+        value: &str,
+    ) -> BrowserResult<()> {
+        let (_connection, session) = self.inner.tab_session(tab_id).await?;
+        let script = format!(
+            "(() => {{
+               const el = document.querySelectorAll('select')[{index}];
+               if (!el) return false;
+               el.focus();
+               el.value = {};
+               el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+               el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+               return true;
+             }})()",
+            serde_json::to_string(value).unwrap_or_else(|_| "''".to_string())
+        );
+        cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({ "expression": script, "returnByValue": true }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
     }
 
     /// The page's current selection, for the panel's copy shortcut.

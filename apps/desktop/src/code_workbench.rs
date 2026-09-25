@@ -18351,6 +18351,25 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
             Box::pin(async { Ok(String::new()) })
         }
+        fn select_menu_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserSelectMenu>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn choose_select_option(
+            &self,
+            _tab_id: &BrowserTabId,
+            _index: u32,
+            _value: &str,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
         fn subscribe_frames(
             &self,
             _tab_id: &BrowserTabId,
