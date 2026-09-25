@@ -634,7 +634,11 @@ mod tests {
 
     /// Stand-in owner for the fade store; the tests only care that a fade
     /// remembers which view to drive.
-    const OWNER: EntityId = EntityId::from_ffi(7);
+    /// The stand-in owner is built at runtime: `EntityId` has no const
+    /// constructor in this gpui version, and the tests only compare ids.
+    fn owner() -> EntityId {
+        EntityId::from(7)
+    }
 
     /// Collect the owners a tick wants to keep drawing.
     fn tick_owners(fades: &mut HoverFades, now: Instant) -> Vec<EntityId> {
@@ -786,7 +790,7 @@ mod tests {
         let ms = |m: u64| t0 + Duration::from_millis(m);
 
         // Enter: 0 at the flip, mid-flight strictly between, 1 at 150ms.
-        fades.set_at("pill", true, false, OWNER, t0);
+        fades.set_at("pill", true, false, owner(), t0);
         assert_eq!(fades.value_at("pill", t0), 0.0);
         let mid = fades.value_at("pill", ms(75));
         assert!(mid > 0.0 && mid < 1.0, "mid-flight enter: {mid}");
@@ -794,9 +798,9 @@ mod tests {
         assert_eq!(fades.value_at("pill", ms(400)), 1.0, "clamps past the end");
 
         // Leave mid-flight re-anchors at the current value — no jump.
-        fades.set_at("pill", true, false, OWNER, t0);
+        fades.set_at("pill", true, false, owner(), t0);
         let at_flip = fades.value_at("pill", ms(75));
-        fades.set_at("pill", false, false, OWNER, ms(75));
+        fades.set_at("pill", false, false, owner(), ms(75));
         let after_flip = fades.value_at("pill", ms(75));
         assert!(
             (after_flip - at_flip).abs() < 1e-4,
@@ -811,9 +815,9 @@ mod tests {
     fn hover_fade_reduced_motion_snaps() {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
-        fades.set_at("row", true, true, OWNER, t0);
+        fades.set_at("row", true, true, owner(), t0);
         assert_eq!(fades.value_at("row", t0), 1.0, "enter snaps to 1");
-        fades.set_at("row", false, true, OWNER, t0);
+        fades.set_at("row", false, true, owner(), t0);
         assert_eq!(fades.value_at("row", t0), 0.0, "leave snaps to 0");
     }
 
@@ -848,7 +852,7 @@ mod tests {
     fn hover_fade_leave_without_enter_is_inert() {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
-        fades.set_at("ghost", false, false, OWNER, t0);
+        fades.set_at("ghost", false, false, owner(), t0);
         assert!(fades.entries.is_empty(), "no entry for a leave-only key");
         assert_eq!(fades.value_at("ghost", t0), 0.0);
     }
@@ -859,11 +863,11 @@ mod tests {
         let t0 = Instant::now();
         let ms = |m: u64| t0 + Duration::from_millis(m);
 
-        fades.set_at("a", true, false, OWNER, t0);
+        fades.set_at("a", true, false, owner(), t0);
         // Mid-flight: the owner is asked for a frame (read each frame).
-        assert_eq!(tick_owners(&mut fades, ms(50)), vec![OWNER]);
+        assert_eq!(tick_owners(&mut fades, ms(50)), vec![owner()]);
         fades.value_at("a", ms(50));
-        assert_eq!(tick_owners(&mut fades, ms(100)), vec![OWNER]);
+        assert_eq!(tick_owners(&mut fades, ms(100)), vec![owner()]);
         fades.value_at("a", ms(100));
         // Settled hovered (still read): no more frames needed, entry kept.
         assert!(tick_owners(&mut fades, ms(200)).is_empty());
@@ -871,8 +875,8 @@ mod tests {
         assert_eq!(fades.value_at("a", ms(250)), 1.0);
 
         // Leave → fades → settles at rest → entry evicted.
-        fades.set_at("a", false, false, OWNER, ms(250));
-        assert_eq!(tick_owners(&mut fades, ms(300)), vec![OWNER]);
+        fades.set_at("a", false, false, owner(), ms(250));
+        assert_eq!(tick_owners(&mut fades, ms(300)), vec![owner()]);
         fades.value_at("a", ms(300));
         assert!(
             tick_owners(&mut fades, ms(500)).is_empty(),
@@ -888,11 +892,11 @@ mod tests {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
         let ms = |m: u64| t0 + Duration::from_millis(m);
-        fades.set_at("menu-row", true, false, OWNER, t0);
+        fades.set_at("menu-row", true, false, owner(), t0);
         tick_owners(&mut fades, ms(16));
         fades.value_at("menu-row", ms(16)); // mounted, read
         // Still fresh and mid-flight without further reads: keep frames coming.
-        assert_eq!(tick_owners(&mut fades, ms(100)), vec![OWNER]);
+        assert_eq!(tick_owners(&mut fades, ms(100)), vec![owner()]);
         // A full lease without any read evicts the entry.
         tick_owners(&mut fades, ms(600));
         assert!(fades.entries.is_empty(), "unread entry evicted");
