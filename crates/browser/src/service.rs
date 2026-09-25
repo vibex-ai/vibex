@@ -1972,6 +1972,11 @@ async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
             "Page.setInterceptFileChooserDialog",
             json!({ "enabled": true }),
         ),
+        // HTTP auth challenges and permission prompts have no headless UI to
+        // answer them. Chrome declines both itself and the load settles, so no
+        // `Fetch` interception is installed: `Fetch.authRequired` only fires for
+        // requests the patterns match, and enabling it without patterns pauses
+        // every request. The behaviour is pinned by the live transport test.
         // Downloads default to denied. A page never chooses a write path.
         (
             "Browser.setDownloadBehavior",

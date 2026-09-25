@@ -991,6 +991,76 @@ mod tests {
                     .is_none(),
                 "a point with no select is not a menu"
             );
+            // An HTTP auth challenge has no headless UI. Left unanswered it
+            // suspends the request forever, so the runtime declines it and the
+            // load finishes with a 401 the page can see.
+            let auth = std::net::TcpListener::bind("127.0.0.1:0").expect("an auth server");
+            let auth_port = auth.local_addr().expect("the auth address").port();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = auth.accept() {
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"vibex\"\r\n                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            transport
+                .navigate(&tab.tab_id, &format!("http://127.0.0.1:{auth_port}/"))
+                .await?;
+            // The body is polled without a Tokio context on purpose, so the
+            // wait blocks the test thread between polls rather than using a
+            // Tokio timer: the browser keeps making progress on its own threads.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut status = None;
+            while std::time::Instant::now() < deadline {
+                let snapshot = transport.session_snapshot(&session).await?;
+                status = snapshot
+                    .session
+                    .tabs
+                    .iter()
+                    .find(|candidate| candidate.tab_id == tab.tab_id)
+                    .map(|candidate| candidate.status);
+                if status == Some(vibex_core::BrowserTabStatus::Ready) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(
+                status,
+                Some(vibex_core::BrowserTabStatus::Ready),
+                "an auth challenge must be declined, not left hanging"
+            );
+
+            // A permission prompt has no headless UI either. The browser
+            // declines it rather than waiting for an answer nobody can give.
+            let geolocation = transport
+                .run(transport.service().call_tool(
+                    &vibex_browser::BrowserToolContext {
+                        session_id: session.clone(),
+                        agent_session_id: None,
+                        workspace_id: None,
+                        authorized_roots: Vec::new(),
+                        tier: BrowserToolTier::Fine,
+                    },
+                    "browser_evaluate",
+                    &serde_json::json!({
+                        "tab_id": tab.tab_id.as_str(),
+                        "script": "new Promise((resolve) => { \
+                            const timer = setTimeout(() => resolve('pending'), 4000); \
+                            navigator.geolocation.getCurrentPosition( \
+                              () => { clearTimeout(timer); resolve('granted'); }, \
+                              (error) => { clearTimeout(timer); resolve('denied:' + error.code); }, \
+                              { timeout: 3000 }); \
+                        })",
+                    }),
+                ))
+                .await;
+            let text = format!("{geolocation:?}");
+            assert!(
+                text.contains("denied"),
+                "a permission prompt must be declined, not left pending: {text}"
+            );
+
             transport.stop_screencast(&tab.tab_id).await?;
             transport.close_tab(&tab.tab_id).await?;
             Ok::<(), BrowserTransportError>(())

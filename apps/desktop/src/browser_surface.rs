@@ -2607,7 +2607,7 @@ mod tests {
             })
             .expect("surface window")
         });
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), &cx);
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         let surface = window.root(&mut cx).expect("surface");
 
         // The first attempt fails, the retry succeeds after its backoff — the
