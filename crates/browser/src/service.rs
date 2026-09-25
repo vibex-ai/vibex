@@ -94,6 +94,21 @@ pub enum BrowserServiceEvent {
     },
 }
 
+/// What the panel's inspector shows about one element.
+///
+/// Deliberately not the whole `DOM.describeNode` payload: the panel shows a
+/// readable one-liner, and anything more would end up in a tooltip nobody reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserElementInspection {
+    /// `tag#id` or `tag.class...`, the shortest thing that names the element.
+    pub selector: String,
+    pub node_name: String,
+    pub id: String,
+    pub classes: Vec<String>,
+    pub width: i64,
+    pub height: i64,
+}
+
 /// Identifies the owner of a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BrowserSessionKey {
@@ -257,6 +272,9 @@ pub(crate) struct TabRecord {
     pub(crate) file_chooser_pending: bool,
     pub(crate) file_chooser_backend_node: Option<i64>,
     pub(crate) viewport: (u32, u32, f64),
+    /// Navigation history position, kept for the panel's back/forward buttons.
+    pub(crate) can_go_back: bool,
+    pub(crate) can_go_forward: bool,
 }
 
 impl TabRecord {
@@ -271,6 +289,8 @@ impl TabRecord {
             created_at_ms: self.created_at_ms,
             last_activity_at_ms: self.last_activity_at_ms,
             generation: self.generation,
+            can_go_back: self.can_go_back,
+            can_go_forward: self.can_go_forward,
         }
     }
 
@@ -1563,6 +1583,8 @@ impl BrowserService {
             file_chooser_pending: false,
             file_chooser_backend_node: None,
             viewport: (DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT, 1.0),
+            can_go_back: false,
+            can_go_forward: false,
         };
         {
             let mut state = self.inner.state.lock().await;
@@ -1778,6 +1800,197 @@ impl BrowserService {
         }
         state.last_activity_ms = unix_timestamp_ms();
         Ok(())
+    }
+
+    /// Moves a tab through its navigation history.
+    ///
+    /// This is what the panel's back and forward buttons and the mouse's side
+    /// buttons call. The history entry is addressed by id, so a page that
+    /// rewrote its own history between the buttons being painted and clicked
+    /// cannot make the runtime jump somewhere else.
+    pub async fn navigate_history(
+        &self,
+        tab_id: &BrowserTabId,
+        forward: bool,
+    ) -> BrowserResult<()> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let history = cdp(
+            &session,
+            "Page.getNavigationHistory",
+            json!({}),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        let index = history
+            .get("currentIndex")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let target_index = if forward { index + 1 } else { index - 1 };
+        let entry_id = (target_index >= 0)
+            .then(|| {
+                history
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .and_then(|entries| entries.get(target_index as usize))
+                    .and_then(|entry| entry.get("id"))
+                    .cloned()
+            })
+            .flatten();
+        let Some(entry_id) = entry_id else {
+            // Nothing that way: the panel's button should have been disabled,
+            // and a stale click is not an error.
+            return Ok(());
+        };
+        cdp(
+            &session,
+            "Page.navigateToHistoryEntry",
+            json!({ "entryId": entry_id }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let _ = refresh_navigation_state(&self.inner, &session).await;
+        Ok(())
+    }
+
+    pub async fn go_back(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+        self.navigate_history(tab_id, false).await
+    }
+
+    pub async fn go_forward(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+        self.navigate_history(tab_id, true).await
+    }
+
+    /// Highlights the element under a viewport point, for the panel's picker.
+    ///
+    /// The highlight is drawn by the page (`Overlay.highlightNode`), so it
+    /// follows scrolling and zooming and shows up in the screencast without any
+    /// coordinate conversion on the client.
+    pub async fn highlight_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserResult<Option<i64>> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let Some(backend_node_id) = node_at_point(&session, x, y).await? else {
+            let _ = cdp(
+                &session,
+                "Overlay.hideHighlight",
+                json!({}),
+                SHORT_TIMEOUT_MS,
+            )
+            .await;
+            return Ok(None);
+        };
+        cdp(
+            &session,
+            "Overlay.highlightNode",
+            json!({
+                "backendNodeId": backend_node_id,
+                "highlightConfig": {
+                    "showInfo": false,
+                    "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.25 },
+                    "paddingColor": { "r": 147, "g": 196, "b": 125, "a": 0.35 },
+                    "borderColor": { "r": 255, "g": 229, "b": 153, "a": 0.7 },
+                    "marginColor": { "r": 246, "g": 178, "b": 107, "a": 0.35 },
+                },
+            }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(Some(backend_node_id))
+    }
+
+    /// Removes the picker's highlight.
+    pub async fn clear_highlight(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        cdp(
+            &session,
+            "Overlay.hideHighlight",
+            json!({}),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Describes the element under a viewport point for the panel's inspector.
+    pub async fn describe_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserResult<Option<BrowserElementInspection>> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let Some(backend_node_id) = node_at_point(&session, x, y).await? else {
+            return Ok(None);
+        };
+        let described = cdp(
+            &session,
+            "DOM.describeNode",
+            json!({ "backendNodeId": backend_node_id, "depth": 0 }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        let node = &described["node"];
+        let node_name = node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut id = String::new();
+        let mut classes = Vec::new();
+        if let Some(attributes) = node.get("attributes").and_then(Value::as_array) {
+            let mut pairs = attributes.iter().filter_map(Value::as_str);
+            while let (Some(name), Some(value)) = (pairs.next(), pairs.next()) {
+                match name {
+                    "id" => id = value.to_string(),
+                    "class" => classes = value.split_whitespace().map(str::to_string).collect(),
+                    _ => {}
+                }
+            }
+        }
+        // The border box is what the eye sees; a missing box model (a hidden
+        // node) is not an error, the card simply has no size to show.
+        let (width, height) = match cdp(
+            &session,
+            "DOM.getBoxModel",
+            json!({ "backendNodeId": backend_node_id }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await
+        {
+            Ok(model) => {
+                let quad = model["model"]["border"]
+                    .as_array()
+                    .map(|values| values.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if quad.len() == 8 {
+                    (
+                        (quad[2] - quad[0]).abs().round() as i64,
+                        (quad[5] - quad[1]).abs().round() as i64,
+                    )
+                } else {
+                    (0, 0)
+                }
+            }
+            Err(_) => (0, 0),
+        };
+        let selector = if !id.is_empty() {
+            format!("{node_name}#{id}")
+        } else if !classes.is_empty() {
+            format!("{node_name}.{}", classes.join("."))
+        } else {
+            node_name.clone()
+        };
+        Ok(Some(BrowserElementInspection {
+            selector,
+            node_name,
+            id,
+            classes,
+            width,
+            height,
+        }))
     }
 
     /// Reloads a tab.
@@ -2244,6 +2457,11 @@ async fn handle_cdp_event(
                     .send(BrowserServiceEvent::SessionChanged(session_id));
             }
             let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
+            // The back and forward buttons are enabled from the history, so a
+            // navigation has to refresh it.
+            let session =
+                CdpSession::new(Arc::clone(connection), session_id.clone(), String::new());
+            let _ = refresh_navigation_state(inner, &session).await;
         }
         "Page.loadEventFired" | "Page.domContentEventFired" => {
             let tab_id = {
@@ -2633,6 +2851,8 @@ async fn adopt_discovered_target(
         file_chooser_pending: false,
         file_chooser_backend_node: None,
         viewport,
+        can_go_back: false,
+        can_go_forward: false,
     };
     let inserted = {
         let mut state = inner.state.lock().await;
@@ -2664,6 +2884,62 @@ async fn adopt_discovered_target(
     let _ = inner
         .events
         .send(BrowserServiceEvent::TabOpened { session_id, tab_id });
+}
+
+/// Reads a tab's position in its navigation history into its record.
+///
+/// The panel's back and forward buttons are enabled from this, so it runs after
+/// every navigation and after a history move, and only reports a change when the
+/// answer actually changed.
+async fn refresh_navigation_state(
+    inner: &Arc<BrowserInner>,
+    session: &CdpSession,
+) -> BrowserResult<()> {
+    let history = cdp(
+        session,
+        "Page.getNavigationHistory",
+        json!({}),
+        SHORT_TIMEOUT_MS,
+    )
+    .await?;
+    let index = history
+        .get("currentIndex")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let entries = history
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0) as i64;
+    let can_go_back = index > 0;
+    let can_go_forward = index + 1 < entries;
+    let changed = {
+        let mut state = inner.state.lock().await;
+        match state.tab_by_cdp_session(&session.session_id) {
+            Some(tab) if tab.can_go_back != can_go_back || tab.can_go_forward != can_go_forward => {
+                tab.can_go_back = can_go_back;
+                tab.can_go_forward = can_go_forward;
+                Some(tab.tab_id.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(tab_id) = changed {
+        let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
+    }
+    Ok(())
+}
+
+/// Resolves the node under a viewport point, in viewport CSS pixels.
+async fn node_at_point(session: &CdpSession, x: f64, y: f64) -> BrowserResult<Option<i64>> {
+    let located = cdp(
+        session,
+        "DOM.getNodeForLocation",
+        json!({ "x": x, "y": y, "includeUserAgentShadowDOM": false }),
+        SHORT_TIMEOUT_MS,
+    )
+    .await?;
+    Ok(located.get("backendNodeId").and_then(Value::as_i64))
 }
 
 /// Removes a tab whose target went away on its own, such as `window.close()`.

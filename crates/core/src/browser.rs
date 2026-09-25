@@ -533,6 +533,12 @@ pub struct BrowserTab {
     pub created_at_ms: i64,
     pub last_activity_at_ms: i64,
     pub generation: u64,
+    /// True when the tab has an earlier entry in its navigation history.
+    #[serde(default)]
+    pub can_go_back: bool,
+    /// True when the tab has a later entry in its navigation history.
+    #[serde(default)]
+    pub can_go_forward: bool,
 }
 
 impl fmt::Debug for BrowserTab {
@@ -838,6 +844,8 @@ mod tests {
             created_at_ms: 0,
             last_activity_at_ms: 0,
             generation: 1,
+            can_go_back: false,
+            can_go_forward: false,
         };
         let debug = format!("{tab:?}");
         assert!(!debug.contains("secret"));
