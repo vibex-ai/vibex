@@ -186,6 +186,32 @@ pub trait BrowserTransport: Send + Sync + 'static {
 
     fn reload(&self, tab_id: &BrowserTabId, ignore_cache: bool) -> BrowserTransportFuture<'_, ()>;
 
+    /// Moves the tab one entry back in its history.
+    fn go_back(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()>;
+
+    /// Moves the tab one entry forward in its history.
+    fn go_forward(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()>;
+
+    /// Highlights the element under a viewport point and returns its
+    /// `backendNodeId`, or `None` when there is nothing there.
+    fn highlight_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<i64>>;
+
+    /// Removes the picker's highlight.
+    fn clear_highlight(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()>;
+
+    /// Describes the element under a viewport point for the inspector card.
+    fn describe_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>>;
+
     /// The page's current selection, for the panel's copy shortcut.
     ///
     /// Headless Chrome's clipboard is its own, so the panel reads the selection
@@ -446,6 +472,55 @@ impl BrowserTransport for LocalBrowserTransport {
         }))
     }
 
+    fn go_back(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.go_back(&tab_id).await.map_err(Into::into) }))
+    }
+
+    fn go_forward(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.go_forward(&tab_id).await.map_err(Into::into) }))
+    }
+
+    fn highlight_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<i64>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .highlight_at(&tab_id, x, y)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn clear_highlight(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(
+            self.run(async move { service.clear_highlight(&tab_id).await.map_err(Into::into) }),
+        )
+    }
+
+    fn describe_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(
+            self.run(async move { service.describe_at(&tab_id, x, y).await.map_err(Into::into) }),
+        )
+    }
+
     fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {
         let tab_id = tab_id.clone();
         let service = self.service.clone();
@@ -631,6 +706,36 @@ impl BrowserTransport for RemoteBrowserTransport {
         _tab_id: &BrowserTabId,
         _ignore_cache: bool,
     ) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn go_back(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn go_forward(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn highlight_at(
+        &self,
+        _tab_id: &BrowserTabId,
+        _x: f64,
+        _y: f64,
+    ) -> BrowserTransportFuture<'_, Option<i64>> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn clear_highlight(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn describe_at(
+        &self,
+        _tab_id: &BrowserTabId,
+        _x: f64,
+        _y: f64,
+    ) -> BrowserTransportFuture<'_, Option<vibex_browser::BrowserElementInspection>> {
         Box::pin(async move { Self::unavailable() })
     }
 

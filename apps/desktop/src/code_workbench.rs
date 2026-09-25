@@ -18319,6 +18319,8 @@ mod tests {
                     created_at_ms: 0,
                     last_activity_at_ms: 0,
                     generation: 0,
+                    can_go_back: false,
+                    can_go_forward: false,
                 })
             })
         }
@@ -18364,6 +18366,43 @@ mod tests {
             _ignore_cache: bool,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
+        }
+        fn go_back(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn go_forward(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn highlight_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, Option<i64>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn clear_highlight(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn describe_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserElementInspection>,
+        > {
+            Box::pin(async { Ok(None) })
         }
         fn selection_text(
             &self,

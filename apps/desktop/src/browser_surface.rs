@@ -30,11 +30,12 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     button::Button,
     button::ButtonVariants as _,
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
     v_flex,
 };
 use image::Frame;
@@ -125,6 +126,12 @@ pub struct BrowserSurface {
     select_hint: Option<SelectHint>,
     /// The open fallback menu, anchored where the click landed.
     select_menu: Option<OpenSelectMenu>,
+    /// Element picker: the next click inspects the element under it.
+    inspecting: bool,
+    /// Where the picker last highlighted, so a hover does not repeat the call.
+    inspect_hover: Option<(f64, f64)>,
+    /// What the inspector card is showing.
+    inspect_card: Option<vibex_browser::BrowserElementInspection>,
     /// True while a hover probe is outstanding.
     select_probe_in_flight: bool,
     /// Who the runtime says is driving this tab.
@@ -189,6 +196,9 @@ impl BrowserSurface {
             file_chooser_pending: false,
             select_hint: None,
             select_menu: None,
+            inspecting: false,
+            inspect_hover: None,
+            inspect_card: None,
             select_probe_in_flight: false,
             execution_source: None,
             agent_paused: false,
@@ -576,6 +586,11 @@ impl BrowserSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && (self.inspecting || self.inspect_card.is_some()) {
+            self.stop_inspecting(cx);
+            cx.stop_propagation();
+            return;
+        }
         // AltGr and friends produce characters; they belong to the text path.
         // A composition owns the keyboard while it is open: Backspace and the
         // arrows are editing the preedit, not the page.
@@ -764,6 +779,92 @@ impl BrowserSurface {
         }
     }
 
+    /// Turns the element picker on: the next click inspects what is under it.
+    fn start_inspecting(&mut self, cx: &mut Context<Self>) {
+        self.inspecting = true;
+        self.inspect_hover = None;
+        cx.notify();
+    }
+
+    /// Leaves the picker and removes the page's highlight, keeping the card.
+    fn stop_inspecting(&mut self, cx: &mut Context<Self>) {
+        self.inspecting = false;
+        self.inspect_hover = None;
+        self.inspect_card = None;
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            cx.notify();
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let _ = transport.clear_highlight(&tab_id).await;
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Highlights whatever the pointer is over, while the picker is on.
+    fn highlight_under_pointer(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
+        if self
+            .inspect_hover
+            .is_some_and(|(px, py)| (px - x).abs() < 4.0 && (py - y).abs() < 4.0)
+        {
+            return;
+        }
+        self.inspect_hover = Some((x, y));
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let _ = transport.highlight_at(&tab_id, x, y).await;
+            })
+            .detach();
+    }
+
+    /// Picks the element under a point and fills the inspector card.
+    fn pick_element(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        self.inspecting = false;
+        self.inspect_hover = None;
+        cx.spawn(async move |this, cx| {
+            let described = transport.describe_at(&tab_id, x, y).await.ok().flatten();
+            let _ = this.update(cx, |surface, cx| {
+                surface.inspect_card = described;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(false, cx);
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(true, cx);
+    }
+
+    /// Moves the tab through its history. The mouse's side buttons take the
+    /// same path as the toolbar arrows.
+    fn navigate_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        self.start_frame_pump(cx);
+        cx.background_executor()
+            .spawn(async move {
+                let _ = if forward {
+                    transport.go_forward(&tab_id).await
+                } else {
+                    transport.go_back(&tab_id).await
+                };
+            })
+            .detach();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
             return;
@@ -908,6 +1009,9 @@ impl BrowserSurface {
     fn render_frame(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let focus = self.focus.clone();
         let input_entity = cx.entity();
+        let menu_entity = cx.weak_entity();
+        let can_go_back = self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
+        let can_go_forward = self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
         let prepaint_entity = input_entity.clone();
         let active = self.active;
         let has_frame = self.frame_image.is_some();
@@ -953,6 +1057,15 @@ impl BrowserSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    // The picker owns the click while it is on: picking an
+                    // element must not also press it.
+                    if this.inspecting {
+                        if let Some((x, y)) = this.to_viewport_point(event.position) {
+                            this.pick_element(x, y, cx);
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.focus.focus(window, cx);
                     let Some((x, y)) = this.to_viewport_point(event.position) else {
                         return;
@@ -1009,6 +1122,16 @@ impl BrowserSurface {
                     );
                 }),
             )
+            // The mouse's side buttons are the same navigation as the toolbar
+            // arrows, which is what they do in a real browser.
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.go_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+            )
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
                     return;
@@ -1016,6 +1139,10 @@ impl BrowserSurface {
                 // The held button travels with the move: Chrome only starts a
                 // drag — a scrollbar, a text selection, an HTML5 drop — when it
                 // knows one is down.
+                if this.inspecting {
+                    this.highlight_under_pointer(x, y, cx);
+                    return;
+                }
                 let buttons = if event.dragging() { 1 } else { 0 };
                 this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y, buttons }, cx);
                 this.probe_select_hint(x, y, cx);
@@ -1070,7 +1197,89 @@ impl BrowserSurface {
                 .absolute()
                 .inset_0(),
             )
+            .context_menu(move |menu, _, _cx| {
+                let back = menu_entity.clone();
+                let forward = menu_entity.clone();
+                let reload = menu_entity.clone();
+                let copy = menu_entity.clone();
+                let paste = menu_entity.clone();
+                let select_all = menu_entity.clone();
+                let inspect = menu_entity.clone();
+                menu.min_w(px(208.0))
+                    .max_w(px(208.0))
+                    .item(
+                        PopupMenuItem::new(locale::text("Back", "后退", "上一頁"))
+                            .icon(IconName::ArrowLeft)
+                            .disabled(!can_go_back)
+                            .on_click(move |_, _, cx| {
+                                let _ = back.update(cx, |this, cx| this.go_back(cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text("Forward", "前进", "下一頁"))
+                            .icon(IconName::ArrowRight)
+                            .disabled(!can_go_forward)
+                            .on_click(move |_, _, cx| {
+                                let _ = forward.update(cx, |this, cx| this.go_forward(cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text("Reload", "重新加载", "重新載入"))
+                            .icon(IconName::Redo)
+                            .on_click(move |_, _, cx| {
+                                let _ = reload.update(cx, |this, cx| this.reload(cx));
+                            }),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(locale::text("Copy", "复制", "複製"))
+                            .icon(IconName::Copy)
+                            .on_click(move |_, _, cx| {
+                                let _ = copy.update(cx, |this, cx| this.copy_selection(cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text("Paste", "粘贴", "貼上")).on_click(
+                            move |_, _, cx| {
+                                let _ = paste.update(cx, |this, cx| this.paste_clipboard(cx));
+                            },
+                        ),
+                    )
+                    .item(
+                        PopupMenuItem::new(locale::text("Select all", "全选", "全選")).on_click(
+                            move |_, _, cx| {
+                                let _ = select_all.update(cx, |this, cx| this.select_all(cx));
+                            },
+                        ),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(locale::text("Inspect element", "检查元素", "檢查元素"))
+                            .icon(IconName::Search)
+                            .on_click(move |_, _, cx| {
+                                let _ = inspect.update(cx, |this, cx| this.start_inspecting(cx));
+                            }),
+                    )
+            })
             .into_any_element()
+    }
+
+    /// Selects everything in the page, the way the context menu's entry does.
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        for event_type in ["rawKeyDown", "keyUp"] {
+            self.dispatch(
+                BrowserInput::Key {
+                    event_type: event_type.to_string(),
+                    key: "a".to_string(),
+                    code: "KeyA".to_string(),
+                    text: None,
+                    // CDP modifier bits: Control.
+                    modifiers: 2,
+                    windows_key_code: 65,
+                },
+                cx,
+            );
+        }
     }
 
     fn phase_message(&self) -> SharedString {
@@ -1141,6 +1350,10 @@ impl BrowserSurface {
             .as_ref()
             .map(|tab| tab.title.clone())
             .unwrap_or_default();
+        // Chrome's three buttons: back and forward follow the tab's own history,
+        // reload is always available.
+        let can_go_back = self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
+        let can_go_forward = self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
         let _ = display_address;
         h_flex()
             .id("browser-toolbar")
@@ -1153,6 +1366,24 @@ impl BrowserSurface {
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
+            .child(
+                Button::new("browser-back")
+                    .icon(Icon::new(IconName::ArrowLeft))
+                    .ghost()
+                    .xsmall()
+                    .disabled(!can_go_back)
+                    .tooltip(locale::text("Back", "后退", "上一頁"))
+                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+            )
+            .child(
+                Button::new("browser-forward")
+                    .icon(Icon::new(IconName::ArrowRight))
+                    .ghost()
+                    .xsmall()
+                    .disabled(!can_go_forward)
+                    .tooltip(locale::text("Forward", "前进", "下一頁"))
+                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+            )
             .child(
                 Button::new("browser-reload")
                     .icon(Icon::new(IconName::Redo))
@@ -1392,6 +1623,68 @@ impl BrowserSurface {
                     ),
             )
             .into_any_element(),
+        )
+    }
+
+    /// The picker's hint and the inspector's card.
+    ///
+    /// Both are panel chrome: the element itself is highlighted inside the page
+    /// by `Overlay.highlightNode`, so it follows scrolling and shows up in the
+    /// screencast.
+    fn render_inspector(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.inspecting {
+            return Some(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted)
+                    .text_color(cx.theme().foreground)
+                    .child(locale::text(
+                        "Click an element to inspect it. Esc cancels.",
+                        "点击页面元素进行检查，Esc 取消。",
+                        "點擊頁面元素進行檢查，Esc 取消。",
+                    ))
+                    .into_any_element(),
+            );
+        }
+        let card = self.inspect_card.clone()?;
+        Some(
+            h_flex()
+                .id("browser-inspector")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .child(format!(
+                            "{}  {} × {}",
+                            card.selector, card.width, card.height
+                        )),
+                )
+                .child(
+                    Button::new("browser-inspector-close")
+                        .icon(Icon::new(IconName::Close))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Close", "关闭", "關閉"))
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_inspecting(cx))),
+                )
+                .into_any_element(),
         )
     }
 
@@ -1905,6 +2198,7 @@ impl Render for BrowserSurface {
         let select_menu = self.render_select_menu(cx);
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
+        let inspector = self.render_inspector(cx);
         v_flex()
             .id("browser-surface")
             .track_focus(&self.focus)
@@ -1936,6 +2230,7 @@ impl Render for BrowserSurface {
             .when_some(select_menu, |this, menu| this.child(menu))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
+            .when_some(inspector, |this, inspector| this.child(inspector))
             .on_key_down(cx.listener(Self::on_page_key_down))
             .on_key_up(cx.listener(Self::on_page_key_up))
     }
@@ -2451,6 +2746,97 @@ mod tests {
         );
     }
 
+    // The picker owns the pointer while it is on: hovering highlights, the
+    // click describes, and neither reaches the page.
+    #[gpui::test]
+    fn the_element_picker_owns_the_pointer(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport::default());
+        let highlighted = transport.highlighted.clone();
+        let inspected = transport.inspected.clone();
+        let inputs = transport.inputs.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface.frame_pixel_size = (1000.0, 600.0);
+                    surface.start_inspecting(cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+
+        let point = Point::new(px(300.0), px(250.0));
+        cx.simulate_mouse_move(point, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            highlighted.lock().unwrap().len(),
+            1,
+            "the picker asks the runtime what is under the pointer"
+        );
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            inspected.lock().unwrap().len(),
+            1,
+            "the click describes the element"
+        );
+        assert!(
+            inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.contains("MouseDown")),
+            "picking an element must not also press it"
+        );
+        assert!(
+            !surface.read_with(&cx, |surface, _| surface.inspecting),
+            "the picker closes after it picks"
+        );
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.inspect_card.is_some()),
+            "the card shows what was picked"
+        );
+    }
+
+    // The toolbar's arrows are the same navigation as the picker's side buttons.
+    #[gpui::test]
+    fn the_toolbar_arrows_reach_the_runtime(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport::default());
+        let moves = transport.history_moves.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| {
+            surface.go_back(cx);
+            surface.go_forward(cx);
+        });
+        cx.run_until_parked();
+        // The two calls are independent background tasks, so only the set is
+        // ordered.
+        let recorded = moves.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.contains(&false) && recorded.contains(&true));
+    }
+
     /// Records what the surface forwards, so an input-path regression fails
     /// here instead of silently doing nothing in the panel.
     struct RecordingTransport {
@@ -2460,6 +2846,11 @@ mod tests {
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
         subscribe_failures: Arc<std::sync::atomic::AtomicUsize>,
+        /// Picker traffic: points highlighted and points described.
+        highlighted: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
+        inspected: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
+        /// History moves, `true` for forward.
+        history_moves: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl Default for RecordingTransport {
@@ -2469,6 +2860,9 @@ mod tests {
                 snapshot: Arc::new(std::sync::Mutex::new(None)),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                highlighted: Arc::new(std::sync::Mutex::new(Vec::new())),
+                inspected: Arc::new(std::sync::Mutex::new(Vec::new())),
+                history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -2564,6 +2958,56 @@ mod tests {
             _ignore_cache: bool,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
+        }
+        fn go_back(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            self.history_moves.lock().unwrap().push(false);
+            Box::pin(async { Ok(()) })
+        }
+        fn go_forward(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            self.history_moves.lock().unwrap().push(true);
+            Box::pin(async { Ok(()) })
+        }
+        fn highlight_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            x: f64,
+            y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, Option<i64>> {
+            self.highlighted.lock().unwrap().push((x, y));
+            Box::pin(async { Ok(Some(7)) })
+        }
+        fn clear_highlight(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn describe_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            x: f64,
+            y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Option<vibex_browser::BrowserElementInspection>,
+        > {
+            self.inspected.lock().unwrap().push((x, y));
+            Box::pin(async {
+                Ok(Some(vibex_browser::BrowserElementInspection {
+                    selector: "button#submit".to_string(),
+                    node_name: "button".to_string(),
+                    id: "submit".to_string(),
+                    classes: Vec::new(),
+                    width: 120,
+                    height: 32,
+                }))
+            })
         }
         fn selection_text(
             &self,
@@ -2713,6 +3157,8 @@ mod tests {
             created_at_ms: 0,
             last_activity_at_ms: 0,
             generation: 1,
+            can_go_back: false,
+            can_go_forward: false,
         }
     }
 
