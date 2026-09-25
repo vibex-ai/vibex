@@ -2207,6 +2207,14 @@ async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
             "Browser.setDownloadBehavior",
             json!({ "behavior": "deny", "eventsEnabled": false }),
         ),
+        // A headless browser has no window focus, and Blink only runs the text
+        // selection gesture in a frame it believes is focused — dragging across
+        // a paragraph selected nothing without this. Puppeteer enables it for
+        // the same reason.
+        (
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        ),
         // Cross-origin iframes live in their own target. Auto-attaching on the
         // tab's own session scopes the child session to this tab, which is what
         // lets the accessibility tree reach into it.
@@ -2247,6 +2255,25 @@ pub(crate) fn button_mask(button: &str) -> i32 {
 }
 
 /// Converts a panel input event into a CDP command.
+/// The button a CDP `buttons` bitmask says is held.
+///
+/// CDP's masks are Left 1, Right 2, Middle 4, Back 8, Forward 16.
+fn held_button(buttons: i32) -> &'static str {
+    if buttons & 1 != 0 {
+        "left"
+    } else if buttons & 2 != 0 {
+        "right"
+    } else if buttons & 4 != 0 {
+        "middle"
+    } else if buttons & 8 != 0 {
+        "back"
+    } else if buttons & 16 != 0 {
+        "forward"
+    } else {
+        "none"
+    }
+}
+
 pub(crate) fn input_to_cdp(input: BrowserInput) -> (&'static str, Value) {
     match input {
         BrowserInput::MouseMove { x, y, buttons } => (
@@ -2255,8 +2282,13 @@ pub(crate) fn input_to_cdp(input: BrowserInput) -> (&'static str, Value) {
                 "type": "mouseMoved",
                 "x": x,
                 "y": y,
-                "button": "none",
+                // While a button is held, the move has to name it: Blink only
+                // runs the selection gesture — dragging across a paragraph —
+                // when the moved button is the pressed one. `none` here clicked
+                // and scrolled fine but selected nothing.
+                "button": held_button(buttons),
                 "buttons": buttons,
+                "pointerType": "mouse",
             }),
         ),
         BrowserInput::MouseDown {
@@ -3305,7 +3337,19 @@ mod tests {
             buttons: 1,
         });
         assert_eq!(dragging["buttons"], 1);
-        assert_eq!(dragging["button"], "none");
+        // The move has to name the button that is down: Blink only runs the
+        // selection gesture when the moved button is the pressed one, so
+        // `none` here dragged nothing.
+        assert_eq!(dragging["button"], "left");
+        let (_, released_move) = input_to_cdp(BrowserInput::MouseMove {
+            x: 1.0,
+            y: 2.0,
+            buttons: 0,
+        });
+        assert_eq!(released_move["button"], "none");
+        assert_eq!(held_button(2), "right");
+        assert_eq!(held_button(4), "middle");
+        assert_eq!(held_button(0), "none");
 
         let (_, pressed) = input_to_cdp(BrowserInput::MouseDown {
             x: 1.0,
