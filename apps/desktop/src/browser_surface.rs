@@ -1013,20 +1013,24 @@ impl BrowserSurface {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
                     return;
                 };
-                this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y }, cx);
+                // The held button travels with the move: Chrome only starts a
+                // drag — a scrollbar, a text selection, an HTML5 drop — when it
+                // knows one is down.
+                let buttons = if event.dragging() { 1 } else { 0 };
+                this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y, buttons }, cx);
                 this.probe_select_hint(x, y, cx);
             }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
                     return;
                 };
-                let delta = event.delta.pixel_delta(px(16.0));
+                let (delta_x, delta_y) = wheel_delta_cdp(event.delta, WHEEL_LINE_HEIGHT);
                 this.dispatch(
                     vibex_browser::BrowserInput::Wheel {
                         x,
                         y,
-                        delta_x: f32::from(delta.x) as f64,
-                        delta_y: f32::from(delta.y) as f64,
+                        delta_x,
+                        delta_y,
                     },
                     cx,
                 );
@@ -1690,6 +1694,24 @@ struct OpenSelectMenu {
 /// the popup the panel was trying to replace.
 const SELECT_HINT_TOLERANCE: f64 = 6.0;
 
+/// How many pixels one wheel line is worth when the platform reports lines.
+///
+/// Roughly a line of text; Chrome's own wheel handling treats a notch as a few
+/// lines, and the panel only has to feel like a browser.
+const WHEEL_LINE_HEIGHT: Pixels = px(16.0);
+
+/// Converts a GPUI wheel delta into the convention the DevTools protocol uses.
+///
+/// The two disagree on sign: GPUI reports a positive `y` when the user scrolls
+/// *up* (its own list tests simulate scrolling up with `+100`), while
+/// `Input.dispatchMouseEvent` follows the DOM, where a positive `deltaY`
+/// scrolls the page *down*. Passing one to the other unchanged inverts the
+/// wheel — which is exactly what the panel did.
+fn wheel_delta_cdp(delta: gpui::ScrollDelta, line_height: Pixels) -> (f64, f64) {
+    let delta = delta.pixel_delta(line_height);
+    (-f64::from(delta.x), -f64::from(delta.y))
+}
+
 /// True when a click is close enough to a probed point to trust its hint.
 fn select_hint_matches(hint: &SelectHint, x: f64, y: f64) -> bool {
     (hint.x - x).abs() <= SELECT_HINT_TOLERANCE && (hint.y - y).abs() <= SELECT_HINT_TOLERANCE
@@ -1996,6 +2018,22 @@ mod tests {
     #[test]
     fn empty_input_stays_blank() {
         assert_eq!(normalize_address("   "), "about:blank");
+    }
+
+    #[test]
+    fn a_wheel_delta_is_flipped_into_the_dom_convention() {
+        // Scrolling up: GPUI says +100, the page must be told -100.
+        let up = gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(100.0)));
+        assert_eq!(wheel_delta_cdp(up, WHEEL_LINE_HEIGHT), (0.0, -100.0));
+        // Scrolling down: GPUI says -50, the page must be told +50.
+        let down = gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-50.0)));
+        assert_eq!(wheel_delta_cdp(down, WHEEL_LINE_HEIGHT), (0.0, 50.0));
+        // Horizontal follows the same rule.
+        let left = gpui::ScrollDelta::Pixels(gpui::point(px(30.0), px(0.0)));
+        assert_eq!(wheel_delta_cdp(left, WHEEL_LINE_HEIGHT), (-30.0, 0.0));
+        // Lines are converted before the flip.
+        let lines = gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0));
+        assert_eq!(wheel_delta_cdp(lines, px(16.0)), (0.0, -48.0));
     }
 
     #[test]

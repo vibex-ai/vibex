@@ -671,7 +671,11 @@ impl BrowserTransport for RemoteBrowserTransport {
 /// Converts a surface input event into the wire payload the backend carries.
 pub fn input_to_payload(input: &BrowserInput) -> Option<BrowserInputPayload> {
     Some(match input {
-        BrowserInput::MouseMove { x, y } => BrowserInputPayload::MouseMove { x: *x, y: *y },
+        BrowserInput::MouseMove { x, y, buttons } => BrowserInputPayload::MouseMove {
+            x: *x,
+            y: *y,
+            buttons: *buttons,
+        },
         BrowserInput::MouseDown {
             x,
             y,
@@ -734,7 +738,11 @@ pub fn input_to_payload(input: &BrowserInput) -> Option<BrowserInputPayload> {
 /// Converts a wire payload back into a surface input event.
 pub fn payload_to_input(payload: &BrowserInputPayload) -> BrowserInput {
     match payload {
-        BrowserInputPayload::MouseMove { x, y } => BrowserInput::MouseMove { x: *x, y: *y },
+        BrowserInputPayload::MouseMove { x, y, buttons } => BrowserInput::MouseMove {
+            x: *x,
+            y: *y,
+            buttons: *buttons,
+        },
         BrowserInputPayload::MouseDown {
             x,
             y,
@@ -826,6 +834,36 @@ mod tests {
                 Poll::Pending => std::thread::park(),
             }
         }
+    }
+
+    /// Runs `browser_evaluate` through the transport and returns the outcome's
+    /// text, for the live assertions that need to read the page.
+    async fn evaluate(
+        transport: &LocalBrowserTransport,
+        session_id: &BrowserSessionId,
+        tab_id: &BrowserTabId,
+        script: &str,
+    ) -> String {
+        let context = vibex_browser::BrowserToolContext {
+            session_id: session_id.clone(),
+            agent_session_id: None,
+            workspace_id: None,
+            authorized_roots: Vec::new(),
+            tier: BrowserToolTier::Fine,
+        };
+        let outcome = transport
+            .run(transport.service().call_tool(
+                &context,
+                "browser_evaluate",
+                &serde_json::json!({ "tab_id": tab_id.as_str(), "script": script }),
+            ))
+            .await;
+        assert!(
+            !outcome.is_error,
+            "browser_evaluate failed: {}",
+            outcome.text
+        );
+        outcome.text
     }
 
     fn test_runtime() -> tokio::runtime::Runtime {
@@ -991,6 +1029,82 @@ mod tests {
                     .is_none(),
                 "a point with no select is not a menu"
             );
+
+            // A wheel in the DOM convention moves the page the way the sign
+            // says: positive `deltaY` scrolls down. The panel flips GPUI's sign
+            // before it reaches here, and this is what pins the flip.
+            evaluate(
+                &transport,
+                &session,
+                &tab.tab_id,
+                "window.__events = []; \
+                 addEventListener('wheel', (e) => window.__events.push('wheel:' + e.deltaY)); \
+                 addEventListener('mousemove', (e) => window.__events.push('move:' + e.buttons)); \
+                 document.body.innerHTML = '<div style=\"height:5000px\">tall</div>'; \
+                 window.scrollTo(0, 0); 'ready'",
+            )
+            .await;
+            transport
+                .dispatch_input(
+                    &tab.tab_id,
+                    BrowserInput::Wheel {
+                        x: 100.0,
+                        y: 100.0,
+                        delta_x: 0.0,
+                        delta_y: 300.0,
+                    },
+                )
+                .await?;
+            // A move with the button held has to say so, or Chrome never treats
+            // it as a drag: a scrollbar or a text selection would stay dead.
+            for input in [
+                BrowserInput::MouseDown {
+                    x: 100.0,
+                    y: 100.0,
+                    button: "left".to_string(),
+                    click_count: 1,
+                    modifiers: 0,
+                },
+                BrowserInput::MouseMove {
+                    x: 140.0,
+                    y: 160.0,
+                    buttons: 1,
+                },
+                BrowserInput::MouseUp {
+                    x: 140.0,
+                    y: 160.0,
+                    button: "left".to_string(),
+                    click_count: 1,
+                    modifiers: 0,
+                },
+            ] {
+                transport.dispatch_input(&tab.tab_id, input).await?;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            // A human's wheel pauses the Agent on that tab, exactly as a click
+            // does; reading the page back needs the hand-back first.
+            transport
+                .run(transport.service().resume_agent_operations(&session))
+                .await;
+            let seen = evaluate(
+                &transport,
+                &session,
+                &tab.tab_id,
+                "({ y: window.scrollY, events: window.__events })",
+            )
+            .await;
+            assert!(
+                seen.contains("wheel:300"),
+                "a positive deltaY reaches the page: {seen}"
+            );
+            assert!(
+                seen.contains("move:1"),
+                "a held button travels with the move: {seen}"
+            );
+            assert!(
+                seen.contains("\"y\":300"),
+                "a positive deltaY scrolls the page down: {seen}"
+            );
             // An HTTP auth challenge has no headless UI. Left unanswered it
             // suspends the request forever, so the runtime declines it and the
             // load finishes with a 401 the page can see.
@@ -1072,7 +1186,11 @@ mod tests {
     #[test]
     fn input_round_trips_through_the_wire_payload() {
         let inputs = [
-            BrowserInput::MouseMove { x: 1.0, y: 2.0 },
+            BrowserInput::MouseMove {
+                x: 1.0,
+                y: 2.0,
+                buttons: 1,
+            },
             BrowserInput::MouseDown {
                 x: 3.0,
                 y: 4.0,

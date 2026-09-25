@@ -58,7 +58,11 @@ impl fmt::Debug for BrowserFrameBatch {
 pub fn payload_to_browser_input(payload: &BrowserInputPayload) -> vibex_browser::BrowserInput {
     use vibex_browser::BrowserInput;
     match payload {
-        BrowserInputPayload::MouseMove { x, y } => BrowserInput::MouseMove { x: *x, y: *y },
+        BrowserInputPayload::MouseMove { x, y, buttons } => BrowserInput::MouseMove {
+            x: *x,
+            y: *y,
+            buttons: *buttons,
+        },
         BrowserInputPayload::MouseDown {
             x,
             y,
@@ -238,6 +242,10 @@ pub enum BrowserInputPayload {
     MouseMove {
         x: f64,
         y: f64,
+        /// Bitmask of the buttons held during the move; Chrome needs it to see
+        /// a drag rather than a series of hovers.
+        #[serde(default)]
+        buttons: i32,
     },
     MouseDown {
         x: f64,
@@ -275,9 +283,7 @@ pub enum BrowserInputPayload {
         windows_key_code: i32,
     },
     /// Committed IME or paste text.
-    InsertText {
-        text: String,
-    },
+    InsertText { text: String },
 }
 
 impl fmt::Debug for BrowserInputPayload {
@@ -285,10 +291,11 @@ impl fmt::Debug for BrowserInputPayload {
     /// `insert_text` and the `key` text field report their length instead.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MouseMove { x, y } => formatter
+            Self::MouseMove { x, y, buttons } => formatter
                 .debug_struct("BrowserInputPayload::MouseMove")
                 .field("x", x)
                 .field("y", y)
+                .field("buttons", buttons)
                 .finish(),
             Self::MouseDown {
                 x,

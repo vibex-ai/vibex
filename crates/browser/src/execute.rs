@@ -939,7 +939,7 @@ impl BrowserService {
         let (backend_node_id, role, name) = self.resolve_element(&tab_id, reference.trim()).await?;
         let (x, y) = self.element_center(&tab_id, backend_node_id).await?;
         self.highlight(&tab_id, backend_node_id).await;
-        self.dispatch_input(&tab_id, BrowserInput::MouseMove { x, y })
+        self.dispatch_input(&tab_id, BrowserInput::MouseMove { x, y, buttons: 0 })
             .await?;
         let record = self
             .record(
@@ -1160,6 +1160,7 @@ impl BrowserService {
             BrowserInput::MouseMove {
                 x: from_x,
                 y: from_y,
+                buttons: 0,
             },
         )
         .await?;
@@ -1182,6 +1183,9 @@ impl BrowserService {
                 BrowserInput::MouseMove {
                     x: from_x + (to_x - from_x) * t,
                     y: from_y + (to_y - from_y) * t,
+                    // Held: this is what makes the intermediate moves a drag
+                    // rather than a series of hovers.
+                    buttons: 1,
                 },
             )
             .await?;

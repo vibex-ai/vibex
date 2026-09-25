@@ -111,6 +111,11 @@ pub enum BrowserInput {
     MouseMove {
         x: f64,
         y: f64,
+        /// Bitmask of the buttons held during the move.
+        ///
+        /// Chrome reads this to decide whether the move is a drag: without it a
+        /// scrollbar drag, a text selection and an HTML5 drag never start.
+        buttons: i32,
     },
     MouseDown {
         x: f64,
@@ -143,9 +148,7 @@ pub enum BrowserInput {
     },
     /// Committed IME or paste text. Composition is drawn client-side and only
     /// the committed string is sent to the page.
-    InsertText {
-        text: String,
-    },
+    InsertText { text: String },
     /// Panel resize; drives `Emulation.setDeviceMetricsOverride`.
     Resize {
         width: u32,
@@ -2020,12 +2023,28 @@ pub(crate) fn input_takes_over(input: &BrowserInput) -> bool {
     )
 }
 
+/// The CDP `buttons` bitmask for one button name.
+pub(crate) fn button_mask(button: &str) -> i32 {
+    match button {
+        "left" => 1,
+        "right" => 2,
+        "middle" => 4,
+        _ => 0,
+    }
+}
+
 /// Converts a panel input event into a CDP command.
 pub(crate) fn input_to_cdp(input: BrowserInput) -> (&'static str, Value) {
     match input {
-        BrowserInput::MouseMove { x, y } => (
+        BrowserInput::MouseMove { x, y, buttons } => (
             "Input.dispatchMouseEvent",
-            json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none" }),
+            json!({
+                "type": "mouseMoved",
+                "x": x,
+                "y": y,
+                "button": "none",
+                "buttons": buttons,
+            }),
         ),
         BrowserInput::MouseDown {
             x,
@@ -2040,6 +2059,7 @@ pub(crate) fn input_to_cdp(input: BrowserInput) -> (&'static str, Value) {
                 "x": x,
                 "y": y,
                 "button": button,
+                "buttons": button_mask(&button),
                 "clickCount": click_count,
                 "modifiers": modifiers,
             }),
@@ -2057,6 +2077,8 @@ pub(crate) fn input_to_cdp(input: BrowserInput) -> (&'static str, Value) {
                 "x": x,
                 "y": y,
                 "button": button,
+                // Released: the button is no longer held.
+                "buttons": 0,
                 "clickCount": click_count,
                 "modifiers": modifiers,
             }),
@@ -2948,7 +2970,11 @@ mod tests {
 
     #[test]
     fn input_conversion_matches_cdp_shapes() {
-        let (method, params) = input_to_cdp(BrowserInput::MouseMove { x: 1.0, y: 2.0 });
+        let (method, params) = input_to_cdp(BrowserInput::MouseMove {
+            x: 1.0,
+            y: 2.0,
+            buttons: 0,
+        });
         assert_eq!(method, "Input.dispatchMouseEvent");
         assert_eq!(params["type"], "mouseMoved");
         assert_eq!(params["x"], 1.0);
@@ -2994,6 +3020,41 @@ mod tests {
     }
 
     #[test]
+    fn mouse_events_carry_the_held_button_mask() {
+        // Chrome starts a drag only when the move says a button is down; a
+        // scrollbar or a text selection otherwise never receives one.
+        let (_, dragging) = input_to_cdp(BrowserInput::MouseMove {
+            x: 1.0,
+            y: 2.0,
+            buttons: 1,
+        });
+        assert_eq!(dragging["buttons"], 1);
+        assert_eq!(dragging["button"], "none");
+
+        let (_, pressed) = input_to_cdp(BrowserInput::MouseDown {
+            x: 1.0,
+            y: 2.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        });
+        assert_eq!(pressed["buttons"], 1);
+
+        let (_, released) = input_to_cdp(BrowserInput::MouseUp {
+            x: 1.0,
+            y: 2.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        });
+        assert_eq!(released["buttons"], 0);
+
+        assert_eq!(button_mask("right"), 2);
+        assert_eq!(button_mask("middle"), 4);
+        assert_eq!(button_mask("none"), 0);
+    }
+
+    #[test]
     fn key_events_without_text_omit_the_field() {
         let (_, params) = input_to_cdp(BrowserInput::Key {
             event_type: "keyUp".to_string(),
@@ -3022,7 +3083,8 @@ mod tests {
         // Agent the moment the pointer crossed the frame.
         assert!(!input_takes_over(&BrowserInput::MouseMove {
             x: 1.0,
-            y: 2.0
+            y: 2.0,
+            buttons: 1,
         }));
         assert!(!input_takes_over(&BrowserInput::Resize {
             width: 800,
