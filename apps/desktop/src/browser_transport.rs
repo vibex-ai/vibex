@@ -185,6 +185,12 @@ pub trait BrowserTransport: Send + Sync + 'static {
 
     fn reload(&self, tab_id: &BrowserTabId, ignore_cache: bool) -> BrowserTransportFuture<'_, ()>;
 
+    /// The page's current selection, for the panel's copy shortcut.
+    ///
+    /// Headless Chrome's clipboard is its own, so the panel reads the selection
+    /// out and writes the system clipboard itself.
+    fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String>;
+
     /// Opens the frame stream and turns the screencast on.
     fn subscribe_frames(
         &self,
@@ -423,6 +429,12 @@ impl BrowserTransport for LocalBrowserTransport {
         }))
     }
 
+    fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.selection_text(&tab_id).await.map_err(Into::into) }))
+    }
+
     fn subscribe_frames(
         &self,
         tab_id: &BrowserTabId,
@@ -569,6 +581,10 @@ impl BrowserTransport for RemoteBrowserTransport {
         _tab_id: &BrowserTabId,
         _ignore_cache: bool,
     ) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async move { Self::unavailable() })
+    }
+
+    fn selection_text(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, String> {
         Box::pin(async move { Self::unavailable() })
     }
 
@@ -842,6 +858,30 @@ mod tests {
                 frame.is_some(),
                 "the first screencast frame should arrive for a painted page"
             );
+            // The panel's clipboard path needs the page's own selection, which
+            // headless Chrome never puts on the system clipboard.
+            transport
+                .run(transport.service().call_tool(
+                    &vibex_browser::BrowserToolContext {
+                        session_id: session.clone(),
+                        agent_session_id: None,
+                        workspace_id: None,
+                        authorized_roots: Vec::new(),
+                        tier: BrowserToolTier::Fine,
+                    },
+                    "browser_evaluate",
+                    &serde_json::json!({
+                        "tab_id": tab.tab_id.as_str(),
+                        "script": "document.body.innerText = 'select me'; \
+                                    const range = document.createRange(); \
+                                    range.selectNodeContents(document.body); \
+                                    window.getSelection().removeAllRanges(); \
+                                    window.getSelection().addRange(range);",
+                    }),
+                ))
+                .await;
+            let selection = transport.selection_text(&tab.tab_id).await?;
+            assert_eq!(selection.trim(), "select me", "the selection is readable");
             transport.stop_screencast(&tab.tab_id).await?;
             transport.close_tab(&tab.tab_id).await?;
             Ok::<(), BrowserTransportError>(())

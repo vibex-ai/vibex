@@ -1002,6 +1002,30 @@ impl BrowserService {
         }
     }
 
+    /// The page's current selection, for the panel's copy shortcut.
+    ///
+    /// Headless Chrome's clipboard is not the system clipboard, so a human's
+    /// Ctrl+C has to be read out of the page and written by the panel.
+    pub async fn selection_text(&self, tab_id: &BrowserTabId) -> BrowserResult<String> {
+        let (_connection, session) = self.inner.tab_session(tab_id).await?;
+        let result = cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "window.getSelection().toString()",
+                "returnByValue": true,
+            }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
     /// Answers a pending JavaScript dialog.
     pub async fn handle_dialog(
         &self,

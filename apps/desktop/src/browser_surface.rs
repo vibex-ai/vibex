@@ -532,7 +532,7 @@ impl BrowserSurface {
     /// input handler, which is what keeps IME composition intact. What this adds
     /// is everything a page reads from `keydown` — Enter submitting a form,
     /// Backspace editing a field, Tab moving focus, the arrows scrolling, and
-    /// shortcuts such as Ctrl+A or Ctrl+C.
+    /// shortcuts such as Ctrl+A.
     fn on_page_key_down(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -548,11 +548,62 @@ impl BrowserSurface {
         {
             return;
         }
+        // Copy and paste belong to the panel: headless Chrome has its own
+        // clipboard, so forwarding the shortcut would copy into a buffer the
+        // human can never reach.
+        match clipboard_command(&event.keystroke) {
+            Some(ClipboardCommand::Copy) => {
+                self.copy_selection(cx);
+                cx.stop_propagation();
+                return;
+            }
+            Some(ClipboardCommand::Paste) => {
+                self.paste_clipboard(cx);
+                cx.stop_propagation();
+                return;
+            }
+            None => {}
+        }
         let Some(input) = key_input(&event.keystroke, "rawKeyDown") else {
             return;
         };
         self.dispatch(input, cx);
         cx.stop_propagation();
+    }
+
+    /// Copies the page's selection into the system clipboard.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(text) = transport.selection_text(&tab_id).await else {
+                return;
+            };
+            if text.is_empty() {
+                // A copy with nothing selected is not an error; the page's own
+                // handler was not going to produce anything either.
+                return;
+            }
+            let _ = this.update(cx, |_surface, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            });
+        })
+        .detach();
+    }
+
+    /// Sends the system clipboard's text to the page as typed input.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.dispatch(BrowserInput::InsertText { text }, cx);
     }
 
     fn on_page_key_up(
@@ -778,6 +829,15 @@ impl BrowserSurface {
         let active = self.active;
         let has_frame = self.frame_image.is_some();
         let phase_message = self.phase_message();
+        // A stalled or failed pump used to be invisible: the last frame stayed
+        // on screen, so a frozen page looked like a live one that ignored the
+        // pointer. Say it out loud instead.
+        let stalled = has_frame
+            && matches!(
+                self.phase,
+                SurfacePhase::Failed | SurfacePhase::Unavailable | SurfacePhase::Crashed
+            );
+        let stalled_message = stalled.then(|| phase_message.clone());
         let image = self.frame_image.clone();
         div()
             .id("browser-frame")
@@ -789,13 +849,16 @@ impl BrowserSurface {
                 // viewport override, so it is stretched rather than letterboxed.
                 this.child(img(image).w_full().h_full())
             })
-            .when(!has_frame, |this| {
+            .when(!has_frame || stalled, |this| {
                 this.child(
                     v_flex()
                         .size_full()
                         .items_center()
                         .justify_center()
                         .gap_2()
+                        .when(stalled, |this| {
+                            this.bg(cx.theme().background.opacity(0.85))
+                        })
                         .child(
                             Icon::new(IconName::Globe)
                                 .size(px(28.0))
@@ -1448,6 +1511,33 @@ fn character_page_key(keystroke: &Keystroke) -> Option<PageKey> {
 /// `EntityInputHandler` and `Input.insertText`. Sending them here as well would
 /// insert every character twice, and would push the raw letters of a CJK
 /// composition into the page. This mirrors how the terminal forwards keys.
+/// A clipboard shortcut the panel answers itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardCommand {
+    Copy,
+    Paste,
+}
+
+/// The clipboard shortcut a keystroke means, if any.
+///
+/// Control on Linux and Windows, Command on macOS — GPUI reports the latter as
+/// `modifiers.platform`. Shift or Alt makes it a different shortcut that the
+/// page owns, so those are left alone.
+fn clipboard_command(keystroke: &Keystroke) -> Option<ClipboardCommand> {
+    if keystroke.modifiers.alt
+        || keystroke.modifiers.shift
+        || keystroke.modifiers.function
+        || !(keystroke.modifiers.control || keystroke.modifiers.platform)
+    {
+        return None;
+    }
+    match keystroke.key.as_str() {
+        "c" | "C" => Some(ClipboardCommand::Copy),
+        "v" | "V" => Some(ClipboardCommand::Paste),
+        _ => None,
+    }
+}
+
 fn key_input(keystroke: &Keystroke, event_type: &str) -> Option<BrowserInput> {
     let identity = named_page_key(keystroke.key.as_str()).or_else(|| {
         let shortcut =
@@ -1720,6 +1810,43 @@ mod tests {
     #[test]
     fn empty_input_stays_blank() {
         assert_eq!(normalize_address("   "), "about:blank");
+    }
+
+    #[test]
+    fn clipboard_shortcuts_are_the_panels_own() {
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let command = gpui::Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let ctrl_shift = gpui::Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl_alt = gpui::Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        let none = gpui::Modifiers::default();
+
+        assert_eq!(
+            clipboard_command(&keystroke("c", Some("c"), ctrl)),
+            Some(ClipboardCommand::Copy)
+        );
+        assert_eq!(
+            clipboard_command(&keystroke("v", Some("v"), command)),
+            Some(ClipboardCommand::Paste)
+        );
+        // Paste-as-plain-text and AltGr combinations belong to the page.
+        assert_eq!(clipboard_command(&keystroke("v", None, ctrl_shift)), None);
+        assert_eq!(clipboard_command(&keystroke("v", None, ctrl_alt)), None);
+        assert_eq!(clipboard_command(&keystroke("c", Some("c"), none)), None);
+        assert_eq!(clipboard_command(&keystroke("x", Some("x"), ctrl)), None);
     }
 
     #[test]
@@ -2172,6 +2299,12 @@ mod tests {
             _ignore_cache: bool,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
+        }
+        fn selection_text(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
+            Box::pin(async { Ok(String::new()) })
         }
         fn subscribe_frames(
             &self,
