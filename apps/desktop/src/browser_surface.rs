@@ -40,8 +40,9 @@ use gpui_component::{
 use image::Frame;
 use vibex_browser::BrowserInput;
 use vibex_core::{
-    BrowserAvailability, BrowserDialogRequest, BrowserFrame, BrowserFrameMetadata,
-    BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus, BrowserUnavailableReason,
+    BrowserAvailability, BrowserDialogRequest, BrowserExecutionSource, BrowserFrame,
+    BrowserFrameMetadata, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus,
+    BrowserUnavailableReason,
 };
 
 use crate::browser_transport::{
@@ -112,6 +113,11 @@ pub struct BrowserSurface {
     dialog: Option<BrowserDialogRequest>,
     prompt_input: String,
     file_chooser_pending: bool,
+    /// Who the runtime says is driving this tab.
+    execution_source: Option<BrowserExecutionSource>,
+    /// True while a human's own input has paused the Agent on this tab, so the
+    /// panel can offer the hand-back and says why Agent tools fail meanwhile.
+    agent_paused: bool,
     focus: FocusHandle,
     marked_text: Option<String>,
     active: bool,
@@ -166,6 +172,8 @@ impl BrowserSurface {
             dialog: None,
             prompt_input: String::new(),
             file_chooser_pending: false,
+            execution_source: None,
+            agent_paused: false,
             focus: cx.focus_handle(),
             marked_text: None,
             active: false,
@@ -295,6 +303,13 @@ impl BrowserSurface {
                         .cloned();
                 }
                 surface.availability = Some(snapshot.availability);
+                // Who is driving the tab decides whether the panel offers the
+                // Agent its control back; the runtime is the authority on that,
+                // so it is read here rather than tracked locally.
+                surface.execution_source = Some(snapshot.session.execution_source);
+                surface.agent_paused = snapshot.session.execution_source
+                    == BrowserExecutionSource::User
+                    && snapshot.session.user_engaged;
                 // The preview tab shows the page's title and whether it is
                 // still loading, so a change has to reach the owner.
                 if surface.tab != previous
@@ -627,13 +642,7 @@ impl BrowserSurface {
         // no remote browser transport yet, so the local service is the only
         // authority that can answer. The call still goes through the transport's
         // runtime seam — the service drives CDP with Tokio deadlines.
-        let local = self.transport.as_ref().and_then(|transport| {
-            transport
-                .as_any()
-                .downcast_ref::<LocalBrowserTransport>()
-                .cloned()
-        });
-        let Some(local) = local else {
+        let Some(local) = self.local_browser() else {
             cx.notify();
             return;
         };
@@ -651,12 +660,94 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// The in-process authority, when this panel is driving one.
+    ///
+    /// Operations the `BrowserTransport` trait does not model — answering a
+    /// dialog, releasing a file chooser, handing control back — only exist on
+    /// the local service. A paired runtime has no equivalent yet, and the panel
+    /// hides the affordance rather than offering one that cannot work.
+    fn local_browser(&self) -> Option<LocalBrowserTransport> {
+        self.transport.as_ref().and_then(|transport| {
+            transport
+                .as_any()
+                .downcast_ref::<LocalBrowserTransport>()
+                .cloned()
+        })
+    }
+
     /// Reflects a dialog the runtime reported, so the panel can answer it.
     pub fn show_dialog(&mut self, dialog: BrowserDialogRequest, cx: &mut Context<Self>) {
         if self.tab_id.as_ref() != Some(&dialog.tab_id) {
             return;
         }
         self.dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// Clears a dialog card the runtime reports as already answered.
+    ///
+    /// The page can also unblock itself — a `beforeunload` dialog goes away
+    /// when the navigation it was guarding is abandoned — and a card that
+    /// outlives its dialog would answer a question nobody is asking.
+    pub fn dismiss_dialog(&mut self, tab_id: &BrowserTabId, cx: &mut Context<Self>) {
+        if self.tab_id.as_ref() != Some(tab_id) {
+            return;
+        }
+        self.dialog = None;
+        self.prompt_input.clear();
+        cx.notify();
+    }
+
+    /// Reflects an availability change the runtime reported.
+    pub fn set_availability(&mut self, availability: BrowserAvailability, cx: &mut Context<Self>) {
+        self.availability = Some(availability);
+        cx.notify();
+    }
+
+    /// Releases the page's file chooser without choosing anything.
+    ///
+    /// Cancelling only in the panel would leave the page waiting for a file
+    /// selection it can never receive, so the runtime is told as well.
+    fn cancel_file_chooser(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.tab_id.clone() else {
+            return;
+        };
+        self.file_chooser_pending = false;
+        let Some(local) = self.local_browser() else {
+            cx.notify();
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let _ = local
+                    .run(local.service().resolve_file_chooser(&tab_id, &[]))
+                    .await;
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Gives the Agent its control back after a human took over.
+    ///
+    /// The page may have moved on while the human was driving, so the Agent is
+    /// expected to observe again; the panel says so instead of pretending the
+    /// hand-back is invisible.
+    fn hand_back_to_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let Some(local) = self.local_browser() else {
+            cx.notify();
+            return;
+        };
+        self.agent_paused = false;
+        cx.background_executor()
+            .spawn(async move {
+                local
+                    .run(local.service().resume_agent_operations(&session_id))
+                    .await;
+            })
+            .detach();
         cx.notify();
     }
 
@@ -919,6 +1010,64 @@ impl BrowserSurface {
             .into_any_element()
     }
 
+    /// The takeover banner.
+    ///
+    /// A human's own input pauses the Agent on this tab; the banner is where
+    /// that is admitted, because the Agent's next action will fail with
+    /// `browser_operation_aborted` and nothing else in the panel explains why.
+    /// The hand-back is offered only where a local service can perform it.
+    fn render_takeover(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.agent_paused {
+            return None;
+        }
+        let can_hand_back = self.local_browser().is_some();
+        Some(
+            h_flex()
+                .id("browser-takeover")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .child(locale::text(
+                            "You are driving this tab; the Agent's page actions are paused. It can \
+                             still observe.",
+                            "你正在操作此标签页，Agent 的页面操作已暂停（仍可观察）。",
+                            "你正在操作此分頁，Agent 的頁面操作已暫停（仍可觀察）。",
+                        )),
+                )
+                .when(can_hand_back, |this| {
+                    this.child(
+                        Button::new("browser-hand-back")
+                            .label(locale::text(
+                                "Hand back to Agent",
+                                "交还给 Agent",
+                                "交還給 Agent",
+                            ))
+                            .ghost()
+                            .xsmall()
+                            .tooltip(locale::text(
+                                "The Agent must observe the page again before acting.",
+                                "Agent 需要重新观察页面后才能继续操作。",
+                                "Agent 需要重新觀察頁面後才能繼續操作。",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.hand_back_to_agent(cx))),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.dialog.clone()?;
         let is_prompt = dialog.dialog_type == "prompt";
@@ -1056,8 +1205,7 @@ impl BrowserSurface {
                                     .ghost()
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.file_chooser_pending = false;
-                                        cx.notify();
+                                        this.cancel_file_chooser(cx);
                                     })),
                             ),
                         ),
@@ -1445,6 +1593,7 @@ impl Render for BrowserSurface {
         }
         self.sync_address_field(window, cx);
         let toolbar = self.render_toolbar(cx);
+        let takeover = self.render_takeover(cx);
         let frame = self.render_frame(cx);
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
@@ -1459,6 +1608,7 @@ impl Render for BrowserSurface {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(toolbar)
+            .when_some(takeover, |this, takeover| this.child(takeover))
             .when(self.marked_text.is_some(), |this| {
                 // The in-progress IME composition is drawn by the panel: the
                 // page never sees uncommitted text.
@@ -1529,6 +1679,7 @@ pub fn unavailable_reason_text(reason: BrowserUnavailableReason) -> SharedString
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Entity, VisualTestContext};
 
     #[test]
     fn a_bare_host_becomes_http() {
@@ -1578,6 +1729,71 @@ mod tests {
             key_char: key_char.map(str::to_string),
             modifiers,
         }
+    }
+
+    /// Opens a bare surface for the entity-level tests.
+    fn test_surface(cx: &mut gpui::TestAppContext) -> (Entity<BrowserSurface>, VisualTestContext) {
+        cx.update(gpui_component::init);
+        let window = cx
+            .update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| BrowserSurface::new("browser:test".to_string(), window, cx))
+                })
+            })
+            .expect("the browser test window should open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let surface = window
+            .root(&mut cx)
+            .expect("the browser test surface should exist");
+        (surface, cx)
+    }
+
+    #[gpui::test]
+    fn a_dialog_card_stays_with_its_own_tab(cx: &mut gpui::TestAppContext) {
+        let (surface, mut cx) = test_surface(cx);
+        let attached = BrowserTabId::new();
+        let other = BrowserTabId::new();
+        let dialog = |tab_id: &BrowserTabId| BrowserDialogRequest {
+            tab_id: tab_id.clone(),
+            dialog_type: "alert".to_string(),
+            message: "hello".to_string(),
+            default_prompt: None,
+            at_ms: 0,
+        };
+
+        surface.update(&mut cx, |surface, cx| {
+            surface.tab_id = Some(attached.clone());
+            surface.show_dialog(dialog(&other), cx);
+            assert!(
+                surface.dialog.is_none(),
+                "a dialog for another tab must not take over this card"
+            );
+            surface.show_dialog(dialog(&attached), cx);
+            assert!(surface.dialog.is_some());
+            surface.dismiss_dialog(&other, cx);
+            assert!(
+                surface.dialog.is_some(),
+                "another tab's dismissal must not clear this card"
+            );
+            surface.dismiss_dialog(&attached, cx);
+            assert!(surface.dialog.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn availability_and_takeover_state_come_from_the_runtime(cx: &mut gpui::TestAppContext) {
+        let (surface, mut cx) = test_surface(cx);
+        surface.update(&mut cx, |surface, cx| {
+            assert!(!surface.agent_paused, "a fresh surface is not taken over");
+            surface.set_availability(
+                BrowserAvailability::unavailable(
+                    BrowserUnavailableReason::BrowserMissing,
+                    Some("no browser".to_string()),
+                ),
+                cx,
+            );
+            assert!(surface.availability.is_some());
+        });
     }
 
     fn key_fields(input: &vibex_browser::BrowserInput) -> (String, String, String, i32, i32) {
@@ -2025,7 +2241,7 @@ mod tests {
             })
             .expect("surface window")
         });
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), &cx);
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         let surface = window.root(&mut cx).expect("surface");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_events = seen.clone();

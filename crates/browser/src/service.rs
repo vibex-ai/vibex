@@ -839,9 +839,11 @@ impl BrowserService {
 
     /// Dispatches a panel input event to the page.
     ///
-    /// Human input takes the session over: `execution_source` flips to `User`
-    /// and the current agent run is cancelled with an explicit error rather
-    /// than silently racing.
+    /// Deliberate human input takes the session over: `execution_source` flips
+    /// to `User` and the current agent run is cancelled with an explicit error
+    /// rather than silently racing. Pointer movement alone does not — a cursor
+    /// resting over the panel is not a takeover, and treating it as one would
+    /// pause the Agent the moment the frame appeared under the mouse.
     pub async fn dispatch_input(
         &self,
         tab_id: &BrowserTabId,
@@ -857,7 +859,9 @@ impl BrowserService {
                 .set_viewport(tab_id, width, height, device_scale_factor)
                 .await;
         }
-        let session = {
+        let takes_over = input_takes_over(&input);
+        let now = unix_timestamp_ms();
+        let (session, changed) = {
             let mut state = self.inner.state.lock().await;
             let connection = state
                 .process
@@ -867,23 +871,27 @@ impl BrowserService {
             let tab = state.tabs.get_mut(tab_id).ok_or_else(|| {
                 BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
             })?;
-            tab.last_activity_at_ms = unix_timestamp_ms();
-            tab.aborted.store(true, Ordering::SeqCst);
-            CdpSession::new(connection, tab.session_id.clone(), tab.target_id.clone())
-        };
-        let changed = {
-            let mut state = self.inner.state.lock().await;
-            let session_ids = state.sessions_for_tab(tab_id);
-            let now = unix_timestamp_ms();
-            for session_id in &session_ids {
-                if let Some(session) = state.sessions.get_mut(session_id) {
-                    session.execution_source = BrowserExecutionSource::User;
-                    session.user_engaged = true;
-                    session.last_activity_at_ms = now;
-                }
+            tab.last_activity_at_ms = now;
+            if takes_over {
+                tab.aborted.store(true, Ordering::SeqCst);
             }
+            let session =
+                CdpSession::new(connection, tab.session_id.clone(), tab.target_id.clone());
+            let changed = if takes_over {
+                let session_ids = state.sessions_for_tab(tab_id);
+                for session_id in &session_ids {
+                    if let Some(session) = state.sessions.get_mut(session_id) {
+                        session.execution_source = BrowserExecutionSource::User;
+                        session.user_engaged = true;
+                        session.last_activity_at_ms = now;
+                    }
+                }
+                session_ids
+            } else {
+                Vec::new()
+            };
             state.last_activity_ms = now;
-            session_ids
+            (session, changed)
         };
         for session_id in changed {
             let _ = self
@@ -1479,6 +1487,12 @@ impl BrowserService {
         if let Some(session) = state.sessions.get_mut(session_id) {
             session.execution_source = BrowserExecutionSource::Agent;
         }
+        // Every client shows who is driving, so the hand-back is announced the
+        // same way the takeover is.
+        let _ = self
+            .inner
+            .events
+            .send(BrowserServiceEvent::SessionChanged(session_id.clone()));
     }
 
     /// Navigates a tab on behalf of the human driving the panel.
@@ -1727,6 +1741,22 @@ async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
         cdp(session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
     }
     Ok(())
+}
+
+/// True when a panel input is deliberate enough to count as a human takeover.
+///
+/// Pointer movement is excluded: the panel forwards every hover so the page can
+/// show its own cursor affordances, and a takeover per hover would pause the
+/// Agent as soon as the pointer crossed the frame.
+pub(crate) fn input_takes_over(input: &BrowserInput) -> bool {
+    matches!(
+        input,
+        BrowserInput::MouseDown { .. }
+            | BrowserInput::MouseUp { .. }
+            | BrowserInput::Wheel { .. }
+            | BrowserInput::Key { .. }
+            | BrowserInput::InsertText { .. }
+    )
 }
 
 /// Converts a panel input event into a CDP command.
@@ -2667,6 +2697,51 @@ mod tests {
         assert_eq!(depth, vibex_core::BROWSER_OBSERVE_AX_DEPTH);
         let (_, depth) = observation_settings(Some(10), true);
         assert_eq!(depth, vibex_core::BROWSER_OBSERVE_EXTENDED_AX_DEPTH);
+    }
+
+    #[test]
+    fn hovering_does_not_take_the_session_over() {
+        // The panel forwards every hover; a takeover per hover would pause the
+        // Agent the moment the pointer crossed the frame.
+        assert!(!input_takes_over(&BrowserInput::MouseMove {
+            x: 1.0,
+            y: 2.0
+        }));
+        assert!(!input_takes_over(&BrowserInput::Resize {
+            width: 800,
+            height: 600,
+            device_scale_factor: 1.0,
+        }));
+        for deliberate in [
+            BrowserInput::MouseDown {
+                x: 1.0,
+                y: 2.0,
+                button: "left".to_string(),
+                click_count: 1,
+                modifiers: 0,
+            },
+            BrowserInput::MouseUp {
+                x: 1.0,
+                y: 2.0,
+                button: "left".to_string(),
+                click_count: 1,
+                modifiers: 0,
+            },
+            BrowserInput::Wheel {
+                x: 0.0,
+                y: 0.0,
+                delta_x: 0.0,
+                delta_y: -120.0,
+            },
+            BrowserInput::InsertText {
+                text: "hi".to_string(),
+            },
+        ] {
+            assert!(
+                input_takes_over(&deliberate),
+                "{deliberate:?} is deliberate input"
+            );
+        }
     }
 
     #[test]

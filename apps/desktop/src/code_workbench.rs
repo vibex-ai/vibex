@@ -4561,9 +4561,7 @@ impl CodeWorkbench {
                 self.adopt_browser_tab(session_id, tab_id, window, cx);
             }
             vibex_browser::BrowserServiceEvent::TabChanged(tab_id) => {
-                if let Some(surface) = self.browser_surfaces.get(tab_id.as_str()).cloned() {
-                    surface.update(cx, |surface, cx| surface.refresh_tab(cx));
-                }
+                self.update_browser_surface(&tab_id, cx, |surface, cx| surface.refresh_tab(cx));
             }
             vibex_browser::BrowserServiceEvent::TabClosed(tab_id) => {
                 let preview_tab_id = format!("browser:{}", tab_id.as_str());
@@ -4571,7 +4569,68 @@ impl CodeWorkbench {
                     self.close_tab(preview_tab_id, true, cx);
                 }
             }
+            // A page dialog suspends the page until somebody answers it. The
+            // panel is the only surface that can, so the event has to reach the
+            // card: without it the tab stays frozen until the Agent's prompt
+            // budget runs out.
+            vibex_browser::BrowserServiceEvent::DialogOpened(request) => {
+                let tab_id = request.tab_id.clone();
+                self.update_browser_surface(&tab_id, cx, |surface, cx| {
+                    surface.show_dialog(*request, cx)
+                });
+            }
+            vibex_browser::BrowserServiceEvent::DialogClosed(tab_id) => {
+                self.update_browser_surface(&tab_id, cx, |surface, cx| {
+                    surface.dismiss_dialog(&tab_id, cx)
+                });
+            }
+            vibex_browser::BrowserServiceEvent::FileChooserOpened(tab_id) => {
+                self.update_browser_surface(&tab_id, cx, |surface, cx| {
+                    surface.show_file_chooser(&tab_id, cx)
+                });
+            }
+            // The execution source flips under the panel — a human took over, or
+            // an Agent asked for help — so the takeover banner re-reads it from
+            // the runtime instead of assuming it still owns the tab.
+            vibex_browser::BrowserServiceEvent::SessionChanged(session_id) => {
+                self.refresh_browser_session(&session_id, cx);
+            }
+            vibex_browser::BrowserServiceEvent::Availability(availability) => {
+                let surfaces = self.browser_surfaces.values().cloned().collect::<Vec<_>>();
+                for surface in surfaces {
+                    surface.update(cx, |surface, cx| {
+                        surface.set_availability(availability.clone(), cx)
+                    });
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Runs one update against the surface of a runtime browser tab, if the
+    /// panel has one materialized.
+    fn update_browser_surface(
+        &self,
+        tab_id: &BrowserTabId,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut BrowserSurface, &mut Context<BrowserSurface>),
+    ) {
+        let Some(surface) = self.browser_surfaces.get(tab_id.as_str()).cloned() else {
+            return;
+        };
+        surface.update(cx, |surface, cx| update(surface, cx));
+    }
+
+    /// Re-reads every surface bound to a session whose state changed.
+    fn refresh_browser_session(&self, session_id: &BrowserSessionId, cx: &mut Context<Self>) {
+        for (tab_id, binding) in &self.browser_bindings {
+            if &binding.session_id != session_id {
+                continue;
+            }
+            let Some(surface) = self.browser_surfaces.get(tab_id).cloned() else {
+                continue;
+            };
+            surface.update(cx, |surface, cx| surface.refresh_tab(cx));
         }
     }
 
