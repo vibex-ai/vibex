@@ -76,6 +76,19 @@ agent acts on and what the user sees cannot diverge.
    never chooses a write path and never opens a native dialog that does not
    exist in headless mode.
 
+9. **The browser service is polled inside the Tokio runtime, always.**
+   `BrowserService` is a Tokio citizen: it spawns Chrome, opens async pipes,
+   arms a deadline on every CDP command and `tokio::spawn`s frame acks. The
+   panel, however, drives it from GPUI's executor, which has no Tokio context —
+   so `LocalBrowserTransport` installs the runtime for the duration of each poll
+   (`runtime_context`, `LocalBrowserTransport::run`). Skipping that seam for one
+   call panics on the first click of the browser entry with
+   `there is no reactor running, must be called from the context of a Tokio 1.x
+   runtime`, raised from tokio's pidfd reaper inside `Command::spawn`. A new
+   panel-side call must go through the transport (or `run`), never straight at
+   the service, and `BrowserFrameStream::next` needs it too because the frame
+   stream is awaited outside the transport.
+
 ## Security rules
 
 - **Isolated profile, always.** `--user-data-dir` points under the runtime data
@@ -166,3 +179,10 @@ covers coordinate conversion and decode layout. `apps/desktop` exposes an
 `EmbeddedBrowserContractProbe` (`--probe`) asserting that degradation stays
 explicit, the tier ladder is monotonic, the frame drop is present, and audited
 records carry no page content.
+
+`browser_transport::tests` guards the executor seam described in invariant 9:
+one test polls runtime-bound work (a process spawn plus a timer) from a thread
+with no Tokio context, and one opens a real session and tab through
+`LocalBrowserTransport` from such a thread. The second skips itself when no
+system browser is installed — that is the environment where the whole feature is
+explicitly unavailable — and is the regression test for the first-click crash.
