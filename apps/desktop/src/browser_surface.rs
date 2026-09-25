@@ -19,7 +19,6 @@
 //!   the drawn size and the frame's reported device size — and must *not* add
 //!   the scroll offset, which would make every click drift.
 
-use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +30,7 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     button::Button,
     button::ButtonVariants as _,
     h_flex,
@@ -74,21 +73,6 @@ enum SurfacePhase {
     Unavailable,
     /// Something failed; the message is shown verbatim.
     Failed,
-}
-
-/// Which view the docked inspector is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InspectorTab {
-    Elements,
-    Console,
-    Network,
-}
-
-/// One drawn row of the DOM tree.
-#[derive(Debug, Clone)]
-struct DomRow {
-    node: vibex_browser::BrowserDomNode,
-    depth: usize,
 }
 
 /// Events the surface raises to its owner.
@@ -142,29 +126,10 @@ pub struct BrowserSurface {
     select_hint: Option<SelectHint>,
     /// The open fallback menu, anchored where the click landed.
     select_menu: Option<OpenSelectMenu>,
-    /// Element picker: the next click inspects the element under it.
-    inspecting: bool,
-    /// Where the picker last highlighted, so a hover does not repeat the call.
-    inspect_hover: Option<(f64, f64)>,
-    /// What the inspector card is showing.
-    inspect_card: Option<vibex_browser::BrowserElementInspection>,
     /// The page's icon, once the runtime has fetched and this side decoded it.
     favicon: Option<Arc<RenderImage>>,
     /// The URL the current icon came from, so a repaint does not refetch it.
     favicon_source: Option<String>,
-    /// The docked inspector: its open state, its tab, and what it is showing.
-    inspector_open: bool,
-    inspector_tab: InspectorTab,
-    /// Rows of the DOM tree in draw order, and the nodes whose children are in
-    /// it. `parents` is what the breadcrumb walks.
-    dom_rows: Vec<DomRow>,
-    dom_expanded: BTreeSet<i64>,
-    dom_children: HashMap<i64, Vec<vibex_browser::BrowserDomNode>>,
-    dom_parents: HashMap<i64, i64>,
-    dom_labels: HashMap<i64, String>,
-    dom_selected: Option<i64>,
-    inspector_console: Vec<vibex_core::BrowserConsoleEntry>,
-    inspector_network: Vec<vibex_core::BrowserNetworkEntry>,
     /// True while a hover probe is outstanding.
     select_probe_in_flight: bool,
     /// Who the runtime says is driving this tab.
@@ -229,21 +194,8 @@ impl BrowserSurface {
             file_chooser_pending: false,
             select_hint: None,
             select_menu: None,
-            inspecting: false,
-            inspect_hover: None,
-            inspect_card: None,
             favicon: None,
             favicon_source: None,
-            inspector_open: false,
-            inspector_tab: InspectorTab::Elements,
-            dom_rows: Vec::new(),
-            dom_expanded: BTreeSet::new(),
-            dom_children: HashMap::new(),
-            dom_parents: HashMap::new(),
-            dom_labels: HashMap::new(),
-            dom_selected: None,
-            inspector_console: Vec::new(),
-            inspector_network: Vec::new(),
             select_probe_in_flight: false,
             execution_source: None,
             agent_paused: false,
@@ -301,196 +253,6 @@ impl BrowserSurface {
     /// The page's icon, for the preview tab.
     pub fn favicon(&self) -> Option<Arc<RenderImage>> {
         self.favicon.clone()
-    }
-
-    /// Opens or closes the docked inspector.
-    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
-        self.inspector_open = !self.inspector_open;
-        if self.inspector_open {
-            self.reload_inspector(cx);
-        }
-        cx.notify();
-    }
-
-    fn set_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
-        if self.inspector_tab == tab {
-            return;
-        }
-        self.inspector_tab = tab;
-        self.reload_inspector(cx);
-        cx.notify();
-    }
-
-    /// Fetches whatever the open inspector tab is showing.
-    fn reload_inspector(&mut self, cx: &mut Context<Self>) {
-        if !self.inspector_open {
-            return;
-        }
-        match self.inspector_tab {
-            InspectorTab::Elements => self.reload_dom_tree(cx),
-            InspectorTab::Console => {
-                let (Some(transport), Some(tab_id)) = self.tab_and_transport() else {
-                    return;
-                };
-                cx.spawn(async move |this, cx| {
-                    let entries = transport.console_entries(&tab_id).await.unwrap_or_default();
-                    let _ = this.update(cx, |surface, cx| {
-                        surface.inspector_console = entries;
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
-            InspectorTab::Network => {
-                let (Some(transport), Some(tab_id)) = self.tab_and_transport() else {
-                    return;
-                };
-                cx.spawn(async move |this, cx| {
-                    let entries = transport.network_entries(&tab_id).await.unwrap_or_default();
-                    let _ = this.update(cx, |surface, cx| {
-                        surface.inspector_network = entries;
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
-        }
-    }
-
-    fn tab_and_transport(&self) -> (Option<Arc<dyn BrowserTransport>>, Option<BrowserTabId>) {
-        (self.transport.clone(), self.tab_id.clone())
-    }
-
-    /// Reads the document's children and draws the collapsed tree.
-    fn reload_dom_tree(&mut self, cx: &mut Context<Self>) {
-        let (Some(transport), Some(tab_id)) = self.tab_and_transport() else {
-            return;
-        };
-        self.dom_expanded.clear();
-        self.dom_children.clear();
-        self.dom_parents.clear();
-        self.dom_labels.clear();
-        self.dom_selected = None;
-        cx.spawn(async move |this, cx| {
-            let root = transport
-                .dom_children(&tab_id, None)
-                .await
-                .unwrap_or_default();
-            let _ = this.update(cx, |surface, cx| {
-                for node in root {
-                    surface
-                        .dom_children
-                        .entry(0)
-                        .or_default()
-                        .push(node.clone());
-                    surface.dom_labels.insert(node.node_id, node.label.clone());
-                }
-                surface.dom_rows = surface.flatten_dom();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Expands or collapses one node, fetching its children the first time.
-    fn toggle_dom_node(&mut self, node: &vibex_browser::BrowserDomNode, cx: &mut Context<Self>) {
-        if !node.has_children {
-            return;
-        }
-        if self.dom_expanded.contains(&node.node_id) {
-            self.dom_expanded.remove(&node.node_id);
-            self.dom_rows = self.flatten_dom();
-            cx.notify();
-            return;
-        }
-        self.dom_expanded.insert(node.node_id);
-        if self.dom_children.contains_key(&node.node_id) {
-            self.dom_rows = self.flatten_dom();
-            cx.notify();
-            return;
-        }
-        let (Some(transport), Some(tab_id)) = self.tab_and_transport() else {
-            return;
-        };
-        let node_id = node.node_id;
-        cx.spawn(async move |this, cx| {
-            let children = transport
-                .dom_children(&tab_id, Some(node_id))
-                .await
-                .unwrap_or_default();
-            let _ = this.update(cx, |surface, cx| {
-                for child in &children {
-                    surface.dom_parents.insert(child.node_id, node_id);
-                    surface
-                        .dom_labels
-                        .insert(child.node_id, child.label.clone());
-                }
-                surface.dom_children.insert(node_id, children);
-                surface.dom_rows = surface.flatten_dom();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Highlights a node in the page and remembers it for the breadcrumb.
-    fn select_dom_node(&mut self, node: &vibex_browser::BrowserDomNode, cx: &mut Context<Self>) {
-        self.dom_selected = Some(node.node_id);
-        let (Some(transport), Some(tab_id)) = self.tab_and_transport() else {
-            return;
-        };
-        let backend_node_id = node.backend_node_id;
-        cx.background_executor()
-            .spawn(async move {
-                let _ = transport.select_node(&tab_id, backend_node_id).await;
-            })
-            .detach();
-        cx.notify();
-    }
-
-    /// The breadcrumb for the selected node, root first.
-    fn dom_breadcrumb(&self) -> Vec<String> {
-        let Some(mut node_id) = self.dom_selected else {
-            return Vec::new();
-        };
-        let mut path = Vec::new();
-        // The walk is bounded by the tree's own depth; a cycle is impossible in
-        // a tree, and the limit keeps a corrupt answer from hanging the panel.
-        for _ in 0..64 {
-            let Some(label) = self.dom_labels.get(&node_id) else {
-                break;
-            };
-            path.push(label.clone());
-            match self.dom_parents.get(&node_id) {
-                Some(parent) => node_id = *parent,
-                None => break,
-            }
-        }
-        path.reverse();
-        path
-    }
-
-    /// Flattens the cached tree into the rows that are drawn, document order,
-    /// with each expanded node's subtree immediately after it.
-    fn flatten_dom(&self) -> Vec<DomRow> {
-        let mut rows = Vec::new();
-        self.flatten_into(0, 0, &mut rows);
-        rows
-    }
-
-    fn flatten_into(&self, parent: i64, depth: usize, rows: &mut Vec<DomRow>) {
-        let Some(children) = self.dom_children.get(&parent) else {
-            return;
-        };
-        for child in children {
-            rows.push(DomRow {
-                node: child.clone(),
-                depth,
-            });
-            if self.dom_expanded.contains(&child.node_id) {
-                self.flatten_into(child.node_id, depth + 1, rows);
-            }
-        }
     }
 
     /// Fetches the page's icon once per URL.
@@ -865,16 +627,6 @@ impl BrowserSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.key == "escape" && self.inspector_open {
-            self.toggle_inspector(cx);
-            cx.stop_propagation();
-            return;
-        }
-        if event.keystroke.key == "escape" && (self.inspecting || self.inspect_card.is_some()) {
-            self.stop_inspecting(cx);
-            cx.stop_propagation();
-            return;
-        }
         // AltGr and friends produce characters; they belong to the text path.
         // A composition owns the keyboard while it is open: Backspace and the
         // arrows are editing the preedit, not the page.
@@ -1061,66 +813,6 @@ impl BrowserSurface {
                 state.set_value(url, window, cx);
             });
         }
-    }
-
-    /// Turns the element picker on: the next click inspects what is under it.
-    fn start_inspecting(&mut self, cx: &mut Context<Self>) {
-        self.inspecting = true;
-        self.inspect_hover = None;
-        cx.notify();
-    }
-
-    /// Leaves the picker and removes the page's highlight, keeping the card.
-    fn stop_inspecting(&mut self, cx: &mut Context<Self>) {
-        self.inspecting = false;
-        self.inspect_hover = None;
-        self.inspect_card = None;
-        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
-            cx.notify();
-            return;
-        };
-        cx.background_executor()
-            .spawn(async move {
-                let _ = transport.clear_highlight(&tab_id).await;
-            })
-            .detach();
-        cx.notify();
-    }
-
-    /// Highlights whatever the pointer is over, while the picker is on.
-    fn highlight_under_pointer(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
-        if self
-            .inspect_hover
-            .is_some_and(|(px, py)| (px - x).abs() < 4.0 && (py - y).abs() < 4.0)
-        {
-            return;
-        }
-        self.inspect_hover = Some((x, y));
-        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
-            return;
-        };
-        cx.background_executor()
-            .spawn(async move {
-                let _ = transport.highlight_at(&tab_id, x, y).await;
-            })
-            .detach();
-    }
-
-    /// Picks the element under a point and fills the inspector card.
-    fn pick_element(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
-        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
-            return;
-        };
-        self.inspecting = false;
-        self.inspect_hover = None;
-        cx.spawn(async move |this, cx| {
-            let described = transport.describe_at(&tab_id, x, y).await.ok().flatten();
-            let _ = this.update(cx, |surface, cx| {
-                surface.inspect_card = described;
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
@@ -1341,15 +1033,6 @@ impl BrowserSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    // The picker owns the click while it is on: picking an
-                    // element must not also press it.
-                    if this.inspecting {
-                        if let Some((x, y)) = this.to_viewport_point(event.position) {
-                            this.pick_element(x, y, cx);
-                        }
-                        cx.stop_propagation();
-                        return;
-                    }
                     this.focus.focus(window, cx);
                     let Some((x, y)) = this.to_viewport_point(event.position) else {
                         return;
@@ -1423,10 +1106,6 @@ impl BrowserSurface {
                 // The held button travels with the move: Chrome only starts a
                 // drag — a scrollbar, a text selection, an HTML5 drop — when it
                 // knows one is down.
-                if this.inspecting {
-                    this.highlight_under_pointer(x, y, cx);
-                    return;
-                }
                 let buttons = if event.dragging() { 1 } else { 0 };
                 this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y, buttons }, cx);
                 this.probe_select_hint(x, y, cx);
@@ -1488,8 +1167,6 @@ impl BrowserSurface {
                 let copy = menu_entity.clone();
                 let paste = menu_entity.clone();
                 let select_all = menu_entity.clone();
-                let inspect = menu_entity.clone();
-                let panel = menu_entity.clone();
                 menu.min_w(px(208.0))
                     .max_w(px(208.0))
                     .item(
@@ -1536,21 +1213,6 @@ impl BrowserSurface {
                                 let _ = select_all.update(cx, |this, cx| this.select_all(cx));
                             },
                         ),
-                    )
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(locale::text("Inspect element", "检查元素", "檢查元素"))
-                            .icon(IconName::Search)
-                            .on_click(move |_, _, cx| {
-                                let _ = inspect.update(cx, |this, cx| this.start_inspecting(cx));
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text("Inspect panel", "检查面板", "檢查面板"))
-                            .icon(IconName::PanelBottom)
-                            .on_click(move |_, _, cx| {
-                                let _ = panel.update(cx, |this, cx| this.toggle_inspector(cx));
-                            }),
                     )
             })
             .into_any_element()
@@ -1916,360 +1578,6 @@ impl BrowserSurface {
             )
             .into_any_element(),
         )
-    }
-
-    /// The picker's hint and the inspector's card.
-    ///
-    /// Both are panel chrome: the element itself is highlighted inside the page
-    /// by `Overlay.highlightNode`, so it follows scrolling and shows up in the
-    /// screencast.
-    fn render_inspector(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.inspecting {
-            return Some(
-                div()
-                    .flex_none()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().muted)
-                    .text_color(cx.theme().foreground)
-                    .child(locale::text(
-                        "Click an element to inspect it. Esc cancels.",
-                        "点击页面元素进行检查，Esc 取消。",
-                        "點擊頁面元素進行檢查，Esc 取消。",
-                    ))
-                    .into_any_element(),
-            );
-        }
-        let card = self.inspect_card.clone()?;
-        Some(
-            h_flex()
-                .id("browser-inspector")
-                .flex_none()
-                .w_full()
-                .px_2()
-                .py_1()
-                .gap_2()
-                .items_center()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().muted)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(cx.theme().foreground)
-                        .child(format!(
-                            "{}  {} × {}",
-                            card.selector, card.width, card.height
-                        )),
-                )
-                .child(
-                    Button::new("browser-inspector-close")
-                        .icon(Icon::new(IconName::Close))
-                        .ghost()
-                        .xsmall()
-                        .tooltip(locale::text("Close", "关闭", "關閉"))
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_inspecting(cx))),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// The docked inspector: Elements, Console and Network.
-    ///
-    /// A panel rather than a window: the page stays visible above it, which is
-    /// the point of inspecting where the page is drawn.
-    fn render_inspector_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.inspector_open {
-            return None;
-        }
-        let body = match self.inspector_tab {
-            InspectorTab::Elements => self.render_inspector_elements(cx),
-            InspectorTab::Console => self.render_inspector_console(cx),
-            InspectorTab::Network => self.render_inspector_network(cx),
-        };
-        let tabs = [
-            (
-                InspectorTab::Elements,
-                "browser-inspector-elements",
-                "Elements",
-                "元素",
-                "元素",
-            ),
-            (
-                InspectorTab::Console,
-                "browser-inspector-console",
-                "Console",
-                "控制台",
-                "主控台",
-            ),
-            (
-                InspectorTab::Network,
-                "browser-inspector-network",
-                "Network",
-                "网络",
-                "網路",
-            ),
-        ];
-        let mut header = h_flex()
-            .flex_none()
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border);
-        for (tab, id, en, zh_cn, zh_tw) in tabs {
-            header = header.child(
-                Button::new(id)
-                    .label(locale::text(en, zh_cn, zh_tw))
-                    .ghost()
-                    .xsmall()
-                    .selected(self.inspector_tab == tab)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_inspector_tab(tab, cx))),
-            );
-        }
-        Some(
-            v_flex()
-                .id("browser-inspector-panel")
-                .flex_none()
-                .w_full()
-                .h(px(240.0))
-                .min_h_0()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().background)
-                .child(
-                    header
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("browser-inspector-refresh")
-                                .icon(Icon::new(IconName::RotateCw))
-                                .ghost()
-                                .xsmall()
-                                .tooltip(locale::text("Refresh", "刷新", "重新整理"))
-                                .on_click(cx.listener(|this, _, _, cx| this.reload_inspector(cx))),
-                        )
-                        .child(
-                            Button::new("browser-inspector-close-panel")
-                                .icon(Icon::new(IconName::Close))
-                                .ghost()
-                                .xsmall()
-                                .tooltip(locale::text("Close", "关闭", "關閉"))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
-                        ),
-                )
-                .child(body)
-                .into_any_element(),
-        )
-    }
-
-    fn inspector_note(&self, text: impl Into<SharedString>, cx: &Context<Self>) -> AnyElement {
-        div()
-            .p_2()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(text.into())
-            .into_any_element()
-    }
-
-    fn render_inspector_elements(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let breadcrumb = self.dom_breadcrumb().join(" › ");
-        let rows = self.dom_rows.clone();
-        let mut list = v_flex()
-            .id("browser-inspector-tree")
-            .flex_1()
-            .min_h_0()
-            .overflow_scroll()
-            .py_1();
-        if rows.is_empty() {
-            list = list.child(self.inspector_note(
-                locale::text("Reading the page…", "正在读取页面…", "正在讀取頁面…"),
-                cx,
-            ));
-        }
-        for (index, row) in rows.iter().enumerate() {
-            let depth = row.depth;
-            let label = row.node.label.clone();
-            let expandable = row.node.has_children;
-            let expanded = self.dom_expanded.contains(&row.node.node_id);
-            let selected = self.dom_selected == Some(row.node.node_id);
-            let node = row.node.clone();
-            let expand_node = node.clone();
-            list = list.child(
-                h_flex()
-                    .id(("browser-inspector-row", index))
-                    .w_full()
-                    .flex_none()
-                    .h(px(18.0))
-                    .pl(px(6.0 + depth as f32 * 12.0))
-                    .gap_1()
-                    .items_center()
-                    .text_xs()
-                    .when(selected, |this| this.bg(cx.theme().accent.opacity(0.25)))
-                    .child(
-                        div()
-                            .w(px(10.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if !expandable {
-                                ""
-                            } else if expanded {
-                                "▾"
-                            } else {
-                                "▸"
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_dom_node(&expand_node, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(cx.theme().foreground)
-                            .child(label),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.select_dom_node(&node, cx)),
-                    ),
-            );
-        }
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(list)
-            .child(
-                div()
-                    .flex_none()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .text_xs()
-                    .truncate()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(breadcrumb),
-            )
-            .into_any_element()
-    }
-
-    fn render_inspector_console(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let entries = self.inspector_console.clone();
-        let mut list = v_flex()
-            .id("browser-inspector-console")
-            .flex_1()
-            .min_h_0()
-            .overflow_scroll()
-            .p_1();
-        if entries.is_empty() {
-            list = list.child(self.inspector_note(
-                locale::text(
-                    "No console messages yet.",
-                    "暂无控制台消息。",
-                    "尚無主控台訊息。",
-                ),
-                cx,
-            ));
-        }
-        for (index, entry) in entries.iter().enumerate() {
-            list = list.child(
-                h_flex()
-                    .id(("browser-inspector-console-row", index))
-                    .w_full()
-                    .flex_none()
-                    .gap_2()
-                    .items_start()
-                    .text_xs()
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(entry.level.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(cx.theme().foreground)
-                            .child(entry.text.clone()),
-                    ),
-            );
-        }
-        list.into_any_element()
-    }
-
-    fn render_inspector_network(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let entries = self.inspector_network.clone();
-        let mut list = v_flex()
-            .id("browser-inspector-network")
-            .flex_1()
-            .min_h_0()
-            .overflow_scroll()
-            .p_1();
-        if entries.is_empty() {
-            list = list.child(self.inspector_note(
-                locale::text(
-                    "No network activity yet.",
-                    "暂无网络活动。",
-                    "尚無網路活動。",
-                ),
-                cx,
-            ));
-        }
-        for (index, entry) in entries.iter().enumerate() {
-            let status = match entry.status {
-                Some(status) => status.to_string(),
-                None if entry.failure.is_some() => "failed".to_string(),
-                None => "…".to_string(),
-            };
-            list = list.child(
-                h_flex()
-                    .id(("browser-inspector-network-row", index))
-                    .w_full()
-                    .flex_none()
-                    .gap_2()
-                    .items_start()
-                    .text_xs()
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(status),
-                    )
-                    .child(
-                        div()
-                            .w(px(48.0))
-                            .flex_none()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(entry.method.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(cx.theme().foreground)
-                            .child(entry.url.clone()),
-                    ),
-            );
-        }
-        list.into_any_element()
     }
 
     fn render_file_chooser(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2782,8 +2090,6 @@ impl Render for BrowserSurface {
         let select_menu = self.render_select_menu(cx);
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
-        let inspector = self.render_inspector(cx);
-        let inspector_panel = self.render_inspector_panel(cx);
         v_flex()
             .id("browser-surface")
             .track_focus(&self.focus)
@@ -2815,8 +2121,6 @@ impl Render for BrowserSurface {
             .when_some(select_menu, |this, menu| this.child(menu))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
-            .when_some(inspector, |this, inspector| this.child(inspector))
-            .when_some(inspector_panel, |this, panel| this.child(panel))
             .on_key_down(cx.listener(Self::on_page_key_down))
             .on_key_up(cx.listener(Self::on_page_key_up))
     }
@@ -3332,133 +2636,6 @@ mod tests {
         );
     }
 
-    fn dom_node(
-        node_id: i64,
-        backend_node_id: i64,
-        label: &str,
-        has_children: bool,
-    ) -> vibex_browser::BrowserDomNode {
-        vibex_browser::BrowserDomNode {
-            node_id,
-            backend_node_id,
-            node_name: label.to_string(),
-            label: label.to_string(),
-            has_children,
-        }
-    }
-
-    // The inspector reads one level at a time and breadcrumbs what is selected.
-    #[gpui::test]
-    fn the_inspector_walks_the_dom_tree(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport::default());
-        let window = cx.update(|cx: &mut App| {
-            cx.open_window(Default::default(), |window, cx| {
-                cx.new(|cx| {
-                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
-                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
-                    surface.set_active(true, cx);
-                    surface.toggle_inspector(cx);
-                    surface
-                })
-            })
-            .expect("surface window")
-        });
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        let surface = window.root(&mut cx).expect("surface");
-        cx.run_until_parked();
-
-        let rows = surface.read_with(&cx, |surface, _| surface.dom_rows.clone());
-        assert_eq!(rows.len(), 1, "the document's child is the first row");
-        assert_eq!(rows[0].node.label, "html");
-        assert_eq!(rows[0].depth, 0);
-
-        let html = rows[0].node.clone();
-        surface.update(&mut cx, |surface, cx| surface.toggle_dom_node(&html, cx));
-        cx.run_until_parked();
-        let rows = surface.read_with(&cx, |surface, _| surface.dom_rows.clone());
-        assert_eq!(rows.len(), 2, "expanding shows the child level");
-        assert_eq!(rows[1].node.label, "body");
-        assert_eq!(rows[1].depth, 1);
-
-        let body = rows[1].node.clone();
-        surface.update(&mut cx, |surface, cx| surface.select_dom_node(&body, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            surface.read_with(&cx, |surface, _| surface.dom_breadcrumb()),
-            vec!["html".to_string(), "body".to_string()],
-            "the breadcrumb walks back to the document"
-        );
-
-        surface.update(&mut cx, |surface, cx| surface.toggle_dom_node(&html, cx));
-        cx.run_until_parked();
-        assert_eq!(
-            surface.read_with(&cx, |surface, _| surface.dom_rows.len()),
-            1,
-            "collapsing hides the subtree"
-        );
-    }
-
-    // The picker owns the pointer while it is on: hovering highlights, the
-    // click describes, and neither reaches the page.
-    #[gpui::test]
-    fn the_element_picker_owns_the_pointer(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let transport = Arc::new(RecordingTransport::default());
-        let highlighted = transport.highlighted.clone();
-        let inspected = transport.inspected.clone();
-        let inputs = transport.inputs.clone();
-        let transport: Arc<dyn BrowserTransport> = transport;
-        let window = cx.update(|cx: &mut App| {
-            cx.open_window(Default::default(), |window, cx| {
-                cx.new(|cx| {
-                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
-                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
-                    surface.set_active(true, cx);
-                    surface.frame_pixel_size = (1000.0, 600.0);
-                    surface.start_inspecting(cx);
-                    surface
-                })
-            })
-            .expect("surface window")
-        });
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        let surface = window.root(&mut cx).expect("surface");
-        cx.run_until_parked();
-
-        let point = Point::new(px(300.0), px(250.0));
-        cx.simulate_mouse_move(point, MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert_eq!(
-            highlighted.lock().unwrap().len(),
-            1,
-            "the picker asks the runtime what is under the pointer"
-        );
-        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert_eq!(
-            inspected.lock().unwrap().len(),
-            1,
-            "the click describes the element"
-        );
-        assert!(
-            inputs
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|entry| !entry.contains("MouseDown")),
-            "picking an element must not also press it"
-        );
-        assert!(
-            !surface.read_with(&cx, |surface, _| surface.inspecting),
-            "the picker closes after it picks"
-        );
-        assert!(
-            surface.read_with(&cx, |surface, _| surface.inspect_card.is_some()),
-            "the card shows what was picked"
-        );
-    }
-
     // The toolbar's arrows are the same navigation as the picker's side buttons.
     #[gpui::test]
     fn the_toolbar_arrows_reach_the_runtime(cx: &mut gpui::TestAppContext) {
@@ -3499,9 +2676,6 @@ mod tests {
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
         subscribe_failures: Arc<std::sync::atomic::AtomicUsize>,
-        /// Picker traffic: points highlighted and points described.
-        highlighted: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
-        inspected: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
         /// History moves, `true` for forward.
         history_moves: Arc<std::sync::Mutex<Vec<bool>>>,
     }
@@ -3513,8 +2687,6 @@ mod tests {
                 snapshot: Arc::new(std::sync::Mutex::new(None)),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                highlighted: Arc::new(std::sync::Mutex::new(Vec::new())),
-                inspected: Arc::new(std::sync::Mutex::new(Vec::new())),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
@@ -3625,82 +2797,6 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             self.history_moves.lock().unwrap().push(true);
             Box::pin(async { Ok(()) })
-        }
-        fn highlight_at(
-            &self,
-            _tab_id: &BrowserTabId,
-            x: f64,
-            y: f64,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, Option<i64>> {
-            self.highlighted.lock().unwrap().push((x, y));
-            Box::pin(async { Ok(Some(7)) })
-        }
-        fn clear_highlight(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn describe_at(
-            &self,
-            _tab_id: &BrowserTabId,
-            x: f64,
-            y: f64,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Option<vibex_browser::BrowserElementInspection>,
-        > {
-            self.inspected.lock().unwrap().push((x, y));
-            Box::pin(async {
-                Ok(Some(vibex_browser::BrowserElementInspection {
-                    selector: "button#submit".to_string(),
-                    node_name: "button".to_string(),
-                    id: "submit".to_string(),
-                    classes: Vec::new(),
-                    width: 120,
-                    height: 32,
-                }))
-            })
-        }
-        fn dom_children(
-            &self,
-            _tab_id: &BrowserTabId,
-            node_id: Option<i64>,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_browser::BrowserDomNode>>
-        {
-            // A two-level tree is enough to prove the walk, the breadcrumb and
-            // the expansion bookkeeping.
-            let nodes = match node_id {
-                None => vec![dom_node(1, 11, "html", true)],
-                Some(1) => vec![dom_node(2, 22, "body", false)],
-                _ => Vec::new(),
-            };
-            Box::pin(async move { Ok(nodes) })
-        }
-        fn select_node(
-            &self,
-            _tab_id: &BrowserTabId,
-            _backend_node_id: i64,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn console_entries(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Vec<vibex_core::BrowserConsoleEntry>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-        fn network_entries(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Vec<vibex_core::BrowserNetworkEntry>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
         fn favicon(
             &self,

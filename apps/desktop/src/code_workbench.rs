@@ -18403,64 +18403,6 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
-        fn highlight_at(
-            &self,
-            _tab_id: &BrowserTabId,
-            _x: f64,
-            _y: f64,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, Option<i64>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn clear_highlight(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn describe_at(
-            &self,
-            _tab_id: &BrowserTabId,
-            _x: f64,
-            _y: f64,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Option<vibex_browser::BrowserElementInspection>,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-        fn dom_children(
-            &self,
-            _tab_id: &BrowserTabId,
-            _node_id: Option<i64>,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_browser::BrowserDomNode>>
-        {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-        fn select_node(
-            &self,
-            _tab_id: &BrowserTabId,
-            _backend_node_id: i64,
-        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn console_entries(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Vec<vibex_core::BrowserConsoleEntry>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-        fn network_entries(
-            &self,
-            _tab_id: &BrowserTabId,
-        ) -> crate::browser_transport::BrowserTransportFuture<
-            '_,
-            Vec<vibex_core::BrowserNetworkEntry>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
         fn favicon(
             &self,
             _tab_id: &BrowserTabId,
