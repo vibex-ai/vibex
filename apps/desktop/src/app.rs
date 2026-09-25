@@ -9834,12 +9834,15 @@ impl VibexWorkbench {
                 cx,
             );
             // The browser panel renders frames the runtime encodes; the local
-            // authority serves them from the in-process service.
+            // authority serves them from the in-process service. The panel
+            // polls that service from GPUI's executor, so the transport needs
+            // the Tokio handle the runtime's process, pipes and deadlines live
+            // on — without it the first call panics inside tokio.
             workbench.set_browser_transport(
                 Some(
                     std::sync::Arc::new(crate::code_workbench::local_browser_surface_transport(
                         runtime.browser().service().clone(),
-                        cx.background_executor().clone(),
+                        gpui_tokio::Tokio::handle(cx),
                     ))
                     .transport(),
                 ),

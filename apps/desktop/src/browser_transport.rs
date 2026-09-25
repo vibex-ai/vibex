@@ -11,9 +11,14 @@
 //! reason. The architecture baseline requires degrading with an explicit
 //! message, not a silent failure.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 
-use gpui::{BackgroundExecutor, Task};
+use tokio::runtime::Handle;
 use vibex_backend::{BackendError, BrowserBackend, BrowserInputPayload};
 use vibex_browser::{
     BrowserFrameSubscription, BrowserInput, BrowserService, BrowserServiceEvent, BrowserSessionKey,
@@ -95,13 +100,22 @@ pub enum BrowserFrameStream {
 
 pub struct LocalFrameStream {
     subscription: BrowserFrameSubscription,
+    /// Acks are sent from a Tokio task, so the stream carries the runtime too:
+    /// the pump awaits frames on GPUI's executor. See [`runtime_context`].
+    runtime: Handle,
 }
 
 impl BrowserFrameStream {
     /// Waits for the next frame, or `None` when the stream is over.
     pub async fn next(&mut self) -> Option<BrowserFrame> {
         match self {
-            Self::Local(stream) => stream.subscription.next().await,
+            Self::Local(stream) => {
+                let LocalFrameStream {
+                    subscription,
+                    runtime,
+                } = stream;
+                runtime_context(runtime.clone(), subscription.next()).await
+            }
             Self::Unavailable => None,
         }
     }
@@ -181,38 +195,82 @@ pub trait BrowserTransport: Send + Sync + 'static {
     fn stop_screencast(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()>;
 }
 
+/// Polls `future` with `handle`'s Tokio runtime context installed.
+///
+/// The panel drives the transport from GPUI's executor, and the browser service
+/// is a Tokio citizen: it spawns the system Chrome, opens async pipes, arms
+/// deadlines and calls `tokio::spawn` for frame acks. Polling any of that from a
+/// thread with no Tokio context panics inside tokio — the reported failure was
+/// `there is no reactor running, must be called from the context of a Tokio 1.x
+/// runtime`, raised by tokio's pidfd reaper on the first click of the browser
+/// entry.
+///
+/// Entering the context for the duration of each poll is the fix, rather than
+/// spawning the future onto the runtime: a spawned task cannot borrow the
+/// transport, and the panel relies on dropping a task to stop waiting for a
+/// frame. The guard is dropped before `poll` returns, so it never crosses an
+/// await point and the adapter stays `Send` whenever the future is.
+fn runtime_context<F: Future>(handle: Handle, future: F) -> RuntimeContext<F> {
+    RuntimeContext {
+        handle,
+        future: Box::pin(future),
+    }
+}
+
+/// Future adapter built by [`runtime_context`].
+struct RuntimeContext<F> {
+    handle: Handle,
+    /// Boxed so the adapter is `Unpin` without an unsafe projection.
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for RuntimeContext<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        // `Pin<Box<F>>` is always `Unpin`, so `get_mut` needs no `unsafe`.
+        let this = self.get_mut();
+        let _entered = this.handle.enter();
+        this.future.as_mut().poll(cx)
+    }
+}
+
 /// Browser transport backed by the in-process runtime.
 pub struct LocalBrowserTransport {
     service: BrowserService,
-    executor: BackgroundExecutor,
+    /// The runtime the browser service must be polled inside. See
+    /// [`runtime_context`].
+    runtime: Handle,
 }
 
 impl Clone for LocalBrowserTransport {
     fn clone(&self) -> Self {
         Self {
             service: self.service.clone(),
-            executor: self.executor.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
 
 impl LocalBrowserTransport {
-    pub fn new(service: BrowserService, executor: BackgroundExecutor) -> Self {
-        Self { service, executor }
+    pub fn new(service: BrowserService, runtime: Handle) -> Self {
+        Self { service, runtime }
     }
 
     pub fn service(&self) -> &BrowserService {
         &self.service
     }
 
-    /// Spawns a task on the surface's executor. Used by the frame pump, which
-    /// must not run on the UI thread.
-    pub fn spawn<F>(&self, future: F) -> Task<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.executor.spawn(future)
+    /// Polls a browser-service future inside the runtime.
+    ///
+    /// Every `BrowserTransport` method already goes through here. Operations the
+    /// trait does not model — answering a page dialog is the only one today —
+    /// must too, because the GPUI executor has no Tokio reactor.
+    pub fn run<'a, T: 'a>(
+        &'a self,
+        future: impl Future<Output = T> + 'a,
+    ) -> impl Future<Output = T> + 'a {
+        runtime_context(self.runtime.clone(), future)
     }
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<BrowserServiceEvent> {
@@ -226,11 +284,13 @@ impl BrowserTransport for LocalBrowserTransport {
     }
 
     fn availability(&self) -> BrowserTransportFuture<'_, BrowserAvailability> {
-        Box::pin(async move { Ok(self.service.availability().await) })
+        let service = self.service.clone();
+        Box::pin(self.run(async move { Ok(service.availability().await) }))
     }
 
     fn list_sessions(&self) -> BrowserTransportFuture<'_, Vec<BrowserSession>> {
-        Box::pin(async move { Ok(self.service.sessions().await) })
+        let service = self.service.clone();
+        Box::pin(self.run(async move { Ok(service.sessions().await) }))
     }
 
     fn session_snapshot(
@@ -238,12 +298,13 @@ impl BrowserTransport for LocalBrowserTransport {
         session_id: &BrowserSessionId,
     ) -> BrowserTransportFuture<'_, BrowserSessionSnapshot> {
         let session_id = session_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .session_snapshot(&session_id)
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn ensure_workspace_session(
@@ -251,15 +312,16 @@ impl BrowserTransport for LocalBrowserTransport {
         workspace_id: &WorkspaceId,
     ) -> BrowserTransportFuture<'_, BrowserSessionId> {
         let workspace_id = workspace_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .ensure_session(
                     BrowserSessionKey::Workspace(workspace_id.clone()),
                     Some(workspace_id),
                 )
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn create_tab(
@@ -269,12 +331,12 @@ impl BrowserTransport for LocalBrowserTransport {
     ) -> BrowserTransportFuture<'_, BrowserTab> {
         let session_id = session_id.clone();
         let url = url.map(str::to_string);
-        Box::pin(async move {
-            let tab_id = self
-                .service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            let tab_id = service
                 .create_tab(&session_id, url.as_deref(), BrowserTabOwner::User)
                 .await?;
-            let snapshot = self.service.session_snapshot(&session_id).await?;
+            let snapshot = service.session_snapshot(&session_id).await?;
             snapshot
                 .session
                 .tabs
@@ -286,12 +348,13 @@ impl BrowserTransport for LocalBrowserTransport {
                         "the browser tab vanished immediately after it was created",
                     )
                 })
-        })
+        }))
     }
 
     fn close_tab(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
-        Box::pin(async move { self.service.close_tab(&tab_id).await.map_err(Into::into) })
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.close_tab(&tab_id).await.map_err(Into::into) }))
     }
 
     fn select_tab(
@@ -301,12 +364,13 @@ impl BrowserTransport for LocalBrowserTransport {
     ) -> BrowserTransportFuture<'_, ()> {
         let session_id = session_id.clone();
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .select_tab(&session_id, &tab_id)
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn set_viewport(
@@ -317,12 +381,13 @@ impl BrowserTransport for LocalBrowserTransport {
         device_scale_factor: f64,
     ) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .set_viewport(&tab_id, width, height, device_scale_factor)
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn dispatch_input(
@@ -331,33 +396,31 @@ impl BrowserTransport for LocalBrowserTransport {
         input: BrowserInput,
     ) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .dispatch_input(&tab_id, input)
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn navigate(&self, tab_id: &BrowserTabId, url: &str) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
         let url = url.to_string();
-        Box::pin(async move {
-            self.service
-                .navigate(&tab_id, &url)
-                .await
-                .map_err(Into::into)
-        })
+        let service = self.service.clone();
+        Box::pin(self.run(async move { service.navigate(&tab_id, &url).await.map_err(Into::into) }))
     }
 
     fn reload(&self, tab_id: &BrowserTabId, ignore_cache: bool) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            self.service
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
                 .reload(&tab_id, ignore_cache)
                 .await
                 .map_err(Into::into)
-        })
+        }))
     }
 
     fn subscribe_frames(
@@ -365,18 +428,24 @@ impl BrowserTransport for LocalBrowserTransport {
         tab_id: &BrowserTabId,
     ) -> BrowserTransportFuture<'_, BrowserFrameStream> {
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            let subscription = self.service.subscribe_frames(&tab_id).await?;
-            Ok(BrowserFrameStream::Local(LocalFrameStream { subscription }))
-        })
+        let service = self.service.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(self.run(async move {
+            let subscription = service.subscribe_frames(&tab_id).await?;
+            Ok(BrowserFrameStream::Local(LocalFrameStream {
+                subscription,
+                runtime,
+            }))
+        }))
     }
 
     fn stop_screencast(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
         let tab_id = tab_id.clone();
-        Box::pin(async move {
-            self.service.stop_screencast(&tab_id).await;
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.stop_screencast(&tab_id).await;
             Ok(())
-        })
+        }))
     }
 }
 
@@ -645,7 +714,141 @@ pub fn tool_tier_for_session(_session: Option<&VibexSessionId>) -> BrowserToolTi
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// Drives a future on the calling thread, which — like GPUI's executor, and
+    /// unlike a Tokio worker — has no Tokio context installed.
+    fn drive_outside_tokio<F: Future>(future: F) -> F::Output {
+        struct ThreadWaker(std::thread::Thread);
+        impl std::task::Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = TaskContext::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                // Parks can return spuriously; the loop simply polls again.
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a Tokio runtime for the test")
+    }
+
+    /// Stops the browser and removes the throwaway profile when the test ends —
+    /// including the panicking path, so a failure cannot leave a Chrome process
+    /// tree behind.
+    struct BrowserCleanup {
+        runtime: tokio::runtime::Runtime,
+        service: BrowserService,
+        home: std::path::PathBuf,
+    }
+
+    impl Drop for BrowserCleanup {
+        fn drop(&mut self) {
+            self.runtime.block_on(self.service.shutdown());
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    /// The context adapter is what keeps the panel's first click from panicking.
+    ///
+    /// Spawning a process is the operation that used to blow up: tokio opens a
+    /// pidfd and registers it with the reactor, so outside a runtime it panics
+    /// with "there is no reactor running". The timer covers the deadlines every
+    /// CDP command carries.
+    #[test]
+    fn runtime_bound_work_runs_when_polled_from_a_foreign_executor() {
+        let runtime = test_runtime();
+        let outcome = drive_outside_tokio(runtime_context(runtime.handle().clone(), async {
+            let mut command = if cfg!(windows) {
+                let mut command = tokio::process::Command::new("cmd");
+                command.args(["/C", "exit", "0"]);
+                command
+            } else {
+                tokio::process::Command::new("true")
+            };
+            let status = command.status().await.expect("the probe process runs");
+            let deadline_held = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            })
+            .await
+            .is_ok();
+            status.success() && deadline_held
+        }));
+        assert!(
+            outcome,
+            "a runtime-bound future must complete when the adapter installs the context"
+        );
+        runtime.shutdown_background();
+    }
+
+    /// The crash the panel hit: `ensure_session` launches the system Chrome, and
+    /// `create_tab` drives CDP. Polled from a thread with no Tokio context — the
+    /// situation GPUI's executor creates — the whole chain must work, which is
+    /// what the reported `there is no reactor running` panic was about.
+    ///
+    /// Machines without a system Chrome cannot prove anything here, and the
+    /// feature is explicitly unavailable there, so the test steps aside.
+    #[test]
+    fn the_panel_can_open_a_browser_session_from_a_foreign_executor() {
+        if vibex_browser::discovery::installation_by_id(None).is_none() {
+            eprintln!("no system browser installed; skipping the browser transport test");
+            return;
+        }
+        let runtime = test_runtime();
+        let home = std::env::temp_dir().join(format!(
+            "vibex-browser-transport-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let service = BrowserService::new(vibex_browser::BrowserServiceConfig::new(&home));
+        let transport = LocalBrowserTransport::new(service.clone(), runtime.handle().clone());
+        let workspace = WorkspaceId::new();
+        let _cleanup = BrowserCleanup {
+            runtime,
+            service,
+            home,
+        };
+
+        let outcome = drive_outside_tokio(async {
+            let session = transport.ensure_workspace_session(&workspace).await?;
+            let tab = transport.create_tab(&session, Some("about:blank")).await?;
+            transport.set_viewport(&tab.tab_id, 800, 600, 1.0).await?;
+            let mut frames = transport.subscribe_frames(&tab.tab_id).await?;
+            // The pump awaits frames outside the transport, so the stream has to
+            // install the context itself: an arriving frame acks from a Tokio
+            // task. A blank page paints, so the first frame is what proves it.
+            let frame = frames.next().await;
+            assert!(
+                frame.is_some(),
+                "the first screencast frame should arrive for a painted page"
+            );
+            transport.stop_screencast(&tab.tab_id).await?;
+            transport.close_tab(&tab.tab_id).await?;
+            Ok::<(), BrowserTransportError>(())
+        });
+
+        outcome.expect("the panel drives the browser service from a foreign executor");
+    }
 
     #[test]
     fn input_round_trips_through_the_wire_payload() {

@@ -1051,11 +1051,11 @@ impl BrowserSurfaceTransport {
 /// Browser transport over the in-process runtime's browser service.
 pub(crate) fn local_browser_surface_transport(
     service: vibex_browser::BrowserService,
-    executor: gpui::BackgroundExecutor,
+    runtime: tokio::runtime::Handle,
 ) -> BrowserSurfaceTransport {
     BrowserSurfaceTransport {
         transport: Arc::new(crate::browser_transport::LocalBrowserTransport::new(
-            service, executor,
+            service, runtime,
         )),
     }
 }

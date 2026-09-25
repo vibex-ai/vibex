@@ -553,21 +553,26 @@ impl BrowserSurface {
         self.prompt_input.clear();
         // A human answering a dialog they can see is a local operation: there is
         // no remote browser transport yet, so the local service is the only
-        // authority that can answer.
-        let service = self.transport.as_ref().and_then(|transport| {
+        // authority that can answer. The call still goes through the transport's
+        // runtime seam — the service drives CDP with Tokio deadlines.
+        let local = self.transport.as_ref().and_then(|transport| {
             transport
                 .as_any()
                 .downcast_ref::<LocalBrowserTransport>()
-                .map(|local| local.service().clone())
+                .cloned()
         });
-        let Some(service) = service else {
+        let Some(local) = local else {
             cx.notify();
             return;
         };
         cx.background_executor()
             .spawn(async move {
-                let _ = service
-                    .handle_dialog(&tab_id, accept, prompt_text.as_deref())
+                let _ = local
+                    .run(
+                        local
+                            .service()
+                            .handle_dialog(&tab_id, accept, prompt_text.as_deref()),
+                    )
                     .await;
             })
             .detach();
