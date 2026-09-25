@@ -129,6 +129,22 @@ agent acts on and what the user sees cannot diverge.
 - **Page content is untrusted data.** Every tool description carries
   `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and `browser_extract` wraps its result in
   explicit content delimiters.
+- **The AI risk notice gates the panel, once per version.** `open_browser` parks
+  the request and asks the owner to show the notice; accepting persists
+  `browser_risk_disclaimer_version` in UI state and finishes the click. Every
+  entry point goes through that one gate because the gate lives in the entry
+  point itself. The runtime-side gate for an Agent that uses the browser before
+  a human ever opened the panel is **not** implemented: the notice is a client
+  surface, and `BrowserUnavailableReason::DisclaimerPending` remains reserved
+  vocabulary.
+- **Auth challenges and permission prompts are declined by Chrome, not by us.**
+  Headless has no UI for either, and Chrome cancels both on its own: a 401 page
+  settles and `navigator.geolocation` resolves to a denial. `Fetch` is
+  deliberately **not** enabled to make that explicit — `Fetch.authRequired` only
+  fires for requests the patterns match, and enabling it without patterns pauses
+  every request (a first attempt hung `Page.navigate` until its deadline). The
+  live transport test pins both behaviours so a Chrome change fails a test
+  instead of freezing the panel.
 
 ## Audit and redaction
 
@@ -164,6 +180,45 @@ JSON-RPC to that endpoint. One handler serves both, so behaviour cannot drift.
 - Some agents (`grok`, `cursor`, `hermes`, `pi`, `factory-droid`) never receive
   wire MCP servers at all. Report them as unavailable rather than listing tools
   they can never call.
+
+## Panel wiring (the parts that are easy to leave dangling)
+
+The runtime already owns the browser; the panel is a subscriber. Three wires
+have been dropped once and must stay:
+
+1. **Every runtime event the panel renders has a consumer.** `DialogOpened` and
+   `FileChooserOpened` are the page blocking on a human, `DialogClosed` is the
+   page unblocking itself, `SessionChanged` is the execution source moving under
+   the panel, `Availability` is the browser appearing or vanishing, and
+   `DevServerDetected` is the offer to open a server the terminal just printed.
+   `apply_browser_event` sends each to the surface that owns the tab; a variant
+   that falls into `_ => {}` is a feature that silently does not exist.
+2. **A hand-over needs a hand-back.** Human input pauses the Agent on that tab
+   (`execution_source = User`, `tab.aborted`), and only
+   `resume_agent_operations` re-arms it — the panel offers that button and says
+   the Agent must observe again. Hover alone must never take over: the panel
+   forwards every pointer move, so `input_takes_over` excludes `MouseMove`.
+3. **Detection lives in the runtime, not in the UI.** `observe_terminal_output`
+   is fed by the PTY reader through `TerminalManager::set_output_observer`, so a
+   URL printed on a terminal tab nobody is watching still counts, and an origin
+   joins the allow-list only after `probe_candidate` answers.
+
+## The browser shell the screencast cannot supply
+
+Chrome's own popups and dialogs are browser UI; a screencast carries only the
+page. Each one needs a panel-side answer:
+
+| Missing surface | What the panel does |
+| --- | --- |
+| JS dialogs (`alert`/`confirm`/`prompt`/`beforeunload`) | card from `DialogOpened`, answered through `handle_dialog` |
+| File chooser | card from `FileChooserOpened`; the Agent attaches files with `browser_upload`, the human cancels through `resolve_file_chooser` |
+| `<select>` popup | `probe_select_hint` on hover, then the panel's own list; `select_menu_at` / `choose_select_option` apply the choice and dispatch `input` + `change` |
+| Clipboard | Ctrl/Cmd+C reads the selection with `selection_text` and writes the system clipboard; Ctrl/Cmd+V types the system clipboard into the page with `Input.insertText`; Shift/Alt combinations stay with the page |
+| Downloads, permissions, HTTP auth | denied by policy or by Chrome itself (see Security rules) |
+
+The `<select>` probe runs on hover rather than on click on purpose: a click that
+waited for a round trip would reach the page after its own release, and Chrome
+would never synthesize the click.
 
 ## Approvals
 
@@ -212,3 +267,13 @@ Security rules): `all_proxy` alone or beside one scheme variable becomes a
 an http-only environment is passed through untouched. The decision is a pure
 function of a lookup closure, so the tests never touch the process environment
 that other tests share.
+
+The same live test also covers the shell fallbacks, because each of them is only
+real against a browser: the page's own selection comes back through
+`selection_text`; a rendered `<select>` is found by point, its options read, a
+choice applied and read back; a 401 settles the tab instead of hanging it; and
+geolocation resolves to a denial. `browser_surface::tests` holds the pure parts —
+which keystrokes mean copy and paste, how close a click must be to a probed
+point, dialog cards belonging to their own tab. `management::tests` and
+`desktop-runtime` pin the per-Agent delivery copy, and `desktop-model` pins that
+an old UI-state file reads as "notice not accepted".
