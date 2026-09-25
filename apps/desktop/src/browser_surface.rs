@@ -207,6 +207,23 @@ impl BrowserSurface {
         self.phase == SurfacePhase::Live
     }
 
+    /// The page title the runtime reports, falling back to the URL while a
+    /// fresh page has not reported one yet.
+    pub fn page_title(&self) -> Option<String> {
+        let tab = self.tab.as_ref()?;
+        if !tab.title.trim().is_empty() {
+            return Some(tab.title.clone());
+        }
+        (!tab.url.trim().is_empty()).then(|| tab.url.clone())
+    }
+
+    /// True while the page is still loading.
+    pub fn is_loading(&self) -> bool {
+        self.tab
+            .as_ref()
+            .is_some_and(|tab| tab.status == BrowserTabStatus::Loading)
+    }
+
     /// Starts or stops the frame pump.
     ///
     /// Switching away from the tab stops the screencast but keeps the target
@@ -268,6 +285,7 @@ impl BrowserSurface {
                 return;
             };
             let _ = this.update(cx, |surface, cx| {
+                let previous = surface.tab.clone();
                 if let Some(tab_id) = &tab_id {
                     surface.tab = snapshot
                         .session
@@ -277,6 +295,13 @@ impl BrowserSurface {
                         .cloned();
                 }
                 surface.availability = Some(snapshot.availability);
+                // The preview tab shows the page's title and whether it is
+                // still loading, so a change has to reach the owner.
+                if surface.tab != previous
+                    && let Some(tab_id) = surface.tab_id.clone()
+                {
+                    cx.emit(BrowserSurfaceEvent::TabChanged { tab_id });
+                }
                 if let Some(tab) = &surface.tab
                     && tab.status == BrowserTabStatus::Crashed
                 {
@@ -1826,6 +1851,7 @@ mod tests {
     /// here instead of silently doing nothing in the panel.
     struct RecordingTransport {
         inputs: Arc<std::sync::Mutex<Vec<String>>>,
+        snapshot: Arc<std::sync::Mutex<Option<vibex_core::BrowserSessionSnapshot>>>,
     }
 
     impl BrowserTransport for RecordingTransport {
@@ -1853,7 +1879,12 @@ mod tests {
             _session_id: &BrowserSessionId,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserSessionSnapshot>
         {
-            Box::pin(async { Err(BrowserTransportError::new("probe", "not used by this test")) })
+            let snapshot = self.snapshot.lock().unwrap().clone();
+            Box::pin(async move {
+                snapshot.ok_or_else(|| {
+                    BrowserTransportError::new("probe", "no snapshot configured for this test")
+                })
+            })
         }
         fn ensure_workspace_session(
             &self,
@@ -1934,12 +1965,117 @@ mod tests {
     // in-flow content. Its origin was the bottom edge of the frame area, so
     // every pointer position converted to a negative local coordinate and the
     // panel dropped all mouse input while still accepting IME text.
+    fn snapshot_with(tabs: Vec<vibex_core::BrowserTab>) -> vibex_core::BrowserSessionSnapshot {
+        vibex_core::BrowserSessionSnapshot {
+            session: vibex_core::BrowserSession {
+                session_id: BrowserSessionId::new(),
+                workspace_id: None,
+                tabs,
+                active_tab_id: None,
+                agent_tab_id: None,
+                execution_source: vibex_core::BrowserExecutionSource::User,
+                user_engaged: true,
+                created_at_ms: 0,
+                last_activity_at_ms: 0,
+            },
+            ledger: Vec::new(),
+            availability: BrowserAvailability::unavailable(
+                BrowserUnavailableReason::BrowserMissing,
+                None,
+            ),
+        }
+    }
+
+    fn tab_with(
+        tab_id: &BrowserTabId,
+        title: &str,
+        status: BrowserTabStatus,
+    ) -> vibex_core::BrowserTab {
+        vibex_core::BrowserTab {
+            tab_id: tab_id.clone(),
+            url: "https://example.com/".to_string(),
+            title: title.to_string(),
+            status,
+            owner: vibex_core::BrowserTabOwner::User,
+            agent_session_id: None,
+            created_at_ms: 0,
+            last_activity_at_ms: 0,
+            generation: 1,
+        }
+    }
+
+    // The preview tab shows the page's title, and a spinner while it loads, so
+    // the surface has to tell its owner when either changes.
+    #[gpui::test]
+    fn the_owner_learns_the_title_and_the_loading_state(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let tab_id = BrowserTabId::new();
+        let snapshot = Arc::new(std::sync::Mutex::new(Some(snapshot_with(vec![tab_with(
+            &tab_id,
+            "Example",
+            BrowserTabStatus::Loading,
+        )]))));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            snapshot: snapshot.clone(),
+        });
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| BrowserSurface::new(tab_id.as_str().to_string(), window, cx))
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), &cx);
+        let surface = window.root(&mut cx).expect("surface");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_events = seen.clone();
+        let _subscription = surface.update(&mut cx, |_, cx| {
+            cx.subscribe_self(move |_, event: &BrowserSurfaceEvent, _| {
+                if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
+                    seen_events
+                        .lock()
+                        .unwrap()
+                        .push(tab_id.as_str().to_string());
+                }
+            })
+        });
+        surface.update(&mut cx, |surface, cx| {
+            surface.attach(transport, BrowserSessionId::new(), tab_id.clone(), cx);
+            surface.refresh_tab(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.page_title()),
+            Some("Example".to_string())
+        );
+        assert!(surface.read_with(&cx, |surface, _| surface.is_loading()));
+
+        *snapshot.lock().unwrap() = Some(snapshot_with(vec![tab_with(
+            &tab_id,
+            "Loaded",
+            BrowserTabStatus::Ready,
+        )]));
+        surface.update(&mut cx, |surface, cx| surface.refresh_tab(cx));
+        cx.run_until_parked();
+        assert!(!surface.read_with(&cx, |surface, _| surface.is_loading()));
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.page_title()),
+            Some("Loaded".to_string())
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "a change has to reach the preview tab"
+        );
+    }
+
     #[gpui::test]
     fn a_click_on_the_page_reaches_the_transport(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
             inputs: inputs.clone(),
+            snapshot: Arc::new(std::sync::Mutex::new(None)),
         });
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {

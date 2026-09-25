@@ -87,7 +87,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
-use crate::browser_surface::BrowserSurface;
+use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
@@ -1036,6 +1036,13 @@ struct BrowserTabBinding {
     session_id: BrowserSessionId,
 }
 
+/// What the preview tab shows for one browser tab.
+#[derive(Clone, Default)]
+struct BrowserTabLabel {
+    title: String,
+    loading: bool,
+}
+
 /// The browser transport slice of the desktop bundle.
 #[derive(Clone)]
 pub(crate) struct BrowserSurfaceTransport {
@@ -1108,6 +1115,13 @@ pub struct CodeWorkbench {
     /// deliberately in-memory: a persisted tab without a binding shows the
     /// "reopen" boundary instead of guessing at a session.
     browser_bindings: BTreeMap<String, BrowserTabBinding>,
+    /// Page title and loading state per browser tab, for the preview tab label.
+    browser_tab_labels: BTreeMap<String, BrowserTabLabel>,
+    /// Keeps each surface's event subscription alive for as long as its tab is
+    /// open.
+    browser_surface_subscriptions: BTreeMap<String, Subscription>,
+    /// The runtime's browser event stream, started with the first surface.
+    browser_events_task: Option<Task<()>>,
     workspace: Option<WorkbenchWorkspace>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
@@ -1293,6 +1307,9 @@ impl CodeWorkbench {
             terminal_transport: None,
             browser_transport: None,
             browser_bindings: BTreeMap::new(),
+            browser_tab_labels: BTreeMap::new(),
+            browser_surface_subscriptions: BTreeMap::new(),
+            browser_events_task: None,
             workspace: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -2406,6 +2423,9 @@ impl CodeWorkbench {
             self.browser_surfaces.clear();
             self.active_browser_surface_ids.clear();
             self.browser_bindings.clear();
+            self.browser_tab_labels.clear();
+            self.browser_surface_subscriptions.clear();
+            self.browser_events_task = None;
         }
         cx.notify();
     }
@@ -4466,10 +4486,132 @@ impl CodeWorkbench {
                 });
             }
         }
+        let subscription = cx.subscribe(
+            &entity,
+            |workbench, surface, event: &BrowserSurfaceEvent, cx| {
+                if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
+                    workbench.browser_tab_labels.insert(
+                        tab_id.as_str().to_string(),
+                        BrowserTabLabel {
+                            title: surface.read(cx).page_title().unwrap_or_default(),
+                            loading: surface.read(cx).is_loading(),
+                        },
+                    );
+                    cx.notify();
+                }
+            },
+        );
+        self.browser_surface_subscriptions
+            .insert(browser_tab_id.to_string(), subscription);
         self.browser_surfaces
             .insert(browser_tab_id.to_string(), entity);
+        self.ensure_browser_event_stream(window, cx);
         self.sync_browser_surface_activity(cx);
         true
+    }
+
+    /// Starts listening to the runtime's browser events.
+    ///
+    /// A page that opens a tab — `target="_blank"` or `window.open` — reports it
+    /// here, and the panel turns it into a preview tab the same way it does for
+    /// a tab the user opened. Without the stream the click looks like it did
+    /// nothing.
+    fn ensure_browser_event_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser_events_task.is_some() {
+            return;
+        }
+        let Some(transport) = self.browser_transport.clone() else {
+            return;
+        };
+        let Some(local) = transport
+            .as_any()
+            .downcast_ref::<crate::browser_transport::LocalBrowserTransport>()
+        else {
+            // The remote transport has no live event channel yet; its panel is
+            // an explicit degradation, so there is nothing to listen to.
+            return;
+        };
+        let mut events = local.subscribe_events();
+        self.browser_events_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let alive = this.update_in(cx, |workbench, window, cx| {
+                            workbench.apply_browser_event(event, window, cx);
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }));
+    }
+
+    fn apply_browser_event(
+        &mut self,
+        event: vibex_browser::BrowserServiceEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            vibex_browser::BrowserServiceEvent::TabOpened { session_id, tab_id } => {
+                self.adopt_browser_tab(session_id, tab_id, window, cx);
+            }
+            vibex_browser::BrowserServiceEvent::TabChanged(tab_id) => {
+                if let Some(surface) = self.browser_surfaces.get(tab_id.as_str()).cloned() {
+                    surface.update(cx, |surface, cx| surface.refresh_tab(cx));
+                }
+            }
+            vibex_browser::BrowserServiceEvent::TabClosed(tab_id) => {
+                let preview_tab_id = format!("browser:{}", tab_id.as_str());
+                if self.preview.tabs.contains_key(&preview_tab_id) {
+                    self.close_tab(preview_tab_id, true, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens a preview tab for a runtime tab that already exists.
+    fn adopt_browser_tab(
+        &mut self,
+        session_id: BrowserSessionId,
+        tab_id: BrowserTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let browser_tab_id = tab_id.as_str().to_string();
+        if self.browser_bindings.contains_key(&browser_tab_id) {
+            return;
+        }
+        self.browser_bindings.insert(
+            browser_tab_id.clone(),
+            BrowserTabBinding {
+                session_id: session_id.clone(),
+            },
+        );
+        if !self.ensure_browser_surface(&browser_tab_id, window, cx) {
+            self.browser_bindings.remove(&browser_tab_id);
+            return;
+        }
+        if let Some(surface) = self.browser_surfaces.get(&browser_tab_id).cloned() {
+            surface.update(cx, |surface, cx| surface.refresh_tab(cx));
+        }
+        if let Some(preview_tab_id) = self.preview.open(
+            PreviewTarget::Browser {
+                browser_tab_id: browser_tab_id.clone(),
+            },
+            None,
+            unix_timestamp_ms(),
+        ) {
+            self.activate_tab(&preview_tab_id, cx);
+            self.persist(cx);
+            self.request_preview_panel(cx);
+        }
+        cx.notify();
     }
 
     pub fn open_terminal(
@@ -5368,6 +5510,21 @@ impl CodeWorkbench {
         if let Some(browser_tab_id) = tab_id.strip_prefix("browser:") {
             self.browser_surfaces.remove(browser_tab_id);
             self.active_browser_surface_ids.remove(browser_tab_id);
+            self.browser_tab_labels.remove(browser_tab_id);
+            self.browser_surface_subscriptions.remove(browser_tab_id);
+            // Closing the preview tab must close the runtime tab with it.
+            // Leaving the Chrome target alive kept its screencast running, and
+            // reopening the tab then failed with "Screencast is already active".
+            if self.browser_bindings.remove(browser_tab_id).is_some()
+                && let Some(transport) = self.browser_transport.clone()
+                && let Ok(browser_tab) = BrowserTabId::parse(browser_tab_id.to_string())
+            {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = transport.close_tab(&browser_tab).await;
+                    })
+                    .detach();
+            }
         }
         if let Some(path) = tab_id.strip_prefix("file:") {
             self.editors.close(path, force);
@@ -7387,8 +7544,25 @@ impl CodeWorkbench {
                 .unwrap_or_else(|| {
                     locale::text("Terminal unavailable", "终端不可用", "終端不可用").to_string()
                 }),
+            // The page names its own tab; the generic "Browser" label is only
+            // what a tab shows before the page has reported a title.
+            PreviewTarget::Browser { browser_tab_id } => self
+                .browser_tab_labels
+                .get(browser_tab_id)
+                .map(|label| label.title.trim())
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| tab_label(&tab.target)),
             target => tab_label(target),
         };
+        let browser_loading = matches!(
+            &tab.target,
+            PreviewTarget::Browser { browser_tab_id }
+                if self
+                    .browser_tab_labels
+                    .get(browser_tab_id)
+                    .is_some_and(|label| label.loading)
+        );
         let parent_label = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
                 relative_parent_path(path).to_string()
@@ -7637,7 +7811,13 @@ impl CodeWorkbench {
                     cx.notify();
                 }
             }))
-            .child(target_icon)
+            .child(if browser_loading {
+                Spinner::status_indicator()
+                    .with_size(Size::Small)
+                    .into_any_element()
+            } else {
+                target_icon
+            })
             .when(pinned, |this| {
                 this.child(
                     Icon::default()
