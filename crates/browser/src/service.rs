@@ -109,6 +109,18 @@ pub struct BrowserElementInspection {
     pub height: i64,
 }
 
+/// One row of the inspector's DOM tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserDomNode {
+    pub node_id: i64,
+    pub backend_node_id: i64,
+    /// Lower-case tag name, e.g. `div`; `#text` for a text node.
+    pub node_name: String,
+    /// The shortest readable label: `div#id.class`.
+    pub label: String,
+    pub has_children: bool,
+}
+
 /// A page's icon, for the panel's preview tab.
 ///
 /// The bytes travel with the runtime's answer rather than the panel fetching
@@ -2014,6 +2026,106 @@ impl BrowserService {
         }))
     }
 
+    /// The DOM children of the document, or of one node.
+    ///
+    /// One level at a time: a full tree of a real page is thousands of rows and
+    /// nobody scrolls that. The panel expands what the human opens.
+    pub async fn dom_children(
+        &self,
+        tab_id: &BrowserTabId,
+        node_id: Option<i64>,
+    ) -> BrowserResult<Vec<BrowserDomNode>> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let children = match node_id {
+            None => {
+                let document = cdp(
+                    &session,
+                    "DOM.getDocument",
+                    json!({ "depth": 1, "pierce": false }),
+                    SHORT_TIMEOUT_MS,
+                )
+                .await?;
+                document["root"]["children"].clone()
+            }
+            Some(node_id) => {
+                let described = cdp(
+                    &session,
+                    "DOM.describeNode",
+                    json!({ "nodeId": node_id, "depth": 1, "pierce": false }),
+                    SHORT_TIMEOUT_MS,
+                )
+                .await?;
+                described["node"]["children"].clone()
+            }
+        };
+        Ok(children
+            .as_array()
+            .map(|children| {
+                children
+                    .iter()
+                    .filter_map(dom_node_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Highlights a node and brings it into view, for the inspector's tree.
+    pub async fn select_node(
+        &self,
+        tab_id: &BrowserTabId,
+        backend_node_id: i64,
+    ) -> BrowserResult<()> {
+        let (_, session) = self.inner.tab_session(tab_id).await?;
+        let _ = cdp(
+            &session,
+            "DOM.scrollIntoViewIfNeeded",
+            json!({ "backendNodeId": backend_node_id }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await;
+        cdp(
+            &session,
+            "Overlay.highlightNode",
+            json!({
+                "backendNodeId": backend_node_id,
+                "highlightConfig": {
+                    "showInfo": false,
+                    "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.25 },
+                    "paddingColor": { "r": 147, "g": 196, "b": 125, "a": 0.35 },
+                    "borderColor": { "r": 255, "g": 229, "b": 153, "a": 0.7 },
+                    "marginColor": { "r": 246, "g": 178, "b": 107, "a": 0.35 },
+                },
+            }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The tab's captured console messages, oldest first.
+    pub async fn console_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserResult<Vec<BrowserConsoleEntry>> {
+        let state = self.inner.state.lock().await;
+        let tab = state.tabs.get(tab_id).ok_or_else(|| {
+            BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
+        })?;
+        Ok(tab.diagnostics.console.iter().cloned().collect())
+    }
+
+    /// The tab's captured network requests, oldest first.
+    pub async fn network_entries(
+        &self,
+        tab_id: &BrowserTabId,
+    ) -> BrowserResult<Vec<BrowserNetworkEntry>> {
+        let state = self.inner.state.lock().await;
+        let tab = state.tabs.get(tab_id).ok_or_else(|| {
+            BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
+        })?;
+        Ok(tab.diagnostics.network.iter().cloned().collect())
+    }
+
     /// The page's icon, fetched by the runtime.
     ///
     /// The URL is read out of the page, but the bytes are fetched here: the
@@ -3012,6 +3124,78 @@ async fn refresh_navigation_state(
         let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
     }
     Ok(())
+}
+
+/// Turns one `DOM.describeNode`/`DOM.getDocument` child into an inspector row.
+///
+/// Whitespace-only text nodes are dropped: they are most of a page's node count
+/// and none of what a human is looking for.
+fn dom_node_from_json(node: &Value) -> Option<BrowserDomNode> {
+    let node_id = node.get("nodeId").and_then(Value::as_i64)?;
+    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64)?;
+    let raw_name = node.get("nodeName").and_then(Value::as_str).unwrap_or("");
+    let node_name = raw_name.to_ascii_lowercase();
+    let is_text = matches!(node_name.as_str(), "#text" | "#comment");
+    if is_text
+        && node
+            .get("nodeValue")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+    let mut id = String::new();
+    let mut classes = Vec::new();
+    if let Some(attributes) = node.get("attributes").and_then(Value::as_array) {
+        let mut pairs = attributes.iter().filter_map(Value::as_str);
+        while let (Some(name), Some(value)) = (pairs.next(), pairs.next()) {
+            match name {
+                "id" => id = value.to_string(),
+                "class" => {
+                    classes = value
+                        .split_whitespace()
+                        .take(3)
+                        .map(str::to_string)
+                        .collect()
+                }
+                _ => {}
+            }
+        }
+    }
+    let label = if is_text {
+        let value = node
+            .get("nodeValue")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        format!("#text {}", truncate_label(value, 40))
+    } else if !id.is_empty() {
+        format!("{node_name}#{id}")
+    } else if !classes.is_empty() {
+        format!("{node_name}.{}", classes.join("."))
+    } else {
+        node_name.clone()
+    };
+    Some(BrowserDomNode {
+        node_id,
+        backend_node_id,
+        node_name,
+        label,
+        has_children: node
+            .get("childNodeCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0,
+    })
+}
+
+fn truncate_label(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(limit).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 /// Largest icon the runtime will carry back to the panel.
