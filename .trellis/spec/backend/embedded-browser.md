@@ -63,20 +63,28 @@ agent acts on and what the user sees cannot diverge.
    with an explanation telling the model to observe again — never resolved
    against the new element list.
 
-6. **Every CDP command carries a deadline.** The DevTools channel is known never
+6. **A failed load does not move the tab's URL.** Chrome navigates to
+   `chrome-error://chromewebdata/` when a page does not load;
+   `is_chrome_error_page` keeps that internal URL out of `tab.url`, so the
+   address bar and the Agent keep seeing what was actually requested. The error
+   page still renders as a frame and the failure stays in the network
+   diagnostics — a page that silently reported the error URL as its address is
+   how a broken launch-time proxy went unnoticed.
+
+7. **Every CDP command carries a deadline.** The DevTools channel is known never
    to settle when the page is wedged. `BROWSER_CDP_COMMAND_TIMEOUT_MS` is the
    default; do not add a command without one.
 
-7. **Chrome must be spawned by the runtime.** A stdio MCP sidecar is spawned and
+8. **Chrome must be spawned by the runtime.** A stdio MCP sidecar is spawned and
    owned by a third-party agent CLI, so the runtime has no child handle for it
    and cannot clean up anything it starts. `shutdown_inner` stops the browser
    next to the terminals.
 
-8. **Downloads default to denied and file choosers are intercepted.** A page
+9. **Downloads default to denied and file choosers are intercepted.** A page
    never chooses a write path and never opens a native dialog that does not
    exist in headless mode.
 
-9. **The browser service is polled inside the Tokio runtime, always.**
+10. **The browser service is polled inside the Tokio runtime, always.**
    `BrowserService` is a Tokio citizen: it spawns Chrome, opens async pipes,
    arms a deadline on every CDP command and `tokio::spawn`s frame acks. The
    panel, however, drives it from GPUI's executor, which has no Tokio context —
@@ -104,6 +112,17 @@ agent acts on and what the user sees cannot diverge.
   identified as this workspace's development server skip approval; every other
   loopback and private-network target prompts, because the browser runs on the
   runtime host and can reach services that are not exposed at all.
+- **The child's proxy environment is decided at launch, not inherited.** Chrome
+  parses `all_proxy` as an HTTP proxy even when it names a SOCKS server, so a
+  shell exporting `all_proxy=socks5://127.0.0.1:7891` (Clash-style) makes every
+  navigation fail with `ERR_EMPTY_RESPONSE`. `browser_proxy_for` therefore drops
+  `all_proxy` when `http_proxy` and `https_proxy` both exist — those are parsed
+  correctly and take precedence — and otherwise hands the same URL to Chrome as
+  `--proxy-server`, where the scheme is honored. `no_proxy` stays in the
+  environment; only Chrome's built-in loopback bypass covers the translated
+  flag. Any new launch variable needs the same kind of review: the panel
+  inherits whatever shell started the workbench, and a broken proxy looks
+  exactly like a broken page.
 - **`browser_upload` and `browser_preview_open` resolve symbolic links and
   confine the result to the agent's authorized roots.** Local previews are
   served as a `data:` URL so the page never learns an absolute path.
@@ -180,9 +199,16 @@ covers coordinate conversion and decode layout. `apps/desktop` exposes an
 explicit, the tier ladder is monotonic, the frame drop is present, and audited
 records carry no page content.
 
-`browser_transport::tests` guards the executor seam described in invariant 9:
+`browser_transport::tests` guards the executor seam described in invariant 10:
 one test polls runtime-bound work (a process spawn plus a timer) from a thread
 with no Tokio context, and one opens a real session and tab through
 `LocalBrowserTransport` from such a thread. The second skips itself when no
 system browser is installed — that is the environment where the whole feature is
 explicitly unavailable — and is the regression test for the first-click crash.
+
+`process::tests` pins the launch-time proxy decision (invariant-adjacent, see the
+Security rules): `all_proxy` alone or beside one scheme variable becomes a
+`--proxy-server` flag, `all_proxy` beside both scheme variables is dropped, and
+an http-only environment is passed through untouched. The decision is a pure
+function of a lookup closure, so the tests never touch the process environment
+that other tests share.
