@@ -194,6 +194,7 @@ async fn launch_with_pipe(config: &BrowserLaunchConfig) -> BrowserResult<Browser
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    apply_proxy_environment(&mut command);
     detach_from_controlling_terminal(command.as_std_mut());
     #[cfg(windows)]
     {
@@ -275,6 +276,7 @@ async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<Browser
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    apply_proxy_environment(&mut command);
     detach_from_controlling_terminal(command.as_std_mut());
     #[cfg(windows)]
     {
@@ -325,6 +327,70 @@ async fn spawn_grouped(command: &mut Command, label: &str) -> BrowserResult<Asyn
                 "Check that the browser executable still exists and is runnable by this user.",
             )
     })
+}
+
+/// The proxy configuration a launch imposes on the browser child.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BrowserProxy {
+    /// Variables removed from the child's environment.
+    remove: Vec<&'static str>,
+    /// Value standing in for `all_proxy` as a `--proxy-server` flag.
+    proxy_server: Option<String>,
+}
+
+/// Reads the launching environment's proxy configuration.
+fn browser_proxy() -> BrowserProxy {
+    browser_proxy_for(|name| std::env::var(name).ok())
+}
+
+/// The proxy decision itself, so it is testable without touching the process
+/// environment that parallel tests share.
+///
+/// Chromium exports `all_proxy` as *the* proxy for every scheme, but it parses
+/// the value as an HTTP proxy even when it names a SOCKS server. A shell that
+/// exports `all_proxy=socks5://127.0.0.1:7891` — the Clash-style setup — then
+/// makes the browser speak HTTP to a SOCKS port, which closes the connection
+/// without answering: every navigation fails with `ERR_EMPTY_RESPONSE`, the
+/// exact symptom the panel showed. The scheme-specific variables are parsed
+/// correctly, and `all_proxy` only applies where those are unset, so:
+///
+/// * with both `http_proxy` and `https_proxy` set, dropping `all_proxy`
+///   matches what the command-line tools in the same shell do;
+/// * otherwise the same URL reaches Chrome as `--proxy-server`, where a
+///   `socks5://` value is honored.
+///
+/// `no_proxy` is left alone: Chrome applies it to the variables it parses
+/// itself, and a `--proxy-server` value still gets Chrome's built-in loopback
+/// bypass. The loss is a custom bypass list on a SOCKS-only environment, which
+/// is not worth a second lossy translation here.
+fn browser_proxy_for(read: impl Fn(&str) -> Option<String>) -> BrowserProxy {
+    let read = |names: [&str; 2]| {
+        names
+            .into_iter()
+            .find_map(|name| read(name).filter(|value| !value.trim().is_empty()))
+    };
+    let http = read(["http_proxy", "HTTP_PROXY"]);
+    let https = read(["https_proxy", "HTTPS_PROXY"]);
+    let mut proxy = BrowserProxy::default();
+    let Some(all) = read(["all_proxy", "ALL_PROXY"]) else {
+        return proxy;
+    };
+    proxy.remove.extend(["all_proxy", "ALL_PROXY"]);
+    if http.is_none() || https.is_none() {
+        proxy.proxy_server = Some(all);
+    }
+    proxy
+}
+
+/// Applies [`browser_proxy`] to a command that is about to be spawned.
+fn apply_proxy_environment(command: &mut Command) {
+    let proxy = browser_proxy();
+    if let Some(value) = proxy.proxy_server {
+        command.arg(format!("--proxy-server={value}"));
+    }
+    for name in proxy.remove {
+        command.as_std_mut().env_remove(name);
+    }
 }
 
 /// Removes the child from the desktop's controlling terminal.
@@ -438,5 +504,81 @@ mod tests {
     fn process_group_probe_is_false_for_an_unused_pid() {
         // PID 0x7fff_fffe is above any realistic pid_max.
         assert!(!process_group_has_members(0x7fff_fffe));
+    }
+
+    fn environment(entries: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let entries = entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        move |name: &str| {
+            entries
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn a_socks_all_proxy_is_translated_instead_of_being_forwarded() {
+        // `all_proxy` alone: Chrome must get the URL as a flag, because it reads
+        // the variable as an HTTP proxy and answers every page with
+        // ERR_EMPTY_RESPONSE.
+        let proxy = browser_proxy_for(environment(&[("all_proxy", "socks5://127.0.0.1:7891")]));
+        assert_eq!(
+            proxy.proxy_server.as_deref(),
+            Some("socks5://127.0.0.1:7891")
+        );
+        assert_eq!(proxy.remove, vec!["all_proxy", "ALL_PROXY"]);
+    }
+
+    #[test]
+    fn scheme_specific_variables_keep_all_proxy_out_of_the_picture() {
+        // The shell that reported the bug: an HTTP proxy for both schemes plus a
+        // SOCKS `all_proxy`. `all_proxy` only fills in for unset schemes, so it
+        // is dropped and the working variables stay untouched.
+        let proxy = browser_proxy_for(environment(&[
+            ("http_proxy", "http://127.0.0.1:7890"),
+            ("https_proxy", "http://127.0.0.1:7890"),
+            ("all_proxy", "socks5://127.0.0.1:7891"),
+        ]));
+        assert_eq!(proxy.proxy_server, None);
+        assert_eq!(proxy.remove, vec!["all_proxy", "ALL_PROXY"]);
+    }
+
+    #[test]
+    fn an_http_only_environment_is_left_to_chrome() {
+        let proxy = browser_proxy_for(environment(&[("https_proxy", "http://127.0.0.1:7890")]));
+        assert_eq!(proxy, BrowserProxy::default());
+    }
+
+    #[test]
+    fn an_all_proxy_that_only_fills_one_scheme_is_still_translated() {
+        // http is covered by its own variable, https is not: the SOCKS proxy has
+        // to keep serving https, which only the flag expresses.
+        let proxy = browser_proxy_for(environment(&[
+            ("http_proxy", "http://127.0.0.1:7890"),
+            ("all_proxy", "socks5://127.0.0.1:7891"),
+        ]));
+        assert_eq!(
+            proxy.proxy_server.as_deref(),
+            Some("socks5://127.0.0.1:7891")
+        );
+    }
+
+    #[test]
+    fn the_uppercase_spellings_are_read_too() {
+        let proxy = browser_proxy_for(environment(&[("ALL_PROXY", "socks5://127.0.0.1:7891")]));
+        assert_eq!(
+            proxy.proxy_server.as_deref(),
+            Some("socks5://127.0.0.1:7891")
+        );
+        assert_eq!(proxy.remove, vec!["all_proxy", "ALL_PROXY"]);
+    }
+
+    #[test]
+    fn an_empty_proxy_variable_is_not_a_proxy() {
+        let proxy = browser_proxy_for(environment(&[("http_proxy", "  "), ("all_proxy", "")]));
+        assert_eq!(proxy, BrowserProxy::default());
     }
 }
