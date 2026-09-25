@@ -18345,6 +18345,12 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
+        fn selection_text(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
         fn subscribe_frames(
             &self,
             _tab_id: &BrowserTabId,
