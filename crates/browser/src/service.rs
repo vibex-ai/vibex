@@ -820,24 +820,38 @@ impl BrowserService {
         &self,
         tab_id: &BrowserTabId,
     ) -> BrowserResult<BrowserFrameSubscription> {
-        let (receiver, session) = {
+        let (receiver, session, connection, target_id) = {
             let state = self.inner.state.lock().await;
             let tab = state.tabs.get(tab_id).ok_or_else(|| {
                 BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
             })?;
+            let connection = state
+                .process
+                .as_ref()
+                .map(BrowserProcess::connection)
+                .ok_or_else(browser_not_running)?;
             (
                 tab.frame.subscribe(),
                 CdpSession::new(
-                    state
-                        .process
-                        .as_ref()
-                        .map(BrowserProcess::connection)
-                        .ok_or_else(browser_not_running)?,
+                    Arc::clone(&connection),
                     tab.session_id.clone(),
                     tab.target_id.clone(),
                 ),
+                connection,
+                tab.target_id.clone(),
             )
         };
+        // The panel is showing this tab now, so make it the browser's active
+        // target the way clicking a tab in a real browser does. Chrome marks the
+        // others hidden, and a page that believes it is hidden may pause its own
+        // timers and animations — which is indistinguishable from a frozen tab.
+        let _ = connection
+            .command(
+                "Target.activateTarget",
+                json!({ "targetId": target_id }),
+                Duration::from_millis(SHORT_TIMEOUT_MS),
+            )
+            .await;
         self.start_screencast(&session).await?;
         {
             let mut state = self.inner.state.lock().await;

@@ -367,64 +367,88 @@ impl BrowserSurface {
         self.frame_task = None;
         self.phase = SurfacePhase::Connecting;
         self.frame_task = Some(cx.spawn(async move |this, cx| {
-            let mut stream = match transport.subscribe_frames(&tab_id).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            // A stream that ends or fails while the panel still shows this tab
+            // used to leave the last frame on screen for good: the picture
+            // looked live and answered nothing. Re-subscribing is safe because
+            // the runtime stops the screencast before starting it again, so a
+            // transient failure now recovers on its own.
+            const ATTEMPTS: usize = 3;
+            for attempt in 0..ATTEMPTS {
+                if attempt > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(400 * attempt as u64))
+                        .await;
+                }
+                let mut stream = match transport.subscribe_frames(&tab_id).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let alive = this.update(cx, |surface, cx| {
+                            surface.apply_transport_error(&error);
+                            cx.notify();
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                if matches!(stream, BrowserFrameStream::Unavailable) {
+                    // This client has no frame channel at all; retrying cannot
+                    // help.
                     let _ = this.update(cx, |surface, cx| {
-                        surface.apply_transport_error(&error);
+                        surface.phase = SurfacePhase::Unavailable;
+                        surface.message = Some(
+                            locale::text(
+                                "This client cannot show the live page. Agent browser tools still work.",
+                                "此客户端无法显示实时页面，Agent 浏览器工具仍可使用。",
+                                "此客戶端無法顯示即時頁面，Agent 瀏覽器工具仍可使用。",
+                            )
+                            .to_string(),
+                        );
                         cx.notify();
                     });
                     return;
                 }
-            };
-            if matches!(stream, BrowserFrameStream::Unavailable) {
-                let _ = this.update(cx, |surface, cx| {
-                    surface.phase = SurfacePhase::Unavailable;
-                    surface.message = Some(
-                        locale::text(
-                            "This client cannot show the live page. Agent browser tools still work.",
-                            "此客户端无法显示实时页面，Agent 浏览器工具仍可使用。",
-                            "此客戶端無法顯示即時頁面，Agent 瀏覽器工具仍可使用。",
-                        )
-                        .to_string(),
-                    );
-                    cx.notify();
-                });
-                return;
-            }
-            loop {
-                let Some(frame) = stream.next().await else {
-                    let _ = this.update(cx, |surface, cx| {
-                        if surface.phase == SurfacePhase::Live {
-                            surface.phase = SurfacePhase::Failed;
-                            surface.message = Some(
-                                locale::text(
-                                    "The browser stopped sending frames.",
-                                    "浏览器已停止发送画面。",
-                                    "瀏覽器已停止傳送畫面。",
-                                )
-                                .to_string(),
-                            );
-                        }
+                loop {
+                    let Some(frame) = stream.next().await else {
+                        break;
+                    };
+                    // JPEG decoding is a few milliseconds of CPU work; doing it
+                    // on the UI thread would show up as dropped interactions at
+                    // 30fps.
+                    let decoded = cx
+                        .background_executor()
+                        .spawn({
+                            let bytes = frame.bytes.clone();
+                            async move { decode_frame(&bytes) }
+                        })
+                        .await;
+                    let dropped = stream.dropped_frames();
+                    let Ok(decoded) = decoded else {
+                        continue;
+                    };
+                    let alive = this.update(cx, |surface, cx| {
+                        surface.accept_frame(frame, decoded, dropped);
                         cx.notify();
                     });
-                    return;
-                };
-                // JPEG decoding is a few milliseconds of CPU work; doing it on
-                // the UI thread would show up as dropped interactions at 30fps.
-                let decoded = cx
-                    .background_executor()
-                    .spawn({
-                        let bytes = frame.bytes.clone();
-                        async move { decode_frame(&bytes) }
-                    })
-                    .await;
-                let dropped = stream.dropped_frames();
-                let Ok(decoded) = decoded else {
-                    continue;
-                };
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+                // The stream ended. Say so, then try once more unless the
+                // surface is gone.
                 let alive = this.update(cx, |surface, cx| {
-                    surface.accept_frame(frame, decoded, dropped);
+                    if surface.phase == SurfacePhase::Live {
+                        surface.phase = SurfacePhase::Failed;
+                        surface.message = Some(
+                            locale::text(
+                                "The browser stopped sending frames.",
+                                "浏览器已停止发送画面。",
+                                "瀏覽器已停止傳送畫面。",
+                            )
+                            .to_string(),
+                        );
+                    }
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -2394,6 +2418,21 @@ mod tests {
     struct RecordingTransport {
         inputs: Arc<std::sync::Mutex<Vec<String>>>,
         snapshot: Arc<std::sync::Mutex<Option<vibex_core::BrowserSessionSnapshot>>>,
+        /// How many times the frame stream was asked for, and how many of the
+        /// first attempts fail before one succeeds.
+        subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
+        subscribe_failures: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Default for RecordingTransport {
+        fn default() -> Self {
+            Self {
+                inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
+                snapshot: Arc::new(std::sync::Mutex::new(None)),
+                subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl BrowserTransport for RecordingTransport {
@@ -2517,7 +2556,26 @@ mod tests {
             &self,
             _tab_id: &BrowserTabId,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserFrameStream> {
-            Box::pin(async { Ok(BrowserFrameStream::Unavailable) })
+            self.subscribe_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining_failures = self
+                .subscribe_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |failures| failures.checked_sub(1),
+                )
+                .is_ok();
+            Box::pin(async move {
+                if remaining_failures {
+                    Err(BrowserTransportError::new(
+                        "test",
+                        "the frame stream failed once",
+                    ))
+                } else {
+                    Ok(BrowserFrameStream::Unavailable)
+                }
+            })
         }
         fn stop_screencast(
             &self,
@@ -2525,6 +2583,55 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    // A stream that fails must be retried: leaving the last frame on screen
+    // with no further attempts is what made a frozen tab look alive.
+    #[gpui::test]
+    fn a_failed_frame_stream_is_retried(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport {
+            subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            ..Default::default()
+        });
+        let calls = transport.subscribe_calls.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), &cx);
+        let surface = window.root(&mut cx).expect("surface");
+
+        // The first attempt fails, the retry succeeds after its backoff — the
+        // test clock advances so the timer fires without waiting.
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first attempt happens immediately"
+        );
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the failed stream is retried once"
+        );
+        // The second attempt reports that this client has no frame channel.
+        cx.run_until_parked();
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.phase),
+            SurfacePhase::Unavailable
+        );
     }
 
     // Regression: the frame geometry used to come from
@@ -2583,8 +2690,8 @@ mod tests {
             BrowserTabStatus::Loading,
         )]))));
         let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
-            inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
             snapshot: snapshot.clone(),
+            ..Default::default()
         });
         let window = cx.update(|cx: &mut App| {
             cx.open_window(Default::default(), |window, cx| {
@@ -2642,7 +2749,7 @@ mod tests {
         let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
             inputs: inputs.clone(),
-            snapshot: Arc::new(std::sync::Mutex::new(None)),
+            ..Default::default()
         });
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
