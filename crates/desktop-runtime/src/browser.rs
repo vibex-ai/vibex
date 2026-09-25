@@ -371,6 +371,22 @@ impl BrowserRuntime {
     }
 }
 
+/// Adapts raw terminal output to the browser service's dev-server detector.
+///
+/// Runs on the PTY reader thread, so it only decodes the bytes and hands them
+/// on: the scan is bounded and the readiness probe is spawned by the service.
+pub fn terminal_output_observer(service: BrowserService) -> vibex_terminal::TerminalOutputObserver {
+    std::sync::Arc::new(
+        move |_terminal_id: &vibex_core::TerminalId, workspace_id: &WorkspaceId, bytes: &[u8]| {
+            if bytes.is_empty() {
+                return;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            service.observe_terminal_output(workspace_id, &text);
+        },
+    )
+}
+
 /// Adapts [`BrowserRuntime`] to the browser crate's MCP host seam.
 ///
 /// A distinct type rather than an `impl ... for Arc<BrowserRuntime>` because the

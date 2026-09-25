@@ -483,6 +483,11 @@ pub(crate) struct BrowserInner {
     event_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reaper_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
+    /// One dev-server scanner per workspace, fed by the runtime's PTY reader.
+    dev_servers: std::sync::Mutex<HashMap<WorkspaceId, crate::devserver::DevServerScanner>>,
+    /// The runtime the readiness probes are spawned on. `None` when the service
+    /// was built outside a Tokio runtime, where the detector stays dormant.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 /// The browser domain service.
@@ -522,6 +527,8 @@ impl BrowserService {
             event_task: Mutex::new(None),
             reaper_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
+            dev_servers: std::sync::Mutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         });
         Self { inner }
     }
@@ -583,6 +590,68 @@ impl BrowserService {
             });
     }
 
+    /// Feeds one read of terminal output to the dev-server detector.
+    ///
+    /// Called from the PTY reader thread, so this never awaits and never
+    /// blocks: the scanner only keeps a bounded tail per workspace, and a
+    /// candidate is reported once its port actually answers — the banner a dev
+    /// server prints comes before it is listening, and a URL in a log line is
+    /// not a server. A detected origin joins the workspace's allow-list, which
+    /// is what lets the panel and the Agent reach the project's own dev server
+    /// without a domain approval; public hosts never match, so the list cannot
+    /// be widened by printing a URL.
+    pub fn observe_terminal_output(&self, workspace_id: &WorkspaceId, chunk: &str) {
+        let Some(runtime) = self.inner.runtime.clone() else {
+            return;
+        };
+        let candidates = {
+            let Ok(mut scanners) = self.inner.dev_servers.lock() else {
+                return;
+            };
+            scanners
+                .entry(workspace_id.clone())
+                .or_default()
+                .push(chunk)
+        };
+        // `push` yields `(origin, host, port)` for every URL it has not
+        // reported before.
+        for (origin, host, port) in candidates {
+            let service = self.clone();
+            let workspace_id = workspace_id.clone();
+            runtime.spawn(async move {
+                if crate::devserver::probe_candidate(&host, port).await {
+                    service.register_dev_server(workspace_id, origin).await;
+                }
+            });
+        }
+    }
+
+    /// Records a dev server that answered on its port.
+    async fn register_dev_server(&self, workspace_id: WorkspaceId, origin: String) {
+        let added = {
+            let mut state = self.inner.state.lock().await;
+            if state
+                .dev_server_origins
+                .iter()
+                .any(|known| known == &origin)
+            {
+                false
+            } else {
+                state.dev_server_origins.push(origin.clone());
+                true
+            }
+        };
+        if added {
+            let _ = self
+                .inner
+                .events
+                .send(BrowserServiceEvent::DevServerDetected {
+                    workspace_id: Some(workspace_id),
+                    origin,
+                });
+        }
+    }
+
     /// Grants a domain for the lifetime of the runtime process. The approval
     /// card's "always allow" action is what calls this; the runtime has no
     /// permission policy store of its own.
@@ -597,6 +666,15 @@ impl BrowserService {
     /// Revokes every domain grant.
     pub async fn clear_domain_grants(&self) {
         self.inner.state.lock().await.session_domain_grants.clear();
+    }
+
+    /// Origins positively identified as this runtime's development servers.
+    ///
+    /// Only these skip the private-network approval on loopback; the list is
+    /// filled by the terminal detector, and an origin joins it only after its
+    /// port answered.
+    pub async fn dev_server_origins(&self) -> Vec<String> {
+        self.inner.state.lock().await.dev_server_origins.clone()
     }
 
     /// Domains granted for this runtime process.
@@ -2610,6 +2688,62 @@ pub(crate) fn observation_settings(max_elements: Option<u32>, extended: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dev server only joins the allow-list once its port answers, and the
+    /// runtime is told exactly once.
+    #[tokio::test]
+    async fn a_listening_dev_server_is_detected_and_announced() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let port = listener.local_addr().expect("the listener address").port();
+        let service = BrowserService::new(BrowserServiceConfig::new(
+            std::env::temp_dir().join("vibex-browser-detector-test"),
+        ));
+        let mut events = service.subscribe();
+        let workspace = WorkspaceId::new();
+
+        // Vite prints its banner before it listens; the scanner must not care.
+        service.observe_terminal_output(&workspace, "  VITE v5.4.0  ready in 320 ms\n");
+        service.observe_terminal_output(
+            &workspace,
+            &format!("  ➜  Local:   http://127.0.0.1:{port}/\n"),
+        );
+
+        let announced = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(BrowserServiceEvent::DevServerDetected { origin, .. }) => return origin,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => panic!("the event stream closed"),
+                }
+            }
+        })
+        .await
+        .expect("the dev server is announced");
+        assert_eq!(announced, format!("http://127.0.0.1:{port}"));
+
+        // The origin is what lets the panel and the Agent reach the project's
+        // own server without a domain approval.
+        assert!(
+            service
+                .dev_server_origins()
+                .await
+                .iter()
+                .any(|known| known == &announced),
+            "the detected origin joins the workspace allow-list"
+        );
+
+        service.observe_terminal_output(&workspace, &format!("http://127.0.0.1:{port}/ again\n"));
+        let second = tokio::time::timeout(Duration::from_millis(300), events.recv()).await;
+        assert!(
+            !matches!(
+                second,
+                Ok(Ok(BrowserServiceEvent::DevServerDetected { .. }))
+            ),
+            "a reprinted banner must not announce the same server twice"
+        );
+        drop(listener);
+    }
 
     #[test]
     fn profile_key_is_stable_and_bounded() {

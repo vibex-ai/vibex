@@ -47,7 +47,18 @@ pub struct TerminalManager {
     sessions: Arc<Mutex<HashMap<TerminalId, TerminalRuntimeHandle>>>,
     ring_capacity: usize,
     raw_observation_capacity: Option<usize>,
+    /// The runtime's dev-server detector. Installed after composition, because
+    /// the browser service it reports to is built after the terminals are.
+    output_observer: Arc<Mutex<Option<TerminalOutputObserver>>>,
 }
+
+/// Observes raw terminal output as it arrives.
+///
+/// Called on the PTY reader thread with the bytes of one read, so an
+/// implementation must not block: the dev-server detector scans a bounded tail
+/// and hands any readiness probe to the runtime's own executor.
+pub type TerminalOutputObserver =
+    Arc<dyn Fn(&TerminalId, &WorkspaceId, &[u8]) + Send + Sync + 'static>;
 
 type TerminalRuntimeHandle = Arc<Mutex<TerminalRuntime>>;
 
@@ -148,6 +159,7 @@ impl TerminalManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ring_capacity: ring_capacity.max(1),
             raw_observation_capacity: None,
+            output_observer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -161,11 +173,23 @@ impl TerminalManager {
             raw_observation_capacity: Some(
                 raw_observation_capacity.max(MIN_RAW_OBSERVATION_CAPACITY),
             ),
+            output_observer: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn raw_observation_capacity(&self) -> Option<usize> {
         self.raw_observation_capacity
+    }
+
+    /// Installs the observer that sees raw output as it arrives.
+    ///
+    /// Late-bound rather than a constructor argument: the composition root
+    /// builds terminals before the browser service they report to, and the
+    /// reader threads already running pick the observer up from the shared slot.
+    pub fn set_output_observer(&self, observer: TerminalOutputObserver) {
+        if let Ok(mut slot) = self.output_observer.lock() {
+            *slot = Some(observer);
+        }
     }
 
     pub fn list(&self, workspace_id: &WorkspaceId) -> VibexResult<Vec<TerminalSession>> {
@@ -380,9 +404,11 @@ impl TerminalManager {
         let writer = Arc::new(Mutex::new(writer));
         spawn_reader_thread(
             terminal_id.clone(),
+            session.workspace_id.clone(),
             reader,
             Arc::downgrade(&writer),
             buffer.clone(),
+            Arc::clone(&self.output_observer),
         );
         let runtime = TerminalRuntime {
             session: session.clone(),
@@ -827,9 +853,11 @@ impl Default for TerminalManager {
 
 fn spawn_reader_thread(
     terminal_id: TerminalId,
+    workspace_id: WorkspaceId,
     mut reader: Box<dyn Read + Send>,
     writer: Weak<Mutex<PtyWriter>>,
     buffer: Arc<Mutex<TerminalBuffer>>,
+    output_observer: Arc<Mutex<Option<TerminalOutputObserver>>>,
 ) {
     thread::spawn(move || {
         let mut bytes = [0_u8; 4096];
@@ -839,6 +867,11 @@ fn spawn_reader_thread(
                 Ok(0) => break,
                 Ok(count) => {
                     push_raw_output(&buffer, &bytes[..count]);
+                    if let Ok(slot) = output_observer.lock()
+                        && let Some(observer) = slot.as_ref()
+                    {
+                        observer(&terminal_id, &workspace_id, &bytes[..count]);
+                    }
                     let Some(writer) = writer.upgrade() else {
                         break;
                     };
@@ -1848,6 +1881,66 @@ mod tests {
         let shutdown = manager.shutdown_all().unwrap();
         assert!(shutdown.sessions.is_empty());
         assert!(shutdown.failures.is_empty());
+    }
+
+    /// The runtime's dev-server detector sees output as it arrives, before any
+    /// of it is interpreted as terminal control sequences.
+    #[test]
+    fn the_output_observer_sees_raw_bytes_as_they_arrive() {
+        let buffer = Arc::new(Mutex::new(TerminalBuffer {
+            chunks: VecDeque::new(),
+            next_sequence: 1,
+            capacity: 1,
+            raw: Some(RawTerminalBuffer {
+                chunks: VecDeque::new(),
+                next_sequence: 1,
+                retained_bytes: 0,
+                capacity_bytes: MIN_RAW_OBSERVATION_CAPACITY,
+                dropped_chunks: 0,
+            }),
+        }));
+        let seen: Arc<Mutex<Vec<(TerminalId, WorkspaceId, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let observer_seen = Arc::clone(&seen);
+        let observer: TerminalOutputObserver = Arc::new(move |terminal_id, workspace_id, bytes| {
+            observer_seen.lock().unwrap().push((
+                terminal_id.clone(),
+                workspace_id.clone(),
+                String::from_utf8_lossy(bytes).to_string(),
+            ));
+        });
+        let writer: Arc<Mutex<PtyWriter>> = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let terminal_id = TerminalId::new();
+        let workspace_id = WorkspaceId::new();
+
+        spawn_reader_thread(
+            terminal_id.clone(),
+            workspace_id.clone(),
+            Box::new(std::io::Cursor::new(
+                b"\x1b[32m  Local:   http://127.0.0.1:5173/\x1b[0m\n".to_vec(),
+            )),
+            Arc::downgrade(&writer),
+            buffer,
+            Arc::new(Mutex::new(Some(observer))),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((seen_terminal, seen_workspace, text)) = seen.lock().unwrap().first() {
+                assert_eq!(seen_terminal, &terminal_id);
+                assert_eq!(seen_workspace, &workspace_id);
+                assert!(
+                    text.contains("http://127.0.0.1:5173/"),
+                    "the raw bytes reach the observer: {text:?}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the observer is called from the reader thread"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

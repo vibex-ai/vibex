@@ -4603,8 +4603,64 @@ impl CodeWorkbench {
                     });
                 }
             }
+            // A terminal printed a local URL and the port answers. The rule is
+            // to offer, never to navigate: a URL in build output is often just a
+            // log line, and the panel is not the terminal the human is watching.
+            vibex_browser::BrowserServiceEvent::DevServerDetected {
+                workspace_id,
+                origin,
+            } => {
+                self.offer_dev_server(workspace_id, origin, window, cx);
+            }
             _ => {}
         }
+    }
+
+    /// Asks the human whether to open a dev server the runtime just detected.
+    fn offer_dev_server(
+        &mut self,
+        workspace_id: Option<WorkspaceId>,
+        origin: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let (Some(detected), Some(current)) = (
+            workspace_id.as_ref(),
+            self.workspace.as_ref().map(|workspace| &workspace.id),
+        ) && detected != current
+        {
+            return;
+        }
+        Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
+        let workbench = cx.entity().downgrade();
+        let opened = origin.clone();
+        window.push_notification(
+            hint_notification(
+                NotificationType::Info,
+                format!(
+                    "{} {origin} — {}",
+                    locale::text(
+                        "Development server detected:",
+                        "检测到开发服务器：",
+                        "偵測到開發伺服器：",
+                    ),
+                    locale::text("click to open", "点击打开", "點擊開啟"),
+                ),
+                cx,
+            )
+            // Clicking a notification dismisses it and then runs the handler,
+            // which is the whole interaction here: open the browser, or close
+            // the notice and stay where you are.
+            .autohide(false)
+            .on_click(move |_, window, cx| {
+                let origin = opened.clone();
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.open_browser(Some(origin), window, cx);
+                });
+            }),
+            cx,
+        );
+        cx.notify();
     }
 
     /// Runs one update against the surface of a runtime browser tab, if the

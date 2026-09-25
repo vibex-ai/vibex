@@ -2606,6 +2606,18 @@ impl DesktopRuntime {
             Ok(())
         })
         .await?;
+        // The dev-server detector is fed by the runtime's own PTY streams, not
+        // by whatever the UI happens to be showing: the terminal that printed
+        // the URL may be on another tab, and a paired client is not on this
+        // machine at all. An origin only joins the allow-list once its port
+        // answers.
+        runtime
+            .terminals
+            .manager
+            .set_output_observer(browser::terminal_output_observer(
+                runtime.browser.service().clone(),
+            ));
+        runtime.browser.service().start_background_tasks().await;
         if let Some(task) = delegation_broker_task {
             runtime
                 .tasks
