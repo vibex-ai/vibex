@@ -355,15 +355,7 @@ pub(crate) struct CodeWorkbenchPersistedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodeWorkbenchEvent {
-    LayoutChanged {
-        fullscreen: bool,
-    },
-    /// The panel was asked for before the human accepted the risk notice.
-    ///
-    /// The owner shows the notice and, on acceptance, tells the workbench to
-    /// proceed; the request is kept so the click the human already made is not
-    /// thrown away.
-    BrowserDisclaimerRequired,
+    LayoutChanged { fullscreen: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1130,10 +1122,6 @@ pub struct CodeWorkbench {
     browser_surface_subscriptions: BTreeMap<String, Subscription>,
     /// The runtime's browser event stream, started with the first surface.
     browser_events_task: Option<Task<()>>,
-    /// Whether the human accepted the embedded browser risk notice.
-    browser_disclaimer_acknowledged: bool,
-    /// The request parked while the notice waits for an answer.
-    pending_browser_request: Option<Option<String>>,
     workspace: Option<WorkbenchWorkspace>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
@@ -1322,8 +1310,6 @@ impl CodeWorkbench {
             browser_tab_labels: BTreeMap::new(),
             browser_surface_subscriptions: BTreeMap::new(),
             browser_events_task: None,
-            browser_disclaimer_acknowledged: false,
-            pending_browser_request: None,
             workspace: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -4796,44 +4782,6 @@ impl CodeWorkbench {
     /// an application shell: it exists so an Agent's browser work is watchable
     /// and interruptible.
     pub fn open_browser(
-        &mut self,
-        url: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // The notice comes before any page does: an Agent can read whatever the
-        // browser loads, and the human is the one who has to know that. The
-        // request is parked so accepting does not make them click twice.
-        if !self.browser_disclaimer_acknowledged {
-            self.pending_browser_request = Some(url);
-            cx.emit(CodeWorkbenchEvent::BrowserDisclaimerRequired);
-            return;
-        }
-        self.open_browser_now(url, window, cx);
-    }
-
-    /// Records that the human accepted the risk notice.
-    ///
-    /// Called by the owner once it has persisted the accepted version.
-    pub fn acknowledge_browser_disclaimer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.browser_disclaimer_acknowledged = true;
-        if let Some(url) = self.pending_browser_request.take() {
-            self.open_browser_now(url, window, cx);
-        }
-    }
-
-    /// Drops a request the human declined the notice for.
-    pub fn cancel_browser_request(&mut self, cx: &mut Context<Self>) {
-        self.pending_browser_request = None;
-        cx.notify();
-    }
-
-    /// Adopts the accepted version the owner loaded from UI state.
-    pub fn set_browser_disclaimer_acknowledged(&mut self, acknowledged: bool) {
-        self.browser_disclaimer_acknowledged = acknowledged;
-    }
-
-    fn open_browser_now(
         &mut self,
         url: Option<String>,
         window: &mut Window,
@@ -18004,32 +17952,6 @@ mod tests {
 
         assert!(renderer.contains("locale::text(\"Commits\", \"提交\", \"提交\")"));
         assert!(!renderer.contains("locale::text(\"History\", \"历史\", \"歷史\")"));
-    }
-
-    #[test]
-    fn every_browser_open_goes_through_the_risk_notice() {
-        let source = include_str!("code_workbench.rs");
-        let gate = source
-            .split_once("    pub fn open_browser(")
-            .and_then(|(_, tail)| tail.split_once("    fn open_browser_now("))
-            .map(|(body, _)| body)
-            .expect("the browser entry point should remain inspectable");
-
-        // The entry point parks the request and announces the notice instead of
-        // opening; the notice's acceptance is what reaches the opener.
-        assert!(gate.contains("self.pending_browser_request = Some(url)"));
-        assert!(gate.contains("CodeWorkbenchEvent::BrowserDisclaimerRequired"));
-        assert!(
-            !gate.contains("ensure_workspace_session"),
-            "the entry point must not reach the runtime before the notice is accepted"
-        );
-        let acknowledgement = source
-            .split_once("    pub fn acknowledge_browser_disclaimer(")
-            .and_then(|(_, tail)| tail.split_once("    /// Drops a request the human declined"))
-            .map(|(body, _)| body)
-            .expect("the acknowledgement should remain inspectable");
-        assert!(acknowledgement.contains("self.browser_disclaimer_acknowledged = true"));
-        assert!(acknowledgement.contains("self.open_browser_now(url, window, cx)"));
     }
 
     #[test]

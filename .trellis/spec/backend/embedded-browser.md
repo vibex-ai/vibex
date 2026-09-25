@@ -129,14 +129,16 @@ agent acts on and what the user sees cannot diverge.
 - **Page content is untrusted data.** Every tool description carries
   `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and `browser_extract` wraps its result in
   explicit content delimiters.
-- **The AI risk notice gates the panel, once per version.** `open_browser` parks
-  the request and asks the owner to show the notice; accepting persists
-  `browser_risk_disclaimer_version` in UI state and finishes the click. Every
-  entry point goes through that one gate because the gate lives in the entry
-  point itself. The runtime-side gate for an Agent that uses the browser before
-  a human ever opened the panel is **not** implemented: the notice is a client
-  surface, and `BrowserUnavailableReason::DisclaimerPending` remains reserved
-  vocabulary.
+- **No blocking notice stands between the user and the browser.** A first
+  attempt parked `open_browser` behind a modal risk card; the card rendered
+  without its buttons, and because the overlay was deliberately not closable the
+  panel became unusable. `BROWSER_RISK_DISCLAIMER_VERSION` and
+  `has_acknowledged_risk_disclaimer` exist but nothing shows a notice, and
+  `BrowserUnavailableReason::DisclaimerPending` stays reserved vocabulary. If a
+  notice is wanted again it must be **non-blocking** — an inline banner in the
+  panel, or a dialog built with an explicit footer like the RC-import card — and
+  it must always have a way out that does not depend on a button rendering.
+  Nothing that a user cannot dismiss may gate a feature.
 - **Auth challenges and permission prompts are declined by Chrome, not by us.**
   Headless has no UI for either, and Chrome cancels both on its own: a 401 page
   settles and `navigator.geolocation` resolves to a denial. `Fetch` is
