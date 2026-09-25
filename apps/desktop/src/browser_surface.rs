@@ -25,11 +25,12 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement as _, Pixels, Point, Render, RenderImage, SharedString, Styled as _,
-    Subscription, Task, UTF16Selection, Window, canvas, div, img, prelude::*, px, size,
+    Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render, RenderImage, SharedString,
+    Styled as _, Subscription, Task, UTF16Selection, Window, canvas, div, img, prelude::*, px,
+    size,
 };
 use gpui_component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _,
     button::Button,
     button::ButtonVariants as _,
     h_flex,
@@ -37,6 +38,7 @@ use gpui_component::{
     v_flex,
 };
 use image::Frame;
+use vibex_browser::BrowserInput;
 use vibex_core::{
     BrowserAvailability, BrowserDialogRequest, BrowserFrame, BrowserFrameMetadata,
     BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus, BrowserUnavailableReason,
@@ -473,6 +475,51 @@ impl BrowserSurface {
             .detach();
     }
 
+    /// Forwards an editing or navigation key to the page.
+    ///
+    /// Text never comes through here: printable characters are committed by the
+    /// input handler, which is what keeps IME composition intact. What this adds
+    /// is everything a page reads from `keydown` — Enter submitting a form,
+    /// Backspace editing a field, Tab moving focus, the arrows scrolling, and
+    /// shortcuts such as Ctrl+A or Ctrl+C.
+    fn on_page_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // AltGr and friends produce characters; they belong to the text path.
+        // A composition owns the keyboard while it is open: Backspace and the
+        // arrows are editing the preedit, not the page.
+        if !self.focus.is_focused(window)
+            || event.prefer_character_input
+            || self.marked_text.is_some()
+        {
+            return;
+        }
+        let Some(input) = key_input(&event.keystroke, "rawKeyDown") else {
+            return;
+        };
+        self.dispatch(input, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_page_key_up(
+        &mut self,
+        event: &gpui::KeyUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        let Some(input) = key_input(&event.keystroke, "keyUp") else {
+            return;
+        };
+        self.dispatch(input, cx);
+        cx.stop_propagation();
+    }
+
     fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
@@ -696,7 +743,26 @@ impl BrowserSurface {
             }))
             .child(
                 canvas(
-                    |_, _, _| (),
+                    move |bounds, _, cx| {
+                        // The frame geometry has to come from this canvas, not
+                        // from `ElementExt::on_prepaint`: that helper adds an
+                        // absolutely positioned `size_full` child, which GPUI
+                        // lays out after the in-flow content, so its origin is
+                        // the *bottom* of the frame area. Every pointer position
+                        // then subtracted that offset and fell outside the
+                        // bounds, and the panel silently dropped all mouse
+                        // input. This canvas is `inset_0` of the frame, so its
+                        // own bounds are the frame's.
+                        prepaint_entity.update(cx, |this, cx| {
+                            this.frame_bounds = Some(bounds);
+                            this.schedule_viewport(
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                                1.0,
+                                cx,
+                            );
+                        });
+                    },
                     move |bounds, _, window, cx| {
                         if active {
                             window.handle_input(
@@ -710,20 +776,6 @@ impl BrowserSurface {
                 .absolute()
                 .inset_0(),
             )
-            .on_prepaint(move |bounds, _, cx| {
-                // The panel size decides the page viewport, and the frame
-                // geometry decides how pointer positions map back to it. Both
-                // are only known once the element has been laid out.
-                prepaint_entity.update(cx, |this, cx| {
-                    this.frame_bounds = Some(bounds);
-                    this.schedule_viewport(
-                        f32::from(bounds.size.width),
-                        f32::from(bounds.size.height),
-                        1.0,
-                        cx,
-                    );
-                });
-            })
             .into_any_element()
     }
 
@@ -1057,6 +1109,179 @@ pub fn normalize_address(input: &str) -> String {
     search.to_string()
 }
 
+/// One key identity in the terms the page understands.
+struct PageKey {
+    /// DOM `KeyboardEvent.key`.
+    key: String,
+    /// DOM `KeyboardEvent.code`.
+    code: &'static str,
+    /// The virtual key code Chrome uses for editing commands and shortcuts.
+    virtual_key_code: i32,
+}
+
+/// Identifies a named editing or navigation key.
+///
+/// Only keys whose *identity* the page needs are listed. Printable characters
+/// stay on the text path below, which is where their characters come from.
+fn named_page_key(key: &str) -> Option<PageKey> {
+    let (key_name, code, virtual_key_code) = match key {
+        "enter" => ("Enter", "Enter", 13),
+        "tab" => ("Tab", "Tab", 9),
+        "backspace" => ("Backspace", "Backspace", 8),
+        "escape" => ("Escape", "Escape", 27),
+        "space" => (" ", "Space", 32),
+        "delete" => ("Delete", "Delete", 46),
+        "insert" => ("Insert", "Insert", 45),
+        "home" => ("Home", "Home", 36),
+        "end" => ("End", "End", 35),
+        "pageup" => ("PageUp", "PageUp", 33),
+        "pagedown" => ("PageDown", "PageDown", 34),
+        "up" => ("ArrowUp", "ArrowUp", 38),
+        "down" => ("ArrowDown", "ArrowDown", 40),
+        "left" => ("ArrowLeft", "ArrowLeft", 37),
+        "right" => ("ArrowRight", "ArrowRight", 39),
+        "shift" => ("Shift", "ShiftLeft", 16),
+        "control" => ("Control", "ControlLeft", 17),
+        "alt" => ("Alt", "AltLeft", 18),
+        "platform" => ("Meta", "MetaLeft", 91),
+        "capslock" => ("CapsLock", "CapsLock", 20),
+        "contextmenu" => ("ContextMenu", "ContextMenu", 93),
+        function if function.len() > 1 && function.starts_with('f') => {
+            let number = function[1..].parse::<i32>().ok()?;
+            if !(1..=12).contains(&number) {
+                return None;
+            }
+            let name = match number {
+                1 => "F1",
+                2 => "F2",
+                3 => "F3",
+                4 => "F4",
+                5 => "F5",
+                6 => "F6",
+                7 => "F7",
+                8 => "F8",
+                9 => "F9",
+                10 => "F10",
+                11 => "F11",
+                _ => "F12",
+            };
+            (name, name, 111 + number)
+        }
+        _ => return None,
+    };
+    Some(PageKey {
+        key: key_name.to_string(),
+        code,
+        virtual_key_code,
+    })
+}
+
+/// Identifies a single-character key, keyed by the character printed on it.
+///
+/// `dom_key` is what the page sees, so Shift+1 reports `!` while `code` and the
+/// virtual key code stay those of the `1` key. The character itself is not sent:
+/// it arrives through `Input.insertText`.
+fn character_page_key(keystroke: &Keystroke) -> Option<PageKey> {
+    let mut characters = keystroke.key.chars();
+    let printed = characters.next()?;
+    if characters.next().is_some() {
+        return None;
+    }
+    let (code, virtual_key_code) = match printed {
+        'a'..='z' => (
+            match printed {
+                'a' => "KeyA",
+                'b' => "KeyB",
+                'c' => "KeyC",
+                'd' => "KeyD",
+                'e' => "KeyE",
+                'f' => "KeyF",
+                'g' => "KeyG",
+                'h' => "KeyH",
+                'i' => "KeyI",
+                'j' => "KeyJ",
+                'k' => "KeyK",
+                'l' => "KeyL",
+                'm' => "KeyM",
+                'n' => "KeyN",
+                'o' => "KeyO",
+                'p' => "KeyP",
+                'q' => "KeyQ",
+                'r' => "KeyR",
+                's' => "KeyS",
+                't' => "KeyT",
+                'u' => "KeyU",
+                'v' => "KeyV",
+                'w' => "KeyW",
+                'x' => "KeyX",
+                'y' => "KeyY",
+                _ => "KeyZ",
+            },
+            i32::from(printed.to_ascii_uppercase() as u8),
+        ),
+        '0'..='9' => (
+            match printed {
+                '0' => "Digit0",
+                '1' => "Digit1",
+                '2' => "Digit2",
+                '3' => "Digit3",
+                '4' => "Digit4",
+                '5' => "Digit5",
+                '6' => "Digit6",
+                '7' => "Digit7",
+                '8' => "Digit8",
+                _ => "Digit9",
+            },
+            i32::from(printed as u8),
+        ),
+        ';' => ("Semicolon", 186),
+        '=' => ("Equal", 187),
+        ',' => ("Comma", 188),
+        '-' => ("Minus", 189),
+        '.' => ("Period", 190),
+        '/' => ("Slash", 191),
+        '`' => ("Backquote", 192),
+        '[' => ("BracketLeft", 219),
+        '\\' => ("Backslash", 220),
+        ']' => ("BracketRight", 221),
+        '\'' => ("Quote", 222),
+        _ => return None,
+    };
+    Some(PageKey {
+        key: keystroke
+            .key_char
+            .clone()
+            .unwrap_or_else(|| printed.to_string()),
+        code,
+        virtual_key_code,
+    })
+}
+
+/// Maps one GPUI keystroke onto the CDP key event the page receives.
+///
+/// Named keys and shortcuts whose identity matters travel this path; plain
+/// printable characters do not, because their text arrives through
+/// `EntityInputHandler` and `Input.insertText`. Sending them here as well would
+/// insert every character twice, and would push the raw letters of a CJK
+/// composition into the page. This mirrors how the terminal forwards keys.
+fn key_input(keystroke: &Keystroke, event_type: &str) -> Option<BrowserInput> {
+    let identity = named_page_key(keystroke.key.as_str()).or_else(|| {
+        let shortcut =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+        shortcut.then(|| character_page_key(keystroke)).flatten()
+    })?;
+    Some(BrowserInput::Key {
+        event_type: event_type.to_string(),
+        key: identity.key,
+        code: identity.code.to_string(),
+        // The character travels on the text path, so the key event must not
+        // carry it or the page would receive it twice.
+        text: None,
+        modifiers: mouse_modifiers(keystroke.modifiers),
+        windows_key_code: identity.virtual_key_code,
+    })
+}
+
 fn mouse_modifiers(modifiers: gpui::Modifiers) -> i32 {
     // CDP modifier bits: Alt 1, Control 2, Meta 4, Shift 8.
     let mut value = 0;
@@ -1227,6 +1452,8 @@ impl Render for BrowserSurface {
             .child(div().relative().flex_1().min_h_0().child(frame))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
+            .on_key_down(cx.listener(Self::on_page_key_down))
+            .on_key_up(cx.listener(Self::on_page_key_up))
     }
 }
 
@@ -1318,6 +1545,121 @@ mod tests {
             function: false,
         };
         assert_eq!(mouse_modifiers(modifiers), 1 | 2 | 8);
+    }
+
+    fn keystroke(key: &str, key_char: Option<&str>, modifiers: gpui::Modifiers) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            key_char: key_char.map(str::to_string),
+            modifiers,
+        }
+    }
+
+    fn key_fields(input: &vibex_browser::BrowserInput) -> (String, String, String, i32, i32) {
+        let vibex_browser::BrowserInput::Key {
+            event_type,
+            key,
+            code,
+            modifiers,
+            windows_key_code,
+            ..
+        } = input
+        else {
+            panic!("not a key input: {input:?}");
+        };
+        (
+            event_type.clone(),
+            key.clone(),
+            code.clone(),
+            modifiers.to_owned(),
+            *windows_key_code,
+        )
+    }
+
+    #[test]
+    fn editing_keys_reach_the_page_with_their_virtual_key_codes() {
+        let none = gpui::Modifiers::default();
+        let enter = key_input(&keystroke("enter", None, none), "rawKeyDown").unwrap();
+        assert_eq!(
+            key_fields(&enter),
+            (
+                "rawKeyDown".to_string(),
+                "Enter".to_string(),
+                "Enter".to_string(),
+                0,
+                13
+            )
+        );
+        let backspace = key_input(&keystroke("backspace", None, none), "rawKeyDown").unwrap();
+        assert_eq!(key_fields(&backspace).4, 8);
+        let delete = key_input(&keystroke("delete", None, none), "keyUp").unwrap();
+        assert_eq!(key_fields(&delete).0, "keyUp");
+        let arrow = key_input(&keystroke("left", None, none), "rawKeyDown").unwrap();
+        assert_eq!(
+            key_fields(&arrow),
+            (
+                "rawKeyDown".to_string(),
+                "ArrowLeft".to_string(),
+                "ArrowLeft".to_string(),
+                0,
+                37
+            )
+        );
+        let function = key_input(&keystroke("f5", None, none), "rawKeyDown").unwrap();
+        assert_eq!(key_fields(&function).4, 116);
+    }
+
+    #[test]
+    fn shortcuts_carry_their_modifiers() {
+        let control = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        // Ctrl+A has no character of its own, so `key` names the key.
+        let select_all = key_input(&keystroke("a", None, control), "rawKeyDown").unwrap();
+        assert_eq!(
+            key_fields(&select_all),
+            (
+                "rawKeyDown".to_string(),
+                "a".to_string(),
+                "KeyA".to_string(),
+                2,
+                65
+            )
+        );
+        // Alt+arrow and Shift+Enter are named keys, so they travel with their
+        // modifiers rather than through the text path.
+        let alt_left = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let back = key_input(&keystroke("left", None, alt_left), "rawKeyDown").unwrap();
+        assert_eq!(key_fields(&back).3, 1);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let newline = key_input(&keystroke("enter", None, shift), "rawKeyDown").unwrap();
+        assert_eq!(key_fields(&newline).3, 8);
+        // A shifted printable is a character, not a shortcut: it stays on the
+        // text path, but its identity is still the key it was typed on.
+        assert!(key_input(&keystroke("1", Some("!"), shift), "rawKeyDown").is_none());
+        let bang = character_page_key(&keystroke("1", Some("!"), shift)).unwrap();
+        assert_eq!(
+            (bang.key.as_str(), bang.code, bang.virtual_key_code),
+            ("!", "Digit1", 49)
+        );
+    }
+
+    #[test]
+    fn printable_keys_stay_on_the_text_path() {
+        let none = gpui::Modifiers::default();
+        // Typing "a" or a space must not produce a key event: the character is
+        // committed through the input handler, and sending it here as well
+        // would insert it twice (and leak raw keys from a CJK composition).
+        assert!(key_input(&keystroke("a", Some("a"), none), "rawKeyDown").is_none());
+        assert!(key_input(&keystroke(";", Some(";"), none), "rawKeyDown").is_none());
+        assert!(key_input(&keystroke("中", Some("中"), none), "rawKeyDown").is_none());
     }
 
     #[test]
@@ -1478,5 +1820,192 @@ mod tests {
             surface.to_viewport_point(Point::new(px(25.0), px(25.0))),
             Some((50.0, 50.0))
         );
+    }
+
+    /// Records what the surface forwards, so an input-path regression fails
+    /// here instead of silently doing nothing in the panel.
+    struct RecordingTransport {
+        inputs: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl BrowserTransport for RecordingTransport {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn availability(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserAvailability> {
+            Box::pin(async {
+                Ok(BrowserAvailability::unavailable(
+                    BrowserUnavailableReason::BrowserMissing,
+                    None,
+                ))
+            })
+        }
+        fn list_sessions(
+            &self,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_core::BrowserSession>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn session_snapshot(
+            &self,
+            _session_id: &BrowserSessionId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserSessionSnapshot>
+        {
+            Box::pin(async { Err(BrowserTransportError::new("probe", "not used by this test")) })
+        }
+        fn ensure_workspace_session(
+            &self,
+            _workspace_id: &vibex_core::WorkspaceId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserSessionId> {
+            Box::pin(async { Ok(BrowserSessionId::new()) })
+        }
+        fn create_tab(
+            &self,
+            _session_id: &BrowserSessionId,
+            _url: Option<&str>,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserTab> {
+            Box::pin(async { Err(BrowserTransportError::new("probe", "not used by this test")) })
+        }
+        fn close_tab(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn select_tab(
+            &self,
+            _session_id: &BrowserSessionId,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_viewport(
+            &self,
+            _tab_id: &BrowserTabId,
+            _width: u32,
+            _height: u32,
+            _device_scale_factor: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dispatch_input(
+            &self,
+            _tab_id: &BrowserTabId,
+            input: vibex_browser::BrowserInput,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            let inputs = self.inputs.clone();
+            Box::pin(async move {
+                inputs.lock().unwrap().push(format!("{input:?}"));
+                Ok(())
+            })
+        }
+        fn navigate(
+            &self,
+            _tab_id: &BrowserTabId,
+            _url: &str,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reload(
+            &self,
+            _tab_id: &BrowserTabId,
+            _ignore_cache: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn subscribe_frames(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserFrameStream> {
+            Box::pin(async { Ok(BrowserFrameStream::Unavailable) })
+        }
+        fn stop_screencast(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // Regression: the frame geometry used to come from
+    // `ElementExt::on_prepaint`, whose helper canvas is laid out after the
+    // in-flow content. Its origin was the bottom edge of the frame area, so
+    // every pointer position converted to a negative local coordinate and the
+    // panel dropped all mouse input while still accepting IME text.
+    #[gpui::test]
+    fn a_click_on_the_page_reaches_the_transport(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            inputs: inputs.clone(),
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface =
+                        BrowserSurface::new("browser_tab_probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("browser probe window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| {
+            surface.frame_pixel_size = (1000.0, 600.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let bounds = surface
+            .read_with(&cx, |surface, _| surface.frame_bounds)
+            .expect("the frame is laid out");
+        let frame_size = surface.read_with(&cx, |surface, _| surface.frame_pixel_size);
+        // A click in the middle of the visible frame area must arrive as a
+        // positive viewport coordinate, which is only true when the frame's
+        // origin was captured instead of its bottom edge.
+        cx.simulate_mouse_down(
+            bounds.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        let recorded = inputs.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected one dispatched input: {recorded:?}"
+        );
+        let entry = &recorded[0];
+        assert!(entry.contains("MouseDown"), "not a press: {entry}");
+        let (x, y) = parse_mouse_down_point(entry);
+        assert!(
+            x > 0.0 && x < f64::from(frame_size.0) && y > 0.0 && y < f64::from(frame_size.1),
+            "the press landed outside the viewport: ({x}, {y}) in {frame_size:?}"
+        );
+    }
+
+    /// Reads the `x`/`y` out of the `Debug` rendering of a mouse-down input.
+    fn parse_mouse_down_point(entry: &str) -> (f64, f64) {
+        let number_after = |key: &str| {
+            entry
+                .split(key)
+                .nth(1)
+                .and_then(|rest| {
+                    rest.trim_start()
+                        .split(|character: char| {
+                            !(character.is_ascii_digit() || character == '.' || character == '-')
+                        })
+                        .next()
+                })
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("no `{key}` in {entry}"))
+        };
+        (number_after("x: "), number_after("y: "))
     }
 }
