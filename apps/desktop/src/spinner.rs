@@ -10,6 +10,14 @@
 //! [`Animation::with_max_fps`] set so the rotation is sampled a few dozen times
 //! a second instead of every refresh. The sweep is far slower than the sample
 //! rate, so the throttle is invisible at the sizes the app draws.
+//!
+//! A spinner in a window nobody is looking at is not animated at all: the
+//! icon is drawn from the same rest angle, repeating animation and all. An
+//! inactive window still gets its frames throttled by the platform, but a
+//! parked workbench with a running session would keep asking for them forever;
+//! drawing still is what actually stops the clock. Window activation itself
+//! repaints the window (gpui refreshes on every active-status change), so the
+//! rotation resumes the moment the window comes back.
 
 use std::time::Duration;
 
@@ -19,12 +27,22 @@ use gpui::{
 };
 use gpui_component::{Icon, IconName, Sizable, Size};
 
-/// Frames per second the spinner rotation is sampled at.
+/// Frames per second a sidebar status spinner is sampled at.
 ///
 /// The loader completes one turn every 0.8s; at 30fps that is a 12° step, well
 /// below what the eye can resolve on an icon this small, while the workbench
 /// repaints at less than half the frames a 75Hz panel would otherwise demand.
 const SPINNER_MAX_FPS: f32 = 30.0;
+
+/// Sample rate for the small status indicators embedded in the sidebar and
+/// other always-mounted chrome.
+///
+/// These are 12px marks the eye reads as "still running", not as motion. At
+/// 10fps the loader steps 45° per frame, which reads as a pulse rather than a
+/// smooth turn — and it asks the window for a third of the frames. Since such
+/// an indicator is mounted for as long as its session runs, that difference is
+/// the difference between a mostly idle main thread and a busy one.
+pub const STATUS_INDICATOR_MAX_FPS: f32 = 10.0;
 
 /// A cycling loading spinner.
 #[derive(IntoElement)]
@@ -34,6 +52,7 @@ pub struct Spinner {
     speed: Duration,
     easing: Box<dyn Fn(f32) -> f32>,
     color: Option<Hsla>,
+    max_fps: f32,
 }
 
 impl Spinner {
@@ -45,7 +64,20 @@ impl Spinner {
             easing: Box::new(ease_in_out),
             icon: Icon::new(IconName::Loader),
             color: None,
+            max_fps: SPINNER_MAX_FPS,
         }
+    }
+
+    /// A spinner for always-mounted status chrome — see
+    /// [`STATUS_INDICATOR_MAX_FPS`].
+    pub fn status_indicator() -> Self {
+        Self::new().fps(STATUS_INDICATOR_MAX_FPS)
+    }
+
+    /// Sample the rotation at `fps` frames per second instead of the default.
+    pub fn fps(mut self, fps: f32) -> Self {
+        self.max_fps = fps.clamp(1.0, 240.0);
+        self
     }
 
     /// Set specified icon for the spinner.
@@ -85,21 +117,32 @@ impl Sizable for Spinner {
 }
 
 impl RenderOnce for Spinner {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let Self {
+            size,
+            icon,
+            speed,
+            easing,
+            color,
+            max_fps,
+        } = self;
+        let icon = icon
+            .with_size(size)
+            .when_some(color, |this, color| this.text_color(color));
+        if !window.is_window_active() {
+            return div().child(icon).into_any_element();
+        }
         div()
             .child(
-                self.icon
-                    .with_size(self.size)
-                    .when_some(self.color, |this, color| this.text_color(color))
-                    .with_animation(
-                        "circle",
-                        Animation::new(self.speed)
-                            .repeat()
-                            .with_easing(self.easing)
-                            .with_max_fps(SPINNER_MAX_FPS),
-                        |this, delta| this.transform(Transformation::rotate(percentage(delta))),
-                    ),
+                icon.with_animation(
+                    "circle",
+                    Animation::new(speed)
+                        .repeat()
+                        .with_easing(easing)
+                        .with_max_fps(max_fps),
+                    |this, delta| this.transform(Transformation::rotate(percentage(delta))),
+                ),
             )
-            .into_element()
+            .into_any_element()
     }
 }

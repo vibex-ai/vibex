@@ -10138,6 +10138,7 @@ dependencies = [
  "gpui-tokio",
  "gtk",
  "image",
+ "libc",
  "pdfium-render",
  "qrcode",
  "resvg 0.46.0",

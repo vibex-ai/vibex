@@ -6,8 +6,13 @@
 //! (150ms, cubic-bezier(0.4, 0, 0.2, 1)) on every interactive wash, so hover
 //! states fade. The [`HoverFades`] store below drives that manually: a
 //! per-element-key hover progress, advanced from wall time on each render, with
-//! the window root keeping frames coming via [`hover_fades_active`] +
-//! `window.request_animation_frame()` while any fade is mid-flight.
+//! [`schedule_hover_frames`] keeping frames coming while any fade is mid-flight.
+//!
+//! A fade is owned by the view whose render reads it, and a flip notifies that
+//! owner — not the window. `Window::refresh` marks the whole window dirty and
+//! sets `refreshing`, which defeats every `.cached()` subtree in the path; a
+//! hover over one row would then rebuild the code workbench, the terminal and
+//! the management centre as well.
 //!
 //! Never use `with_animation` for hover blends: its element-id-keyed clock
 //! replays from 0 on remount, and a remount mid-hover is a full-opacity flash.
@@ -31,8 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationElement, App, ElementId, Hsla, IntoElement, Rgba, SharedString, Styled,
-    Window, px,
+    Animation, AnimationElement, App, ElementId, EntityId, Hsla, IntoElement, Rgba, SharedString,
+    Styled, Window, px,
 };
 
 pub use gpui::AnimationExt;
@@ -325,6 +330,9 @@ struct FadeEntry {
     started: Instant,
     /// Wall clock at the last read (liveness stamp — see [`HoverFades`]).
     seen: Instant,
+    /// The view whose render reads this fade. A flip notifies it, and it is the
+    /// view that gets the follow-up frame while the fade is mid-flight.
+    owner: EntityId,
 }
 
 impl FadeEntry {
@@ -366,7 +374,14 @@ impl HoverFades {
 
     /// Pointer entered (`hovered`) or left the element behind `key`. Reduced
     /// motion snaps straight to the endpoint.
-    pub fn set_at(&mut self, key: &str, hovered: bool, reduced: bool, now: Instant) {
+    pub fn set_at(
+        &mut self,
+        key: &str,
+        hovered: bool,
+        reduced: bool,
+        owner: EntityId,
+        now: Instant,
+    ) {
         let target = if hovered { 1.0 } else { 0.0 };
         let duration = Self::duration();
         let current = self
@@ -385,6 +400,7 @@ impl HoverFades {
                 target,
                 started: now,
                 seen: now,
+                owner,
             },
         );
     }
@@ -402,23 +418,25 @@ impl HoverFades {
 
     /// Once-per-frame bookkeeping (call exactly once per frame from the window
     /// root): prune entries that settled back to rest or went a full lease
-    /// unread (unmounted), and report whether any fade is still mid-flight
-    /// (→ keep frames coming).
-    pub fn tick_at(&mut self, now: Instant) -> bool {
+    /// unread (unmounted), and hand every owner whose fade is still mid-flight
+    /// to `schedule` so it can request its next frame.
+    pub fn tick_at(&mut self, now: Instant, mut schedule: impl FnMut(EntityId)) {
         let duration = Self::duration();
-        let mut active = false;
+        let mut active: Vec<EntityId> = Vec::new();
         self.entries.retain(|_, entry| {
             if now.saturating_duration_since(entry.seen) > HOVER_LEASE {
                 return false;
             }
             let settled = entry.settled(now, duration);
-            if !settled {
-                active = true;
+            if !settled && !active.contains(&entry.owner) {
+                active.push(entry.owner);
             }
             // Settled at rest — steady state, indistinguishable from absent.
             !(settled && entry.target == 0.0)
         });
-        active
+        for owner in active {
+            schedule(owner);
+        }
     }
 }
 
@@ -437,35 +455,47 @@ pub fn hover_t(key: &str) -> f32 {
     HOVER_FADES.with(|fades| fades.borrow_mut().value_at(key, Instant::now()))
 }
 
-/// Record a hover flip for `key` (reduced motion snaps).
-pub fn set_hover(key: &str, hovered: bool, reduced: bool) {
+/// Record a hover flip for `key` (reduced motion snaps). `owner` is the view
+/// whose render reads the fade; it is the one notified when the blend must
+/// advance.
+pub fn set_hover(key: &str, hovered: bool, reduced: bool, owner: EntityId) {
     HOVER_FADES.with(|fades| {
         fades
             .borrow_mut()
-            .set_at(key, hovered, reduced, Instant::now())
+            .set_at(key, hovered, reduced, owner, Instant::now())
     });
 }
 
 /// An `.on_hover` listener driving the fade for `key` — pair with
 /// [`hover_t`]/[`hover_blend`] reads of the same key in the same element.
+///
+/// `owner` is the view being rendered when the listener is built (normally
+/// `cx.entity_id()`): the flip notifies that view instead of calling
+/// `Window::refresh`, so cached sibling subtrees survive a hover.
 pub fn hover_listener(
+    owner: EntityId,
     key: impl Into<SharedString>,
 ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let key = key.into();
-    move |hovered, window, cx| {
-        set_hover(&key, *hovered, cx.reduce_motion());
-        // Event-dispatch context: `request_animation_frame` is draw-phase-only
-        // — `refresh` marks the whole window dirty, the root render re-evaluates
-        // the blend and keeps frames coming via its tail while the fade is
-        // mid-flight.
-        window.refresh();
+    move |hovered, _window, cx| {
+        set_hover(&key, *hovered, cx.reduce_motion(), owner);
+        // Event-dispatch context: `request_animation_frame` is draw-phase-only,
+        // and `Window::refresh` would defeat every `.cached()` subtree. Notify
+        // the owning view; [`schedule_hover_frames`] keeps the fade advancing.
+        cx.notify(owner);
     }
 }
 
-/// Frame-drive hook: call ONCE per frame (the window root render); true while
-/// any hover fade is mid-flight and frames must keep coming.
-pub fn hover_fades_active() -> bool {
-    HOVER_FADES.with(|fades| fades.borrow_mut().tick_at(Instant::now()))
+/// Frame-drive hook: call ONCE per frame (the window root render). Schedules a
+/// follow-up frame for every view that still has a hover fade mid-flight, so
+/// each blend advances inside its own (possibly cached) view instead of
+/// re-rendering the whole window.
+pub fn schedule_hover_frames(window: &mut Window) {
+    HOVER_FADES.with(|fades| {
+        fades.borrow_mut().tick_at(Instant::now(), |owner| {
+            window.on_next_frame(move |_, cx| cx.notify(owner));
+        });
+    });
 }
 
 /// Linear interpolation (layout tweens, color channels).
@@ -581,6 +611,12 @@ fn sync_reduce_motion(cx: &mut App) {
     cx.set_reduce_motion(reduced);
 }
 
+/// Whether the workbench window is currently inactive (unfocused, minimized,
+/// or hidden). Background timers use this to skip repaints nobody can see.
+pub fn window_is_inactive() -> bool {
+    WINDOW_INACTIVE.load(Ordering::Relaxed)
+}
+
 /// The three inputs to [`sync_reduce_motion`], as a pure function so the truth
 /// table — in particular that an inactive window only pauses when the setting
 /// asks for it — is testable without an `App`.
@@ -595,6 +631,17 @@ fn effective_reduced_motion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand-in owner for the fade store; the tests only care that a fade
+    /// remembers which view to drive.
+    const OWNER: EntityId = EntityId::from_ffi(7);
+
+    /// Collect the owners a tick wants to keep drawing.
+    fn tick_owners(fades: &mut HoverFades, now: Instant) -> Vec<EntityId> {
+        let mut owners = Vec::new();
+        fades.tick_at(now, |owner| owners.push(owner));
+        owners
+    }
 
     fn assert_close(actual: f32, expected: f32, tol: f32, ctx: &str) {
         assert!(
@@ -739,7 +786,7 @@ mod tests {
         let ms = |m: u64| t0 + Duration::from_millis(m);
 
         // Enter: 0 at the flip, mid-flight strictly between, 1 at 150ms.
-        fades.set_at("pill", true, false, t0);
+        fades.set_at("pill", true, false, OWNER, t0);
         assert_eq!(fades.value_at("pill", t0), 0.0);
         let mid = fades.value_at("pill", ms(75));
         assert!(mid > 0.0 && mid < 1.0, "mid-flight enter: {mid}");
@@ -747,9 +794,9 @@ mod tests {
         assert_eq!(fades.value_at("pill", ms(400)), 1.0, "clamps past the end");
 
         // Leave mid-flight re-anchors at the current value — no jump.
-        fades.set_at("pill", true, false, t0);
+        fades.set_at("pill", true, false, OWNER, t0);
         let at_flip = fades.value_at("pill", ms(75));
-        fades.set_at("pill", false, false, ms(75));
+        fades.set_at("pill", false, false, OWNER, ms(75));
         let after_flip = fades.value_at("pill", ms(75));
         assert!(
             (after_flip - at_flip).abs() < 1e-4,
@@ -764,9 +811,9 @@ mod tests {
     fn hover_fade_reduced_motion_snaps() {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
-        fades.set_at("row", true, true, t0);
+        fades.set_at("row", true, true, OWNER, t0);
         assert_eq!(fades.value_at("row", t0), 1.0, "enter snaps to 1");
-        fades.set_at("row", false, true, t0);
+        fades.set_at("row", false, true, OWNER, t0);
         assert_eq!(fades.value_at("row", t0), 0.0, "leave snaps to 0");
     }
 
@@ -801,7 +848,7 @@ mod tests {
     fn hover_fade_leave_without_enter_is_inert() {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
-        fades.set_at("ghost", false, false, t0);
+        fades.set_at("ghost", false, false, OWNER, t0);
         assert!(fades.entries.is_empty(), "no entry for a leave-only key");
         assert_eq!(fades.value_at("ghost", t0), 0.0);
     }
@@ -812,22 +859,25 @@ mod tests {
         let t0 = Instant::now();
         let ms = |m: u64| t0 + Duration::from_millis(m);
 
-        fades.set_at("a", true, false, t0);
-        // Mid-flight: active, frames must keep coming (read each frame).
-        assert!(fades.tick_at(ms(50)));
+        fades.set_at("a", true, false, OWNER, t0);
+        // Mid-flight: the owner is asked for a frame (read each frame).
+        assert_eq!(tick_owners(&mut fades, ms(50)), vec![OWNER]);
         fades.value_at("a", ms(50));
-        assert!(fades.tick_at(ms(100)));
+        assert_eq!(tick_owners(&mut fades, ms(100)), vec![OWNER]);
         fades.value_at("a", ms(100));
         // Settled hovered (still read): no more frames needed, entry kept.
-        assert!(!fades.tick_at(ms(200)));
+        assert!(tick_owners(&mut fades, ms(200)).is_empty());
         fades.value_at("a", ms(200));
         assert_eq!(fades.value_at("a", ms(250)), 1.0);
 
         // Leave → fades → settles at rest → entry evicted.
-        fades.set_at("a", false, false, ms(250));
-        assert!(fades.tick_at(ms(300)));
+        fades.set_at("a", false, false, OWNER, ms(250));
+        assert_eq!(tick_owners(&mut fades, ms(300)), vec![OWNER]);
         fades.value_at("a", ms(300));
-        assert!(!fades.tick_at(ms(500)), "settled at rest");
+        assert!(
+            tick_owners(&mut fades, ms(500)).is_empty(),
+            "settled at rest"
+        );
         assert!(fades.entries.is_empty(), "rest entries are pruned");
     }
 
@@ -838,13 +888,13 @@ mod tests {
         let mut fades = HoverFades::default();
         let t0 = Instant::now();
         let ms = |m: u64| t0 + Duration::from_millis(m);
-        fades.set_at("menu-row", true, false, t0);
-        fades.tick_at(ms(16));
+        fades.set_at("menu-row", true, false, OWNER, t0);
+        tick_owners(&mut fades, ms(16));
         fades.value_at("menu-row", ms(16)); // mounted, read
         // Still fresh and mid-flight without further reads: keep frames coming.
-        assert!(fades.tick_at(ms(100)));
+        assert_eq!(tick_owners(&mut fades, ms(100)), vec![OWNER]);
         // A full lease without any read evicts the entry.
-        fades.tick_at(ms(600));
+        tick_owners(&mut fades, ms(600));
         assert!(fades.entries.is_empty(), "unread entry evicted");
         assert_eq!(fades.value_at("menu-row", ms(600)), 0.0);
     }

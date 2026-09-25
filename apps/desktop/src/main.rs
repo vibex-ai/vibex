@@ -47,7 +47,31 @@ enum LaunchMode {
     },
 }
 
+/// Caps the glibc malloc arenas the process may create.
+///
+/// glibc opens up to 8 arenas per core (128 on a 16-core machine), and each
+/// keeps the pages it once touched: with the desktop's mix of GPUI workers,
+/// Tokio workers, PTY readers and artifact renderers, a long session ends up
+/// with over a hundred megabytes spread across thread arenas that is never
+/// returned to the system. A small cap keeps the fragmentation bounded — a
+/// handful of arenas contend slightly more, which is invisible next to the
+/// syscalls this process already makes.
+///
+/// Only meaningful for glibc; musl and the macOS/Windows allocators ignore it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn configure_allocator() {
+    // SAFETY: `mallopt` is a plain glibc tuning call made before any threads
+    // exist; M_ARENA_MAX takes an integer and has no failure mode.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 4);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn configure_allocator() {}
+
 fn main() {
+    configure_allocator();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     // Both self-exec sidecar modes are dispatched here. They run before any
     // GPUI setup, because the process that launches them is a third-party Agent

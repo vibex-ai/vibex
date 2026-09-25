@@ -447,6 +447,17 @@ impl TerminalSurface {
         } else {
             BTreeSet::new()
         };
+        // A blinking cursor is a 500ms notify loop per terminal. An inactive
+        // window cannot show it, so the loop is dropped while the window is
+        // away and restarted (from a lit cursor) when it comes back.
+        let window_activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.cursor_visible = true;
+                this.start_cursor_blink(cx);
+            } else {
+                this.blink_task = None;
+            }
+        });
         let mut this = Self {
             transport,
             background: cx.background_executor().clone(),
@@ -481,7 +492,7 @@ impl TerminalSurface {
             last_error_code,
             mode,
             owned_terminal_ids,
-            _subscriptions: vec![focus_in, focus_out],
+            _subscriptions: vec![focus_in, focus_out, window_activation],
             #[cfg(test)]
             input_log: Vec::new(),
         };
@@ -2048,17 +2059,43 @@ fn paint_terminal_grid(
 
     for row in 0..rows {
         // Backgrounds first, so glyphs and decorations land on top of them.
-        for column in 0..columns {
-            let point = TerminalGridPoint { row, column };
-            let (_, background) = terminal_cell_colors(
-                frame.cell(point),
-                cursor,
-                point,
-                default_foreground,
-                default_background,
-            );
-            if background != default_background {
-                window.paint_quad(fill(cell_bounds(bounds.origin, point, metrics), background));
+        // Adjacent cells sharing a background are painted as one quad: a
+        // full-screen TUI in colour used to emit thousands of quads per frame,
+        // one per cell, and a run of the same colour is the common shape.
+        let mut run_start: Option<(u16, Hsla)> = None;
+        for column in 0..=columns {
+            let background = (column < columns).then(|| {
+                let point = TerminalGridPoint { row, column };
+                terminal_cell_colors(
+                    frame.cell(point),
+                    cursor,
+                    point,
+                    default_foreground,
+                    default_background,
+                )
+                .1
+            });
+            match (run_start, background) {
+                (Some((start, color)), Some(background)) if background == color => {
+                    run_start = Some((start, color));
+                }
+                (Some((start, color)), next) => {
+                    let first = TerminalGridPoint { row, column: start };
+                    let mut run_bounds = cell_bounds(bounds.origin, first, metrics);
+                    run_bounds.size.width =
+                        px(f32::from(column.saturating_sub(start)) * metrics.cell_width);
+                    window.paint_quad(fill(run_bounds, color));
+                    run_start = match next {
+                        Some(background) if background != default_background => {
+                            Some((column, background))
+                        }
+                        _ => None,
+                    };
+                }
+                (None, Some(background)) if background != default_background => {
+                    run_start = Some((column, background));
+                }
+                (None, _) => {}
             }
         }
 
@@ -2705,20 +2742,22 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Three cells of ANSI red background, one cell each, in the first row.
+        // Three adjacent cells of ANSI red background in the first row are one
+        // merged quad: adjacent cells sharing a background paint exactly once.
         let red = solid(indexed_terminal_color(1));
-        assert_eq!(red.len(), 3, "one quad per red-background cell: {red:?}");
-        for (index, (x, y, width, height)) in red.iter().enumerate() {
-            assert!((width - cell_width).abs() < 0.01);
-            assert!((height - cell_height).abs() < 0.01);
-            assert!((y - origin.y).abs() < 0.01, "red cell should sit in row 0");
-            let expected_x = origin.x + (17.0 + index as f32) * cell_width;
-            assert!(
-                (x - expected_x).abs() < 0.01,
-                "red cell {index} should start at column {}: {x} vs {expected_x}",
-                17 + index
-            );
-        }
+        assert_eq!(red.len(), 1, "one quad for a run of red cells: {red:?}");
+        let (x, y, width, height) = red[0];
+        assert!(
+            (width - 3.0 * cell_width).abs() < 0.01,
+            "run width: {width}"
+        );
+        assert!((height - cell_height).abs() < 0.01);
+        assert!((y - origin.y).abs() < 0.01, "red cell should sit in row 0");
+        let expected_x = origin.x + 17.0 * cell_width;
+        assert!(
+            (x - expected_x).abs() < 0.01,
+            "red run should start at column 17: {x} vs {expected_x}"
+        );
 
         // The underline run covers the ten `underlined` cells, and nothing else.
         let decorations = solid(foreground);

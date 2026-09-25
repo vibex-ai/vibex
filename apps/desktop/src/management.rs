@@ -9735,7 +9735,7 @@ impl ManagementCenter {
             .cursor_ns_resize()
             .border_b_1()
             .border_color(cx.theme().border)
-            .on_hover(hover_listener(seam_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let next = match event.keystroke.key.as_str() {
                     "up" => this.compact_sidebar_height - MANAGEMENT_COMPACT_RESIZE_STEP,

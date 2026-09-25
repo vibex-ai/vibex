@@ -19,7 +19,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui::{
     AccessibleAction, Anchor, Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App,
     AvailableSpace, Bounds, BoxShadow, ClickEvent, ClipboardEntry, ClipboardItem, Context,
-    Decorations, DismissEvent, Div, DragMoveEvent, Element, ElementId, Empty, Entity,
+    Decorations, DismissEvent, Div, DragMoveEvent, Element, ElementId, Empty, Entity, EntityId,
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable as _, FontWeight, Global,
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -484,8 +484,18 @@ const CHILD_AGENT_TIMELINE_PREVIEW_ROW_LIMIT: usize = 6;
 const CHILD_AGENT_TIMELINE_MAX_NESTING: u8 = 3;
 const AGENT_CONTENT_NARROW_MAX_WIDTH: f32 = 768.0;
 const AGENT_CONTENT_STANDARD_MAX_WIDTH: f32 = 1024.0;
-const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 12;
-const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// How many session views stay resident after the user switches away.
+///
+/// A view carries the timeline plus the per-view projections (markdown
+/// sources, tool calls, diffs, file changes) the renderer derives from it, and
+/// those are not part of the resident estimate. A dozen views let a long
+/// browsing session hold several hundred megabytes; six still covers the
+/// working set of switching back and forth between two conversations.
+const AGENT_SESSION_VIEW_CACHE_LIMIT: usize = 6;
+const AGENT_SESSION_VIEW_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Multiplier applied to a view's estimated bytes to cover what the estimate
+/// cannot see: allocator overhead per allocation and the derived caches.
+const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
 /// Snapshotted Markdown sources kept for the rows of one expanded turn.
 ///
 /// A turn that ran for hours holds hundreds of rows, and an expanded turn
@@ -1836,6 +1846,10 @@ fn timeline_markdown_source_snapshot(
     );
     (source, sequence)
 }
+
+/// Cadence the selected session's fallback poll drops to while the workbench
+/// window is in the background.
+const AGENT_TIMELINE_INACTIVE_POLL_MS: u64 = 2_000;
 
 fn agent_timeline_poll_interval(base_ms: u64, idle_poll_count: u16) -> Duration {
     let base_ms = base_ms.max(1);
@@ -5196,7 +5210,7 @@ fn skeleton_session_search(cx: &App) -> AnyElement {
 /// cached turns and clears the flag instead. Turn heights are measured and
 /// virtualized, so the placeholder approximates a short conversation rather
 /// than predicting it — it must never write into the row-size table.
-fn skeleton_conversation(content_max_width: Option<f32>, strings: Strings, cx: &App) -> AnyElement {
+fn skeleton_conversation(content_max_width: Option<f32>, strings: &'static Strings, cx: &App) -> AnyElement {
     /// Per turn: the User bubble's width, then the Agent answer's line widths,
     /// as fractions of the content column. A zero ends the answer.
     const TURNS: [(f32, [f32; 3]); 2] = [(0.42, [0.94, 0.86, 0.52]), (0.56, [0.90, 0.72, 0.0])];
@@ -6299,7 +6313,7 @@ struct SidebarFolderMenuTarget {
 
 #[derive(Clone, Copy)]
 struct SidebarToolbarMoreMenuState {
-    strings: Strings,
+    strings: &'static Strings,
     hierarchy_mode: SidebarHierarchyMode,
     batch_mode: bool,
     sessions_empty: bool,
@@ -6796,6 +6810,15 @@ pub struct VibexWorkbench {
     optimistic_project_deletion_reconciliation_pending: bool,
     sidebar_state: SidebarState,
     sidebar_projection_revision: u64,
+    /// The inputs the legacy sidebar-folder migration last ran against.
+    ///
+    /// The migration is a whole-sidebar index build, and a folder that is
+    /// project-scoped by design (its sessions span worktrees) reports "nothing
+    /// changed" on every render — so without a memo the sidebar rebuilt those
+    /// indexes once per frame. Compared on `(revision, sessions, workspaces,
+    /// folders)`: every sidebar mutation bumps the projection revision, and
+    /// the counts catch a list that changed without one.
+    legacy_folder_reconcile_inputs: Option<(u64, usize, usize, usize)>,
     sidebar_projection_cache: Option<SidebarProjectionCache>,
     sidebar_scroll: gpui::ScrollHandle,
     selected_session_scroll_anchor: gpui::ScrollAnchor,
@@ -6939,6 +6962,10 @@ pub struct VibexWorkbench {
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     remote_token_usage_in_flight: Option<VibexSessionId>,
     remote_token_usage_task: Option<Task<()>>,
+    /// Sessions with a background token-usage read in flight. The read can open
+    /// and migrate the database on a cold binding, so it never runs on the UI
+    /// thread; this set keeps a burst of attachments from queueing duplicates.
+    token_usage_reads_in_flight: BTreeSet<VibexSessionId>,
     composer_runtime_menu_open: bool,
     composer_runtime_menu_view: ComposerRuntimeMenuView,
     composer_runtime_menu_agent_id: Option<AgentId>,
@@ -7777,6 +7804,7 @@ impl VibexWorkbench {
             optimistic_project_deletion_reconciliation_pending: false,
             sidebar_state,
             sidebar_projection_revision: 0,
+            legacy_folder_reconcile_inputs: None,
             sidebar_projection_cache: None,
             sidebar_scroll,
             selected_session_scroll_anchor,
@@ -7860,6 +7888,7 @@ impl VibexWorkbench {
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             remote_token_usage_in_flight: None,
+            token_usage_reads_in_flight: BTreeSet::new(),
             remote_token_usage_task: None,
             composer_runtime_menu_open: false,
             composer_runtime_menu_view: ComposerRuntimeMenuView::AuthSource,
@@ -11136,10 +11165,23 @@ impl VibexWorkbench {
     ) -> bool {
         let mut dirty = false;
         let mut timeline_events = Vec::new();
+        // Attachment updates are published for every ACP message — far more
+        // often than the token usage they carry actually changes. They are not
+        // a batch barrier: collapsing them per session and applying them at the
+        // tail lets the 16 ms timeline coalescing window do its job instead of
+        // flushing a one-event batch per chunk. `SessionUpdated`,
+        // `RuntimeSelection`, `Lagged`, `Shutdown` keep their barrier
+        // semantics because the timeline's relative order matters to them.
+        let mut attachment_sessions: Vec<VibexSessionId> = Vec::new();
         for signal in signals {
             match signal {
                 RuntimeUiSignal::Event(event) => match *event {
                     DesktopEvent::Timeline(event) => timeline_events.push(event),
+                    DesktopEvent::Runtime(event) => {
+                        if !attachment_sessions.contains(&event.session_id) {
+                            attachment_sessions.push(event.session_id);
+                        }
+                    }
                     event => {
                         if !timeline_events.is_empty() {
                             dirty |= self.apply_live_timeline_batch(
@@ -11175,6 +11217,9 @@ impl VibexWorkbench {
         }
         if !timeline_events.is_empty() {
             dirty |= self.apply_live_timeline_batch(timeline_events, cx);
+        }
+        for session_id in attachment_sessions {
+            dirty |= self.refresh_agent_token_usage(&session_id, cx);
         }
         dirty
     }
@@ -12664,9 +12709,18 @@ impl VibexWorkbench {
     /// Mixed-worktree folders remain project-scoped and are intentionally left
     /// unchanged.
     fn reconcile_legacy_sidebar_folder_worktree_owners(&mut self) -> bool {
+        let inputs = (
+            self.sidebar_projection_revision,
+            self.sessions.len(),
+            self.workspaces.len(),
+            self.ui_state.sidebar.organization.folders.len(),
+        );
+        if self.legacy_folder_reconcile_inputs == Some(inputs) {
+            return false;
+        }
+        self.legacy_folder_reconcile_inputs = Some(inputs);
         // This migration only ever acts on legacy folders, and a sidebar that
-        // has none is the common case. It runs on every render, so leave before
-        // building the indexes below.
+        // has none is the common case. Leave before building the indexes below.
         let legacy_folder_ids = self
             .ui_state
             .sidebar
@@ -15587,7 +15641,10 @@ impl VibexWorkbench {
         // pass can sum these numbers instead of re-walking every stored view's
         // timeline on every borrow/release — which a split paid twice per pane,
         // per frame.
-        entry.resident_bytes = entry.calculate_estimated_resident_bytes();
+        entry.resident_bytes = entry
+            .calculate_estimated_resident_bytes()
+            .saturating_mul(AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD)
+            / 2;
         let stored_bytes = self
             .session_views
             .values()
@@ -15840,14 +15897,41 @@ impl VibexWorkbench {
             self.request_remote_token_usage(session_id.clone(), cx);
             return false;
         };
-        let Ok(usage) = runtime_token_usage_snapshot(&runtime, session_id) else {
-            return false;
-        };
-        if self.token_usage == usage {
+        // Every streamed chunk publishes an attachment update, and a cold
+        // binding resolves the snapshot by opening and migrating the database.
+        // The read therefore runs on the background executor — the UI thread
+        // only sees the finished value — and a session only ever has one read
+        // in flight.
+        let tracked_session_id = session_id.clone();
+        if !self
+            .token_usage_reads_in_flight
+            .insert(tracked_session_id.clone())
+        {
             return false;
         }
-        self.token_usage = usage;
-        true
+        let request_session_id = tracked_session_id.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let usage = cx
+                .background_spawn(async move {
+                    runtime_token_usage_snapshot(&runtime, &request_session_id)
+                        .ok()
+                        .flatten()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.token_usage_reads_in_flight.remove(&tracked_session_id);
+                if this.selected_session_id.as_ref() != Some(&tracked_session_id) {
+                    return;
+                }
+                if this.token_usage == usage {
+                    return;
+                }
+                this.token_usage = usage;
+                cx.notify();
+            });
+        })
+        .detach();
+        false
     }
 
     /// Reads the live token snapshot from the paired runtime. Only one request
@@ -17598,11 +17682,22 @@ impl VibexWorkbench {
             let mut last_runtime_poll = Instant::now();
             let mut last_terminal_poll = Instant::now();
             loop {
-                tokio::time::sleep(agent_timeline_poll_interval(
-                    policy.timeline_fallback_ms,
-                    idle_poll_count,
-                ))
-                .await;
+                // The live event stream is what keeps an active window current;
+                // this poll is the fallback for a missing or lagged stream. A
+                // window nobody is looking at has no use for either, so it
+                // drops to the slow cadence and skips the reads entirely — the
+                // next tick after the window returns catches up from
+                // `after_sequence`.
+                let window_inactive = motion::window_is_inactive();
+                let interval = if window_inactive {
+                    Duration::from_millis(AGENT_TIMELINE_INACTIVE_POLL_MS)
+                } else {
+                    agent_timeline_poll_interval(policy.timeline_fallback_ms, idle_poll_count)
+                };
+                tokio::time::sleep(interval).await;
+                if window_inactive {
+                    continue;
+                }
                 let mut received_items = false;
                 if let Ok(page) = runtime
                     .agent()
@@ -17872,15 +17967,19 @@ impl VibexWorkbench {
                 // above is all it needs.
                 continue;
             }
-            if !self.borrow_session_view(&session_id) {
+            // The swap is unweighed: weighing a view walks its whole timeline
+            // and every derived projection, and this path runs once per batch
+            // per streaming session. The render pass weighs the view when it
+            // hands it back, which is where the budget is enforced.
+            if !self.borrow_session_view_unweighed(&session_id) {
                 // The view was never loaded, so there is nothing to apply the
                 // events to. The group loader owns bringing it up.
-                self.release_session_view();
+                self.release_session_view_unweighed();
                 continue;
             }
             let (changed, needs_refetch) =
                 self.apply_timeline_events_to_borrowed_view(&session_id, batch, cx);
-            self.release_session_view();
+            self.release_session_view_unweighed();
             timeline_changed |= changed;
             if needs_refetch {
                 refetch_pending = true;
@@ -19184,6 +19283,14 @@ impl VibexWorkbench {
                     return;
                 }
                 this.timeline_duration_tick_task = None;
+                if motion::window_is_inactive() {
+                    // Nobody can see the elapsed-time label while the window is
+                    // in the background: keep the tick armed but skip the
+                    // repaint. Coming back to the window repaints anyway, and
+                    // the label is rebuilt from wall time.
+                    this.sync_timeline_duration_tick(true, cx);
+                    return;
+                }
                 cx.notify();
             });
         }));
@@ -30120,6 +30227,17 @@ impl VibexWorkbench {
                 cx.background_executor()
                     .timer(performance_log::SAMPLE_INTERVAL)
                     .await;
+                // Context that decides how the interval should be read: an
+                // inactive window is throttled, and the same build costs more
+                // in a large session than in an empty one.
+                let context = workbench
+                    .update(cx, |this, _| performance_log::FpsMonitorContext {
+                        window_active: !motion::window_is_inactive(),
+                        session_count: this.sessions.len() as u32,
+                        timeline_rows: this.timeline.items.len() as u32,
+                    })
+                    .unwrap_or_default();
+                recorder.set_context(context);
                 let Some(line) = recorder.sample_line() else {
                     continue;
                 };
@@ -32008,12 +32126,20 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    fn strings(&self) -> Strings {
+    fn strings(&self) -> &'static Strings {
         locale::strings(self.resolved_locale())
     }
 
+    /// The locale this workbench renders in.
+    ///
+    /// `System` reads the value `apply_locale` resolved once at startup;
+    /// re-parsing the system tag here allocated twice per call and this runs
+    /// per rendered row.
     fn resolved_locale(&self) -> locale::ResolvedLocale {
-        locale::resolve_locale(self.ui_state.appearance.locale, locale::system_locale())
+        match self.ui_state.appearance.locale {
+            LocaleMode::System => locale::current_locale(),
+            mode => locale::resolve_locale(mode, None),
+        }
     }
 
     fn open_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -32813,7 +32939,7 @@ impl VibexWorkbench {
         session_title: String,
         pinned: bool,
         deletion_pending: bool,
-        strings: Strings,
+        strings: &'static Strings,
         entity: WeakEntity<Self>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
@@ -32871,15 +32997,16 @@ impl VibexWorkbench {
         let strings = self.strings();
         let groups = self.sidebar_workspace_groups("");
         let reorder_enabled = !self.sidebar_batch_mode;
-        let all_session_ids = self
-            .sessions
-            .iter()
-            .map(|session| session.id.as_str().to_string())
-            .collect::<Vec<_>>();
-        let all_sessions_selected = !all_session_ids.is_empty()
-            && all_session_ids
-                .iter()
-                .all(|id| self.sidebar_state.selected_ids.contains(id));
+        // "All selected" only means something while the batch bar is up. It
+        // used to allocate a `String` per session on every frame, visible or
+        // not; the count comparison needs no allocation at all.
+        let all_sessions_selected = self.sidebar_batch_mode
+            && !self.sessions.is_empty()
+            && self.sessions.iter().all(|session| {
+                self.sidebar_state
+                    .selected_ids
+                    .contains(session.id.as_str())
+            });
         let selected_workspace_id = self
             .ui_state
             .workbench
@@ -33172,7 +33299,7 @@ impl VibexWorkbench {
                                         } else {
                                             strings.sidebar_select_all
                                         })
-                                        .disabled(all_session_ids.is_empty())
+                                        .disabled(self.sessions.is_empty())
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.toggle_all_batch_sessions(cx)
                                         })),
@@ -33442,7 +33569,7 @@ impl VibexWorkbench {
     fn build_sidebar_project_menu(
         menu: PopupMenu,
         target: SidebarProjectMenuTarget,
-        strings: Strings,
+        strings: &'static Strings,
         entity: WeakEntity<Self>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
@@ -33727,7 +33854,7 @@ impl VibexWorkbench {
         parent_folder_id: Option<String>,
         selected_workspace_id: Option<String>,
         reorder_enabled: bool,
-        strings: Strings,
+        strings: &'static Strings,
         depth: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -33821,7 +33948,7 @@ impl VibexWorkbench {
         include_root_sessions: bool,
         legacy_project_folders_only: bool,
         reorder_enabled: bool,
-        strings: Strings,
+        strings: &'static Strings,
         depth: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -34017,7 +34144,7 @@ impl VibexWorkbench {
         workspace_index: usize,
         parent_folder_id: Option<String>,
         reorder_enabled: bool,
-        strings: Strings,
+        strings: &'static Strings,
         depth: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -36643,7 +36770,7 @@ impl VibexWorkbench {
         project_index: usize,
         active: bool,
         reorder_enabled: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group = &groups[project_index];
@@ -37217,7 +37344,7 @@ impl VibexWorkbench {
         project_index: usize,
         workspace_index: usize,
         reorder_enabled: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let projection = &groups[project_index].workspaces[workspace_index];
@@ -37682,7 +37809,7 @@ impl VibexWorkbench {
         project_scope_id: &str,
         reorder_enabled: bool,
         show_worktree_identity: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project_scope_id = project_scope_id.to_string();
@@ -38061,7 +38188,7 @@ impl VibexWorkbench {
             .anchor_scroll(selected.then(|| self.selected_session_scroll_anchor.clone()))
             .rounded(px(8.0))
             .bg(row_rest_background)
-            .on_hover(hover_listener(session_hover_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), session_hover_key.clone()))
             .map(|row| {
                 let tone = hover_blend(&session_hover_key, row_rest_background, row_hover_tone);
                 row.hover(move |style| style.bg(tone))
@@ -38643,7 +38770,7 @@ impl VibexWorkbench {
                     .text_color(cx.theme().foreground)
                     .bg(background)
                     .when(item.selected, |this| this.shadow(selected_shadows.clone()))
-                    .on_hover(hover_listener(row_id.clone()))
+                    .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| match &item.action {
                         RuntimeChoiceMenuAction::NewSession(selection) => {
                             this.choose_new_session_runtime(selection.clone(), window, cx)
@@ -39360,7 +39487,7 @@ impl VibexWorkbench {
             .when(locked, |this| this.opacity(0.35))
             .when(!locked, |this| this.cursor_pointer())
             .when(!locked, |this| {
-                this.on_hover(hover_listener(hover_key.clone()))
+                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
             })
             .child(icon);
         if selected {
@@ -39613,7 +39740,7 @@ impl VibexWorkbench {
                 })
                 .when(group.can_authenticate, |this| {
                     this.cursor_pointer()
-                        .on_hover(hover_listener(heading_key.clone()))
+                        .on_hover(hover_listener(cx.entity_id(), heading_key.clone()))
                 })
                 .child(match group.source.kind {
                     RuntimeAuthSourceKind::ProviderProfile => new_session_selector_icon(
@@ -39733,7 +39860,7 @@ impl VibexWorkbench {
                     .bg(background)
                     .when(is_selected, |this| this.shadow(selected_shadows.clone()))
                     .cursor_pointer()
-                    .on_hover(hover_listener(row_id.clone()))
+                    .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if new_session {
                             this.choose_new_session_runtime(click_selection.clone(), window, cx);
@@ -39765,6 +39892,7 @@ impl VibexWorkbench {
                                 cx,
                             )
                         }),
+                        cx.entity_id(),
                         cx,
                     ));
                 row = row.on_prepaint(move |bounds, window, cx| {
@@ -39964,7 +40092,7 @@ impl VibexWorkbench {
                                     rest_background,
                                     highlight_background,
                                 ))
-                                .on_hover(hover_listener("runtime-configure-agent"))
+                                .on_hover(hover_listener(cx.entity_id(), "runtime-configure-agent"))
                                 .on_click(cx.listener({
                                     let agent_id = agent_id.clone();
                                     move |this, _, _, cx| {
@@ -40304,7 +40432,7 @@ impl VibexWorkbench {
 
     fn render_new_session_panel(
         &mut self,
-        strings: Strings,
+        strings: &'static Strings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -43214,7 +43342,7 @@ impl VibexWorkbench {
                 // Animated hover wash: the tab brightens toward the active
                 // plate instead of snapping between two opaque fills.
                 let hover_key = motion::hover_key("composer-terminal-tab", &terminal_id_string);
-                this.on_hover(hover_listener(hover_key.clone()))
+                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                     .bg(hover_blend(
                         &hover_key,
                         cx.theme().transparent,
@@ -43707,7 +43835,7 @@ impl VibexWorkbench {
             .h(px(COMPOSER_TERMINAL_RESIZE_HANDLE_HEIGHT_PX))
             .cursor_row_resize()
             .occlude()
-            .on_hover(hover_listener(seam_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _: &MouseDownEvent, window, cx| {
@@ -49671,7 +49799,7 @@ impl VibexWorkbench {
             .tooltip(move |window, cx| Tooltip::new(disclosure_label).build(window, cx))
             .cursor_pointer()
             .bg(background)
-            .on_hover(hover_listener(hover_key))
+            .on_hover(hover_listener(cx.entity_id(), hover_key))
             .focus_visible(|style| {
                 style.shadow(vec![
                     BoxShadow::new(px(0.0), px(0.0), cx.theme().ring).spread_radius(px(1.0)),
@@ -52174,7 +52302,7 @@ impl VibexWorkbench {
         &mut self,
         code: String,
         message: String,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         v_flex()
@@ -52227,7 +52355,7 @@ impl VibexWorkbench {
         &mut self,
         visibility: WorkbenchVisibility,
         sidebar_width: f32,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some((min_width, max_width)) = self.sidebar_resize_limits(visibility, cx) else {
@@ -52257,7 +52385,7 @@ impl VibexWorkbench {
             .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
             .cursor_col_resize()
             .occlude()
-            .on_hover(hover_listener(seam_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
             .focus_visible(|style| style.bg(cx.theme().border.opacity(0.16)))
             .on_key_down(cx.listener(Self::on_sidebar_resize_key_down))
             .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
@@ -52352,7 +52480,7 @@ impl VibexWorkbench {
             .w(px(RIGHT_PANEL_RESIZE_HANDLE_WIDTH))
             .cursor_col_resize()
             .occlude()
-            .on_hover(hover_listener(seam_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
             .focus_visible(|style| style.bg(cx.theme().border.opacity(0.16)))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let delta = match event.keystroke.key.as_str() {
@@ -52421,7 +52549,7 @@ impl VibexWorkbench {
         visibility: WorkbenchVisibility,
         visible: bool,
         sidebar_width: f32,
-        strings: Strings,
+        strings: &'static Strings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -52701,7 +52829,7 @@ impl VibexWorkbench {
     fn command_palette_sections(
         &self,
         query: &str,
-        strings: Strings,
+        strings: &'static Strings,
     ) -> Vec<CommandPaletteSection> {
         let query_empty = query.is_empty();
         let mut sections = Vec::new();
@@ -53102,7 +53230,7 @@ impl VibexWorkbench {
     fn render_shell(
         &mut self,
         visibility: WorkbenchVisibility,
-        strings: Strings,
+        strings: &'static Strings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -55555,7 +55683,7 @@ fn sidebar_project_is_active(
     !session_selected && selected_workspace_id == Some(workspace_id)
 }
 
-fn sidebar_empty_sessions(strings: Strings, cx: &App) -> AnyElement {
+fn sidebar_empty_sessions(strings: &'static Strings, cx: &App) -> AnyElement {
     h_flex()
         .h(px(28.0))
         .items_center()
@@ -55592,7 +55720,7 @@ struct SidebarSessionRunSource {
     project_scope_id: String,
     reorder_enabled: bool,
     show_worktree_identity: bool,
-    strings: Strings,
+    strings: &'static Strings,
 }
 
 impl SidebarSessionRunSource {
@@ -56140,7 +56268,7 @@ fn push_sidebar_session_run(
     show_worktree_identity: bool,
     rename_target: Option<&str>,
     selected_session: Option<&str>,
-    strings: Strings,
+    strings: &'static Strings,
 ) {
     if run.is_empty() {
         return;
@@ -58100,6 +58228,7 @@ fn runtime_menu_star_toggle(
     id: String,
     starred: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    owner: EntityId,
     cx: &App,
 ) -> AnyElement {
     let hover_key = format!("{id}:star");
@@ -58117,7 +58246,7 @@ fn runtime_menu_star_toggle(
             runtime_menu_rest_background(cx),
             runtime_menu_highlight_background(cx),
         ))
-        .on_hover(hover_listener(hover_key.clone()))
+        .on_hover(hover_listener(owner, hover_key.clone()))
         // The row itself is clickable; starring must not also pick the model.
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
@@ -58507,7 +58636,7 @@ fn sidebar_delete_project_description(
     }
 }
 
-fn sidebar_session_state_label(state: AgentSessionState, strings: Strings) -> Option<&'static str> {
+fn sidebar_session_state_label(state: AgentSessionState, strings: &'static Strings) -> Option<&'static str> {
     match state {
         AgentSessionState::NeedsInput => Some(strings.sidebar_state_pending),
         AgentSessionState::Initializing => Some(strings.sidebar_state_initializing),
@@ -58605,7 +58734,7 @@ fn sidebar_aggregate_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match status {
-        SidebarWorkspaceStatus::Running => Spinner::new()
+        SidebarWorkspaceStatus::Running => Spinner::status_indicator()
             .icon(Icon::new(IconName::LoaderCircle))
             .color(if auto_continue_enabled {
                 cx.theme().success
@@ -58629,7 +58758,7 @@ fn sidebar_session_status_indicator(
     cx: &App,
 ) -> AnyElement {
     match state {
-        AgentSessionState::Running | AgentSessionState::Initializing => Spinner::new()
+        AgentSessionState::Running | AgentSessionState::Initializing => Spinner::status_indicator()
             .icon(Icon::new(IconName::LoaderCircle))
             .color(if auto_continue_enabled {
                 cx.theme().success
@@ -58674,7 +58803,7 @@ fn sidebar_session_display_state(
 fn format_sidebar_session_time(
     timestamp_ms: i64,
     locale: locale::ResolvedLocale,
-    strings: Strings,
+    strings: &'static Strings,
 ) -> String {
     let Some(local_time) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
         .map(|timestamp| timestamp.with_timezone(&chrono::Local).naive_local())
@@ -58693,7 +58822,7 @@ fn format_sidebar_session_time_at(
     local_time: chrono::NaiveDateTime,
     now: chrono::NaiveDateTime,
     locale: locale::ResolvedLocale,
-    strings: Strings,
+    strings: &'static Strings,
 ) -> String {
     let days = now
         .date()
@@ -59490,7 +59619,7 @@ const REDO_IMAGE_EDIT_SHORTCUT: &str = "ctrl-shift-z";
 /// two different things in two places. Every entry is localized — an English
 /// label here would surface as mixed-language copy on an otherwise translated
 /// page.
-fn shortcut_action_label(action: &str, strings: Strings) -> &'static str {
+fn shortcut_action_label(action: &str, strings: &'static Strings) -> &'static str {
     let locale = strings.locale;
     match action {
         "toggle_sidebar" => locale::text_for(locale, "Toggle sidebar", "切换侧栏", "切換側邊欄"),
@@ -59538,7 +59667,7 @@ fn shortcut_action_label(action: &str, strings: Strings) -> &'static str {
 ///
 /// "Vibex" is the fallback for an action this table has not classified; it is a
 /// product name rather than a category, so it stays untranslated.
-fn shortcut_action_group(action: &str, strings: Strings) -> &'static str {
+fn shortcut_action_group(action: &str, strings: &'static Strings) -> &'static str {
     let locale = strings.locale;
     let navigation = || locale::text_for(locale, "Navigation", "导航", "導覽");
     match action {
@@ -59730,7 +59859,7 @@ const fn settings_search_candidate(
     }
 }
 
-fn settings_search_candidates(strings: Strings) -> Vec<SettingsSearchCandidate> {
+fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCandidate> {
     let mut candidates = vec![
         settings_search_candidate(
             SettingsSection::General,
@@ -60413,7 +60542,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
 
 fn settings_search_candidates_for_query(
     query: &str,
-    strings: Strings,
+    strings: &'static Strings,
 ) -> Vec<SettingsSearchCandidate> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -60440,7 +60569,7 @@ fn settings_search_candidates_for_query(
 /// The foundation actions already carry localized labels in
 /// [`shortcut_action_label`]; only the two the palette introduces on its own
 /// need wording here.
-fn command_palette_action_label(action: &'static str, strings: Strings) -> &'static str {
+fn command_palette_action_label(action: &'static str, strings: &'static Strings) -> &'static str {
     match action {
         "new_session" => locale::text("New session", "新建会话", "新增工作階段"),
         "pair_mobile_device" => strings.pair_mobile,
@@ -60590,7 +60719,7 @@ fn compact_agent_search_term(value: &str) -> String {
 /// The same rule the settings entries use: a case-insensitive substring over
 /// the label and every keyword, in either direction, so a short query still
 /// finds a longer term.
-fn command_palette_action_matches(action: &'static str, query: &str, strings: Strings) -> bool {
+fn command_palette_action_matches(action: &'static str, query: &str, strings: &'static Strings) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -60654,7 +60783,7 @@ fn palette_match_highlight(cx: &App) -> HighlightStyle {
 fn command_palette_row(
     entry: &CommandPaletteEntry,
     query: &str,
-    strings: Strings,
+    strings: &'static Strings,
     locale: locale::ResolvedLocale,
 ) -> CommandItem {
     match entry {
@@ -61732,7 +61861,7 @@ impl FoundationSettings {
     fn preview_settings_search_selection(
         &mut self,
         index: usize,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) {
         let query = self.search.read(cx).value().trim().to_lowercase();
@@ -61840,7 +61969,7 @@ impl FoundationSettings {
 
     fn render_search_results(
         &self,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let query = self.search.read(cx).value().trim().to_string();
@@ -62710,7 +62839,7 @@ impl FoundationSettings {
         &mut self,
         action: String,
         current: String,
-        strings: Strings,
+        strings: &'static Strings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -62798,7 +62927,7 @@ impl FoundationSettings {
     fn render_navigation(
         &self,
         wide: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_dark = cx.theme().is_dark();
@@ -62970,7 +63099,7 @@ impl FoundationSettings {
         desktop_behavior: &DesktopBehaviorUiState,
         network_proxy: &NetworkProxyUiState,
         stacked: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let language_select = settings_select(
@@ -63232,7 +63361,7 @@ impl FoundationSettings {
         appearance: &AppearanceUiState,
         stacked: bool,
         cards_width: f32,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mode_cards = appearance_theme::theme_mode_picker(
@@ -63490,7 +63619,7 @@ impl FoundationSettings {
         session: &SessionUiState,
         desktop_behavior: &DesktopBehaviorUiState,
         stacked: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let turn_preview_rail_switch =
@@ -64344,7 +64473,7 @@ impl FoundationSettings {
     fn render_shortcuts_page(
         &self,
         stacked: bool,
-        strings: Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let overrides = self.keyboard_shortcuts(cx);
@@ -65482,7 +65611,7 @@ impl Render for FoundationSettings {
     }
 }
 
-fn locale_choices(strings: Strings) -> Vec<LocaleChoice> {
+fn locale_choices(strings: &'static Strings) -> Vec<LocaleChoice> {
     vec![
         LocaleChoice {
             label: strings.system_default.into(),
@@ -65503,7 +65632,7 @@ fn locale_choices(strings: Strings) -> Vec<LocaleChoice> {
     ]
 }
 
-fn session_content_width_choices(strings: Strings) -> Vec<SessionContentWidthChoice> {
+fn session_content_width_choices(strings: &'static Strings) -> Vec<SessionContentWidthChoice> {
     vec![
         SessionContentWidthChoice {
             label: strings.session_content_width_narrow.into(),
@@ -65530,7 +65659,7 @@ fn selected_session_content_width_index(
         .map(|row| IndexPath::default().row(row))
 }
 
-fn reasoning_display_choices(strings: Strings) -> Vec<ReasoningDisplayChoice> {
+fn reasoning_display_choices(strings: &'static Strings) -> Vec<ReasoningDisplayChoice> {
     vec![
         ReasoningDisplayChoice {
             label: strings.reasoning_display_latest.into(),
@@ -65682,12 +65811,10 @@ fn startup_loading_overlay(show_loading_indicator: bool, cx: &App) -> AnyElement
 
 impl Render for VibexWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Manual hover fades tick exactly once per frame here, and while any
-        // blend is mid-flight the root keeps scheduling frames (the same
-        // scheduling `with_animation` would have requested).
-        if motion::hover_fades_active() {
-            window.request_animation_frame();
-        }
+        // Manual hover fades tick exactly once per frame here; every view that
+        // still has a blend mid-flight is asked for its next frame directly, so
+        // a fade inside a cached subtree advances without rebuilding the window.
+        motion::schedule_hover_frames(window);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         if self.initial_new_session_setup_pending {
@@ -65827,7 +65954,7 @@ impl Render for VibexWorkbench {
                     });
                     cx.new(|_| FpsHudDrag)
                 })
-                .child(monitor)
+                .child(monitor.cached(StyleRefinement::default().flex()))
                 .into_any_element()
         });
         v_flex()
@@ -72155,8 +72282,10 @@ mod tests {
             timeline_batch
                 .contains("let mut batches = BTreeMap::<String, Vec<TimelineLiveEvent>>::new();")
         );
-        assert!(timeline_batch.contains("self.borrow_session_view(&session_id)"));
-        assert!(timeline_batch.contains("self.release_session_view();"));
+        // The ingest path swaps views without weighing them; the render pass
+        // owns the budget.
+        assert!(timeline_batch.contains("self.borrow_session_view_unweighed(&session_id)"));
+        assert!(timeline_batch.contains("self.release_session_view_unweighed();"));
         assert!(
             timeline_batch
                 .contains("self.apply_timeline_events_to_borrowed_view(&session_id, batch, cx)")
@@ -84028,8 +84157,8 @@ mod tests {
 
     #[test]
     fn opened_session_view_cache_is_bounded_and_refreshes_recency() {
-        assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 12);
-        assert_eq!(AGENT_SESSION_VIEW_CACHE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(AGENT_SESSION_VIEW_CACHE_LIMIT, 6);
+        assert_eq!(AGENT_SESSION_VIEW_CACHE_BYTES, 128 * 1024 * 1024);
         let pinned = BTreeSet::new();
         let mut cache = BTreeMap::new();
         let mut lru = VecDeque::new();

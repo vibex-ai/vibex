@@ -355,20 +355,15 @@ fn editor_font_database() -> Arc<resvg::usvg::fontdb::Database> {
     FONT_DATABASE
         .get_or_init(|| {
             let mut database = resvg::usvg::fontdb::Database::new();
-            database.load_font_data(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
-                ))
-                .to_vec(),
-            );
-            database.load_font_data(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc"
-                ))
-                .to_vec(),
-            );
+            // The bytes come from the asset module's `include_bytes!` tables and
+            // are handed to fontdb as shared static slices: no second copy in
+            // the binary, and none on the heap.
+            database.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(
+                crate::assets::IBM_PLEX_SANS_REGULAR,
+            )));
+            database.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(
+                crate::assets::WQY_MICROHEI,
+            )));
             database.set_sans_serif_family("IBM Plex Sans");
             database.set_serif_family("IBM Plex Sans");
             database.set_monospace_family("IBM Plex Sans");

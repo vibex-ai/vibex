@@ -11143,7 +11143,7 @@ impl CodeRightRail {
                 let is_dark = cx.theme().is_dark();
                 let hover_key =
                     crate::motion::hover_key("file-name-search", format!("{index}:{}", row.path));
-                this.on_hover(hover_listener(hover_key.clone()))
+                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                     .bg(hover_blend(
                         &hover_key,
                         cx.theme().transparent,
@@ -11279,7 +11279,7 @@ impl CodeRightRail {
                     "file-content-search",
                     format!("{index}:{path}:{line}"),
                 );
-                this.on_hover(hover_listener(hover_key.clone()))
+                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                     .bg(hover_blend(
                         &hover_key,
                         cx.theme().transparent,
@@ -11957,7 +11957,7 @@ impl CodeRightRail {
                     // root's hover-fade tick).
                     let is_dark = cx.theme().is_dark();
                     let hover_key = crate::motion::hover_key("file-tree", &row.id);
-                    this.on_hover(hover_listener(hover_key.clone()))
+                    this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                         .bg(hover_blend(
                             &hover_key,
                             cx.theme().transparent,
@@ -13649,7 +13649,7 @@ impl CodeRightRail {
                     // Animated hover wash (see the file tree rows).
                     let is_dark = cx.theme().is_dark();
                     let hover_key = crate::motion::hover_key("git-tree", &git_tree_row_id);
-                    this.on_hover(hover_listener(hover_key.clone()))
+                    this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                         .bg(hover_blend(
                             &hover_key,
                             cx.theme().transparent,
@@ -13767,7 +13767,7 @@ impl CodeRightRail {
                 // Animated hover wash (see the file tree rows).
                 let is_dark = cx.theme().is_dark();
                 let hover_key = crate::motion::hover_key("git-tree", &git_tree_row_id);
-                this.on_hover(hover_listener(hover_key.clone()))
+                this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                     .bg(hover_blend(
                         &hover_key,
                         cx.theme().transparent,
@@ -14108,7 +14108,7 @@ impl CodeRightRail {
             .w_full()
             .flex_none()
             .cursor_ns_resize()
-            .on_hover(hover_listener(seam_key.clone()))
+            .on_hover(hover_listener(cx.entity_id(), seam_key.clone()))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 let next = match event.keystroke.key.as_str() {
                     "up" => this.history_drawer_height + GIT_HISTORY_DRAWER_KEYBOARD_STEP,
@@ -14334,7 +14334,7 @@ impl CodeRightRail {
                         // Animated hover wash (see the file tree rows).
                         let is_dark = cx.theme().is_dark();
                         let hover_key = crate::motion::hover_key("git-history-card", &commit.hash);
-                        this.on_hover(hover_listener(hover_key.clone()))
+                        this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                             .bg(hover_blend(
                                 &hover_key,
                                 if selected {
@@ -16424,7 +16424,7 @@ fn render_commit_patch_row(
                     let is_dark = cx.theme().is_dark();
                     let hover_key =
                         crate::motion::hover_key("commit-file", format!("{hash}:{file_index}"));
-                    this.on_hover(hover_listener(hover_key.clone()))
+                    this.on_hover(hover_listener(cx.entity_id(), hover_key.clone()))
                         .bg(hover_blend(
                             &hover_key,
                             cx.theme().muted.opacity(0.30),

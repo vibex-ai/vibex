@@ -60,7 +60,12 @@ pub(crate) const LILEX_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
 /// italics — the temporary preview tab — names this family instead of the
 /// configured one.
 pub const BUNDLED_SANS_FAMILY: &str = "IBM Plex Sans";
-const WQY_MICROHEI: &[u8] =
+/// The bundled CJK family.
+///
+/// Shared with the image editor, which parses it with its own font database:
+/// the same bytes embedded twice cost 5 MB in the binary and another copy on
+/// the heap the first time the editor opened.
+pub(crate) const WQY_MICROHEI: &[u8] =
     include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
 const BUNDLED_GPUI_FONT_ASSETS: &[(&str, &[u8])] = &[
     (

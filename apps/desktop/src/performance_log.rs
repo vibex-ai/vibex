@@ -37,7 +37,45 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// `droppedPercent` means what the HUD's `DROP` row means.
 pub const FRAME_BUDGET: Duration = Duration::from_nanos(16_666_667);
 /// Stamped into every line so a later reader can tell formats apart.
-pub const SAMPLE_SCHEMA_VERSION: u32 = 1;
+pub const SAMPLE_SCHEMA_VERSION: u32 = 2;
+
+/// The build profile a sample came from.
+///
+/// `desktop-preview` is shared by `pnpm dev:desktop` and the preview AppImage,
+/// so a sample that does not say which build produced it cannot be compared
+/// with one from the other.
+pub const BUILD_PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
+
+/// What the workbench looked like while an interval was recorded.
+///
+/// An inactive window gets its frames throttled by the platform and can
+/// accumulate invalidations while it is hidden, so a frame-time figure without
+/// this context says very little. The data scale is the other half: the same
+/// build costs more per frame in a session with 170k timeline rows than in an
+/// empty one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FpsMonitorContext {
+    /// Whether the workbench window was active for the interval.
+    pub window_active: bool,
+    /// Sessions the sidebar held.
+    pub session_count: u32,
+    /// Timeline rows the selected session held.
+    pub timeline_rows: u32,
+}
+
+impl Default for FpsMonitorContext {
+    fn default() -> Self {
+        Self {
+            window_active: true,
+            session_count: 0,
+            timeline_rows: 0,
+        }
+    }
+}
 /// Roughly ten hours of continuous HUD time: a forgotten HUD rotates rather
 /// than filling the disk.
 const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -81,6 +119,14 @@ pub struct FpsMonitorSample {
     /// counter its platform module keeps private, so this is the same order of
     /// magnitude rather than always the same number.
     pub resident_memory_bytes: Option<u64>,
+    /// Build profile the sample came from (`debug` / `release`).
+    pub build_profile: &'static str,
+    /// Whether the workbench window was active during the interval.
+    pub window_active: bool,
+    /// Sessions the sidebar held, and rows the selected timeline held, so a
+    /// sample carries the scale it was measured at.
+    pub session_count: u32,
+    pub timeline_rows: u32,
 }
 
 /// Drains GPUI's frame trace and summarizes each interval into a line.
@@ -90,6 +136,7 @@ pub struct FpsMonitorRecorder {
     window_id: WindowId,
     interval: IntervalFrames,
     resources: Option<ProcessResources>,
+    context: FpsMonitorContext,
 }
 
 impl FpsMonitorRecorder {
@@ -101,11 +148,17 @@ impl FpsMonitorRecorder {
             window_id,
             interval: IntervalFrames::default(),
             resources: ProcessResources::new(),
+            context: FpsMonitorContext::default(),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Records what the workbench looked like for the next interval.
+    pub fn set_context(&mut self, context: FpsMonitorContext) {
+        self.context = context;
     }
 
     /// The next line to append, or `None` when the window drew nothing since
@@ -136,6 +189,10 @@ impl FpsMonitorRecorder {
             invalidations: summary.invalidations,
             cpu_percent,
             resident_memory_bytes,
+            build_profile: BUILD_PROFILE,
+            window_active: self.context.window_active,
+            session_count: self.context.session_count,
+            timeline_rows: self.context.timeline_rows,
         })
         .ok()
     }
@@ -466,6 +523,10 @@ mod tests {
             invalidations: 1.0,
             cpu_percent: Some(142.0),
             resident_memory_bytes: Some(88_080_384),
+            build_profile: BUILD_PROFILE,
+            window_active: false,
+            session_count: 12,
+            timeline_rows: 4_096,
         };
         let line = serde_json::to_string(&sample).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -475,6 +536,10 @@ mod tests {
         assert_eq!(parsed["droppedPercent"], 1.7);
         assert_eq!(parsed["cpuPercent"], 142.0);
         assert_eq!(parsed["residentMemoryBytes"], 88_080_384u64);
+        assert_eq!(parsed["buildProfile"], BUILD_PROFILE);
+        assert_eq!(parsed["windowActive"], false);
+        assert_eq!(parsed["sessionCount"], 12);
+        assert_eq!(parsed["timelineRows"], 4_096u64);
         assert!(line.ends_with('}') && !line.contains('\n'));
     }
 
