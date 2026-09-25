@@ -1238,6 +1238,14 @@ pub struct DesktopUiStateV1 {
     pub agent_sort_strategy: AgentSortStrategy,
     #[serde(default)]
     pub plugin_order_migrated: bool,
+    /// Version of the embedded-browser risk notice the user accepted.
+    ///
+    /// The notice explains that page content is untrusted and that an Agent
+    /// reading it can be steered by it. Bumping
+    /// `BROWSER_RISK_DISCLAIMER_VERSION` shows it again after a material change
+    /// to the wording.
+    #[serde(default)]
+    pub browser_risk_disclaimer_version: u32,
     pub migration: UiStateMigration,
 }
 
@@ -1264,6 +1272,7 @@ impl Default for DesktopUiStateV1 {
             agent_tab_order: Vec::new(),
             agent_sort_strategy: AgentSortStrategy::default(),
             plugin_order_migrated: false,
+            browser_risk_disclaimer_version: 0,
             migration: UiStateMigration::default(),
         }
     }
@@ -2246,6 +2255,33 @@ mod tests {
 
         let restored: NetworkProxyUiState = serde_json::from_value(encoded).unwrap();
         assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn the_browser_risk_acknowledgement_is_versioned_and_defaults_to_unset() {
+        let mut state = DesktopUiStateV1::default();
+        assert_eq!(
+            state.browser_risk_disclaimer_version, 0,
+            "a fresh install has not accepted anything"
+        );
+        state.browser_risk_disclaimer_version = 3;
+
+        let mut encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            encoded["browserRiskDisclaimerVersion"],
+            serde_json::json!(3)
+        );
+        let restored: DesktopUiStateV1 = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.browser_risk_disclaimer_version, 3);
+
+        // A file written before the field existed reads as never accepted, so
+        // the notice is shown rather than silently skipped.
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("browserRiskDisclaimerVersion");
+        let legacy: DesktopUiStateV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.browser_risk_disclaimer_version, 0);
     }
 
     #[test]

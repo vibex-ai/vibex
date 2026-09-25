@@ -41,7 +41,7 @@ use gpui_component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     collapsible::Collapsible,
     command::{Command, CommandGroup, CommandItem, CommandState},
-    dialog::{DialogAction, DialogClose, DialogFooter},
+    dialog::{DialogAction, DialogButtonProps, DialogClose, DialogFooter},
     empty::{
         Empty as EmptyState, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
     },
@@ -7620,6 +7620,9 @@ impl VibexWorkbench {
                         cx.notify();
                     }
                 }
+                CodeWorkbenchEvent::BrowserDisclaimerRequired => {
+                    this.present_browser_risk_notice(cx);
+                }
             },
         ));
         agent_subscriptions.push(cx.subscribe(
@@ -8925,7 +8928,13 @@ impl VibexWorkbench {
             self.ui_state.right_rail.selected_activity_id.as_deref(),
         );
         self.right_rail_mode = right_rail_mode;
+        // The notice is versioned: a material change to the wording re-asks.
+        let browser_disclaimer_acknowledged =
+            vibex_browser::policy::has_acknowledged_risk_disclaimer(
+                self.ui_state.browser_risk_disclaimer_version,
+            );
         self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_disclaimer_acknowledged(browser_disclaimer_acknowledged);
             workbench.restore_persisted_state(
                 preview,
                 preview_owner,
@@ -29699,6 +29708,82 @@ impl VibexWorkbench {
         self.ui_state.sidebar.pinned_session_ids = self.sidebar_state.pinned_ids.clone();
         self.ui_state.sidebar.collapsed_project_ids = self.sidebar_state.collapsed_ids.clone();
         self.queue_ui_state();
+    }
+
+    /// Shows the embedded browser risk notice when the panel is first used.
+    ///
+    /// The browser lets an Agent read pages it did not write, and a page can
+    /// address the Agent as if the human had. That is worth saying once, in
+    /// plain words, before the first page loads — technical limits live in the
+    /// policy layer, not in this card.
+    fn present_browser_risk_notice(&mut self, cx: &mut Context<Self>) {
+        let acknowledging = cx.weak_entity();
+        let declining = cx.weak_entity();
+        let muted = cx.theme().muted_foreground;
+        let Some(window_handle) = self.window_handle else {
+            return;
+        };
+        let _ = window_handle.update(cx, |_, window, cx| {
+            window.open_dialog(cx, move |dialog, _, _| {
+                let acknowledging = acknowledging.clone();
+                let declining = declining.clone();
+                let muted = muted;
+                dialog
+                    .title(locale::text(
+                        "Before you open the embedded browser",
+                        "在打开内嵌浏览器之前",
+                        "在開啟內嵌瀏覽器之前",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(locale::text(
+                                "The Agent reads pages through this browser, and page content is untrusted data: a page can try to give the Agent instructions the user never gave. Do not follow its instructions, and keep domain approvals on for anything you did not ask it to visit.",
+                                "Agent 通过这个浏览器读取网页，而网页内容属于不可信数据：网页可能向 Agent 下达用户从未下达的指令。请不要遵从网页里的指令，并保留域名审批。",
+                                "Agent 透過這個瀏覽器讀取網頁，而網頁內容屬於不可信資料：網頁可能向 Agent 下達使用者從未下達的指令。請不要遵從網頁裡的指令，並保留網域審批。",
+                            ))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(locale::text(
+                                        "Downloads are denied, the browser uses its own profile, and every action is audited.",
+                                        "下载默认拒绝，浏览器使用独立 profile，所有操作都会记录审计。",
+                                        "下載預設拒絕，瀏覽器使用獨立 profile，所有操作都會記錄審計。",
+                                    )),
+                            ),
+                    )
+                    .overlay_closable(false)
+                    .keyboard(false)
+                    .close_button(false)
+                    .button_props(
+                        DialogButtonProps::default()
+                            .ok_text(locale::text("I understand", "我已了解", "我已了解"))
+                            .cancel_text(locale::text("Not now", "暂不", "暫不")),
+                    )
+                    .on_ok(move |_, window, cx| {
+                        let _ = acknowledging.update(cx, |this, cx| {
+                            this.ui_state.browser_risk_disclaimer_version =
+                                vibex_browser::policy::BROWSER_RISK_DISCLAIMER_VERSION;
+                            this.queue_ui_state();
+                            this.code_workbench.update(cx, |workbench, cx| {
+                                workbench.acknowledge_browser_disclaimer(window, cx)
+                            });
+                        });
+                        true
+                    })
+                    .on_cancel(move |_, _, cx| {
+                        let _ = declining.update(cx, |this, cx| {
+                            this.code_workbench.update(cx, |workbench, cx| {
+                                workbench.cancel_browser_request(cx)
+                            });
+                        });
+                        true
+                    })
+            });
+        });
     }
 
     pub(crate) fn persist_code_workbench_state(
