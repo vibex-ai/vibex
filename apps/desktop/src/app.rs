@@ -5210,7 +5210,11 @@ fn skeleton_session_search(cx: &App) -> AnyElement {
 /// cached turns and clears the flag instead. Turn heights are measured and
 /// virtualized, so the placeholder approximates a short conversation rather
 /// than predicting it — it must never write into the row-size table.
-fn skeleton_conversation(content_max_width: Option<f32>, strings: &'static Strings, cx: &App) -> AnyElement {
+fn skeleton_conversation(
+    content_max_width: Option<f32>,
+    strings: &'static Strings,
+    cx: &App,
+) -> AnyElement {
     /// Per turn: the User bubble's width, then the Agent answer's line widths,
     /// as fractions of the content column. A zero ends the answer.
     const TURNS: [(f32, [f32; 3]); 2] = [(0.42, [0.94, 0.86, 0.52]), (0.56, [0.90, 0.72, 0.0])];
@@ -15910,26 +15914,28 @@ impl VibexWorkbench {
             return false;
         }
         let request_session_id = tracked_session_id.clone();
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-            let usage = cx
-                .background_spawn(async move {
-                    runtime_token_usage_snapshot(&runtime, &request_session_id)
-                        .ok()
-                        .flatten()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.token_usage_reads_in_flight.remove(&tracked_session_id);
-                if this.selected_session_id.as_ref() != Some(&tracked_session_id) {
-                    return;
-                }
-                if this.token_usage == usage {
-                    return;
-                }
-                this.token_usage = usage;
-                cx.notify();
-            });
-        })
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let usage = cx
+                    .background_spawn(async move {
+                        runtime_token_usage_snapshot(&runtime, &request_session_id)
+                            .ok()
+                            .flatten()
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.token_usage_reads_in_flight.remove(&tracked_session_id);
+                    if this.selected_session_id.as_ref() != Some(&tracked_session_id) {
+                        return;
+                    }
+                    if this.token_usage == usage {
+                        return;
+                    }
+                    this.token_usage = usage;
+                    cx.notify();
+                });
+            },
+        )
         .detach();
         false
     }
@@ -58636,7 +58642,10 @@ fn sidebar_delete_project_description(
     }
 }
 
-fn sidebar_session_state_label(state: AgentSessionState, strings: &'static Strings) -> Option<&'static str> {
+fn sidebar_session_state_label(
+    state: AgentSessionState,
+    strings: &'static Strings,
+) -> Option<&'static str> {
     match state {
         AgentSessionState::NeedsInput => Some(strings.sidebar_state_pending),
         AgentSessionState::Initializing => Some(strings.sidebar_state_initializing),
@@ -60719,7 +60728,11 @@ fn compact_agent_search_term(value: &str) -> String {
 /// The same rule the settings entries use: a case-insensitive substring over
 /// the label and every keyword, in either direction, so a short query still
 /// finds a longer term.
-fn command_palette_action_matches(action: &'static str, query: &str, strings: &'static Strings) -> bool {
+fn command_palette_action_matches(
+    action: &'static str,
+    query: &str,
+    strings: &'static Strings,
+) -> bool {
     if query.is_empty() {
         return true;
     }
