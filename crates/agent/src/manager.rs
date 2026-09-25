@@ -98,6 +98,15 @@ pub struct AgentManager {
     /// what makes the reuse safe; it is only ever held for the synchronous
     /// query, never across an await.
     timeline_reader: StdMutex<Option<DbConnection>>,
+    /// One write connection shared by the streamed-append path.
+    ///
+    /// A streamed turn appends one row per provider chunk, and every append
+    /// used to open the database (directory check, `Connection::open`, three
+    /// pragmas and a schema parse — about 0.6 ms) and close it again. The
+    /// connection is kept here, with a warm statement cache, for the life of
+    /// the manager; the mutex serialises the synchronous writes the way
+    /// SQLite's own write lock would.
+    stream_writer: StdMutex<Option<DbConnection>>,
     context_bridge: ContextBridgeService,
     /// Sessions with a registered out-of-turn provider event pump. Shared with
     /// the pump task so it can release the slot when the attachment goes away.
@@ -306,6 +315,7 @@ impl AgentManager {
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
+            stream_writer: StdMutex::new(None),
             context_bridge,
             session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
         };
@@ -1735,6 +1745,37 @@ impl AgentManager {
 
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
         self.fetch_timeline_page(&request.session_id, request.after_sequence, request.limit)
+    }
+
+    /// Runs `f` against the shared streamed-append write connection.
+    ///
+    /// A connection that fails is dropped rather than reused, so the next
+    /// append starts from a fresh one — the same recovery the read path uses.
+    fn with_stream_writer<R>(
+        &self,
+        f: impl FnOnce(&mut DbConnection) -> VibexResult<R>,
+    ) -> VibexResult<R> {
+        let mut writer = self
+            .stream_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if writer.is_none() {
+            let conn = self.open_migrated()?;
+            // The streaming path runs a handful of statements in a tight loop;
+            // a cache this size keeps all of them prepared.
+            conn.set_prepared_statement_cache_capacity(64);
+            *writer = Some(conn);
+        }
+        let conn = writer
+            .as_mut()
+            .expect("the stream writer was opened just above");
+        match f(conn) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                *writer = None;
+                Err(error)
+            }
+        }
     }
 
     /// Fetches one timeline page over the shared read connection.
@@ -4473,22 +4514,23 @@ impl AgentManager {
         execution_attribution: Option<&TurnExecutionAttribution>,
         needs_input: &mut bool,
     ) -> VibexResult<TimelineItem> {
-        let mut conn = self.open_migrated()?;
-        if let TimelinePayload::PermissionRequest(permission) = &event.payload {
-            PermissionRepository::insert_request(&conn, permission)?;
-            *needs_input = true;
-        }
-        if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
-            ElicitationRepository::insert_request(&conn, elicitation)?;
-            *needs_input = true;
-        }
-        let item = self.append_provider_event(
-            &mut conn,
-            session_id,
-            event,
-            coalesce_after_sequence,
-            execution_attribution,
-        )?;
+        let item = self.with_stream_writer(|conn| {
+            if let TimelinePayload::PermissionRequest(permission) = &event.payload {
+                PermissionRepository::insert_request(conn, permission)?;
+                *needs_input = true;
+            }
+            if let TimelinePayload::ElicitationRequest(elicitation) = &event.payload {
+                ElicitationRepository::insert_request(conn, elicitation)?;
+                *needs_input = true;
+            }
+            self.append_provider_event(
+                conn,
+                session_id,
+                event,
+                coalesce_after_sequence,
+                execution_attribution,
+            )
+        })?;
         self.publish_attention_notification(&item);
         Ok(item)
     }
@@ -4904,13 +4946,19 @@ fn usage_counter_origin_for_switch_method(
     }
 }
 
+/// Appends `item`, or replaces the row it belongs to.
+///
+/// The rows being folded together are the current turn's, and a streamed turn
+/// appends in sequence order: a replacement is almost always the last row, so
+/// the search runs backwards and stops at the first hit. The forward scan this
+/// replaces walked the whole turn for every chunk — quadratic in a turn with
+/// tens of thousands of chunks.
 fn push_or_replace_timeline_item(items: &mut Vec<TimelineItem>, item: TimelineItem) -> usize {
-    if let Some((index, existing)) = items
-        .iter_mut()
-        .enumerate()
-        .find(|(_, existing)| existing.id == item.id || existing.sequence == item.sequence)
+    if let Some(index) = items
+        .iter()
+        .rposition(|existing| existing.id == item.id || existing.sequence == item.sequence)
     {
-        *existing = item;
+        items[index] = item;
         return index;
     }
     let index = items.len();

@@ -124,6 +124,7 @@ impl TestRuntimeHarness {
                 manager_message_dispatcher(&manager),
                 MessageSubmissionCoordinatorConfig {
                     poll_interval: Duration::from_millis(1),
+                    fallback_poll_interval: Duration::from_millis(1),
                 },
             )
             .unwrap(),

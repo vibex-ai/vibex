@@ -12,14 +12,28 @@ use gpui_util::defer;
 
 pub use tokio::task::JoinError;
 
-/// Initializes the Tokio wrapper using a new Tokio runtime with 2 worker threads.
+/// Worker threads the shared Tokio runtime starts with.
+///
+/// Upstream uses two to keep the footprint small, but the desktop runtime runs
+/// SQLite writes, `git` subprocesses and filesystem walks directly on these
+/// workers. Two of them meant one slow `git status` plus one fsync stalled the
+/// event bridge and the UI signal pump behind them, and the backlog then
+/// arrived as a burst. Scale with the machine instead, capped so a large host
+/// does not spawn an idle army.
+fn worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// Initializes the Tokio wrapper using a new Tokio runtime sized to the host.
 ///
 /// If you need more threads (or access to the runtime outside of GPUI), you can create the runtime
 /// yourself and pass a Handle to `init_from_handle`.
 pub fn init(cx: &mut App) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        // Since we now have two executors, let's try to keep our footprint small
-        .worker_threads(2)
+        .worker_threads(worker_thread_count())
         .enable_all()
         .build()
         .expect("Failed to initialize Tokio");

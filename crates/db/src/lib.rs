@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 57;
+pub const CURRENT_SCHEMA_VERSION: i64 = 58;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -8464,7 +8464,7 @@ impl TimelineRepository {
         let overfetch = limit + 1;
         let mut items = if let Some(after_sequence) = after_sequence {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "
                     SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
                         correlation_id, provider_correlation_id, payload_json, redaction_state,
@@ -8498,7 +8498,7 @@ impl TimelineRepository {
             out
         } else {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "
                     SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
                         correlation_id, provider_correlation_id, payload_json, redaction_state,
@@ -10913,6 +10913,16 @@ pub fn open_database(path: &Path) -> VibexResult<Connection> {
             "db_pragma_failed",
             "failed to enable SQLite foreign keys",
         ))?;
+    // WAL with `synchronous = NORMAL` is the standard pairing: commits still
+    // go through the write-ahead log, so the database cannot be corrupted by a
+    // power loss, but a commit no longer pays for an fsync. The streamed
+    // timeline commits once per chunk, and the default FULL made that an fsync
+    // per token.
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(storage_err(
+            "db_pragma_failed",
+            "failed to configure SQLite synchronous mode",
+        ))?;
     Ok(conn)
 }
 
@@ -10973,6 +10983,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_skill_body_column(conn, &mut applied)?;
     apply_runtime_identity(conn, &mut applied)?;
     apply_browser_audit(conn, &mut applied)?;
+    apply_drop_duplicate_timeline_index(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -11235,6 +11246,47 @@ fn apply_agent_delegations(conn: &mut Connection, applied: &mut Vec<String>) -> 
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit Agent delegation migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Drops the timeline index that only repeated the primary key.
+///
+/// `agent_timeline_items` is keyed on `(session_id, sequence)`, and
+/// `idx_agent_timeline_session_sequence` indexed exactly those columns — a
+/// second B-tree of the same size (about 120 MB in a mature database) that
+/// every insert had to maintain. Queries that walked the index still have the
+/// primary-key index to fall back on.
+fn apply_drop_duplicate_timeline_index(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 58;
+    const NAME: &str = "drop_duplicate_timeline_index";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start duplicate timeline index migration",
+    ))?;
+    tx.execute_batch("DROP INDEX IF EXISTS idx_agent_timeline_session_sequence;")
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to drop the duplicate timeline index",
+        ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the duplicate timeline index migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the duplicate timeline index migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -12083,7 +12135,7 @@ fn append_timeline_in_transaction(
         payload,
     };
 
-    tx.execute(
+    tx.prepare_cached(
         "
         INSERT INTO agent_timeline_items (
             session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
@@ -12092,21 +12144,25 @@ fn append_timeline_in_transaction(
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
-        params![
-            item.session_id.as_str(),
-            item.sequence,
-            item.id.as_str(),
-            enum_to_db(&item.kind)?,
-            enum_to_db(&item.source)?,
-            item.timestamp_ms,
-            item.correlation_id.as_ref().map(|value| value.as_str()),
-            item.provider_correlation_id,
-            timeline_payload_json(&item.payload)?,
-            enum_to_db(&item.redaction_state)?,
-            unix_timestamp_ms(),
-            execution_attribution.map(json_to_db).transpose()?
-        ],
     )
+    .map_err(storage_err(
+        "timeline_insert_failed",
+        "failed to prepare timeline insert",
+    ))?
+    .execute(params![
+        item.session_id.as_str(),
+        item.sequence,
+        item.id.as_str(),
+        enum_to_db(&item.kind)?,
+        enum_to_db(&item.source)?,
+        item.timestamp_ms,
+        item.correlation_id.as_ref().map(|value| value.as_str()),
+        item.provider_correlation_id,
+        timeline_payload_json(&item.payload)?,
+        enum_to_db(&item.redaction_state)?,
+        unix_timestamp_ms(),
+        execution_attribution.map(json_to_db).transpose()?
+    ])
     .map_err(|err| {
         VibexError::storage("timeline_insert_failed", "failed to insert timeline item")
             .with_diagnostic("error", err.to_string())
@@ -14541,7 +14597,8 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
-                "57:browser_audit"
+                "57:browser_audit",
+                "58:drop_duplicate_timeline_index"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14683,6 +14740,7 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
+                "58:drop_duplicate_timeline_index",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14804,7 +14862,8 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
-                "57:browser_audit"
+                "57:browser_audit",
+                "58:drop_duplicate_timeline_index"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -14964,7 +15023,8 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
-                "57:browser_audit"
+                "57:browser_audit",
+                "58:drop_duplicate_timeline_index"
             ]
         );
         assert_eq!(
@@ -16381,7 +16441,8 @@ mod tests {
                 "54:local_history_import_index",
                 "55:skill_body",
                 "56:runtime_identity",
-                "57:browser_audit"
+                "57:browser_audit",
+                "58:drop_duplicate_timeline_index"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -19084,11 +19145,16 @@ mod tests {
         let mut conn = open_database(&temp).unwrap();
         let first = apply_migrations(&mut conn).unwrap();
         assert!(first.iter().any(|entry| entry == "57:browser_audit"));
+        assert!(
+            first
+                .iter()
+                .any(|entry| entry == "58:drop_duplicate_timeline_index")
+        );
         // A second run must be a no-op: the tables already exist and the
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 57);
+        assert_eq!(current_schema_version(&conn).unwrap(), 58);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION

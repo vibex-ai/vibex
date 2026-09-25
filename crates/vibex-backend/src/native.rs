@@ -1087,7 +1087,18 @@ impl GitBackend for NativeBackend {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
-            runtime.git().status(&workspace_id).map_err(Into::into)
+            let git = runtime.git();
+            // `status` spawns `git status` and waits for it; on an async worker
+            // that blocks every other task sharing the thread.
+            tokio::task::spawn_blocking(move || git.status(&workspace_id))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "git_status_task_failed",
+                        "the git status task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
         })
     }
 
@@ -1436,7 +1447,18 @@ impl GitBackend for NativeBackend {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime.ensure_accepting_actions()?;
-            runtime.git().branch_list(&workspace_id).map_err(Into::into)
+            let git = runtime.git();
+            // Listing branches runs `git rev-list` per branch; keep it off the
+            // async workers.
+            tokio::task::spawn_blocking(move || git.branch_list(&workspace_id))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "git_branch_list_task_failed",
+                        "the git branch list task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
         })
     }
 

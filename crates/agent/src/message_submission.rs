@@ -28,6 +28,14 @@ use crate::{
 
 pub const DEFAULT_MESSAGE_SUBMISSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// How long a waiter for a submission's terminal state blocks on the progress
+/// signal before it re-reads the record anyway.
+///
+/// Status changes made by this process wake the waiter immediately; a slow
+/// fallback is only there for another process writing the same database
+/// (a headless server next to the desktop app) and for lost wake-ups.
+pub const DEFAULT_MESSAGE_SUBMISSION_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 const AMBIGUOUS_PROMPT_ERROR_DETAIL: &str =
     "prompt dispatch began, but no durable provider result was recorded";
 const PRE_DISPATCH_ERROR_DETAIL: &str = "message submission could not be prepared for dispatch";
@@ -44,12 +52,15 @@ enum PersistedDispatchResult {
 #[derive(Debug, Clone)]
 pub struct MessageSubmissionCoordinatorConfig {
     pub poll_interval: Duration,
+    /// Interval of the last-resort re-read while waiting for a terminal state.
+    pub fallback_poll_interval: Duration,
 }
 
 impl Default for MessageSubmissionCoordinatorConfig {
     fn default() -> Self {
         Self {
             poll_interval: DEFAULT_MESSAGE_SUBMISSION_POLL_INTERVAL,
+            fallback_poll_interval: DEFAULT_MESSAGE_SUBMISSION_FALLBACK_POLL_INTERVAL,
         }
     }
 }
@@ -198,6 +209,10 @@ pub struct MessageSubmissionCoordinator {
     observability: Arc<RuntimeObservability>,
     watched_sessions: Mutex<HashSet<VibexSessionId>>,
     runtime_lifecycle: Mutex<Option<Arc<RuntimeLifecycleService>>>,
+    /// Wakes waiters parked on a submission whose status just moved. Waiting on
+    /// this instead of re-reading the record every 25 ms turns a whole turn of
+    /// "Agent is thinking" into one wake-up per state transition.
+    progress: tokio::sync::Notify,
 }
 
 impl MessageSubmissionCoordinator {
@@ -223,7 +238,7 @@ impl MessageSubmissionCoordinator {
         config: MessageSubmissionCoordinatorConfig,
         observability: Arc<RuntimeObservability>,
     ) -> VibexResult<Self> {
-        if config.poll_interval.is_zero() {
+        if config.poll_interval.is_zero() || config.fallback_poll_interval.is_zero() {
             return Err(VibexError::validation(
                 "message_submission_config_invalid",
                 "message submission poll interval must be positive",
@@ -240,6 +255,7 @@ impl MessageSubmissionCoordinator {
             observability,
             watched_sessions: Mutex::new(HashSet::new()),
             runtime_lifecycle: Mutex::new(None),
+            progress: tokio::sync::Notify::new(),
         })
     }
 
@@ -486,6 +502,7 @@ impl MessageSubmissionCoordinator {
             if let Err(error) = self.drive_submission(&record).await {
                 self.terminalize_drive_error(&record.submission_id, &error);
             }
+            self.publish_progress();
         }
     }
 
@@ -1152,7 +1169,15 @@ impl MessageSubmissionCoordinator {
                 | MessageSubmissionStatus::ReadyToDispatch
                 | MessageSubmissionStatus::AboutToPrompt
                 | MessageSubmissionStatus::Dispatched => {
-                    sleep(self.config.poll_interval).await;
+                    // The dispatcher drives every transition in this process,
+                    // so a wake-up normally arrives within a scheduler hop. The
+                    // timeout covers a record advanced by another process and
+                    // the race between reading the record and parking.
+                    let _ = tokio::time::timeout(
+                        self.config.fallback_poll_interval,
+                        self.progress.notified(),
+                    )
+                    .await;
                 }
             }
         }
@@ -1297,6 +1322,15 @@ impl MessageSubmissionCoordinator {
 
     fn open_connection(&self) -> VibexResult<vibex_db::DbConnection> {
         open_database(&self.db_path)
+    }
+
+    /// Wakes every waiter parked in [`Self::wait_for_terminal`].
+    fn publish_progress(&self) {
+        // `notify_waiters` reaches tasks already parked; `notify_one` leaves a
+        // permit for one that read the record just before the transition and
+        // has not parked yet.
+        self.progress.notify_waiters();
+        self.progress.notify_one();
     }
 }
 
@@ -1760,6 +1794,7 @@ mod tests {
                 Arc::downgrade(&dispatcher_trait),
                 MessageSubmissionCoordinatorConfig {
                     poll_interval: Duration::from_millis(2),
+                    fallback_poll_interval: Duration::from_millis(2),
                 },
             )
             .unwrap(),

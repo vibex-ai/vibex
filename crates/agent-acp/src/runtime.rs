@@ -505,7 +505,11 @@ struct ProcessSnapshotLaunchInputs<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpDebugDirection {
+    /// Only produced through [`AcpDebugLog::record_json`], which exists for
+    /// the diagnostics tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     Outgoing,
+    #[cfg_attr(not(test), allow(dead_code))]
     Incoming,
     Stderr,
 }
@@ -520,10 +524,23 @@ struct AcpDebugMessage {
 #[derive(Debug, Default)]
 struct AcpDebugLog {
     next_sequence: u64,
+    /// The child's stderr diagnostics, in their own bounded ring.
+    ///
+    /// Stderr is the only stream production reads back: it is what a launch
+    /// failure is explained from, and it used to share a ring with every
+    /// JSON-RPC frame, so a chatty stdout pushed the diagnostics out.
+    #[cfg_attr(test, allow(dead_code))]
+    stderr: VecDeque<AcpDebugMessage>,
+    /// The full frame ring. Diagnostics tests read it; production never does,
+    /// and the redaction and serialization that filled it cost a full JSON
+    /// tree walk on every streamed chunk.
+    #[cfg(test)]
     messages: VecDeque<AcpDebugMessage>,
 }
 
 impl AcpDebugLog {
+    /// Records a redacted JSON-RPC frame. Test-only — see `messages`.
+    #[cfg(test)]
     fn record_json(&mut self, direction: AcpDebugDirection, value: &Value) {
         self.record(direction, redact_debug_value(value).to_string());
     }
@@ -555,14 +572,27 @@ impl AcpDebugLog {
     fn record(&mut self, direction: AcpDebugDirection, message: String) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.messages.len() == ACP_DEBUG_LOG_LIMIT {
-            self.messages.pop_front();
-        }
-        self.messages.push_back(AcpDebugMessage {
+        let entry = AcpDebugMessage {
             sequence,
             direction,
             message,
-        });
+        };
+        #[cfg(test)]
+        {
+            if self.messages.len() == ACP_DEBUG_LOG_LIMIT {
+                self.messages.pop_front();
+            }
+            self.messages.push_back(entry.clone());
+        }
+        if direction == AcpDebugDirection::Stderr {
+            if self.stderr.len() == ACP_DEBUG_LOG_LIMIT {
+                self.stderr.pop_front();
+            }
+            self.stderr.push_back(entry);
+        } else {
+            // Production records stderr only.
+            drop(entry);
+        }
     }
 
     #[cfg(test)]
@@ -572,7 +602,7 @@ impl AcpDebugLog {
 
     fn trailing_stderr_since(&self, sequence: u64) -> Option<String> {
         let lines = self
-            .messages
+            .stderr
             .iter()
             .filter(|message| {
                 message.sequence >= sequence && message.direction == AcpDebugDirection::Stderr
@@ -998,6 +1028,7 @@ fn resolve_mcp_command_path(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn redact_debug_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -5108,9 +5139,6 @@ impl AcpProcess {
             )
             .with_diagnostic("error", err.to_string())
         })?;
-        if let Ok(mut debug_log) = self.debug_log.lock() {
-            debug_log.record_json(AcpDebugDirection::Outgoing, value);
-        }
         let outbound = self
             .outbound
             .lock()
@@ -6089,10 +6117,6 @@ impl AcpProcess {
         if !value.is_object() {
             return;
         }
-        if let Ok(mut debug_log) = self.debug_log.lock() {
-            debug_log.record_json(AcpDebugDirection::Incoming, &value);
-        }
-
         let method = value
             .get("method")
             .and_then(Value::as_str)
@@ -26560,6 +26584,29 @@ for line in sys.stdin:
             .unwrap_or_else(|| panic!("{method} request missing in {log:?}"))
     }
 
+    /// Waits until the mock Agent has logged a JSON-RPC frame matching
+    /// `predicate`, and returns the log it matched in.
+    ///
+    /// Outgoing frames are no longer kept in the in-process diagnostics ring,
+    /// so tests observe them where production does: the child's own request
+    /// log, which it writes a moment after the frame arrives.
+    async fn wait_for_logged_request(
+        fixture: &MockAcpFixture,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let log = fixture.request_log();
+                if log.iter().any(&predicate) {
+                    return log;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an outgoing JSON-RPC frame should reach the Agent")
+    }
+
     fn logged_request_count(log: &[Value], method: &str) -> usize {
         log.iter()
             .filter(|entry| entry.get("method").and_then(Value::as_str) == Some(method))
@@ -34154,17 +34201,14 @@ for line in sys.stdin:
             .await
             .unwrap();
         drop(prompt_guard);
+        let log = wait_for_logged_request(&fixture, |entry| {
+            entry.get("method").and_then(Value::as_str)
+                == Some(AcpOperation::SessionCancel.method())
+        })
+        .await;
         assert!(
-            process
-                .debug_log
-                .lock()
-                .unwrap()
-                .messages()
-                .iter()
-                .any(|message| message.direction == AcpDebugDirection::Outgoing
-                    && message
-                        .message
-                        .contains(AcpOperation::SessionCancel.method()))
+            logged_request_count(&log, AcpOperation::SessionCancel.method()) >= 1,
+            "the cancelled turn should have sent a session/cancel to the Agent"
         );
 
         client.close_session(&binding).await.unwrap();
@@ -35684,12 +35728,16 @@ for line in sys.stdin:
             assert!(state.pending_terminal_creates.is_empty());
         }
         assert!(terminal_host.created.lock().unwrap().is_empty());
-        let debug = { process.debug_log.lock().unwrap().messages() };
+        let log = wait_for_logged_request(&fixture, |entry| {
+            entry.get("id").and_then(Value::as_i64) == Some(903)
+        })
+        .await;
         for rpc_id in [901, 902, 903] {
-            assert!(debug.iter().any(|message| {
-                message.direction == AcpDebugDirection::Outgoing
-                    && message.message.contains(&format!("\"id\":{rpc_id}"))
-            }));
+            assert!(
+                log.iter()
+                    .any(|entry| entry.get("id").and_then(Value::as_i64) == Some(rpc_id)),
+                "the process-level response for request {rpc_id} should reach the Agent"
+            );
         }
 
         payload.finish_turn(false).unwrap();

@@ -2186,6 +2186,7 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
+                "58:drop_duplicate_timeline_index",
             ]
         );
         assert_eq!(
