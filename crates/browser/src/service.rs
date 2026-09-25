@@ -1823,7 +1823,12 @@ async fn handle_cdp_event(
                 let Some(tab) = state.tab_by_cdp_session(&session_id) else {
                     return;
                 };
-                if let Some(url) = url {
+                // A failed navigation lands on Chrome's own error page. Adopting
+                // its internal URL would replace what the human typed — and what
+                // an Agent asked for — with `chrome-error://chromewebdata/`, so
+                // the requested URL stays; the failure itself is already in the
+                // network diagnostics.
+                if let Some(url) = url.filter(|url| !is_chrome_error_page(url)) {
                     tab.url = url;
                 }
                 // A navigation invalidates every ref issued before it.
@@ -2039,6 +2044,15 @@ fn render_console_value(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// True for the internal URL Chrome navigates to when a page fails to load.
+///
+/// The error page itself is worth showing — the panel renders it as a frame —
+/// but the URL is not: `chrome-error://chromewebdata/` is not something a human
+/// typed or an Agent can act on.
+fn is_chrome_error_page(url: &str) -> bool {
+    url.starts_with("chrome-error://")
 }
 
 async fn push_console(
@@ -2312,5 +2326,14 @@ mod tests {
     fn console_values_render_strings_without_quotes() {
         assert_eq!(render_console_value(&json!("hello")), "hello");
         assert_eq!(render_console_value(&json!(42)), "42");
+    }
+
+    #[test]
+    fn only_the_error_page_url_is_refused_as_a_tab_url() {
+        // The requested URL survives a failed load; Chrome's internal error URL
+        // never becomes the tab's address.
+        assert!(is_chrome_error_page("chrome-error://chromewebdata/"));
+        assert!(!is_chrome_error_page("https://example.com/"));
+        assert!(!is_chrome_error_page("chrome://version/"));
     }
 }
