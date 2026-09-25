@@ -22,10 +22,10 @@
 //! decode frames at all — it forwards the encoded JPEG so the same payload
 //! works locally and over a remote transport.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -76,6 +76,15 @@ pub enum BrowserServiceEvent {
     DialogClosed(BrowserTabId),
     /// A page requested a file chooser.
     FileChooserOpened(BrowserTabId),
+    /// A tab appeared because the page opened one — `target="_blank"` or
+    /// `window.open` — exactly as it would in a real browser. The panel opens a
+    /// preview tab for it.
+    TabOpened {
+        session_id: BrowserSessionId,
+        tab_id: BrowserTabId,
+    },
+    /// A tab's URL, title or loading state changed.
+    TabChanged(BrowserTabId),
     /// A tab was closed or reclaimed.
     TabClosed(BrowserTabId),
     /// A development server was detected in terminal output.
@@ -318,6 +327,10 @@ pub(crate) struct ServiceState {
     pub(crate) session_domain_grants: Vec<String>,
     /// Origins positively identified as this runtime's development servers.
     pub(crate) dev_server_origins: Vec<String>,
+    /// Targets that existed before discovery was switched on. They are not
+    /// tabs: the browser's own startup target is the only one today, and
+    /// adopting it would show an empty tab the user never opened.
+    pub(crate) ignored_targets: HashSet<String>,
 }
 
 impl ServiceState {
@@ -460,6 +473,13 @@ pub(crate) struct BrowserInner {
     pub(crate) state: Mutex<ServiceState>,
     events: broadcast::Sender<BrowserServiceEvent>,
     launch_lock: Mutex<()>,
+    /// Non-zero while `create_tab` is waiting for `Target.createTarget`.
+    ///
+    /// The discovery event for a target the runtime creates itself can reach
+    /// the event pump before the tab record exists; adopting it there would
+    /// show the same page twice. Events are ignored while a create is in
+    /// flight, and the returned target id is remembered either way.
+    creating_targets: AtomicUsize,
     event_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reaper_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutting_down: AtomicBool,
@@ -494,9 +514,11 @@ impl BrowserService {
                 last_activity_ms: unix_timestamp_ms(),
                 session_domain_grants,
                 dev_server_origins: Vec::new(),
+                ignored_targets: HashSet::new(),
             }),
             events,
             launch_lock: Mutex::new(()),
+            creating_targets: AtomicUsize::new(0),
             event_task: Mutex::new(None),
             reaper_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
@@ -1115,18 +1137,48 @@ impl BrowserService {
                 }
             }
         }));
-        // Auto-attach so cross-origin iframes, which live in their own target,
-        // become visible to the accessibility tree.
+        // Target discovery is what makes a page-opened tab a tab: clicking
+        // `target="_blank"` or calling `window.open` creates a page target, and
+        // without discovery the runtime never hears about it and the panel sits
+        // on the old page as if the click did nothing. The targets that already
+        // exist are recorded first so the initial burst does not adopt the
+        // browser's own startup target as a tab.
+        if let Ok(existing) = connection
+            .command(
+                "Target.getTargets",
+                json!({}),
+                Duration::from_millis(BROWSER_CDP_COMMAND_TIMEOUT_MS),
+            )
+            .await
+        {
+            let mut state = self.inner.state.lock().await;
+            for info in existing
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(target_id) = info.get("targetId").and_then(Value::as_str) {
+                    state.ignored_targets.insert(target_id.to_string());
+                }
+            }
+        }
         let _ = connection
             .command(
-                "Target.setAutoAttach",
-                json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+                "Target.setDiscoverTargets",
+                json!({ "discover": true }),
                 Duration::from_millis(BROWSER_CDP_COMMAND_TIMEOUT_MS),
             )
             .await;
     }
 
     async fn start_screencast(&self, session: &CdpSession) -> BrowserResult<()> {
+        // Chrome answers a second `Page.startScreencast` on a tab whose
+        // screencast is still running with "Screencast is already active", which
+        // used to surface as a dead panel after a tab was closed and reopened.
+        // Stopping first is harmless when nothing is running and makes the call
+        // idempotent.
+        let _ = cdp(session, "Page.stopScreencast", json!({}), SHORT_TIMEOUT_MS).await;
         let (width, height) = {
             let state = self.inner.state.lock().await;
             state
@@ -1162,13 +1214,16 @@ impl BrowserService {
         self.ensure_process().await?;
         let connection = self.connection().await?;
         let target_url = url.unwrap_or("about:blank");
+        self.inner.creating_targets.fetch_add(1, Ordering::SeqCst);
         let created = connection
             .command(
                 "Target.createTarget",
                 json!({ "url": target_url }),
                 Duration::from_millis(BROWSER_CDP_COMMAND_TIMEOUT_MS),
             )
-            .await?;
+            .await;
+        self.inner.creating_targets.fetch_sub(1, Ordering::SeqCst);
+        let created = created?;
         let target_id = created
             .get("targetId")
             .and_then(Value::as_str)
@@ -1179,6 +1234,14 @@ impl BrowserService {
                 )
             })?
             .to_string();
+        // Remember the target so a discovery event that is already queued does
+        // not adopt it as a page-opened tab.
+        self.inner
+            .state
+            .lock()
+            .await
+            .ignored_targets
+            .insert(target_id.clone());
         let attached = connection
             .command(
                 "Target.attachToTarget",
@@ -1653,6 +1716,13 @@ async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
             "Browser.setDownloadBehavior",
             json!({ "behavior": "deny", "eventsEnabled": false }),
         ),
+        // Cross-origin iframes live in their own target. Auto-attaching on the
+        // tab's own session scopes the child session to this tab, which is what
+        // lets the accessibility tree reach into it.
+        (
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+        ),
     ] {
         cdp(session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
     }
@@ -1748,6 +1818,23 @@ async fn handle_cdp_event(
     connection: &Arc<CdpConnection>,
     event: CdpEvent,
 ) {
+    // Target lifecycle events arrive on the browser session, before any tab
+    // session exists for the target they describe.
+    match event.method.as_str() {
+        "Target.targetCreated" if event.session_id.is_none() => {
+            adopt_discovered_target(inner, connection, &event.params, true).await;
+            return;
+        }
+        "Target.targetInfoChanged" if event.session_id.is_none() => {
+            adopt_discovered_target(inner, connection, &event.params, false).await;
+            return;
+        }
+        "Target.targetDestroyed" if event.session_id.is_none() => {
+            handle_target_destroyed(inner, &event.params).await;
+            return;
+        }
+        _ => {}
+    }
     let Some(session_id) = event.session_id.clone() else {
         return;
     };
@@ -1818,7 +1905,7 @@ async fn handle_cdp_event(
             if !is_main {
                 return;
             }
-            let session_ids = {
+            let (tab_id, session_ids) = {
                 let mut state = inner.state.lock().await;
                 let Some(tab) = state.tab_by_cdp_session(&session_id) else {
                     return;
@@ -1836,19 +1923,26 @@ async fn handle_cdp_event(
                 tab.elements.clear();
                 tab.status = BrowserTabStatus::Loading;
                 let tab_id = tab.tab_id.clone();
-                state.sessions_for_tab(&tab_id)
+                (tab_id.clone(), state.sessions_for_tab(&tab_id))
             };
             for session_id in session_ids {
                 let _ = inner
                     .events
                     .send(BrowserServiceEvent::SessionChanged(session_id));
             }
+            let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
         }
         "Page.loadEventFired" | "Page.domContentEventFired" => {
-            let mut state = inner.state.lock().await;
-            if let Some(tab) = state.tab_by_cdp_session(&session_id) {
-                tab.status = BrowserTabStatus::Ready;
-                tab.last_activity_at_ms = unix_timestamp_ms();
+            let tab_id = {
+                let mut state = inner.state.lock().await;
+                state.tab_by_cdp_session(&session_id).map(|tab| {
+                    tab.status = BrowserTabStatus::Ready;
+                    tab.last_activity_at_ms = unix_timestamp_ms();
+                    tab.tab_id.clone()
+                })
+            };
+            if let Some(tab_id) = tab_id {
+                let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
             }
         }
         "Runtime.consoleAPICalled" => {
@@ -2025,6 +2119,19 @@ async fn handle_cdp_event(
             if child_session.is_empty() {
                 return;
             }
+            // A page target attached here is a tab the page opened, not a child
+            // frame: target discovery adopts it as a tab of its own. Let the
+            // automatic session go so the tab owns exactly one session.
+            if event.params["sessionInfo"]["targetInfo"]["type"].as_str() == Some("page") {
+                let _ = connection
+                    .command(
+                        "Target.detachFromTarget",
+                        json!({ "sessionId": child_session }),
+                        Duration::from_millis(SHORT_TIMEOUT_MS),
+                    )
+                    .await;
+                return;
+            }
             let child =
                 CdpSession::new(Arc::clone(connection), child_session.clone(), String::new());
             for method in ["Page.enable", "Accessibility.enable", "Runtime.enable"] {
@@ -2037,6 +2144,246 @@ async fn handle_cdp_event(
         }
         _ => {}
     }
+}
+
+/// Adopts a page target the browser discovered as a tab of this runtime.
+///
+/// `target="_blank"` and `window.open` create a page target of their own. A real
+/// browser shows it as a new tab; without adopting it the panel keeps rendering
+/// the opener and the click looks like it did nothing.
+async fn adopt_discovered_target(
+    inner: &Arc<BrowserInner>,
+    connection: &Arc<CdpConnection>,
+    params: &Value,
+    created: bool,
+) {
+    if created && inner.creating_targets.load(Ordering::SeqCst) > 0 {
+        return;
+    }
+    let info = &params["targetInfo"];
+    if info.get("type").and_then(Value::as_str) != Some("page") {
+        return;
+    }
+    let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
+        return;
+    };
+    let url = info
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("about:blank")
+        .to_string();
+    let title = info
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let opener_id = info
+        .get("openerId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // A tab this runtime already knows: the event is a title or URL update.
+    let known = {
+        let mut state = inner.state.lock().await;
+        if let Some(tab) = state
+            .tabs
+            .values_mut()
+            .find(|tab| tab.target_id == target_id)
+        {
+            let changed = tab.url != url || tab.title != title;
+            // A failed load lands on Chrome's error page; the tab keeps showing
+            // what was actually requested.
+            if !is_chrome_error_page(&url) {
+                tab.url = url.clone();
+            }
+            tab.title = title.clone();
+            Some((tab.tab_id.clone(), changed))
+        } else {
+            // Targets that existed before discovery was switched on are not
+            // tabs; the initial burst must not adopt them.
+            if created && state.ignored_targets.remove(target_id) {
+                return;
+            }
+            None
+        }
+    };
+    if let Some((tab_id, changed)) = known {
+        if changed {
+            let _ = inner.events.send(BrowserServiceEvent::TabChanged(tab_id));
+        }
+        return;
+    }
+    if !created {
+        return;
+    }
+
+    // The opener decides which panel session the tab belongs to and how large
+    // it is drawn: the popup takes the opener's place in the same panel.
+    let (session_id, viewport) = {
+        let state = inner.state.lock().await;
+        let opener = opener_id
+            .as_deref()
+            .and_then(|opener| state.tabs.values().find(|tab| tab.target_id == opener));
+        let session_id = opener
+            .and_then(|tab| {
+                state
+                    .sessions
+                    .iter()
+                    .find(|(_, session)| session.tabs.contains(&tab.tab_id))
+                    .map(|(id, _)| id.clone())
+            })
+            .or_else(|| {
+                (state.sessions.len() == 1)
+                    .then(|| state.sessions.keys().next().cloned())
+                    .flatten()
+            });
+        let viewport = opener.map(|tab| tab.viewport).unwrap_or((
+            DEFAULT_VIEWPORT_WIDTH,
+            DEFAULT_VIEWPORT_HEIGHT,
+            1.0,
+        ));
+        (session_id, viewport)
+    };
+    let Some(session_id) = session_id else {
+        return;
+    };
+
+    let Ok(attached) = connection
+        .command(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+            Duration::from_millis(BROWSER_CDP_COMMAND_TIMEOUT_MS),
+        )
+        .await
+    else {
+        return;
+    };
+    let Some(cdp_session_id) = attached.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let cdp_session_id = cdp_session_id.to_string();
+    let session = CdpSession::new(
+        Arc::clone(connection),
+        cdp_session_id.clone(),
+        target_id.to_string(),
+    );
+    let _ = prepare_tab_session(&session).await;
+    let _ = cdp(
+        &session,
+        "Emulation.setDeviceMetricsOverride",
+        json!({
+            "width": viewport.0,
+            "height": viewport.1,
+            "deviceScaleFactor": viewport.2,
+            "mobile": false,
+        }),
+        BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    )
+    .await;
+
+    let now = unix_timestamp_ms();
+    let tab_id = BrowserTabId::new();
+    let (frame, _) = watch::channel(None);
+    let agent_session_id = {
+        let state = inner.state.lock().await;
+        state
+            .sessions
+            .get(&session_id)
+            .and_then(|session| match &session.key {
+                BrowserSessionKey::Agent(agent) => Some(agent.clone()),
+                _ => None,
+            })
+    };
+    let record = TabRecord {
+        tab_id: tab_id.clone(),
+        target_id: target_id.to_string(),
+        session_id: cdp_session_id,
+        owner: BrowserTabOwner::User,
+        agent_session_id,
+        url,
+        title,
+        status: BrowserTabStatus::Loading,
+        generation: 0,
+        elements: Vec::new(),
+        created_at_ms: now,
+        last_activity_at_ms: now,
+        frame,
+        frame_sequence: Arc::new(AtomicU64::new(0)),
+        frame_ack_session_id: None,
+        screencast_active: false,
+        diagnostics: TabDiagnostics::default(),
+        pending_requests: HashMap::new(),
+        child_sessions: Vec::new(),
+        active_operations: Arc::new(AtomicU64::new(0)),
+        aborted: Arc::new(AtomicBool::new(false)),
+        pending_dialog: None,
+        file_chooser_pending: false,
+        file_chooser_backend_node: None,
+        viewport,
+    };
+    let inserted = {
+        let mut state = inner.state.lock().await;
+        if state.tabs.values().any(|tab| tab.target_id == target_id) {
+            // A racing event already adopted it.
+            false
+        } else {
+            state.tabs.insert(tab_id.clone(), record);
+            match state.sessions.get_mut(&session_id) {
+                Some(session) => {
+                    session.tabs.push(tab_id.clone());
+                    // The new tab is what the panel and the human look at, the
+                    // same as a real browser foregrounding a link's target.
+                    session.active_tab_id = Some(tab_id.clone());
+                    session.last_activity_at_ms = now;
+                    state.last_activity_ms = now;
+                    true
+                }
+                None => {
+                    state.tabs.remove(&tab_id);
+                    false
+                }
+            }
+        }
+    };
+    if !inserted {
+        return;
+    }
+    let _ = inner
+        .events
+        .send(BrowserServiceEvent::TabOpened { session_id, tab_id });
+}
+
+/// Removes a tab whose target went away on its own, such as `window.close()`.
+async fn handle_target_destroyed(inner: &Arc<BrowserInner>, params: &Value) {
+    let Some(target_id) = params.get("targetId").and_then(Value::as_str) else {
+        return;
+    };
+    let closed = {
+        let mut state = inner.state.lock().await;
+        if state.ignored_targets.remove(target_id) {
+            return;
+        }
+        let Some(tab_id) = state
+            .tabs
+            .values()
+            .find(|tab| tab.target_id == target_id)
+            .map(|tab| tab.tab_id.clone())
+        else {
+            return;
+        };
+        state.tabs.remove(&tab_id);
+        for record in state.sessions.values_mut() {
+            record.tabs.retain(|id| id != &tab_id);
+            if record.active_tab_id.as_ref() == Some(&tab_id) {
+                record.active_tab_id = record.tabs.first().cloned();
+            }
+            if record.agent_tab_id.as_ref() == Some(&tab_id) {
+                record.agent_tab_id = None;
+            }
+        }
+        tab_id
+    };
+    let _ = inner.events.send(BrowserServiceEvent::TabClosed(closed));
 }
 
 fn render_console_value(value: &Value) -> String {
