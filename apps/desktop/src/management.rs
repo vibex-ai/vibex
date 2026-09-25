@@ -10123,7 +10123,21 @@ impl ManagementCenter {
                             } else {
                                 status_label.to_string()
                             }),
-                    );
+                    )
+                    .when(added && enabled, |row| {
+                        // Not every Agent can call browser tools, and a tool that
+                        // is listed but never arrives is worse than no tool at
+                        // all. The row says which of the two this Agent is.
+                        let note = management_agent_browser_delivery_label(&id);
+                        row.child(
+                            div()
+                                .pl(px(40.0))
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(note),
+                        )
+                    });
             agent_rows = agent_rows.child(row);
         }
 
@@ -22693,6 +22707,35 @@ fn management_install_label() -> &'static str {
     management_locale_text("Install", "安装", "安裝")
 }
 
+/// What the Agent row says about browser tool delivery.
+///
+/// Some Agents never receive wire MCP servers, so the browser tools can never
+/// reach them; listing them anyway would promise a capability that does not
+/// exist. The wording stays with the delivery answer the runtime computed.
+fn management_agent_browser_delivery_label(agent_id: &str) -> String {
+    use vibex_core::BrowserToolDelivery;
+    match vibex_desktop_runtime::BrowserRuntime::delivery_for(agent_id) {
+        BrowserToolDelivery::Http => management_locale_text(
+            "Browser tools: available over HTTP",
+            "浏览器工具：可用（HTTP）",
+            "瀏覽器工具：可用（HTTP）",
+        )
+        .to_string(),
+        BrowserToolDelivery::Stdio => management_locale_text(
+            "Browser tools: available over the stdio fallback",
+            "浏览器工具：可用（stdio 回退）",
+            "瀏覽器工具：可用（stdio 後備）",
+        )
+        .to_string(),
+        BrowserToolDelivery::Unavailable => management_locale_text(
+            "Browser tools: unavailable — this Agent does not receive MCP tools",
+            "浏览器工具：不可用（该 Agent 不接收 MCP 工具）",
+            "瀏覽器工具：無法使用（該 Agent 不接收 MCP 工具）",
+        )
+        .to_string(),
+    }
+}
+
 fn management_agent_status_label(agent: &AgentSnapshotEntry) -> &'static str {
     match agent.managed_install.status {
         vibex_core::AgentManagedInstallStatus::Installing
@@ -23526,6 +23569,23 @@ fn empty_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_tool_delivery_copy_names_the_unreachable_agents() {
+        // The row has to say which Agents can never call the tools, because a
+        // listed tool that never arrives reads as a broken one.
+        let reachable = management_agent_browser_delivery_label("claude");
+        assert!(reachable.contains("HTTP") || reachable.contains("available"));
+        for agent in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
+            let note = management_agent_browser_delivery_label(agent);
+            assert!(
+                note.contains("unavailable")
+                    || note.contains("不可用")
+                    || note.contains("無法使用"),
+                "{agent} should be labelled unreachable, got {note}"
+            );
+        }
+    }
     use vibex_desktop_model::AgentSortStrategy;
 
     #[test]

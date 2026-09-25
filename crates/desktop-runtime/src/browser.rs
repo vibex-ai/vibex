@@ -322,6 +322,22 @@ impl BrowserRuntime {
         BrowserToolDelivery::Http
     }
 
+    /// The delivery answer for one Agent id, deviations included.
+    ///
+    /// This is what a UI row per Agent asks; [`Self::tool_delivery_for_agent`]
+    /// alone would answer `Unavailable` for an id that is merely absent from the
+    /// deviation table, which is most Agents and all of the working ones.
+    pub fn delivery_for(agent_id: &str) -> BrowserToolDelivery {
+        let profiled = vibex_agent_acp::agent_dialect_profiles()
+            .iter()
+            .any(|profile| profile.agent_id == agent_id);
+        if profiled {
+            Self::tool_delivery_for_agent(agent_id)
+        } else {
+            Self::generic_tool_delivery()
+        }
+    }
+
     /// The list of exceptions the UI shows next to the capability matrix.
     ///
     /// Only Agents that deviate from the generic delivery are listed, because
@@ -657,6 +673,27 @@ mod tests {
                 .iter()
                 .any(|(_, delivery)| *delivery == BrowserToolDelivery::Unavailable)
         );
+    }
+
+    #[test]
+    fn the_per_agent_answer_covers_agents_outside_the_deviation_table() {
+        // Claude and Codex are not in the table; asking the deviation lookup
+        // directly would have been the wrong question for a UI row.
+        assert_eq!(
+            BrowserRuntime::delivery_for("claude"),
+            BrowserToolDelivery::Http
+        );
+        assert_eq!(
+            BrowserRuntime::delivery_for("codex"),
+            BrowserToolDelivery::Http
+        );
+        for agent in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
+            assert_eq!(
+                BrowserRuntime::delivery_for(agent),
+                BrowserToolDelivery::Unavailable,
+                "{agent} never receives wire MCP servers"
+            );
+        }
     }
 
     #[test]
