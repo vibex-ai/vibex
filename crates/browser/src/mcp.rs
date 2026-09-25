@@ -319,63 +319,27 @@ fn error_response(id: Value, code: i32, message: &str) -> Value {
 }
 
 /// Prefix of a browser MCP bearer token.
-pub const BROWSER_TOKEN_PREFIX: &str = "btok";
+pub const BROWSER_TOKEN_PREFIX: &str = vibex_core::BROWSER_MCP_TOKEN_PREFIX;
 
 /// Issues a session-scoped bearer token.
 ///
 /// The token is `btok_<session id>_<mac>` with
 /// `mac = SHA256(global secret ‖ 0x00 ‖ session id)`.
 ///
-/// The derivation is the one the delegation broker already uses, with the
-/// session id carried in the clear so the HTTP endpoint can find the session
-/// without scanning every live session on each request. Authentication is
-/// unchanged: the MAC covers the session id, the global secret is never
-/// accepted as a token, and a token minted for one session cannot be replayed
-/// for another.
+/// The derivation belongs to the shared contract crate, because the runtime
+/// mints this token when it describes the browser MCP server to an Agent and
+/// this crate verifies it when the request arrives. Both call
+/// [`vibex_core::browser_mcp_session_token`]; deriving it twice is what once
+/// left every request answerable only with a 401.
 pub fn issue_session_token(global_secret: &str, session_id: &str) -> String {
-    format!(
-        "{BROWSER_TOKEN_PREFIX}_{session_id}_{}",
-        session_mac(global_secret, session_id)
-    )
+    vibex_core::browser_mcp_session_token(global_secret, session_id)
 }
 
 /// Verifies a bearer token and returns the session id it authenticates.
 ///
 /// The comparison is constant time over the MAC.
 pub fn verify_session_token(global_secret: &str, token: &str) -> Option<String> {
-    let rest = token
-        .strip_prefix(BROWSER_TOKEN_PREFIX)?
-        .strip_prefix('_')?;
-    // The session id itself contains underscores, so split at the last one.
-    let (session_id, presented_mac) = rest.rsplit_once('_')?;
-    if session_id.is_empty() || presented_mac.is_empty() {
-        return None;
-    }
-    let expected = session_mac(global_secret, session_id);
-    if !constant_time_eq(expected.as_bytes(), presented_mac.as_bytes()) {
-        return None;
-    }
-    Some(session_id.to_string())
-}
-
-fn session_mac(global_secret: &str, session_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(global_secret.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(session_id.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        difference |= a ^ b;
-    }
-    difference == 0
+    vibex_core::verify_browser_mcp_session_token(global_secret, token)
 }
 
 /// Builds the JSON-RPC payload for one stdio message.

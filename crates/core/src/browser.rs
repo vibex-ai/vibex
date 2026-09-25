@@ -43,6 +43,72 @@ pub fn is_builtin_mcp_server_id(id: &str) -> bool {
     BUILTIN_MCP_SERVER_IDS.contains(&id)
 }
 
+/// Prefix of the bearer token that authenticates one Agent session against the
+/// runtime's browser MCP endpoint.
+pub const BROWSER_MCP_TOKEN_PREFIX: &str = "btok";
+
+/// Mints the browser MCP bearer token for one Agent session.
+///
+/// The token is `btok_<session id>_<mac>` with
+/// `mac = SHA256(global secret ‖ 0x00 ‖ session id)`. The session id travels in
+/// the clear so the endpoint can resolve the session without scanning every
+/// live session on each request; the MAC is what authenticates it, so a token
+/// minted for one session cannot be replayed for another and the global secret
+/// itself is never accepted as a token.
+///
+/// The derivation lives in the shared contract crate because two sides have to
+/// agree on it: the runtime mints the token when it describes the browser MCP
+/// server to an Agent, and the endpoint verifies it when a request arrives.
+/// Deriving it independently on each side is exactly how the two drifted apart
+/// before — the descriptor carried a token the endpoint could never accept, so
+/// every browser tool call failed with 401 and no Agent ever saw the tools.
+pub fn browser_mcp_session_token(global_secret: &str, session_id: &str) -> String {
+    format!(
+        "{BROWSER_MCP_TOKEN_PREFIX}_{session_id}_{}",
+        browser_mcp_session_mac(global_secret, session_id)
+    )
+}
+
+/// Verifies a browser MCP bearer token and returns the session id it
+/// authenticates.
+///
+/// The comparison is constant time over the MAC. The session id may contain
+/// underscores, so the split is at the last one.
+pub fn verify_browser_mcp_session_token(global_secret: &str, token: &str) -> Option<String> {
+    let rest = token
+        .strip_prefix(BROWSER_MCP_TOKEN_PREFIX)?
+        .strip_prefix('_')?;
+    let (session_id, presented_mac) = rest.rsplit_once('_')?;
+    if session_id.is_empty() || presented_mac.is_empty() {
+        return None;
+    }
+    let expected = browser_mcp_session_mac(global_secret, session_id);
+    if !constant_time_eq(expected.as_bytes(), presented_mac.as_bytes()) {
+        return None;
+    }
+    Some(session_id.to_string())
+}
+
+fn browser_mcp_session_mac(global_secret: &str, session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(global_secret.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(session_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
 /// Maximum number of elements returned by a single observation.
 pub const BROWSER_OBSERVE_DEFAULT_MAX_ELEMENTS: usize = 240;
 pub const BROWSER_OBSERVE_MIN_MAX_ELEMENTS: usize = 20;
@@ -844,6 +910,38 @@ mod tests {
         assert!(is_builtin_mcp_server_id(BROWSER_MCP_SERVER_ID));
         assert!(!is_builtin_mcp_server_id("user-configured-server"));
         assert!(!is_builtin_mcp_server_id(""));
+    }
+
+    #[test]
+    fn a_browser_mcp_token_authenticates_only_its_own_session() {
+        let secret = "cap_global_secret";
+        let session = "vibex-session-1";
+        let token = browser_mcp_session_token(secret, session);
+        assert!(token.starts_with("btok_"));
+        assert_eq!(
+            verify_browser_mcp_session_token(secret, &token).as_deref(),
+            Some(session)
+        );
+        // The session id is carried in the clear, so the token must survive one
+        // that itself contains underscores.
+        let underscored = browser_mcp_session_token(secret, "session_a_b");
+        assert_eq!(
+            verify_browser_mcp_session_token(secret, &underscored).as_deref(),
+            Some("session_a_b")
+        );
+        // Another session's token, another secret, the raw secret and a
+        // truncated token are all refused.
+        assert_ne!(token, browser_mcp_session_token(secret, "vibex-session-2"));
+        assert_eq!(
+            verify_browser_mcp_session_token("cap_other_secret", &token),
+            None
+        );
+        assert_eq!(verify_browser_mcp_session_token(secret, secret), None);
+        assert_eq!(verify_browser_mcp_session_token(secret, "btok_"), None);
+        assert_eq!(
+            verify_browser_mcp_session_token(secret, "session_abc_def"),
+            None
+        );
     }
 
     #[test]

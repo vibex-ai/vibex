@@ -136,6 +136,59 @@ pub struct BrowserMcpToolConfig {
     pub capability_token: String,
 }
 
+/// Builds the browser MCP descriptors for one Agent session.
+///
+/// The HTTP descriptor is offered first and the stdio sidecar second. The ACP
+/// wire filter keeps the first entry whose transport the Agent actually
+/// supports and drops the later duplicate, so every Agent receives exactly one
+/// browser server: HTTP when it can use it, the sidecar otherwise. Sending both
+/// would register the server twice.
+///
+/// Both descriptors carry the same credential, and it must be the token the
+/// runtime's browser MCP endpoint verifies
+/// ([`vibex_core::browser_mcp_session_token`]). Minting it with the delegation
+/// broker's derivation instead produced requests the endpoint could only answer
+/// with 401, which is how every browser tool went missing from every Agent
+/// while the server still looked installed.
+fn browser_mcp_descriptors(
+    tool: &BrowserMcpToolConfig,
+    session_id: &VibexSessionId,
+) -> Vec<ProviderRuntimeMcpServer> {
+    let session_token =
+        vibex_core::browser_mcp_session_token(&tool.capability_token, session_id.as_str());
+    vec![
+        ProviderRuntimeMcpServer {
+            id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+            display_name: "Embedded browser".to_string(),
+            transport: ProviderRuntimeMcpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some(tool.endpoint.clone()),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!("Bearer {session_token}"),
+            )],
+        },
+        ProviderRuntimeMcpServer {
+            id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+            display_name: "Embedded browser (sidecar)".to_string(),
+            transport: ProviderRuntimeMcpTransport::Stdio,
+            command: Some(tool.command.to_string_lossy().to_string()),
+            args: vec!["--browser-mcp".to_string()],
+            env: vec![
+                (
+                    "VIBEX_BROWSER_MCP_ENDPOINT".to_string(),
+                    tool.endpoint.clone(),
+                ),
+                ("VIBEX_BROWSER_MCP_TOKEN".to_string(), session_token),
+            ],
+            url: None,
+            headers: Vec::new(),
+        },
+    ]
+}
+
 #[derive(Clone)]
 struct AgentTurnRequest {
     session_id: VibexSessionId,
@@ -564,41 +617,9 @@ impl AgentManager {
         if provider_kind == ProviderKind::Acp
             && let Some(tool) = self.browser_mcp_tool.get()
         {
-            let session_token = session_capability_token(&tool.capability_token, session_id);
-            // The HTTP descriptor is offered first and the stdio sidecar second.
-            // The ACP wire filter keeps the first entry whose transport the
-            // Agent actually supports and drops the later duplicate, so every
-            // Agent receives exactly one browser server: HTTP when it can use
-            // it, the sidecar otherwise. Sending both would double-register.
-            resources.mcp_servers.push(ProviderRuntimeMcpServer {
-                id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
-                display_name: "Embedded browser".to_string(),
-                transport: ProviderRuntimeMcpTransport::Http,
-                command: None,
-                args: Vec::new(),
-                env: Vec::new(),
-                url: Some(tool.endpoint.clone()),
-                headers: vec![(
-                    "Authorization".to_string(),
-                    format!("Bearer {session_token}"),
-                )],
-            });
-            resources.mcp_servers.push(ProviderRuntimeMcpServer {
-                id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
-                display_name: "Embedded browser (sidecar)".to_string(),
-                transport: ProviderRuntimeMcpTransport::Stdio,
-                command: Some(tool.command.to_string_lossy().to_string()),
-                args: vec!["--browser-mcp".to_string()],
-                env: vec![
-                    (
-                        "VIBEX_BROWSER_MCP_ENDPOINT".to_string(),
-                        tool.endpoint.clone(),
-                    ),
-                    ("VIBEX_BROWSER_MCP_TOKEN".to_string(), session_token),
-                ],
-                url: None,
-                headers: Vec::new(),
-            });
+            resources
+                .mcp_servers
+                .extend(browser_mcp_descriptors(tool, session_id));
         }
         Ok(resources)
     }
@@ -8975,5 +8996,58 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn the_browser_descriptors_carry_a_token_the_endpoint_accepts() {
+        let secret = "cap_browser_test_secret";
+        let tool = BrowserMcpToolConfig {
+            command: PathBuf::from("/usr/bin/vibex"),
+            endpoint: "http://127.0.0.1:43210/mcp".to_string(),
+            capability_token: secret.to_string(),
+        };
+        let session_id = VibexSessionId::new();
+        let descriptors = browser_mcp_descriptors(&tool, &session_id);
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].transport, ProviderRuntimeMcpTransport::Http);
+        assert_eq!(descriptors[1].transport, ProviderRuntimeMcpTransport::Stdio);
+
+        let http_token = descriptors[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| {
+                value
+                    .strip_prefix("Bearer ")
+                    .expect("the header carries a bearer token")
+                    .to_string()
+            })
+            .expect("the HTTP descriptor authorizes its requests");
+        // The endpoint is the only verifier that matters: this is the exact
+        // check `BrowserMcpHost::resolve_token` runs on every request.
+        assert_eq!(
+            vibex_core::verify_browser_mcp_session_token(secret, &http_token).as_deref(),
+            Some(session_id.as_str())
+        );
+        // The delegation derivation is a different credential; sending it is
+        // what made the endpoint answer every browser request with 401.
+        assert_ne!(http_token, session_capability_token(secret, &session_id));
+
+        let sidecar_token = descriptors[1]
+            .env
+            .iter()
+            .find(|(name, _)| name == "VIBEX_BROWSER_MCP_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("the sidecar receives the same credential");
+        assert_eq!(sidecar_token, http_token);
+
+        // A token minted for another session does not authenticate this one.
+        let other = browser_mcp_descriptors(&tool, &VibexSessionId::new());
+        let other_token = other[0].headers[0].1.clone();
+        assert_ne!(other_token, descriptors[0].headers[0].1);
+        assert_ne!(
+            vibex_core::verify_browser_mcp_session_token(secret, &other_token).as_deref(),
+            Some(session_id.as_str())
+        );
     }
 }
