@@ -1360,10 +1360,17 @@ impl RuntimeSwitchRepository {
             policy.validate()?;
         }
 
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_reserve_transaction_failed",
-            "failed to start runtime switch reserve transaction",
-        ))?;
+        // Reservation reads the session row and the idempotency key before it
+        // inserts. Acquire the write lock before those reads so a concurrent
+        // commit cannot invalidate the WAL snapshot mid-transaction: a deferred
+        // upgrade fails immediately with `SQLITE_BUSY_SNAPSHOT`, which the busy
+        // handler does not cover.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_reserve_transaction_failed",
+                "failed to start runtime switch reserve transaction",
+            ))?;
 
         // 1. Idempotent insert-or-get.
         if let Some(existing) =
@@ -1563,10 +1570,12 @@ impl RuntimeSwitchRepository {
     /// atomically. If the desired selection revision moved on, the switch is
     /// marked `Superseded` (durably) and a conflict is returned.
     pub fn commit(conn: &mut Connection, request: &RuntimeSwitchCommitRequest) -> VibexResult<()> {
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_commit_transaction_failed",
-            "failed to start runtime switch commit transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_commit_transaction_failed",
+                "failed to start runtime switch commit transaction",
+            ))?;
         let now = unix_timestamp_ms();
 
         let changed = tx
@@ -2268,10 +2277,12 @@ impl RuntimeSwitchRepository {
         conn: &mut Connection,
         switch_id: &RuntimeSwitchId,
     ) -> VibexResult<bool> {
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_reconcile_transaction_failed",
-            "failed to start runtime switch reconcile transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_reconcile_transaction_failed",
+                "failed to start runtime switch reconcile transaction",
+            ))?;
         let row: Option<(String, String, Option<String>)> = tx
             .query_row(
                 "SELECT session_id, status, target_binding_id
@@ -2391,10 +2402,12 @@ impl RuntimeSwitchRepository {
         conn: &mut Connection,
         switch_id: &RuntimeSwitchId,
     ) -> VibexResult<bool> {
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_reconcile_transaction_failed",
-            "failed to start runtime switch reconcile transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_reconcile_transaction_failed",
+                "failed to start runtime switch reconcile transaction",
+            ))?;
         let row: Option<(String, String, Option<String>)> = tx
             .query_row(
                 "SELECT session_id, status, source_binding_id
@@ -2795,10 +2808,12 @@ impl RuntimeSwitchRepository {
                 "runtime selection error code must be non-empty, bounded and contain no control characters",
             ));
         }
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_switch_finish_transaction_failed",
-            "failed to start runtime switch finish transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_switch_finish_transaction_failed",
+                "failed to start runtime switch finish transaction",
+            ))?;
         let current_raw: Option<(String, String, i64)> = tx
             .query_row(
                 "SELECT status, session_id, desired_selection_revision
@@ -5140,10 +5155,12 @@ impl AgentSessionRuntimeRepository {
             ));
         }
 
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_selection_initialize_transaction_failed",
-            "failed to start runtime selection initialization transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_selection_initialize_transaction_failed",
+                "failed to start runtime selection initialization transaction",
+            ))?;
         let state = Self::get_runtime_state(&tx, &binding.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
@@ -5267,10 +5284,12 @@ impl AgentSessionRuntimeRepository {
                 "activation generation is exhausted",
             )
         })?;
-        let tx = conn.transaction().map_err(storage_err(
-            "runtime_activation_generation_transaction_failed",
-            "failed to start activation generation transaction",
-        ))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "runtime_activation_generation_transaction_failed",
+                "failed to start activation generation transaction",
+            ))?;
         let changed = tx
             .execute(
                 "UPDATE agent_sessions
@@ -5624,10 +5643,15 @@ impl AgentSessionRuntimeRepository {
             ));
         }
 
-        let tx = conn.transaction().map_err(storage_err(
-            "desired_selection_enqueue_transaction_failed",
-            "failed to start desired runtime selection transaction",
-        ))?;
+        // Like reservation, the enqueue reads the idempotency key and the
+        // session row before inserting the switch intent, so the write lock is
+        // taken up front to keep the WAL snapshot valid for the insert.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err(
+                "desired_selection_enqueue_transaction_failed",
+                "failed to start desired runtime selection transaction",
+            ))?;
         if let Some(existing) = RuntimeSwitchRepository::get_by_idempotency_key_tx(
             &tx,
             &request.session_id,
@@ -7568,6 +7592,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.pending_switch_id, Some(first.switch_id));
+        cleanup_db(temp);
+    }
+
+    /// Reservation must survive a writer that commits between its reads and its
+    /// insert. A deferred transaction reads a WAL snapshot first and then fails
+    /// the write upgrade with `SQLITE_BUSY_SNAPSHOT` (which the busy handler
+    /// does not cover), losing the user's message; an immediate transaction
+    /// waits for the writer and then reserves against a fresh snapshot.
+    #[test]
+    fn reserve_waits_for_a_concurrent_writer_instead_of_failing_on_a_stale_snapshot() {
+        let temp = temp_db_path("reserve-busy");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let session_id = seeded_session(&conn, "reserve-busy");
+
+        // The second connection takes the write lock and tells the test when it
+        // is held, so the reservation below is guaranteed to start against a
+        // database that another writer is about to commit to.
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let blocker_session = session_id.clone();
+        let blocker_path = temp.clone();
+        let writer = thread::spawn(move || {
+            let mut blocker = open_database(&blocker_path).unwrap();
+            let blocker_tx = blocker
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            blocker_tx
+                .execute(
+                    "UPDATE agent_sessions SET updated_at_ms = updated_at_ms + 1
+                     WHERE session_id = ?1",
+                    params![blocker_session.as_str()],
+                )
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+            blocker_tx.commit().unwrap();
+        });
+        acquired_rx.recv().unwrap();
+
+        let request = reserve_request(&session_id, "busy-key", 0, None);
+        let record =
+            RuntimeSwitchRepository::reserve(&mut conn, RuntimeSwitchId::new(), &request).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(record.status, RuntimeSwitchStatus::Reserved);
+        assert_eq!(
+            RuntimeSwitchRepository::get(&conn, &record.switch_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            RuntimeSwitchStatus::Reserved
+        );
         cleanup_db(temp);
     }
 

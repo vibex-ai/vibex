@@ -15,6 +15,7 @@ pub mod runtime_switch;
 pub mod scheduler;
 pub mod smoke_workspace;
 pub mod state_machine;
+pub(crate) mod storage_retry;
 #[cfg(test)]
 pub(crate) mod test_support;
 

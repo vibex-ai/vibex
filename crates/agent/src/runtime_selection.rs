@@ -236,7 +236,9 @@ impl RuntimeSelectionService {
                 resolved.session_config,
                 fork_native_session_id,
             )?;
-        let record = {
+        // A brand new session materializes through this durable intent, so a
+        // transient write race must not fail session creation.
+        let record = crate::storage_retry::retry_transient_storage(|| async {
             let mut conn = open_database(self.inner.coordinator.database_path())?;
             AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
                 &mut conn,
@@ -247,15 +249,16 @@ impl RuntimeSelectionService {
                     expected_revision: 0,
                     expected_selection_revision: 0,
                     target_binding_id: RuntimeBindingId::new(),
-                    target_adapter_id: resolved.adapter_id,
+                    target_adapter_id: resolved.adapter_id.clone(),
                     target_auth_source_revision: resolved.auth_source_revision,
-                    desired: resolved.selection,
+                    desired: resolved.selection.clone(),
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
-                    requested_session_config,
+                    requested_session_config: requested_session_config.clone(),
                 },
-            )?
-        };
+            )
+        })
+        .await?;
         Ok(record)
     }
 
@@ -338,7 +341,10 @@ impl RuntimeSelectionService {
             resolved.session_config,
         )?;
         RuntimeSwitchRepository::validate_requested_config(&requested_session_config)?;
-        let result = {
+        // The desired-selection write and its switch intent are one durable
+        // transaction, so a transient write race is retried here instead of
+        // surfacing to the queued message that asked for the switch.
+        let result = crate::storage_retry::retry_transient_storage(|| async {
             let mut conn = open_database(self.inner.coordinator.database_path())?;
             AgentSessionRuntimeRepository::enqueue_desired_switch(
                 &mut conn,
@@ -349,15 +355,16 @@ impl RuntimeSelectionService {
                     expected_revision: request.expected_revision,
                     expected_selection_revision: request.expected_selection_revision,
                     target_binding_id: RuntimeBindingId::new(),
-                    target_adapter_id: resolved.adapter_id,
+                    target_adapter_id: resolved.adapter_id.clone(),
                     target_auth_source_revision: resolved.auth_source_revision,
-                    desired: resolved.selection,
+                    desired: resolved.selection.clone(),
                     requested_policy: RuntimeSwitchPolicy::Automatic,
                     active_work_policy: self.seamless_active_work_policy(),
-                    requested_session_config,
+                    requested_session_config: requested_session_config.clone(),
                 },
-            )?
-        };
+            )
+        })
+        .await?;
         if let DesiredRuntimeSwitchEnqueueResult::NoChange(state) = &result
             && state.runtime_selection_status
                 == Some(SessionRuntimeSelectionStatus::FailedUsingPrevious)

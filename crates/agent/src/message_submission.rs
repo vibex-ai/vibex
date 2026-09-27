@@ -42,6 +42,10 @@ const PRE_DISPATCH_ERROR_DETAIL: &str = "message submission could not be prepare
 const RUNTIME_PREPARATION_ERROR_DETAIL: &str = "required runtime could not be prepared";
 const TERMINAL_PROVIDER_ERROR_DETAIL: &str =
     "the provider completed the turn with a recoverable failure";
+/// Consecutive transient local-storage failures tolerated while driving one
+/// queued submission. Lock contention clears in milliseconds, so this budget
+/// only exists to stop a permanently locked database from spinning forever.
+const MAX_TRANSIENT_DRIVE_FAILURES: usize = 24;
 
 enum PersistedDispatchResult {
     Completed(Vec<TimelineItem>),
@@ -487,6 +491,12 @@ impl MessageSubmissionCoordinator {
     }
 
     async fn drain_session(self: Arc<Self>, session_id: VibexSessionId) {
+        // A step can lose a race with any other local writer (the startup
+        // bootstrap probes and discovery refreshes write while the first
+        // message of the session is being prepared). Those failures are
+        // transient: the submission stays queued and the step is retried
+        // instead of being terminalized as "message not sent".
+        let mut transient_failures = 0usize;
         loop {
             let record = match self.head_non_terminal(&session_id) {
                 Ok(Some(record)) => record,
@@ -499,8 +509,34 @@ impl MessageSubmissionCoordinator {
                     continue;
                 }
             };
-            if let Err(error) = self.drive_submission(&record).await {
-                self.terminalize_drive_error(&record.submission_id, &error);
+            match self.drive_submission(&record).await {
+                Ok(()) => {
+                    transient_failures = 0;
+                }
+                Err(error)
+                    if crate::storage_retry::is_transient_storage_error(&error)
+                        && transient_failures < MAX_TRANSIENT_DRIVE_FAILURES =>
+                {
+                    transient_failures += 1;
+                    // The submission stays queued, so this is a warning rather
+                    // than a terminal outcome the user has to act on.
+                    RuntimeLogContext::new("message_submission_retry")
+                        .with_logical_session_id(&record.session_id)
+                        .emit(
+                            RuntimeLogLevel::Warn,
+                            "runtime_message_submission_transient_retry",
+                            RuntimeMetricResult::Failure,
+                            Some(error.code.as_str()),
+                            None,
+                        );
+                    sleep(crate::storage_retry::transient_storage_retry_delay(
+                        transient_failures,
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    self.terminalize_drive_error(&record.submission_id, &error);
+                }
             }
             self.publish_progress();
         }

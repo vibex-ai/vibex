@@ -851,10 +851,14 @@ impl RuntimeSwitchCoordinator {
             )?),
             requested_session_config: Some(durable_config),
         };
-        let record = {
+        // Reservation writes the switch intent that every later step depends
+        // on. Losing a race with another local writer is transient, so the
+        // insert is retried instead of failing the caller's message.
+        let record = crate::storage_retry::retry_transient_storage(|| async {
             let mut conn = self.open_connection()?;
-            RuntimeSwitchRepository::reserve(&mut conn, switch_id, &reserve_request)?
-        };
+            RuntimeSwitchRepository::reserve(&mut conn, switch_id.clone(), &reserve_request)
+        })
+        .await?;
         self.claim_and_drive(record).await
     }
 
@@ -2330,14 +2334,7 @@ fn is_retryable_requested_claim_error(error: &VibexError) -> bool {
     ) {
         return false;
     }
-    error.diagnostics.iter().any(|diagnostic| {
-        let value = diagnostic.value.to_ascii_lowercase();
-        value.contains("database is locked")
-            || value.contains("database table is locked")
-            || value.contains("database schema is locked")
-            || value.contains("database busy")
-            || value.contains("sqlite_busy")
-    })
+    crate::storage_retry::is_transient_storage_error(error)
 }
 
 fn cancel_operation_kind(kind: ActiveWorkKind) -> &'static str {
