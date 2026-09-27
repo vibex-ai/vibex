@@ -651,6 +651,21 @@ impl BrowserMcpHost for RuntimeBrowserHost {
         let deadline = requested_at_ms + BROWSER_APPROVAL_TTL_MS;
         loop {
             tokio::time::sleep(Duration::from_millis(BROWSER_APPROVAL_POLL_MS)).await;
+            // The Agent's "stop" arrives as `notifications/cancelled`, which
+            // aborts the tab on its own request. Waiting out the card would
+            // keep a stopped tool call alive for the rest of the TTL.
+            if self
+                .runtime
+                .service
+                .agent_operations_aborted(&session.session_id)
+                .await
+            {
+                tracing::info!(
+                    target: "vibex_browser",
+                    "a browser approval card was abandoned because the Agent was stopped"
+                );
+                return BrowserPermissionDecision::Deny;
+            }
             let resolved = tokio::task::spawn_blocking({
                 let database_path = database_path.clone();
                 let request_id = request.id.clone();

@@ -1907,6 +1907,23 @@ impl BrowserService {
         }
     }
 
+    /// True when the Agent's work on this session's tab has been stopped.
+    ///
+    /// The approval wait reads this: an approval card the human never sees must
+    /// not hold a tool call that the user already stopped, and the browser
+    /// layer's own timeout is the only other way out.
+    pub async fn agent_operations_aborted(&self, session_id: &BrowserSessionId) -> bool {
+        let state = self.inner.state.lock().await;
+        let Some(session) = state.sessions.get(session_id) else {
+            return true;
+        };
+        session
+            .tabs
+            .iter()
+            .filter_map(|tab_id| state.tabs.get(tab_id))
+            .any(|tab| tab.aborted.load(Ordering::SeqCst))
+    }
+
     /// Lets an agent continue after a human handover.
     ///
     /// The page may have changed underneath the agent, so the caller must
