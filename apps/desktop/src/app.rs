@@ -117,34 +117,34 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
-    ComposerAttachment, ComposerQueueSendMode, ComposerSuggestionSelection, ComposerToken,
-    ComposerTrigger, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS,
-    DesktopBehaviorUiState, DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode,
-    FpsMonitorPlacement, GitSelectionKey, GitWorkbenchMode, LocaleMode,
-    MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey, NavigationHistory,
-    NetworkProxyMode, NetworkProxyUiState, NewSessionLocation, NewSessionProjectTicket,
-    NewSessionSubmissionStage, NewSessionWorkspaceState, PreviewWindowMode,
-    RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode, RuntimeCascadeChoice,
-    RuntimeCascadeProjection, RuntimeModelFavorite, SESSION_GROUP_SPLIT_SCALE,
-    SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode, SessionGroupLayout, SessionGroupPane,
-    SessionGroupSplitPosition, SessionGroupUiState, SessionUiState, SidebarHierarchyMode,
-    SidebarMutationOutcome, SidebarMutationRejection, SidebarOrganizationItem,
-    SidebarOrganizationScope, SidebarOrganizationView, SidebarProjectAppearance,
-    SidebarProjectLogo, SidebarProjectLogoColor, SidebarProjectProjection, SidebarState,
-    SidebarUiState, SidebarWorkspaceProjection, StartupDestination, TerminalWorkingDirectory,
-    ThemeMode as ModelThemeMode, ThrottledUiStateWriter, TimelineConversationTurn,
-    TimelineDelegationProjection, TimelineFollowState, TimelineModel, TimelineProcessActivityGroup,
-    TimelineRow, TimelineRowKind, UiStateStore, UnifiedDiffLineKind, WorkbenchRoute,
-    WorkspaceContextProjection, WorkspaceLayoutState, WorkspaceStateScope,
-    WorktreeLifecycleDisplayState, active_collaborations, clamp_editor_autosave_delay_ms,
-    complete_string_order, composer_tokens, composer_trigger_at, current_active_goal,
-    current_agent_plan, custom_worktree_path_is_absolute, has_managed_child_agent_delegations,
-    move_string_relative, move_strings_relative, ordered_agent_ids, parse_unified_diff,
-    sidebar_project_custom_logo_file_is_valid, sidebar_project_items,
-    sidebar_project_items_for_workspace, sidebar_project_projections_with_workspace_order,
-    sidebar_root_items, split_share, timeline_agent_message_count_after_sequence,
-    timeline_conversation_turns, timeline_conversation_turns_with_reasoning_mode,
-    timeline_row_delegation,
+    BrowserSearchEngine, BrowserStartPage, BrowserUiState, ComposerAttachment,
+    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerToken, ComposerTrigger,
+    DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
+    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey,
+    GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS,
+    MessageSendKey, NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
+    NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
+    PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
+    RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
+    SESSION_GROUP_SPLIT_SCALE, SIDEBAR_AUTO_ARCHIVE_MAX_DAYS, SessionContentWidthMode,
+    SessionGroupLayout, SessionGroupPane, SessionGroupSplitPosition, SessionGroupUiState,
+    SessionUiState, SidebarHierarchyMode, SidebarMutationOutcome, SidebarMutationRejection,
+    SidebarOrganizationItem, SidebarOrganizationScope, SidebarOrganizationView,
+    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    SidebarProjectProjection, SidebarState, SidebarUiState, SidebarWorkspaceProjection,
+    StartupDestination, TerminalWorkingDirectory, ThemeMode as ModelThemeMode,
+    ThrottledUiStateWriter, TimelineConversationTurn, TimelineDelegationProjection,
+    TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
+    UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
+    WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
+    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order, composer_tokens,
+    composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
+    has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
+    ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
+    sidebar_project_items, sidebar_project_items_for_workspace,
+    sidebar_project_projections_with_workspace_order, sidebar_root_items, split_share,
+    timeline_agent_message_count_after_sequence, timeline_conversation_turns,
+    timeline_conversation_turns_with_reasoning_mode, timeline_row_delegation,
 };
 use vibex_desktop_runtime::{
     AuthoritativeRefetch, DesktopEvent, DesktopEventStream, DesktopRuntime, DesktopRuntimeConfig,
@@ -8921,6 +8921,7 @@ impl VibexWorkbench {
         let editor_autosave = self.ui_state.preview.editor_autosave;
         let editor_autosave_delay_ms = self.ui_state.preview.editor_autosave_delay_ms;
         let workspace_id = self.ui_state.workbench.selected_workspace_id.clone();
+        let browser_preferences = self.ui_state.browser.clone();
         let right_rail_mode = right_rail_mode_from_activity_id(
             self.ui_state.right_rail.selected_activity_id.as_deref(),
         );
@@ -8940,6 +8941,7 @@ impl VibexWorkbench {
                 editor_autosave_delay_ms,
                 cx,
             );
+            workbench.set_browser_preferences(browser_preferences, cx);
             workbench.right_rail_mode = right_rail_mode;
         });
         self.code_right_rail.update(cx, |right_rail, cx| {
@@ -31750,6 +31752,63 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    fn set_browser_start_page(&mut self, start_page: BrowserStartPage, cx: &mut Context<Self>) {
+        let next = BrowserUiState {
+            start_page,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
+    fn set_browser_start_page_url(&mut self, value: String, cx: &mut Context<Self>) {
+        let next = BrowserUiState {
+            start_page_url: value,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
+    fn set_browser_search_engine(
+        &mut self,
+        search_engine: BrowserSearchEngine,
+        cx: &mut Context<Self>,
+    ) {
+        let next = BrowserUiState {
+            search_engine,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
+    fn set_browser_search_engine_url(&mut self, value: String, cx: &mut Context<Self>) {
+        let next = BrowserUiState {
+            search_engine_url: value,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
+    /// Stores browser preferences and applies them to the panel that is open.
+    ///
+    /// Resolved here rather than in the panel: the workbench owns the settings,
+    /// and a custom value that cannot be used has to fall back to the preset
+    /// the panel is actually using instead of reaching a tab as an empty
+    /// address.
+    fn apply_browser_preferences(
+        &mut self,
+        mut preferences: BrowserUiState,
+        cx: &mut Context<Self>,
+    ) {
+        preferences.normalize();
+        self.ui_state.browser = preferences;
+        let browser = self.ui_state.browser.clone();
+        self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_preferences(browser, cx)
+        });
+        self.queue_ui_state();
+        cx.notify();
+    }
+
     fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.ui_state.appearance.reduced_motion = enabled;
         self.queue_ui_state();
@@ -31928,6 +31987,7 @@ impl VibexWorkbench {
                 editor_autosave_delay_ms,
                 cx,
             );
+            workbench.set_browser_preferences(self.ui_state.browser.clone(), cx);
             workbench.right_rail_mode = right_rail_mode;
             workbench.set_code_font(code_font_family, code_font_size, cx);
         });
@@ -31943,6 +32003,7 @@ impl VibexWorkbench {
         let session = self.ui_state.session.clone();
         let terminal_preferences = self.ui_state.terminal_preferences.clone();
         let network_proxy = self.ui_state.network_proxy.clone();
+        let browser = self.ui_state.browser.clone();
         let settings_view = self.settings_view.clone();
         window.defer(cx, move |window, cx| {
             settings_view.update(cx, |settings, cx| {
@@ -31951,6 +32012,7 @@ impl VibexWorkbench {
                     &session,
                     &terminal_preferences,
                     &network_proxy,
+                    &browser,
                     window,
                     cx,
                 )
@@ -59459,6 +59521,7 @@ enum SettingsSection {
     Workbench,
     Session,
     Terminal,
+    Browser,
     Shortcuts,
     Data,
     Developer,
@@ -59804,6 +59867,21 @@ fn settings_section_for_query(query: &str) -> Option<SettingsSection> {
         "工作目錄",
     ]) {
         Some(SettingsSection::Terminal)
+    } else if matches(&[
+        "browser",
+        "web",
+        "start page",
+        "home page",
+        "search engine",
+        "search",
+        "浏览器",
+        "瀏覽器",
+        "起始页",
+        "首頁",
+        "搜索引擎",
+        "搜尋引擎",
+    ]) {
+        Some(SettingsSection::Browser)
     } else if matches(&[
         "shortcut",
         "key",
@@ -60380,6 +60458,46 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             &["terminal", "cwd", "directory", "工作目录", "工作目錄"],
         ),
         settings_search_candidate(
+            SettingsSection::Browser,
+            locale::text("Start page", "起始页", "起始頁"),
+            locale::text(
+                "The page a new browser tab opens: Google, Bing, Baidu, or an address of your own.",
+                "新建浏览器标签页打开的页面：Google、Bing、百度或自定义地址。",
+                "新增瀏覽器分頁開啟的頁面：Google、Bing、百度或自訂網址。",
+            ),
+            &[
+                "browser",
+                "start page",
+                "home page",
+                "new tab",
+                "起始页",
+                "起始頁",
+                "首页",
+                "首頁",
+            ],
+        ),
+        settings_search_candidate(
+            SettingsSection::Browser,
+            locale::text("Search engine", "搜索引擎", "搜尋引擎"),
+            locale::text(
+                "The engine the browser address bar searches with when the input is a keyword.",
+                "地址栏输入关键词时使用的搜索引擎。",
+                "網址列輸入關鍵字時使用的搜尋引擎。",
+            ),
+            &[
+                "browser",
+                "search",
+                "engine",
+                "google",
+                "bing",
+                "baidu",
+                "搜索引擎",
+                "搜尋引擎",
+                "搜索",
+                "搜尋",
+            ],
+        ),
+        settings_search_candidate(
             SettingsSection::Shortcuts,
             locale::text("All shortcuts", "全部快捷键", "全部快速鍵"),
             locale::text(
@@ -60542,6 +60660,7 @@ fn settings_section_label(section: SettingsSection) -> &'static str {
         SettingsSection::Workbench => locale::text("Workbench", "工作台", "工作台"),
         SettingsSection::Session => locale::text("Session", "会话", "會話"),
         SettingsSection::Terminal => locale::text("Terminal", "终端", "終端機"),
+        SettingsSection::Browser => locale::text("Browser", "浏览器", "瀏覽器"),
         SettingsSection::Shortcuts => locale::text("Shortcuts", "快捷键", "快速鍵"),
         SettingsSection::Data => locale::text("Data & Diagnostics", "数据与诊断", "資料與診斷"),
         SettingsSection::Developer => locale::text("Developer", "开发者", "開發者"),
@@ -61213,6 +61332,95 @@ impl SearchableListItem for ShellChoice {
     }
 }
 
+/// One entry of a browser preset select: a localized name and the value the
+/// preference stores.
+///
+/// The presets are keyed by their stored value rather than by index, so adding
+/// an engine later cannot silently move every existing selection.
+#[derive(Clone)]
+struct BrowserPresetChoice {
+    label: SharedString,
+    value: String,
+}
+
+impl SearchableListItem for BrowserPresetChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+}
+
+/// The start pages on offer, in the order the select shows them.
+fn browser_start_page_choices() -> Vec<BrowserPresetChoice> {
+    use vibex_desktop_model::BrowserStartPage;
+    [
+        BrowserStartPage::Google,
+        BrowserStartPage::Bing,
+        BrowserStartPage::Baidu,
+        BrowserStartPage::Custom,
+    ]
+    .into_iter()
+    .map(|preset| BrowserPresetChoice {
+        label: browser_start_page_label(preset).into(),
+        value: preset.storage_value().to_string(),
+    })
+    .collect()
+}
+
+/// The search engines on offer, in the order the select shows them.
+fn browser_search_engine_choices() -> Vec<BrowserPresetChoice> {
+    use vibex_desktop_model::BrowserSearchEngine;
+    [
+        BrowserSearchEngine::Google,
+        BrowserSearchEngine::Bing,
+        BrowserSearchEngine::Baidu,
+        BrowserSearchEngine::DuckDuckGo,
+        BrowserSearchEngine::Custom,
+    ]
+    .into_iter()
+    .map(|preset| BrowserPresetChoice {
+        label: browser_search_engine_label(preset).into(),
+        value: preset.storage_value().to_string(),
+    })
+    .collect()
+}
+
+fn browser_start_page_label(preset: vibex_desktop_model::BrowserStartPage) -> &'static str {
+    use vibex_desktop_model::BrowserStartPage;
+    match preset {
+        BrowserStartPage::Google => "Google",
+        BrowserStartPage::Bing => "Bing",
+        BrowserStartPage::Baidu => locale::text("Baidu", "百度", "百度"),
+        BrowserStartPage::Custom => locale::text("Custom address", "自定义地址", "自訂網址"),
+    }
+}
+
+fn browser_search_engine_label(preset: vibex_desktop_model::BrowserSearchEngine) -> &'static str {
+    use vibex_desktop_model::BrowserSearchEngine;
+    match preset {
+        BrowserSearchEngine::Google => "Google",
+        BrowserSearchEngine::Bing => "Bing",
+        BrowserSearchEngine::Baidu => locale::text("Baidu", "百度", "百度"),
+        BrowserSearchEngine::DuckDuckGo => "DuckDuckGo",
+        BrowserSearchEngine::Custom => locale::text("Custom engine", "自定义引擎", "自訂引擎"),
+    }
+}
+
+fn selected_browser_preset_index(
+    choices: &[BrowserPresetChoice],
+    selected: &str,
+) -> Option<IndexPath> {
+    choices
+        .iter()
+        .position(|choice| choice.value == selected)
+        .map(|row| IndexPath::default().row(row))
+}
+
 impl SearchableListItem for FontChoice {
     type Value = Option<String>;
 
@@ -61240,6 +61448,10 @@ struct FoundationSettings {
     session_content_widths: Entity<SelectState<Vec<SessionContentWidthChoice>>>,
     reasoning_display_modes: Entity<SelectState<Vec<ReasoningDisplayChoice>>>,
     terminal_shells: Entity<SelectState<Vec<ShellChoice>>>,
+    browser_start_pages: Entity<SelectState<Vec<BrowserPresetChoice>>>,
+    browser_search_engines: Entity<SelectState<Vec<BrowserPresetChoice>>>,
+    browser_start_page_input: Entity<InputState>,
+    browser_search_engine_input: Entity<InputState>,
     proxy_input: Entity<InputState>,
     proxy_bypass_input: Entity<InputState>,
     /// The in-flight custom-proxy connection test, if any. Holding it keeps the
@@ -61372,6 +61584,40 @@ impl FoundationSettings {
         });
         let terminal_shells = cx.new(|cx| {
             SelectState::new(shell_choices, terminal_shell_selected, window, cx).searchable(true)
+        });
+        let browser_start_page_choices = browser_start_page_choices();
+        let browser_search_engine_choices = browser_search_engine_choices();
+        let browser_start_pages = cx.new(|cx| {
+            SelectState::new(
+                browser_start_page_choices.clone(),
+                selected_browser_preset_index(
+                    &browser_start_page_choices,
+                    ui_state.browser.start_page.storage_value(),
+                ),
+                window,
+                cx,
+            )
+        });
+        let browser_search_engines = cx.new(|cx| {
+            SelectState::new(
+                browser_search_engine_choices.clone(),
+                selected_browser_preset_index(
+                    &browser_search_engine_choices,
+                    ui_state.browser.search_engine.storage_value(),
+                ),
+                window,
+                cx,
+            )
+        });
+        let browser_start_page_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(ui_state.browser.start_page_url.clone())
+                .placeholder("https://example.com/")
+        });
+        let browser_search_engine_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(ui_state.browser.search_engine_url.clone())
+                .placeholder("https://example.com/search?q={query}")
         });
         let proxy_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -61550,6 +61796,67 @@ impl FoundationSettings {
                 },
             )
             .detach();
+            cx.subscribe(
+                &browser_start_pages,
+                move |this: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<BrowserPresetChoice>>,
+                      cx| {
+                    let SelectEvent::Confirm(value) = event;
+                    if let Some(value) = value.clone() {
+                        this.set_browser_start_page(
+                            BrowserStartPage::from_storage_value(&value).unwrap_or_default(),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
+            cx.subscribe(
+                &browser_search_engines,
+                move |this: &mut FoundationSettings,
+                      _,
+                      event: &SelectEvent<Vec<BrowserPresetChoice>>,
+                      cx| {
+                    let SelectEvent::Confirm(value) = event;
+                    if let Some(value) = value.clone() {
+                        this.set_browser_search_engine(
+                            BrowserSearchEngine::from_storage_value(&value).unwrap_or_default(),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                },
+            )
+            .detach();
+            // The two address fields commit on blur and Enter, the same way the
+            // proxy fields do: a per-keystroke commit would persist half-typed
+            // URLs and make the inline hint flicker.
+            let start_page_input_for_commit = browser_start_page_input.clone();
+            cx.subscribe(
+                &browser_start_page_input,
+                move |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        let value = start_page_input_for_commit.read(cx).value().to_string();
+                        this.set_browser_start_page_url(value, cx);
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+            let search_engine_input_for_commit = browser_search_engine_input.clone();
+            cx.subscribe(
+                &browser_search_engine_input,
+                move |this: &mut FoundationSettings, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        let value = search_engine_input_for_commit.read(cx).value().to_string();
+                        this.set_browser_search_engine_url(value, cx);
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
             Self {
                 workbench,
                 font_families: families,
@@ -61561,6 +61868,10 @@ impl FoundationSettings {
                 session_content_widths,
                 reasoning_display_modes,
                 terminal_shells,
+                browser_start_pages,
+                browser_search_engines,
+                browser_start_page_input,
+                browser_search_engine_input,
                 proxy_input,
                 proxy_bypass_input,
                 proxy_test_task: None,
@@ -62120,6 +62431,44 @@ impl FoundationSettings {
             .unwrap_or_default()
     }
 
+    fn browser_preferences(&self, cx: &App) -> BrowserUiState {
+        self.workbench
+            .read_with(cx, |this, _| this.ui_state.browser.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_browser_start_page(&mut self, start_page: BrowserStartPage, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_browser_start_page(start_page, cx));
+        cx.notify();
+    }
+
+    fn set_browser_start_page_url(&mut self, value: String, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_browser_start_page_url(value, cx));
+        cx.notify();
+    }
+
+    fn set_browser_search_engine(
+        &mut self,
+        search_engine: BrowserSearchEngine,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_browser_search_engine(search_engine, cx)
+        });
+        cx.notify();
+    }
+
+    fn set_browser_search_engine_url(&mut self, value: String, cx: &mut Context<Self>) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_browser_search_engine_url(value, cx));
+        cx.notify();
+    }
+
     fn network_proxy(&self, cx: &App) -> NetworkProxyUiState {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.network_proxy.clone())
@@ -62154,6 +62503,7 @@ impl FoundationSettings {
         session: &SessionUiState,
         terminal_preferences: &vibex_desktop_model::TerminalPreferencesUiState,
         network_proxy: &NetworkProxyUiState,
+        browser: &BrowserUiState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -62195,6 +62545,40 @@ impl FoundationSettings {
             let shell = terminal_preferences.shell.clone().unwrap_or_default();
             select.set_selected_value(&shell, window, cx);
         });
+        let start_page_choices = browser_start_page_choices();
+        self.browser_start_pages.update(cx, |select, cx| {
+            select.set_items(start_page_choices.clone(), window, cx);
+            select.set_selected_index(
+                selected_browser_preset_index(
+                    &start_page_choices,
+                    browser.start_page.storage_value(),
+                ),
+                window,
+                cx,
+            );
+        });
+        let search_engine_choices = browser_search_engine_choices();
+        self.browser_search_engines.update(cx, |select, cx| {
+            select.set_items(search_engine_choices.clone(), window, cx);
+            select.set_selected_index(
+                selected_browser_preset_index(
+                    &search_engine_choices,
+                    browser.search_engine.storage_value(),
+                ),
+                window,
+                cx,
+            );
+        });
+        self.browser_start_page_input.update(cx, |input, cx| {
+            if input.value().as_ref() != browser.start_page_url {
+                input.set_value(browser.start_page_url.clone(), window, cx);
+            }
+        });
+        self.browser_search_engine_input.update(cx, |input, cx| {
+            if input.value().as_ref() != browser.search_engine_url {
+                input.set_value(browser.search_engine_url.clone(), window, cx);
+            }
+        });
         self.session_content_widths.update(cx, |select, cx| {
             select.set_items(session_content_width_choices, window, cx);
             select.set_selected_value(&session.content_width, window, cx)
@@ -62232,11 +62616,13 @@ impl FoundationSettings {
                 let session = this.session(cx);
                 let terminal_preferences = this.terminal_preferences(cx);
                 let network_proxy = this.network_proxy(cx);
+                let browser = this.browser_preferences(cx);
                 this.sync_controls(
                     &appearance,
                     &session,
                     &terminal_preferences,
                     &network_proxy,
+                    &browser,
                     window,
                     cx,
                 );
@@ -62973,6 +63359,11 @@ impl FoundationSettings {
                 SettingsSection::Terminal,
                 locale::text("Terminal", "终端", "終端機"),
                 IconName::SquareTerminal,
+            ),
+            (
+                SettingsSection::Browser,
+                locale::text("Browser", "浏览器", "瀏覽器"),
+                IconName::Globe,
             ),
             (
                 SettingsSection::Shortcuts,
@@ -64483,6 +64874,153 @@ impl FoundationSettings {
         )
     }
 
+    /// Browser panel settings: where a new tab goes and who answers a search.
+    ///
+    /// Both are a preset select plus a URL that only matters for "Custom", so
+    /// the custom row appears with that choice — like the proxy rows — and a
+    /// value the panel cannot use says so where it was typed.
+    fn render_browser_page(&self, stacked: bool, cx: &mut Context<Self>) -> AnyElement {
+        let browser = self.browser_preferences(cx);
+        let start_page_select = settings_select(
+            &self.browser_start_pages,
+            Some(px(220.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
+        let search_engine_select = settings_select(
+            &self.browser_search_engines,
+            Some(px(220.0)),
+            stacked,
+            None::<&str>,
+            cx,
+        );
+        let custom_start_page = browser.start_page == BrowserStartPage::Custom;
+        let custom_search_engine = browser.search_engine == BrowserSearchEngine::Custom;
+        let start_page_url_control = v_flex()
+            .items_end()
+            .gap_1()
+            .child(
+                div().w(px(280.0)).child(
+                    Input::new(&self.browser_start_page_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
+            )
+            .when(
+                custom_start_page && !browser.custom_start_page_is_valid(),
+                |this| {
+                    this.child(
+                        div()
+                            .max_w(px(280.0))
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(locale::text(
+                                "Enter an address such as https://example.com/.",
+                                "请输入完整地址，例如 https://example.com/。",
+                                "請輸入完整網址，例如 https://example.com/。",
+                            )),
+                    )
+                },
+            );
+        let search_engine_url_control = v_flex()
+            .items_end()
+            .gap_1()
+            .child(
+                div().w(px(280.0)).child(
+                    Input::new(&self.browser_search_engine_input)
+                        .small()
+                        .h(px(28.0))
+                        .rounded(px(8.0)),
+                ),
+            )
+            .when(
+                custom_search_engine && !browser.custom_search_engine_is_valid(),
+                |this| {
+                    this.child(
+                        div()
+                            .max_w(px(280.0))
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(locale::text(
+                                "Include {query} where the keyword goes, for example \
+                                 https://example.com/search?q={query}.",
+                                "请在关键词位置包含 {query}，例如 \
+                                 https://example.com/search?q={query}。",
+                                "請在關鍵字位置包含 {query}，例如 \
+                                 https://example.com/search?q={query}。",
+                            )),
+                    )
+                },
+            );
+        let mut new_tab_rows = vec![setting_row(
+            locale::text("Start page", "起始页", "起始頁"),
+            locale::text(
+                "The page a new browser tab opens. Applies to the browser panel's new tabs, not to an Agent's own tabs.",
+                "新建浏览器标签页时打开的页面；仅作用于浏览器面板新建的标签页，不影响 Agent 自己打开的标签页。",
+                "新建瀏覽器分頁時開啟的頁面；僅作用於瀏覽器面板新建的分頁，不影響 Agent 自己開啟的分頁。",
+            ),
+            start_page_select,
+            stacked,
+            cx,
+        )];
+        if custom_start_page {
+            new_tab_rows.push(setting_row(
+                locale::text("Start page address", "起始页地址", "起始頁網址"),
+                locale::text(
+                    "An absolute address, opened as written. Left empty, the default page is used.",
+                    "完整地址，将按原样打开；留空时使用默认页面。",
+                    "完整網址，將按原樣開啟；留空時使用預設頁面。",
+                ),
+                start_page_url_control,
+                stacked,
+                cx,
+            ));
+        }
+        let mut search_rows = vec![setting_row(
+            locale::text("Search engine", "搜索引擎", "搜尋引擎"),
+            locale::text(
+                "Used when the address bar holds a keyword rather than an address.",
+                "当地址栏输入的不是网址而是关键词时使用。",
+                "當網址列輸入的不是網址而是關鍵字時使用。",
+            ),
+            search_engine_select,
+            stacked,
+            cx,
+        )];
+        if custom_search_engine {
+            search_rows.push(setting_row(
+                locale::text("Search URL", "搜索地址", "搜尋網址"),
+                locale::text(
+                    "Put {query} where the keyword goes, for example \
+                     https://example.com/search?q={query}.",
+                    "请在关键词位置填写 {query}，例如 https://example.com/search?q={query}。",
+                    "請在關鍵字位置填寫 {query}，例如 https://example.com/search?q={query}。",
+                ),
+                search_engine_url_control,
+                stacked,
+                cx,
+            ));
+        }
+        settings_page(
+            locale::text("Browser", "浏览器", "瀏覽器"),
+            locale::text(
+                "Configure the embedded browser panel's own tabs.",
+                "配置内嵌浏览器面板的新建标签页与搜索行为。",
+                "設定內嵌瀏覽器面板的新增分頁與搜尋行為。",
+            ),
+            vec![
+                SettingsGroup::new(
+                    locale::text("New tab", "新建标签页", "新增分頁"),
+                    new_tab_rows,
+                ),
+                SettingsGroup::new(locale::text("Search", "搜索", "搜尋"), search_rows),
+            ],
+            cx,
+        )
+    }
+
     fn render_shortcuts_page(
         &self,
         stacked: bool,
@@ -65539,6 +66077,7 @@ impl Render for FoundationSettings {
             }
             SettingsSection::Workbench => self.render_workbench_page(&workbench, stacked_rows, cx),
             SettingsSection::Terminal => self.render_terminal_page(&terminal, stacked_rows, cx),
+            SettingsSection::Browser => self.render_browser_page(stacked_rows, cx),
             SettingsSection::Shortcuts => self.render_shortcuts_page(stacked_rows, strings, cx),
             SettingsSection::Data => self.render_data_page(stacked_rows, cx),
             SettingsSection::Developer => self.render_developer_page(stacked_rows, cx),
@@ -65850,12 +66389,14 @@ impl Render for VibexWorkbench {
             let session = self.ui_state.session.clone();
             let terminal_preferences = self.ui_state.terminal_preferences.clone();
             let network_proxy = self.ui_state.network_proxy.clone();
+            let browser = self.ui_state.browser.clone();
             self.settings_view.update(cx, |settings, cx| {
                 settings.sync_controls(
                     &appearance,
                     &session,
                     &terminal_preferences,
                     &network_proxy,
+                    &browser,
                     window,
                     cx,
                 )
@@ -79983,6 +80524,56 @@ mod tests {
             .map(|(body, _)| body)
             .expect("settings page surface should remain inspectable");
         assert!(!page.contains(".bg(background)"));
+    }
+
+    /// The browser page is where a new tab's page and the address bar's engine
+    /// are chosen, and both have to reach the workbench rather than only the
+    /// settings snapshot.
+    #[test]
+    fn the_browser_settings_page_wires_both_choices_to_the_workbench() {
+        let source = include_str!("app.rs");
+        let page = source
+            .split_once("    fn render_browser_page(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_shortcuts_page("))
+            .map(|(body, _)| body)
+            .expect("the browser settings page should remain inspectable");
+        assert!(page.contains("&self.browser_start_pages"));
+        assert!(page.contains("&self.browser_search_engines"));
+        assert!(page.contains("BrowserStartPage::Custom"));
+        assert!(page.contains("BrowserSearchEngine::Custom"));
+        assert!(
+            page.contains("&self.browser_start_page_input")
+                && page.contains("&self.browser_search_engine_input"),
+            "a custom choice needs the field its address is typed into"
+        );
+
+        // The two selects only reach the workbench through the settings
+        // subscriptions; a page that rendered them without those would show a
+        // choice that changes nothing.
+        let subscriptions = source
+            .split_once("            cx.subscribe(\n                &browser_start_pages,")
+            .and_then(|(_, tail)| tail.split_once("            Self {"))
+            .map(|(body, _)| body)
+            .expect("the browser selects should remain inspectable");
+        assert!(subscriptions.contains("this.set_browser_start_page("));
+        assert!(subscriptions.contains("this.set_browser_search_engine("));
+        assert!(subscriptions.contains("this.set_browser_start_page_url("));
+        assert!(subscriptions.contains("this.set_browser_search_engine_url("));
+
+        // Both fields commit on blur and Enter, like the proxy fields: a
+        // half-typed URL must not be stored.
+        assert!(subscriptions.contains("InputEvent::Blur | InputEvent::PressEnter"));
+
+        assert_eq!(
+            settings_section_for_query("搜索引擎"),
+            Some(SettingsSection::Browser)
+        );
+        let english = locale::strings(locale::ResolvedLocale::En);
+        assert!(
+            settings_search_candidates_for_query("start page", english)
+                .iter()
+                .any(|candidate| candidate.section == SettingsSection::Browser)
+        );
     }
 
     #[test]

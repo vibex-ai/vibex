@@ -5,6 +5,7 @@
 
 mod agent_ordering;
 mod agent_workbench;
+mod browser;
 mod composer;
 mod content_preview;
 mod diff;
@@ -28,6 +29,7 @@ mod worktree_session;
 
 pub use agent_ordering::*;
 pub use agent_workbench::*;
+pub use browser::*;
 pub use composer::*;
 pub use content_preview::*;
 pub use diff::*;

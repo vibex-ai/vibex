@@ -10182,6 +10182,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "url",
  "vibex-core",
  "vibex-markdown",
  "windows-sys 0.59.0",

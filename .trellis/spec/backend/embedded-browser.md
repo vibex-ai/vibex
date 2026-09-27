@@ -227,9 +227,9 @@ carries the one piece of page state that can be restored — the address.
   included) and the surface, its subscription, its label and its active flag
   are rekeyed with it. History is not restored and cannot be: a new target
   starts at the address.
-- **No address, no guess.** A tab saved before addresses were remembered shows
-  the "no longer open, reopen it from the browser panel" boundary and creates
-  nothing. An unavailable transport, a missing workspace and a refused
+- **No address, no guess.** A tab saved before addresses were remembered has
+  none to reopen, so it opens the configured start page — the same answer a new
+  tab gets. An unavailable transport, a missing workspace and a refused
   `create_tab` all report their reason on the surface.
 - **The idle placeholder is never the answer to a missing runtime tab.**
   "Waiting for the browser to start" is only correct while an attach is
@@ -247,6 +247,40 @@ query string and fragment, the way a browser's own session restore does, because
 a stripped address reopens the wrong page. The redaction rules for
 `BrowserActionRecord` and the persisted `browser_audit_records` table are
 unchanged and are not the place a restorable address may be read back from.
+
+## New-tab page and search engine
+
+A browser tab created without an address — the right-rail button, the "+" menu,
+a restored tab with nothing remembered — opens the reader's **start page**, and
+a bare keyword typed in the address bar goes to the reader's **search engine**.
+Both live in `BrowserUiState` (`crates/desktop-model/src/browser.rs`), which the
+settings own and the panel applies:
+
+- **A preset plus a custom value, never a blank.** `BrowserStartPage` and
+  `BrowserSearchEngine` are preset enums (Google, Bing, Baidu, … plus `Custom`);
+  the custom address/template sits next to the selection. `resolved_start_page`
+  and `resolved_search_url` fall back to the default preset when a custom value
+  is unusable, so a half-typed URL can never reach `create_tab` as an empty
+  address. Google is the default for both.
+- **The selection survives editing, the fallback is what runs.** `normalize`
+  only trims and bounds: moving a `Custom` selection back to a preset while the
+  reader is still typing would make the field they are about to fill in
+  unreachable. The settings card reports the missing value inline instead.
+- **A custom search URL carries `{query}`.** A template without the placeholder
+  cannot search, so it is treated as unusable and the default engine is used;
+  `SEARCH_QUERY_PLACEHOLDER` is the one documented placeholder, and
+  `browser_surface::search_url` form-encodes the keyword into it (spaces, `&`
+  and non-ASCII included).
+- **The address bar decides first, the engine second.** `normalize_address`
+  keeps its old rule — an explicit scheme, a host-bearing URL, or a bare host
+  becomes an address — and only what is left over becomes a search, now on the
+  configured engine rather than a hard-coded one.
+- **Only the panel's own tabs.** An Agent's `create_tab` keeps `about:blank`
+  unless the Agent named a URL: the start page is a reader preference, not a
+  runtime default.
+- **The setting reaches what is already open.** The workbench pushes the search
+  template into every live surface (`set_search_template`); the start page is
+  read when a tab is created, because it cannot apply to a page already loaded.
 
 ## The browser shell the screencast cannot supply
 

@@ -1219,6 +1219,10 @@ pub struct DesktopUiStateV1 {
     pub terminal: TerminalUiState,
     #[serde(default)]
     pub terminal_preferences: TerminalPreferencesUiState,
+    /// Embedded browser panel preferences: the page a new tab opens and the
+    /// engine the address bar searches with.
+    #[serde(default)]
+    pub browser: crate::BrowserUiState,
     pub right_rail: RightRailUiState,
     #[serde(default)]
     pub session: SessionUiState,
@@ -1254,6 +1258,7 @@ impl Default for DesktopUiStateV1 {
             workspace_layouts: BTreeMap::new(),
             terminal: TerminalUiState::default(),
             terminal_preferences: TerminalPreferencesUiState::default(),
+            browser: crate::BrowserUiState::default(),
             right_rail: RightRailUiState::default(),
             session: SessionUiState::default(),
             desktop_behavior: DesktopBehaviorUiState::default(),
@@ -1341,6 +1346,7 @@ impl DesktopUiStateV1 {
         normalize_ids(&mut self.composer.terminal_ids, 64);
         self.terminal_preferences.shell =
             bounded_optional(self.terminal_preferences.shell.take(), 4_096);
+        self.browser.normalize();
         self.composer.runtime_selections_by_agent =
             std::mem::take(&mut self.composer.runtime_selections_by_agent)
                 .into_iter()

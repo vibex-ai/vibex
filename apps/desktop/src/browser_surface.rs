@@ -46,6 +46,8 @@ use vibex_core::{
     BrowserUnavailableReason,
 };
 
+use vibex_desktop_model::SEARCH_QUERY_PLACEHOLDER;
+
 use crate::browser_transport::{
     BrowserFrameStream, BrowserTransport, BrowserTransportError, LocalBrowserTransport,
 };
@@ -144,6 +146,12 @@ pub struct BrowserSurface {
     /// The address bar. Editable, because a human taking over needs to be able
     /// to go somewhere the Agent did not.
     address_input: Entity<InputState>,
+    /// URL template the address bar searches with, `{query}` included.
+    ///
+    /// Pushed in by the owner, which is where the setting lives: the surface
+    /// only turns a typed keyword into the address the configured engine
+    /// expects.
+    search_template: String,
     #[cfg(test)]
     pub(crate) input_log: Vec<String>,
 }
@@ -204,6 +212,9 @@ impl BrowserSurface {
             active: false,
             _subscriptions: vec![address_subscription],
             address_input,
+            search_template: vibex_desktop_model::BrowserUiState::default()
+                .resolved_search_url()
+                .to_string(),
             #[cfg(test)]
             input_log: Vec::new(),
         }
@@ -308,6 +319,26 @@ impl BrowserSurface {
         self.tab
             .as_ref()
             .is_some_and(|tab| tab.status == BrowserTabStatus::Loading)
+    }
+
+    /// Points the address bar at the search engine the settings chose.
+    ///
+    /// Whatever a reader already typed stays put: the setting applies to the
+    /// next search, not to a bar someone is in the middle of filling.
+    pub fn set_search_template(&mut self, template: impl Into<String>, cx: &mut Context<Self>) {
+        let template = template.into();
+        if self.search_template == template {
+            return;
+        }
+        self.search_template = template;
+        cx.notify();
+    }
+
+    /// The engine the address bar would search with, for tests that pin the
+    /// wiring from the settings to an open panel.
+    #[cfg(test)]
+    pub(crate) fn search_template(&self) -> &str {
+        &self.search_template
     }
 
     /// Starts or stops the frame pump.
@@ -789,7 +820,7 @@ impl BrowserSurface {
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
             return;
         };
-        let url = normalize_address(&trimmed);
+        let url = normalize_address(&trimmed, &self.search_template);
         self.phase = SurfacePhase::Connecting;
         cx.spawn(async move |this, cx| {
             let result = transport.navigate(&tab_id, &url).await;
@@ -1708,8 +1739,8 @@ fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, String> {
 ///
 /// A bare host becomes `http://host`, and a bare word becomes a search — the
 /// same rule every browser address bar uses, so the panel does not surprise
-/// anyone.
-pub fn normalize_address(input: &str) -> String {
+/// anyone. The search goes to `search_template`, the engine the settings chose.
+pub fn normalize_address(input: &str, search_template: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return "about:blank".to_string();
@@ -1738,12 +1769,26 @@ pub fn normalize_address(input: &str) -> String {
     if looks_like_host && url::Url::parse(&format!("http://{trimmed}")).is_ok() {
         return format!("http://{trimmed}");
     }
-    // Anything else is a search. `query_pairs_mut` does the percent-encoding,
-    // which is exactly the form-encoding a search box needs.
-    let mut search = url::Url::parse("https://duckduckgo.com/")
-        .expect("the search base URL is a valid absolute URL");
-    search.query_pairs_mut().append_pair("q", trimmed);
-    search.to_string()
+    search_url(search_template, trimmed)
+}
+
+/// Fills a search engine's `{query}` with a keyword.
+///
+/// The keyword is form-encoded, which is what a search box needs for spaces,
+/// `&` and non-ASCII text. A template that lost its placeholder can only come
+/// from a caller that bypassed the settings, so it still searches rather than
+/// opening the engine's home page with the keyword dropped.
+pub fn search_url(search_template: &str, query: &str) -> String {
+    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+    if search_template.contains(SEARCH_QUERY_PLACEHOLDER) {
+        return search_template.replace(SEARCH_QUERY_PLACEHOLDER, &encoded);
+    }
+    let separator = if search_template.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!("{search_template}{separator}q={encoded}")
 }
 
 /// One key identity in the terms the page understands.
@@ -2218,34 +2263,65 @@ mod tests {
     use super::*;
     use gpui::{Entity, VisualTestContext};
 
+    /// The engine the settings chose, which every case below leans on.
+    const GOOGLE: &str = "https://www.google.com/search?q={query}";
+
     #[test]
     fn a_bare_host_becomes_http() {
-        assert_eq!(normalize_address("localhost:5173"), "http://localhost:5173");
-        assert_eq!(normalize_address("example.com"), "http://example.com");
-        assert_eq!(normalize_address("127.0.0.1:3000"), "http://127.0.0.1:3000");
+        assert_eq!(
+            normalize_address("localhost:5173", GOOGLE),
+            "http://localhost:5173"
+        );
+        assert_eq!(
+            normalize_address("example.com", GOOGLE),
+            "http://example.com"
+        );
+        assert_eq!(
+            normalize_address("127.0.0.1:3000", GOOGLE),
+            "http://127.0.0.1:3000"
+        );
     }
 
     #[test]
     fn an_absolute_url_is_left_alone() {
         assert_eq!(
-            normalize_address("https://example.com/a?b=1"),
+            normalize_address("https://example.com/a?b=1", GOOGLE),
             "https://example.com/a?b=1"
         );
-        assert_eq!(normalize_address("about:blank"), "about:blank");
+        assert_eq!(normalize_address("about:blank", GOOGLE), "about:blank");
     }
 
     #[test]
-    fn a_bare_word_becomes_a_search() {
-        let url = normalize_address("hello world");
-        assert!(url.starts_with("https://duckduckgo.com/?q="));
-        // Query encoding turns the space into `+`, which is what a search box
-        // needs; both `+` and `%20` decode to a space.
+    fn a_bare_word_becomes_a_search_on_the_configured_engine() {
+        let url = normalize_address("hello world", GOOGLE);
+        assert!(url.starts_with("https://www.google.com/search?q="));
+        // Query encoding turns the space into `+` or `%20`; both decode to a
+        // space on every engine.
         assert!(url.contains("hello+world") || url.contains("hello%20world"));
+
+        // A different engine is one setting away, and the keyword still has to
+        // be encoded: an unencoded `&` would become a second parameter.
+        let baidu = normalize_address("a&b", "https://www.baidu.com/s?wd={query}");
+        assert_eq!(baidu, "https://www.baidu.com/s?wd=a%26b");
+    }
+
+    /// A template that lost its placeholder can only reach here from a caller
+    /// that bypassed the settings; the keyword must still be searched for.
+    #[test]
+    fn a_search_template_without_a_placeholder_still_carries_the_keyword() {
+        assert_eq!(
+            search_url("https://example.com/find", "hello world"),
+            "https://example.com/find?q=hello+world"
+        );
+        assert_eq!(
+            search_url("https://example.com/find?lang=en", "hi"),
+            "https://example.com/find?lang=en&q=hi"
+        );
     }
 
     #[test]
     fn empty_input_stays_blank() {
-        assert_eq!(normalize_address("   "), "about:blank");
+        assert_eq!(normalize_address("   ", GOOGLE), "about:blank");
     }
 
     #[test]

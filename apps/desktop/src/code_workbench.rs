@@ -66,16 +66,16 @@ use vibex_core::{
     VibexError, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    BoundedImageCache, ContentPreviewKind, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, EditorAutosaveMode,
-    EditorBufferAvailability, EditorBufferRegistry, EditorExternalState, EditorRecoverySnapshot,
-    FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind, FileMutationKind, FileTreeLoadState,
-    FileTreeProjection, GitCommitPatchRow, GitMutationKind, GitPathSelectionState, GitQueryKind,
-    GitSelectionKey, GitTreeRow, GitTreeRowKind, GitWorkbenchMode, GitWorkbenchPresentation,
-    GitWorkbenchState, ImageCacheKey, PendingFileMutation, PreviewCloseDisposition, PreviewPane,
-    PreviewSplitNode, PreviewSplitPosition, PreviewState, PreviewTab, PreviewTarget,
-    UnifiedDiffLineKind, WorktreeLifecycleDisplayState, WorktreeLifecycleView,
-    clamp_editor_autosave_delay_ms, content_preview_kind, content_preview_kind_for_path,
-    file_icon_descriptor, mutation_scope,
+    BoundedImageCache, BrowserUiState, ContentPreviewKind, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
+    EditorAutosaveMode, EditorBufferAvailability, EditorBufferRegistry, EditorExternalState,
+    EditorRecoverySnapshot, FILE_TREE_POLL_MS, FileExplorerRow, FileIconKind, FileMutationKind,
+    FileTreeLoadState, FileTreeProjection, GitCommitPatchRow, GitMutationKind,
+    GitPathSelectionState, GitQueryKind, GitSelectionKey, GitTreeRow, GitTreeRowKind,
+    GitWorkbenchMode, GitWorkbenchPresentation, GitWorkbenchState, ImageCacheKey,
+    PendingFileMutation, PreviewCloseDisposition, PreviewPane, PreviewSplitNode,
+    PreviewSplitPosition, PreviewState, PreviewTab, PreviewTarget, UnifiedDiffLineKind,
+    WorktreeLifecycleDisplayState, WorktreeLifecycleView, clamp_editor_autosave_delay_ms,
+    content_preview_kind, content_preview_kind_for_path, file_icon_descriptor, mutation_scope,
 };
 use vibex_desktop_runtime::validate_external_open_url;
 use vibex_markdown::{
@@ -1129,6 +1129,9 @@ pub struct CodeWorkbench {
     /// the previous run used. A tab must not be reopened twice, and dropping an
     /// entry cancels the attempt.
     browser_restores: BTreeMap<String, Task<()>>,
+    /// The page a new browser tab opens and the engine the address bar
+    /// searches with. Owned by the settings; the workbench only applies it.
+    browser_preferences: BrowserUiState,
     /// The runtime's browser event stream, started with the first surface.
     browser_events_task: Option<Task<()>>,
     workspace: Option<WorkbenchWorkspace>,
@@ -1319,6 +1322,7 @@ impl CodeWorkbench {
             browser_tab_labels: BTreeMap::new(),
             browser_surface_subscriptions: BTreeMap::new(),
             browser_restores: BTreeMap::new(),
+            browser_preferences: BrowserUiState::default(),
             browser_events_task: None,
             workspace: None,
             pending_workspace: None,
@@ -2435,6 +2439,30 @@ impl CodeWorkbench {
             // transport that arrives later still has to reopen the browser tabs
             // the previous run left open.
             self.restore_browser_bindings(cx);
+        }
+        cx.notify();
+    }
+
+    /// Applies the browser preferences the settings own.
+    ///
+    /// The start page is read when a tab is opened, so only the search template
+    /// has to reach surfaces that already exist.
+    pub(crate) fn set_browser_preferences(
+        &mut self,
+        mut preferences: BrowserUiState,
+        cx: &mut Context<Self>,
+    ) {
+        preferences.normalize();
+        if self.browser_preferences == preferences {
+            return;
+        }
+        self.browser_preferences = preferences;
+        let template = self.browser_preferences.resolved_search_url().to_string();
+        let surfaces = self.browser_surfaces.values().cloned().collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_search_template(template.clone(), cx)
+            });
         }
         cx.notify();
     }
@@ -4484,6 +4512,10 @@ impl CodeWorkbench {
             return true;
         }
         let entity = cx.new(|cx| BrowserSurface::new(browser_tab_id.to_string(), window, cx));
+        let search_template = self.browser_preferences.resolved_search_url().to_string();
+        entity.update(cx, |surface, cx| {
+            surface.set_search_template(search_template, cx)
+        });
         let subscription = cx.subscribe(
             &entity,
             |workbench, surface, event: &BrowserSurfaceEvent, cx| {
@@ -4577,18 +4609,14 @@ impl CodeWorkbench {
             return;
         }
         let surface = self.browser_surfaces.get(browser_tab_id).cloned();
-        let Some(url) = self.preview.browser_url(browser_tab_id).map(str::to_string) else {
-            self.report_unattached_browser_tab(
-                browser_tab_id,
-                locale::text(
-                    "This browser tab is no longer open. Reopen it from the browser panel.",
-                    "该浏览器标签已关闭。请从浏览器面板重新打开。",
-                    "該瀏覽器分頁已關閉。請從瀏覽器面板重新開啟。",
-                ),
-                cx,
-            );
-            return;
-        };
+        // A tab saved before addresses were remembered has none to reopen, so it
+        // opens the start page: the same answer a new tab gets, which is what
+        // the reader asked for when the tab was created.
+        let url = self
+            .preview
+            .browser_url(browser_tab_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.browser_preferences.resolved_start_page().to_string());
         let Some(transport) = self.browser_transport.clone() else {
             self.report_unattached_browser_tab(
                 browser_tab_id,
@@ -5073,7 +5101,11 @@ impl CodeWorkbench {
             cx.notify();
             return;
         };
-        let url = url.filter(|url| !url.trim().is_empty());
+        // A request without an address is "a new tab", and a new tab opens the
+        // page the settings chose rather than a blank one.
+        let url = url
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| self.browser_preferences.resolved_start_page().to_string());
         // The right-rail entry point reuses the tab it opened before; an
         // explicit "new browser" always makes another one.
         let existing = reuse_existing
@@ -5111,7 +5143,7 @@ impl CodeWorkbench {
             };
             let (tab_string, tab_id, tab_url) = match existing {
                 Some((tab_string, tab_id)) => (tab_string, tab_id, existing_url),
-                None => match transport.create_tab(&session_id, url.as_deref()).await {
+                None => match transport.create_tab(&session_id, Some(url.as_str())).await {
                     Ok(tab) => (tab.tab_id.as_str().to_string(), tab.tab_id, Some(tab.url)),
                     Err(error) => {
                         let _ = this.update(cx, |workbench, cx| {
@@ -18785,11 +18817,13 @@ mod tests {
         });
     }
 
-    // A saved entry from before addresses were remembered cannot be reopened.
-    // It must say so, because the idle placeholder is what made the panel look
-    // permanently stuck.
+    // A saved entry from before addresses were remembered has no page to
+    // reopen, so it opens the start page: the same answer a new tab gets, and
+    // never the idle placeholder that made the panel look stuck.
     #[gpui::test]
-    fn a_restored_browser_tab_without_an_address_explains_itself(cx: &mut gpui::TestAppContext) {
+    fn a_restored_browser_tab_without_an_address_opens_the_start_page(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (workbench, cx) = fixture_workbench(cx);
         restore_browser_layout(&workbench, cx, "browser_tab_previous_run", None);
         let transport = std::sync::Arc::new(IdleBrowserTransport::default());
@@ -18798,27 +18832,98 @@ mod tests {
             workbench.set_browser_transport(Some(transport), cx);
         });
         cx.run_until_parked();
+
+        assert_eq!(
+            urls.lock().unwrap().clone(),
+            vec![Some("https://www.google.com/".to_string())],
+            "a tab with no remembered page opens the configured start page"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            assert_eq!(workbench.browser_bindings.len(), 1);
+            assert!(workbench.browser_restores.is_empty());
+        });
+    }
+
+    // A browser tab opened without an address — the rail button, the "+" menu —
+    // opens the start page the settings chose instead of a blank document.
+    #[gpui::test]
+    fn a_new_browser_tab_opens_the_configured_start_page(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_preferences(
+                BrowserUiState {
+                    start_page: vibex_desktop_model::BrowserStartPage::Custom,
+                    start_page_url: "https://example.com/home".to_string(),
+                    ..BrowserUiState::default()
+                },
+                cx,
+            );
+        });
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        // An address the caller names is opened as given: the start page is
+        // only the answer when nobody named one.
         workbench.update_in(cx, |workbench, window, cx| {
-            workbench.ensure_browser_surface("browser_tab_previous_run", window, cx);
+            workbench.open_browser(Some("http://127.0.0.1:3000/".to_string()), window, cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_browser_new_tab(None, window, cx);
         });
         cx.run_until_parked();
 
-        assert!(
-            urls.lock().unwrap().is_empty(),
-            "an unknown address is not guessed at"
+        assert_eq!(
+            urls.lock().unwrap().clone(),
+            vec![
+                Some("http://127.0.0.1:3000/".to_string()),
+                Some("https://example.com/home".to_string()),
+            ],
+            "an explicit address is kept, and a tab opened without one uses the configured start page"
         );
-        workbench.read_with(cx, |workbench, _| {
-            assert!(
-                !workbench
-                    .browser_bindings
-                    .contains_key("browser_tab_previous_run")
+    }
+
+    // The address bar searches with the engine the settings chose, and a change
+    // reaches surfaces that are already open.
+    #[gpui::test]
+    fn the_settings_engine_reaches_every_browser_surface(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(
+            &workbench,
+            cx,
+            "browser_tab_previous_run",
+            Some("about:blank"),
+        );
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+
+        let template = "https://www.baidu.com/s?wd={query}";
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_preferences(
+                BrowserUiState {
+                    search_engine: vibex_desktop_model::BrowserSearchEngine::Custom,
+                    search_engine_url: template.to_string(),
+                    ..BrowserUiState::default()
+                },
+                cx,
             );
-            assert!(workbench.browser_restores.is_empty());
-            assert!(
-                workbench
-                    .browser_surfaces
-                    .contains_key("browser_tab_previous_run"),
-                "the tab still renders a boundary rather than nothing"
+        });
+        workbench.read_with(cx, |workbench, cx| {
+            let surface = workbench
+                .browser_surfaces
+                .values()
+                .next()
+                .expect("the restored tab has a surface");
+            assert_eq!(
+                surface.read_with(cx, |surface, _| surface.search_template().to_string()),
+                template,
+                "an open surface follows the setting"
             );
         });
     }

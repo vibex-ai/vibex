@@ -555,6 +555,11 @@ mod tests {
 
     #[test]
     fn shared_highlight_tokens_preserve_the_locked_component_defaults() {
+        // This reads the same process-wide slots as
+        // `an_unset_slot_paints_the_catalog_default`, so it needs the same
+        // guard: a test that points them at a named variant would otherwise
+        // make the locked defaults look like that variant's block.
+        let _guard = slot_guard();
         assert_eq!(
             shared_highlight_theme(GpuiThemeMode::Light).style,
             HighlightTheme::default_light().style
