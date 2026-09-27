@@ -8910,6 +8910,81 @@ impl CodeWorkbench {
             .into_any_element()
     }
 
+    /// Highlights the browser element a source line rendered.
+    ///
+    /// The editor's Alt+click asks for this. The answer is where the human is
+    /// already looking — the visible browser panel — so a panel that is not
+    /// open is a reason to say so, not to fail quietly.
+    fn reveal_source_in_browser(
+        &mut self,
+        path: String,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Every visible pane is a candidate: two panes can each show a browser
+        // tab, and only one of them renders this file. Asking them in order and
+        // stopping at the first hit beats picking one and calling it a miss.
+        let candidates = self
+            .active_browser_surface_ids
+            .iter()
+            .filter(|tab_id| self.browser_bindings.contains_key(*tab_id))
+            .filter_map(|tab_id| BrowserTabId::parse(tab_id.clone()).ok())
+            .collect::<Vec<_>>();
+        let Some(transport) = self.browser_transport.clone() else {
+            return;
+        };
+        if candidates.is_empty() {
+            window.push_notification(
+                hint_notification(
+                    NotificationType::Info,
+                    locale::text(
+                        "Open a browser panel to show the element this line renders",
+                        "请先打开浏览器面板，才能定位此行对应的元素",
+                        "請先開啟瀏覽器面板，才能定位此行對應的元素",
+                    ),
+                    cx,
+                ),
+                cx,
+            );
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let mut message = None;
+            let mut found = false;
+            for tab_id in &candidates {
+                match transport.highlight_source(tab_id, &path, line).await {
+                    Ok(match_result) if match_result.found => {
+                        // An approximate hit still says so: Vue hands back the
+                        // component file, not the line, and the human should not
+                        // read that as an exact match.
+                        found = true;
+                        message = match_result.detail;
+                        break;
+                    }
+                    Ok(match_result) => message = match_result.detail,
+                    Err(error) => message = Some(error.message),
+                }
+            }
+            if !found && message.is_none() {
+                message = Some(format!(
+                    "No element on the open pages was rendered by {path}:{line}"
+                ));
+            }
+            let _ = this.update_in(cx, |_workbench, window, cx| {
+                if let Some(message) = message {
+                    // A miss has to be visible: "I pressed it and nothing
+                    // happened" is the failure this feature must not have.
+                    window.push_notification(
+                        hint_notification(NotificationType::Info, message, cx),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     fn render_file_content(
         &mut self,
         path: String,
@@ -9300,6 +9375,34 @@ impl CodeWorkbench {
                         .font_family(self.code_font_family.clone())
                         .text_size(px(f32::from(self.code_font_size)))
                         .font_weight(code_font_weight(cx))
+                        // Alt+click is the code-to-element direction: the caret
+                        // has already moved by the time the button is released,
+                        // so the line under the pointer is the line that was
+                        // asked about.
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener({
+                                let reveal_path = path.clone();
+                                move |this, event: &gpui::MouseUpEvent, window, cx| {
+                                    if !event.modifiers.alt {
+                                        return;
+                                    }
+                                    let line = this
+                                        .editor_bindings
+                                        .get(&reveal_path)
+                                        .map(|binding| {
+                                            binding.input.read(cx).cursor_position().line as u32 + 1
+                                        })
+                                        .unwrap_or(1);
+                                    this.reveal_source_in_browser(
+                                        reveal_path.clone(),
+                                        line,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
+                        )
                         .child(
                             Editor::new(&binding.input)
                                 .appearance(false)
@@ -18608,6 +18711,10 @@ mod tests {
         created_tabs: Arc<std::sync::Mutex<Vec<BrowserTabId>>>,
         /// Addresses the panel asked each tab to open, in call order.
         created_urls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// The `(tab, path, line)` triples the editor asked to reveal.
+        reveals: Arc<std::sync::Mutex<Vec<(String, String, u32)>>>,
+        /// Answers `highlight_source` with a hit once set.
+        reveal_hits: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
@@ -18644,6 +18751,22 @@ mod tests {
                     "no element source",
                 ))
             })
+        }
+        fn highlight_source(
+            &self,
+            tab_id: &BrowserTabId,
+            path: &str,
+            line: u32,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::SourceElementMatch>
+        {
+            self.reveals.lock().unwrap().push((
+                tab_id.as_str().to_string(),
+                path.to_string(),
+                line,
+            ));
+            let found = self.reveal_hits.load(std::sync::atomic::Ordering::SeqCst);
+            let detail = (!found).then(|| format!("no element was rendered by {path}:{line}"));
+            Box::pin(async move { Ok(vibex_core::SourceElementMatch { found, detail }) })
         }
         fn ledger(
             &self,
@@ -19278,6 +19401,69 @@ mod tests {
             "the older surface is live again"
         );
         assert!(!surface_active(&second, cx));
+    }
+
+    // Alt+click in the editor is the code-to-element half of the pairing. It
+    // has to reach the tab the reader is looking at, carry the line the caret
+    // landed on, and — when the page cannot answer — say so instead of looking
+    // like a dead key.
+    #[gpui::test]
+    fn alt_click_in_the_editor_asks_the_visible_browser_tab_to_show_the_element(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workbench, cx) = fixture_workbench_with_root(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let reveals = transport.reveals.clone();
+        let hits = transport.reveal_hits.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(
+                Some(transport as std::sync::Arc<dyn crate::browser_transport::BrowserTransport>),
+                cx,
+            )
+        });
+        let session_id = BrowserSessionId::new();
+        let tab_id = BrowserTabId::new();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.adopt_browser_tab(session_id, tab_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.reveal_source_in_browser("src/App.tsx".to_string(), 12, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reveals.lock().unwrap().clone(),
+            vec![(tab_id.as_str().to_string(), "src/App.tsx".to_string(), 12)],
+            "the visible tab is asked about the line the caret sits on"
+        );
+
+        // The reverse direction only exists while a browser panel is on screen;
+        // with none open the answer is a hint, not a silent no-op.
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_preview_visible(false, cx);
+            workbench.reveal_source_in_browser("src/App.tsx".to_string(), 12, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reveals.lock().unwrap().len(),
+            1,
+            "no visible browser means no request to the runtime"
+        );
+
+        // And a hit is the quiet case: the page already shows the answer.
+        hits.store(true, std::sync::atomic::Ordering::SeqCst);
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.reveal_source_in_browser("src/App.tsx".to_string(), 40, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reveals.lock().unwrap().last().cloned(),
+            Some((tab_id.as_str().to_string(), "src/App.tsx".to_string(), 40)),
+            "a hit still goes through and does not need a banner"
+        );
     }
 
     #[gpui::test]
@@ -20356,6 +20542,32 @@ mod tests {
             CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Diff, window, cx)
         });
         let workbench = fixture.read_with(cx, |fixture, _| fixture.workbench.clone());
+        (workbench, cx)
+    }
+
+    /// The same fixture under the kit's `Root`.
+    ///
+    /// Anything that pushes a notification needs this: `push_notification`
+    /// resolves the window's first layer as `gpui_component::Root` and panics
+    /// without one. The production shell always installs it, so a test that
+    /// skips it is testing a window the app never builds.
+    fn fixture_workbench_with_root(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<CodeWorkbench>, &mut gpui::VisualTestContext) {
+        cx.update(gpui_component::init);
+        let captured: std::rc::Rc<std::cell::RefCell<Option<Entity<CodeWorkbench>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let fixture =
+                cx.new(|cx| CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Diff, window, cx));
+            *slot.borrow_mut() = Some(fixture.read(cx).workbench.clone());
+            gpui_component::Root::new(fixture, window, cx).bordered(false)
+        });
+        let workbench = captured
+            .borrow()
+            .clone()
+            .expect("the fixture is built before the window renders");
         (workbench, cx)
     }
 

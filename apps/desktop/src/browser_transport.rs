@@ -27,7 +27,8 @@ use vibex_browser::{
 use vibex_core::{
     BrowserActionRecord, BrowserAvailability, BrowserElementSource, BrowserFrame, BrowserSession,
     BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner,
-    BrowserToolTier, BrowserUnavailableReason, VibexError, VibexSessionId, WorkspaceId,
+    BrowserToolTier, BrowserUnavailableReason, SourceElementMatch, VibexError, VibexSessionId,
+    WorkspaceId,
 };
 
 /// Failure reported by a [`BrowserTransport`] operation.
@@ -242,6 +243,17 @@ pub trait BrowserTransport: Send + Sync + 'static {
         y: f64,
     ) -> BrowserTransportFuture<'_, BrowserElementSource>;
 
+    /// Highlights the element a source line rendered.
+    ///
+    /// The reverse of [`Self::element_source_at`]: the editor points at code and
+    /// the page shows the element. `detail` explains a miss.
+    fn highlight_source(
+        &self,
+        tab_id: &BrowserTabId,
+        path: &str,
+        line: u32,
+    ) -> BrowserTransportFuture<'_, SourceElementMatch>;
+
     /// Opens the frame stream and turns the screencast on.
     fn subscribe_frames(
         &self,
@@ -384,6 +396,23 @@ impl BrowserTransport for LocalBrowserTransport {
         Box::pin(self.run(async move {
             service
                 .element_source_at(&tab_id, x, y)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn highlight_source(
+        &self,
+        tab_id: &BrowserTabId,
+        path: &str,
+        line: u32,
+    ) -> BrowserTransportFuture<'_, SourceElementMatch> {
+        let tab_id = tab_id.clone();
+        let path = path.to_string();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .highlight_source(&tab_id, &path, line)
                 .await
                 .map_err(Into::into)
         }))
@@ -667,6 +696,21 @@ impl BrowserTransport for RemoteBrowserTransport {
                 .browser_ledger(session_id)
                 .await
                 .map_err(Into::into)
+        })
+    }
+
+    fn highlight_source(
+        &self,
+        _tab_id: &BrowserTabId,
+        _path: &str,
+        _line: u32,
+    ) -> BrowserTransportFuture<'_, SourceElementMatch> {
+        Box::pin(async {
+            Err(BrowserTransportError::new(
+                "remote_browser_unavailable",
+                "The paired runtime is remote; revealing an element needs the live panel transport, \
+                 which is not implemented yet.",
+            ))
         })
     }
 

@@ -33,6 +33,23 @@ use crate::visual;
 const MAX_WAIT_MS: u64 = 60_000;
 /// Default wait.
 const DEFAULT_WAIT_MS: u64 = 10_000;
+/// The selector the source probes mark their target with.
+const MARKER_SELECTOR: &str = "[data-vibex-source-target=\"1\"]";
+
+/// The box `Overlay.highlightNode` draws for an element.
+///
+/// One style for both directions — an Agent's action and a human's code
+/// lookup — so a watcher never has to ask which one they are looking at.
+fn highlight_config() -> Value {
+    json!({
+        "showInfo": false,
+        "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.25 },
+        "paddingColor": { "r": 147, "g": 196, "b": 125, "a": 0.35 },
+        "borderColor": { "r": 255, "g": 229, "b": 153, "a": 0.7 },
+        "marginColor": { "r": 246, "g": 178, "b": 107, "a": 0.35 },
+    })
+}
+
 /// Longest the settle wait runs before it gives up and captures anyway.
 const SETTLE_BUDGET_MS: u64 = 4_000;
 
@@ -402,13 +419,7 @@ impl BrowserService {
             "Overlay.highlightNode",
             json!({
                 "backendNodeId": backend_node_id,
-                "highlightConfig": {
-                    "showInfo": false,
-                    "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.25 },
-                    "paddingColor": { "r": 147, "g": 196, "b": 125, "a": 0.35 },
-                    "borderColor": { "r": 255, "g": 229, "b": 153, "a": 0.7 },
-                    "marginColor": { "r": 246, "g": 178, "b": 107, "a": 0.35 },
-                },
+                "highlightConfig": highlight_config(),
             }),
             SHORT_TIMEOUT_MS,
         )
@@ -2121,6 +2132,106 @@ impl BrowserService {
                 )
             })?;
         self.probe_element_source(&session, backend_node_id).await
+    }
+
+    /// Highlights the element a source line rendered.
+    ///
+    /// The editor's Alt+click asks this: the human points at code and the page
+    /// shows them the element. It is the reverse of
+    /// [`Self::element_source_at`] and reads the same framework metadata, so a
+    /// page that cannot answer says why instead of highlighting the wrong
+    /// element.
+    pub async fn highlight_source(
+        &self,
+        tab_id: &BrowserTabId,
+        path: &str,
+        line: u32,
+    ) -> BrowserResult<vibex_core::SourceElementMatch> {
+        let (_, session) = self.inner().tab_session(tab_id).await?;
+        let script = element_source::source_mark_script(path, line);
+        let answer = cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({ "expression": script, "returnByValue": true }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let value = answer
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let matched = element_source::parse_source_mark(&value);
+        if !matched.found {
+            return Ok(matched);
+        }
+        // The script marked the element; the marker is what turns into a node
+        // the overlay can draw a box around.
+        let document = cdp(
+            &session,
+            "DOM.getDocument",
+            json!({ "depth": 0 }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let root = document
+            .get("root")
+            .and_then(|root| root.get("nodeId"))
+            .and_then(Value::as_i64);
+        if let Some(root) = root
+            && let Ok(selected) = cdp(
+                &session,
+                "DOM.querySelector",
+                json!({ "nodeId": root, "selector": MARKER_SELECTOR }),
+                BROWSER_CDP_COMMAND_TIMEOUT_MS,
+            )
+            .await
+            && let Some(node_id) = selected
+                .get("nodeId")
+                .and_then(Value::as_i64)
+                .filter(|node_id| *node_id != 0)
+        {
+            let _ = cdp(
+                &session,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "nodeId": node_id }),
+                SHORT_TIMEOUT_MS,
+            )
+            .await;
+            let _ = cdp(
+                &session,
+                "Overlay.highlightNode",
+                json!({ "nodeId": node_id, "highlightConfig": highlight_config() }),
+                SHORT_TIMEOUT_MS,
+            )
+            .await;
+            // The highlight is a snapshot of one moment: hide it on the same
+            // schedule an action highlight uses, so a stale box never sits on a
+            // page that has moved on.
+            let inner = std::sync::Arc::clone(self.inner());
+            let tab_id = tab_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(BROWSER_ACTION_HIGHLIGHT_MS)).await;
+                if let Ok((_, session)) = inner.tab_session(&tab_id).await {
+                    let _ = cdp(
+                        &session,
+                        "Overlay.hideHighlight",
+                        json!({}),
+                        SHORT_TIMEOUT_MS,
+                    )
+                    .await;
+                }
+            });
+        }
+        // Leave the page as it was found, marker and all.
+        let _ = cdp(
+            &session,
+            "Runtime.evaluate",
+            json!({ "expression": element_source::marker_setup_script(), "returnByValue": true }),
+            SHORT_TIMEOUT_MS,
+        )
+        .await;
+        Ok(matched)
     }
 
     /// Tags one backend node, runs the framework probe, and untags it.

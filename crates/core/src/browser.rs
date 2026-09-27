@@ -167,6 +167,18 @@ pub fn fence_untrusted_content(body: &str) -> String {
     format!("{BROWSER_UNTRUSTED_CONTENT_BEGIN}\n{body}\n{BROWSER_UNTRUSTED_CONTENT_END}")
 }
 
+/// What a source-to-element lookup found.
+///
+/// Shared because both sides need it: the runtime produces it and the client
+/// renders it, and "found nothing, because" must not be lost in between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceElementMatch {
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Why a browser operation ended the way it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

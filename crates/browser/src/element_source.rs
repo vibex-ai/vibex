@@ -21,7 +21,7 @@
 //! failing silently.
 
 use serde_json::{Value, json};
-use vibex_core::BrowserElementSource;
+use vibex_core::{BrowserElementSource, SourceElementMatch};
 
 /// The JavaScript probe run inside the page.
 ///
@@ -230,6 +230,111 @@ pub fn normalize_source_path(raw: &str) -> Option<String> {
     Some(path.to_string())
 }
 
+/// Builds the script that marks the element rendered by a source line.
+///
+/// The reverse of [`ELEMENT_SOURCE_PROBE`]: the editor knows a file and a line,
+/// and the page has to say which element came from it. It is the same metadata
+/// read the other way — Svelte and Vue publish it on the element, React on the
+/// fiber — and the closest line wins, because a component's opening tag and its
+/// host element are often a few lines apart.
+pub fn source_mark_script(path: &str, line: u32) -> String {
+    let target = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const target = {target};
+  const line = {line};
+  const normalize = (raw) => {{
+    if (!raw) return null;
+    let value = String(raw).split('?')[0].split('#')[0];
+    value = value.replace(/^[a-z]+:\/\/[^/]+/i, '').replace(/^\/+/, '');
+    try {{ value = decodeURIComponent(value); }} catch (_) {{}}
+    return value || null;
+  }};
+  const matches = (raw) => {{
+    const value = normalize(raw);
+    if (!value) return false;
+    return value === target || value.endsWith('/' + target) || target.endsWith('/' + value);
+  }};
+  const clear = () => {{
+    document.querySelectorAll('[data-vibex-source-target="1"]').forEach((node) => {{
+      node.removeAttribute('data-vibex-source-target');
+    }});
+  }};
+  let best = null;
+  let bestDistance = Infinity;
+  let approximate = false;
+  const consider = (node, file, at) => {{
+    if (!node || node.nodeType !== 1 || !matches(file)) return;
+    const distance = at ? Math.abs(at - line) : 0;
+    if (distance < bestDistance) {{
+      bestDistance = distance;
+      best = node;
+      approximate = !at;
+    }}
+  }};
+
+  const elements = document.querySelectorAll('*');
+  const limit = Math.min(elements.length, 20000);
+  for (let index = 0; index < limit; index += 1) {{
+    const node = elements[index];
+    if (node.__svelte_meta && node.__svelte_meta.loc) {{
+      consider(node, node.__svelte_meta.loc.file, node.__svelte_meta.loc.line);
+      continue;
+    }}
+    if (node.__vueParentComponent) {{
+      const definition = node.__vueParentComponent.type || {{}};
+      consider(node, definition.__file, null);
+    }}
+  }}
+
+  if (!best) {{
+    const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    if (hook && hook.renderers && hook.getFiberRoots) {{
+      const roots = [];
+      hook.renderers.forEach((_renderer, rendererId) => {{
+        try {{ hook.getFiberRoots(rendererId).forEach((root) => roots.push(root)); }} catch (_) {{}}
+      }});
+      const stack = roots.map((root) => root.current).filter(Boolean);
+      const seen = new Set();
+      while (stack.length) {{
+        const fiber = stack.pop();
+        if (!fiber || seen.has(fiber)) continue;
+        seen.add(fiber);
+        const source = fiber._debugSource;
+        if (source && fiber.stateNode && fiber.stateNode.nodeType === 1) {{
+          consider(fiber.stateNode, source.fileName, source.lineNumber);
+        }}
+        if (fiber.child) stack.push(fiber.child);
+        if (fiber.sibling) stack.push(fiber.sibling);
+      }}
+    }}
+  }}
+
+  clear();
+  if (!best) {{
+    return {{ found: false, detail: 'no element on this page was rendered by ' + target }};
+  }}
+  best.setAttribute('data-vibex-source-target', '1');
+  try {{ best.scrollIntoView({{ block: 'center', inline: 'nearest' }}); }} catch (_) {{}}
+  return {{
+    found: true,
+    detail: approximate ? 'the framework reports the file but not an exact line' : null,
+  }};
+}})()"#
+    )
+}
+
+/// Parses the answer of [`source_mark_script`].
+pub fn parse_source_mark(value: &Value) -> SourceElementMatch {
+    let found = value.get("found").and_then(Value::as_bool).unwrap_or(false);
+    let detail = value
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string);
+    SourceElementMatch { found, detail }
+}
+
 /// Builds the JSON the page probe is invoked with.
 pub fn probe_call_params(backend_node_id: i64) -> Value {
     json!({ "backendNodeId": backend_node_id })
@@ -323,6 +428,44 @@ mod tests {
     fn path_traversal_is_rejected() {
         assert_eq!(normalize_source_path("/../../etc/passwd"), None);
         assert_eq!(normalize_source_path("http://x/../secret"), None);
+    }
+
+    #[test]
+    fn the_reverse_probe_quotes_the_path_and_keeps_the_line() {
+        let script = source_mark_script("src/App.tsx", 42);
+        assert!(script.contains("const target = \"src/App.tsx\";"));
+        assert!(script.contains("const line = 42;"));
+        // Both frameworks are consulted, and the marker is what the runtime
+        // resolves into a node afterwards.
+        assert!(script.contains("__svelte_meta"));
+        assert!(script.contains("__vueParentComponent"));
+        assert!(script.contains("__REACT_DEVTOOLS_GLOBAL_HOOK__"));
+        assert!(script.contains("data-vibex-source-target"));
+    }
+
+    #[test]
+    fn a_path_with_quotes_cannot_break_out_of_the_script() {
+        let script = source_mark_script("src/we\"ird.tsx", 1);
+        assert!(script.contains(r#"const target = "src/we\"ird.tsx";"#));
+    }
+
+    #[test]
+    fn source_mark_results_parse_both_answers() {
+        let found = parse_source_mark(&json!({ "found": true, "detail": null }));
+        assert!(found.found);
+        assert_eq!(found.detail, None);
+
+        let approximate = parse_source_mark(&json!({
+            "found": true,
+            "detail": "the framework reports the file but not an exact line"
+        }));
+        assert!(approximate.found);
+        assert!(approximate.detail.is_some());
+
+        let missing = parse_source_mark(&json!({ "found": false, "detail": "no element" }));
+        assert!(!missing.found);
+        // A malformed answer is a miss, never a silent success.
+        assert!(!parse_source_mark(&Value::Null).found);
     }
 
     #[test]

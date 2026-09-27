@@ -116,9 +116,9 @@ pub use browser::{
     BrowserNetworkEntry, BrowserObservation, BrowserOperationStatus, BrowserRecordingStep,
     BrowserSession, BrowserSessionSnapshot, BrowserTab, BrowserTabOwner, BrowserTabStatus,
     BrowserToolDelivery, BrowserToolTier, BrowserUnavailableReason, BrowserVisualDiff,
-    browser_mcp_session_token, fence_untrusted_content, is_builtin_mcp_server_id, is_cross_origin,
-    is_loopback_origin, normalize_origin, redact_url_for_ledger, url_host_redacted,
-    verify_browser_mcp_session_token,
+    SourceElementMatch, browser_mcp_session_token, fence_untrusted_content,
+    is_builtin_mcp_server_id, is_cross_origin, is_loopback_origin, normalize_origin,
+    redact_url_for_ledger, url_host_redacted, verify_browser_mcp_session_token,
 };
 
 pub use canonical_json::canonical_json_vec;

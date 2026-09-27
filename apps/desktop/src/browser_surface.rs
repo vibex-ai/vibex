@@ -3326,6 +3326,8 @@ mod tests {
         element_source: Arc<std::sync::Mutex<Option<vibex_core::BrowserElementSource>>>,
         /// The viewport points Alt+click asked about.
         source_calls: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
+        /// The source locations the editor asked the browser to reveal.
+        reveals: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
         /// How many times the frame stream was asked for, and how many of the
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -3342,6 +3344,7 @@ mod tests {
                 ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
                 element_source: Arc::new(std::sync::Mutex::new(None)),
                 source_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                reveals: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3379,6 +3382,22 @@ mod tests {
             let ledger = self.ledger.lock().unwrap().clone();
             Box::pin(async move { Ok(ledger) })
         }
+        fn highlight_source(
+            &self,
+            _tab_id: &BrowserTabId,
+            path: &str,
+            line: u32,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::SourceElementMatch>
+        {
+            self.reveals.lock().unwrap().push((path.to_string(), line));
+            Box::pin(async {
+                Ok(vibex_core::SourceElementMatch {
+                    found: true,
+                    detail: None,
+                })
+            })
+        }
+
         fn element_source_at(
             &self,
             _tab_id: &BrowserTabId,
