@@ -33,8 +33,8 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use vibex_core::{
     BROWSER_BACKGROUND_IDLE_MS, BROWSER_CDP_COMMAND_TIMEOUT_MS, BROWSER_MAX_BACKGROUND_SESSIONS,
     BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_FRAME_BYTES, BROWSER_MAX_SESSION_LEDGER_ITEMS,
-    BROWSER_MAX_TABS, BrowserActionRecord, BrowserAvailability, BrowserConsoleEntry,
-    BrowserDialogRequest, BrowserExecutionSource, BrowserFrame, BrowserFrameFormat,
+    BROWSER_MAX_TABS, BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality,
+    BrowserConsoleEntry, BrowserDialogRequest, BrowserExecutionSource, BrowserFrame,
     BrowserFrameMetadata, BrowserNetworkEntry, BrowserSession, BrowserSessionId,
     BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner, BrowserTabStatus,
     BrowserToolTier, BrowserUnavailableReason, VibexSessionId, WorkspaceId, unix_timestamp_ms,
@@ -280,6 +280,10 @@ pub(crate) struct TabRecord {
     /// The `sessionId` field Chrome expects back on `screencastFrameAck`.
     pub(crate) frame_ack_session_id: Option<i64>,
     pub(crate) screencast_active: bool,
+    /// What the panel asked the encoder for. Kept on the tab because a
+    /// viewport change or a stream recovery restarts the screencast without
+    /// the client asking again.
+    pub(crate) frame_quality: BrowserCaptureQuality,
     pub(crate) diagnostics: TabDiagnostics,
     /// In-flight requests keyed by CDP request id, valued by diagnostic
     /// sequence, so a later failure or response updates the same row.
@@ -921,20 +925,26 @@ impl BrowserService {
     }
 
     /// Subscribes to a tab's screencast frames and turns the stream on.
+    ///
+    /// `quality` is stored on the tab before the encoder starts, so a later
+    /// restart — a viewport change, a recovered stream — keeps the reader's
+    /// choice without the client having to repeat it.
     pub async fn subscribe_frames(
         &self,
         tab_id: &BrowserTabId,
+        quality: BrowserCaptureQuality,
     ) -> BrowserResult<BrowserFrameSubscription> {
         let (receiver, session, connection, target_id) = {
-            let state = self.inner.state.lock().await;
-            let tab = state.tabs.get(tab_id).ok_or_else(|| {
-                BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
-            })?;
+            let mut state = self.inner.state.lock().await;
             let connection = state
                 .process
                 .as_ref()
                 .map(BrowserProcess::connection)
                 .ok_or_else(browser_not_running)?;
+            let tab = state.tabs.get_mut(tab_id).ok_or_else(|| {
+                BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
+            })?;
+            tab.frame_quality = quality;
             (
                 tab.frame.subscribe(),
                 CdpSession::new(
@@ -1610,7 +1620,7 @@ impl BrowserService {
         // The encoder budget is the panel's *physical* size: the emulated
         // viewport is logical pixels, so a 2x display would otherwise cap the
         // stream at half the resolution it is shown at.
-        let (width, height) = {
+        let (width, height, quality) = {
             let state = self.inner.state.lock().await;
             state
                 .tabs
@@ -1621,20 +1631,29 @@ impl BrowserService {
                     (
                         ((tab.viewport.0 as f64 * scale).round() as u32).max(1),
                         ((tab.viewport.1 as f64 * scale).round() as u32).max(1),
+                        tab.frame_quality,
                     )
                 })
-                .unwrap_or((DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT))
+                .unwrap_or((
+                    DEFAULT_VIEWPORT_WIDTH,
+                    DEFAULT_VIEWPORT_HEIGHT,
+                    BrowserCaptureQuality::default(),
+                ))
         };
+        // PNG carries no quality knob; Chrome rejects one alongside it.
+        let mut params = json!({
+            "format": quality.cdp_format(),
+            "maxWidth": width,
+            "maxHeight": height,
+            "everyNthFrame": 1,
+        });
+        if quality == BrowserCaptureQuality::Standard {
+            params["quality"] = json!(SCREENCAST_JPEG_QUALITY);
+        }
         cdp(
             session,
             "Page.startScreencast",
-            json!({
-                "format": "jpeg",
-                "quality": SCREENCAST_JPEG_QUALITY,
-                "maxWidth": width,
-                "maxHeight": height,
-                "everyNthFrame": 1,
-            }),
+            params,
             BROWSER_CDP_COMMAND_TIMEOUT_MS,
         )
         .await
@@ -1733,6 +1752,7 @@ impl BrowserService {
             frame_sequence: Arc::new(AtomicU64::new(0)),
             frame_ack_session_id: None,
             screencast_active: false,
+            frame_quality: BrowserCaptureQuality::default(),
             diagnostics: TabDiagnostics::default(),
             pending_requests: HashMap::new(),
             child_sessions: Vec::new(),
@@ -3045,6 +3065,7 @@ async fn adopt_discovered_target(
         frame_sequence: Arc::new(AtomicU64::new(0)),
         frame_ack_session_id: None,
         screencast_active: false,
+        frame_quality: BrowserCaptureQuality::default(),
         diagnostics: TabDiagnostics::default(),
         pending_requests: HashMap::new(),
         child_sessions: Vec::new(),
@@ -3324,7 +3345,9 @@ async fn handle_screencast_frame(inner: &Arc<BrowserInner>, cdp_session_id: &str
     let frame = BrowserFrame {
         tab_id: tab.tab_id.clone(),
         sequence,
-        format: BrowserFrameFormat::Jpeg,
+        // The format follows the encoder the tab was started with, so the
+        // client's decoder is told the truth instead of sniffing bytes.
+        format: tab.frame_quality.frame_format(),
         bytes,
         metadata: frame_metadata,
     };

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use vibex_browser::{
     BrowserInput, BrowserService, BrowserServiceConfig, BrowserServiceEvent, BrowserSessionKey,
 };
-use vibex_core::BrowserTabOwner;
+use vibex_core::{BrowserCaptureQuality, BrowserTabOwner};
 
 /// A page whose whole viewport is a `target="_blank"` link.
 const PAGE: &str = "data:text/html,<a id=l href='about:blank' target='_blank' \
@@ -43,7 +43,7 @@ async fn a_page_opened_tab_is_adopted_and_closed_like_any_other() {
     // "Screencast is already active": reopening a panel tab takes this path.
     for _ in 0..2 {
         service
-            .subscribe_frames(&first)
+            .subscribe_frames(&first, BrowserCaptureQuality::Standard)
             .await
             .expect("the screencast restarts");
     }
@@ -147,7 +147,10 @@ async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
         .await
         .expect("a tab");
     service.set_viewport(&opener, 800, 600, 1.0).await.ok();
-    service.subscribe_frames(&opener).await.ok();
+    service
+        .subscribe_frames(&opener, BrowserCaptureQuality::Standard)
+        .await
+        .ok();
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // The tab this test created announces itself first.

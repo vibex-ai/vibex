@@ -41,10 +41,10 @@ use gpui_component::{
 use image::Frame;
 use vibex_browser::BrowserInput;
 use vibex_core::{
-    BrowserActionKind, BrowserActionRecord, BrowserAvailability, BrowserDialogRequest,
-    BrowserExecutionSource, BrowserFrame, BrowserFrameMetadata, BrowserOperationStatus,
-    BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus, BrowserUnavailableReason,
-    unix_timestamp_ms,
+    BrowserActionKind, BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality,
+    BrowserDialogRequest, BrowserExecutionSource, BrowserFrame, BrowserFrameMetadata,
+    BrowserOperationStatus, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus,
+    BrowserUnavailableReason, unix_timestamp_ms,
 };
 
 use vibex_desktop_model::SEARCH_QUERY_PLACEHOLDER;
@@ -143,6 +143,9 @@ pub enum BrowserSurfaceEvent {
         line: Option<u32>,
         approximate: bool,
     },
+    /// The reader switched the encoder from the toolbar, so the choice should
+    /// outlive this surface and reach the settings that own it.
+    CaptureQualityChanged(BrowserCaptureQuality),
 }
 
 /// A GPUI surface for one browser tab.
@@ -239,6 +242,9 @@ pub struct BrowserSurface {
     /// only turns a typed keyword into the address the configured engine
     /// expects.
     search_template: String,
+    /// What the panel asks the encoder for. JPEG 80 by default; the toolbar's
+    /// HD toggle switches to lossless PNG.
+    capture_quality: BrowserCaptureQuality,
     #[cfg(test)]
     pub(crate) input_log: Vec<String>,
 }
@@ -309,6 +315,7 @@ impl BrowserSurface {
             search_template: vibex_desktop_model::BrowserUiState::default()
                 .resolved_search_url()
                 .to_string(),
+            capture_quality: BrowserCaptureQuality::default(),
             #[cfg(test)]
             input_log: Vec::new(),
         }
@@ -438,6 +445,29 @@ impl BrowserSurface {
     #[cfg(test)]
     pub(crate) fn search_template(&self) -> &str {
         &self.search_template
+    }
+
+    /// Switches the encoder between JPEG 80 and lossless PNG.
+    ///
+    /// A live stream has to be restarted for the change to take effect, which
+    /// is why this is not just a field write: the reader pressed the button
+    /// because the picture was not good enough, and leaving the old encoder
+    /// running would look like the button did nothing.
+    pub fn set_capture_quality(&mut self, quality: BrowserCaptureQuality, cx: &mut Context<Self>) {
+        if self.capture_quality == quality {
+            return;
+        }
+        self.capture_quality = quality;
+        if self.active && self.tab_id.is_some() && self.transport.is_some() {
+            self.start_frame_pump(cx);
+        }
+        cx.notify();
+    }
+
+    /// The encoder mode in force, for tests.
+    #[cfg(test)]
+    pub(crate) fn capture_quality(&self) -> BrowserCaptureQuality {
+        self.capture_quality
     }
 
     /// Starts or stops the frame pump.
@@ -665,6 +695,7 @@ impl BrowserSurface {
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
             return;
         };
+        let quality = self.capture_quality;
         self.frame_task = None;
         self.phase = SurfacePhase::Connecting;
         self.frame_task = Some(cx.spawn(async move |this, cx| {
@@ -680,7 +711,7 @@ impl BrowserSurface {
                         .timer(Duration::from_millis(400 * attempt as u64))
                         .await;
                 }
-                let mut stream = match transport.subscribe_frames(&tab_id).await {
+                let mut stream = match transport.subscribe_frames(&tab_id, quality).await {
                     Ok(stream) => stream,
                     Err(error) => {
                         let alive = this.update(cx, |surface, cx| {
@@ -1660,6 +1691,32 @@ impl BrowserSurface {
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_ledger(cx))),
             )
+            .child({
+                // The stream is JPEG 80 by default; text-heavy pages are the
+                // reason the toggle exists. The label is the mode in force, so
+                // the button says what the picture is doing rather than what
+                // pressing it would do.
+                let high = self.capture_quality == BrowserCaptureQuality::High;
+                Button::new("browser-quality")
+                    .label(if high { "HD" } else { "SD" })
+                    .ghost()
+                    .xsmall()
+                    .toggled(high)
+                    .tooltip(locale::text(
+                        "Lossless PNG frames; larger and slower than the default",
+                        "无损 PNG 画面；比默认更清晰，但更大更慢",
+                        "無損 PNG 畫面；比預設更清晰，但更大更慢",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = if this.capture_quality == BrowserCaptureQuality::High {
+                            BrowserCaptureQuality::Standard
+                        } else {
+                            BrowserCaptureQuality::High
+                        };
+                        this.set_capture_quality(next, cx);
+                        cx.emit(BrowserSurfaceEvent::CaptureQualityChanged(next));
+                    }))
+            })
             .when(!status.is_empty(), |this| {
                 this.child(
                     div()
@@ -3331,6 +3388,8 @@ mod tests {
         /// How many times the frame stream was asked for, and how many of the
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// The encoder mode each frame subscription asked for, in call order.
+        subscribe_qualities: Arc<std::sync::Mutex<Vec<BrowserCaptureQuality>>>,
         subscribe_failures: Arc<std::sync::atomic::AtomicUsize>,
         /// History moves, `true` for forward.
         history_moves: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -3346,6 +3405,7 @@ mod tests {
                 source_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 reveals: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                subscribe_qualities: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
@@ -3539,7 +3599,9 @@ mod tests {
         fn subscribe_frames(
             &self,
             _tab_id: &BrowserTabId,
+            quality: BrowserCaptureQuality,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, BrowserFrameStream> {
+            self.subscribe_qualities.lock().unwrap().push(quality);
             self.subscribe_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let remaining_failures = self
@@ -3615,6 +3677,64 @@ mod tests {
         assert_eq!(
             surface.read_with(&cx, |surface, _| surface.phase),
             SurfacePhase::Unavailable
+        );
+    }
+
+    // The HD toggle is only honest if the encoder really changes: a live JPEG
+    // stream would keep painting over the choice, so the switch has to restart
+    // the subscription with the new mode.
+    #[gpui::test]
+    fn switching_to_hd_restarts_the_stream_with_the_new_mode(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport::default());
+        let qualities = transport.subscribe_qualities.clone();
+        let calls = transport.subscribe_calls.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+
+        assert_eq!(
+            qualities.lock().unwrap().clone(),
+            vec![BrowserCaptureQuality::Standard],
+            "a panel starts on the small, fast encoder"
+        );
+
+        surface.update(&mut cx, |surface, cx| {
+            surface.set_capture_quality(BrowserCaptureQuality::High, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            qualities.lock().unwrap().clone(),
+            vec![BrowserCaptureQuality::Standard, BrowserCaptureQuality::High],
+            "the new mode reaches the runtime"
+        );
+        surface.read_with(&cx, |surface, _| {
+            assert_eq!(surface.capture_quality(), BrowserCaptureQuality::High);
+        });
+
+        // Pressing the mode already in force is not a restart: an idle flick of
+        // the button must not tear the picture down and re-encode it.
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        surface.update(&mut cx, |surface, cx| {
+            surface.set_capture_quality(BrowserCaptureQuality::High, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "setting the mode already in force changes nothing"
         );
     }
 

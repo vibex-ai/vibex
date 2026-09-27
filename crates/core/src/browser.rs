@@ -235,13 +235,32 @@ pub enum BrowserFrameFormat {
     Png,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserCaptureQuality {
     /// JPEG at quality 80 — the default; small and fast.
+    #[default]
     Standard,
     /// Lossless PNG — larger, used when text fidelity matters.
     High,
+}
+
+impl BrowserCaptureQuality {
+    /// The wire format this quality produces.
+    pub fn frame_format(self) -> BrowserFrameFormat {
+        match self {
+            Self::Standard => BrowserFrameFormat::Jpeg,
+            Self::High => BrowserFrameFormat::Png,
+        }
+    }
+
+    /// The value `Page.startScreencast` and `Page.captureScreenshot` expect.
+    pub fn cdp_format(self) -> &'static str {
+        match self {
+            Self::Standard => "jpeg",
+            Self::High => "png",
+        }
+    }
 }
 
 /// Actions recorded in the browser ledger. Kept unknown-safe: a newer runtime
@@ -845,6 +864,24 @@ pub fn is_cross_origin(current: &str, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_capture_quality_names_the_format_the_encoder_will_send() {
+        assert_eq!(
+            BrowserCaptureQuality::default(),
+            BrowserCaptureQuality::Standard
+        );
+        assert_eq!(
+            BrowserCaptureQuality::Standard.frame_format(),
+            BrowserFrameFormat::Jpeg
+        );
+        assert_eq!(BrowserCaptureQuality::Standard.cdp_format(), "jpeg");
+        assert_eq!(
+            BrowserCaptureQuality::High.frame_format(),
+            BrowserFrameFormat::Png
+        );
+        assert_eq!(BrowserCaptureQuality::High.cdp_format(), "png");
+    }
 
     #[test]
     fn frame_debug_hides_payload_bytes() {

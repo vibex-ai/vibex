@@ -25,10 +25,10 @@ use vibex_browser::{
     BrowserSessionKey,
 };
 use vibex_core::{
-    BrowserActionRecord, BrowserAvailability, BrowserElementSource, BrowserFrame, BrowserSession,
-    BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner,
-    BrowserToolTier, BrowserUnavailableReason, SourceElementMatch, VibexError, VibexSessionId,
-    WorkspaceId,
+    BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserElementSource,
+    BrowserFrame, BrowserSession, BrowserSessionId, BrowserSessionSnapshot, BrowserTab,
+    BrowserTabId, BrowserTabOwner, BrowserToolTier, BrowserUnavailableReason, SourceElementMatch,
+    VibexError, VibexSessionId, WorkspaceId,
 };
 
 /// Failure reported by a [`BrowserTransport`] operation.
@@ -258,6 +258,7 @@ pub trait BrowserTransport: Send + Sync + 'static {
     fn subscribe_frames(
         &self,
         tab_id: &BrowserTabId,
+        quality: BrowserCaptureQuality,
     ) -> BrowserTransportFuture<'_, BrowserFrameStream>;
 
     /// Stops the screencast. The target and the page state stay alive.
@@ -597,12 +598,13 @@ impl BrowserTransport for LocalBrowserTransport {
     fn subscribe_frames(
         &self,
         tab_id: &BrowserTabId,
+        quality: BrowserCaptureQuality,
     ) -> BrowserTransportFuture<'_, BrowserFrameStream> {
         let tab_id = tab_id.clone();
         let service = self.service.clone();
         let runtime = self.runtime.clone();
         Box::pin(self.run(async move {
-            let subscription = service.subscribe_frames(&tab_id).await?;
+            let subscription = service.subscribe_frames(&tab_id, quality).await?;
             Ok(BrowserFrameStream::Local(LocalFrameStream {
                 subscription,
                 runtime,
@@ -828,6 +830,7 @@ impl BrowserTransport for RemoteBrowserTransport {
     fn subscribe_frames(
         &self,
         _tab_id: &BrowserTabId,
+        _quality: BrowserCaptureQuality,
     ) -> BrowserTransportFuture<'_, BrowserFrameStream> {
         Box::pin(async move { Ok(BrowserFrameStream::Unavailable) })
     }
@@ -1125,7 +1128,9 @@ mod tests {
             let session = transport.ensure_workspace_session(&workspace).await?;
             let tab = transport.create_tab(&session, Some("about:blank")).await?;
             transport.set_viewport(&tab.tab_id, 800, 600, 1.0).await?;
-            let mut frames = transport.subscribe_frames(&tab.tab_id).await?;
+            let mut frames = transport
+                .subscribe_frames(&tab.tab_id, BrowserCaptureQuality::Standard)
+                .await?;
             // The pump awaits frames outside the transport, so the stream has to
             // install the context itself: an arriving frame acks from a Tokio
             // task. A blank page paints, so the first frame is what proves it.

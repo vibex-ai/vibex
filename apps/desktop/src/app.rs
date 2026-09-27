@@ -92,16 +92,16 @@ use vibex_core::{
     AgentListRequest, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
     AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
     AgentTimelineReasoningDisplayMode, AgentTokenUsage, AttachRuntimeRequest,
-    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
-    DetachRuntimeRequest, ElicitationField, ElicitationFieldKind, ElicitationRequest,
-    ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind, FileOperationKind,
-    FileOperationPatchFormat, ForkAgentSessionRequest, GetMessageSubmissionRequest,
-    GitProjectEligibilityState, GitProjectIneligibleReason, GitStatusSummary,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind, GitWorktreeDiscardRequest,
-    GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction, GoalPhase,
-    MessageAttachment, MessageSubmissionState, MessageSubmissionStatus, OpenWorkspaceRequest,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId, ProjectRecord,
-    PromptId, ProviderProfileSummary, RcImportPayload, RenameAgentSessionRequest,
+    BrowserCaptureQuality, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
+    CreateAgentSessionRequest, DetachRuntimeRequest, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationResolutionAction, FetchTimelineRequest, FileEntryKind,
+    FileOperationKind, FileOperationPatchFormat, ForkAgentSessionRequest,
+    GetMessageSubmissionRequest, GitProjectEligibilityState, GitProjectIneligibleReason,
+    GitStatusSummary, GitWorktreeAssistanceSessionRequest, GitWorktreeConflictKind,
+    GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
+    GoalPhase, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
+    OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
+    ProjectRecord, PromptId, ProviderProfileSummary, RcImportPayload, RenameAgentSessionRequest,
     ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
     RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
     RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
@@ -7619,6 +7619,11 @@ impl VibexWorkbench {
                         this.preview_fullscreen_active = *fullscreen;
                         cx.notify();
                     }
+                }
+                // The HD toggle lives in the panel, but the preference is the
+                // settings': the write is queued here so a restart keeps it.
+                CodeWorkbenchEvent::BrowserCaptureQualityChanged(quality) => {
+                    this.set_browser_capture_quality(*quality, cx);
                 }
             },
         ));
@@ -31783,6 +31788,23 @@ impl VibexWorkbench {
     fn set_browser_search_engine_url(&mut self, value: String, cx: &mut Context<Self>) {
         let next = BrowserUiState {
             search_engine_url: value,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
+    /// Stores the panel's HD toggle.
+    ///
+    /// The panel already restarted its own encoder; going through the same
+    /// apply path keeps the settings card and the panel from disagreeing about
+    /// what the mode is.
+    pub(crate) fn set_browser_capture_quality(
+        &mut self,
+        capture_quality: BrowserCaptureQuality,
+        cx: &mut Context<Self>,
+    ) {
+        let next = BrowserUiState {
+            capture_quality,
             ..self.ui_state.browser.clone()
         };
         self.apply_browser_preferences(next, cx);
@@ -62469,6 +62491,17 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_browser_capture_quality(
+        &mut self,
+        quality: BrowserCaptureQuality,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .workbench
+            .update(cx, |this, cx| this.set_browser_capture_quality(quality, cx));
+        cx.notify();
+    }
+
     fn network_proxy(&self, cx: &App) -> NetworkProxyUiState {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.network_proxy.clone())
@@ -65016,6 +65049,34 @@ impl FoundationSettings {
                     new_tab_rows,
                 ),
                 SettingsGroup::new(locale::text("Search", "搜索", "搜尋"), search_rows),
+                SettingsGroup::new(
+                    locale::text("Display", "显示", "顯示"),
+                    vec![setting_row(
+                        locale::text("Lossless frames", "无损画面", "無損畫面"),
+                        locale::text(
+                            "Stream the page as PNG instead of JPEG. Text is sharper, and the \
+                             stream is larger and slower; the panel's HD button switches the \
+                             same setting.",
+                            "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
+                            "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
+                        ),
+                        Switch::new("browser-lossless-frames")
+                            .small()
+                            .checked(browser.capture_quality == BrowserCaptureQuality::High)
+                            .on_click(cx.listener(|this, enabled, _, cx| {
+                                this.set_browser_capture_quality(
+                                    if *enabled {
+                                        BrowserCaptureQuality::High
+                                    } else {
+                                        BrowserCaptureQuality::Standard
+                                    },
+                                    cx,
+                                )
+                            })),
+                        stacked,
+                        cx,
+                    )],
+                ),
             ],
             cx,
         )

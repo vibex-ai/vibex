@@ -7,6 +7,7 @@
 //! was typed wrong.
 
 use serde::{Deserialize, Serialize};
+use vibex_core::BrowserCaptureQuality;
 
 /// Placeholder a custom search engine URL carries the keyword in.
 ///
@@ -125,6 +126,10 @@ pub struct BrowserUiState {
     /// [`SEARCH_QUERY_PLACEHOLDER`] where the keyword goes.
     #[serde(default)]
     pub search_engine_url: String,
+    /// What the panel's HD toggle selects. JPEG 80 unless the reader asked for
+    /// lossless frames.
+    #[serde(default)]
+    pub capture_quality: BrowserCaptureQuality,
 }
 
 impl BrowserUiState {
@@ -277,6 +282,7 @@ mod tests {
             start_page_url: "https://example.com/home".to_string(),
             search_engine: BrowserSearchEngine::Custom,
             search_engine_url: "https://example.com/find?q={query}".to_string(),
+            ..BrowserUiState::default()
         };
         state.normalize();
         assert_eq!(state.resolved_start_page(), "https://example.com/home");
@@ -297,6 +303,7 @@ mod tests {
             // A search URL without the placeholder opens the engine's home page
             // and looks like the search silently did nothing.
             search_engine_url: "https://example.com/find".to_string(),
+            ..BrowserUiState::default()
         };
         state.normalize();
         // The selection survives, because the reader is still editing it, but
@@ -389,6 +396,9 @@ mod tests {
             start_page_url: "https://example.com/".to_string(),
             search_engine: BrowserSearchEngine::DuckDuckGo,
             search_engine_url: "https://example.com/?q={query}".to_string(),
+            // The HD toggle is part of the same file, so a round trip that
+            // dropped it would silently reset the reader's choice.
+            capture_quality: BrowserCaptureQuality::High,
         };
         let encoded = serde_json::to_value(&state).expect("the preferences serialize");
         assert_eq!(
@@ -398,6 +408,7 @@ mod tests {
                 "startPageUrl": "https://example.com/",
                 "searchEngine": "duck_duck_go",
                 "searchEngineUrl": "https://example.com/?q={query}",
+                "captureQuality": "high",
             })
         );
         let decoded: BrowserUiState =

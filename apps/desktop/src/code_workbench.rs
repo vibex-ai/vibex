@@ -50,20 +50,20 @@ use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, LogicalSurfaceBounds,
 };
 use vibex_core::{
-    BrowserSessionId, BrowserTab, BrowserTabId, FileEncoding, FileEntryKind, FileLineEnding,
-    FileMutationRequest, FilePreviewKind, FileReadRequest, FileReadResponse, FileSearchRequest,
-    FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest, GitBranchSummary,
-    GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitCommitSummary,
-    GitDiffRequest, GitDiffResponse, GitHistoryAuthor, GitHistoryRequest, GitManagedWorktreeStatus,
-    GitRemoteActionKind, GitRemoteActionRequest, GitRemoteSummary, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile, GitWorktreeConflictKind,
-    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeConflictVersion,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeMergeStrategy,
-    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
-    GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeRestoreRequest,
-    GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId, TerminalSession, TerminalStatus,
-    VibexError, WorkspaceId, unix_timestamp_ms,
+    BrowserCaptureQuality, BrowserSessionId, BrowserTab, BrowserTabId, FileEncoding, FileEntryKind,
+    FileLineEnding, FileMutationRequest, FilePreviewKind, FileReadRequest, FileReadResponse,
+    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
+    GitBranchSummary, GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitSummary, GitDiffRequest, GitDiffResponse, GitHistoryAuthor, GitHistoryRequest,
+    GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitRemoteSummary,
+    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile,
+    GitWorktreeConflictKind, GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
+    GitWorktreeConflictVersion, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeMergeStrategy, GitWorktreeOperationRecord, GitWorktreeOperationRequest,
+    GitWorktreeOperationStatus, GitWorktreeReadinessRequest, GitWorktreeReadinessState,
+    GitWorktreeRestoreRequest, GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId,
+    TerminalSession, TerminalStatus, VibexError, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     BoundedImageCache, BrowserUiState, ContentPreviewKind, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
@@ -358,7 +358,12 @@ pub(crate) struct CodeWorkbenchPersistedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodeWorkbenchEvent {
-    LayoutChanged { fullscreen: bool },
+    LayoutChanged {
+        fullscreen: bool,
+    },
+    /// The reader flipped the browser panel's HD toggle, so the settings that
+    /// own the preference have to store it.
+    BrowserCaptureQualityChanged(BrowserCaptureQuality),
 }
 
 #[derive(Debug, Clone)]
@@ -2465,12 +2470,38 @@ impl CodeWorkbench {
         }
         self.browser_preferences = preferences;
         let template = self.browser_preferences.resolved_search_url().to_string();
+        let quality = self.browser_preferences.capture_quality;
         let surfaces = self.browser_surfaces.values().cloned().collect::<Vec<_>>();
         for surface in surfaces {
             surface.update(cx, |surface, cx| {
-                surface.set_search_template(template.clone(), cx)
+                surface.set_search_template(template.clone(), cx);
+                surface.set_capture_quality(quality, cx);
             });
         }
+        cx.notify();
+    }
+
+    /// Records the panel's HD toggle and lets the settings store it.
+    ///
+    /// The surface already switched its own encoder; this is about the choice
+    /// outliving both the panel and the process, so it goes out as an event
+    /// rather than being written here: the settings own the file.
+    fn apply_browser_capture_quality(
+        &mut self,
+        quality: BrowserCaptureQuality,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_preferences.capture_quality == quality {
+            return;
+        }
+        self.browser_preferences.capture_quality = quality;
+        // Every other open panel follows: it is one preference, not a switch
+        // per tab.
+        let surfaces = self.browser_surfaces.values().cloned().collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| surface.set_capture_quality(quality, cx));
+        }
+        cx.emit(CodeWorkbenchEvent::BrowserCaptureQualityChanged(quality));
         cx.notify();
     }
 
@@ -4585,6 +4616,12 @@ impl CodeWorkbench {
                         window,
                         cx,
                     );
+                }
+                // The toolbar's HD toggle is a preference, not a per-panel
+                // switch: a reader who turned it on wants it everywhere, and
+                // the settings are what remember it across a restart.
+                if let BrowserSurfaceEvent::CaptureQualityChanged(quality) = event {
+                    workbench.apply_browser_capture_quality(*quality, cx);
                 }
             },
         );
@@ -18915,6 +18952,7 @@ mod tests {
         fn subscribe_frames(
             &self,
             _tab_id: &BrowserTabId,
+            _quality: BrowserCaptureQuality,
         ) -> crate::browser_transport::BrowserTransportFuture<
             '_,
             crate::browser_transport::BrowserFrameStream,
@@ -19111,6 +19149,7 @@ mod tests {
                 BrowserUiState {
                     search_engine: vibex_desktop_model::BrowserSearchEngine::Custom,
                     search_engine_url: template.to_string(),
+                    capture_quality: BrowserCaptureQuality::High,
                     ..BrowserUiState::default()
                 },
                 cx,
@@ -19126,6 +19165,11 @@ mod tests {
                 surface.read_with(cx, |surface, _| surface.search_template().to_string()),
                 template,
                 "an open surface follows the setting"
+            );
+            assert_eq!(
+                surface.read_with(cx, |surface, _| surface.capture_quality()),
+                BrowserCaptureQuality::High,
+                "the HD setting reaches a panel that is already open"
             );
         });
     }

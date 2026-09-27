@@ -28,16 +28,16 @@ use vibex_core::{
     AutomationRunListRequest, AutomationRunResumeRequest, AutomationRunStartRequest,
     AutomationRunStep, AutomationRunStepListRequest, BackupCreateOutcome, BackupCreatePayload,
     BackupInspectOutcome, BackupInspectPayload, BackupRestoreOutcome, BackupRestorePayload,
-    BrowserActionRecord, BrowserAvailability, BrowserSession, BrowserSessionId,
-    BrowserSessionSnapshot, BrowserTab, BrowserTabId, CancelAgentSessionRuntimeSwitchRequest,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, DiagnosticExportOutcome,
-    DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest, FileReadRequest,
-    FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest,
-    FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse,
-    GitCommitDetail, GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest,
-    GitDiffResponse, GitHistoryRequest, GitHistoryResponse, GitProjectEligibility,
-    GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest, GitStatusSummary,
-    GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserSession,
+    BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId,
+    CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest, CreateAgentSessionRequest,
+    DiagnosticExportOutcome, DiagnosticExportPayload, FetchTimelineRequest, FileMutationRequest,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
     GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
     GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
@@ -1696,7 +1696,13 @@ impl BrowserFrameSubscription for NativeBrowserSubscription {
         Box::pin(async move {
             if self.subscription.is_none() {
                 let service = self.runtime.browser().service().clone();
-                self.subscription = Some(service.subscribe_frames(&self.tab_id).await?);
+                // The backend's frame subscription has no quality channel yet;
+                // the desktop's local panel does not come through here.
+                self.subscription = Some(
+                    service
+                        .subscribe_frames(&self.tab_id, BrowserCaptureQuality::Standard)
+                        .await?,
+                );
             }
             let Some(subscription) = self.subscription.as_mut() else {
                 return Ok(None);
