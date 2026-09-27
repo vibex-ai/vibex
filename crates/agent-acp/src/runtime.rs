@@ -5317,12 +5317,8 @@ impl AcpProcess {
             .lock()
             .map(|shared| (shared.supports_mcp_http, shared.supports_mcp_sse))
             .unwrap_or((false, false));
-        let (forwarded, skipped) = select_wire_mcp_servers(
-            delivery,
-            &self.mcp_servers,
-            supports_http,
-            supports_sse,
-        );
+        let (forwarded, skipped) =
+            select_wire_mcp_servers(delivery, &self.mcp_servers, supports_http, supports_sse);
         for _ in 0..skipped {
             self.log_context.for_operation("session/new").emit(
                 RuntimeLogLevel::Warn,
@@ -22558,12 +22554,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         // The capability the adapter may or may not advertise is irrelevant on
         // this tier: the built-in endpoint is forwarded on the transport it
         // declares.
-        let (forwarded, skipped) = select_wire_mcp_servers(
-            McpWireDelivery::NativeConfig,
-            &servers,
-            false,
-            false,
-        );
+        let (forwarded, skipped) =
+            select_wire_mcp_servers(McpWireDelivery::NativeConfig, &servers, false, false);
         assert_eq!(skipped, 0);
         assert_eq!(
             forwarded
@@ -22576,12 +22568,8 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
 
         // A delivered Agent still receives both, and the transport gate still
         // applies to the user's own HTTP server.
-        let (forwarded, skipped) = select_wire_mcp_servers(
-            McpWireDelivery::Delivered,
-            &servers,
-            true,
-            true,
-        );
+        let (forwarded, skipped) =
+            select_wire_mcp_servers(McpWireDelivery::Delivered, &servers, true, true);
         assert_eq!(skipped, 0);
         assert_eq!(forwarded.len(), 2);
     }
