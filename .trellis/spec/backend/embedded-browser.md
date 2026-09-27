@@ -177,7 +177,9 @@ agent acts on and what the user sees cannot diverge.
 URLs lose credentials, query strings and fragments; form values never appear.
 `browser_recording_*` is the one place raw values are kept, in memory only,
 because an exported test is useless without them — and the tool description says
-so out loud. The persisted `browser_audit_records` table stores no page content,
+so out loud, as does the panel: `BrowserSession::recording` carries the flag in
+the session snapshot and the panel renders a banner while it is set, refreshed
+by the `SessionChanged` the tool emits. The persisted `browser_audit_records` table stores no page content,
 form value, cookie or screenshot. `Debug` for frames, observations, tabs,
 sessions and network entries prints metadata only.
 

@@ -217,6 +217,8 @@ pub struct BrowserSurface {
     favicon: Option<Arc<RenderImage>>,
     /// The URL the current icon came from, so a repaint does not refetch it.
     favicon_source: Option<String>,
+    /// True while the runtime reports an active recording on this session.
+    recording: bool,
     /// True while a hover probe is outstanding.
     select_probe_in_flight: bool,
     /// Who the runtime says is driving this tab.
@@ -284,6 +286,7 @@ impl BrowserSurface {
             frame_task: None,
             stop_task: None,
             dialog: None,
+            recording: false,
             prompt_input: String::new(),
             file_chooser_pending: false,
             select_hint: None,
@@ -623,6 +626,7 @@ impl BrowserSurface {
                 // Agent its control back; the runtime is the authority on that,
                 // so it is read here rather than tracked locally.
                 surface.execution_source = Some(snapshot.session.execution_source);
+                surface.recording = snapshot.session.recording;
                 surface.agent_paused = snapshot.session.execution_source
                     == BrowserExecutionSource::User
                     && snapshot.session.user_engaged;
@@ -1688,6 +1692,44 @@ impl BrowserSurface {
             .into_any_element()
     }
 
+    /// The recording banner.
+    ///
+    /// An exported test needs the values typed into the page, so recording keeps
+    /// them in memory while the audit ledger stays redacted. That trade is the
+    /// human's to make, which means the panel has to say it is happening.
+    fn render_recording(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // The flag is the runtime's answer from the session snapshot, so it is
+        // already false until a snapshot says otherwise.
+        self.recording.then_some(())?;
+        Some(
+            h_flex()
+                .id("browser-recording")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .child(locale::text(
+                            "Recording: values typed into this page are kept in memory so the \
+                             exported test is usable. The audit ledger stays redacted.",
+                            "录制中：输入到页面的内容会保存在内存中，以便导出可用的测试；审计记录仍然脱敏。",
+                            "錄製中：輸入到頁面的內容會保存在記憶體中，以便匯出可用的測試；審計記錄仍然脫敏。",
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The takeover banner.
     ///
     /// A human's own input pauses the Agent on this tab; the banner is where
@@ -1744,6 +1786,12 @@ impl BrowserSurface {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// Whether the recording banner would render, for the test that pins it.
+    #[cfg(test)]
+    pub(crate) fn render_recording_banner_for_test(&self) -> bool {
+        self.recording
     }
 
     /// Why an Alt+click could not be mapped, said where the human clicked.
@@ -2605,6 +2653,7 @@ impl Render for BrowserSurface {
         self.sync_address_field(window, cx);
         let toolbar = self.render_toolbar(cx);
         let takeover = self.render_takeover(cx);
+        let recording = self.render_recording(cx);
         let source_notice = self.render_source_notice(cx);
         let ledger = self.render_ledger(cx);
         let frame = self.render_frame(cx);
@@ -2623,6 +2672,7 @@ impl Render for BrowserSurface {
             .text_color(cx.theme().foreground)
             .child(toolbar)
             .when_some(takeover, |this, takeover| this.child(takeover))
+            .when_some(recording, |this, recording| this.child(recording))
             .when_some(source_notice, |this, notice| this.child(notice))
             .when_some(ledger, |this, ledger| this.child(ledger))
             .when(self.marked_text.is_some(), |this| {
@@ -3564,6 +3614,7 @@ mod tests {
                 agent_tab_id: None,
                 execution_source: vibex_core::BrowserExecutionSource::User,
                 user_engaged: true,
+                recording: false,
                 created_at_ms: 0,
                 last_activity_at_ms: 0,
             },
@@ -3733,6 +3784,42 @@ mod tests {
         assert!(!pending, "the fetch finished");
         assert_eq!(error, None);
         assert_eq!(records, 1, "the runtime's ledger is what the panel shows");
+    }
+
+    #[gpui::test]
+    fn an_active_recording_is_shown_in_the_panel(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut snapshot = snapshot_with(vec![]);
+        snapshot.session.recording = true;
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            snapshot: Arc::new(std::sync::Mutex::new(Some(snapshot))),
+            ..Default::default()
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface =
+                        BrowserSurface::new("browser_tab_probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface
+                })
+            })
+            .expect("browser probe window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| surface.refresh_tab(cx));
+        cx.run_until_parked();
+
+        // The banner the human must see: recording keeps raw form values.
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.recording),
+            "the snapshot's recording flag reaches the panel"
+        );
+        assert!(
+            surface.read_with(&cx, |surface, _| surface.render_recording_banner_for_test()),
+            "a recording shows a banner"
+        );
     }
 
     #[gpui::test]

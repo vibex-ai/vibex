@@ -353,6 +353,7 @@ impl SessionRecord {
             agent_tab_id: self.agent_tab_id.clone(),
             execution_source: self.execution_source,
             user_engaged: self.user_engaged,
+            recording: self.recorder.is_active(),
             created_at_ms: self.created_at_ms,
             last_activity_at_ms: self.last_activity_at_ms,
         }
@@ -1905,6 +1906,21 @@ impl BrowserService {
         if let Some(tab) = state.tabs.get_mut(tab_id) {
             tab.aborted.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Tells subscribers that a session's state moved.
+    ///
+    /// The panel renders execution source, hand-over and recording from the
+    /// session snapshot, so a change made by a tool call has to be announced
+    /// rather than waited for.
+    pub async fn notify_session_changed(&self, session_id: &BrowserSessionId) {
+        // Sending is all this does: a subscriber that no longer knows the
+        // session ignores it, which is the same answer as a session that was
+        // closed between the two calls.
+        let _ = self
+            .inner
+            .events
+            .send(BrowserServiceEvent::SessionChanged(session_id.clone()));
     }
 
     /// True when the Agent's work on this session's tab has been stopped.

@@ -589,6 +589,13 @@ pub struct BrowserSession {
     /// then be handed the live page context.
     #[serde(default)]
     pub user_engaged: bool,
+    /// True while a recording is capturing raw form values in memory.
+    ///
+    /// The panel has to say so: an exported test is useless without the values,
+    /// which is exactly why the audit ledger stays redacted and why the human
+    /// must be told the recording is on.
+    #[serde(default)]
+    pub recording: bool,
     pub created_at_ms: i64,
     pub last_activity_at_ms: i64,
 }

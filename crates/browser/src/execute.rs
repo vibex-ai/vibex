@@ -2236,9 +2236,13 @@ impl BrowserService {
             })?;
             session.recorder.start();
         }
+        // The panel shows a recording banner from the session snapshot, so the
+        // change has to reach it without waiting for the next tool call.
+        self.notify_session_changed(&ctx.session_id).await;
         Ok(BrowserToolOutcome::text(
             "Recording started. Values typed into form fields are kept in memory so the exported \
-             test is usable; the audit ledger stays redacted. Tell the user recording is on.",
+             test is usable; the audit ledger stays redacted. The panel now shows a recording \
+             banner.",
         ))
     }
 
@@ -2264,6 +2268,7 @@ impl BrowserService {
             })?;
             session.recorder.stop()
         };
+        self.notify_session_changed(&ctx.session_id).await;
         if steps.is_empty() {
             return Ok(BrowserToolOutcome::text(
                 "Recording stopped, but no exportable actions were recorded.",
