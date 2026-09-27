@@ -2794,7 +2794,8 @@ impl DesktopRuntime {
                 };
                 for agent_id in agent_ids {
                     let id = agent_id.as_str().to_string();
-                    if let Err(error) = install_service.ensure_installed(agent_id).await {
+                    let prepared = install_service.ensure_installed(agent_id).await;
+                    if let Err(error) = &prepared {
                         tracing::warn!(
                             target: "vibex_desktop",
                             agent_id = %id,
@@ -2802,6 +2803,18 @@ impl DesktopRuntime {
                             "managed ACP Agent background preparation failed"
                         );
                     }
+                    // Repairs are per Agent and this loop is serialized behind
+                    // the rest of the warm-up. Publish after each one so an
+                    // Agent whose runtime path was just refreshed reaches the
+                    // selectors immediately instead of when the whole
+                    // inventory (installs, auth checks, probes) has finished.
+                    let _ = runtime_option_events.send(DesktopEvent::ProviderConfigChanged(
+                        ProviderConfigChangedEvent {
+                            provider_profile_ids: Vec::new(),
+                            phase: ProviderConfigChangePhase::ProfilesChanged,
+                        },
+                    ));
+                    let _ = runtime_option_gateway.publish_provider_invalidation();
                 }
             }
             match provider_config.list_agents(vibex_core::AgentListRequest {
@@ -3890,6 +3903,15 @@ mod tests {
         assert!(!manager.contains("install_service.install"));
         assert!(bootstrap.contains("install_service.bootstrap_agent_ids()"));
         assert!(bootstrap.contains("install_service.ensure_installed(agent_id)"));
+        // Every repaired Agent publishes an invalidation immediately: the
+        // selectors must not wait for the whole install/probe inventory.
+        let install_loop = bootstrap
+            .split_once("for agent_id in agent_ids {")
+            .and_then(|(_, tail)| tail.split_once("match provider_config.list_agents("))
+            .map(|(loop_body, _)| loop_body)
+            .expect("the managed Agent preparation loop should remain inspectable");
+        assert!(install_loop.contains("ProviderConfigChangePhase::ProfilesChanged"));
+        assert!(install_loop.contains("runtime_option_gateway.publish_provider_invalidation()"));
         assert!(!bootstrap.contains("refresh_missing"));
         assert!(bootstrap.contains("agent.added"));
         assert!(bootstrap.contains("agent.enabled"));

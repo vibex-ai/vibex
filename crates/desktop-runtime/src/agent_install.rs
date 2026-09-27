@@ -2070,12 +2070,31 @@ impl AgentInstallService {
         minimum_version: &semver::Version,
     ) -> VibexResult<NodeRuntime> {
         if let Some(runtime) = self.select_external_node_runtime(minimum_version).await {
-            return Ok(runtime);
+            return Ok(self.pin_external_node_runtime(runtime));
         }
         let _guard = self.acquire_operation("shared:runtime:node".into()).await;
         let runtime = self.ensure_managed_node_runtime().await?;
         validate_minimum_node_version(&runtime.version, minimum_version)?;
         Ok(runtime)
+    }
+
+    /// Points the external Node.js runtime at a stable entry inside the Vibex
+    /// root and returns a runtime that launches through it.
+    ///
+    /// The resolved candidate usually lives in a shell-scoped directory (an
+    /// `fnm`/`nvm` multishell path). Persisting that path into a Provider
+    /// Profile made every restart look like a configuration change: the old
+    /// path was gone, the Agent reported `unavailable`, and the repaired
+    /// Profile invalidated every Session binding. The link keeps the durable
+    /// command stable while the target behind it is refreshed on repair.
+    fn pin_external_node_runtime(&self, runtime: NodeRuntime) -> NodeRuntime {
+        let Some(link) = stable_external_node_link(&self.root, &runtime.node) else {
+            return runtime;
+        };
+        NodeRuntime {
+            node: link,
+            ..runtime
+        }
     }
 
     async fn select_external_node_runtime(
@@ -2870,14 +2889,6 @@ enum NpmLauncher {
     Executable(PathBuf),
 }
 
-impl NpmLauncher {
-    fn path(&self) -> &Path {
-        match self {
-            Self::NodeScript(path) | Self::Executable(path) => path,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct NodeRuntime {
     node: PathBuf,
@@ -2901,12 +2912,14 @@ impl NodeRuntime {
     }
 
     fn fingerprint_identity(&self) -> String {
+        // The npm launcher is only used while installing and lives wherever
+        // the host shell put it, so its path must not decide whether a managed
+        // installation is still current. `node` is the stable entry point.
         format!(
-            "{}\0{}\0{}\0{}",
+            "{}\0{}\0{}",
             self.source.as_str(),
             self.version,
-            self.node.to_string_lossy(),
-            self.npm.path().to_string_lossy()
+            self.node.to_string_lossy()
         )
     }
 }
@@ -3253,6 +3266,47 @@ fn uv_binary_at(root: &Path) -> PathBuf {
     {
         root.join("uv")
     }
+}
+
+/// Stable entry point for an externally provided Node.js runtime.
+///
+/// The resolved candidate usually sits in a shell-scoped directory (`fnm`
+/// multishells, `nvm` version dirs) that disappears with the shell that
+/// created it. Persisting that path into a Provider Profile made every restart
+/// look like a configuration change, so the profile command is pinned to this
+/// link instead and only the link target is refreshed on repair.
+///
+/// Returns `None` when the link cannot be created (for example a Windows host
+/// without symlink privileges). Callers then keep the resolved path and behave
+/// exactly as before.
+fn stable_external_node_link(root: &Path, node: &Path) -> Option<PathBuf> {
+    if node.as_os_str().is_empty() || !node.is_file() {
+        return None;
+    }
+    let directory = root.join("runtimes/node/external");
+    #[cfg(windows)]
+    let link = directory.join("node.exe");
+    #[cfg(not(windows))]
+    let link = directory.join("bin/node");
+    if node == link {
+        return link.is_file().then_some(link);
+    }
+    fs::create_dir_all(link.parent()?).ok()?;
+    if !fs::read_link(&link).is_ok_and(|target| target == node) {
+        let _ = fs::remove_file(&link);
+        symlink_file(node, &link).ok()?;
+    }
+    link.is_file().then_some(link)
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 fn uv_venv_python(venv: &Path) -> PathBuf {
@@ -5645,6 +5699,52 @@ mod tests {
         assert_eq!(runtime.source, NodeRuntimeSource::Explicit);
         assert_eq!(runtime.node, explicit_node);
         assert_eq!(runtime.version, semver::Version::new(22, 14, 0));
+    }
+
+    /// The durable ACP command must survive a restart from a new shell: the
+    /// pinned entry keeps its path while the runtime behind it is refreshed.
+    #[cfg(unix)]
+    #[test]
+    fn external_node_is_pinned_to_a_stable_entry_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vibex-root");
+        let first = temp.path().join("shell-a/node");
+        let second = temp.path().join("shell-b/node");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"node").unwrap();
+        fs::write(&second, b"node").unwrap();
+
+        let link = stable_external_node_link(&root, &first).expect("the link is created");
+        assert!(link.is_file());
+        assert_eq!(fs::read_link(&link).unwrap(), first);
+
+        // Re-resolving the same binary keeps the link untouched ...
+        assert_eq!(stable_external_node_link(&root, &first).unwrap(), link);
+        // ... while a new shell-scoped path re-points the same stable entry.
+        assert_eq!(stable_external_node_link(&root, &second).unwrap(), link);
+        assert_eq!(fs::read_link(&link).unwrap(), second);
+        assert!(link.starts_with(&root));
+
+        // A runtime that is already gone cannot be pinned.
+        assert!(stable_external_node_link(&root, &temp.path().join("gone/node")).is_none());
+    }
+
+    #[test]
+    fn install_fingerprint_ignores_the_shell_scoped_npm_path() {
+        let version = semver::Version::new(22, 14, 0);
+        let node = PathBuf::from("/opt/vibex/runtimes/node/external/bin/node");
+        let runtime = |npm: &str| NodeRuntime {
+            node: node.clone(),
+            npm: NpmLauncher::Executable(PathBuf::from(npm)),
+            version: version.clone(),
+            source: NodeRuntimeSource::System,
+        };
+        assert_eq!(
+            runtime("/run/user/1000/fnm_multishells/1/bin/npm").fingerprint_identity(),
+            runtime("/run/user/1000/fnm_multishells/2/bin/npm").fingerprint_identity(),
+            "a relocated npm must not force a reinstall of an intact Agent"
+        );
     }
 
     #[cfg(unix)]
