@@ -206,6 +206,31 @@ JSON-RPC to that endpoint. One handler serves both, so behaviour cannot drift.
   wire MCP servers at all. Report them as unavailable rather than listing tools
   they can never call.
 
+## Element ↔ code
+
+`browser_element_source` and the panel's Alt+click run the *same* probe
+(`execute::probe_element_source`), so an Agent and a human can never get
+different answers about which file rendered an element.
+
+- The probe reads the framework's own dev hook — Svelte's `__svelte_meta`,
+  Vue's `__vueParentComponent.type.__file`, React's
+  `__REACT_DEVTOOLS_GLOBAL_HOOK__` fibers. A production build exposes none of
+  them, so the answer is an explicit "needs a development build" rather than a
+  wrong file.
+- Alt+click resolves the element under the pointer and the page **never sees
+  the click**: looking for code must not also press the button. It travels
+  through `BrowserTransport::element_source_at` and reaches the editor as
+  `BrowserSurfaceEvent::SourceLocated`, which the workbench opens with
+  `open_file_search_result`.
+- Nothing about a miss is silent. A page with no mapping, a point with no
+  element and an unavailable transport all set the panel's `source_notice`,
+  which renders inline under the toolbar; a resolved-but-approximate answer
+  (React 19's missing `_debugSource`, Vue's file without a line) opens the file
+  and says the line is not exact.
+- A point inside a cross-origin frame resolves to the frame element itself on
+  the parent document. That is the honest answer for a document this session
+  cannot see into, and it is where a fuller per-frame lookup would start.
+
 ## Panel wiring (the parts that are easy to leave dangling)
 
 The runtime already owns the browser; the panel is a subscriber. Three wires

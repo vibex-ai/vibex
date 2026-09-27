@@ -4536,9 +4536,12 @@ impl CodeWorkbench {
             surface.set_search_template(search_template, cx);
             surface.set_orphan_textures(orphans);
         });
-        let subscription = cx.subscribe(
+        // `subscribe_in` rather than `subscribe`: opening the mapped source
+        // needs the window, and this is the variant that carries it.
+        let subscription = cx.subscribe_in(
             &entity,
-            |workbench, surface, event: &BrowserSurfaceEvent, cx| {
+            window,
+            |workbench, surface, event: &BrowserSurfaceEvent, window, cx| {
                 if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
                     let (title, loading, favicon, url) = {
                         let surface = surface.read(cx);
@@ -4567,6 +4570,21 @@ impl CodeWorkbench {
                         workbench.persist(cx);
                     }
                     cx.notify();
+                }
+                // Alt+click asked the runtime which file drew the element; the
+                // editor is where that answer is useful, so it jumps there.
+                if let BrowserSurfaceEvent::SourceLocated { path, line, .. } = event {
+                    workbench.open_file_search_result(
+                        FileSearchReveal {
+                            path: path.clone(),
+                            query: String::new(),
+                            line: line.unwrap_or(1),
+                            match_start: None,
+                            match_end: None,
+                        },
+                        window,
+                        cx,
+                    );
                 }
             },
         );
@@ -4892,9 +4910,8 @@ impl CodeWorkbench {
                 origin,
             } => {
                 self.offer_dev_server(workspace_id, origin, window, cx);
-            }
-            // No catch-all: every variant has a consumer, and the next one that
-            // does not should be a compile error rather than a silent drop.
+            } // No catch-all: every variant has a consumer, and the next one that
+              // does not should be a compile error rather than a silent drop.
         }
     }
 
@@ -18613,6 +18630,20 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_core::BrowserSession>>
         {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn element_source_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserElementSource>
+        {
+            Box::pin(async {
+                Err(crate::browser_transport::BrowserTransportError::new(
+                    "test",
+                    "no element source",
+                ))
+            })
         }
         fn ledger(
             &self,

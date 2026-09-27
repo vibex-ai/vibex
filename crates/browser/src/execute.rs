@@ -18,6 +18,7 @@ use vibex_core::{
 };
 
 use crate::ax::ReferenceRejection;
+use crate::cdp::CdpSession;
 use crate::element_source;
 use crate::error::{BrowserError, BrowserResult, operation_aborted_error};
 use crate::policy::{self, NavigationDecision};
@@ -2087,29 +2088,56 @@ impl BrowserService {
         })
     }
 
-    async fn tool_element_source(
+    /// Answers which source rendered the element at a viewport point.
+    ///
+    /// The panel's Alt+click uses this: the human points at what they can see
+    /// and the runtime names the file. It runs the same probe
+    /// `browser_element_source` runs, so the two can never disagree.
+    ///
+    /// A point inside a cross-origin frame resolves to the frame element on the
+    /// parent document, which is the honest answer for a document the panel's
+    /// own session cannot see into.
+    pub async fn element_source_at(
         &self,
-        ctx: &BrowserToolContext,
-        args: &Value,
-    ) -> BrowserResult<BrowserToolOutcome> {
-        let reference = required_str(args, "ref")?;
-        let tab_id = self.target_tab(ctx, args).await?;
-        let (backend_node_id, _, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let session = self
-            .inner()
-            .element_session(&tab_id, reference.trim())
-            .await?;
-        // Tag the element, run the framework probe against it, then remove the
-        // tag so the page is left exactly as it was found.
-        let _ = cdp(
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserResult<vibex_core::BrowserElementSource> {
+        let (_, session) = self.inner().tab_session(tab_id).await?;
+        let located = cdp(
             &session,
+            "DOM.getNodeForLocation",
+            json!({ "x": x, "y": y, "includeUserAgentShadowDOM": false }),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let backend_node_id = located
+            .get("backendNodeId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                BrowserError::validation(
+                    "browser_element_not_found",
+                    "no element is at that point on the page",
+                )
+            })?;
+        self.probe_element_source(&session, backend_node_id).await
+    }
+
+    /// Tags one backend node, runs the framework probe, and untags it.
+    async fn probe_element_source(
+        &self,
+        session: &CdpSession,
+        backend_node_id: i64,
+    ) -> BrowserResult<vibex_core::BrowserElementSource> {
+        let _ = cdp(
+            session,
             "Runtime.evaluate",
             json!({ "expression": element_source::marker_setup_script(), "returnByValue": true }),
             SHORT_TIMEOUT_MS,
         )
         .await;
         let object = cdp(
-            &session,
+            session,
             "DOM.resolveNode",
             json!({ "backendNodeId": backend_node_id }),
             BROWSER_CDP_COMMAND_TIMEOUT_MS,
@@ -2127,7 +2155,7 @@ impl BrowserService {
             })?
             .to_string();
         let _ = cdp(
-            &session,
+            session,
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
@@ -2138,14 +2166,14 @@ impl BrowserService {
         )
         .await;
         let probe = cdp(
-            &session,
+            session,
             "Runtime.evaluate",
             json!({ "expression": element_source::ELEMENT_SOURCE_PROBE, "returnByValue": true }),
             BROWSER_CDP_COMMAND_TIMEOUT_MS,
         )
         .await?;
         let _ = cdp(
-            &session,
+            session,
             "Runtime.evaluate",
             json!({ "expression": element_source::marker_setup_script(), "returnByValue": true }),
             SHORT_TIMEOUT_MS,
@@ -2156,7 +2184,25 @@ impl BrowserService {
             .and_then(|result| result.get("value"))
             .cloned()
             .unwrap_or(Value::Null);
-        let source: BrowserElementSource = element_source::parse_probe_result(&value);
+        Ok(element_source::parse_probe_result(&value))
+    }
+
+    async fn tool_element_source(
+        &self,
+        ctx: &BrowserToolContext,
+        args: &Value,
+    ) -> BrowserResult<BrowserToolOutcome> {
+        let reference = required_str(args, "ref")?;
+        let tab_id = self.target_tab(ctx, args).await?;
+        let (backend_node_id, _, name) = self.resolve_element(&tab_id, reference.trim()).await?;
+        let session = self
+            .inner()
+            .element_session(&tab_id, reference.trim())
+            .await?;
+        // The same probe the panel's Alt+click runs, so the two cannot
+        // disagree about what a page reports.
+        let source: BrowserElementSource =
+            self.probe_element_source(&session, backend_node_id).await?;
         let record = self
             .record(
                 ctx,

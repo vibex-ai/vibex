@@ -25,9 +25,9 @@ use vibex_browser::{
     BrowserSessionKey,
 };
 use vibex_core::{
-    BrowserActionRecord, BrowserAvailability, BrowserFrame, BrowserSession, BrowserSessionId,
-    BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner, BrowserToolTier,
-    BrowserUnavailableReason, VibexError, VibexSessionId, WorkspaceId,
+    BrowserActionRecord, BrowserAvailability, BrowserElementSource, BrowserFrame, BrowserSession,
+    BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner,
+    BrowserToolTier, BrowserUnavailableReason, VibexError, VibexSessionId, WorkspaceId,
 };
 
 /// Failure reported by a [`BrowserTransport`] operation.
@@ -230,6 +230,18 @@ pub trait BrowserTransport: Send + Sync + 'static {
         value: &str,
     ) -> BrowserTransportFuture<'_, ()>;
 
+    /// Which source rendered the element at a viewport point.
+    ///
+    /// The panel's Alt+click asks this so a human can jump from the page to the
+    /// code that drew it; a page whose framework cannot answer says so in
+    /// `detail` instead of failing.
+    fn element_source_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, BrowserElementSource>;
+
     /// Opens the frame stream and turns the screencast on.
     fn subscribe_frames(
         &self,
@@ -359,6 +371,22 @@ impl BrowserTransport for LocalBrowserTransport {
         let session_id = session_id.clone();
         let service = self.service.clone();
         Box::pin(self.run(async move { Ok(service.ledger(&session_id).await) }))
+    }
+
+    fn element_source_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, BrowserElementSource> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .element_source_at(&tab_id, x, y)
+                .await
+                .map_err(Into::into)
+        }))
     }
 
     fn ensure_workspace_session(
@@ -639,6 +667,22 @@ impl BrowserTransport for RemoteBrowserTransport {
                 .browser_ledger(session_id)
                 .await
                 .map_err(Into::into)
+        })
+    }
+
+    fn element_source_at(
+        &self,
+        _tab_id: &BrowserTabId,
+        _x: f64,
+        _y: f64,
+    ) -> BrowserTransportFuture<'_, BrowserElementSource> {
+        // The frame transport is not implemented for a remote runtime, so the
+        // panel cannot know a viewport point to ask about either.
+        Box::pin(async {
+            Err(BrowserTransportError::new(
+                "remote_browser_unavailable",
+                "The paired runtime is remote; element-to-source mapping needs the live panel                  transport, which is not implemented yet.",
+            ))
         })
     }
 

@@ -134,6 +134,15 @@ pub enum BrowserSurfaceEvent {
     TabChanged { tab_id: BrowserTabId },
     /// A JavaScript dialog is blocking the page and needs a human.
     DialogOpened(BrowserDialogRequest),
+    /// Alt+click resolved the element under the pointer to a source location.
+    ///
+    /// `path` is workspace-relative, the way the editor's find-and-reveal wants
+    /// it; `approximate` says the framework could not give an exact line.
+    SourceLocated {
+        path: String,
+        line: Option<u32>,
+        approximate: bool,
+    },
 }
 
 /// A GPUI surface for one browser tab.
@@ -202,6 +211,8 @@ pub struct BrowserSurface {
     /// Set while the ledger is being fetched, so the list can say so.
     ledger_pending: bool,
     ledger_error: Option<String>,
+    /// Why the last Alt+click could not be mapped to a file, shown inline.
+    source_notice: Option<String>,
     /// The page's icon, once the runtime has fetched and this side decoded it.
     favicon: Option<Arc<RenderImage>>,
     /// The URL the current icon came from, so a repaint does not refetch it.
@@ -281,6 +292,7 @@ impl BrowserSurface {
             ledger_open: false,
             ledger_pending: false,
             ledger_error: None,
+            source_notice: None,
             favicon: None,
             favicon_source: None,
             select_probe_in_flight: false,
@@ -478,6 +490,59 @@ impl BrowserSurface {
                 match result {
                     Ok(records) => surface.ledger = records,
                     Err(error) => surface.ledger_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resolves the element under a viewport point to the file that drew it.
+    ///
+    /// Nothing happens silently: a page whose framework cannot answer shows the
+    /// probe's own explanation, because "I clicked and nothing happened" is the
+    /// one outcome the design forbids.
+    pub fn locate_source(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = transport.element_source_at(&tab_id, x, y).await;
+            let _ = this.update(cx, |surface, cx| {
+                match result {
+                    Ok(source) => {
+                        let path =
+                            vibex_browser::element_source::normalize_source_path(&source.path);
+                        match path {
+                            Some(path) => {
+                                // A file without a line is still useful, but
+                                // saying the line is missing beats pretending
+                                // the caret landed where the element is.
+                                surface.source_notice = source.approximate.then(|| {
+                                    locale::text(
+                                        "Opened the element's component file; this build does not \
+                                         expose the exact line.",
+                                        "已打开该元素所在的组件文件；此构建未暴露精确行号。",
+                                        "已開啟該元素所在的元件檔案；此建置未暴露精確行號。",
+                                    )
+                                    .to_string()
+                                });
+                                cx.emit(BrowserSurfaceEvent::SourceLocated {
+                                    path,
+                                    line: source.line,
+                                    approximate: source.approximate,
+                                });
+                            }
+                            None => {
+                                surface.source_notice =
+                                    Some(source.detail.clone().unwrap_or_else(|| {
+                                        "this element could not be mapped to a source file"
+                                            .to_string()
+                                    }));
+                            }
+                        }
+                    }
+                    Err(error) => surface.source_notice = Some(error.message),
                 }
                 cx.notify();
             });
@@ -1246,6 +1311,13 @@ impl BrowserSurface {
                     let Some((x, y)) = this.to_viewport_point(event.position) else {
                         return;
                     };
+                    // Alt+click asks which file rendered the element instead of
+                    // clicking it: the page never sees the click, which is what
+                    // makes it safe to use while looking for code.
+                    if event.modifiers.alt {
+                        this.locate_source(x, y, cx);
+                        return;
+                    }
                     // An open menu swallows the next click: that is how a popup
                     // closes, and letting it through would also click the page
                     // underneath.
@@ -1670,6 +1742,43 @@ impl BrowserSurface {
                             .on_click(cx.listener(|this, _, _, cx| this.hand_back_to_agent(cx))),
                     )
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// Why an Alt+click could not be mapped, said where the human clicked.
+    fn render_source_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notice = self.source_notice.clone()?;
+        Some(
+            h_flex()
+                .id("browser-source-notice")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .child(notice),
+                )
+                .child(
+                    Button::new("browser-source-notice-close")
+                        .label(locale::text("Dismiss", "忽略", "忽略"))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.source_notice = None;
+                            cx.notify();
+                        })),
+                )
                 .into_any_element(),
         )
     }
@@ -2496,6 +2605,7 @@ impl Render for BrowserSurface {
         self.sync_address_field(window, cx);
         let toolbar = self.render_toolbar(cx);
         let takeover = self.render_takeover(cx);
+        let source_notice = self.render_source_notice(cx);
         let ledger = self.render_ledger(cx);
         let frame = self.render_frame(cx);
         let select_menu = self.render_select_menu(cx);
@@ -2513,6 +2623,7 @@ impl Render for BrowserSurface {
             .text_color(cx.theme().foreground)
             .child(toolbar)
             .when_some(takeover, |this, takeover| this.child(takeover))
+            .when_some(source_notice, |this, notice| this.child(notice))
             .when_some(ledger, |this, ledger| this.child(ledger))
             .when(self.marked_text.is_some(), |this| {
                 // The in-progress IME composition is drawn by the panel: the
@@ -3161,6 +3272,10 @@ mod tests {
         snapshot: Arc<std::sync::Mutex<Option<vibex_core::BrowserSessionSnapshot>>>,
         /// The ledger the panel reads when the activity list is opened.
         ledger: Arc<std::sync::Mutex<Vec<vibex_core::BrowserActionRecord>>>,
+        /// What Alt+click resolves to, when the test configures an answer.
+        element_source: Arc<std::sync::Mutex<Option<vibex_core::BrowserElementSource>>>,
+        /// The viewport points Alt+click asked about.
+        source_calls: Arc<std::sync::Mutex<Vec<(f64, f64)>>>,
         /// How many times the frame stream was asked for, and how many of the
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -3175,6 +3290,8 @@ mod tests {
                 inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
                 snapshot: Arc::new(std::sync::Mutex::new(None)),
                 ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
+                element_source: Arc::new(std::sync::Mutex::new(None)),
+                source_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3211,6 +3328,24 @@ mod tests {
         > {
             let ledger = self.ledger.lock().unwrap().clone();
             Box::pin(async move { Ok(ledger) })
+        }
+        fn element_source_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            x: f64,
+            y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserElementSource>
+        {
+            self.source_calls.lock().unwrap().push((x, y));
+            Box::pin(async {
+                let source = self.element_source.lock().unwrap().clone();
+                source.ok_or_else(|| {
+                    crate::browser_transport::BrowserTransportError::new(
+                        "test",
+                        "no element source",
+                    )
+                })
+            })
         }
         fn session_snapshot(
             &self,
@@ -3598,6 +3733,116 @@ mod tests {
         assert!(!pending, "the fetch finished");
         assert_eq!(error, None);
         assert_eq!(records, 1, "the runtime's ledger is what the panel shows");
+    }
+
+    #[gpui::test]
+    fn alt_clicking_the_page_asks_which_file_drew_the_element(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            element_source: Arc::new(std::sync::Mutex::new(Some(
+                vibex_core::BrowserElementSource {
+                    path: "/src/App.tsx".to_string(),
+                    line: Some(42),
+                    column: Some(3),
+                    component: Some("App".to_string()),
+                    framework: "react".to_string(),
+                    approximate: false,
+                    detail: None,
+                },
+            ))),
+            source_calls: calls.clone(),
+            inputs: inputs.clone(),
+            ..Default::default()
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface =
+                        BrowserSurface::new("browser_tab_probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("browser probe window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| {
+            surface.frame_pixel_size = (1000.0, 600.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = surface
+            .read_with(&cx, |surface, _| surface.frame_bounds)
+            .expect("the frame is laid out");
+
+        cx.simulate_mouse_down(
+            bounds.center(),
+            MouseButton::Left,
+            gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        cx.run_until_parked();
+
+        // The click asked about the point under the pointer...
+        let asked = calls.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "one lookup for one Alt+click: {asked:?}");
+        assert!(asked[0].0 > 0.0 && asked[0].1 > 0.0, "viewport coordinates");
+        // ...and the page never saw a click: Alt+click looks for code.
+        assert!(
+            inputs.lock().unwrap().is_empty(),
+            "Alt+click must not reach the page"
+        );
+    }
+
+    #[gpui::test]
+    fn a_page_that_cannot_map_an_element_says_so(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            element_source: Arc::new(std::sync::Mutex::new(Some(
+                vibex_core::BrowserElementSource {
+                    path: String::new(),
+                    line: None,
+                    column: None,
+                    component: None,
+                    framework: "unknown".to_string(),
+                    approximate: true,
+                    detail: Some(
+                        "this page is not a React, Vue or Svelte development build".to_string(),
+                    ),
+                },
+            ))),
+            ..Default::default()
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface =
+                        BrowserSurface::new("browser_tab_probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface
+                })
+            })
+            .expect("browser probe window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+
+        surface.update(&mut cx, |surface, cx| surface.locate_source(40.0, 40.0, cx));
+        cx.run_until_parked();
+
+        let notice = surface.read_with(&cx, |surface, _| surface.source_notice.clone());
+        assert_eq!(
+            notice.as_deref(),
+            Some("this page is not a React, Vue or Svelte development build"),
+            "an unmappable element explains itself instead of doing nothing"
+        );
     }
 
     #[gpui::test]
