@@ -66,7 +66,7 @@ impl ManagementSection {
             Self::ModelProviders => "Model Providers",
             Self::Mcp => "MCP",
             Self::Skills => "Skills",
-            Self::PromptsHooks => "Prompts & Hooks",
+            Self::PromptsHooks => "Prompts",
             Self::Advanced => "Advanced",
             Self::Scheduled => "Scheduled",
             Self::Automation => "Automation",

@@ -305,6 +305,12 @@ struct ManagementCopy {
     agents: &'static str,
     mcp: &'static str,
     skills: &'static str,
+    /// The primary tab that owns the reusable Prompts the composer inserts.
+    ///
+    /// The caption has to fit one of four equal pills in the Config Center
+    /// sidebar, so English uses the object's short name while Chinese uses the
+    /// composer-facing one.
+    prompts: &'static str,
     search_agents: &'static str,
     search_mcp: &'static str,
     search_skills: &'static str,
@@ -325,6 +331,7 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "Skills",
+            prompts: "Prompts",
             search_agents: "Search Agent",
             search_mcp: "Search MCP",
             search_skills: "Search Skills",
@@ -342,6 +349,7 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "Skill",
+            prompts: "快捷短语",
             search_agents: "搜索 Agent",
             search_mcp: "搜索 MCP",
             search_skills: "搜索 Skill",
@@ -359,6 +367,7 @@ fn management_copy() -> ManagementCopy {
             agents: "Agent",
             mcp: "MCP",
             skills: "Skill",
+            prompts: "快捷短語",
             search_agents: "搜尋 Agent",
             search_mcp: "搜尋 MCP",
             search_skills: "搜尋 Skill",
@@ -1508,7 +1517,7 @@ impl ManagementCenter {
                     return;
                 }
                 this.navigation
-                    .mark_dirty(ManagementSection::Advanced, true);
+                    .mark_dirty(ManagementSection::PromptsHooks, true);
                 cx.notify();
             }),
             cx.subscribe(&prompt_body, |this, _, event: &InputEvent, cx| {
@@ -1516,7 +1525,7 @@ impl ManagementCenter {
                     return;
                 }
                 this.navigation
-                    .mark_dirty(ManagementSection::Advanced, true);
+                    .mark_dirty(ManagementSection::PromptsHooks, true);
                 cx.notify();
             }),
             cx.subscribe(&hook_name, |this, _, event: &InputEvent, cx| {
@@ -3721,8 +3730,7 @@ impl ManagementCenter {
     ) -> bool {
         let section = match section {
             ManagementSection::ModelProviders => ManagementSection::Agents,
-            ManagementSection::PromptsHooks
-            | ManagementSection::Scheduled
+            ManagementSection::Scheduled
             | ManagementSection::Automation
             | ManagementSection::Recovery => ManagementSection::Advanced,
             section => section,
@@ -7026,7 +7034,12 @@ impl ManagementCenter {
                     Ok(Ok(success)) => {
                         match &completed_mutation {
                             ManagementMutation::PromptAction(action)
-                            | ManagementMutation::HookAction(action)
+                                if action.starts_with("create") =>
+                            {
+                                this.navigation
+                                    .mark_dirty(ManagementSection::PromptsHooks, false);
+                            }
+                            ManagementMutation::HookAction(action)
                                 if action.starts_with("create") =>
                             {
                                 this.navigation
@@ -9936,6 +9949,11 @@ impl ManagementCenter {
             (ManagementSection::Agents, copy.agents, IconName::Bot),
             (ManagementSection::Mcp, copy.mcp, IconName::Network),
             (ManagementSection::Skills, copy.skills, IconName::BookOpen),
+            (
+                ManagementSection::PromptsHooks,
+                copy.prompts,
+                IconName::FileText,
+            ),
         ];
         let selected_index = items
             .iter()
@@ -9976,9 +9994,7 @@ impl ManagementCenter {
             }
             ManagementSection::Mcp => self.render_mcp(cx),
             ManagementSection::Skills => self.render_skills(cx),
-            ManagementSection::PromptsHooks => {
-                self.render_prompts_hooks(f32::from(window.viewport_size().width) >= 1536.0, cx)
-            }
+            ManagementSection::PromptsHooks => self.render_prompts(cx),
             ManagementSection::Advanced => self.render_advanced(window, cx),
             ManagementSection::Scheduled => self.render_scheduled(window, cx),
             ManagementSection::Automation => self.render_automation(cx),
@@ -9995,6 +10011,7 @@ impl ManagementCenter {
             ManagementSection::Agents => self.render_agents(cx),
             ManagementSection::Mcp => self.render_mcp_sidebar(cx),
             ManagementSection::Skills => self.render_skills_sidebar(cx),
+            ManagementSection::PromptsHooks => self.render_prompts_sidebar(cx),
             ManagementSection::Advanced => self.render_advanced_sidebar(window, cx),
             _ => unreachable!("primary management section must be normalized"),
         }
@@ -12006,15 +12023,6 @@ impl ManagementCenter {
                     "Agent 探測與能力檢查",
                 ),
                 IconName::CircleCheck,
-            ),
-            (
-                management_locale_text("Prompts", "提示词", "提示詞"),
-                management_locale_text(
-                    "Reusable prompt library",
-                    "可复用提示词库",
-                    "可重用提示詞庫",
-                ),
-                IconName::BookOpen,
             ),
             (
                 "Hooks",
@@ -16071,9 +16079,12 @@ impl ManagementCenter {
             .into_any_element()
     }
 
-    fn render_prompts_hooks(&mut self, extra_wide: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The reusable Prompts that back the composer's quick-phrase tab.
+    ///
+    /// Quick phrases are the same record as a reusable Prompt, so this one card
+    /// is the whole Prompts tab: it creates, edits and enables them.
+    fn render_prompts(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let prompts = self.snapshot.prompts.clone();
-        let hooks = self.snapshot.hooks.clone();
         let pending = self.mutation.is_some();
         let mut prompt_rows = v_flex().gap_3();
         for prompt in prompts.clone() {
@@ -16194,81 +16205,7 @@ impl ManagementCenter {
                     ),
             );
         }
-        let mut hook_rows = v_flex().gap_3();
-        for hook in hooks.clone() {
-            let id = hook.id.as_str().to_string();
-            let delete_id = id.clone();
-            let delete_label = hook.display_name.clone();
-            let deleting = matches!(
-                &self.mutation,
-                Some(ManagementMutation::HookAction(action))
-                    if action == &format!("delete:{id}")
-            );
-            hook_rows = hook_rows.child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .p_3()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(hook.display_name),
-                            )
-                            .child(management_status_badge(
-                                management_hook_status_label(hook.status).to_string(),
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · {}",
-                                hook.provider_kind,
-                                management_hook_event_kind_key(hook.event_kind)
-                            )),
-                    )
-                    .child(
-                        h_flex().child(
-                            Button::new(SharedString::from(format!("hook-delete-{delete_id}")))
-                                .small()
-                                .danger()
-                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
-                                .label(management_locale_text("Delete", "删除", "刪除"))
-                                .loading(deleting)
-                                .disabled(pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_managed_delete(
-                                        ManagedDeleteTarget::Hook {
-                                            id: delete_id.clone(),
-                                            label: delete_label.clone(),
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        ),
-                    ),
-            );
-        }
-        let prompt_card = management_card(
+        management_card(
             management_locale_text(
                 "Prompts & quick phrases",
                 "提示词与快捷短语",
@@ -16349,8 +16286,156 @@ impl ManagementCenter {
                 })
                 .into_any_element(),
             cx,
-        );
-        let hook_card = management_card(
+        )
+    }
+
+    /// The Prompts tab is a single card, so its side column names the object
+    /// and where it shows up instead of listing sibling resources.
+    fn render_prompts_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = [
+            (
+                management_locale_text("Quick phrases", "快捷短语", "快捷短語"),
+                management_locale_text(
+                    "Inserted from the composer's / menu",
+                    "在输入框输入 / 后切换到快捷短语插入",
+                    "在輸入框輸入 / 後切換到快捷短語插入",
+                ),
+                IconName::FileText,
+            ),
+            (
+                management_locale_text("Reusable prompts", "可复用提示词", "可重用提示詞"),
+                management_locale_text(
+                    "Only enabled prompts reach the composer",
+                    "只有已启用的提示词会出现在输入框中",
+                    "只有已啟用的提示詞會出現在輸入框中",
+                ),
+                IconName::BookOpen,
+            ),
+        ];
+        let mut sidebar = v_flex().w_full().gap_2();
+        for (title, subtitle, icon) in rows {
+            sidebar = sidebar.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .px_3()
+                    .py_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(icon.clone()).size(px(16.0)))
+                            .child(div().truncate().text_sm().font_medium().child(title)),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(subtitle),
+                    ),
+            );
+        }
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .scroll_gutter()
+                    .child(sidebar),
+            )
+            .into_any_element()
+    }
+
+    /// Hooks stay on the Advanced tab: they are a runtime installation detail
+    /// rather than a composer object, so they do not follow Prompts out.
+    fn render_hooks_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let hooks = self.snapshot.hooks.clone();
+        let pending = self.mutation.is_some();
+        let mut hook_rows = v_flex().gap_3();
+        for hook in hooks.clone() {
+            let id = hook.id.as_str().to_string();
+            let delete_id = id.clone();
+            let delete_label = hook.display_name.clone();
+            let deleting = matches!(
+                &self.mutation,
+                Some(ManagementMutation::HookAction(action))
+                    if action == &format!("delete:{id}")
+            );
+            hook_rows = hook_rows.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .p_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child(hook.display_name),
+                            )
+                            .child(management_status_badge(
+                                management_hook_status_label(hook.status).to_string(),
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {}",
+                                hook.provider_kind,
+                                management_hook_event_kind_key(hook.event_kind)
+                            )),
+                    )
+                    .child(
+                        h_flex().child(
+                            Button::new(SharedString::from(format!("hook-delete-{delete_id}")))
+                                .small()
+                                .danger()
+                                .icon(Icon::default().path("icons/vibex/trash-2.svg"))
+                                .label(management_locale_text("Delete", "删除", "刪除"))
+                                .loading(deleting)
+                                .disabled(pending)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_managed_delete(
+                                        ManagedDeleteTarget::Hook {
+                                            id: delete_id.clone(),
+                                            label: delete_label.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        ),
+                    ),
+            );
+        }
+        management_card(
             "Hooks",
             management_locale_text(
                 "Preview managed Hook installation before enabling it.",
@@ -16407,23 +16492,7 @@ impl ManagementCenter {
                 })
                 .into_any_element(),
             cx,
-        );
-        if extra_wide {
-            h_flex()
-                .w_full()
-                .items_start()
-                .gap_4()
-                .child(div().min_w_0().flex_1().child(prompt_card))
-                .child(div().min_w_0().flex_1().child(hook_card))
-                .into_any_element()
-        } else {
-            v_flex()
-                .w_full()
-                .gap_4()
-                .child(prompt_card)
-                .child(hook_card)
-                .into_any_element()
-        }
+        )
     }
 
     fn selected_management_provider_profile(&self) -> Option<vibex_core::ProviderProfile> {
@@ -17258,7 +17327,7 @@ impl ManagementCenter {
         let extra_wide = f32::from(window.viewport_size().width) >= 1536.0;
         let acp_card = self.render_acp_config_card(window, cx);
         let native_export_card = self.render_native_export_card(cx);
-        let prompts_hooks = self.render_prompts_hooks(extra_wide, cx);
+        let hooks_card = self.render_hooks_card(cx);
         let pending = self.mutation.is_some();
         let mut health_rows = v_flex().w_full().gap_1();
         for summary in self.health_summaries.clone() {
@@ -17442,7 +17511,7 @@ impl ManagementCenter {
         ))
         .child(top_cards)
         .child(status_cards)
-        .child(prompts_hooks)
+        .child(hooks_card)
         .into_any_element()
     }
 
@@ -19351,8 +19420,8 @@ fn management_primary_section(section: ManagementSection) -> ManagementSection {
         ManagementSection::Agents | ManagementSection::ModelProviders => ManagementSection::Agents,
         ManagementSection::Mcp => ManagementSection::Mcp,
         ManagementSection::Skills => ManagementSection::Skills,
-        ManagementSection::PromptsHooks
-        | ManagementSection::Advanced
+        ManagementSection::PromptsHooks => ManagementSection::PromptsHooks,
+        ManagementSection::Advanced
         | ManagementSection::Scheduled
         | ManagementSection::Automation
         | ManagementSection::Recovery => ManagementSection::Advanced,
@@ -19749,7 +19818,7 @@ fn management_secondary_label(section: ManagementSection) -> &'static str {
             management_locale_text("Native & Plugins", "原生配置与插件", "原生配置與外掛")
         }
         ManagementSection::PromptsHooks => {
-            management_locale_text("Prompts & Hooks", "提示词与 Hooks", "提示詞與 Hooks")
+            management_locale_text("Quick phrases", "快捷短语", "快捷短語")
         }
         ManagementSection::Scheduled => management_locale_text("Scheduled", "定时任务", "排程任務"),
         ManagementSection::Automation => management_locale_text("Automation", "自动化", "自動化"),
@@ -24436,8 +24505,14 @@ mod tests {
             management_primary_section(ManagementSection::Skills),
             ManagementSection::Skills
         );
+        // Prompts is a primary tab of its own: quick phrases are a composer
+        // concept, not a native-runtime detail, so it does not collapse into
+        // Advanced the way the remaining sections do.
+        assert_eq!(
+            management_primary_section(ManagementSection::PromptsHooks),
+            ManagementSection::PromptsHooks
+        );
         for section in [
-            ManagementSection::PromptsHooks,
             ManagementSection::Advanced,
             ManagementSection::Scheduled,
             ManagementSection::Automation,
@@ -24462,7 +24537,33 @@ mod tests {
         assert!(renderer.contains("ManagementSection::Agents"));
         assert!(renderer.contains("ManagementSection::Mcp"));
         assert!(renderer.contains("ManagementSection::Skills"));
+        assert!(renderer.contains("ManagementSection::PromptsHooks"));
         assert!(!renderer.contains("ManagementSection::Advanced"));
+    }
+
+    /// Quick phrases are a composer concept, so the Prompts tab owns the card
+    /// that creates them while Hooks stay behind in Advanced.
+    #[test]
+    fn prompts_tab_owns_the_prompt_card_and_advanced_keeps_hooks() {
+        let source = include_str!("management.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("management tests should remain inspectable");
+        let content = production
+            .split_once("    fn render_content(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_context_sidebar("))
+            .map(|(body, _)| body)
+            .expect("management content router should remain inspectable");
+        assert!(content.contains("ManagementSection::PromptsHooks => self.render_prompts(cx)"));
+
+        let advanced = production
+            .split_once("    fn render_advanced(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clear_scheduled_editor("))
+            .map(|(body, _)| body)
+            .expect("advanced renderer should remain inspectable");
+        assert!(advanced.contains("self.render_hooks_card(cx)"));
+        assert!(!advanced.contains("self.render_prompts(cx)"));
     }
 
     /// MCP servers and Skills are delivered through each Agent's own channel,
@@ -24481,7 +24582,7 @@ mod tests {
             .expect("MCP renderer should remain inspectable");
         let skills = production
             .split_once("    fn render_skills(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_prompts_hooks("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_prompts("))
             .map(|(body, _)| body)
             .expect("Skills renderer should remain inspectable");
 
@@ -24565,7 +24666,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Pill tabs paint no track, and only the active section is a filled
-        // capsule; the other two stay transparent.
+        // capsule; the other three stay transparent.
         let pills = band
             .iter()
             .filter(|quad| quad.background.as_solid() == Some(primary))
@@ -24593,12 +24694,13 @@ mod tests {
             (radius - height / 2.0).abs() < 0.5,
             "the pill is fully rounded rather than a rectangle: {radius}"
         );
-        // Three equal tabs and two 4px gaps fill the 368px sidebar inside its
-        // 12px padding.
-        let expected_width = (MANAGEMENT_SIDEBAR_WIDTH - 24.0 - 8.0) / 3.0;
+        // Four equal tabs and three 4px gaps fill the 368px sidebar inside its
+        // 12px padding. The bar rounds each pill outward, so the tolerance has
+        // to admit one pixel of distribution.
+        let expected_width = (MANAGEMENT_SIDEBAR_WIDTH - 24.0 - 12.0) / 4.0;
         assert!(
-            (width - expected_width).abs() < 1.0,
-            "pill width {width} should be a third of the bar ({expected_width})"
+            (width - expected_width).abs() <= 1.5,
+            "pill width {width} should be a quarter of the bar ({expected_width})"
         );
         assert!(
             !band.iter().any(|quad| quad.background == track),
