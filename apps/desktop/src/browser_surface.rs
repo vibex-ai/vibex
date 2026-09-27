@@ -250,6 +250,15 @@ impl BrowserSurface {
         (!tab.url.trim().is_empty()).then(|| tab.url.clone())
     }
 
+    /// The address the runtime reports for this tab.
+    ///
+    /// The owner persists it: the page's address is the only browser state that
+    /// can outlive the runtime's tab, so it is what a restart reopens.
+    pub fn page_url(&self) -> Option<String> {
+        let url = self.tab.as_ref()?.url.trim();
+        (!url.is_empty()).then(|| url.to_string())
+    }
+
     /// The page's icon, for the preview tab.
     pub fn favicon(&self) -> Option<Arc<RenderImage>> {
         self.favicon.clone()
@@ -926,6 +935,34 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Says what the panel is waiting for while it has no runtime tab yet.
+    ///
+    /// A surface restored from a saved layout spends a moment here while the
+    /// runtime reopens the page, and "waiting for the browser to start" is the
+    /// wrong sentence for that. A retry after a refusal has to clear that
+    /// refusal too, or the panel would keep showing it while the browser starts.
+    pub fn set_pending_message(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        if self.tab_id.is_some() {
+            return;
+        }
+        self.phase = SurfacePhase::Idle;
+        self.message = Some(message.into());
+        cx.notify();
+    }
+
+    /// Explains why no runtime tab stands behind this panel.
+    ///
+    /// A restored tab whose runtime cannot serve it must say so; the idle
+    /// placeholder would leave it looking like a browser that never starts.
+    pub fn set_unattached_reason(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        if self.tab_id.is_some() {
+            return;
+        }
+        self.phase = SurfacePhase::Unavailable;
+        self.message = Some(message.into());
+        cx.notify();
+    }
+
     /// Releases the page's file chooser without choosing anything.
     ///
     /// Cancelling only in the panel would leave the page waiting for a file
@@ -1238,12 +1275,18 @@ impl BrowserSurface {
 
     fn phase_message(&self) -> SharedString {
         match self.phase {
-            SurfacePhase::Idle => locale::text(
-                "Waiting for the browser to start.",
-                "正在等待浏览器启动。",
-                "正在等待瀏覽器啟動。",
-            )
-            .into(),
+            SurfacePhase::Idle => self
+                .message
+                .clone()
+                .unwrap_or_else(|| {
+                    locale::text(
+                        "Waiting for the browser to start.",
+                        "正在等待浏览器启动。",
+                        "正在等待瀏覽器啟動。",
+                    )
+                    .to_string()
+                })
+                .into(),
             SurfacePhase::Connecting => {
                 locale::text("Loading the page…", "正在加载页面…", "正在載入頁面…").into()
             }
@@ -2366,6 +2409,50 @@ mod tests {
                 cx,
             );
             assert!(surface.availability.is_some());
+        });
+    }
+
+    /// A restored tab with no runtime tab behind it must say why, and must say
+    /// what it is doing meanwhile: the idle placeholder is the state the
+    /// "waiting for the browser to start" bug got stuck in.
+    #[gpui::test]
+    fn an_unattached_surface_explains_itself_instead_of_waiting(cx: &mut gpui::TestAppContext) {
+        let (surface, mut cx) = test_surface(cx);
+        surface.update(&mut cx, |surface, cx| {
+            surface.set_pending_message("Reopening the browser tab…", cx);
+            assert_eq!(
+                surface.phase_message().as_ref(),
+                "Reopening the browser tab…"
+            );
+            assert_eq!(surface.phase, SurfacePhase::Idle);
+            assert!(surface.page_url().is_none());
+
+            surface.set_unattached_reason("The embedded browser is unavailable.", cx);
+            assert_eq!(surface.phase, SurfacePhase::Unavailable);
+            assert_eq!(
+                surface.phase_message().as_ref(),
+                "The embedded browser is unavailable."
+            );
+
+            // A second attempt after a refusal says it is trying again rather
+            // than leaving the refusal on screen.
+            surface.set_pending_message("Reopening the browser tab…", cx);
+            assert_eq!(surface.phase, SurfacePhase::Idle);
+            assert_eq!(
+                surface.phase_message().as_ref(),
+                "Reopening the browser tab…"
+            );
+
+            // A surface that already owns a runtime tab keeps rendering that
+            // tab: a late boundary must not take over a live page.
+            surface.tab_id = Some(BrowserTabId::new());
+            surface.set_unattached_reason("late reason", cx);
+            assert_eq!(surface.phase, SurfacePhase::Idle);
+            assert_eq!(
+                surface.phase_message().as_ref(),
+                "Reopening the browser tab…",
+                "a boundary for a surface that already has a tab is ignored"
+            );
         });
     }
 

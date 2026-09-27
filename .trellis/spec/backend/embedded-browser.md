@@ -205,6 +205,49 @@ have been dropped once and must stay:
    URL printed on a terminal tab nobody is watching still counts, and an origin
    joins the allow-list only after `probe_candidate` answers.
 
+## A browser tab across a restart
+
+A runtime browser tab does not survive the runtime process: the Chrome target,
+its CDP session and its navigation history are gone, and `BrowserTabId` is a
+fresh UUID per tab. The preview tab is therefore the durable half, and it
+carries the one piece of page state that can be restored — the address.
+
+- **The address lives in the preview target.** `PreviewTarget::Browser {
+  browser_tab_id, url }` (`url` optional and omitted when absent, so an older
+  UI-state file still reads). The surface reports the address it sees on
+  `BrowserSurfaceEvent::TabChanged`, and the workbench writes it through
+  `PreviewState::remember_browser_url` — a real navigation is what persists, not
+  a repaint.
+- **A saved tab with no binding is reopened, not left waiting.** Restore
+  hydration (`ensure_browser_surface`) and a browser transport installed after
+  the layout was restored (`set_browser_transport`) both call
+  `start_browser_restore`: ensure the workspace's session, `create_tab` at the
+  remembered address, then `PreviewState::rebind_browser_tab` moves the preview
+  tab to the new runtime id (panes, fullscreen and side-preview references
+  included) and the surface, its subscription, its label and its active flag
+  are rekeyed with it. History is not restored and cannot be: a new target
+  starts at the address.
+- **No address, no guess.** A tab saved before addresses were remembered shows
+  the "no longer open, reopen it from the browser panel" boundary and creates
+  nothing. An unavailable transport, a missing workspace and a refused
+  `create_tab` all report their reason on the surface.
+- **The idle placeholder is never the answer to a missing runtime tab.**
+  "Waiting for the browser to start" is only correct while an attach is
+  actually in flight; a restored tab that will not be attached must say why,
+  which is why `set_pending_message` / `set_unattached_reason` exist and why
+  `phase_message` reads the pending message in the idle phase. A restored tab
+  stuck on the placeholder is the regression this contract guards.
+- **A reopen in flight is cancelled by the workspace it belonged to.**
+  `browser_restores` keys the attempt by the previous run's runtime id; a
+  workspace change drops the entries, and a completion whose preview tab is
+  gone closes the runtime tab it created instead of leaking a Chrome target.
+
+The stored address is **local UI state**, not an audit record: it keeps its
+query string and fragment, the way a browser's own session restore does, because
+a stripped address reopens the wrong page. The redaction rules for
+`BrowserActionRecord` and the persisted `browser_audit_records` table are
+unchanged and are not the place a restorable address may be read back from.
+
 ## The browser shell the screencast cannot supply
 
 Chrome's own popups and dialogs are browser UI; a screencast carries only the

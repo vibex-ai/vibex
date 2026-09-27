@@ -17,6 +17,13 @@ pub enum PreviewTarget {
     Browser {
         #[serde(alias = "browserTabId")]
         browser_tab_id: String,
+        /// Address the tab was showing when the layout was last saved.
+        ///
+        /// A runtime browser tab dies with the runtime process, so the address
+        /// is the only thing that can be restored: a restart reopens a tab at
+        /// this URL and rebinds the preview tab to the new runtime id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
     GitDiff {
         path: String,
@@ -42,8 +49,12 @@ impl PreviewTarget {
             Self::Terminal { terminal_id } => {
                 *terminal_id = normalized_text(terminal_id)?;
             }
-            Self::Browser { browser_tab_id } => {
+            Self::Browser {
+                browser_tab_id,
+                url,
+            } => {
                 *browser_tab_id = normalized_text(browser_tab_id)?;
+                *url = url.take().and_then(|value| normalized_text(&value));
             }
             Self::GitCommit {
                 commit_hash,
@@ -63,7 +74,7 @@ impl PreviewTarget {
         match self {
             Self::File { path } => format!("file:{path}"),
             Self::Terminal { terminal_id } => format!("terminal:{terminal_id}"),
-            Self::Browser { browser_tab_id } => format!("browser:{browser_tab_id}"),
+            Self::Browser { browser_tab_id, .. } => format!("browser:{browser_tab_id}"),
             Self::GitDiff { path, staged } => {
                 format!("git:{}:{path}", if *staged { "staged" } else { "unstaged" })
             }
@@ -577,6 +588,85 @@ impl PreviewState {
         self.normalize_live();
     }
 
+    /// Points a browser tab at the runtime tab that replaced it.
+    ///
+    /// A runtime browser tab does not survive a restart, so a tab restored from
+    /// persistence is reopened and rebound to a fresh runtime id. The tab keeps
+    /// its place: only its id and the runtime id inside its target change.
+    /// Returns the tab's new id, or `None` when the layout holds no browser tab
+    /// under `tab_id`.
+    pub fn rebind_browser_tab(
+        &mut self,
+        tab_id: &str,
+        browser_tab_id: &str,
+        url: Option<&str>,
+    ) -> Option<String> {
+        let target = PreviewTarget::Browser {
+            browser_tab_id: browser_tab_id.to_string(),
+            url: url.and_then(normalized_text),
+        }
+        .normalize()?;
+        if !matches!(
+            self.tabs.get(tab_id).map(|tab| &tab.target),
+            Some(PreviewTarget::Browser { .. })
+        ) {
+            return None;
+        }
+        let next_id = target.tab_id();
+        let mut tab = self.tabs.remove(tab_id)?;
+        tab.id = next_id.clone();
+        tab.target = target;
+        self.tabs.insert(next_id.clone(), tab);
+        if next_id != tab_id {
+            let replacements = BTreeMap::from([(tab_id.to_string(), next_id.clone())]);
+            replace_tab_ids(&mut self.root, &replacements);
+            if self.fullscreen_tab_id.as_deref() == Some(tab_id) {
+                self.fullscreen_tab_id = Some(next_id.clone());
+            }
+            if self.side_preview_tab_id.as_deref() == Some(tab_id) {
+                self.side_preview_tab_id = Some(next_id.clone());
+            }
+        }
+        self.normalize_live();
+        Some(next_id)
+    }
+
+    /// Remembers the address a browser tab is showing.
+    ///
+    /// Returns whether the layout changed, so a caller only persists on a real
+    /// navigation.
+    pub fn remember_browser_url(&mut self, browser_tab_id: &str, url: &str) -> bool {
+        let Some(url) = normalized_text(url) else {
+            return false;
+        };
+        for tab in self.tabs.values_mut() {
+            if let PreviewTarget::Browser {
+                browser_tab_id: id,
+                url: remembered,
+            } = &mut tab.target
+                && id == browser_tab_id
+            {
+                if remembered.as_deref() == Some(url.as_str()) {
+                    return false;
+                }
+                *remembered = Some(url);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The address a restored browser tab should reopen, when one was saved.
+    pub fn browser_url(&self, browser_tab_id: &str) -> Option<&str> {
+        self.tabs.values().find_map(|tab| match &tab.target {
+            PreviewTarget::Browser {
+                browser_tab_id: id,
+                url,
+            } if id == browser_tab_id => url.as_deref(),
+            _ => None,
+        })
+    }
+
     pub fn delete_path(&mut self, path: &str) {
         self.delete_path_guarded(path, &BTreeSet::new());
     }
@@ -1040,6 +1130,14 @@ mod tests {
     fn browser(browser_tab_id: &str) -> PreviewTarget {
         PreviewTarget::Browser {
             browser_tab_id: browser_tab_id.to_string(),
+            url: None,
+        }
+    }
+
+    fn browser_at(browser_tab_id: &str, url: &str) -> PreviewTarget {
+        PreviewTarget::Browser {
+            browser_tab_id: browser_tab_id.to_string(),
+            url: Some(url.to_string()),
         }
     }
 
@@ -1333,6 +1431,126 @@ mod tests {
         assert_eq!(
             state.fullscreen_tab_id.as_deref(),
             Some(browser_id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_browser_tab_keeps_its_address_across_a_round_trip() {
+        let mut state = PreviewState::default();
+        let tab_id = state
+            .open(
+                browser_at("browser_tab_x", "http://127.0.0.1:5173/"),
+                None,
+                10,
+            )
+            .unwrap();
+
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(encoded.contains("http://127.0.0.1:5173/"));
+        let mut restored: PreviewState = serde_json::from_str(&encoded).unwrap();
+        restored.normalize();
+        assert_eq!(
+            restored.browser_url("browser_tab_x"),
+            Some("http://127.0.0.1:5173/")
+        );
+        assert_eq!(restored.tabs.keys().collect::<Vec<_>>(), vec![&tab_id]);
+    }
+
+    /// An older UI-state file has no address, and must still read: the tab is
+    /// restored without one instead of failing the whole layout.
+    #[test]
+    fn a_browser_target_without_an_address_still_reads() {
+        let target: PreviewTarget =
+            serde_json::from_str(r#"{"kind":"browser","browserTabId":"browser_tab_x"}"#).unwrap();
+        assert_eq!(target, browser("browser_tab_x"));
+        assert_eq!(target.normalize(), Some(browser("browser_tab_x")));
+    }
+
+    #[test]
+    fn rebinding_a_browser_tab_keeps_its_place_in_the_layout() {
+        let mut state = PreviewState::default();
+        let browser_id = state
+            .open(
+                browser_at("browser_tab_x", "https://example.com/"),
+                None,
+                10,
+            )
+            .unwrap();
+        let file_id = state.open(file("src/lib.rs"), None, 20).unwrap();
+        state.split_pruned(
+            &browser_id,
+            PREVIEW_MAIN_PANE_ID,
+            PreviewSplitPosition::Right,
+            "preview-pane-side",
+            "preview-split-1",
+        );
+        assert!(state.set_fullscreen(Some(&browser_id)));
+        assert!(state.set_side_preview(Some(&browser_id)));
+
+        let rebound = state
+            .rebind_browser_tab(
+                &browser_id,
+                "browser_tab_y",
+                Some("https://example.com/next"),
+            )
+            .expect("the browser tab is rebound");
+
+        assert_eq!(rebound, "browser:browser_tab_y");
+        assert!(!state.tabs.contains_key(&browser_id));
+        assert_eq!(
+            state.tabs.keys().collect::<Vec<_>>(),
+            vec!["browser:browser_tab_y", file_id.as_str()]
+        );
+        assert_eq!(state.fullscreen_tab_id.as_deref(), Some(rebound.as_str()));
+        assert_eq!(state.side_preview_tab_id.as_deref(), Some(rebound.as_str()));
+        assert_eq!(
+            pane_containing_tab(&state.root, &rebound),
+            Some("preview-pane-side"),
+            "the rebound tab stays in the pane it was split into"
+        );
+        assert_eq!(
+            state.browser_url("browser_tab_y"),
+            Some("https://example.com/next")
+        );
+    }
+
+    #[test]
+    fn rebinding_a_missing_or_non_browser_tab_changes_nothing() {
+        let mut state = PreviewState::default();
+        let file_id = state.open(file("src/lib.rs"), None, 10).unwrap();
+        let before = state.clone();
+
+        assert_eq!(
+            state.rebind_browser_tab("browser:browser_tab_x", "browser_tab_y", None),
+            None
+        );
+        assert_eq!(
+            state.rebind_browser_tab(&file_id, "browser_tab_y", None),
+            None
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn remembering_a_browser_address_reports_only_real_changes() {
+        let mut state = PreviewState::default();
+        state.open(browser("browser_tab_x"), None, 10).unwrap();
+
+        assert!(state.remember_browser_url("browser_tab_x", "https://example.com/"));
+        assert!(!state.remember_browser_url("browser_tab_x", "https://example.com/"));
+        assert!(!state.remember_browser_url("browser_tab_x", "  "));
+        assert!(!state.remember_browser_url("browser_tab_missing", "https://example.com/"));
+        assert_eq!(
+            state.browser_url("browser_tab_x"),
+            Some("https://example.com/")
+        );
+        assert_eq!(
+            serde_json::to_value(&state.tabs["browser:browser_tab_x"].target).unwrap(),
+            serde_json::json!({
+                "kind": "browser",
+                "browser_tab_id": "browser_tab_x",
+                "url": "https://example.com/",
+            })
         );
     }
 }

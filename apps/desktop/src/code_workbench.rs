@@ -50,7 +50,7 @@ use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, LogicalSurfaceBounds,
 };
 use vibex_core::{
-    BrowserSessionId, BrowserTabId, FileEncoding, FileEntryKind, FileLineEnding,
+    BrowserSessionId, BrowserTab, BrowserTabId, FileEncoding, FileEntryKind, FileLineEnding,
     FileMutationRequest, FilePreviewKind, FileReadRequest, FileReadResponse, FileSearchRequest,
     FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest, GitBranchSummary,
     GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitCommitSummary,
@@ -1117,14 +1117,18 @@ pub struct CodeWorkbench {
     browser_transport: Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>>,
     /// Which runtime browser session each preview tab is bound to. A preview tab
     /// survives a restart but a runtime browser session does not, so this map is
-    /// deliberately in-memory: a persisted tab without a binding shows the
-    /// "reopen" boundary instead of guessing at a session.
+    /// deliberately in-memory: a persisted tab without a binding is reopened
+    /// from the address the layout remembers.
     browser_bindings: BTreeMap<String, BrowserTabBinding>,
     /// Page title and loading state per browser tab, for the preview tab label.
     browser_tab_labels: BTreeMap<String, BrowserTabLabel>,
     /// Keeps each surface's event subscription alive for as long as its tab is
     /// open.
     browser_surface_subscriptions: BTreeMap<String, Subscription>,
+    /// Reopens a browser tab a saved layout remembers, keyed by the runtime id
+    /// the previous run used. A tab must not be reopened twice, and dropping an
+    /// entry cancels the attempt.
+    browser_restores: BTreeMap<String, Task<()>>,
     /// The runtime's browser event stream, started with the first surface.
     browser_events_task: Option<Task<()>>,
     workspace: Option<WorkbenchWorkspace>,
@@ -1314,6 +1318,7 @@ impl CodeWorkbench {
             browser_bindings: BTreeMap::new(),
             browser_tab_labels: BTreeMap::new(),
             browser_surface_subscriptions: BTreeMap::new(),
+            browser_restores: BTreeMap::new(),
             browser_events_task: None,
             workspace: None,
             pending_workspace: None,
@@ -1863,7 +1868,7 @@ impl CodeWorkbench {
                 .filter_map(|pane_id| self.preview.active_tab_id(pane_id))
                 .filter_map(|tab_id| self.preview.tabs.get(tab_id))
                 .filter_map(|tab| match &tab.target {
-                    PreviewTarget::Browser { browser_tab_id }
+                    PreviewTarget::Browser { browser_tab_id, .. }
                         if self.browser_surfaces.contains_key(browser_tab_id) =>
                     {
                         Some(browser_tab_id.clone())
@@ -2401,6 +2406,7 @@ impl CodeWorkbench {
             self.active_terminal_surface_ids.clear();
             self.browser_surfaces.clear();
             self.active_browser_surface_ids.clear();
+            self.browser_restores.clear();
         }
         cx.notify();
     }
@@ -2422,7 +2428,13 @@ impl CodeWorkbench {
             self.browser_bindings.clear();
             self.browser_tab_labels.clear();
             self.browser_surface_subscriptions.clear();
+            self.browser_restores.clear();
             self.browser_events_task = None;
+        } else {
+            // The layout is restored before the runtime is installed, so a
+            // transport that arrives later still has to reopen the browser tabs
+            // the previous run left open.
+            self.restore_browser_bindings(cx);
         }
         cx.notify();
     }
@@ -2517,6 +2529,8 @@ impl CodeWorkbench {
         self.active_terminal_surface_ids.clear();
         self.browser_surfaces.clear();
         self.active_browser_surface_ids.clear();
+        // An attempt to reopen a tab belongs to the workspace that asked for it.
+        self.browser_restores.clear();
         self.backend = Some(backend.clone());
         self.pending_workspace = None;
         self.presentations.clear();
@@ -2833,7 +2847,7 @@ impl CodeWorkbench {
             .tabs
             .values()
             .filter_map(|tab| match &tab.target {
-                PreviewTarget::Browser { browser_tab_id }
+                PreviewTarget::Browser { browser_tab_id, .. }
                     if !self.browser_surfaces.contains_key(browser_tab_id) =>
                 {
                     Some(browser_tab_id.clone())
@@ -4399,7 +4413,7 @@ impl CodeWorkbench {
             .tabs
             .values()
             .filter_map(|tab| match &tab.target {
-                PreviewTarget::Browser { browser_tab_id } => Some(browser_tab_id.as_str()),
+                PreviewTarget::Browser { browser_tab_id, .. } => Some(browser_tab_id.as_str()),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
@@ -4470,31 +4484,36 @@ impl CodeWorkbench {
             return true;
         }
         let entity = cx.new(|cx| BrowserSurface::new(browser_tab_id.to_string(), window, cx));
-        // The surface needs the authority and the runtime-side session before
-        // it can show anything; without them it renders the "waiting for the
-        // browser" state rather than an empty rectangle.
-        if let Some(transport) = self.browser_transport.clone()
-            && let Some(binding) = self.browser_bindings.get(browser_tab_id).cloned()
-        {
-            let tab_id = BrowserTabId::parse(browser_tab_id.to_string()).ok();
-            if let Some(tab_id) = tab_id {
-                entity.update(cx, |surface, cx| {
-                    surface.attach(transport, binding.session_id.clone(), tab_id, cx);
-                });
-            }
-        }
         let subscription = cx.subscribe(
             &entity,
             |workbench, surface, event: &BrowserSurfaceEvent, cx| {
                 if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
+                    let (title, loading, favicon, url) = {
+                        let surface = surface.read(cx);
+                        (
+                            surface.page_title().unwrap_or_default(),
+                            surface.is_loading(),
+                            surface.favicon(),
+                            surface.page_url(),
+                        )
+                    };
                     workbench.browser_tab_labels.insert(
                         tab_id.as_str().to_string(),
                         BrowserTabLabel {
-                            title: surface.read(cx).page_title().unwrap_or_default(),
-                            loading: surface.read(cx).is_loading(),
-                            favicon: surface.read(cx).favicon(),
+                            title,
+                            loading,
+                            favicon,
                         },
                     );
+                    // The address is the one piece of page state a restart can
+                    // bring back, so a navigation has to reach the layout.
+                    if let Some(url) = url
+                        && workbench
+                            .preview
+                            .remember_browser_url(tab_id.as_str(), &url)
+                    {
+                        workbench.persist(cx);
+                    }
                     cx.notify();
                 }
             },
@@ -4502,10 +4521,217 @@ impl CodeWorkbench {
         self.browser_surface_subscriptions
             .insert(browser_tab_id.to_string(), subscription);
         self.browser_surfaces
-            .insert(browser_tab_id.to_string(), entity);
+            .insert(browser_tab_id.to_string(), entity.clone());
         self.ensure_browser_event_stream(window, cx);
+        // The surface needs the authority and the runtime-side session before it
+        // can show anything. A binding means this run already has the runtime
+        // tab; without one the tab came from a saved layout and the runtime has
+        // to be asked for it again.
+        if let Some(binding) = self.browser_bindings.get(browser_tab_id).cloned() {
+            if let Some(transport) = self.browser_transport.clone()
+                && let Ok(tab_id) = BrowserTabId::parse(browser_tab_id.to_string())
+            {
+                entity.update(cx, |surface, cx| {
+                    surface.attach(transport, binding.session_id.clone(), tab_id, cx);
+                });
+            }
+        } else {
+            self.start_browser_restore(browser_tab_id, cx);
+        }
         self.sync_browser_surface_activity(cx);
         true
+    }
+
+    /// Reopens every restored browser tab that has no runtime tab behind it.
+    ///
+    /// The layout is restored before the runtime is installed, and a browser
+    /// transport that arrives later still has to pick up the tabs the previous
+    /// run left open.
+    fn restore_browser_bindings(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .preview
+            .tabs
+            .values()
+            .filter_map(|tab| match &tab.target {
+                PreviewTarget::Browser { browser_tab_id, .. }
+                    if !self.browser_bindings.contains_key(browser_tab_id) =>
+                {
+                    Some(browser_tab_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for browser_tab_id in pending {
+            self.start_browser_restore(&browser_tab_id, cx);
+        }
+    }
+
+    /// Asks the runtime for a tab at the address a restored preview tab
+    /// remembers, then rebinds that preview tab to it.
+    ///
+    /// The surface says what is happening while that runs, and says why it
+    /// could not happen when the runtime refuses — a restored tab must never
+    /// sit on the idle placeholder forever.
+    fn start_browser_restore(&mut self, browser_tab_id: &str, cx: &mut Context<Self>) {
+        if self.browser_restores.contains_key(browser_tab_id) {
+            return;
+        }
+        let surface = self.browser_surfaces.get(browser_tab_id).cloned();
+        let Some(url) = self.preview.browser_url(browser_tab_id).map(str::to_string) else {
+            self.report_unattached_browser_tab(
+                browser_tab_id,
+                locale::text(
+                    "This browser tab is no longer open. Reopen it from the browser panel.",
+                    "该浏览器标签已关闭。请从浏览器面板重新打开。",
+                    "該瀏覽器分頁已關閉。請從瀏覽器面板重新開啟。",
+                ),
+                cx,
+            );
+            return;
+        };
+        let Some(transport) = self.browser_transport.clone() else {
+            self.report_unattached_browser_tab(
+                browser_tab_id,
+                locale::text(
+                    "The embedded browser needs a connected runtime.",
+                    "内嵌浏览器需要已连接的 runtime。",
+                    "內嵌瀏覽器需要已連接的 runtime。",
+                ),
+                cx,
+            );
+            return;
+        };
+        let Some(workspace_id) = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.id.clone())
+        else {
+            self.report_unattached_browser_tab(
+                browser_tab_id,
+                locale::text(
+                    "Select a workspace before reopening the browser.",
+                    "请先选择工作区再重新打开浏览器。",
+                    "請先選擇工作區再重新開啟瀏覽器。",
+                ),
+                cx,
+            );
+            return;
+        };
+        if let Some(surface) = surface.as_ref() {
+            surface.update(cx, |surface, cx| {
+                surface.set_pending_message(
+                    locale::text(
+                        "Reopening the browser tab…",
+                        "正在恢复浏览器标签…",
+                        "正在恢復瀏覽器分頁…",
+                    ),
+                    cx,
+                )
+            });
+        }
+        let key = browser_tab_id.to_string();
+        let task = cx.spawn(async move |this, cx| {
+            let reopened = async {
+                let session_id = transport.ensure_workspace_session(&workspace_id).await?;
+                let tab = transport
+                    .create_tab(&session_id, Some(url.as_str()))
+                    .await?;
+                Ok::<_, crate::browser_transport::BrowserTransportError>((session_id, tab))
+            }
+            .await;
+            let _ = this.update(cx, |workbench, cx| {
+                workbench.browser_restores.remove(&key);
+                match reopened {
+                    Ok((session_id, tab)) => {
+                        workbench.finish_browser_restore(&key, transport, session_id, tab, cx)
+                    }
+                    Err(error) => workbench.fail_browser_restore(&key, error, cx),
+                }
+            });
+        });
+        self.browser_restores
+            .insert(browser_tab_id.to_string(), task);
+    }
+
+    /// Points a restored preview tab at the runtime tab that reopened it.
+    fn finish_browser_restore(
+        &mut self,
+        previous_id: &str,
+        transport: std::sync::Arc<dyn crate::browser_transport::BrowserTransport>,
+        session_id: BrowserSessionId,
+        tab: BrowserTab,
+        cx: &mut Context<Self>,
+    ) {
+        let preview_tab_id = format!("browser:{previous_id}");
+        let url = tab.url.clone();
+        let Some(rebound_id) = self.preview.rebind_browser_tab(
+            &preview_tab_id,
+            tab.tab_id.as_str(),
+            (!url.trim().is_empty()).then_some(url.as_str()),
+        ) else {
+            // The human closed the tab while the runtime was starting. The
+            // runtime tab it left behind belongs to nobody.
+            let tab_id = tab.tab_id.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = transport.close_tab(&tab_id).await;
+                })
+                .detach();
+            return;
+        };
+        let next_key = tab.tab_id.as_str().to_string();
+        if let Some(surface) = self.browser_surfaces.remove(previous_id) {
+            self.browser_surfaces
+                .insert(next_key.clone(), surface.clone());
+            surface.update(cx, |surface, cx| {
+                surface.attach(transport, session_id.clone(), tab.tab_id.clone(), cx);
+                surface.refresh_tab(cx);
+            });
+        }
+        if let Some(subscription) = self.browser_surface_subscriptions.remove(previous_id) {
+            self.browser_surface_subscriptions
+                .insert(next_key.clone(), subscription);
+        }
+        if let Some(label) = self.browser_tab_labels.remove(previous_id) {
+            self.browser_tab_labels.insert(next_key.clone(), label);
+        }
+        if self.active_browser_surface_ids.remove(previous_id) {
+            self.active_browser_surface_ids.insert(next_key.clone());
+        }
+        self.browser_bindings
+            .insert(next_key, BrowserTabBinding { session_id });
+        debug_assert!(self.preview.tabs.contains_key(&rebound_id));
+        self.sync_browser_surface_activity(cx);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Reports why a restored browser tab could not be reopened.
+    ///
+    /// The reason stays on the surface: a tab that failed to reopen is a
+    /// statement about that tab, not an error banner over the whole workbench.
+    fn fail_browser_restore(
+        &mut self,
+        browser_tab_id: &str,
+        error: crate::browser_transport::BrowserTransportError,
+        cx: &mut Context<Self>,
+    ) {
+        self.report_unattached_browser_tab(browser_tab_id, error.message, cx);
+    }
+
+    /// Tells a surface why no runtime tab stands behind it.
+    fn report_unattached_browser_tab(
+        &mut self,
+        browser_tab_id: &str,
+        reason: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(surface) = self.browser_surfaces.get(browser_tab_id).cloned() {
+            surface.update(cx, |surface, cx| {
+                surface.set_unattached_reason(reason, cx);
+            });
+        }
+        cx.notify();
     }
 
     /// Starts listening to the runtime's browser events.
@@ -4716,6 +4942,7 @@ impl CodeWorkbench {
         if let Some(preview_tab_id) = self.preview.open(
             PreviewTarget::Browser {
                 browser_tab_id: browser_tab_id.clone(),
+                url: None,
             },
             None,
             unix_timestamp_ms(),
@@ -4862,6 +5089,13 @@ impl CodeWorkbench {
                     })
             })
             .flatten();
+        // A reused tab keeps the address the layout already remembers: the
+        // caller does not know the page here, and forgetting it would cost the
+        // tab its restore after the next restart.
+        let existing_url = existing
+            .as_ref()
+            .and_then(|(tab_string, _)| self.preview.browser_url(tab_string))
+            .map(str::to_string);
         let pane_id =
             pane_id.filter(|pane_id| self.preview.pane_ids().iter().any(|id| id == pane_id));
         cx.spawn_in(window, async move |this, cx| {
@@ -4875,10 +5109,10 @@ impl CodeWorkbench {
                     return;
                 }
             };
-            let (tab_string, tab_id) = match existing {
-                Some((tab_string, tab_id)) => (tab_string, tab_id),
+            let (tab_string, tab_id, tab_url) = match existing {
+                Some((tab_string, tab_id)) => (tab_string, tab_id, existing_url),
                 None => match transport.create_tab(&session_id, url.as_deref()).await {
-                    Ok(tab) => (tab.tab_id.as_str().to_string(), tab.tab_id),
+                    Ok(tab) => (tab.tab_id.as_str().to_string(), tab.tab_id, Some(tab.url)),
                     Err(error) => {
                         let _ = this.update(cx, |workbench, cx| {
                             workbench.apply_browser_transport_error(&error);
@@ -4905,6 +5139,7 @@ impl CodeWorkbench {
                     let tab_id_string = workbench.preview.open(
                         PreviewTarget::Browser {
                             browser_tab_id: tab_string.clone(),
+                            url: tab_url,
                         },
                         pane_id.as_deref(),
                         unix_timestamp_ms(),
@@ -7742,7 +7977,7 @@ impl CodeWorkbench {
                 }),
             // The page names its own tab; the generic "Browser" label is only
             // what a tab shows before the page has reported a title.
-            PreviewTarget::Browser { browser_tab_id } => self
+            PreviewTarget::Browser { browser_tab_id, .. } => self
                 .browser_tab_labels
                 .get(browser_tab_id)
                 .map(|label| label.title.trim())
@@ -7753,7 +7988,7 @@ impl CodeWorkbench {
         };
         let browser_loading = matches!(
             &tab.target,
-            PreviewTarget::Browser { browser_tab_id }
+            PreviewTarget::Browser { browser_tab_id, .. }
                 if self
                     .browser_tab_labels
                     .get(browser_tab_id)
@@ -7766,7 +8001,7 @@ impl CodeWorkbench {
             _ => String::new(),
         };
         let browser_favicon = match &tab.target {
-            PreviewTarget::Browser { browser_tab_id } => self
+            PreviewTarget::Browser { browser_tab_id, .. } => self
                 .browser_tab_labels
                 .get(browser_tab_id)
                 .and_then(|label| label.favicon.clone()),
@@ -8545,7 +8780,7 @@ impl CodeWorkbench {
                         cx,
                     )
                 }),
-            PreviewTarget::Browser { browser_tab_id } => self
+            PreviewTarget::Browser { browser_tab_id, .. } => self
                 .browser_surfaces
                 .get(&browser_tab_id)
                 .cloned()
@@ -18283,6 +18518,8 @@ mod tests {
     #[derive(Default)]
     struct IdleBrowserTransport {
         created_tabs: Arc<std::sync::Mutex<Vec<BrowserTabId>>>,
+        /// Addresses the panel asked each tab to open, in call order.
+        created_urls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     }
 
     impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
@@ -18331,6 +18568,10 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, vibex_core::BrowserTab> {
             let tab_id = BrowserTabId::new();
             self.created_tabs.lock().unwrap().push(tab_id.clone());
+            self.created_urls
+                .lock()
+                .unwrap()
+                .push(url.map(str::to_string));
             let url = url.unwrap_or("about:blank").to_string();
             Box::pin(async move {
                 Ok(vibex_core::BrowserTab {
@@ -18452,6 +18693,264 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    /// Opens a browser tab straight into the layout, the way a restart leaves
+    /// one: a preview tab with a remembered address and no runtime tab behind
+    /// it.
+    fn restore_browser_layout(
+        workbench: &Entity<CodeWorkbench>,
+        cx: &mut gpui::VisualTestContext,
+        browser_tab_id: &str,
+        url: Option<&str>,
+    ) {
+        workbench.update(cx, |workbench, _| {
+            workbench.preview.open(
+                PreviewTarget::Browser {
+                    browser_tab_id: browser_tab_id.to_string(),
+                    url: url.map(str::to_string),
+                },
+                None,
+                unix_timestamp_ms(),
+            );
+        });
+    }
+
+    // A browser tab survives a restart only as a saved layout entry: the
+    // runtime's tab dies with the process. The panel has to reopen the address
+    // the tab was showing and rebind the preview tab to the tab that comes
+    // back, or the reader is left on a placeholder that never resolves.
+    #[gpui::test]
+    fn a_restored_browser_tab_reopens_the_page_it_was_showing(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(
+            &workbench,
+            cx,
+            "browser_tab_previous_run",
+            Some("http://127.0.0.1:5173/"),
+        );
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            urls.lock().unwrap().clone(),
+            vec![Some("http://127.0.0.1:5173/".to_string())],
+            "the runtime is asked for the page the tab was showing"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            assert!(
+                !workbench
+                    .preview
+                    .tabs
+                    .contains_key("browser:browser_tab_previous_run"),
+                "the preview tab is rebound to the runtime tab that reopened it"
+            );
+            let (preview_tab_id, tab) = workbench
+                .preview
+                .tabs
+                .iter()
+                .find(|(_, tab)| matches!(tab.target, PreviewTarget::Browser { .. }))
+                .expect("the restored browser tab is still in the layout");
+            let PreviewTarget::Browser {
+                browser_tab_id,
+                url,
+            } = &tab.target
+            else {
+                unreachable!("the entry was filtered to browser tabs")
+            };
+            assert_eq!(
+                url.as_deref(),
+                Some("http://127.0.0.1:5173/"),
+                "the address travels with the rebind"
+            );
+            assert_eq!(preview_tab_id, &format!("browser:{browser_tab_id}"));
+            assert!(
+                workbench.browser_bindings.contains_key(browser_tab_id),
+                "the rebound tab has a runtime session behind it"
+            );
+            let surface = workbench
+                .browser_surfaces
+                .get(browser_tab_id)
+                .expect("the rebound tab has a surface");
+            assert_eq!(
+                surface.read_with(cx, |surface, _| surface.tab_id().cloned()),
+                Some(BrowserTabId::parse(browser_tab_id.clone()).unwrap()),
+                "the surface renders the reopened runtime tab"
+            );
+        });
+    }
+
+    // A saved entry from before addresses were remembered cannot be reopened.
+    // It must say so, because the idle placeholder is what made the panel look
+    // permanently stuck.
+    #[gpui::test]
+    fn a_restored_browser_tab_without_an_address_explains_itself(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(&workbench, cx, "browser_tab_previous_run", None);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.ensure_browser_surface("browser_tab_previous_run", window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            urls.lock().unwrap().is_empty(),
+            "an unknown address is not guessed at"
+        );
+        workbench.read_with(cx, |workbench, _| {
+            assert!(
+                !workbench
+                    .browser_bindings
+                    .contains_key("browser_tab_previous_run")
+            );
+            assert!(workbench.browser_restores.is_empty());
+            assert!(
+                workbench
+                    .browser_surfaces
+                    .contains_key("browser_tab_previous_run"),
+                "the tab still renders a boundary rather than nothing"
+            );
+        });
+    }
+
+    // The startup order is not fixed: the layout and its surfaces can exist
+    // before the runtime that serves them. A transport arriving later has to
+    // pick the tab up — surface, subscription and label included — and clear
+    // the reason the panel showed while it had none.
+    #[gpui::test]
+    fn a_late_browser_transport_reopens_the_surface_it_found(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(
+            &workbench,
+            cx,
+            "browser_tab_previous_run",
+            Some("https://example.com/docs"),
+        );
+        workbench.update_in(cx, |workbench, window, cx| {
+            assert!(workbench.ensure_browser_surface("browser_tab_previous_run", window, cx));
+        });
+        cx.run_until_parked();
+
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let urls = transport.created_urls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            urls.lock().unwrap().clone(),
+            vec![Some("https://example.com/docs".to_string())]
+        );
+        workbench.read_with(cx, |workbench, _| {
+            let browser_tab_id = workbench
+                .browser_bindings
+                .keys()
+                .next()
+                .cloned()
+                .expect("the restored tab is bound");
+            assert_ne!(
+                browser_tab_id, "browser_tab_previous_run",
+                "the tab is rebound to the id the runtime handed back"
+            );
+            assert!(
+                !workbench
+                    .browser_surfaces
+                    .contains_key("browser_tab_previous_run"),
+                "the surface moved with the tab instead of being replaced"
+            );
+            let surface = workbench
+                .browser_surfaces
+                .get(&browser_tab_id)
+                .expect("the surface is keyed by the reopened tab");
+            assert_eq!(
+                surface.read_with(cx, |surface, _| surface.tab_id().cloned()),
+                Some(BrowserTabId::parse(browser_tab_id.clone()).unwrap()),
+            );
+            assert!(
+                workbench
+                    .browser_surface_subscriptions
+                    .contains_key(&browser_tab_id),
+                "the subscription follows the surface"
+            );
+            assert!(workbench.browser_restores.is_empty());
+        });
+    }
+
+    // The whole point of remembering the address: navigating has to reach the
+    // saved layout, and a tab reused from the rail must not lose it.
+    #[gpui::test]
+    fn the_page_address_reaches_the_saved_layout(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(
+            &workbench,
+            cx,
+            "browser_tab_previous_run",
+            Some("about:blank"),
+        );
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        let browser_tab_id = workbench.read_with(cx, |workbench, _| {
+            workbench
+                .browser_bindings
+                .keys()
+                .next()
+                .cloned()
+                .expect("the restored tab is bound to a runtime tab")
+        });
+
+        workbench.update(cx, |workbench, _| {
+            assert_eq!(
+                workbench.preview.browser_url(&browser_tab_id),
+                Some("about:blank")
+            );
+            assert!(
+                workbench
+                    .preview
+                    .remember_browser_url(&browser_tab_id, "https://example.com/docs"),
+                "a navigation is a real change to the saved layout"
+            );
+            assert!(
+                !workbench
+                    .preview
+                    .remember_browser_url(&browser_tab_id, "https://example.com/docs")
+            );
+        });
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_browser(Some("https://example.com/other".to_string()), window, cx);
+        });
+        cx.run_until_parked();
+
+        workbench.read_with(cx, |workbench, _| {
+            assert_eq!(
+                workbench
+                    .preview
+                    .tabs
+                    .values()
+                    .filter(|tab| matches!(tab.target, PreviewTarget::Browser { .. }))
+                    .count(),
+                1,
+                "the rail reuses the browser tab it already has"
+            );
+            assert_eq!(
+                workbench.preview.browser_url(&browser_tab_id),
+                Some("https://example.com/docs"),
+                "reusing a tab does not erase the address that restores it"
+            );
+        });
     }
 
     // The "+" menu and the empty preview panel mean "a new browser", the same
