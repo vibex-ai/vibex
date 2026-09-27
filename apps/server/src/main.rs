@@ -471,6 +471,8 @@ fn parse_permission(value: &str) -> Result<RemoteDevicePermissionLevel, VibexErr
 fn print_help() {
     println!("vibex-server {VERSION}");
     println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check]");
+    println!("  --agent-delegation-mcp                run the Agent delegation MCP stdio sidecar");
+    println!("  --browser-mcp                         run the embedded browser MCP stdio sidecar");
     println!("  serve [--no-pairing]                 run the authoritative headless runtime");
     println!("  pairing-code [--permission full-control] [--ttl-ms N]");
     println!("                                       mint a one-time code plus its pairing link");

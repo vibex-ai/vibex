@@ -87,7 +87,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
-use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent};
+use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
@@ -1175,6 +1175,12 @@ pub struct CodeWorkbench {
     terminal_surfaces: BTreeMap<String, Entity<TerminalSurface>>,
     active_terminal_surface_ids: BTreeSet<String>,
     browser_surfaces: BTreeMap<String, Entity<BrowserSurface>>,
+    /// Textures retired by browser surfaces that no longer paint.
+    ///
+    /// `Window::drop_image` is the only release for an atlas tile and the code
+    /// that closes a tab has no window, so the images wait for this workbench's
+    /// next paint.
+    browser_texture_orphans: OrphanTextures,
     active_browser_surface_ids: BTreeSet<String>,
     selected_file_path: Option<String>,
     selected_git_path: Option<String>,
@@ -1353,6 +1359,7 @@ impl CodeWorkbench {
             terminal_surfaces: BTreeMap::new(),
             active_terminal_surface_ids: BTreeSet::new(),
             browser_surfaces: BTreeMap::new(),
+            browser_texture_orphans: OrphanTextures::default(),
             active_browser_surface_ids: BTreeSet::new(),
             selected_file_path,
             selected_git_path,
@@ -2408,7 +2415,7 @@ impl CodeWorkbench {
         if self.terminal_transport.is_none() {
             self.terminal_surfaces.clear();
             self.active_terminal_surface_ids.clear();
-            self.browser_surfaces.clear();
+            self.retire_browser_surfaces(cx);
             self.active_browser_surface_ids.clear();
             self.browser_restores.clear();
         }
@@ -2427,7 +2434,7 @@ impl CodeWorkbench {
     ) {
         self.browser_transport = transport;
         if self.browser_transport.is_none() {
-            self.browser_surfaces.clear();
+            self.retire_browser_surfaces(cx);
             self.active_browser_surface_ids.clear();
             self.browser_bindings.clear();
             self.browser_tab_labels.clear();
@@ -2555,7 +2562,7 @@ impl CodeWorkbench {
         self.reconcile_terminal_selection();
         self.terminal_surfaces.clear();
         self.active_terminal_surface_ids.clear();
-        self.browser_surfaces.clear();
+        self.retire_browser_surfaces(cx);
         self.active_browser_surface_ids.clear();
         // An attempt to reopen a tab belongs to the workspace that asked for it.
         self.browser_restores.clear();
@@ -4502,6 +4509,17 @@ impl CodeWorkbench {
         true
     }
 
+    /// Hands every browser surface's textures to the paint that can release
+    /// them, then drops the surfaces.
+    ///
+    /// Dropping an `Entity<BrowserSurface>` on its own leaves each frame and
+    /// favicon resident in the sprite atlas, which has no eviction.
+    fn retire_browser_surfaces(&mut self, cx: &mut Context<Self>) {
+        for (_, surface) in std::mem::take(&mut self.browser_surfaces) {
+            surface.update(cx, |surface, _| surface.retire_textures());
+        }
+    }
+
     fn ensure_browser_surface(
         &mut self,
         browser_tab_id: &str,
@@ -4513,8 +4531,10 @@ impl CodeWorkbench {
         }
         let entity = cx.new(|cx| BrowserSurface::new(browser_tab_id.to_string(), window, cx));
         let search_template = self.browser_preferences.resolved_search_url().to_string();
+        let orphans = self.browser_texture_orphans.clone();
         entity.update(cx, |surface, cx| {
-            surface.set_search_template(search_template, cx)
+            surface.set_search_template(search_template, cx);
+            surface.set_orphan_textures(orphans);
         });
         let subscription = cx.subscribe(
             &entity,
@@ -5920,7 +5940,9 @@ impl CodeWorkbench {
             }
         }
         if let Some(browser_tab_id) = tab_id.strip_prefix("browser:") {
-            self.browser_surfaces.remove(browser_tab_id);
+            if let Some(surface) = self.browser_surfaces.remove(browser_tab_id) {
+                surface.update(cx, |surface, _| surface.retire_textures());
+            }
             self.active_browser_surface_ids.remove(browser_tab_id);
             self.browser_tab_labels.remove(browser_tab_id);
             self.browser_surface_subscriptions.remove(browser_tab_id);
@@ -10067,6 +10089,13 @@ impl CodeWorkbench {
 
 impl Render for CodeWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Release every texture a closed browser tab left behind. The sprite
+        // atlas has no eviction, so an image whose surface is gone still holds
+        // its tile until the window is told to drop it.
+        let orphans = std::mem::take(&mut *self.browser_texture_orphans.borrow_mut());
+        for image in orphans {
+            let _ = window.drop_image(image);
+        }
         self.schedule_restore_hydration(window, cx);
         if !cx.has_active_drag() {
             self.preview_tab_drop_target = None;

@@ -109,9 +109,20 @@ agent acts on and what the user sees cannot diverge.
 - **Never `--no-sandbox`.** In a container, configure user namespaces or seccomp
   instead.
 - **Loopback is not blanket-trusted.** Only origins the runtime positively
-  identified as this workspace's development server skip approval; every other
+  identified as *this workspace's* development server skip approval; every other
   loopback and private-network target prompts, because the browser runs on the
-  runtime host and can reach services that are not exposed at all.
+  runtime host and can reach services that are not exposed at all. The
+  dev-server exemption is per workspace: a server detected in one project never
+  opens another project's sessions.
+- **An approval is remembered per origin, never per host.**
+  `http://localhost:5173` and `http://localhost:2375` are two decisions;
+  approving the first must not expose a local Docker socket or a database
+  console. A one-off "approve" applies to the retry that carries it and is not
+  written down at all.
+- **Opening a tab is a navigation.** `browser_create_tab` with a URL goes
+  through the same policy as `browser_navigate`. A tab that could be opened
+  anywhere would make the approval card optional, which is how an Agent reached
+  an unapproved origin without ever calling `browser_navigate`.
 - **The child's proxy environment is decided at launch, not inherited.** Chrome
   parses `all_proxy` as an HTTP proxy even when it names a SOCKS server, so a
   shell exporting `all_proxy=socks5://127.0.0.1:7891` (Clash-style) makes every
@@ -127,8 +138,11 @@ agent acts on and what the user sees cannot diverge.
   confine the result to the agent's authorized roots.** Local previews are
   served as a `data:` URL so the page never learns an absolute path.
 - **Page content is untrusted data.** Every tool description carries
-  `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and `browser_extract` wraps its result in
-  explicit content delimiters.
+  `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and page-derived results — the AX element
+  list from `browser_observe` / `browser_find`, and `browser_extract` — are
+  wrapped in `BROWSER_UNTRUSTED_CONTENT_BEGIN` / `_END` delimiters. The notice
+  alone is a sentence at the end; the fence is what makes where the page stops
+  and the runtime's own text starts unambiguous.
 - **No blocking notice stands between the user and the browser.** A first
   attempt parked `open_browser` behind a modal risk card; the card rendered
   without its buttons, and because the overlay was deliberately not closable the

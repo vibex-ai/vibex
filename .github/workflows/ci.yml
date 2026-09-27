@@ -55,6 +55,21 @@ jobs:
       - name: Run default checks
         run: pnpm check
 
+  browser-smoke:
+    name: Embedded browser smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang g++ gcc pkg-config libssl-dev
+      - name: Run the embedded browser smoke
+        # The suite skips itself when the runner has no Chrome/Chromium, which
+        # is the same explicit degradation the panel shows. A SKIP is a pass.
+        run: cargo test -p vibex-browser --locked --test page_tabs -- --nocapture
+
   smoke-placeholders:
     name: Scripted smoke entrypoints
     runs-on: ubuntu-latest
@@ -63,6 +78,7 @@ jobs:
           echo "Stage 0 smoke commands are explicit local entrypoints:"
           echo "pnpm smoke:db"
           echo "pnpm smoke:git"
+          echo "pnpm smoke:browser"
           echo "pnpm smoke:pty"
           echo "pnpm smoke:codex"
           echo "pnpm smoke:claude"

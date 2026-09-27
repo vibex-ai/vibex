@@ -87,6 +87,13 @@ pub enum BrowserSurfaceEvent {
 }
 
 /// A GPUI surface for one browser tab.
+/// Textures waiting for a window to release them.
+///
+/// Shared between the browser surfaces and the workbench: a surface that is
+/// removed from the panel never paints again, so the paint that frees its atlas
+/// tiles has to happen somewhere else.
+pub type OrphanTextures = std::rc::Rc<std::cell::RefCell<Vec<Arc<RenderImage>>>>;
+
 pub struct BrowserSurface {
     transport: Option<Arc<dyn BrowserTransport>>,
     tab_id: Option<BrowserTabId>,
@@ -103,6 +110,13 @@ pub struct BrowserSurface {
     /// the previous frame is parked here and released at the top of the next
     /// paint instead of leaking.
     pending_drop: Vec<Arc<RenderImage>>,
+    /// Textures handed to the workbench because this entity is going away.
+    ///
+    /// A removed surface never paints again, so anything it still holds would
+    /// keep its atlas tile for the life of the process. The workbench owns the
+    /// paint that can release them, so the images are parked in a queue shared
+    /// with it.
+    orphans: Option<OrphanTextures>,
     frame_metadata: BrowserFrameMetadata,
     frame_sequence: u64,
     dropped_frames: u64,
@@ -188,6 +202,7 @@ impl BrowserSurface {
             message: None,
             frame_image: None,
             pending_drop: Vec::new(),
+            orphans: None,
             frame_metadata: BrowserFrameMetadata::default(),
             frame_sequence: 0,
             dropped_frames: 0,
@@ -299,7 +314,12 @@ impl BrowserSurface {
                 return;
             };
             let _ = this.update(cx, |surface, cx| {
-                surface.favicon = Some(Arc::new(RenderImage::new(vec![Frame::new(decoded.image)])));
+                let next = Arc::new(RenderImage::new(vec![Frame::new(decoded.image)]));
+                // The atlas has no eviction: replacing an image without asking
+                // the window to drop it leaves the old tile resident.
+                if let Some(previous) = surface.favicon.replace(next) {
+                    surface.pending_drop.push(previous);
+                }
                 if let Some(tab_id) = surface.tab_id.clone() {
                     cx.emit(BrowserSurfaceEvent::TabChanged { tab_id });
                 }
@@ -375,7 +395,9 @@ impl BrowserSurface {
             return;
         }
         self.tab_id = tab_id;
-        self.frame_image = None;
+        if let Some(previous) = self.frame_image.take() {
+            self.pending_drop.push(previous);
+        }
         self.frame_sequence = 0;
         self.dropped_frames = 0;
         self.dialog = None;
@@ -1195,7 +1217,7 @@ impl BrowserSurface {
             }))
             .child(
                 canvas(
-                    move |bounds, _, cx| {
+                    move |bounds, window, cx| {
                         // The frame geometry has to come from this canvas, not
                         // from `ElementExt::on_prepaint`: that helper adds an
                         // absolutely positioned `size_full` child, which GPUI
@@ -1205,12 +1227,17 @@ impl BrowserSurface {
                         // bounds, and the panel silently dropped all mouse
                         // input. This canvas is `inset_0` of the frame, so its
                         // own bounds are the frame's.
+                        //
+                        // The window's scale factor travels with the size: the
+                        // page has to render at the density it is displayed at,
+                        // or a HiDPI panel shows a page laid out at 1x.
+                        let scale_factor = window.scale_factor();
                         prepaint_entity.update(cx, |this, cx| {
                             this.frame_bounds = Some(bounds);
                             this.schedule_viewport(
                                 f32::from(bounds.size.width),
                                 f32::from(bounds.size.height),
-                                1.0,
+                                scale_factor,
                                 cx,
                             );
                         });
@@ -2161,6 +2188,36 @@ impl EntityInputHandler for BrowserSurface {
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
         self.active && self.transport.is_some()
+    }
+}
+
+impl BrowserSurface {
+    /// Points this surface at the queue the workbench drains.
+    pub fn set_orphan_textures(&mut self, orphans: OrphanTextures) {
+        self.orphans = Some(orphans);
+    }
+
+    /// Hands every texture this surface still owns to the workbench.
+    ///
+    /// Called when the surface is removed from the panel: `Window::drop_image`
+    /// is the only release, and the code that closes a tab has no window.
+    pub fn retire_textures(&mut self) {
+        let mut images = std::mem::take(&mut self.pending_drop);
+        if let Some(frame) = self.frame_image.take() {
+            images.push(frame);
+        }
+        if let Some(favicon) = self.favicon.take() {
+            images.push(favicon);
+        }
+        if images.is_empty() {
+            return;
+        }
+        match self.orphans.as_ref() {
+            Some(orphans) => orphans.borrow_mut().append(&mut images),
+            // Without a queue the images stay parked: dropping them here would
+            // leave the atlas tiles behind with no way to release them.
+            None => self.pending_drop.append(&mut images),
+        }
     }
 }
 
