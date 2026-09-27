@@ -31823,6 +31823,15 @@ impl VibexWorkbench {
         self.apply_browser_preferences(next, cx);
     }
 
+    /// Whether the browser panel is served by a paired remote runtime.
+    ///
+    /// The settings card needs this to say that a display choice has nothing to
+    /// configure on the machine the page actually runs on.
+    pub(crate) fn browser_panel_is_degraded(&self, cx: &App) -> bool {
+        self.code_workbench
+            .read_with(cx, |workbench, _| workbench.browser_panel_is_degraded())
+    }
+
     /// Stores browser preferences and applies them to the panel that is open.
     ///
     /// Resolved here rather than in the panel: the workbench owns the settings,
@@ -65062,7 +65071,7 @@ impl FoundationSettings {
         // to work and changes nothing on the machine running the page.
         let degraded = self
             .workbench
-            .read_with(cx, |workbench, _| workbench.browser_panel_is_degraded())
+            .read_with(cx, |workbench, cx| workbench.browser_panel_is_degraded(cx))
             .unwrap_or(false);
         let mut display_rows = vec![setting_row(
             locale::text("Lossless frames", "无损画面", "無損畫面"),

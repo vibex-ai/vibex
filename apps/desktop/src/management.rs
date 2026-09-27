@@ -23576,7 +23576,18 @@ mod tests {
         // listed tool that never arrives reads as a broken one.
         let reachable = management_agent_browser_delivery_label("claude");
         assert!(reachable.contains("HTTP") || reachable.contains("available"));
-        for agent in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
+        // The built-ins reach an Agent whose CLI reads its own MCP file, because
+        // they are never written to that file; the row says HTTP for them.
+        for agent in ["grok", "cursor", "hermes"] {
+            let note = management_agent_browser_delivery_label(agent);
+            assert!(
+                note.contains("HTTP") || note.contains("available"),
+                "{agent} receives the built-in browser server, got {note}"
+            );
+        }
+        // An Agent that drops or rejects the field still gets nothing, and the
+        // row must say so rather than listing a tool that never arrives.
+        for agent in ["pi", "factory-droid"] {
             let note = management_agent_browser_delivery_label(agent);
             assert!(
                 note.contains("unavailable")

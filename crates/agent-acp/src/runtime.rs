@@ -22528,7 +22528,6 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         );
     }
 
-    #[test]
     /// The browser and delegation servers are product capabilities that live
     /// only on the wire: a native-file Agent's own MCP file cannot hold a
     /// per-session endpoint and token. Forwarding them is what makes the tools
@@ -22631,6 +22630,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(skipped, 1, "the dropped entry is what the warning counts");
     }
 
+    #[test]
     fn session_request_builders_include_mcp_descriptors() {
         let cwd = PathBuf::from("/tmp/vibex-workspace");
         let servers = vec![
