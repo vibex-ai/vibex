@@ -899,6 +899,7 @@ mod tests {
             workspace_id: None,
             authorized_roots: Vec::new(),
             tier: BrowserToolTier::Fine,
+            approved_origins: Vec::new(),
         };
         let outcome = transport
             .run(transport.service().call_tool(
@@ -1023,6 +1024,7 @@ mod tests {
                         workspace_id: None,
                         authorized_roots: Vec::new(),
                         tier: BrowserToolTier::Fine,
+                        approved_origins: Vec::new(),
                     },
                     "browser_evaluate",
                     &serde_json::json!({
@@ -1048,6 +1050,7 @@ mod tests {
                         workspace_id: None,
                         authorized_roots: Vec::new(),
                         tier: BrowserToolTier::Fine,
+                        approved_origins: Vec::new(),
                     },
                     "browser_evaluate",
                     &serde_json::json!({
@@ -1204,6 +1207,7 @@ mod tests {
                         workspace_id: None,
                         authorized_roots: Vec::new(),
                         tier: BrowserToolTier::Fine,
+                        approved_origins: Vec::new(),
                     },
                     "browser_evaluate",
                     &serde_json::json!({

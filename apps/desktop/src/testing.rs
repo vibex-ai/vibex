@@ -129,6 +129,9 @@ pub struct EmbeddedBrowserContractProbe {
     /// True when navigation to the workspace's own dev server skips approval
     /// while other loopback origins do not.
     pub loopback_is_not_blanket_trusted: bool,
+    /// True when a remembered approval is matched on the full origin, so
+    /// trusting one dev server never exempts another port on the host.
+    pub grants_are_origin_scoped: bool,
     /// True when a stale element reference is refused rather than guessed at.
     pub stale_refs_are_refused: bool,
 }
@@ -151,11 +154,24 @@ pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
             None,
             &[dev_server_origin],
             &[],
+            &[],
         ),
         vibex_browser::policy::NavigationDecision::Allowed
     );
     let other_loopback_is_gated = matches!(
-        vibex_browser::policy::classify_navigation("http://127.0.0.1:2375/", None, &[], &[]),
+        vibex_browser::policy::classify_navigation("http://127.0.0.1:2375/", None, &[], &[], &[]),
+        vibex_browser::policy::NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
+    );
+    // An approval is matched on the origin, so trusting one dev server never
+    // opens the rest of the machine.
+    let grant_is_origin_scoped = matches!(
+        vibex_browser::policy::classify_navigation(
+            "http://127.0.0.1:2375/",
+            None,
+            &[],
+            &["http://127.0.0.1:5173".to_string()],
+            &[],
+        ),
         vibex_browser::policy::NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
     );
 
@@ -249,6 +265,7 @@ pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
                 .contains(vibex_core::BROWSER_UNTRUSTED_CONTENT_NOTICE)
         }),
         loopback_is_not_blanket_trusted: workspace_dev_server && other_loopback_is_gated,
+        grants_are_origin_scoped: grant_is_origin_scoped,
         stale_refs_are_refused,
     }
 }

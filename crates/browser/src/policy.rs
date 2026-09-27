@@ -43,22 +43,84 @@ pub enum NavigationDecision {
     /// server. No prompt.
     Allowed,
     /// A cross-origin navigation to a public origin. Requires approval unless
-    /// the domain is already granted for the session.
+    /// the origin is already granted for the session.
     RequiresApproval { origin: String, domain: String },
     /// A navigation to a loopback or private-network origin that the runtime
-    /// did not identify as this workspace's dev server. Always prompts, even if
-    /// the public domain is granted.
+    /// did not identify as this workspace's dev server.
+    ///
+    /// A grant for a *public* origin can never satisfy this: grants are matched
+    /// on the full origin, so approving `https://example.com` does not open
+    /// `http://127.0.0.1:2375`. Approving this exact origin does, because that
+    /// is what "always allow" on the card means.
     RequiresApprovalForPrivateNetwork { origin: String, domain: String },
     /// The scheme is not loadable at all.
     Refused { reason: String },
 }
 
+impl NavigationDecision {
+    /// The approval error a tool raises so the human is asked.
+    ///
+    /// One constructor for every navigation entry point: a tool that forgot to
+    /// raise this is a navigation that silently ignores the policy.
+    pub fn approval_error(&self) -> Option<BrowserError> {
+        match self {
+            Self::RequiresApproval { origin, domain } => Some(
+                BrowserError::permission(
+                    "browser_navigation_approval_required",
+                    format!("Agent wants to navigate to {domain}"),
+                )
+                .with_diagnostic("origin", origin)
+                .with_diagnostic("domain", domain)
+                .with_recovery_hint(
+                    "The user must approve this origin; approving with `always allow` grants it \
+                     for the rest of the session.",
+                ),
+            ),
+            Self::RequiresApprovalForPrivateNetwork { origin, domain } => Some(
+                BrowserError::permission(
+                    "browser_private_network_approval_required",
+                    format!("Agent wants to reach the private-network address {domain}"),
+                )
+                .with_diagnostic("origin", origin)
+                .with_diagnostic("domain", domain)
+                .with_recovery_hint(
+                    "The browser runs on the runtime host, so this can reach services that are \
+                     not exposed to the network. Approve only if you recognise the target.",
+                ),
+            ),
+            Self::Allowed | Self::Refused { .. } => None,
+        }
+    }
+}
+
+/// True when a raw value is an approval-required navigation error code.
+pub fn is_navigation_approval_code(code: &str) -> bool {
+    matches!(
+        code,
+        "browser_navigation_approval_required" | "browser_private_network_approval_required"
+    )
+}
+
+/// The canonical comparison key for an origin.
+///
+/// Grants are stored and matched as origins — scheme, host *and port* — so
+/// approving `http://localhost:5173` can never exempt `http://localhost:2375`.
+/// The normalization lives in `vibex-core` because the runtime persists and
+/// re-loads these keys.
+pub fn origin_key(raw: &str) -> String {
+    vibex_core::normalize_origin(raw)
+}
+
 /// Classifies a navigation target.
+///
+/// `approved_origins` carries origins a human approved for exactly one retry;
+/// they are spent by the call that needed them rather than remembered.
 pub fn classify_navigation(
     target: &str,
     current_url: Option<&str>,
     workspace_dev_server_origins: &[String],
-    granted_domains: &[String],
+    granted_origins: &[String],
+    approved_origins: &[String],
 ) -> NavigationDecision {
     if target.trim().is_empty() {
         return NavigationDecision::Refused {
@@ -80,6 +142,7 @@ pub fn classify_navigation(
         return NavigationDecision::Allowed;
     }
     let origin = parsed.origin().ascii_serialization();
+    let key = origin_key(&origin);
     let domain = parsed
         .host_str()
         .map(str::to_ascii_lowercase)
@@ -99,10 +162,12 @@ pub fn classify_navigation(
         return NavigationDecision::Allowed;
     }
 
-    if granted_domains
-        .iter()
-        .any(|granted| granted.eq_ignore_ascii_case(&domain))
-    {
+    let origin_matches = |candidate: &String| origin_key(candidate) == key;
+    if approved_origins.iter().any(origin_matches) {
+        return NavigationDecision::Allowed;
+    }
+
+    if granted_origins.iter().any(origin_matches) {
         return NavigationDecision::Allowed;
     }
 
@@ -364,6 +429,17 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>(),
             &granted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &[],
+        )
+    }
+
+    fn approved_decision(target: &str, approved: &[&str], granted: &[&str]) -> NavigationDecision {
+        classify_navigation(
+            target,
+            None,
+            &[],
+            &granted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
     }
 
@@ -394,10 +470,103 @@ mod tests {
     }
 
     #[test]
-    fn granted_domains_skip_the_prompt() {
+    fn granted_origins_skip_the_prompt() {
         assert_eq!(
-            decision("https://other.test/x", None, &[], &["other.test"]),
+            decision("https://other.test/x", None, &[], &["https://other.test"]),
             NavigationDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn a_one_shot_approval_covers_exactly_the_approved_origin() {
+        assert_eq!(
+            approved_decision("https://other.test/x", &["https://other.test"], &[]),
+            NavigationDecision::Allowed
+        );
+        assert!(matches!(
+            approved_decision("https://third.test/x", &["https://other.test"], &[]),
+            NavigationDecision::RequiresApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn a_grant_is_scoped_to_one_origin_and_not_to_the_whole_host() {
+        // Approving a dev server must not open every other port on the host:
+        // that is how an injected agent would reach a local Docker socket or a
+        // database console with one click.
+        assert!(matches!(
+            decision(
+                "http://127.0.0.1:2375/",
+                None,
+                &[],
+                &["http://127.0.0.1:5173"]
+            ),
+            NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
+        ));
+        // A public grant never satisfies a private target either.
+        assert!(matches!(
+            decision(
+                "http://localhost:8080/",
+                None,
+                &[],
+                &["https://example.com"]
+            ),
+            NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
+        ));
+        assert_eq!(
+            decision(
+                "http://127.0.0.1:5173/other",
+                None,
+                &[],
+                &["http://127.0.0.1:5173"]
+            ),
+            NavigationDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn approval_errors_carry_the_origin_and_the_private_flag() {
+        let public = NavigationDecision::RequiresApproval {
+            origin: "https://other.test".to_string(),
+            domain: "other.test".to_string(),
+        }
+        .approval_error()
+        .expect("a public approval has an error");
+        assert_eq!(public.code, "browser_navigation_approval_required");
+        assert!(is_navigation_approval_code(&public.code));
+        assert_eq!(
+            public
+                .diagnostics
+                .iter()
+                .find(|(key, _)| key == "origin")
+                .map(|(_, value)| value.as_str()),
+            Some("https://other.test")
+        );
+
+        let private = NavigationDecision::RequiresApprovalForPrivateNetwork {
+            origin: "http://127.0.0.1:2375".to_string(),
+            domain: "127.0.0.1".to_string(),
+        }
+        .approval_error()
+        .expect("a private approval has an error");
+        assert_eq!(private.code, "browser_private_network_approval_required");
+        assert!(is_navigation_approval_code(&private.code));
+        assert!(NavigationDecision::Allowed.approval_error().is_none());
+    }
+
+    #[test]
+    fn origin_keys_normalize_scheme_host_and_port() {
+        assert_eq!(
+            origin_key("https://Example.COM/a?b=1"),
+            "https://example.com"
+        );
+        assert_eq!(
+            origin_key("http://127.0.0.1:5173/"),
+            "http://127.0.0.1:5173"
+        );
+        assert_ne!(
+            origin_key("http://127.0.0.1:5173"),
+            origin_key("http://127.0.0.1:2375")
         );
     }
 

@@ -58,6 +58,7 @@ impl BrowserMcpSession {
             workspace_id: self.workspace_id.clone(),
             authorized_roots: self.authorized_roots.clone(),
             tier: self.tier,
+            approved_origins: Vec::new(),
         }
     }
 }
@@ -65,8 +66,10 @@ impl BrowserMcpSession {
 /// How a human answered a browser approval prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserPermissionDecision {
+    /// Approve this call only. The approval is attached to the retry and is not
+    /// remembered.
     Approve,
-    /// Approve and remember the domain for the rest of the runtime session.
+    /// Approve and remember the origin for the rest of the session.
     AlwaysAllow,
     Deny,
 }
@@ -91,6 +94,13 @@ pub trait BrowserMcpHost: Send + Sync + 'static {
         session: &BrowserMcpSession,
         error: &BrowserError,
     ) -> BrowserPermissionDecision;
+
+    /// Makes an "always allow" decision survive a runtime restart.
+    ///
+    /// The browser layer grants the origin in memory itself; this is the hook
+    /// that puts it somewhere durable. The default is a no-op so a host without
+    /// storage still works.
+    async fn remember_origin(&self, _session: &BrowserMcpSession, _origin: &str) {}
 
     /// Reports a browser event worth surfacing in the UI.
     async fn report(&self, _session: &BrowserMcpSession, _event: &str, _payload: Value) {}
@@ -207,94 +217,79 @@ impl BrowserMcpHandler {
             });
         }
         let ctx = session.tool_context();
-        let mut outcome = self.service.call_tool(&ctx, name, &arguments).await;
-
-        // A navigation into a new domain is a human decision. The runtime owns
-        // the approval channel, so the handler asks it and retries once.
-        if outcome.is_error
-            && let Some(approval) = self.approval_for(&ctx, name, &arguments, &outcome).await
-        {
-            match approval {
-                BrowserPermissionDecision::Approve => {
-                    outcome = self.service.call_tool(&ctx, name, &arguments).await;
-                }
-                BrowserPermissionDecision::AlwaysAllow => {
-                    if let Some(domain) = domain_from_outcome(&outcome) {
-                        self.service.grant_domain(&domain).await;
+        let outcome = match self.service.call_tool_checked(&ctx, name, &arguments).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A navigation or file access into somewhere new is a human
+                // decision. The runtime owns the approval channel, so the
+                // handler asks it and retries once with the approval attached
+                // to that retry only.
+                match self.approval_for(session, &error).await {
+                    Some(BrowserPermissionDecision::Approve) => {
+                        let approved = ctx.with_approved_origin(approval_key(&error));
+                        match self
+                            .service
+                            .call_tool_checked(&approved, name, &arguments)
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(error) => BrowserToolOutcome::error(&error),
+                        }
                     }
-                    outcome = self.service.call_tool(&ctx, name, &arguments).await;
-                }
-                BrowserPermissionDecision::Deny => {
-                    outcome = BrowserToolOutcome {
-                        text: "The user denied access to that domain.".to_string(),
-                        is_error: true,
-                        images: Vec::new(),
-                        records: Vec::new(),
-                        dialog: None,
-                        file_chooser_tab: None,
-                    };
+                    Some(BrowserPermissionDecision::AlwaysAllow) => {
+                        let origin = approval_key(&error);
+                        if let Some(host) = self.host.as_ref() {
+                            host.remember_origin(session, &origin).await;
+                        }
+                        self.service.grant_origin(&origin).await;
+                        match self.service.call_tool_checked(&ctx, name, &arguments).await {
+                            Ok(outcome) => outcome,
+                            Err(error) => BrowserToolOutcome::error(&error),
+                        }
+                    }
+                    Some(BrowserPermissionDecision::Deny) => {
+                        BrowserToolOutcome::error(&BrowserError::permission(
+                            "browser_navigation_denied",
+                            "The user denied access to that origin.",
+                        ))
+                    }
+                    None => BrowserToolOutcome::error(&error),
                 }
             }
-        }
+        };
         outcome_to_mcp(&outcome)
     }
 
     /// Asks the host whether an approval-required failure may proceed.
+    ///
+    /// The decision is made on the typed error alone: an earlier version keyed
+    /// it off the presence of a `tab_id` argument and a substring of the
+    /// message, which silently skipped the card for the common
+    /// `browser_navigate` call that omits `tab_id`.
     async fn approval_for(
         &self,
-        ctx: &BrowserToolContext,
-        name: &str,
-        arguments: &Value,
-        outcome: &BrowserToolOutcome,
+        session: &BrowserMcpSession,
+        error: &BrowserError,
     ) -> Option<BrowserPermissionDecision> {
         let host = self.host.as_ref()?;
-        // Retry only the tools that can raise an approval, so a policy error
-        // from anywhere else is not silently retried.
-        if !matches!(
-            name,
-            "browser_navigate" | "browser_open_and_read" | "browser_create_tab"
-        ) {
+        if !crate::policy::is_navigation_approval_code(&error.code) {
             return None;
         }
-        if arguments.get("tab_id").is_none() && !outcome.text.contains("approval") {
-            return None;
-        }
-        let error = crate::error::BrowserError::permission(
-            "browser_navigation_approval_required",
-            outcome.text.clone(),
-        );
-        let session = BrowserMcpSession {
-            session_id: ctx.session_id.clone(),
-            agent_session_id: ctx.agent_session_id.clone(),
-            workspace_id: ctx.workspace_id.clone(),
-            authorized_roots: ctx.authorized_roots.clone(),
-            tier: ctx.tier,
-            agent_label: String::new(),
-        };
-        Some(host.request_permission(&session, &error).await)
+        Some(host.request_permission(session, error).await)
     }
 }
 
-fn domain_from_outcome(outcome: &BrowserToolOutcome) -> Option<String> {
-    // The domain is the first host-looking token in the diagnostic text; the
-    // ledger entry carries the authoritative value when available.
-    outcome
-        .records
+/// The origin an approval decision applies to.
+///
+/// Falls back to the empty string only for an error that reached an approval
+/// path without diagnostics, which cannot happen for the codes that get here.
+fn approval_key(error: &BrowserError) -> String {
+    error
+        .diagnostics
         .iter()
-        .find_map(|record| record.domain.clone())
-        .or_else(|| {
-            outcome
-                .text
-                .split_whitespace()
-                .find(|token| token.contains('.') && !token.contains('/'))
-                .map(|token| {
-                    token
-                        .trim_matches(|character: char| {
-                            !character.is_alphanumeric() && character != '.' && character != '-'
-                        })
-                        .to_ascii_lowercase()
-                })
-        })
+        .find(|(key, _)| key == "origin")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
 }
 
 /// Renders a tool outcome as MCP content.
@@ -644,6 +639,103 @@ mod tests {
         let mut buffer = Vec::new();
         write_stdio_message(&mut buffer, &json!({ "id": 3 })).unwrap();
         assert_eq!(String::from_utf8(buffer).unwrap(), "{\"id\":3}\n");
+    }
+
+    /// A host that answers every approval with the same decision and records
+    /// what it was asked about.
+    struct ApprovalHost {
+        decision: BrowserPermissionDecision,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BrowserMcpHost for ApprovalHost {
+        async fn resolve_token(&self, _token: &str) -> Option<BrowserMcpSession> {
+            None
+        }
+
+        async fn request_permission(
+            &self,
+            _session: &BrowserMcpSession,
+            error: &BrowserError,
+        ) -> BrowserPermissionDecision {
+            self.asked.lock().unwrap().push(error.code.clone());
+            self.decision
+        }
+    }
+
+    fn navigation_approval_error() -> BrowserError {
+        crate::policy::NavigationDecision::RequiresApproval {
+            origin: "https://other.test".to_string(),
+            domain: "other.test".to_string(),
+        }
+        .approval_error()
+        .expect("a cross-origin navigation needs approval")
+    }
+
+    fn private_network_approval_error() -> BrowserError {
+        crate::policy::NavigationDecision::RequiresApprovalForPrivateNetwork {
+            origin: "http://127.0.0.1:2375".to_string(),
+            domain: "127.0.0.1".to_string(),
+        }
+        .approval_error()
+        .expect("a private-network navigation needs approval")
+    }
+
+    fn handler_with_host(decision: BrowserPermissionDecision) -> BrowserMcpHandler {
+        BrowserMcpHandler::new(BrowserService::new(
+            crate::service::BrowserServiceConfig::new("/tmp/vibex-browser-approval-test"),
+        ))
+        .with_host(Arc::new(ApprovalHost {
+            decision,
+            asked: std::sync::Mutex::new(Vec::new()),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_navigation_approval_is_requested_even_without_a_tab_id() {
+        // The regression: the gate used to require a `tab_id` argument or the
+        // substring "approval" in the message, so the most natural
+        // `browser_navigate` call — which omits the optional `tab_id` — never
+        // reached the human.
+        let handler = handler_with_host(BrowserPermissionDecision::Deny);
+        let decision = handler
+            .approval_for(&session(), &navigation_approval_error())
+            .await;
+        assert_eq!(decision, Some(BrowserPermissionDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn a_private_network_approval_is_requested_too() {
+        let handler = handler_with_host(BrowserPermissionDecision::AlwaysAllow);
+        let decision = handler
+            .approval_for(&session(), &private_network_approval_error())
+            .await;
+        assert_eq!(decision, Some(BrowserPermissionDecision::AlwaysAllow));
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_is_not_an_approval_never_raises_a_card() {
+        let handler = handler_with_host(BrowserPermissionDecision::Approve);
+        let error = BrowserError::validation("browser_element_not_found", "no such element");
+        assert_eq!(handler.approval_for(&session(), &error).await, None);
+        let missing_path = BrowserError::permission(
+            "browser_path_not_authorized",
+            "the requested path is outside the authorized roots",
+        );
+        assert_eq!(handler.approval_for(&session(), &missing_path).await, None);
+    }
+
+    #[test]
+    fn an_approval_key_is_the_origin_from_the_error_diagnostics() {
+        assert_eq!(
+            approval_key(&navigation_approval_error()),
+            "https://other.test"
+        );
+        assert_eq!(
+            approval_key(&private_network_approval_error()),
+            "http://127.0.0.1:2375"
+        );
     }
 
     #[test]

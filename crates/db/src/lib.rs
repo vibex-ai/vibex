@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 58;
+pub const CURRENT_SCHEMA_VERSION: i64 = 59;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1904,7 +1904,7 @@ pub struct RemoteDeviceRepository;
 pub struct RemotePairingCodeRepository;
 pub struct RemoteAuditRepository;
 pub struct BrowserAuditRepository;
-pub struct BrowserDomainGrantRepository;
+pub struct BrowserOriginGrantRepository;
 
 /// One entry in the embedded browser's redacted operation ledger.
 ///
@@ -1926,15 +1926,16 @@ pub struct BrowserAuditRecord {
     pub at_ms: i64,
 }
 
-/// One session-scoped embedded browser domain grant.
+/// One remembered embedded browser origin grant.
 ///
 /// The runtime has no permission policy store, so `AlwaysAllowForSession` has
-/// to be remembered here by the browser layer itself. `expires_at_ms` is
-/// nullable so a future TTL needs no further migration.
+/// to be remembered here by the browser layer itself. Grants are keyed by the
+/// full origin, not by the host: approving a development server must not exempt
+/// every other port on the same machine. `expires_at_ms` is nullable so a
+/// future TTL needs no further migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BrowserDomainGrant {
-    pub domain: String,
-    pub origin: Option<String>,
+pub struct BrowserOriginGrant {
+    pub origin: String,
     pub granted_at_ms: i64,
     pub expires_at_ms: Option<i64>,
 }
@@ -10721,93 +10722,104 @@ impl BrowserAuditRepository {
     }
 }
 
-impl BrowserDomainGrantRepository {
-    pub fn upsert(conn: &Connection, grant: &BrowserDomainGrant) -> VibexResult<()> {
+impl BrowserOriginGrantRepository {
+    pub fn upsert(conn: &Connection, grant: &BrowserOriginGrant) -> VibexResult<()> {
         conn.execute(
             "
-            INSERT INTO browser_domain_grants (domain, origin, granted_at_ms, expires_at_ms)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(domain) DO UPDATE SET
-                origin = excluded.origin,
+            INSERT INTO browser_origin_grants (origin, granted_at_ms, expires_at_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(origin) DO UPDATE SET
                 granted_at_ms = excluded.granted_at_ms,
                 expires_at_ms = excluded.expires_at_ms
             ",
             params![
-                grant.domain.to_ascii_lowercase(),
-                grant.origin.as_deref(),
+                grant.origin.to_ascii_lowercase(),
                 grant.granted_at_ms,
                 grant.expires_at_ms
             ],
         )
         .map_err(storage_err(
-            "browser_domain_grant_upsert_failed",
-            "failed to upsert browser domain grant",
+            "browser_origin_grant_upsert_failed",
+            "failed to upsert browser origin grant",
         ))?;
         Ok(())
     }
 
-    pub fn list(conn: &Connection) -> VibexResult<Vec<BrowserDomainGrant>> {
+    pub fn list(conn: &Connection) -> VibexResult<Vec<BrowserOriginGrant>> {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT domain, origin, granted_at_ms, expires_at_ms
-                FROM browser_domain_grants
-                ORDER BY domain ASC
+                SELECT origin, granted_at_ms, expires_at_ms
+                FROM browser_origin_grants
+                ORDER BY origin ASC
                 ",
             )
             .map_err(storage_err(
-                "browser_domain_grant_list_failed",
-                "failed to list browser domain grants",
+                "browser_origin_grant_list_failed",
+                "failed to list browser origin grants",
             ))?;
         let rows = stmt
-            .query_map([], map_browser_domain_grant)
+            .query_map([], map_browser_origin_grant)
             .map_err(storage_err(
-                "browser_domain_grant_list_failed",
-                "failed to list browser domain grants",
+                "browser_origin_grant_list_failed",
+                "failed to list browser origin grants",
             ))?;
         collect_rows(
             rows,
-            "browser_domain_grant_decode_failed",
-            "failed to decode browser domain grant",
+            "browser_origin_grant_decode_failed",
+            "failed to decode browser origin grant",
         )
     }
 
-    pub fn is_granted(conn: &Connection, domain: &str) -> VibexResult<bool> {
+    /// Every unexpired origin, for seeding the browser service at startup.
+    pub fn live_origins(conn: &Connection) -> VibexResult<Vec<String>> {
+        Ok(Self::list(conn)?
+            .into_iter()
+            .filter(|grant| {
+                grant
+                    .expires_at_ms
+                    .is_none_or(|expires| expires > unix_timestamp_ms())
+            })
+            .map(|grant| grant.origin)
+            .collect())
+    }
+
+    pub fn is_granted(conn: &Connection, origin: &str) -> VibexResult<bool> {
         let granted = conn
             .query_row(
                 "
                 SELECT 1
-                FROM browser_domain_grants
-                WHERE domain = ?1
+                FROM browser_origin_grants
+                WHERE origin = ?1
                     AND (expires_at_ms IS NULL OR expires_at_ms > ?2)
                 ",
-                params![domain.to_ascii_lowercase(), unix_timestamp_ms()],
+                params![origin.to_ascii_lowercase(), unix_timestamp_ms()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(storage_err(
-                "browser_domain_grant_lookup_failed",
-                "failed to look up browser domain grant",
+                "browser_origin_grant_lookup_failed",
+                "failed to look up browser origin grant",
             ))?;
         Ok(granted.is_some())
     }
 
-    pub fn revoke(conn: &Connection, domain: &str) -> VibexResult<usize> {
+    pub fn revoke(conn: &Connection, origin: &str) -> VibexResult<usize> {
         conn.execute(
-            "DELETE FROM browser_domain_grants WHERE domain = ?1",
-            params![domain.to_ascii_lowercase()],
+            "DELETE FROM browser_origin_grants WHERE origin = ?1",
+            params![origin.to_ascii_lowercase()],
         )
         .map_err(storage_err(
-            "browser_domain_grant_revoke_failed",
-            "failed to revoke browser domain grant",
+            "browser_origin_grant_revoke_failed",
+            "failed to revoke browser origin grant",
         ))
     }
 
     pub fn clear(conn: &Connection) -> VibexResult<usize> {
-        conn.execute("DELETE FROM browser_domain_grants", [])
+        conn.execute("DELETE FROM browser_origin_grants", [])
             .map_err(storage_err(
-                "browser_domain_grant_clear_failed",
-                "failed to clear browser domain grants",
+                "browser_origin_grant_clear_failed",
+                "failed to clear browser origin grants",
             ))
     }
 }
@@ -10984,6 +10996,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_runtime_identity(conn, &mut applied)?;
     apply_browser_audit(conn, &mut applied)?;
     apply_drop_duplicate_timeline_index(conn, &mut applied)?;
+    apply_browser_origin_grants(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -11155,6 +11168,60 @@ fn apply_browser_audit(conn: &mut Connection, applied: &mut Vec<String>) -> Vibe
     .map_err(storage_err(
         "migration_record_failed",
         "failed to record the embedded browser migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Re-keys the browser allowlist from a bare host to a full origin.
+///
+/// Approving `http://localhost:5173` used to record `localhost`, which then
+/// exempted every port on that host — including the local services an injected
+/// Agent most wants to reach. The grant is now the origin the human actually
+/// approved. The old table had no production writer, so only rows that already
+/// carry an origin are carried over.
+fn apply_browser_origin_grants(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 59;
+    const NAME: &str = "browser_origin_grants";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the browser origin grant migration",
+    ))?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS browser_origin_grants (
+            origin TEXT PRIMARY KEY,
+            granted_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER NULL
+        );
+        INSERT OR IGNORE INTO browser_origin_grants (origin, granted_at_ms, expires_at_ms)
+            SELECT origin, granted_at_ms, expires_at_ms
+            FROM browser_domain_grants
+            WHERE origin IS NOT NULL;
+        DROP TABLE IF EXISTS browser_domain_grants;
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to re-key the embedded browser allowlist",
+    ))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the browser origin grant migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the browser origin grant migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13521,12 +13588,11 @@ fn map_browser_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Browser
     })
 }
 
-fn map_browser_domain_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserDomainGrant> {
-    Ok(BrowserDomainGrant {
-        domain: row.get(0)?,
-        origin: row.get(1)?,
-        granted_at_ms: row.get(2)?,
-        expires_at_ms: row.get(3)?,
+fn map_browser_origin_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserOriginGrant> {
+    Ok(BrowserOriginGrant {
+        origin: row.get(0)?,
+        granted_at_ms: row.get(1)?,
+        expires_at_ms: row.get(2)?,
     })
 }
 
@@ -14598,7 +14664,8 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
-                "58:drop_duplicate_timeline_index"
+                "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14741,6 +14808,7 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14863,7 +14931,8 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
-                "58:drop_duplicate_timeline_index"
+                "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -15024,7 +15093,8 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
-                "58:drop_duplicate_timeline_index"
+                "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants"
             ]
         );
         assert_eq!(
@@ -16442,7 +16512,8 @@ mod tests {
                 "55:skill_body",
                 "56:runtime_identity",
                 "57:browser_audit",
-                "58:drop_duplicate_timeline_index"
+                "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -19150,11 +19221,16 @@ mod tests {
                 .iter()
                 .any(|entry| entry == "58:drop_duplicate_timeline_index")
         );
+        assert!(
+            first
+                .iter()
+                .any(|entry| entry == "59:browser_origin_grants")
+        );
         // A second run must be a no-op: the tables already exist and the
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 58);
+        assert_eq!(current_schema_version(&conn).unwrap(), 59);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION
@@ -19286,70 +19362,87 @@ mod tests {
     }
 
     #[test]
-    fn browser_domain_grants_upsert_lowercase_expiry_and_clear() {
-        let temp = temp_db_path("browser-domain-grants");
+    fn browser_origin_grants_are_keyed_by_origin_not_by_host() {
+        let temp = temp_db_path("browser-origin-grants");
         let mut conn = open_database(&temp).unwrap();
         apply_migrations(&mut conn).unwrap();
 
-        let first = BrowserDomainGrant {
-            domain: "Example.COM".to_string(),
-            origin: Some("https://example.com".to_string()),
+        let first = BrowserOriginGrant {
+            origin: "HTTP://Example.COM".to_string(),
             granted_at_ms: 1_000,
             expires_at_ms: None,
         };
-        BrowserDomainGrantRepository::upsert(&conn, &first).unwrap();
-        // A second upsert of the same domain is an update, not a duplicate.
-        let second = BrowserDomainGrant {
-            domain: "example.com".to_string(),
-            origin: Some("https://docs.example.com".to_string()),
+        BrowserOriginGrantRepository::upsert(&conn, &first).unwrap();
+        // A second upsert of the same origin is an update, not a duplicate.
+        let second = BrowserOriginGrant {
+            origin: "http://example.com".to_string(),
             granted_at_ms: 2_000,
             expires_at_ms: None,
         };
-        BrowserDomainGrantRepository::upsert(&conn, &second).unwrap();
+        BrowserOriginGrantRepository::upsert(&conn, &second).unwrap();
         assert_eq!(
-            BrowserDomainGrantRepository::list(&conn).unwrap(),
+            BrowserOriginGrantRepository::list(&conn).unwrap(),
             vec![second]
         );
 
-        assert!(BrowserDomainGrantRepository::is_granted(&conn, "EXAMPLE.com").unwrap());
-        assert!(BrowserDomainGrantRepository::is_granted(&conn, "example.com").unwrap());
-        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "other.example").unwrap());
+        assert!(BrowserOriginGrantRepository::is_granted(&conn, "http://EXAMPLE.com").unwrap());
+        // The scheme is part of an origin: https is a different grant.
+        assert!(!BrowserOriginGrantRepository::is_granted(&conn, "https://example.com").unwrap());
+        assert!(!BrowserOriginGrantRepository::is_granted(&conn, "other.example").unwrap());
 
-        let expired = BrowserDomainGrant {
-            domain: "stale.example".to_string(),
-            origin: None,
+        // Two ports on one host are two grants: approving a dev server must not
+        // exempt every other loopback service.
+        let dev_server = BrowserOriginGrant {
+            origin: "http://127.0.0.1:5173".to_string(),
+            granted_at_ms: 3_000,
+            expires_at_ms: None,
+        };
+        BrowserOriginGrantRepository::upsert(&conn, &dev_server).unwrap();
+        assert!(!BrowserOriginGrantRepository::is_granted(&conn, "http://127.0.0.1:2375").unwrap());
+        assert_eq!(
+            BrowserOriginGrantRepository::live_origins(&conn).unwrap(),
+            vec![
+                "http://127.0.0.1:5173".to_string(),
+                "http://example.com".to_string()
+            ]
+        );
+
+        let expired = BrowserOriginGrant {
+            origin: "http://stale.example".to_string(),
             granted_at_ms: 1_000,
             expires_at_ms: Some(unix_timestamp_ms() - 1_000),
         };
-        BrowserDomainGrantRepository::upsert(&conn, &expired).unwrap();
-        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "stale.example").unwrap());
+        BrowserOriginGrantRepository::upsert(&conn, &expired).unwrap();
+        assert!(!BrowserOriginGrantRepository::is_granted(&conn, "http://stale.example").unwrap());
+        assert!(
+            !BrowserOriginGrantRepository::live_origins(&conn)
+                .unwrap()
+                .contains(&"http://stale.example".to_string())
+        );
 
-        let future = BrowserDomainGrant {
-            domain: "fresh.example".to_string(),
-            origin: None,
+        let future = BrowserOriginGrant {
+            origin: "http://fresh.example".to_string(),
             granted_at_ms: 1_000,
             expires_at_ms: Some(unix_timestamp_ms() + 60_000),
         };
-        BrowserDomainGrantRepository::upsert(&conn, &future).unwrap();
-        assert!(BrowserDomainGrantRepository::is_granted(&conn, "fresh.example").unwrap());
+        BrowserOriginGrantRepository::upsert(&conn, &future).unwrap();
+        assert!(BrowserOriginGrantRepository::is_granted(&conn, "http://fresh.example").unwrap());
 
         assert_eq!(
-            BrowserDomainGrantRepository::revoke(&conn, "Stale.Example").unwrap(),
+            BrowserOriginGrantRepository::revoke(&conn, "HTTP://Stale.Example").unwrap(),
             1
         );
-        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "stale.example").unwrap());
         assert_eq!(
-            BrowserDomainGrantRepository::revoke(&conn, "stale.example").unwrap(),
+            BrowserOriginGrantRepository::revoke(&conn, "http://stale.example").unwrap(),
             0
         );
 
-        assert_eq!(BrowserDomainGrantRepository::clear(&conn).unwrap(), 2);
+        assert_eq!(BrowserOriginGrantRepository::clear(&conn).unwrap(), 3);
         assert!(
-            BrowserDomainGrantRepository::list(&conn)
+            BrowserOriginGrantRepository::list(&conn)
                 .unwrap()
                 .is_empty()
         );
-        assert!(!BrowserDomainGrantRepository::is_granted(&conn, "example.com").unwrap());
 
         drop(conn);
         cleanup_db(temp);

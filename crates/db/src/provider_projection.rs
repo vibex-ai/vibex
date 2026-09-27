@@ -2187,6 +2187,7 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
+                "59:browser_origin_grants",
             ]
         );
         assert_eq!(

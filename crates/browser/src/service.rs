@@ -31,13 +31,13 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use vibex_core::{
-    BROWSER_CDP_COMMAND_TIMEOUT_MS, BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_FRAME_BYTES,
-    BROWSER_MAX_SESSION_LEDGER_ITEMS, BROWSER_MAX_TABS, BrowserActionRecord, BrowserAvailability,
-    BrowserConsoleEntry, BrowserDialogRequest, BrowserExecutionSource, BrowserFrame,
-    BrowserFrameFormat, BrowserFrameMetadata, BrowserNetworkEntry, BrowserSession,
-    BrowserSessionId, BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner,
-    BrowserTabStatus, BrowserToolTier, BrowserUnavailableReason, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    BROWSER_BACKGROUND_IDLE_MS, BROWSER_CDP_COMMAND_TIMEOUT_MS, BROWSER_MAX_BACKGROUND_SESSIONS,
+    BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_FRAME_BYTES, BROWSER_MAX_SESSION_LEDGER_ITEMS,
+    BROWSER_MAX_TABS, BrowserActionRecord, BrowserAvailability, BrowserConsoleEntry,
+    BrowserDialogRequest, BrowserExecutionSource, BrowserFrame, BrowserFrameFormat,
+    BrowserFrameMetadata, BrowserNetworkEntry, BrowserSession, BrowserSessionId,
+    BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner, BrowserTabStatus,
+    BrowserToolTier, BrowserUnavailableReason, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 
 use crate::ax::{PrunedElement, clamp_max_elements, prune_ax_tree, resolve_depth};
@@ -188,6 +188,21 @@ pub struct BrowserToolContext {
     /// are confined to these.
     pub authorized_roots: Vec<PathBuf>,
     pub tier: BrowserToolTier,
+    /// Origins the human approved for exactly one retry.
+    ///
+    /// A one-off "approve" on the card must let *this* call through and no
+    /// other, so the approval travels with the retry instead of being written
+    /// into the session's remembered grants.
+    pub approved_origins: Vec<String>,
+}
+
+impl BrowserToolContext {
+    /// The same call context, carrying one human approval for a retry.
+    pub fn with_approved_origin(&self, origin: impl Into<String>) -> Self {
+        let mut next = self.clone();
+        next.approved_origins = vec![origin.into()];
+        next
+    }
 }
 
 /// Service configuration.
@@ -199,8 +214,9 @@ pub struct BrowserServiceConfig {
     pub extra_flags: Vec<String>,
     /// When false the service reports `FeatureDisabled` and never launches.
     pub enabled: bool,
-    /// Domains approved for the lifetime of the runtime process.
-    pub session_domain_grants: Vec<String>,
+    /// Origins approved before the service started, loaded from the durable
+    /// allowlist.
+    pub origin_grants: Vec<String>,
 }
 
 impl BrowserServiceConfig {
@@ -209,7 +225,7 @@ impl BrowserServiceConfig {
             home_dir: home_dir.into(),
             extra_flags: Vec::new(),
             enabled: true,
-            session_domain_grants: Vec::new(),
+            origin_grants: Vec::new(),
         }
     }
 }
@@ -353,9 +369,14 @@ pub(crate) struct ServiceState {
     pub(crate) tabs: HashMap<BrowserTabId, TabRecord>,
     pub(crate) availability: BrowserAvailability,
     pub(crate) last_activity_ms: i64,
-    pub(crate) session_domain_grants: Vec<String>,
-    /// Origins positively identified as this runtime's development servers.
-    pub(crate) dev_server_origins: Vec<String>,
+    /// Origins the human approved, matched exactly (scheme, host and port).
+    pub(crate) granted_origins: Vec<String>,
+    /// Origins positively identified as a development server, per workspace.
+    ///
+    /// Keyed by workspace because the exemption exists for *this* project's dev
+    /// server: a process-wide list would let a server detected in one workspace
+    /// skip approval for every other workspace's sessions.
+    pub(crate) dev_server_origins: BTreeMap<WorkspaceId, Vec<String>>,
     /// Targets that existed before discovery was switched on. They are not
     /// tabs: the browser's own startup target is the only one today, and
     /// adopting it would show an empty tab the user never opened.
@@ -363,6 +384,17 @@ pub(crate) struct ServiceState {
 }
 
 impl ServiceState {
+    /// The dev-server exemptions that apply to one workspace's sessions.
+    ///
+    /// A session with no workspace gets none: an exemption is only meaningful
+    /// for the project whose terminal printed the URL.
+    pub(crate) fn dev_server_origins_for(&self, workspace_id: Option<&WorkspaceId>) -> Vec<String> {
+        workspace_id
+            .and_then(|workspace| self.dev_server_origins.get(workspace))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn push_ledger(&mut self, record: BrowserActionRecord) {
         if let Some(session) = self.sessions.get_mut(&record.session_id) {
             session.last_activity_at_ms = record.at_ms;
@@ -488,6 +520,23 @@ pub struct BrowserImageContent {
     pub base64: String,
 }
 
+/// Keeps a session's tabs out of the reclaimer while a tool call runs.
+///
+/// The reclaimer reads `TabRecord::active_operations`; without something that
+/// increments it that guard is permanently true and a tab an Agent is midway
+/// through using can be closed as idle.
+pub(crate) struct ActiveOperationGuard {
+    counters: Vec<Arc<AtomicU64>>,
+}
+
+impl Drop for ActiveOperationGuard {
+    fn drop(&mut self) {
+        for counter in &self.counters {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 impl BrowserToolOutcome {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
@@ -556,7 +605,7 @@ impl BrowserService {
     /// Creates the service. No browser is launched until it is needed.
     pub fn new(config: BrowserServiceConfig) -> Self {
         let (events, _) = broadcast::channel(256);
-        let session_domain_grants = config.session_domain_grants.clone();
+        let granted_origins = config.origin_grants.clone();
         let inner = Arc::new(BrowserInner {
             config: RwLock::new(config),
             state: Mutex::new(ServiceState {
@@ -565,8 +614,8 @@ impl BrowserService {
                 tabs: HashMap::new(),
                 availability: discovery::availability(),
                 last_activity_ms: unix_timestamp_ms(),
-                session_domain_grants,
-                dev_server_origins: Vec::new(),
+                granted_origins,
+                dev_server_origins: BTreeMap::new(),
                 ignored_targets: HashSet::new(),
             }),
             events,
@@ -587,16 +636,16 @@ impl BrowserService {
         if guard.is_some() {
             return;
         }
-        let inner = Arc::clone(&self.inner);
+        let service = self.clone();
         *guard = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(BROWSER_IDLE_SWEEP);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                if inner.shutting_down.load(Ordering::SeqCst) {
+                if service.inner.shutting_down.load(Ordering::SeqCst) {
                     return;
                 }
-                inner.reap_idle().await;
+                service.reap_idle().await;
             }
         }));
     }
@@ -621,10 +670,17 @@ impl BrowserService {
         availability
     }
 
-    /// Records the origins the runtime identified as this workspace's
+    /// Records the origins the runtime identified as one workspace's
     /// development servers. Only these skip domain approval on loopback.
-    pub async fn set_dev_server_origins(&self, origins: Vec<String>) {
-        self.inner.state.lock().await.dev_server_origins = origins;
+    pub async fn set_dev_server_origins(&self, workspace_id: &WorkspaceId, origins: Vec<String>) {
+        let mut state = self.inner.state.lock().await;
+        if origins.is_empty() {
+            state.dev_server_origins.remove(workspace_id);
+        } else {
+            state
+                .dev_server_origins
+                .insert(workspace_id.clone(), origins);
+        }
     }
 
     /// Reports a development server found in terminal output.
@@ -676,16 +732,17 @@ impl BrowserService {
 
     /// Records a dev server that answered on its port.
     async fn register_dev_server(&self, workspace_id: WorkspaceId, origin: String) {
+        let origin = vibex_core::normalize_origin(&origin);
         let added = {
             let mut state = self.inner.state.lock().await;
-            if state
+            let known = state
                 .dev_server_origins
-                .iter()
-                .any(|known| known == &origin)
-            {
+                .entry(workspace_id.clone())
+                .or_default();
+            if known.iter().any(|existing| existing == &origin) {
                 false
             } else {
-                state.dev_server_origins.push(origin.clone());
+                known.push(origin.clone());
                 true
             }
         };
@@ -700,34 +757,52 @@ impl BrowserService {
         }
     }
 
-    /// Grants a domain for the lifetime of the runtime process. The approval
-    /// card's "always allow" action is what calls this; the runtime has no
+    /// Grants one origin for the lifetime of the runtime process. The approval
+    /// card's "always allow" action is what calls this; the runtime keeps no
     /// permission policy store of its own.
-    pub async fn grant_domain(&self, domain: &str) {
+    ///
+    /// The grant is matched against the full origin, so approving a dev server
+    /// does not open every other port on the same host.
+    pub async fn grant_origin(&self, origin: &str) {
         let mut state = self.inner.state.lock().await;
-        let domain = domain.to_ascii_lowercase();
-        if !state.session_domain_grants.contains(&domain) {
-            state.session_domain_grants.push(domain);
+        let origin = vibex_core::normalize_origin(origin);
+        if !state.granted_origins.contains(&origin) {
+            state.granted_origins.push(origin);
         }
     }
 
-    /// Revokes every domain grant.
-    pub async fn clear_domain_grants(&self) {
-        self.inner.state.lock().await.session_domain_grants.clear();
+    /// Replaces the in-memory grants, seeding the durable allowlist at startup.
+    pub async fn seed_origin_grants(&self, origins: Vec<String>) {
+        let mut state = self.inner.state.lock().await;
+        for origin in origins {
+            let origin = vibex_core::normalize_origin(&origin);
+            if !state.granted_origins.contains(&origin) {
+                state.granted_origins.push(origin);
+            }
+        }
     }
 
-    /// Origins positively identified as this runtime's development servers.
+    /// Revokes every origin grant.
+    pub async fn clear_origin_grants(&self) {
+        self.inner.state.lock().await.granted_origins.clear();
+    }
+
+    /// Origins positively identified as one workspace's development servers.
     ///
     /// Only these skip the private-network approval on loopback; the list is
     /// filled by the terminal detector, and an origin joins it only after its
     /// port answered.
-    pub async fn dev_server_origins(&self) -> Vec<String> {
-        self.inner.state.lock().await.dev_server_origins.clone()
+    pub async fn dev_server_origins(&self, workspace_id: &WorkspaceId) -> Vec<String> {
+        self.inner
+            .state
+            .lock()
+            .await
+            .dev_server_origins_for(Some(workspace_id))
     }
 
-    /// Domains granted for this runtime process.
-    pub async fn granted_domains(&self) -> Vec<String> {
-        self.inner.state.lock().await.session_domain_grants.clone()
+    /// Origins granted for this runtime process.
+    pub async fn granted_origins(&self) -> Vec<String> {
+        self.inner.state.lock().await.granted_origins.clone()
     }
 
     /// Returns the session for a key, creating it if needed.
@@ -1042,6 +1117,74 @@ impl BrowserService {
         let (method, params) = input_to_cdp(input);
         cdp(&session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
         Ok(())
+    }
+
+    /// Hands a tab to the human because the Agent asked for help.
+    ///
+    /// The hand-over has to be real in both directions: the panel only shows the
+    /// takeover banner for a session that is `user_engaged`, and the Agent can
+    /// only be said to be waiting if its next call on the tab is refused. That
+    /// is what `tab.aborted` does — every tool entry checks it — so the Agent
+    /// resumes exactly when the human hands the tab back.
+    pub async fn request_human_help(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+        let now = unix_timestamp_ms();
+        let changed = {
+            let mut state = self.inner.state.lock().await;
+            let Some(tab) = state.tabs.get_mut(tab_id) else {
+                return Err(BrowserError::validation(
+                    "browser_tab_not_found",
+                    "the browser tab was not found",
+                ));
+            };
+            tab.aborted.store(true, Ordering::SeqCst);
+            tab.last_activity_at_ms = now;
+            let session_ids = state.sessions_for_tab(tab_id);
+            for session_id in &session_ids {
+                if let Some(session) = state.sessions.get_mut(session_id) {
+                    session.execution_source = BrowserExecutionSource::User;
+                    session.user_engaged = true;
+                    session.last_activity_at_ms = now;
+                }
+            }
+            state.last_activity_ms = now;
+            session_ids
+        };
+        for session_id in changed {
+            let _ = self
+                .inner
+                .events
+                .send(BrowserServiceEvent::SessionChanged(session_id));
+        }
+        Ok(())
+    }
+
+    /// Marks every tab of a session as busy for the duration of one tool call.
+    ///
+    /// Returns a guard rather than a pair of calls so an early return or a panic
+    /// cannot leave a tab marked busy forever.
+    pub(crate) async fn begin_operation(
+        &self,
+        session_id: &BrowserSessionId,
+    ) -> ActiveOperationGuard {
+        let counters: Vec<Arc<AtomicU64>> = {
+            let state = self.inner.state.lock().await;
+            state
+                .sessions
+                .get(session_id)
+                .map(|session| {
+                    session
+                        .tabs
+                        .iter()
+                        .filter_map(|tab_id| state.tabs.get(tab_id))
+                        .map(|tab| Arc::clone(&tab.active_operations))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for counter in &counters {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        ActiveOperationGuard { counters }
     }
 
     /// Shuts the browser down. Called from the runtime's shutdown chain.
@@ -1463,13 +1606,22 @@ impl BrowserService {
         // Stopping first is harmless when nothing is running and makes the call
         // idempotent.
         let _ = cdp(session, "Page.stopScreencast", json!({}), SHORT_TIMEOUT_MS).await;
+        // The encoder budget is the panel's *physical* size: the emulated
+        // viewport is logical pixels, so a 2x display would otherwise cap the
+        // stream at half the resolution it is shown at.
         let (width, height) = {
             let state = self.inner.state.lock().await;
             state
                 .tabs
                 .values()
                 .find(|tab| tab.session_id == session.session_id)
-                .map(|tab| (tab.viewport.0, tab.viewport.1))
+                .map(|tab| {
+                    let scale = tab.viewport.2.clamp(1.0, 4.0);
+                    (
+                        ((tab.viewport.0 as f64 * scale).round() as u32).max(1),
+                        ((tab.viewport.1 as f64 * scale).round() as u32).max(1),
+                    )
+                })
                 .unwrap_or((DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT))
         };
         cdp(
@@ -1966,6 +2118,88 @@ impl BrowserService {
     pub(crate) fn inner(&self) -> &Arc<BrowserInner> {
         &self.inner
     }
+
+    // ---------------------------------------------------------------------
+    // Background reclamation
+    // ---------------------------------------------------------------------
+
+    /// Caps how many browser sessions may sit in the background.
+    ///
+    /// A session the panel is not showing is not free: it keeps its tabs and
+    /// Chrome keeps a renderer for each. The oldest idle ones are closed. A
+    /// session that is being watched, has a tool call in flight, or was active
+    /// within the idle window is never a candidate — the ceiling must not take
+    /// a page away from an Agent that is working on it.
+    async fn reclaim_background_sessions(&self) {
+        let now = unix_timestamp_ms();
+        let victims = {
+            let state = self.inner.state.lock().await;
+            let mut background: Vec<(i64, BrowserSessionId)> = state
+                .sessions
+                .values()
+                .filter(|session| {
+                    let tabs = || {
+                        session
+                            .tabs
+                            .iter()
+                            .filter_map(|tab_id| state.tabs.get(tab_id))
+                    };
+                    let watched = tabs().any(|tab| tab.screencast_active);
+                    let busy = tabs().any(|tab| tab.active_operations.load(Ordering::SeqCst) > 0);
+                    !watched
+                        && !busy
+                        && now - session.last_activity_at_ms >= BROWSER_BACKGROUND_IDLE_MS
+                })
+                .map(|session| (session.last_activity_at_ms, session.session_id.clone()))
+                .collect();
+            if background.len() <= BROWSER_MAX_BACKGROUND_SESSIONS {
+                return;
+            }
+            background.sort_by_key(|(at, _)| *at);
+            let excess = background.len() - BROWSER_MAX_BACKGROUND_SESSIONS;
+            background
+                .into_iter()
+                .take(excess)
+                .map(|(_, session_id)| session_id)
+                .collect::<Vec<_>>()
+        };
+        for session_id in victims {
+            tracing::info!(
+                target: "vibex_browser",
+                "reclaimed an idle background browser session"
+            );
+            let _ = self.close_session(&session_id).await;
+        }
+    }
+
+    /// Closes an idle browser that no session is using.
+    async fn reap_idle(&self) {
+        self.reclaim_background_sessions().await;
+        let idle_for = unix_timestamp_ms() - self.inner.state.lock().await.last_activity_ms;
+        if idle_for < BROWSER_IDLE_TIMEOUT_MS {
+            return;
+        }
+        let process = {
+            let mut state = self.inner.state.lock().await;
+            // A session with tabs is in use even if it has been quiet.
+            if state
+                .sessions
+                .values()
+                .any(|session| !session.tabs.is_empty())
+            {
+                return;
+            }
+            state.sessions.clear();
+            state.process.take()
+        };
+        if let Some(process) = process {
+            tracing::info!(
+                target: "vibex_browser",
+                "closing the idle embedded browser"
+            );
+            process.shutdown().await;
+        }
+    }
 }
 
 impl BrowserInner {
@@ -2014,34 +2248,6 @@ impl BrowserInner {
         )
         .await?;
         Ok(())
-    }
-
-    /// Closes an idle browser that no session is using.
-    async fn reap_idle(&self) {
-        let idle_for = unix_timestamp_ms() - self.state.lock().await.last_activity_ms;
-        if idle_for < BROWSER_IDLE_TIMEOUT_MS {
-            return;
-        }
-        let process = {
-            let mut state = self.state.lock().await;
-            // A session with tabs is in use even if it has been quiet.
-            if state
-                .sessions
-                .values()
-                .any(|session| !session.tabs.is_empty())
-            {
-                return;
-            }
-            state.sessions.clear();
-            state.process.take()
-        };
-        if let Some(process) = process {
-            tracing::info!(
-                target: "vibex_browser",
-                "closing the idle embedded browser"
-            );
-            process.shutdown().await;
-        }
     }
 }
 
@@ -3196,11 +3402,20 @@ mod tests {
         // own server without a domain approval.
         assert!(
             service
-                .dev_server_origins()
+                .dev_server_origins(&workspace)
                 .await
                 .iter()
                 .any(|known| known == &announced),
             "the detected origin joins the workspace allow-list"
+        );
+        // The exemption is scoped to the workspace that printed the URL: a
+        // server detected in one project must not open loopback for another.
+        assert!(
+            service
+                .dev_server_origins(&WorkspaceId::new())
+                .await
+                .is_empty(),
+            "another workspace inherits no dev-server exemption"
         );
 
         service.observe_terminal_output(&workspace, &format!("http://127.0.0.1:{port}/ again\n"));

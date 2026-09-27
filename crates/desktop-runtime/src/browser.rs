@@ -132,6 +132,7 @@ impl BrowserRuntime {
         if let Some(url) = self.endpoint_url.lock().await.clone() {
             return Ok(url);
         }
+        self.load_remembered_origins().await;
         let host = Arc::new(RuntimeBrowserHost {
             runtime: Arc::clone(self),
         });
@@ -149,6 +150,61 @@ impl BrowserRuntime {
         *self.endpoint_url.lock().await = Some(url.clone());
         *guard = Some(endpoint);
         Ok(url)
+    }
+
+    /// Seeds the browser service with the origins the human approved before.
+    ///
+    /// "Always allow" is remembered by the browser layer, and this is the read
+    /// half of that: without it the grant dies with the process and a resumed
+    /// session has to ask again for a site the user already trusted.
+    async fn load_remembered_origins(&self) {
+        let database_path = self.agent.manager().database_path().to_path_buf();
+        let origins = tokio::task::spawn_blocking(move || {
+            let connection = vibex_db::open_database(&database_path).ok()?;
+            vibex_db::BrowserOriginGrantRepository::live_origins(&connection).ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        if origins.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: "vibex_browser",
+            count = origins.len(),
+            "restored the remembered browser origin allowlist"
+        );
+        self.service.seed_origin_grants(origins).await;
+    }
+
+    /// Writes one approved origin down so it survives a restart.
+    pub async fn remember_origin(&self, origin: &str) {
+        let origin = vibex_core::normalize_origin(origin);
+        if origin.is_empty() {
+            return;
+        }
+        let database_path = self.agent.manager().database_path().to_path_buf();
+        let grant = vibex_db::BrowserOriginGrant {
+            origin,
+            granted_at_ms: unix_timestamp_ms(),
+            // A session grant has no expiry of its own; the column exists so a
+            // TTL would not need another migration.
+            expires_at_ms: None,
+        };
+        let written = tokio::task::spawn_blocking(move || {
+            let connection = vibex_db::open_database(&database_path).ok()?;
+            vibex_db::BrowserOriginGrantRepository::upsert(&connection, &grant).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if written.is_none() {
+            tracing::warn!(
+                target: "vibex_browser",
+                "an approved browser origin could not be persisted; it applies to this process only"
+            );
+        }
     }
 
     /// Persists every browser action into the audit ledger.
@@ -303,7 +359,17 @@ impl BrowserRuntime {
     pub fn tool_delivery_for_agent(agent_id: &str) -> BrowserToolDelivery {
         use vibex_agent_acp::{McpWireDelivery, agent_dialect_profile};
         match agent_dialect_profile(agent_id).mcp_wire_delivery {
-            McpWireDelivery::Delivered => BrowserToolDelivery::Http,
+            McpWireDelivery::Delivered => {
+                if AGENTS_USING_THE_STDIO_FALLBACK.contains(&agent_id) {
+                    // These adapters do not declare `mcpCapabilities.http`, so
+                    // the descriptor they receive is the stdio sidecar. Saying
+                    // "over HTTP" for them would be wrong in the one place the
+                    // user goes to find out how the tools arrive.
+                    BrowserToolDelivery::Stdio
+                } else {
+                    BrowserToolDelivery::Http
+                }
+            }
             // These Agents never receive wire MCP servers today, so neither the
             // delegation tool nor the browser tool can reach them. Saying so is
             // better than listing tools that can never be called.
@@ -474,12 +540,14 @@ impl BrowserMcpHost for RuntimeBrowserHost {
             .find(|(key, _)| key == "domain")
             .map(|(_, value)| value.clone())
             .unwrap_or_else(|| "the requested origin".to_string());
-        let origin = error
-            .diagnostics
-            .iter()
-            .find(|(key, _)| key == "origin")
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default();
+        let origin = vibex_core::normalize_origin(
+            &error
+                .diagnostics
+                .iter()
+                .find(|(key, _)| key == "origin")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default(),
+        );
         let private_network = error.code == "browser_private_network_approval_required";
         let requested_at_ms = unix_timestamp_ms();
         let request = PermissionRequest {
@@ -562,7 +630,8 @@ impl BrowserMcpHost for RuntimeBrowserHost {
                 Some(PermissionRequestStatus::Approved) => {
                     // "Always allow for this session" is remembered by the
                     // browser layer, because the runtime keeps no permission
-                    // policy store of its own.
+                    // policy store of its own. A one-off approve is *not*
+                    // remembered here: the handler attaches it to the retry.
                     return match self.runtime.last_always_allow(&request.id).await {
                         true => BrowserPermissionDecision::AlwaysAllow,
                         false => BrowserPermissionDecision::Approve,
@@ -586,6 +655,10 @@ impl BrowserMcpHost for RuntimeBrowserHost {
         }
     }
 
+    async fn remember_origin(&self, _session: &BrowserMcpSession, origin: &str) {
+        self.runtime.remember_origin(origin).await;
+    }
+
     async fn report(&self, _session: &BrowserMcpSession, event: &str, payload: Value) {
         tracing::debug!(
             target: "vibex_browser",
@@ -603,11 +676,33 @@ impl BrowserMcpHost for RuntimeBrowserHost {
 /// weak model the full fine-grained surface produces worse outcomes than giving
 /// it two coarse tools it can actually drive.
 pub fn browser_tool_tier(agent_id: &vibex_core::AgentId) -> BrowserToolTier {
+    if AGENTS_ON_THE_COARSE_TOOL_TIER.contains(&agent_id.as_str()) {
+        return BrowserToolTier::Coarse;
+    }
     if AGENTS_ACCEPTING_IMAGE_TOOL_RESULTS.contains(&agent_id.as_str()) {
         return BrowserToolTier::Visual;
     }
     BrowserToolTier::Fine
 }
+
+/// Agents that should only be offered the coarse tools.
+///
+/// The coarse tier exists so a model that cannot drive a long structured tool
+/// surface still gets a usable browser: `browser_open_and_read` and
+/// `browser_click_by_name` replace observe-then-act. No Agent is listed today —
+/// the tier is reachable through this table, and an Agent belongs here only
+/// after it has actually been observed to do worse with the fine surface.
+/// Adding a name is the whole change.
+pub const AGENTS_ON_THE_COARSE_TOOL_TIER: &[&str] = &[];
+
+/// Agents that receive the browser MCP server over the stdio sidecar because
+/// their adapter does not declare `mcpCapabilities.http`.
+///
+/// Measured from the installed adapters' `initialize` result; the browser
+/// transport chooser reads the same capability at wire time, so an adapter that
+/// starts declaring HTTP must be removed from this list or its row in the
+/// capability matrix starts lying.
+pub const AGENTS_USING_THE_STDIO_FALLBACK: &[&str] = &["gemini", "copilot"];
 
 /// Agents that accept image content inside an MCP tool result.
 ///
@@ -651,6 +746,50 @@ mod tests {
                 BrowserRuntime::tool_delivery_for_agent(agent),
                 BrowserToolDelivery::Unavailable,
                 "{agent} should be reported as unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_only_agents_are_labelled_as_such() {
+        // These adapters declare no `mcpCapabilities.http`, so the descriptor
+        // they get is the sidecar. The label is the only place a user can learn
+        // that, and "over HTTP" would be a lie.
+        for agent in AGENTS_USING_THE_STDIO_FALLBACK {
+            assert_eq!(
+                BrowserRuntime::tool_delivery_for_agent(agent),
+                BrowserToolDelivery::Stdio,
+                "{agent} receives the stdio fallback"
+            );
+        }
+        assert_eq!(
+            BrowserRuntime::tool_delivery_for_agent("claude"),
+            BrowserToolDelivery::Http
+        );
+        // An Agent that never receives anything is still reported as
+        // unreachable, whatever the transport table says.
+        assert_eq!(
+            BrowserRuntime::tool_delivery_for_agent("pi"),
+            BrowserToolDelivery::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_coarse_tier_is_reachable_through_its_table() {
+        let agent = vibex_core::AgentId::parse("weak-model-agent").unwrap();
+        assert_eq!(browser_tool_tier(&agent), BrowserToolTier::Fine);
+        // The ladder is: listed coarse Agents get the coarse tools, Agents that
+        // forward images get the visual tools, and everyone else gets fine.
+        assert!(
+            AGENTS_ON_THE_COARSE_TOOL_TIER
+                .iter()
+                .all(|agent| !AGENTS_ACCEPTING_IMAGE_TOOL_RESULTS.contains(agent)),
+            "an Agent cannot be on two tiers"
+        );
+        for listed in AGENTS_ON_THE_COARSE_TOOL_TIER {
+            assert_eq!(
+                browser_tool_tier(&vibex_core::AgentId::parse(*listed).unwrap()),
+                BrowserToolTier::Coarse
             );
         }
     }

@@ -100,13 +100,15 @@ pub use automation_graph::{
     AutomationTerminalCheckConfig,
 };
 pub use browser::{
-    AGENT_DELEGATION_MCP_SERVER_ID, BROWSER_ACTION_HIGHLIGHT_MS, BROWSER_CDP_COMMAND_TIMEOUT_MS,
+    AGENT_DELEGATION_MCP_SERVER_ID, BROWSER_ACTION_HIGHLIGHT_MS, BROWSER_BACKGROUND_IDLE_MS,
+    BROWSER_CDP_COMMAND_TIMEOUT_MS, BROWSER_MAX_BACKGROUND_SESSIONS,
     BROWSER_MAX_DIAGNOSTIC_ENTRIES, BROWSER_MAX_EXTRACT_CHARS, BROWSER_MAX_FRAME_BYTES,
     BROWSER_MAX_SCREENSHOT_BYTES, BROWSER_MAX_SCRIPT_CHARS, BROWSER_MAX_SCRIPT_RESULT_CHARS,
     BROWSER_MAX_SCROLL_DELTA, BROWSER_MAX_SESSION_LEDGER_ITEMS, BROWSER_MAX_TAB_TRACE_ITEMS,
     BROWSER_MAX_TABS, BROWSER_MCP_SERVER_ID, BROWSER_MCP_TOKEN_PREFIX, BROWSER_OBSERVE_AX_DEPTH,
     BROWSER_OBSERVE_DEFAULT_MAX_ELEMENTS, BROWSER_OBSERVE_EXTENDED_AX_DEPTH,
     BROWSER_OBSERVE_MAX_MAX_ELEMENTS, BROWSER_OBSERVE_MIN_MAX_ELEMENTS, BROWSER_OBSERVE_TIMEOUT_MS,
+    BROWSER_UNTRUSTED_CONTENT_BEGIN, BROWSER_UNTRUSTED_CONTENT_END,
     BROWSER_UNTRUSTED_CONTENT_NOTICE, BUILTIN_MCP_SERVER_IDS, BrowserActionKind,
     BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality, BrowserConsoleEntry,
     BrowserDialogRequest, BrowserElement, BrowserElementSource, BrowserExecutionSource,
@@ -114,9 +116,11 @@ pub use browser::{
     BrowserNetworkEntry, BrowserObservation, BrowserOperationStatus, BrowserRecordingStep,
     BrowserSession, BrowserSessionSnapshot, BrowserTab, BrowserTabOwner, BrowserTabStatus,
     BrowserToolDelivery, BrowserToolTier, BrowserUnavailableReason, BrowserVisualDiff,
-    browser_mcp_session_token, is_builtin_mcp_server_id, is_cross_origin, is_loopback_origin,
-    redact_url_for_ledger, url_host_redacted, verify_browser_mcp_session_token,
+    browser_mcp_session_token, fence_untrusted_content, is_builtin_mcp_server_id, is_cross_origin,
+    is_loopback_origin, normalize_origin, redact_url_for_ledger, url_host_redacted,
+    verify_browser_mcp_session_token,
 };
+
 pub use canonical_json::canonical_json_vec;
 pub use delegation::{
     AgentDelegation, AgentDelegationStatus, CancelAgentDelegationRequest,
