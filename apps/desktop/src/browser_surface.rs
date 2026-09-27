@@ -41,9 +41,10 @@ use gpui_component::{
 use image::Frame;
 use vibex_browser::BrowserInput;
 use vibex_core::{
-    BrowserAvailability, BrowserDialogRequest, BrowserExecutionSource, BrowserFrame,
-    BrowserFrameMetadata, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus,
-    BrowserUnavailableReason,
+    BrowserActionKind, BrowserActionRecord, BrowserAvailability, BrowserDialogRequest,
+    BrowserExecutionSource, BrowserFrame, BrowserFrameMetadata, BrowserOperationStatus,
+    BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus, BrowserUnavailableReason,
+    unix_timestamp_ms,
 };
 
 use vibex_desktop_model::SEARCH_QUERY_PLACEHOLDER;
@@ -52,6 +53,55 @@ use crate::browser_transport::{
     BrowserFrameStream, BrowserTransport, BrowserTransportError, LocalBrowserTransport,
 };
 use crate::locale;
+
+/// A short label for one ledger entry's action.
+///
+/// A kind this build does not know is shown as `other`: the enum is
+/// unknown-safe so a newer runtime's entry can still be listed.
+fn activity_kind(kind: BrowserActionKind) -> &'static str {
+    match kind {
+        BrowserActionKind::Launch => "launch",
+        BrowserActionKind::Navigate => "navigate",
+        BrowserActionKind::Observe => "observe",
+        BrowserActionKind::Find => "find",
+        BrowserActionKind::Click => "click",
+        BrowserActionKind::Fill => "fill",
+        BrowserActionKind::Press => "press",
+        BrowserActionKind::Hover => "hover",
+        BrowserActionKind::Scroll => "scroll",
+        BrowserActionKind::SelectOption => "select",
+        BrowserActionKind::Drag => "drag",
+        BrowserActionKind::Upload => "upload",
+        BrowserActionKind::Extract => "extract",
+        BrowserActionKind::Screenshot => "screenshot",
+        BrowserActionKind::Evaluate => "script",
+        BrowserActionKind::WaitFor => "wait",
+        BrowserActionKind::ListTabs => "tabs",
+        BrowserActionKind::CreateTab => "new tab",
+        BrowserActionKind::SelectTab => "switch",
+        BrowserActionKind::CloseTab => "close tab",
+        BrowserActionKind::PreviewOpen => "preview",
+        BrowserActionKind::ConsoleMessages => "console",
+        BrowserActionKind::NetworkRequests => "network",
+        BrowserActionKind::HandleDialog => "dialog",
+        BrowserActionKind::RequestHelp => "help",
+        BrowserActionKind::SnapshotBaseline => "baseline",
+        BrowserActionKind::CompareBaseline => "compare",
+        BrowserActionKind::ElementToSource => "source",
+        BrowserActionKind::Unknown => "other",
+    }
+}
+
+/// How long ago an entry happened, in the shortest honest form.
+fn relative_time(at_ms: i64, now_ms: i64) -> String {
+    let seconds = ((now_ms - at_ms).max(0) / 1_000) as u64;
+    match seconds {
+        0..=9 => "now".to_string(),
+        10..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3_600),
+    }
+}
 
 /// How long the panel waits after a resize before telling the browser.
 ///
@@ -142,6 +192,16 @@ pub struct BrowserSurface {
     select_hint: Option<SelectHint>,
     /// The open fallback menu, anchored where the click landed.
     select_menu: Option<OpenSelectMenu>,
+    /// The session's redacted operation ledger, newest last.
+    ///
+    /// This is what lets a human see what the Agent did without having watched
+    /// the whole run; the entries carry no page content by construction.
+    ledger: Vec<BrowserActionRecord>,
+    /// True while the activity list is docked under the page.
+    ledger_open: bool,
+    /// Set while the ledger is being fetched, so the list can say so.
+    ledger_pending: bool,
+    ledger_error: Option<String>,
     /// The page's icon, once the runtime has fetched and this side decoded it.
     favicon: Option<Arc<RenderImage>>,
     /// The URL the current icon came from, so a repaint does not refetch it.
@@ -217,6 +277,10 @@ impl BrowserSurface {
             file_chooser_pending: false,
             select_hint: None,
             select_menu: None,
+            ledger: Vec::new(),
+            ledger_open: false,
+            ledger_pending: false,
+            ledger_error: None,
             favicon: None,
             favicon_source: None,
             select_probe_in_flight: false,
@@ -389,12 +453,67 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Opens or closes the activity list, fetching the ledger when it opens.
+    pub fn toggle_ledger(&mut self, cx: &mut Context<Self>) {
+        self.ledger_open = !self.ledger_open;
+        if self.ledger_open {
+            self.refresh_ledger(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads the session's ledger from the runtime.
+    pub fn refresh_ledger(&mut self, cx: &mut Context<Self>) {
+        let (Some(transport), Some(session_id)) = (self.transport.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        self.ledger_pending = true;
+        self.ledger_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = transport.ledger(&session_id).await;
+            let _ = this.update(cx, |surface, cx| {
+                surface.ledger_pending = false;
+                match result {
+                    Ok(records) => surface.ledger = records,
+                    Err(error) => surface.ledger_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Appends one operation the runtime just reported.
+    ///
+    /// The runtime is the source of truth and the panel is a subscriber, so a
+    /// record that arrives while the list is open appears without a refetch.
+    pub fn receive_ledger_record(&mut self, record: BrowserActionRecord, cx: &mut Context<Self>) {
+        if record.tab_id != self.tab_id.clone().unwrap_or_default() {
+            return;
+        }
+        self.ledger.push(record);
+        let excess = self
+            .ledger
+            .len()
+            .saturating_sub(vibex_core::BROWSER_MAX_SESSION_LEDGER_ITEMS);
+        if excess > 0 {
+            self.ledger.drain(..excess);
+        }
+        if self.ledger_open {
+            cx.notify();
+        }
+    }
+
     /// Points the surface at a different runtime tab.
     pub fn set_tab(&mut self, tab_id: Option<BrowserTabId>, cx: &mut Context<Self>) {
         if self.tab_id == tab_id {
             return;
         }
         self.tab_id = tab_id;
+        self.ledger.clear();
+        self.ledger_error = None;
         if let Some(previous) = self.frame_image.take() {
             self.pending_drop.push(previous);
         }
@@ -1453,6 +1572,18 @@ impl BrowserSurface {
                     .min_w_0()
                     .child(Input::new(&self.address_input).small()),
             )
+            .child(
+                Button::new("browser-activity")
+                    .icon(Icon::new(IconName::LayoutDashboard))
+                    .ghost()
+                    .xsmall()
+                    .tooltip(locale::text(
+                        "Show what the Agent did in this tab",
+                        "查看 Agent 在此标签页的操作记录",
+                        "查看 Agent 在此分頁的操作記錄",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ledger(cx))),
+            )
             .when(!status.is_empty(), |this| {
                 this.child(
                     div()
@@ -1539,6 +1670,140 @@ impl BrowserSurface {
                             .on_click(cx.listener(|this, _, _, cx| this.hand_back_to_agent(cx))),
                     )
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// The docked activity list.
+    ///
+    /// It shows the same redacted ledger the runtime persists, so a human can
+    /// answer "what did it just do?" without having watched the run.
+    fn render_ledger(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.ledger_open {
+            return None;
+        }
+        let now = unix_timestamp_ms();
+        let mut rows = Vec::new();
+        for record in self.ledger.iter().rev().take(40) {
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_baseline()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(relative_time(record.at_ms, now)),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(match record.status {
+                                BrowserOperationStatus::Failed => cx.theme().danger,
+                                _ => cx.theme().muted_foreground,
+                            })
+                            .child(activity_kind(record.kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .truncate()
+                            .text_color(cx.theme().foreground)
+                            .child(record.summary.clone()),
+                    )
+                    .when(
+                        record.execution_source == BrowserExecutionSource::User,
+                        |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(locale::text("you", "你", "你")),
+                            )
+                        },
+                    )
+                    .into_any_element(),
+            );
+        }
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.ledger_pending {
+                        locale::text("Loading…", "加载中…", "載入中…")
+                    } else {
+                        locale::text(
+                            "Nothing recorded in this tab yet.",
+                            "此标签页还没有操作记录。",
+                            "此分頁還沒有操作記錄。",
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = self.ledger_error.clone() {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error)
+                    .into_any_element(),
+            );
+        }
+        Some(
+            v_flex()
+                .id("browser-activity")
+                .flex_none()
+                .w_full()
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(locale::text(
+                                    "Agent activity in this tab (redacted)",
+                                    "Agent 在此标签页的操作（已脱敏）",
+                                    "Agent 在此分頁的操作（已脫敏）",
+                                )),
+                        )
+                        .child(
+                            Button::new("browser-activity-refresh")
+                                .label(locale::text("Refresh", "刷新", "重新整理"))
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_ledger(cx))),
+                        )
+                        .child(
+                            Button::new("browser-activity-close")
+                                .label(locale::text("Close", "关闭", "關閉"))
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_ledger(cx))),
+                        ),
+                )
+                .children(rows)
                 .into_any_element(),
         )
     }
@@ -2231,6 +2496,7 @@ impl Render for BrowserSurface {
         self.sync_address_field(window, cx);
         let toolbar = self.render_toolbar(cx);
         let takeover = self.render_takeover(cx);
+        let ledger = self.render_ledger(cx);
         let frame = self.render_frame(cx);
         let select_menu = self.render_select_menu(cx);
         let dialog = self.render_dialog(cx);
@@ -2247,6 +2513,7 @@ impl Render for BrowserSurface {
             .text_color(cx.theme().foreground)
             .child(toolbar)
             .when_some(takeover, |this, takeover| this.child(takeover))
+            .when_some(ledger, |this, ledger| this.child(ledger))
             .when(self.marked_text.is_some(), |this| {
                 // The in-progress IME composition is drawn by the panel: the
                 // page never sees uncommitted text.
@@ -2892,6 +3159,8 @@ mod tests {
     struct RecordingTransport {
         inputs: Arc<std::sync::Mutex<Vec<String>>>,
         snapshot: Arc<std::sync::Mutex<Option<vibex_core::BrowserSessionSnapshot>>>,
+        /// The ledger the panel reads when the activity list is opened.
+        ledger: Arc<std::sync::Mutex<Vec<vibex_core::BrowserActionRecord>>>,
         /// How many times the frame stream was asked for, and how many of the
         /// first attempts fail before one succeeds.
         subscribe_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -2905,6 +3174,7 @@ mod tests {
             Self {
                 inputs: Arc::new(std::sync::Mutex::new(Vec::new())),
                 snapshot: Arc::new(std::sync::Mutex::new(None)),
+                ledger: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2931,6 +3201,16 @@ mod tests {
         ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_core::BrowserSession>>
         {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn ledger(
+            &self,
+            _session_id: &BrowserSessionId,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Vec<vibex_core::BrowserActionRecord>,
+        > {
+            let ledger = self.ledger.lock().unwrap().clone();
+            Box::pin(async move { Ok(ledger) })
         }
         fn session_snapshot(
             &self,
@@ -3243,6 +3523,81 @@ mod tests {
             2,
             "a change has to reach the preview tab"
         );
+    }
+
+    #[test]
+    fn activity_labels_cover_every_kind_and_stay_short() {
+        // Every kind has a label; an unknown one from a newer runtime is
+        // `other` rather than a panic or an empty cell.
+        for kind in [
+            BrowserActionKind::Launch,
+            BrowserActionKind::Navigate,
+            BrowserActionKind::Observe,
+            BrowserActionKind::ElementToSource,
+            BrowserActionKind::Unknown,
+        ] {
+            assert!(!activity_kind(kind).is_empty());
+        }
+        assert_eq!(activity_kind(BrowserActionKind::Unknown), "other");
+    }
+
+    #[test]
+    fn relative_times_are_coarse_and_never_negative() {
+        assert_eq!(relative_time(1_000, 1_500), "now");
+        assert_eq!(relative_time(1_000, 30_000), "29s");
+        assert_eq!(relative_time(1_000, 130_000), "2m");
+        assert_eq!(relative_time(1_000, 7_300_000), "2h");
+        // A clock that moved backwards must not print a negative age.
+        assert_eq!(relative_time(2_000, 1_000), "now");
+    }
+
+    #[gpui::test]
+    fn opening_the_activity_list_reads_the_ledger(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let record = vibex_core::BrowserActionRecord {
+            id: "braction_probe".to_string(),
+            session_id: BrowserSessionId::new(),
+            tab_id: BrowserTabId::new(),
+            kind: BrowserActionKind::Click,
+            summary: "clicked `Submit`".to_string(),
+            at_ms: 1_000,
+            status: BrowserOperationStatus::Dispatched,
+            domain: Some("example.com".to_string()),
+            execution_source: BrowserExecutionSource::Agent,
+        };
+        let ledger = Arc::new(std::sync::Mutex::new(vec![record]));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            ledger: ledger.clone(),
+            ..Default::default()
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface =
+                        BrowserSurface::new("browser_tab_probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface
+                })
+            })
+            .expect("browser probe window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| surface.toggle_ledger(cx));
+        cx.run_until_parked();
+
+        let (open, pending, error, records) = surface.read_with(&cx, |surface, _| {
+            (
+                surface.ledger_open,
+                surface.ledger_pending,
+                surface.ledger_error.clone(),
+                surface.ledger.len(),
+            )
+        });
+        assert!(open, "the activity list opens");
+        assert!(!pending, "the fetch finished");
+        assert_eq!(error, None);
+        assert_eq!(records, 1, "the runtime's ledger is what the panel shows");
     }
 
     #[gpui::test]

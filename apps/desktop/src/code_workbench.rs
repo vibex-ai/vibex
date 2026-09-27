@@ -4835,6 +4835,15 @@ impl CodeWorkbench {
             vibex_browser::BrowserServiceEvent::TabChanged(tab_id) => {
                 self.update_browser_surface(&tab_id, cx, |surface, cx| surface.refresh_tab(cx));
             }
+            // Every browser tool call the runtime makes ends up here, whichever
+            // Agent made it and however that Agent reports events. The panel
+            // appends it, so the activity list is live without a refetch.
+            vibex_browser::BrowserServiceEvent::Action(record) => {
+                let tab_id = record.tab_id.clone();
+                self.update_browser_surface(&tab_id, cx, |surface, cx| {
+                    surface.receive_ledger_record((*record).clone(), cx)
+                });
+            }
             vibex_browser::BrowserServiceEvent::TabClosed(tab_id) => {
                 let preview_tab_id = format!("browser:{}", tab_id.as_str());
                 if self.preview.tabs.contains_key(&preview_tab_id) {
@@ -4884,7 +4893,8 @@ impl CodeWorkbench {
             } => {
                 self.offer_dev_server(workspace_id, origin, window, cx);
             }
-            _ => {}
+            // No catch-all: every variant has a consumer, and the next one that
+            // does not should be a compile error rather than a silent drop.
         }
     }
 
@@ -18602,6 +18612,15 @@ mod tests {
             &self,
         ) -> crate::browser_transport::BrowserTransportFuture<'_, Vec<vibex_core::BrowserSession>>
         {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn ledger(
+            &self,
+            _session_id: &BrowserSessionId,
+        ) -> crate::browser_transport::BrowserTransportFuture<
+            '_,
+            Vec<vibex_core::BrowserActionRecord>,
+        > {
             Box::pin(async { Ok(Vec::new()) })
         }
         fn session_snapshot(

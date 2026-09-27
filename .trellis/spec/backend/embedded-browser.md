@@ -223,7 +223,14 @@ have been dropped once and must stay:
    `resume_agent_operations` re-arms it — the panel offers that button and says
    the Agent must observe again. Hover alone must never take over: the panel
    forwards every pointer move, so `input_takes_over` excludes `MouseMove`.
-3. **Detection lives in the runtime, not in the UI.** `observe_terminal_output`
+3. **The activity list is the ledger, not a second one.** The panel's
+   "activity" list reads the session ledger through `BrowserTransport::ledger`
+   when it opens and appends `BrowserServiceEvent::Action` while it is open, so
+   a record the runtime reports appears without a refetch and no client keeps a
+   parallel history. `apply_browser_event` has no catch-all arm: every variant
+   has a consumer, and the next one that does not should fail to compile rather
+   than fall into `_ => {}`.
+4. **Detection lives in the runtime, not in the UI.** `observe_terminal_output`
    is fed by the PTY reader through `TerminalManager::set_output_observer`, so a
    URL printed on a terminal tab nobody is watching still counts, and an origin
    joins the allow-list only after `probe_candidate` answers.

@@ -25,9 +25,9 @@ use vibex_browser::{
     BrowserSessionKey,
 };
 use vibex_core::{
-    BrowserAvailability, BrowserFrame, BrowserSession, BrowserSessionId, BrowserSessionSnapshot,
-    BrowserTab, BrowserTabId, BrowserTabOwner, BrowserToolTier, BrowserUnavailableReason,
-    VibexError, VibexSessionId, WorkspaceId,
+    BrowserActionRecord, BrowserAvailability, BrowserFrame, BrowserSession, BrowserSessionId,
+    BrowserSessionSnapshot, BrowserTab, BrowserTabId, BrowserTabOwner, BrowserToolTier,
+    BrowserUnavailableReason, VibexError, VibexSessionId, WorkspaceId,
 };
 
 /// Failure reported by a [`BrowserTransport`] operation.
@@ -146,6 +146,16 @@ pub trait BrowserTransport: Send + Sync + 'static {
         &self,
         session_id: &BrowserSessionId,
     ) -> BrowserTransportFuture<'_, BrowserSessionSnapshot>;
+
+    /// The session's redacted operation ledger, oldest first.
+    ///
+    /// The panel shows it so a human can see what the Agent did without having
+    /// watched the whole run; the entries carry no page content, form value or
+    /// screenshot by construction.
+    fn ledger(
+        &self,
+        session_id: &BrowserSessionId,
+    ) -> BrowserTransportFuture<'_, Vec<BrowserActionRecord>>;
 
     /// Returns the session backing a workspace's panel, creating it if needed.
     fn ensure_workspace_session(
@@ -340,6 +350,15 @@ impl BrowserTransport for LocalBrowserTransport {
                 .await
                 .map_err(Into::into)
         }))
+    }
+
+    fn ledger(
+        &self,
+        session_id: &BrowserSessionId,
+    ) -> BrowserTransportFuture<'_, Vec<BrowserActionRecord>> {
+        let session_id = session_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move { Ok(service.ledger(&session_id).await) }))
     }
 
     fn ensure_workspace_session(
@@ -605,6 +624,19 @@ impl BrowserTransport for RemoteBrowserTransport {
         Box::pin(async move {
             self.backend
                 .browser_session_snapshot(session_id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn ledger(
+        &self,
+        session_id: &BrowserSessionId,
+    ) -> BrowserTransportFuture<'_, Vec<BrowserActionRecord>> {
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            self.backend
+                .browser_ledger(session_id)
                 .await
                 .map_err(Into::into)
         })
