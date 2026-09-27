@@ -28,12 +28,12 @@ use vibex_core::{
     McpServerSecretReference, McpServerStatus, PermissionActionDetail, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
     PermissionResponseOption, ProjectId, ProjectRecord, Prompt, PromptCreateRequest, PromptId,
-    PromptStatus, ProviderCapabilityProbeResult, ProviderHealthProbeResult,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderKind,
-    ProviderNativeExportApplyResult, ProviderNativeExportFilePlan, ProviderNativeExportListRequest,
-    ProviderNativeExportPreview, ProviderNativeExportRecordSummary,
-    ProviderNativeExportRollbackResult, ProviderNetworkDefaults, ProviderOptions,
-    ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
+    PromptKind, PromptStatus, PromptUsage, ProviderCapabilityProbeResult,
+    ProviderHealthProbeResult, ProviderInjectionPreview, ProviderInjectionPreviewRequest,
+    ProviderKind, ProviderNativeExportApplyResult, ProviderNativeExportFilePlan,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ProviderNativeExportRecordSummary, ProviderNativeExportRollbackResult, ProviderNetworkDefaults,
+    ProviderOptions, ProviderPermissionDefaults, ProviderProfile, ProviderProfileCreateRequest,
     ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileId,
     ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderSandboxDefaults,
     ProviderSecretReference, ProviderUsageRecord, ProviderUsageWindow, RedactedDiagnostic,
@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 59;
+pub const CURRENT_SCHEMA_VERSION: i64 = 60;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -7961,6 +7961,47 @@ impl PromptRepository {
         collect_rows(rows, "prompt_decode_failed", "failed to decode Prompt row")
     }
 
+    /// Enabled reusable Prompts in composer quick-phrase order.
+    ///
+    /// Most used first, then the most recently edited, then by name so the
+    /// order stays total and stable. A Prompt the user never inserted has no
+    /// `prompt_usage` row and sorts on its own merits.
+    pub fn list_enabled_reusable_by_usage(conn: &Connection) -> VibexResult<Vec<Prompt>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT p.prompt_id, p.display_name, p.kind, p.status, p.scope_kind,
+                    p.project_id, p.workspace_id, p.body, p.description, p.tags_json,
+                    p.created_at_ms, p.updated_at_ms, p.deleted_at_ms
+                FROM prompts p
+                LEFT JOIN prompt_usage u ON u.prompt_id = p.prompt_id
+                WHERE p.deleted_at_ms IS NULL
+                    AND p.status = ?1
+                    AND p.kind = ?2
+                ORDER BY COALESCE(u.use_count, 0) DESC,
+                    p.updated_at_ms DESC,
+                    p.display_name ASC
+                ",
+            )
+            .map_err(storage_err(
+                "prompt_list_failed",
+                "failed to list reusable Prompts by usage",
+            ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    enum_to_db(&PromptStatus::Enabled)?,
+                    enum_to_db(&PromptKind::ReusablePrompt)?
+                ],
+                map_prompt,
+            )
+            .map_err(storage_err(
+                "prompt_list_failed",
+                "failed to list reusable Prompts by usage",
+            ))?;
+        collect_rows(rows, "prompt_decode_failed", "failed to decode Prompt row")
+    }
+
     pub fn get(conn: &Connection, prompt_id: &PromptId) -> VibexResult<Option<Prompt>> {
         conn.query_row(
             "
@@ -8032,6 +8073,56 @@ impl PromptRepository {
             "failed to delete Prompt",
         ))?;
         Ok(())
+    }
+}
+
+/// Composer quick-phrase usage counters for reusable Prompts.
+pub struct PromptUsageRepository;
+
+impl PromptUsageRepository {
+    /// Records one insertion of `prompt_id` into a composer.
+    ///
+    /// Insertions are the whole signal: the composer counts a phrase when the
+    /// user picks it, not when the message is sent, so the counter is written
+    /// straight off the user's action.
+    pub fn record_use(conn: &Connection, prompt_id: &PromptId) -> VibexResult<PromptUsage> {
+        conn.execute(
+            "
+            INSERT INTO prompt_usage (prompt_id, use_count, last_used_at_ms)
+            VALUES (?1, 1, ?2)
+            ON CONFLICT(prompt_id) DO UPDATE SET
+                use_count = use_count + 1,
+                last_used_at_ms = excluded.last_used_at_ms
+            ",
+            params![prompt_id.as_str(), unix_timestamp_ms()],
+        )
+        .map_err(storage_err(
+            "prompt_usage_record_failed",
+            "failed to record Prompt usage",
+        ))?;
+        Self::get(conn, prompt_id)?.ok_or_else(|| {
+            VibexError::storage(
+                "prompt_usage_lookup_failed",
+                "Prompt usage row was not found after recording it",
+            )
+        })
+    }
+
+    pub fn get(conn: &Connection, prompt_id: &PromptId) -> VibexResult<Option<PromptUsage>> {
+        conn.query_row(
+            "
+            SELECT prompt_id, use_count, last_used_at_ms
+            FROM prompt_usage
+            WHERE prompt_id = ?1
+            ",
+            params![prompt_id.as_str()],
+            map_prompt_usage,
+        )
+        .optional()
+        .map_err(storage_err(
+            "prompt_usage_lookup_failed",
+            "failed to lookup Prompt usage",
+        ))
     }
 }
 
@@ -10997,6 +11088,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_browser_audit(conn, &mut applied)?;
     apply_drop_duplicate_timeline_index(conn, &mut applied)?;
     apply_browser_origin_grants(conn, &mut applied)?;
+    apply_prompt_usage_table(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -11222,6 +11314,45 @@ fn apply_browser_origin_grants(
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit the browser origin grant migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Adds the composer quick-phrase usage counters.
+///
+/// A Prompt is inserted into the composer verbatim, so the composer orders its
+/// quick phrases by how often the user picked them. That count is behavioural
+/// state about a Prompt rather than part of its definition, so it lives in a
+/// table of its own instead of widening the Prompt contract clients receive.
+fn apply_prompt_usage_table(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 60;
+    const NAME: &str = "prompt_usage";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS prompt_usage (
+            prompt_id TEXT PRIMARY KEY
+                REFERENCES prompts(prompt_id)
+                ON DELETE CASCADE,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at_ms INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the prompt usage table",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the prompt usage migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13865,6 +13996,14 @@ fn map_prompt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Prompt> {
     })
 }
 
+fn map_prompt_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptUsage> {
+    Ok(PromptUsage {
+        prompt_id: parse_id_sql(row.get(0)?, PromptId::parse)?,
+        use_count: u32_from_sql(row.get(1)?)?,
+        last_used_at_ms: row.get(2)?,
+    })
+}
+
 fn map_hook(row: &rusqlite::Row<'_>) -> rusqlite::Result<Hook> {
     Ok(Hook {
         id: parse_id_sql(row.get(0)?, HookId::parse)?,
@@ -14665,7 +14804,8 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
-                "59:browser_origin_grants"
+                "59:browser_origin_grants",
+                "60:prompt_usage"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -14809,6 +14949,7 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
+                "60:prompt_usage",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -14932,7 +15073,8 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
-                "59:browser_origin_grants"
+                "59:browser_origin_grants",
+                "60:prompt_usage"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -15094,7 +15236,8 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
-                "59:browser_origin_grants"
+                "59:browser_origin_grants",
+                "60:prompt_usage"
             ]
         );
         assert_eq!(
@@ -16513,7 +16656,8 @@ mod tests {
                 "56:runtime_identity",
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
-                "59:browser_origin_grants"
+                "59:browser_origin_grants",
+                "60:prompt_usage"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -17547,6 +17691,107 @@ mod tests {
         PromptRepository::soft_delete(&conn, &prompt_id).unwrap();
         assert!(PromptRepository::get(&conn, &prompt_id).unwrap().is_none());
 
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn prompt_usage_orders_reusable_prompts_by_use_then_recency() {
+        let temp = temp_db_path("prompt-usage");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let insert_prompt = |conn: &Connection,
+                             display_name: &str,
+                             kind: PromptKind,
+                             status: PromptStatus,
+                             updated_at_ms: i64|
+         -> PromptId {
+            let mut prompt = PromptRepository::from_create_request(PromptCreateRequest {
+                display_name: display_name.to_string(),
+                kind,
+                status,
+                scope_kind: PromptScopeKind::User,
+                project_id: None,
+                workspace_id: None,
+                body: format!("{display_name} body"),
+                description: None,
+                tags: Vec::new(),
+            });
+            prompt.updated_at_ms = updated_at_ms;
+            let prompt_id = prompt.id.clone();
+            PromptRepository::insert(conn, &prompt).unwrap();
+            prompt_id
+        };
+
+        let beta = insert_prompt(
+            &conn,
+            "Beta",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            50,
+        );
+        let gamma = insert_prompt(
+            &conn,
+            "Gamma",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            200,
+        );
+        let delta = insert_prompt(
+            &conn,
+            "Delta",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            300,
+        );
+        let _alpha = insert_prompt(
+            &conn,
+            "Alpha",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            100,
+        );
+        // Neither a disabled reusable Prompt nor an enabled slash command is a
+        // quick phrase, so neither may reach the composer list.
+        let _disabled = insert_prompt(
+            &conn,
+            "Hidden",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Disabled,
+            400,
+        );
+        let _slash = insert_prompt(
+            &conn,
+            "Review",
+            PromptKind::SlashCommand,
+            PromptStatus::Enabled,
+            400,
+        );
+
+        let first_use = PromptUsageRepository::record_use(&conn, &beta).unwrap();
+        assert_eq!(first_use.prompt_id, beta);
+        assert_eq!(first_use.use_count, 1);
+        assert!(first_use.last_used_at_ms > 0);
+        let second_use = PromptUsageRepository::record_use(&conn, &beta).unwrap();
+        assert_eq!(second_use.use_count, 2);
+        PromptUsageRepository::record_use(&conn, &gamma).unwrap();
+
+        let ordered = PromptRepository::list_enabled_reusable_by_usage(&conn).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|prompt| prompt.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Beta", "Gamma", "Delta", "Alpha"],
+            "most used first, then the most recently edited"
+        );
+        assert_eq!(
+            PromptUsageRepository::get(&conn, &delta).unwrap(),
+            None,
+            "a Prompt that was never inserted has no usage row"
+        );
+
+        drop(conn);
         cleanup_db(temp);
     }
 
@@ -19226,11 +19471,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry == "59:browser_origin_grants")
         );
+        assert!(first.iter().any(|entry| entry == "60:prompt_usage"));
         // A second run must be a no-op: the tables already exist and the
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 59);
+        assert_eq!(current_schema_version(&conn).unwrap(), 60);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION

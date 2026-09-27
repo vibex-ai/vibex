@@ -2395,6 +2395,59 @@ impl AgentManager {
         Ok(capabilities)
     }
 
+    /// Lists the user's enabled reusable Prompts as composer quick phrases.
+    ///
+    /// A quick phrase is inserted into the composer verbatim rather than
+    /// executed, so an entry carries the Prompt body as its insertion text and
+    /// declares no execution behavior. Ordering comes from the repository: the
+    /// phrases the user inserted most often come first.
+    pub fn discover_quick_phrases(
+        &self,
+        request: &AgentCommandDiscoverRequest,
+    ) -> VibexResult<Vec<AgentCommandEntry>> {
+        if !command_trigger_matches(request.trigger, AgentCommandTrigger::Slash) {
+            return Ok(Vec::new());
+        }
+        let query = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_lowercase();
+        let limit = request.limit.unwrap_or(50) as usize;
+        let conn = self.open_migrated()?;
+        Ok(PromptRepository::list_enabled_reusable_by_usage(&conn)?
+            .into_iter()
+            .filter(|prompt| {
+                query.is_empty()
+                    || prompt.display_name.to_lowercase().contains(&query)
+                    || prompt.body.to_lowercase().contains(&query)
+                    || prompt
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| description.to_lowercase().contains(&query))
+            })
+            .take(limit)
+            .map(|prompt| AgentCommandEntry {
+                id: format!("phrase:{}", prompt.id.as_str()),
+                trigger: AgentCommandTrigger::Slash,
+                source_kind: AgentCommandSourceKind::Prompt,
+                label: prompt.display_name.clone(),
+                description: Some(quick_phrase_preview(&prompt.body)),
+                insertion_text: prompt.body,
+                command_name: None,
+                provider_kind: Some(ProviderKind::Acp),
+                prompt_id: Some(prompt.id),
+                skill_id: None,
+                reference_path: None,
+                selection_behavior: AgentCommandSelectionBehavior::Insert,
+                execution_behavior: AgentCommandExecutionBehavior::None,
+                destructive: false,
+                metadata: Vec::new(),
+            })
+            .collect())
+    }
+
     fn normalize_command_discover_request(
         &self,
         mut request: AgentCommandDiscoverRequest,
@@ -5658,6 +5711,19 @@ fn expand_prompt_body(body: &str, arguments: &str) -> String {
     }
 }
 
+/// One line of Prompt body, bounded so a long Prompt does not ride along on
+/// every keystroke's discovery response. The insertion text stays complete.
+fn quick_phrase_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_CHARS {
+        return collapsed;
+    }
+    let mut preview = collapsed.chars().take(MAX_CHARS).collect::<String>();
+    preview.push('…');
+    preview
+}
+
 fn filter_and_limit_command_entries(
     entries: &mut Vec<AgentCommandEntry>,
     query: Option<&str>,
@@ -5695,15 +5761,16 @@ mod tests {
     use async_trait::async_trait;
     use vibex_core::{
         AcpAdapterId, AgentRuntimeRouteKey, AgentSessionSafety, MessageSubmissionStatus,
-        NativeStateHomeId, ProviderConfiguredModel, RuntimeBinding, RuntimeBindingId,
-        RuntimeMaterializationStatus, RuntimeProcessId, RuntimeProcessSnapshot,
-        RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus,
-        SessionRuntimeConfigState, WorkspaceMode,
+        NativeStateHomeId, PromptCreateRequest, PromptScopeKind, ProviderConfiguredModel,
+        RuntimeBinding, RuntimeBindingId, RuntimeMaterializationStatus, RuntimeProcessId,
+        RuntimeProcessSnapshot, RuntimeSwitchActiveWorkPolicy, RuntimeSwitchId,
+        RuntimeSwitchPolicy, RuntimeSwitchStatus, SessionRuntimeConfigState, WorkspaceMode,
     };
     use vibex_db::{
         ContextBridgePrepareRequest, ContextBridgeRepository, DesiredRuntimeSwitchEnqueueRequest,
-        DesiredRuntimeSwitchEnqueueResult, RequestedSwitchClaimOutcome, RuntimeBindingRepository,
-        RuntimeSwitchCommitRequest, RuntimeSwitchRepository, WorkspaceRepository,
+        DesiredRuntimeSwitchEnqueueResult, PromptUsageRepository, RequestedSwitchClaimOutcome,
+        RuntimeBindingRepository, RuntimeSwitchCommitRequest, RuntimeSwitchRepository,
+        WorkspaceRepository,
     };
 
     use super::*;
@@ -8983,6 +9050,135 @@ mod tests {
             "vibex-agent-{label}-{}.db",
             vibex_core::RequestId::new().as_str()
         ))
+    }
+
+    #[test]
+    fn quick_phrases_are_enabled_reusable_prompts_in_use_order() {
+        let db_path = temp_db_path("quick-phrases");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let conn = manager.open_migrated().unwrap();
+
+        let insert = |display_name: &str,
+                      kind: vibex_core::PromptKind,
+                      status: vibex_core::PromptStatus,
+                      updated_at_ms: i64|
+         -> vibex_core::PromptId {
+            let mut prompt = PromptRepository::from_create_request(PromptCreateRequest {
+                display_name: display_name.to_string(),
+                kind,
+                status,
+                scope_kind: PromptScopeKind::User,
+                project_id: None,
+                workspace_id: None,
+                body: format!("{display_name} body"),
+                description: None,
+                tags: Vec::new(),
+            });
+            prompt.updated_at_ms = updated_at_ms;
+            let prompt_id = prompt.id.clone();
+            PromptRepository::insert(&conn, &prompt).unwrap();
+            prompt_id
+        };
+
+        let beta = insert(
+            "Beta",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            50,
+        );
+        let gamma = insert(
+            "Gamma",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            200,
+        );
+        insert(
+            "Delta",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Enabled,
+            300,
+        );
+        insert(
+            "Hidden",
+            PromptKind::ReusablePrompt,
+            PromptStatus::Disabled,
+            400,
+        );
+        insert(
+            "Review",
+            PromptKind::SlashCommand,
+            PromptStatus::Enabled,
+            500,
+        );
+        PromptUsageRepository::record_use(&conn, &beta).unwrap();
+        PromptUsageRepository::record_use(&conn, &beta).unwrap();
+        PromptUsageRepository::record_use(&conn, &gamma).unwrap();
+        drop(conn);
+
+        let request = |query: &str, limit: u32| AgentCommandDiscoverRequest {
+            agent_id: None,
+            provider_profile_id: None,
+            session_id: None,
+            workspace_id: None,
+            trigger: Some(AgentCommandTrigger::Slash),
+            query: Some(query.to_string()),
+            limit: Some(limit),
+        };
+
+        let phrases = manager.discover_quick_phrases(&request("", 10)).unwrap();
+        assert_eq!(
+            phrases
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Beta", "Gamma", "Delta"],
+            "disabled Prompts and slash commands are not quick phrases"
+        );
+        assert!(phrases.iter().all(|entry| {
+            entry.trigger == AgentCommandTrigger::Slash
+                && entry.source_kind == AgentCommandSourceKind::Prompt
+                && entry.selection_behavior == AgentCommandSelectionBehavior::Insert
+                && entry.execution_behavior == AgentCommandExecutionBehavior::None
+                && entry.prompt_id.is_some()
+        }));
+        assert_eq!(phrases[0].insertion_text, "Beta body");
+        assert_eq!(phrases[0].description.as_deref(), Some("Beta body"));
+
+        // The typed `/` query filters the phrases, and the popup's limit caps
+        // how many the authority sends back.
+        let filtered = manager
+            .discover_quick_phrases(&request("gamma", 10))
+            .unwrap();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Gamma"]
+        );
+        assert_eq!(
+            manager
+                .discover_quick_phrases(&request("", 2))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // An `@` or `$` popup never resolves quick phrases.
+        let mut mention = request("", 10);
+        mention.trigger = Some(AgentCommandTrigger::Mention);
+        assert!(manager.discover_quick_phrases(&mention).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn quick_phrase_preview_collapses_and_bounds_long_bodies() {
+        assert_eq!(quick_phrase_preview("one\n  two\tthree"), "one two three");
+        let long = "x".repeat(400);
+        let preview = quick_phrase_preview(&long);
+        assert_eq!(preview.chars().count(), 161);
+        assert!(preview.ends_with('…'));
     }
 
     fn temp_workspace_path(label: &str) -> PathBuf {

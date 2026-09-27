@@ -51,9 +51,10 @@ use vibex_core::{
     McpServerImportResult, McpServerSetAgentMatrixRequest, McpServerUpdateRequest,
     McpServerValidateRequest, McpServerValidationResult, MessageSubmissionState,
     OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
-    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderConfiguredModel,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -3119,6 +3120,23 @@ impl ManagementBackend for NativeBackend {
                 .providers()
                 .management()
                 .validate_prompt(request)
+                .map_err(Into::into)
+        })
+    }
+
+    fn record_prompt_usage(
+        &self,
+        request: MutationRequest<PromptUsageRecordRequest>,
+    ) -> BackendFuture<'_, PromptUsage> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .management()
+                .providers()
+                .management()
+                .record_prompt_usage(request.payload)
                 .map_err(Into::into)
         })
     }

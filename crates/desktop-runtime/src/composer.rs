@@ -30,10 +30,12 @@ pub async fn discover_composer_commands(
     let capabilities = manager.command_discovery_capabilities(&request)?;
     append_file_reference_commands(files, &request, &mut response)?;
     append_workspace_skill_commands(providers, &request, &mut response, capabilities.skills)?;
+    let quick_phrases = manager.discover_quick_phrases(&request)?;
     Ok(AgentCommandDiscovery {
         response,
         slash_commands: capabilities.slash_commands,
         skills: capabilities.skills,
+        quick_phrases,
     })
 }
 

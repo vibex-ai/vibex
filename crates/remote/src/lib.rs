@@ -3579,6 +3579,28 @@ async fn dispatch_provider_request(
             serde_json::to_value(vibex_core::RemoteProviderPromptValidateResponse { result: value })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteProviderRequest::PromptRecordUsage(request) => {
+            let auth = authorize_provider_action(
+                runtime,
+                request.auth,
+                RemoteActionClass::MutateProviderSettings,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = service.record_prompt_usage(request.request);
+            audit_provider_mutation(
+                runtime,
+                &auth,
+                "prompt".to_string(),
+                "Prompt quick-phrase usage recorded from a paired device",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let usage = result?;
+            serde_json::to_value(vibex_core::RemoteProviderPromptRecordUsageResponse { usage })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteProviderRequest::HookList(request) => {
             authorize_provider_action(
                 runtime,
@@ -11008,6 +11030,7 @@ mod tests {
                     },
                     slash_commands: true,
                     skills: false,
+                    quick_phrases: Vec::new(),
                 })
             }
         }

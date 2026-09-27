@@ -32,9 +32,9 @@ use vibex_core::{
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
     McpServerValidationResult, ModelProviderProfile, ModelProviderProfileCreateRequest,
     ModelProviderProfileUpdateRequest, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderCredentialSecretMutationRequest, ProviderHealthSummary,
-    ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderCredentialSecretMutationRequest,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
     ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -569,6 +569,15 @@ pub trait ManagementBackend: BackendBound {
         &self,
         request: PromptValidateRequest,
     ) -> BackendFuture<'_, PromptValidationResult>;
+
+    /// Records one composer insertion of a reusable Prompt.
+    ///
+    /// The composer orders its quick phrases by this counter, so a paired
+    /// client reports the insertion to the authority that owns the Prompt.
+    fn record_prompt_usage(
+        &self,
+        request: MutationRequest<PromptUsageRecordRequest>,
+    ) -> BackendFuture<'_, PromptUsage>;
 
     fn hooks(&self) -> BackendFuture<'_, Vec<Hook>>;
 

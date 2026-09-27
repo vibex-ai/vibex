@@ -42,9 +42,10 @@ use vibex_core::{
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
     McpServerValidationResult, OpenWorkspaceRequest, ProjectId, Prompt, PromptCreateRequest,
-    PromptDeleteRequest, PromptUpdateRequest, PromptValidateRequest, PromptValidationResult,
-    ProviderCapabilitySummary, ProviderHealthSummary, ProviderNativeExportApplyRequest,
-    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    PromptDeleteRequest, PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest,
+    PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
+    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
+    ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -1003,6 +1004,13 @@ impl ManagementBackend for DisconnectedBackend {
         &self,
         _request: PromptValidateRequest,
     ) -> BackendFuture<'_, PromptValidationResult> {
+        disconnected_future!()
+    }
+
+    fn record_prompt_usage(
+        &self,
+        _request: MutationRequest<PromptUsageRecordRequest>,
+    ) -> BackendFuture<'_, PromptUsage> {
         disconnected_future!()
     }
 

@@ -66,9 +66,10 @@ use crate::provider::{
     McpServerDiscoveryResponse, McpServerImportRequest, McpServerImportResult,
     McpServerSetAgentMatrixRequest, McpServerUpdateRequest, McpServerValidateRequest,
     McpServerValidationResult, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, ProviderCapabilitySummary,
-    ProviderFailoverRecommendation, ProviderFailoverRecommendationRequest, ProviderHealthSummary,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
+    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
+    PromptValidationResult, ProviderCapabilitySummary, ProviderFailoverRecommendation,
+    ProviderFailoverRecommendationRequest, ProviderHealthSummary, ProviderInjectionPreview,
+    ProviderInjectionPreviewRequest, ProviderNativeExportApplyRequest,
     ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
@@ -2272,6 +2273,7 @@ pub enum RemoteProviderOperationKind {
     PromptUpdate,
     PromptDelete,
     PromptValidate,
+    PromptRecordUsage,
     HookList,
     HookCreate,
     HookUpdate,
@@ -3075,6 +3077,20 @@ pub struct RemoteProviderPromptValidateResponse {
     pub result: PromptValidationResult,
 }
 
+/// Reports one composer quick-phrase insertion to the authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptRecordUsageRequest {
+    pub auth: RemoteAuthProof,
+    pub request: PromptUsageRecordRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderPromptRecordUsageResponse {
+    pub usage: PromptUsage,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteProviderHookListRequest {
@@ -3621,6 +3637,7 @@ pub enum RemoteProviderRequest {
     PromptUpdate(RemoteProviderPromptUpdateRequest),
     PromptDelete(RemoteProviderPromptDeleteRequest),
     PromptValidate(RemoteProviderPromptValidateRequest),
+    PromptRecordUsage(RemoteProviderPromptRecordUsageRequest),
     HookList(RemoteProviderHookListRequest),
     HookCreate(RemoteProviderHookCreateRequest),
     HookUpdate(RemoteProviderHookUpdateRequest),
@@ -3815,6 +3832,7 @@ impl RemoteProviderRequest {
             Self::PromptUpdate(_) => RemoteProviderOperationKind::PromptUpdate,
             Self::PromptDelete(_) => RemoteProviderOperationKind::PromptDelete,
             Self::PromptValidate(_) => RemoteProviderOperationKind::PromptValidate,
+            Self::PromptRecordUsage(_) => RemoteProviderOperationKind::PromptRecordUsage,
             Self::HookList(_) => RemoteProviderOperationKind::HookList,
             Self::HookCreate(_) => RemoteProviderOperationKind::HookCreate,
             Self::HookUpdate(_) => RemoteProviderOperationKind::HookUpdate,

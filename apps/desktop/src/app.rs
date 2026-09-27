@@ -87,7 +87,7 @@ use vibex_core::{
     AgentAuthCatalog, AgentAuthContext, AgentAuthContextAuthenticateRequest,
     AgentAuthContextStatus, AgentAuthContextVerifyRequest, AgentAuthMethodEffect,
     AgentAuthMethodKind, AgentAuthenticationOperationId, AgentCommandDiscoverRequest,
-    AgentCommandDiscoverResponse, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandEntry, AgentCommandExecuteRequest, AgentCommandExecutionBehavior,
     AgentCommandSourceKind, AgentCommandTrigger, AgentGoalControlRequest, AgentId,
     AgentListRequest, AgentMessagePhase, AgentSession, AgentSessionRuntimeSelectionState,
     AgentSessionSafety, AgentSessionState, AgentSnapshotEntry, AgentTimelineDisplaySettings,
@@ -101,17 +101,17 @@ use vibex_core::{
     GitWorktreeDiscardRequest, GitWorktreeOperationRecord, GitWorktreeOperationStatus, GoalAction,
     GoalPhase, MessageAttachment, MessageSubmissionState, MessageSubmissionStatus,
     OpenWorkspaceRequest, PermissionResolution, PermissionResponseKind, PlanStepStatus, ProjectId,
-    ProjectRecord, PromptId, ProviderProfileSummary, RcImportPayload, RenameAgentSessionRequest,
-    ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest, RuntimeAuthSource,
-    RuntimeAuthSourceAvailability, RuntimeAuthSourceKind, RuntimeAuthSourceSummary,
-    RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeature, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
-    SteerMessageOutcome, TerminalCreateRequest, TerminalId, TerminalSession, TerminalStatus,
-    TerminalSwitchShellRequest, TimelineItem, TimelineItemId, TimelineLiveEvent, TimelinePage,
-    TimelinePayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
-    UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
+    ProjectRecord, PromptId, PromptUsageRecordRequest, ProviderProfileSummary, RcImportPayload,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, RequestId, ResolvePermissionRequest,
+    RuntimeAuthSource, RuntimeAuthSourceAvailability, RuntimeAuthSourceKind,
+    RuntimeAuthSourceSummary, RuntimeClientId, RuntimeLeaseRole, RuntimeModelSelection,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeature,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    SteerAgentMessageRequest, SteerMessageOutcome, TerminalCreateRequest, TerminalId,
+    TerminalSession, TerminalStatus, TerminalSwitchShellRequest, TimelineItem, TimelineItemId,
+    TimelineLiveEvent, TimelinePage, TimelinePayload, TimelineRedactionState, TimelineSource,
+    UserMessageDelivery, UserMessagePayload, VibexSessionId, WorkspaceMode, WorkspaceRecord,
     agent_session_turn_requires_continuation, latest_timeline_turn_ended_normally,
     managed_worktree_name_slug, normalize_agent_session_title, unix_timestamp_ms,
 };
@@ -701,6 +701,9 @@ const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 72.0;
 const COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT: f32 = 32.0;
 const COMPOSER_SUGGESTION_MENU_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 8.0;
+/// Height of the quick-phrase footer that owns the manage action. The list
+/// gives up this much of the menu so the footer never squeezes the rows.
+const COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT: f32 = 30.0;
 const COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN: f32 = 12.0;
 const COMPOSER_SUGGESTION_MENU_TRIGGER_GAP: f32 = 6.0;
 const NEW_SESSION_RUNTIME_MENU_MAX_HEIGHT: f32 = 360.0;
@@ -796,6 +799,51 @@ enum ComposerSuggestionAction {
     Next,
     Apply,
     Dismiss,
+}
+
+/// Which of the two `/` lists the composer popup is showing.
+///
+/// Only a `/` trigger has a second list; `@` and `$` keep their single-panel
+/// behaviour, so this stays [`Self::Commands`] for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ComposerSuggestionTab {
+    #[default]
+    Commands,
+    Phrases,
+}
+
+impl ComposerSuggestionTab {
+    /// Stable element-id fragment for this tab's header button.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Phrases => "phrases",
+        }
+    }
+
+    /// The rows this tab shows, given both lists from one discovery result.
+    fn rows<'a>(
+        self,
+        commands: &'a [AgentCommandEntry],
+        phrases: &'a [AgentCommandEntry],
+    ) -> &'a [AgentCommandEntry] {
+        match self {
+            Self::Commands => commands,
+            Self::Phrases => phrases,
+        }
+    }
+
+    /// The tab one `Left` (`forward == false`) or `Right` press moves to.
+    ///
+    /// The two tabs clamp instead of wrapping, so a press that cannot change
+    /// the tab falls through to the caret's usual movement.
+    fn moved(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Commands, true) => Self::Phrases,
+            (Self::Phrases, false) => Self::Commands,
+            (tab, _) => tab,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3352,6 +3400,13 @@ pub struct SessionView {
     composer_attachment_serial: u64,
     composer_command_entry: Option<AgentCommandEntry>,
     suggestions: Vec<AgentCommandEntry>,
+    /// Reusable Prompts offered by the `/` popup's quick-phrase tab.
+    ///
+    /// Both lists arrive from one discovery request, so switching tabs stays
+    /// local and behaves the same against a paired authority as against the
+    /// native one.
+    phrase_suggestions: Vec<AgentCommandEntry>,
+    suggestion_tab: ComposerSuggestionTab,
     suggestion_selection: ComposerSuggestionSelection,
     suggestion_context: Option<ComposerSuggestionContext>,
     suggestion_loading: bool,
@@ -3446,6 +3501,8 @@ impl SessionView {
             composer_attachment_serial: 0,
             composer_command_entry: None,
             suggestions: Vec::new(),
+            phrase_suggestions: Vec::new(),
+            suggestion_tab: ComposerSuggestionTab::default(),
             suggestion_selection: ComposerSuggestionSelection::default(),
             suggestion_context: None,
             suggestion_loading: false,
@@ -19611,6 +19668,8 @@ impl VibexWorkbench {
 
     fn clear_suggestions(&mut self) {
         self.suggestions.clear();
+        self.phrase_suggestions.clear();
+        self.suggestion_tab = ComposerSuggestionTab::default();
         self.suggestion_selection.dismiss();
         self.suggestion_context = None;
         self.suggestion_loading = false;
@@ -19789,13 +19848,20 @@ impl VibexWorkbench {
         let request_session_id = self.view_session_id.clone();
         self.suggestion_context = Some(context.clone());
         if !preserve_rows {
+            // A new trigger kind starts on its first tab: `/` always opens on
+            // commands, and `@`/`$` have no second tab at all. A query change
+            // keeps the rows and the tab, so typing does not bounce the user
+            // back to commands.
             self.suggestions.clear();
+            self.phrase_suggestions.clear();
+            self.suggestion_tab = ComposerSuggestionTab::default();
             self.suggestion_selection.dismiss();
         }
         self.suggestion_loading = true;
 
         let Some(backend) = self.backend.clone() else {
             self.suggestions.clear();
+            self.phrase_suggestions.clear();
             self.suggestion_selection.dismiss();
             self.suggestion_loading = false;
             cx.notify();
@@ -19816,12 +19882,15 @@ impl VibexWorkbench {
                         return;
                     }
                     this.suggestion_loading = false;
-                    this.suggestions = match outcome {
-                        Ok(Ok(response)) => response.entries,
-                        _ => Vec::new(),
+                    let (entries, quick_phrases) = match outcome {
+                        Ok(Ok(discovery)) => (discovery.response.entries, discovery.quick_phrases),
+                        _ => (Vec::new(), Vec::new()),
                     };
-                    let suggestion_count = this.suggestions.len().min(10);
-                    this.suggestion_selection.replace_items(suggestion_count);
+                    this.suggestions = entries;
+                    this.phrase_suggestions = quick_phrases;
+                    // Keep the selected row where it was across a query update;
+                    // the active tab decides which list supplies the count.
+                    this.reseat_suggestion_selection(false);
                     cx.notify();
                 });
             },
@@ -19886,6 +19955,73 @@ impl VibexWorkbench {
         self.suggestion_context
             .as_ref()
             .is_some_and(|context| context.target == target)
+    }
+
+    /// Whether the open popup offers the command and quick-phrase tabs.
+    ///
+    /// Only `/` resolves two lists; `@` file references and `$` skills keep
+    /// their single-panel popup and their plain `Left`/`Right` caret movement.
+    fn composer_suggestion_tabs_available(&self, target: ComposerTarget) -> bool {
+        self.suggestion_context.as_ref().is_some_and(|context| {
+            context.target == target && context.request.trigger == Some(AgentCommandTrigger::Slash)
+        })
+    }
+
+    /// The tab the popup is showing. A trigger without tabs always reads as
+    /// [`ComposerSuggestionTab::Commands`], so a leftover phrase tab from an
+    /// earlier `/` cannot leak into an `@` or `$` popup.
+    fn active_suggestion_tab(&self) -> ComposerSuggestionTab {
+        if self
+            .suggestion_context
+            .as_ref()
+            .is_some_and(|context| context.request.trigger == Some(AgentCommandTrigger::Slash))
+        {
+            self.suggestion_tab
+        } else {
+            ComposerSuggestionTab::Commands
+        }
+    }
+
+    /// The rows the popup is showing right now.
+    fn visible_suggestions(&self) -> &[AgentCommandEntry] {
+        self.active_suggestion_tab()
+            .rows(&self.suggestions, &self.phrase_suggestions)
+    }
+
+    /// Points the popup's selection at the active tab's rows.
+    ///
+    /// Switching tabs counts as a fresh list, so the selection restarts at the
+    /// first row instead of keeping an index from the other tab.
+    fn reseat_suggestion_selection(&mut self, reset: bool) {
+        if reset {
+            self.suggestion_selection.dismiss();
+        }
+        let rows = self.visible_suggestions().len().min(10);
+        self.suggestion_selection.replace_items(rows);
+    }
+
+    /// `Left`/`Right` on an open `/` popup moves between its two tabs.
+    ///
+    /// Returns whether the key was consumed. At the edge in that direction the
+    /// key is *not* consumed: the caret keeps its usual movement inside the
+    /// `/query` being edited, which is also what keeps the popup open.
+    fn capture_composer_suggestion_tab(
+        &mut self,
+        target: ComposerTarget,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.composer_suggestion_tabs_available(target) {
+            return false;
+        }
+        let next = self.active_suggestion_tab().moved(forward);
+        if next == self.active_suggestion_tab() {
+            return false;
+        }
+        self.suggestion_tab = next;
+        self.reseat_suggestion_selection(true);
+        cx.notify();
+        true
     }
 
     /// Whether the composer is showing a message recalled from history rather
@@ -20062,7 +20198,7 @@ impl VibexWorkbench {
             }
             ComposerSuggestionAction::Apply => {
                 if let Some(index) = self.suggestion_selection.selected_index
-                    && let Some(entry) = self.suggestions.get(index).cloned()
+                    && let Some(entry) = self.visible_suggestions().get(index).cloned()
                 {
                     self.apply_suggestion(target, entry, window, cx);
                 }
@@ -20086,7 +20222,7 @@ impl VibexWorkbench {
             .suggestion_context
             .as_ref()
             .is_some_and(|context| context.target == target)
-            && index < self.suggestions.len().min(10)
+            && index < self.visible_suggestions().len().min(10)
             && self.suggestion_selection.selected_index != Some(index)
         {
             self.suggestion_selection.selected_index = Some(index);
@@ -20131,8 +20267,31 @@ impl VibexWorkbench {
                     is_executable_command_source(&entry).then_some(entry.clone())
             }
         }
+        self.record_quick_phrase_usage(&entry, cx);
         self.clear_suggestions();
         cx.notify();
+    }
+
+    /// Reports one quick-phrase insertion to the authority that owns the Prompt.
+    ///
+    /// The composer orders its quick phrases by use count, so the counter has to
+    /// reach the authoritative store — the native runtime here, or the paired
+    /// authority behind a remote client. The write is best effort: it must never
+    /// delay or fail the insertion the user already sees.
+    fn record_quick_phrase_usage(&mut self, entry: &AgentCommandEntry, cx: &mut Context<Self>) {
+        let Some(prompt_id) = quick_phrase_prompt_id(entry) else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        gpui_tokio::Tokio::spawn(cx, async move {
+            let _ = backend
+                .management()
+                .record_prompt_usage(MutationRequest::new(PromptUsageRecordRequest { prompt_id }))
+                .await;
+        })
+        .detach();
     }
 
     fn remove_inline_composer_attachment(
@@ -41777,6 +41936,14 @@ impl VibexWorkbench {
                                                     ))
                                                     .capture_action(cx.listener(
                                                         |this, _: &InputMoveLeft, window, cx| {
+                                                            if this.capture_composer_suggestion_tab(
+                                                                ComposerTarget::NewSession,
+                                                                false,
+                                                                cx,
+                                                            ) {
+                                                                cx.stop_propagation();
+                                                                return;
+                                                            }
                                                             this.capture_inline_attachment_edit(
                                                                 InlineAttachmentEdit::Left,
                                                                 true,
@@ -41787,6 +41954,14 @@ impl VibexWorkbench {
                                                     ))
                                                     .capture_action(cx.listener(
                                                         |this, _: &InputMoveRight, window, cx| {
+                                                            if this.capture_composer_suggestion_tab(
+                                                                ComposerTarget::NewSession,
+                                                                true,
+                                                                cx,
+                                                            ) {
+                                                                cx.stop_propagation();
+                                                                return;
+                                                            }
                                                             this.capture_inline_attachment_edit(
                                                                 InlineAttachmentEdit::Right,
                                                                 true,
@@ -50313,11 +50488,23 @@ impl VibexWorkbench {
             .max(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN);
         let menu_left = f32::from(surface_bounds.origin.x)
             .clamp(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN, max_left);
-        let visible_row_count = self.suggestions.len().min(10);
+        let tabs_available = context.request.trigger == Some(AgentCommandTrigger::Slash);
+        let active_tab = self.active_suggestion_tab();
+        let tab_footer_height = if tabs_available && active_tab == ComposerSuggestionTab::Phrases {
+            COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT
+        } else {
+            0.0
+        };
+        // Cloned once per render: the row builders below need an owned entry
+        // anyway, and this keeps the list borrow out of the element closures.
+        let visible_entries = self.visible_suggestions().to_vec();
+        let visible_row_count = visible_entries.len().min(10);
         let menu_placement =
             composer_suggestion_menu_placement(surface_bounds, viewport_height, visible_row_count);
-        let list_max_height =
-            (menu_placement.max_height - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT).max(1.0);
+        let list_max_height = (menu_placement.max_height
+            - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+            - tab_footer_height)
+            .max(1.0);
         let (menu_title, menu_icon, trigger_symbol) = match context.request.trigger {
             Some(AgentCommandTrigger::Slash) => (
                 locale::text("Commands", "命令", "命令"),
@@ -50341,8 +50528,7 @@ impl VibexWorkbench {
             ),
         };
 
-        let rows = self
-            .suggestions
+        let rows = visible_entries
             .iter()
             .take(10)
             .cloned()
@@ -50436,31 +50622,70 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
 
-        let menu_header = h_flex()
-            .w_full()
-            .h(px(COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT))
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(cx.theme().border.opacity(0.72))
-            .px_3()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(menu_icon).small())
-                    .child(div().truncate().font_medium().child(menu_title)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .child(trigger_symbol),
-            );
+        let menu_header = if tabs_available {
+            h_flex()
+                .w_full()
+                .h(px(COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT))
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(cx.theme().border.opacity(0.72))
+                .px_3()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .h_full()
+                        .items_center()
+                        .gap_3()
+                        .child(self.composer_suggestion_tab_button(
+                            target,
+                            ComposerSuggestionTab::Commands,
+                            active_tab == ComposerSuggestionTab::Commands,
+                            cx,
+                        ))
+                        .child(self.composer_suggestion_tab_button(
+                            target,
+                            ComposerSuggestionTab::Phrases,
+                            active_tab == ComposerSuggestionTab::Phrases,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(trigger_symbol),
+                )
+        } else {
+            h_flex()
+                .w_full()
+                .h(px(COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT))
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(cx.theme().border.opacity(0.72))
+                .px_3()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(menu_icon).small())
+                        .child(div().truncate().font_medium().child(menu_title)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(trigger_symbol),
+                )
+        };
 
         // ScrollableElement adds a normal-flow wrapper, so it must stay inside
         // the absolutely positioned shell or it will shrink the workbench.
@@ -50470,7 +50695,20 @@ impl VibexWorkbench {
             .max_h(px(list_max_height))
             .p(px(4.0))
             .when(!rows.is_empty(), |this| this.children(rows))
-            .when(self.suggestions.is_empty(), |this| {
+            .when(visible_entries.is_empty(), |this| {
+                let message = if self.suggestion_loading {
+                    locale::text("Loading...", "加载中...", "載入中...")
+                } else if active_tab == ComposerSuggestionTab::Phrases
+                    && context
+                        .request
+                        .query
+                        .as_deref()
+                        .is_none_or(|query| query.trim().is_empty())
+                {
+                    locale::text("No quick phrases yet", "还没有快捷短语", "還沒有快捷短語")
+                } else {
+                    locale::text("No matches", "没有匹配项", "沒有符合項目")
+                };
                 this.child(
                     div()
                         .h(px(COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
@@ -50481,15 +50719,59 @@ impl VibexWorkbench {
                         .px_3()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if self.suggestion_loading {
-                            locale::text("Loading...", "加载中...", "載入中...")
-                        } else {
-                            locale::text("No matches", "没有匹配项", "沒有符合項目")
-                        }),
+                        .child(message),
                 )
             })
             .overflow_y_scrollbar()
             .scroll_gutter();
+
+        // A quick phrase is an editable object, so its tab carries the one
+        // action that changes the list itself. The command tabs have no such
+        // object: their entries are configured by the Agents that provide them.
+        let quick_phrase_footer = (tabs_available && active_tab == ComposerSuggestionTab::Phrases)
+            .then(|| {
+                h_flex()
+                    .w_full()
+                    .h(px(COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT))
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.72))
+                    .px_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "Reusable prompts, ordered by use",
+                                "来自可复用提示词，按使用频率排序",
+                                "來自可重用提示詞，依使用頻率排序",
+                            )),
+                    )
+                    .child(
+                        Button::new(format!("composer-quick-phrase-manage:{}", target.id()))
+                            .ghost()
+                            .small()
+                            .label(locale::text(
+                                "Manage quick phrases",
+                                "管理快捷短语",
+                                "管理快捷短語",
+                            ))
+                            .tooltip(locale::text(
+                                "Open Prompts in Config Center",
+                                "在配置中心打开提示词",
+                                "在配置中心開啟提示詞",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.open_quick_phrase_management(cx)),
+                            ),
+                    )
+                    .into_any_element()
+            });
 
         // Quick opacity pop on mount; stays mounted while typing so the fade
         // does not replay per keystroke.
@@ -50512,9 +50794,90 @@ impl VibexWorkbench {
                 .shadow_xl()
                 .child(menu_header)
                 .child(scroll_content)
+                .when_some(quick_phrase_footer, |this, footer| this.child(footer))
                 .bottom(px(menu_placement.window_edge_offset)),
         )
         .into_any_element()
+    }
+
+    /// One tab of the `/` popup header.
+    ///
+    /// The active tab keeps a persistent selected treatment — a foreground
+    /// label over an accent underline — because the popup's selected row
+    /// already spends the accent fill that a segmented control would use.
+    fn composer_suggestion_tab_button(
+        &mut self,
+        target: ComposerTarget,
+        tab: ComposerSuggestionTab,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = match tab {
+            ComposerSuggestionTab::Commands => locale::text("Commands", "命令", "命令"),
+            ComposerSuggestionTab::Phrases => locale::text("Quick phrases", "快捷短语", "快捷短語"),
+        };
+        h_flex()
+            .id(format!(
+                "composer-suggestion-tab:{}:{}",
+                target.id(),
+                tab.id()
+            ))
+            .role(Role::Button)
+            .aria_label(label)
+            .aria_selected(active)
+            .h_full()
+            .items_center()
+            .border_b_2()
+            .border_color(if active {
+                cx.theme().accent
+            } else {
+                cx.theme().border.opacity(0.0)
+            })
+            .text_sm()
+            .when(active, |this| {
+                this.font_medium().text_color(cx.theme().popover_foreground)
+            })
+            .when(!active, |this| {
+                this.text_color(cx.theme().muted_foreground)
+                    .hover(|this| this.text_color(cx.theme().popover_foreground))
+            })
+            .child(label)
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_composer_suggestion_tab(target, tab, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// Switches the popup to `tab` from a click on its header.
+    fn select_composer_suggestion_tab(
+        &mut self,
+        target: ComposerTarget,
+        tab: ComposerSuggestionTab,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.composer_suggestion_tabs_available(target) || self.active_suggestion_tab() == tab {
+            return;
+        }
+        self.suggestion_tab = tab;
+        self.reseat_suggestion_selection(true);
+        cx.notify();
+    }
+
+    /// Opens the Config Center on the Prompt card that owns quick phrases.
+    fn open_quick_phrase_management(&mut self, cx: &mut Context<Self>) {
+        self.clear_suggestions();
+        self.open_management(cx);
+        self.management_view.update(cx, |management, cx| {
+            management.select_section(
+                vibex_desktop_model::ManagementSection::PromptsHooks,
+                false,
+                cx,
+            );
+        });
     }
 
     fn render_composer_collaboration(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -52211,6 +52574,14 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveLeft, window, cx| {
+                                                    if this.capture_composer_suggestion_tab(
+                                                        ComposerTarget::Session,
+                                                        false,
+                                                        cx,
+                                                    ) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     this.capture_inline_attachment_edit(
                                                         InlineAttachmentEdit::Left,
                                                         false,
@@ -52221,6 +52592,14 @@ impl VibexWorkbench {
                                             ))
                                             .capture_action(cx.listener(
                                                 |this, _: &InputMoveRight, window, cx| {
+                                                    if this.capture_composer_suggestion_tab(
+                                                        ComposerTarget::Session,
+                                                        true,
+                                                        cx,
+                                                    ) {
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     this.capture_inline_attachment_edit(
                                                         InlineAttachmentEdit::Right,
                                                         false,
@@ -56845,11 +57224,16 @@ fn is_new_session_agent_available(agent: &AgentSnapshotEntry) -> bool {
 /// The Agent catalogue, the workspace file tree and the workspace Skills all
 /// live with whichever runtime owns the workspace, so the composite is one
 /// backend read instead of three local ones.
+/// Resolves one composer trigger into the popup's two lists.
+///
+/// The command entries and the quick phrases come back together, so the popup
+/// can switch tabs without asking the authority again — which matters most when
+/// this client is remote and every request is a network round trip.
 async fn discover_desktop_composer_commands(
     backend: BackendFacade,
     request: AgentCommandDiscoverRequest,
-) -> vibex_core::VibexResult<AgentCommandDiscoverResponse> {
-    let discovery = backend
+) -> vibex_core::VibexResult<vibex_core::AgentCommandDiscovery> {
+    backend
         .agent()
         .discover_agent_commands(request)
         .await
@@ -56859,8 +57243,7 @@ async fn discover_desktop_composer_commands(
                 error.code,
                 error.message,
             )
-        })?;
-    Ok(discovery.response)
+        })
 }
 
 fn floor_char_boundary(text: &str, offset: usize) -> usize {
@@ -56902,11 +57285,29 @@ fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)
     Some((command_name.to_string(), arguments))
 }
 
+/// Whether applying this entry makes the draft an executable slash command.
+///
+/// Both a `/name` Prompt and a quick phrase carry the `Prompt` source kind, so
+/// the source alone cannot tell them apart: a quick phrase is inserted into the
+/// draft, while an executable command declares what to run. Without the
+/// behavior check, pasting a quick phrase would arm the composer to send the
+/// phrase's own text as `/command` on the next Enter.
 fn is_executable_command_source(entry: &AgentCommandEntry) -> bool {
     matches!(
         entry.source_kind,
         AgentCommandSourceKind::Provider | AgentCommandSourceKind::Prompt
-    )
+    ) && entry.execution_behavior != AgentCommandExecutionBehavior::None
+}
+
+/// The reusable Prompt behind a quick-phrase entry, if the entry is one.
+///
+/// A quick phrase is a `Prompt` entry whose selection only inserts text; the
+/// Prompt id is what its usage counter is keyed by.
+fn quick_phrase_prompt_id(entry: &AgentCommandEntry) -> Option<PromptId> {
+    (entry.source_kind == AgentCommandSourceKind::Prompt
+        && entry.execution_behavior == AgentCommandExecutionBehavior::None)
+        .then(|| entry.prompt_id.clone())
+        .flatten()
 }
 
 fn command_entry_matches_draft(text: &str, entry: Option<&AgentCommandEntry>) -> bool {
@@ -62559,6 +62960,8 @@ impl FoundationSettings {
             .unwrap_or(false)
     }
 
+    /// Pushes the workbench's current settings into the controls of each page.
+    #[allow(clippy::too_many_arguments)]
     fn sync_controls(
         &mut self,
         appearance: &vibex_desktop_model::AppearanceUiState,
@@ -65128,7 +65531,8 @@ impl FoundationSettings {
                          the choices here apply to the next local runtime instead.",
                         "此客户端连接的是远程 runtime。面板画面与这些显示设置所依赖的通道尚未实现，因此这里的选项会在下次使用本机 runtime 时生效。",
                         "此客戶端連接的是遠端 runtime。面板畫面與這些顯示設定所依賴的通道尚未實作，因此這裡的選項會在下次使用本機 runtime 時生效。",
-                    )),
+                    ))
+                    .into_any_element(),
             );
         }
         settings_page(
@@ -71227,6 +71631,99 @@ mod tests {
         assert!(parse_slash_command_invocation("review").is_none());
         assert!(parse_slash_command_invocation("/").is_none());
         assert!(parse_slash_command_invocation("/review/now").is_none());
+    }
+
+    #[test]
+    fn composer_suggestion_tabs_clamp_and_pick_their_own_rows() {
+        // `/` opens on commands and Right reaches phrases; neither end wraps,
+        // so the popup keeps owning the arrow key instead of moving the caret.
+        assert_eq!(
+            ComposerSuggestionTab::default(),
+            ComposerSuggestionTab::Commands
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Commands.moved(false),
+            ComposerSuggestionTab::Commands
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Commands.moved(true),
+            ComposerSuggestionTab::Phrases
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Phrases.moved(true),
+            ComposerSuggestionTab::Phrases
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Phrases.moved(false),
+            ComposerSuggestionTab::Commands
+        );
+
+        let mut command = command_entry(
+            AgentCommandSourceKind::Provider,
+            AgentCommandTrigger::Slash,
+            Some("review"),
+        );
+        command.id = "command:slash".into();
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            None,
+        );
+        phrase.id = "phrase:one".into();
+        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
+        phrase.prompt_id = Some(PromptId::parse("prompt_quick_phrase_test").unwrap());
+        let commands = vec![command.clone()];
+        let phrases = vec![phrase.clone()];
+        assert_eq!(
+            ComposerSuggestionTab::Commands
+                .rows(&commands, &phrases)
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["command:slash"]
+        );
+        assert_eq!(
+            ComposerSuggestionTab::Phrases
+                .rows(&commands, &phrases)
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phrase:one"]
+        );
+    }
+
+    #[test]
+    fn quick_phrases_insert_without_arming_a_slash_command() {
+        // A `/name` Prompt runs; a quick phrase is the same source kind but only
+        // inserts text, so it must not arm the composer's command invocation.
+        let slash_prompt = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            Some("review"),
+        );
+        assert!(is_executable_command_source(&slash_prompt));
+
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            None,
+        );
+        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
+        let prompt_id = PromptId::parse("prompt_quick_phrase_test").unwrap();
+        phrase.prompt_id = Some(prompt_id.clone());
+        assert!(!is_executable_command_source(&phrase));
+        assert_eq!(quick_phrase_prompt_id(&phrase), Some(prompt_id));
+        assert_eq!(quick_phrase_prompt_id(&slash_prompt), None);
+
+        // Skills and file references share the empty behavior but are not
+        // phrases either.
+        let mut skill = command_entry(
+            AgentCommandSourceKind::Skill,
+            AgentCommandTrigger::Dollar,
+            None,
+        );
+        skill.execution_behavior = AgentCommandExecutionBehavior::None;
+        assert_eq!(quick_phrase_prompt_id(&skill), None);
     }
 
     #[test]

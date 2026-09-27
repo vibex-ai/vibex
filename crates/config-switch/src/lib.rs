@@ -38,26 +38,26 @@ use vibex_core::{
     McpServerSetAgentMatrixRequest, McpServerSetProviderMatrixRequest, McpServerTransportKind,
     McpServerUpdateRequest, McpServerValidateRequest, McpServerValidationResult,
     McpServerValidationStatus, Prompt, PromptCreateRequest, PromptDeleteRequest,
-    PromptUpdateRequest, PromptValidateRequest, PromptValidationResult, PromptValidationStatus,
-    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilityProbeResult,
-    ProviderCapabilityProbeStatus, ProviderCapabilitySummary, ProviderConfiguredModel,
-    ProviderDefaultScopeKind, ProviderFailoverRecommendation, ProviderFailoverRecommendationReason,
-    ProviderFailoverRecommendationRequest, ProviderFailoverRecommendationStatus,
-    ProviderHealthProbeKind, ProviderHealthProbeResult, ProviderHealthStatus,
-    ProviderHealthSummary, ProviderInjectionField, ProviderInjectionOverlayFile,
-    ProviderInjectionPreview, ProviderInjectionPreviewRequest, ProviderInjectionStrategy,
-    ProviderKind, ProviderOptions, ProviderProfile, ProviderProfileCreateRequest,
-    ProviderProfileDefaultScope, ProviderProfileDefaultSelection, ProviderProfileDeleteRequest,
-    ProviderProfileDuplicateRequest, ProviderProfileId, ProviderProfileSetDefaultRequest,
-    ProviderProfileStatus, ProviderProfileUpdateRequest, ProviderRunCapabilityProbesRequest,
-    ProviderRunCapabilityProbesResult, ProviderRunHealthProbesRequest,
-    ProviderRunHealthProbesResult, ProviderSecretBackend, ProviderSecretKind,
-    ProviderSecretReference, ProviderSecretReferenceCreateRequest, ProviderSecretSetupState,
-    ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord, ProviderUsageSummary,
-    RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill, SkillAgentMatrix,
-    SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest, SkillDiscoverRequest,
-    SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest, SkillImportRequest,
-    SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
+    PromptUpdateRequest, PromptUsage, PromptUsageRecordRequest, PromptValidateRequest,
+    PromptValidationResult, PromptValidationStatus, ProviderBindingMetadata, ProviderCapabilities,
+    ProviderCapabilityProbeResult, ProviderCapabilityProbeStatus, ProviderCapabilitySummary,
+    ProviderConfiguredModel, ProviderDefaultScopeKind, ProviderFailoverRecommendation,
+    ProviderFailoverRecommendationReason, ProviderFailoverRecommendationRequest,
+    ProviderFailoverRecommendationStatus, ProviderHealthProbeKind, ProviderHealthProbeResult,
+    ProviderHealthStatus, ProviderHealthSummary, ProviderInjectionField,
+    ProviderInjectionOverlayFile, ProviderInjectionPreview, ProviderInjectionPreviewRequest,
+    ProviderInjectionStrategy, ProviderKind, ProviderOptions, ProviderProfile,
+    ProviderProfileCreateRequest, ProviderProfileDefaultScope, ProviderProfileDefaultSelection,
+    ProviderProfileDeleteRequest, ProviderProfileDuplicateRequest, ProviderProfileId,
+    ProviderProfileSetDefaultRequest, ProviderProfileStatus, ProviderProfileUpdateRequest,
+    ProviderRunCapabilityProbesRequest, ProviderRunCapabilityProbesResult,
+    ProviderRunHealthProbesRequest, ProviderRunHealthProbesResult, ProviderSecretBackend,
+    ProviderSecretKind, ProviderSecretReference, ProviderSecretReferenceCreateRequest,
+    ProviderSecretSetupState, ProviderUsageBalance, ProviderUsageListRequest, ProviderUsageRecord,
+    ProviderUsageSummary, RequestId, ResourceAgentMatrixSourceKind, ResourceDiscoveryStatus, Skill,
+    SkillAgentMatrix, SkillAgentMatrixListRequest, SkillCreateRequest, SkillDeleteRequest,
+    SkillDiscoverRequest, SkillDiscovery, SkillDiscoveryResponse, SkillForAgentListRequest,
+    SkillImportRequest, SkillImportResult, SkillProviderMatrix, SkillSetAgentMatrixRequest,
     SkillSetProviderMatrixRequest, SkillSourceKind, SkillUpdateRequest, SkillValidateRequest,
     SkillValidationResult, SkillValidationStatus, VibexError, VibexResult,
     acp_agent_catalog_entries, builtin_agent_definitions, custom_agent_definition,
@@ -69,10 +69,11 @@ use vibex_db::{
     AgentManagedInstallationRepository, AgentModelProviderDisplayOrderRepository,
     AgentModelProviderFailoverRepository, AgentRuntimeOptionSnapshotRepository,
     CustomAgentDefinitionRepository, HookRepository, McpServerRepository, PromptRepository,
-    ProviderCapabilityRepository, ProviderDefaultProfileRepository, ProviderHealthRepository,
-    ProviderInjectionPreviewRepository, ProviderModelRuntimeOptionSnapshotRepository,
-    ProviderProfileRepository, ProviderSecretReferenceRepository, ProviderUsageRepository,
-    SkillRepository, apply_migrations, open_database,
+    PromptUsageRepository, ProviderCapabilityRepository, ProviderDefaultProfileRepository,
+    ProviderHealthRepository, ProviderInjectionPreviewRepository,
+    ProviderModelRuntimeOptionSnapshotRepository, ProviderProfileRepository,
+    ProviderSecretReferenceRepository, ProviderUsageRepository, SkillRepository, apply_migrations,
+    open_database,
 };
 
 mod market;
@@ -2494,6 +2495,24 @@ impl ProviderConfigService {
             );
         }
         PromptRepository::soft_delete(&conn, &request.prompt_id)
+    }
+
+    /// Records that the user inserted one Prompt into a composer.
+    ///
+    /// The composer orders quick phrases by this counter, so it is written on
+    /// the authority instead of in the client that renders the popup.
+    pub fn record_prompt_usage(
+        &self,
+        request: PromptUsageRecordRequest,
+    ) -> VibexResult<PromptUsage> {
+        let conn = self.open_connection()?;
+        if PromptRepository::get(&conn, &request.prompt_id)?.is_none() {
+            return Err(
+                VibexError::validation("prompt_not_found", "Prompt was not found")
+                    .with_diagnostic("promptId", request.prompt_id.as_str()),
+            );
+        }
+        PromptUsageRepository::record_use(&conn, &request.prompt_id)
     }
 
     pub fn validate_prompt(

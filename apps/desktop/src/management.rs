@@ -963,6 +963,11 @@ pub struct ManagementCenter {
     automation_description: Entity<InputState>,
     prompt_name: Entity<InputState>,
     prompt_body: Entity<InputState>,
+    /// The Prompt the form is editing, or `None` while it is creating one.
+    ///
+    /// Quick phrases and reusable Prompts are the same record, so one form both
+    /// creates and edits them instead of offering a second, thinner editor.
+    prompt_editing_id: Option<vibex_core::PromptId>,
     hook_name: Entity<InputState>,
     hook_command: Entity<InputState>,
     backup_path: Entity<InputState>,
@@ -1722,6 +1727,7 @@ impl ManagementCenter {
             automation_description,
             prompt_name,
             prompt_body,
+            prompt_editing_id: None,
             hook_name,
             hook_command,
             backup_path,
@@ -8703,7 +8709,13 @@ impl ManagementCenter {
         );
     }
 
-    fn create_prompt(&mut self, cx: &mut Context<Self>) {
+    /// Creates the Prompt in the form, or saves the one it is editing.
+    ///
+    /// One form serves both because a quick phrase and a reusable Prompt are
+    /// the same record: the composer inserts it, and this card names and edits
+    /// it. Editing therefore replaces the create button's contract rather than
+    /// opening a second editor.
+    fn save_prompt(&mut self, cx: &mut Context<Self>) {
         let active_locale = locale::current_locale();
         let display_name = self.prompt_name.read(cx).value().trim().to_string();
         let display_name = if display_name.is_empty() {
@@ -8732,30 +8744,138 @@ impl ManagementCenter {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        match self.prompt_editing_id.clone() {
+            Some(prompt_id) => self.begin_simple_task(
+                ManagementMutation::PromptAction(format!("update:{}", prompt_id.as_str())),
+                cx,
+                async move {
+                    backend
+                        .management()
+                        .update_prompt(MutationRequest::new(vibex_core::PromptUpdateRequest {
+                            prompt_id,
+                            display_name: Some(display_name),
+                            kind: None,
+                            status: None,
+                            scope_kind: None,
+                            project_id: None,
+                            workspace_id: None,
+                            body: Some(body),
+                            description: None,
+                            tags: None,
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)
+                        .map(|prompt| match active_locale {
+                            ResolvedLocale::En => format!("Saved Prompt {}", prompt.display_name),
+                            ResolvedLocale::ZhCn => format!("已保存提示词 {}", prompt.display_name),
+                            ResolvedLocale::ZhTw => format!("已儲存提示詞 {}", prompt.display_name),
+                        })
+                },
+            ),
+            None => self.begin_simple_task(
+                ManagementMutation::PromptAction("create".into()),
+                cx,
+                async move {
+                    backend
+                        .management()
+                        .create_prompt(MutationRequest::new(vibex_core::PromptCreateRequest {
+                            display_name,
+                            kind: vibex_core::PromptKind::ReusablePrompt,
+                            status: vibex_core::PromptStatus::Enabled,
+                            scope_kind: vibex_core::PromptScopeKind::User,
+                            project_id: None,
+                            workspace_id: None,
+                            body,
+                            description: None,
+                            tags: Vec::new(),
+                        }))
+                        .await
+                        .map_err(crate::app::remote_error_into_vibex)
+                        .map(|prompt| match active_locale {
+                            ResolvedLocale::En => format!("Created Prompt {}", prompt.display_name),
+                            ResolvedLocale::ZhCn => format!("已创建提示词 {}", prompt.display_name),
+                            ResolvedLocale::ZhTw => format!("已建立提示詞 {}", prompt.display_name),
+                        })
+                },
+            ),
+        }
+    }
+
+    /// Loads one Prompt into the form so the user can edit it in place.
+    fn begin_prompt_edit(
+        &mut self,
+        prompt: &vibex_core::Prompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prompt_editing_id = Some(prompt.id.clone());
+        let display_name = prompt.display_name.clone();
+        let body = prompt.body.clone();
+        self.prompt_name
+            .update(cx, |state, cx| state.set_value(display_name, window, cx));
+        self.prompt_body
+            .update(cx, |state, cx| state.set_value(body, window, cx));
+        cx.notify();
+    }
+
+    /// Leaves edit mode and clears the form so the next Prompt starts blank.
+    fn cancel_prompt_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_editing_id = None;
+        self.prompt_name
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.prompt_body
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Enables or disables one Prompt, which is what admits it to the
+    /// composer's quick-phrase tab.
+    fn set_prompt_status(
+        &mut self,
+        prompt: &vibex_core::Prompt,
+        status: vibex_core::PromptStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt_id = prompt.id.clone();
+        let display_name = prompt.display_name.clone();
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let active_locale = locale::current_locale();
         self.begin_simple_task(
-            ManagementMutation::PromptAction("create".into()),
+            ManagementMutation::PromptAction(format!("status:{}", prompt_id.as_str())),
             cx,
             async move {
                 backend
                     .management()
-                    .create_prompt(MutationRequest::new(vibex_core::PromptCreateRequest {
-                        display_name,
-                        kind: vibex_core::PromptKind::ReusablePrompt,
-                        status: vibex_core::PromptStatus::Enabled,
-                        scope_kind: vibex_core::PromptScopeKind::User,
+                    .update_prompt(MutationRequest::new(vibex_core::PromptUpdateRequest {
+                        prompt_id,
+                        display_name: None,
+                        kind: None,
+                        status: Some(status),
+                        scope_kind: None,
                         project_id: None,
                         workspace_id: None,
-                        body,
+                        body: None,
                         description: None,
-                        tags: Vec::new(),
+                        tags: None,
                     }))
                     .await
-                    .map_err(crate::app::remote_error_into_vibex)
-                    .map(|prompt| match active_locale {
-                        ResolvedLocale::En => format!("Created Prompt {}", prompt.display_name),
-                        ResolvedLocale::ZhCn => format!("已创建提示词 {}", prompt.display_name),
-                        ResolvedLocale::ZhTw => format!("已建立提示詞 {}", prompt.display_name),
-                    })
+                    .map_err(crate::app::remote_error_into_vibex)?;
+                Ok(match (active_locale, status) {
+                    (ResolvedLocale::En, vibex_core::PromptStatus::Enabled) => {
+                        format!("Enabled {display_name}")
+                    }
+                    (ResolvedLocale::En, _) => format!("Disabled {display_name}"),
+                    (ResolvedLocale::ZhCn, vibex_core::PromptStatus::Enabled) => {
+                        format!("已启用 {display_name}")
+                    }
+                    (ResolvedLocale::ZhCn, _) => format!("已停用 {display_name}"),
+                    (ResolvedLocale::ZhTw, vibex_core::PromptStatus::Enabled) => {
+                        format!("已啟用 {display_name}")
+                    }
+                    (ResolvedLocale::ZhTw, _) => format!("已停用 {display_name}"),
+                })
             },
         );
     }
@@ -15965,6 +16085,18 @@ impl ManagementCenter {
                 Some(ManagementMutation::PromptAction(action))
                     if action == &format!("delete:{id}")
             );
+            let editing_prompt = prompt.clone();
+            let status_prompt = prompt.clone();
+            let status_toggle = if prompt.status == vibex_core::PromptStatus::Enabled {
+                vibex_core::PromptStatus::Disabled
+            } else {
+                vibex_core::PromptStatus::Enabled
+            };
+            let toggling = matches!(
+                &self.mutation,
+                Some(ManagementMutation::PromptAction(action))
+                    if action == &format!("status:{id}")
+            );
             prompt_rows = prompt_rows.child(
                 v_flex()
                     .w_full()
@@ -16007,25 +16139,58 @@ impl ManagementCenter {
                             )),
                     )
                     .child(
-                        h_flex().child(
-                            Button::new(SharedString::from(format!("prompt-delete-{delete_id}")))
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new(SharedString::from(format!("prompt-edit-{id}")))
+                                    .small()
+                                    .ghost()
+                                    .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                    .label(management_locale_text("Edit", "编辑", "編輯"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_prompt_edit(&editing_prompt, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("prompt-status-{id}")))
+                                    .small()
+                                    .ghost()
+                                    .label(match status_toggle {
+                                        vibex_core::PromptStatus::Enabled => {
+                                            management_locale_text("Enable", "启用", "啟用")
+                                        }
+                                        _ => management_locale_text("Disable", "停用", "停用"),
+                                    })
+                                    .loading(toggling)
+                                    .disabled(pending)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_prompt_status(&status_prompt, status_toggle, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "prompt-delete-{delete_id}"
+                                )))
                                 .small()
                                 .danger()
                                 .icon(Icon::default().path("icons/vibex/trash-2.svg"))
                                 .label(management_locale_text("Delete", "删除", "刪除"))
                                 .loading(deleting)
                                 .disabled(pending)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_managed_delete(
-                                        ManagedDeleteTarget::Prompt {
-                                            id: delete_id.clone(),
-                                            label: delete_label.clone(),
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        ),
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.confirm_managed_delete(
+                                            ManagedDeleteTarget::Prompt {
+                                                id: delete_id.clone(),
+                                                label: delete_label.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            ),
                     ),
             );
         }
@@ -16104,11 +16269,15 @@ impl ManagementCenter {
             );
         }
         let prompt_card = management_card(
-            management_locale_text("Prompts", "提示词", "提示詞"),
             management_locale_text(
-                "Reusable prompts shared with supported Agent runtimes.",
-                "管理可供支持的 Agent 运行时复用的提示词。",
-                "管理可供支援的 Agent 執行階段重用的提示詞。",
+                "Prompts & quick phrases",
+                "提示词与快捷短语",
+                "提示詞與快捷短語",
+            ),
+            management_locale_text(
+                "Reusable prompts that the composer's / menu inserts as quick phrases.",
+                "可复用提示词，输入框的 / 菜单会把它们作为快捷短语插入。",
+                "可重用提示詞，輸入框的 / 選單會將它們作為快捷短語插入。",
             ),
             v_flex()
                 .w_full()
@@ -16126,20 +16295,44 @@ impl ManagementCenter {
                     cx,
                 ))
                 .child(
-                    Button::new("prompt-create")
-                        .small()
-                        .primary()
-                        .label(management_locale_text(
-                            "Create Prompt",
-                            "创建提示词",
-                            "建立提示詞",
-                        ))
-                        .loading(matches!(
-                            self.mutation,
-                            Some(ManagementMutation::PromptAction(ref action)) if action == "create"
-                        ))
-                        .disabled(pending)
-                        .on_click(cx.listener(|this, _, _, cx| this.create_prompt(cx))),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("prompt-save")
+                                .small()
+                                .primary()
+                                .label(match self.prompt_editing_id {
+                                    Some(_) => management_locale_text(
+                                        "Save Prompt",
+                                        "保存提示词",
+                                        "儲存提示詞",
+                                    ),
+                                    None => management_locale_text(
+                                        "Create Prompt",
+                                        "创建提示词",
+                                        "建立提示詞",
+                                    ),
+                                })
+                                .loading(matches!(
+                                    self.mutation,
+                                    Some(ManagementMutation::PromptAction(ref action))
+                                        if action == "create" || action.starts_with("update:")
+                                ))
+                                .disabled(pending)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_prompt(cx))),
+                        )
+                        .when(self.prompt_editing_id.is_some(), |this| {
+                            this.child(
+                                Button::new("prompt-cancel-edit")
+                                    .small()
+                                    .ghost()
+                                    .label(management_locale_text("Cancel", "取消", "取消"))
+                                    .disabled(pending)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_prompt_edit(window, cx)
+                                    })),
+                            )
+                        }),
                 )
                 .child(if prompts.is_empty() {
                     compact_empty_state(

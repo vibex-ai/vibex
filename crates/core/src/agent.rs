@@ -688,6 +688,13 @@ pub struct AgentCommandDiscovery {
     pub response: AgentCommandDiscoverResponse,
     pub slash_commands: bool,
     pub skills: bool,
+    /// Reusable Prompts offered as `/` quick phrases, most used first.
+    ///
+    /// They travel beside `response.entries` because the composer shows the two
+    /// lists in separate tabs of one popup: fetching them together keeps tab
+    /// switching local instead of a round trip through the authority.
+    #[serde(default)]
+    pub quick_phrases: Vec<AgentCommandEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

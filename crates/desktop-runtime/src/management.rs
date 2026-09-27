@@ -719,6 +719,13 @@ impl ProviderManagementFacade {
         self.service.validate_prompt(request)
     }
 
+    pub fn record_prompt_usage(
+        &self,
+        request: vibex_core::PromptUsageRecordRequest,
+    ) -> VibexResult<vibex_core::PromptUsage> {
+        self.service.record_prompt_usage(request)
+    }
+
     pub fn list_hooks(&self) -> VibexResult<Vec<vibex_core::Hook>> {
         self.service.list_hooks()
     }

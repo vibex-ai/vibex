@@ -2188,6 +2188,7 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
+                "60:prompt_usage",
             ]
         );
         assert_eq!(

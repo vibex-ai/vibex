@@ -1972,6 +1972,13 @@ mod tests {
             error_future()
         }
 
+        fn record_prompt_usage(
+            &self,
+            _request: MutationRequest<vibex_core::PromptUsageRecordRequest>,
+        ) -> BackendFuture<'_, vibex_core::PromptUsage> {
+            error_future()
+        }
+
         fn hooks(&self) -> BackendFuture<'_, Vec<vibex_core::Hook>> {
             error_future()
         }

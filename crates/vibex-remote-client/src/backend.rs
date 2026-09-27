@@ -5025,6 +5025,33 @@ impl ManagementBackend for WebRemoteBackend {
         })
     }
 
+    fn record_prompt_usage(
+        &self,
+        request: MutationRequest<vibex_core::PromptUsageRecordRequest>,
+    ) -> BackendFuture<'_, vibex_core::PromptUsage> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteProviderRequest::PromptRecordUsage(
+                vibex_core::RemoteProviderPromptRecordUsageRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::ProviderSettings,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<vibex_core::RemoteProviderPromptRecordUsageResponse>(value)?.usage)
+        })
+    }
+
     fn hooks(&self) -> BackendFuture<'_, Vec<vibex_core::Hook>> {
         let this = self.clone();
         Box::pin(async move {
