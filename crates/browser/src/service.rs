@@ -2223,6 +2223,34 @@ impl BrowserInner {
         ))
     }
 
+    /// The CDP session a reference's element lives in.
+    ///
+    /// The tab's own session for the page, or the child session of the
+    /// cross-origin frame the element came from. A `DOM.*` call about a frame's
+    /// node on the parent session fails with "node not found", which is what
+    /// made an element merged from an iframe unusable.
+    pub(crate) async fn element_session(
+        &self,
+        tab_id: &BrowserTabId,
+        reference: &str,
+    ) -> BrowserResult<CdpSession> {
+        let state = self.state.lock().await;
+        let tab = state.tabs.get(tab_id).ok_or_else(|| {
+            BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
+        })?;
+        let element = crate::ax::resolve_reference(reference, tab.generation, &tab.elements)
+            .map_err(|rejection| crate::execute::reference_error(rejection, tab.generation))?;
+        let connection = state
+            .process
+            .as_ref()
+            .map(BrowserProcess::connection)
+            .ok_or_else(browser_not_running)?;
+        Ok(match element.frame_session.clone() {
+            Some(frame_session) => CdpSession::new(connection, frame_session, String::new()),
+            None => CdpSession::new(connection, tab.session_id.clone(), tab.target_id.clone()),
+        })
+    }
+
     async fn ack_frame(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
         let (session, ack_session_id) = {
             let state = self.state.lock().await;
@@ -3282,7 +3310,7 @@ pub(crate) async fn observe_tab(
     depth: u16,
     filter: Option<(Option<String>, Option<String>)>,
 ) -> BrowserResult<(String, String, u64, Vec<PrunedElement>, bool)> {
-    let (_, session) = inner.tab_session(tab_id).await?;
+    let (connection, session) = inner.tab_session(tab_id).await?;
     let result = cdp(
         &session,
         "Accessibility.getFullAXTree",
@@ -3296,6 +3324,46 @@ pub(crate) async fn observe_tab(
         .cloned()
         .unwrap_or_default();
     let mut pruned = prune_ax_tree(&nodes, max_elements, depth);
+    // A cross-origin iframe is a target of its own, so the main frame's tree
+    // cannot see inside it. Each attached child session is read separately and
+    // merged, which is what makes a third-party login, payment or consent form
+    // visible to the Agent at all.
+    let child_sessions = {
+        let state = inner.state.lock().await;
+        state
+            .tabs
+            .get(tab_id)
+            .map(|tab| tab.child_sessions.clone())
+            .unwrap_or_default()
+    };
+    let mut frames = Vec::new();
+    for child in &child_sessions {
+        let budget = max_elements.saturating_sub(pruned.elements.len());
+        if budget == 0 {
+            break;
+        }
+        let child_session = CdpSession::new(Arc::clone(&connection), child.clone(), String::new());
+        let Ok(result) = cdp(
+            &child_session,
+            "Accessibility.getFullAXTree",
+            json!({ "depth": depth }),
+            vibex_core::BROWSER_OBSERVE_TIMEOUT_MS,
+        )
+        .await
+        else {
+            // A frame that will not answer must not fail the whole
+            // observation: the page's own tree is still worth returning.
+            continue;
+        };
+        let nodes = result
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if crate::ax::merge_frame_elements(&mut pruned, &nodes, child, budget, depth) > 0 {
+            frames.push(child.clone());
+        }
+    }
     if let Some((role_filter, name_filter)) = filter {
         pruned.elements.retain(|element| {
             let role_matches = role_filter

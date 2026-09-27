@@ -549,6 +549,15 @@ impl BrowserMcpHost for RuntimeBrowserHost {
                 .unwrap_or_default(),
         );
         let private_network = error.code == "browser_private_network_approval_required";
+        // Reading workspace files is approved one request at a time: there is no
+        // durable "always allow uploads", so the card must not offer one.
+        let local_files = vibex_browser::policy::is_local_file_approval_code(&error.code);
+        let file_names = error
+            .diagnostics
+            .iter()
+            .find(|(key, _)| key == "files")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
         let requested_at_ms = unix_timestamp_ms();
         let request = PermissionRequest {
             id: RequestId::new(),
@@ -560,23 +569,43 @@ impl BrowserMcpHost for RuntimeBrowserHost {
             // reach somewhere"; adding a variant would force edits to the
             // exhaustive risk-label matches on desktop and mobile for no gain.
             risk_category: PermissionRiskCategory::Network,
-            title: if private_network {
+            title: if local_files {
+                format!(
+                    "Agent wants to read {} workspace file(s)",
+                    file_names.split(", ").count()
+                )
+            } else if private_network {
                 format!("Agent wants to reach the private address {domain}")
             } else {
                 format!("Agent wants to visit {domain}")
             },
             details: vec![
                 PermissionActionDetail {
-                    label: "Origin".to_string(),
-                    value: origin.clone(),
+                    label: if local_files {
+                        "Files".to_string()
+                    } else {
+                        "Origin".to_string()
+                    },
+                    value: if local_files {
+                        file_names.clone()
+                    } else {
+                        origin.clone()
+                    },
                 },
                 PermissionActionDetail {
                     label: "Agent".to_string(),
                     value: session.agent_label.clone(),
                 },
                 PermissionActionDetail {
-                    label: "Network".to_string(),
-                    value: if private_network {
+                    label: if local_files {
+                        "Filesystem".to_string()
+                    } else {
+                        "Network".to_string()
+                    },
+                    value: if local_files {
+                        "The browser runs on the machine hosting the Vibex runtime, so a file sent                          to a page leaves the workspace."
+                            .to_string()
+                    } else if private_network {
                         "Private or loopback: the browser runs on the machine hosting the Vibex \
                          runtime, so this can reach services that are not exposed to the network."
                             .to_string()
@@ -585,11 +614,18 @@ impl BrowserMcpHost for RuntimeBrowserHost {
                     },
                 },
             ],
-            allowed_responses: vec![
-                PermissionResponseKind::Approve,
-                PermissionResponseKind::Deny,
-                PermissionResponseKind::AlwaysAllowForSession,
-            ],
+            allowed_responses: if local_files {
+                vec![
+                    PermissionResponseKind::Approve,
+                    PermissionResponseKind::Deny,
+                ]
+            } else {
+                vec![
+                    PermissionResponseKind::Approve,
+                    PermissionResponseKind::Deny,
+                    PermissionResponseKind::AlwaysAllowForSession,
+                ]
+            },
             response_options: Vec::new(),
             status: PermissionRequestStatus::Pending,
             requested_at_ms,

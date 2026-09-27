@@ -26,7 +26,12 @@ the `TerminalBackend` seam.
 
 - **Humans** watch `Page.startScreencast` frames rendered as GPUI textures.
 - **Agents** read `Accessibility.getFullAXTree`, pruned to a bounded element
-  list.
+  list. Cross-origin frames live in their own target, so each attached child
+  session is read separately and merged with its elements marked as framed
+  (`PrunedElement::frame_session`). A merged element is only usable if every
+  `DOM.*` call about it runs on that child session, which is what
+  `BrowserInner::element_session` resolves — resolving a frame's
+  `backendNodeId` on the tab's own session fails with "node not found".
 - **Diagnostics** (`Runtime.consoleAPICalled`, `Runtime.exceptionThrown`,
   `Log.entryAdded`, failed `Network` responses) are always on, because for a
   coding agent they are usually the most useful signal on the page.
@@ -136,7 +141,11 @@ agent acts on and what the user sees cannot diverge.
   exactly like a broken page.
 - **`browser_upload` and `browser_preview_open` resolve symbolic links and
   confine the result to the agent's authorized roots.** Local previews are
-  served as a `data:` URL so the page never learns an absolute path.
+  served as a `data:` URL so the page never learns an absolute path. Being
+  inside a root is not consent: both ask the human first through
+  `browser_local_file_approval_required`, whose card lists the file names and
+  deliberately offers no "always allow" — a file sent to a page leaves the
+  workspace, and the approval is spent by the retry that carries it.
 - **Page content is untrusted data.** Every tool description carries
   `BROWSER_UNTRUSTED_CONTENT_NOTICE`, and page-derived results — the AX element
   list from `browser_observe` / `browser_find`, and `browser_extract` — are

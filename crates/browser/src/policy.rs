@@ -93,6 +93,46 @@ impl NavigationDecision {
     }
 }
 
+/// The key a one-off local-file approval travels under.
+///
+/// Local file access is not an origin, so it cannot use the origin grants: the
+/// human approves one upload or one preview, and nothing is remembered.
+pub const LOCAL_FILE_APPROVAL_KEY: &str = "local-files";
+
+/// True when an error code asks for permission to read local files.
+pub fn is_local_file_approval_code(code: &str) -> bool {
+    code == "browser_local_file_approval_required"
+}
+
+/// The error a tool raises before reading files out of the workspace.
+///
+/// Uploading a file and opening a local preview both hand project content to a
+/// page, which is the step an injected Agent wants; the path check alone only
+/// says the file is inside the workspace, not that the human agreed to send it.
+pub fn local_file_approval_error(action: &str, files: &[String]) -> BrowserError {
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        })
+        .collect();
+    BrowserError::permission(
+        "browser_local_file_approval_required",
+        format!(
+            "Agent wants to {action} {} file(s) from the workspace",
+            files.len()
+        ),
+    )
+    .with_diagnostic("files", names.join(", "))
+    .with_diagnostic("file_count", files.len().to_string())
+    .with_recovery_hint(
+        "The user must approve reading these files; nothing is remembered, so a second request asks          again.",
+    )
+}
+
 /// True when a raw value is an approval-required navigation error code.
 pub fn is_navigation_approval_code(code: &str) -> bool {
     matches!(
@@ -703,6 +743,44 @@ mod tests {
         assert!(!has_acknowledged_risk_disclaimer(0));
         assert!(has_acknowledged_risk_disclaimer(
             BROWSER_RISK_DISCLAIMER_VERSION
+        ));
+    }
+
+    #[test]
+    fn local_file_approval_names_the_files_and_is_never_remembered() {
+        let error = local_file_approval_error(
+            "upload",
+            &[
+                "/work/.env".to_string(),
+                "/work/secrets/token.txt".to_string(),
+            ],
+        );
+        assert_eq!(error.code, "browser_local_file_approval_required");
+        assert!(is_local_file_approval_code(&error.code));
+        assert!(!is_navigation_approval_code(&error.code));
+        // The card shows names, not an absolute path the human cannot use.
+        assert_eq!(
+            error
+                .diagnostics
+                .iter()
+                .find(|(key, _)| key == "files")
+                .map(|(_, value)| value.as_str()),
+            Some(".env, token.txt")
+        );
+        assert_eq!(
+            error
+                .diagnostics
+                .iter()
+                .find(|(key, _)| key == "file_count")
+                .map(|(_, value)| value.as_str()),
+            Some("2")
+        );
+        // A local-file approval has no origin, so it can never satisfy an
+        // origin grant or a one-shot navigation approval.
+        assert_eq!(LOCAL_FILE_APPROVAL_KEY, "local-files");
+        assert!(matches!(
+            approved_decision("http://127.0.0.1:2375/", &[LOCAL_FILE_APPROVAL_KEY], &[]),
+            NavigationDecision::RequiresApprovalForPrivateNetwork { .. }
         ));
     }
 

@@ -272,7 +272,9 @@ impl BrowserMcpHandler {
         error: &BrowserError,
     ) -> Option<BrowserPermissionDecision> {
         let host = self.host.as_ref()?;
-        if !crate::policy::is_navigation_approval_code(&error.code) {
+        if !crate::policy::is_navigation_approval_code(&error.code)
+            && !crate::policy::is_local_file_approval_code(&error.code)
+        {
             return None;
         }
         Some(host.request_permission(session, error).await)
@@ -281,9 +283,14 @@ impl BrowserMcpHandler {
 
 /// The origin an approval decision applies to.
 ///
-/// Falls back to the empty string only for an error that reached an approval
-/// path without diagnostics, which cannot happen for the codes that get here.
+/// Local file access has no origin, so it uses a sentinel key: the approval
+/// travels with the retry exactly like an origin's does, and is never written
+/// down. Falls back to the empty string only for an error that reached an
+/// approval path without diagnostics, which cannot happen for the codes here.
 fn approval_key(error: &BrowserError) -> String {
+    if crate::policy::is_local_file_approval_code(&error.code) {
+        return crate::policy::LOCAL_FILE_APPROVAL_KEY.to_string();
+    }
     error
         .diagnostics
         .iter()
@@ -724,6 +731,20 @@ mod tests {
             "the requested path is outside the authorized roots",
         );
         assert_eq!(handler.approval_for(&session(), &missing_path).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_local_file_read_raises_a_card_under_its_own_key() {
+        let handler = handler_with_host(BrowserPermissionDecision::Approve);
+        let error =
+            crate::policy::local_file_approval_error("upload", &["/work/notes.txt".to_string()]);
+        assert_eq!(
+            handler.approval_for(&session(), &error).await,
+            Some(BrowserPermissionDecision::Approve)
+        );
+        // The one-off approval travels under a key that no origin grant can
+        // match, so approving a site never approves a file read.
+        assert_eq!(approval_key(&error), crate::policy::LOCAL_FILE_APPROVAL_KEY);
     }
 
     #[test]

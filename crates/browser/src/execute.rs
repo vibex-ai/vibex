@@ -337,12 +337,16 @@ impl BrowserService {
     }
 
     /// Resolves an element's viewport box so a click lands in the middle of it.
+    ///
+    /// The reference travels with the id because a node inside a cross-origin
+    /// frame only resolves on that frame's own CDP session.
     async fn element_center(
         &self,
         tab_id: &BrowserTabId,
+        reference: &str,
         backend_node_id: i64,
     ) -> BrowserResult<(f64, f64)> {
-        let (_, session) = self.inner().tab_session(tab_id).await?;
+        let session = self.inner().element_session(tab_id, reference).await?;
         // Scroll the element into view first: clicks land at viewport
         // coordinates, so an off-screen element would be clicked at the wrong
         // place.
@@ -388,8 +392,8 @@ impl BrowserService {
     /// it lives in the page: scrolling and zooming follow for free, it appears
     /// in the screencast automatically, and there is no coordinate conversion to
     /// get wrong.
-    async fn highlight(&self, tab_id: &BrowserTabId, backend_node_id: i64) {
-        let Ok((_, session)) = self.inner().tab_session(tab_id).await else {
+    async fn highlight(&self, tab_id: &BrowserTabId, reference: &str, backend_node_id: i64) {
+        let Ok(session) = self.inner().element_session(tab_id, reference).await else {
             return;
         };
         let _ = cdp(
@@ -410,9 +414,10 @@ impl BrowserService {
         .await;
         let inner = std::sync::Arc::clone(self.inner());
         let tab_id = tab_id.clone();
+        let reference = reference.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(BROWSER_ACTION_HIGHLIGHT_MS)).await;
-            if let Ok((_, session)) = inner.tab_session(&tab_id).await {
+            if let Ok(session) = inner.element_session(&tab_id, &reference).await {
                 let _ = cdp(
                     &session,
                     "Overlay.hideHighlight",
@@ -747,10 +752,12 @@ impl BrowserService {
         self.ensure_not_aborted(tab_id).await?;
         self.mark_source(ctx).await;
         let (backend_node_id, role, name) = self.resolve_element(tab_id, reference).await?;
-        let (x, y) = self.element_center(tab_id, backend_node_id).await?;
+        let (x, y) = self
+            .element_center(tab_id, reference, backend_node_id)
+            .await?;
         // Highlight before clicking so a watching user sees where the click is
         // about to land.
-        self.highlight(tab_id, backend_node_id).await;
+        self.highlight(tab_id, reference, backend_node_id).await;
         let click = self.click_at(tab_id, x, y, "left", 1).await;
         let status = if click.is_ok() {
             BrowserOperationStatus::Dispatched
@@ -833,7 +840,10 @@ impl BrowserService {
         self.ensure_not_aborted(&tab_id).await?;
         self.mark_source(ctx).await;
         let (backend_node_id, role, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let (_, session) = self.inner().tab_session(&tab_id).await?;
+        let session = self
+            .inner()
+            .element_session(&tab_id, reference.trim())
+            .await?;
         let _ = cdp(
             &session,
             "DOM.focus",
@@ -904,7 +914,10 @@ impl BrowserService {
         self.ensure_not_aborted(&tab_id).await?;
         if let Some(reference) = args.get("ref").and_then(Value::as_str) {
             let (backend_node_id, _, _) = self.resolve_element(&tab_id, reference.trim()).await?;
-            let (_, session) = self.inner().tab_session(&tab_id).await?;
+            let session = self
+                .inner()
+                .element_session(&tab_id, reference.trim())
+                .await?;
             let _ = cdp(
                 &session,
                 "DOM.focus",
@@ -982,8 +995,11 @@ impl BrowserService {
         let tab_id = self.target_tab(ctx, args).await?;
         self.ensure_not_aborted(&tab_id).await?;
         let (backend_node_id, role, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let (x, y) = self.element_center(&tab_id, backend_node_id).await?;
-        self.highlight(&tab_id, backend_node_id).await;
+        let (x, y) = self
+            .element_center(&tab_id, reference.trim(), backend_node_id)
+            .await?;
+        self.highlight(&tab_id, reference.trim(), backend_node_id)
+            .await;
         self.dispatch_input(&tab_id, BrowserInput::MouseMove { x, y, buttons: 0 })
             .await?;
         let record = self
@@ -1041,7 +1057,8 @@ impl BrowserService {
             Some(reference) => {
                 let (backend_node_id, _, _) =
                     self.resolve_element(&tab_id, reference.trim()).await?;
-                self.element_center(&tab_id, backend_node_id).await?
+                self.element_center(&tab_id, reference.trim(), backend_node_id)
+                    .await?
             }
             None => (10.0, 10.0),
         };
@@ -1099,7 +1116,10 @@ impl BrowserService {
         let tab_id = self.target_tab(ctx, args).await?;
         self.ensure_not_aborted(&tab_id).await?;
         let (backend_node_id, role, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let (_, session) = self.inner().tab_session(&tab_id).await?;
+        let session = self
+            .inner()
+            .element_session(&tab_id, reference.trim())
+            .await?;
         let object = cdp(
             &session,
             "DOM.resolveNode",
@@ -1197,9 +1217,11 @@ impl BrowserService {
         self.ensure_not_aborted(&tab_id).await?;
         let (from_node, _, from_name) = self.resolve_element(&tab_id, from_ref.trim()).await?;
         let (to_node, _, to_name) = self.resolve_element(&tab_id, to_ref.trim()).await?;
-        let (from_x, from_y) = self.element_center(&tab_id, from_node).await?;
-        let (to_x, to_y) = self.element_center(&tab_id, to_node).await?;
-        self.highlight(&tab_id, from_node).await;
+        let (from_x, from_y) = self
+            .element_center(&tab_id, from_ref.trim(), from_node)
+            .await?;
+        let (to_x, to_y) = self.element_center(&tab_id, to_ref.trim(), to_node).await?;
+        self.highlight(&tab_id, from_ref.trim(), from_node).await;
         self.dispatch_input(
             &tab_id,
             BrowserInput::MouseMove {
@@ -1286,8 +1308,26 @@ impl BrowserService {
         let tab_id = self.target_tab(ctx, args).await?;
         self.ensure_not_aborted(&tab_id).await?;
         let authorized = policy::authorize_upload_paths(&paths, &ctx.authorized_roots)?;
+        // Being inside an authorized root is not the same as the human agreeing
+        // to send the file to a page.
+        if !ctx
+            .approved_origins
+            .iter()
+            .any(|approved| approved == policy::LOCAL_FILE_APPROVAL_KEY)
+        {
+            return Err(policy::local_file_approval_error(
+                "upload",
+                &authorized
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
         let (backend_node_id, _, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let (_, session) = self.inner().tab_session(&tab_id).await?;
+        let session = self
+            .inner()
+            .element_session(&tab_id, reference.trim())
+            .await?;
         let files: Vec<String> = authorized
             .iter()
             .map(|path| path.to_string_lossy().to_string())
@@ -1330,7 +1370,10 @@ impl BrowserService {
             Some(reference) => {
                 let (backend_node_id, _, _) =
                     self.resolve_element(&tab_id, reference.trim()).await?;
-                let (_, session) = self.inner().tab_session(&tab_id).await?;
+                let session = self
+                    .inner()
+                    .element_session(&tab_id, reference.trim())
+                    .await?;
                 let object = cdp(
                     &session,
                     "DOM.resolveNode",
@@ -1762,6 +1805,16 @@ impl BrowserService {
         // authorized root, so a link cannot smuggle the agent out of the
         // workspace.
         let resolved = policy::authorize_preview_path(path.trim(), &ctx.authorized_roots)?;
+        if !ctx
+            .approved_origins
+            .iter()
+            .any(|approved| approved == policy::LOCAL_FILE_APPROVAL_KEY)
+        {
+            return Err(policy::local_file_approval_error(
+                "open as a local preview",
+                &[resolved.to_string_lossy().to_string()],
+            ));
+        }
         let bytes = std::fs::read(&resolved).map_err(|error| {
             BrowserError::validation(
                 "browser_preview_read_failed",
@@ -2042,7 +2095,10 @@ impl BrowserService {
         let reference = required_str(args, "ref")?;
         let tab_id = self.target_tab(ctx, args).await?;
         let (backend_node_id, _, name) = self.resolve_element(&tab_id, reference.trim()).await?;
-        let (_, session) = self.inner().tab_session(&tab_id).await?;
+        let session = self
+            .inner()
+            .element_session(&tab_id, reference.trim())
+            .await?;
         // Tag the element, run the framework probe against it, then remove the
         // tag so the page is left exactly as it was found.
         let _ = cdp(
@@ -2492,9 +2548,16 @@ impl BrowserService {
         extended: bool,
     ) -> BrowserResult<ObservedPage> {
         let (max_elements, depth) = crate::service::observation_settings(max_elements, extended);
-        let (url, title, generation, elements, truncated) =
+        let (url, title, generation, pruned, truncated) =
             observe_tab(self.inner(), tab_id, max_elements, depth, None).await?;
-        let elements = crate::ax::assign_references(&elements, generation);
+        // Elements merged from a cross-origin frame are marked: the model has to
+        // know that a field it cannot find on the main document came from an
+        // embedded document, and the refs are still resolved the same way.
+        let framed: Vec<bool> = pruned
+            .iter()
+            .map(|element| element.frame_session.is_some())
+            .collect();
+        let elements = crate::ax::assign_references(&pruned, generation);
         refresh_tab_title(self.inner(), tab_id).await;
         let (url, title) = {
             let state = self.inner().state.lock().await;
@@ -2512,14 +2575,19 @@ impl BrowserService {
                 .and_then(|tab| tab.pending_dialog.clone())
         };
         let mut listing = format!("Interactive elements ({}):\n", elements.len());
-        for element in &elements {
+        for (index, element) in elements.iter().enumerate() {
             listing.push_str(&format!(
-                "  {} — {} `{}`{}{}\n",
+                "  {} — {} `{}`{}{}{}\n",
                 element.reference,
                 element.role,
                 element.name,
                 if element.editable { " (editable)" } else { "" },
-                if element.disabled { " (disabled)" } else { "" }
+                if element.disabled { " (disabled)" } else { "" },
+                if framed.get(index).copied().unwrap_or(false) {
+                    " (in a cross-origin frame)"
+                } else {
+                    ""
+                }
             ));
         }
         if elements.is_empty() {
@@ -2669,7 +2737,7 @@ fn next_record_id() -> String {
     )
 }
 
-fn reference_error(rejection: ReferenceRejection, generation: u64) -> BrowserError {
+pub(crate) fn reference_error(rejection: ReferenceRejection, generation: u64) -> BrowserError {
     let code = match rejection {
         ReferenceRejection::Malformed => "browser_ref_malformed",
         ReferenceRejection::Stale => "browser_ref_stale",

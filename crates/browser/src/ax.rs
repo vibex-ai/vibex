@@ -123,6 +123,13 @@ pub struct PrunedElement {
     pub name: String,
     pub value: Option<String>,
     pub disabled: bool,
+    /// The flattened CDP session this node belongs to.
+    ///
+    /// `None` is the tab's own session. A cross-origin iframe lives in a child
+    /// target, and every DOM call about one of its nodes has to be made on that
+    /// child session — resolving `backendNodeId` on the parent fails with "node
+    /// not found".
+    pub frame_session: Option<String>,
 }
 
 impl PrunedElement {
@@ -224,6 +231,7 @@ pub fn prune_ax_tree(ax_nodes: &[Value], max_elements: usize, depth: u16) -> Pru
                     })
                 })
                 .unwrap_or(false),
+            frame_session: None,
         };
         if interactive_role {
             interactive.push(element);
@@ -273,6 +281,35 @@ fn node_depth(node: &Value, by_id: &HashMap<&str, &Value>) -> usize {
         current = parent;
     }
     depth
+}
+
+/// Merges a cross-origin frame's pruned tree into the tab's observation.
+///
+/// A cross-origin iframe is its own CDP target, so the parent frame's
+/// `Accessibility.getFullAXTree` cannot see a login or payment form rendered
+/// inside one. Each frame is read on its child session and appended here, with
+/// `budget` elements left for it so a single frame cannot crowd out the page.
+pub fn merge_frame_elements(
+    observation: &mut PrunedObservation,
+    frame_nodes: &[Value],
+    frame_session: &str,
+    budget: usize,
+    depth: u16,
+) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    let mut frame = prune_ax_tree(frame_nodes, budget, depth);
+    if frame.elements.len() >= budget {
+        observation.truncated = true;
+    }
+    observation.truncated |= frame.truncated;
+    for element in &mut frame.elements {
+        element.frame_session = Some(frame_session.to_string());
+    }
+    let added = frame.elements.len();
+    observation.elements.extend(frame.elements);
+    added
 }
 
 /// Assigns `r{generation}-{index}` references to pruned elements.
@@ -458,6 +495,58 @@ mod tests {
     }
 
     #[test]
+    fn a_cross_origin_frame_merges_with_its_own_session() {
+        let page = prune_ax_tree(&[node("1", "button", "Save", None)], 10, 8);
+        let mut observation = page.clone();
+        let frame_nodes = vec![
+            node("2", "textbox", "Email", None),
+            node("3", "button", "Sign in", None),
+        ];
+        let added = merge_frame_elements(&mut observation, &frame_nodes, "frame-session", 10, 8);
+
+        assert_eq!(added, 2);
+        assert_eq!(observation.elements.len(), 3);
+        // The page's own element stays on the tab's session.
+        assert_eq!(observation.elements[0].frame_session, None);
+        // A merged element carries the child session: resolving its
+        // `backendNodeId` anywhere else fails.
+        assert_eq!(
+            observation.elements[1].frame_session.as_deref(),
+            Some("frame-session")
+        );
+        // Refs still address the merged list in order.
+        let elements = assign_references(&observation.elements, 4);
+        assert_eq!(elements[2].name, "Sign in");
+        assert_eq!(
+            resolve_reference("r4-2", 4, &observation.elements)
+                .unwrap()
+                .frame_session
+                .as_deref(),
+            Some("frame-session")
+        );
+    }
+
+    #[test]
+    fn a_frame_cannot_exceed_its_share_of_the_budget() {
+        let mut observation = PrunedObservation {
+            elements: Vec::new(),
+            truncated: false,
+        };
+        let frame_nodes = vec![
+            node("1", "button", "One", None),
+            node("2", "button", "Two", None),
+        ];
+        let added = merge_frame_elements(&mut observation, &frame_nodes, "frame-session", 1, 8);
+        assert_eq!(added, 1);
+        // Hitting the frame's budget is a truncation, not a silent drop.
+        assert!(observation.truncated);
+        assert_eq!(
+            merge_frame_elements(&mut observation, &frame_nodes, "frame-session", 0, 8),
+            0
+        );
+    }
+
+    #[test]
     fn references_are_generation_scoped() {
         let elements = vec![PrunedElement {
             backend_dom_node_id: Some(7),
@@ -465,6 +554,7 @@ mod tests {
             name: "Submit".to_string(),
             value: None,
             disabled: false,
+            frame_session: None,
         }];
         let observed = assign_references(&elements, 3);
         assert_eq!(observed[0].reference, "r3-1");

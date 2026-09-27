@@ -269,7 +269,8 @@ pub fn all_tools() -> Vec<BrowserToolDefinition> {
         description: with_notice(
             "Attach files to a file input identified by a ref. Paths must resolve inside the \
              Agent's authorized project or attached directories; symbolic links are resolved and \
-             paths outside those roots are refused.",
+             paths outside those roots are refused. The user is asked to approve the read, because \
+             a file sent to a page leaves the workspace.",
         ),
         tier: BrowserToolTier::Fine,
         input_schema: object_schema(
@@ -391,7 +392,8 @@ pub fn all_tools() -> Vec<BrowserToolDefinition> {
         description: with_notice(
             "Open a local HTML file from the workspace as a preview. The path must resolve inside \
              the Agent's authorized project or attached directories, and only .html/.htm files are \
-             accepted. Absolute filesystem paths are never exposed to the page.",
+             accepted. Absolute filesystem paths are never exposed to the page. The user is asked \
+             to approve the read first.",
         ),
         tier: BrowserToolTier::Fine,
         input_schema: object_schema(

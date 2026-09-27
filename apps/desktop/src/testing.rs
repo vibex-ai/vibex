@@ -184,6 +184,7 @@ pub fn embedded_browser_contract_probe() -> EmbeddedBrowserContractProbe {
             name: "Submit".to_string(),
             value: None,
             disabled: false,
+            frame_session: None,
         }];
         vibex_browser::ax::resolve_reference("r1-1", 2, &elements).is_err()
     };
