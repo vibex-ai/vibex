@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 pub fn cursor_probe_params(x: f64, y: f64) -> Value {
     let script = format!(
         r#"(() => {{
+  // `document.elementFromPoint`, not a global: the bare name is a
+  // ReferenceError that the probe would report as "no element anywhere".
   const element = document.elementFromPoint({x}, {y});
   if (!element) return null;
   try {{
@@ -47,7 +49,7 @@ mod tests {
     fn the_probe_carries_the_point_and_reads_the_computed_style() {
         let params = cursor_probe_params(12.5, 40.0);
         let expression = params["expression"].as_str().unwrap();
-        assert!(expression.contains("elementFromPoint(12.5, 40)"));
+        assert!(expression.contains("document.elementFromPoint(12.5, 40)"));
         assert!(expression.contains("getComputedStyle(element).cursor"));
         assert_eq!(params["returnByValue"], json!(true));
     }

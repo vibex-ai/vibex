@@ -32,7 +32,7 @@
     "smoke:acp:bridge-contract": "cargo run -p vibex-agent-acp --bin vibex-acp-bridge-contract --",
     "smoke:agents": "pnpm smoke:acp:bridge-contract && pnpm smoke:codex && pnpm smoke:claude",
     "smoke:backup": "cargo run -p vibex-backup --bin vibex-backup-restore-smoke",
-    "smoke:browser": "cargo test -p vibex-browser --locked --test page_tabs -- --nocapture",
+    "smoke:browser": "cargo test -p vibex-browser --locked --test page_tabs --test panel_tools -- --nocapture",
     "smoke:claude": "cargo run -p vibex-agent-acp --bin real_claude_agent_acp_smoke",
     "smoke:codex": "cargo run -p vibex-agent-acp --bin real_codex_acp_smoke",
     "smoke:db": "cargo run -p vibex-db --bin vibex-db-smoke",
