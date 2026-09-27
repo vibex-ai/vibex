@@ -2399,7 +2399,7 @@ impl AgentProvider for AcpAgentProvider {
         let profile_revision = match self.config_service.as_ref() {
             Some(service) => service
                 .get_profile(&request.provider_profile_id)?
-                .map(|profile| profile.updated_at_ms)
+                .map(|profile| profile.launch_revision())
                 .ok_or_else(|| {
                     VibexError::validation(
                         "provider_profile_not_found",

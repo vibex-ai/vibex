@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent_config::{AgentId, agent_id_for_provider_kind};
 use crate::ids::{
@@ -767,6 +768,24 @@ pub struct PromptSummary {
     pub updated_at_ms: i64,
 }
 
+/// How often one reusable Prompt has been inserted into a composer.
+///
+/// The composer orders its quick phrases by this counter, so it is recorded
+/// where the authority owns it rather than in a client's local state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptUsage {
+    pub prompt_id: PromptId,
+    pub use_count: u32,
+    pub last_used_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptUsageRecordRequest {
+    pub prompt_id: PromptId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptCreateRequest {
@@ -1479,7 +1498,71 @@ impl ProviderProfile {
             configured_models: self.configured_models.clone(),
             secret_setup_state: summarize_secret_setup(&self.secrets),
             updated_at_ms: self.updated_at_ms,
+            launch_revision: self.launch_revision(),
         }
+    }
+
+    /// Stable revision of the durable launch contract this Profile describes.
+    ///
+    /// `updated_at_ms` is a wall-clock stamp that *any* rewrite refreshes, so
+    /// using it as an authentication-source revision invalidated every Session
+    /// binding whenever Vibex touched a Profile — including a no-op startup
+    /// reconciliation. This digest only moves when a field the ACP launch and
+    /// restore contract actually depends on changes, so a cosmetic edit (a
+    /// display name, a model label) keeps existing bindings usable.
+    ///
+    /// The value is deterministic across processes and never zero, because it
+    /// is persisted in bindings and switches and compared on later starts.
+    pub fn launch_revision(&self) -> i64 {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LaunchContract<'a> {
+            id: &'a ProviderProfileId,
+            agent_id: &'a AgentId,
+            kind: ProviderKind,
+            status: ProviderProfileStatus,
+            account_alias: &'a Option<String>,
+            base_url: &'a Option<String>,
+            default_model: &'a Option<String>,
+            small_model: &'a Option<String>,
+            large_model: &'a Option<String>,
+            reasoning_effort: &'a Option<String>,
+            configured_models: &'a [ProviderConfiguredModel],
+            sandbox_defaults: &'a ProviderSandboxDefaults,
+            network_defaults: &'a ProviderNetworkDefaults,
+            permission_defaults: &'a ProviderPermissionDefaults,
+            provider_options: &'a ProviderOptions,
+            // Secret references carry their own revision, so rotating a
+            // credential moves the launch revision even though the Profile's
+            // metadata does not change.
+            secrets: &'a [ProviderSecretReference],
+        }
+        let contract = LaunchContract {
+            id: &self.id,
+            agent_id: &self.agent_id,
+            kind: self.kind,
+            status: self.status,
+            account_alias: &self.account_alias,
+            base_url: &self.base_url,
+            default_model: &self.default_model,
+            small_model: &self.small_model,
+            large_model: &self.large_model,
+            reasoning_effort: &self.reasoning_effort,
+            configured_models: &self.configured_models,
+            sandbox_defaults: &self.sandbox_defaults,
+            network_defaults: &self.network_defaults,
+            permission_defaults: &self.permission_defaults,
+            provider_options: &self.provider_options,
+            secrets: &self.secrets,
+        };
+        // Every field above serializes deterministically (no maps), so the
+        // digest is identical for equal launch contracts in any process.
+        let encoded = serde_json::to_vec(&contract).unwrap_or_default();
+        let digest = Sha256::digest(encoded);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let revision = i64::from_be_bytes(bytes) & i64::MAX;
+        revision.max(1)
     }
 }
 
@@ -1515,6 +1598,11 @@ pub struct ProviderProfileSummary {
     pub configured_models: Vec<ProviderConfiguredModel>,
     pub secret_setup_state: ProviderSecretSetupState,
     pub updated_at_ms: i64,
+    /// Digest of the launch contract, so runtime catalogs can key their
+    /// revision on real configuration changes instead of any Profile write.
+    /// See [`ProviderProfile::launch_revision`].
+    #[serde(default)]
+    pub launch_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2705,7 +2793,47 @@ pub struct AdapterDiagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderConfiguredModel, ProviderModelWireApi, ProviderReasoningEffortLevel};
+    use super::{
+        ProviderConfiguredModel, ProviderKind, ProviderModelWireApi, ProviderProfile,
+        ProviderProfileStatus, ProviderReasoningEffortLevel,
+    };
+
+    #[test]
+    fn launch_revision_tracks_the_launch_contract_only() {
+        let profile = ProviderProfile::local_default(ProviderKind::Acp);
+        let baseline = profile.launch_revision();
+        assert!(baseline > 0);
+        assert_eq!(baseline, profile.launch_revision(), "the digest is stable");
+
+        // A cosmetic edit rewrites the row but must not invalidate bindings.
+        let mut cosmetic = profile.clone();
+        cosmetic.display_name = "Renamed".to_string();
+        cosmetic.updated_at_ms += 5_000;
+        assert_eq!(cosmetic.launch_revision(), baseline);
+
+        // Anything the launch or restore contract depends on moves it.
+        let mut endpoint = profile.clone();
+        endpoint.base_url = Some("https://relocated.example.test".to_string());
+        assert_ne!(endpoint.launch_revision(), baseline);
+
+        let mut enabled = profile.clone();
+        enabled.status = ProviderProfileStatus::Enabled;
+        assert_ne!(enabled.launch_revision(), baseline);
+
+        let mut routed = profile.clone();
+        routed.agent_id = crate::agent_config::AgentId::parse("claude-code").unwrap();
+        assert_ne!(routed.launch_revision(), baseline);
+
+        let mut modelled = profile.clone();
+        modelled.configured_models = vec![ProviderConfiguredModel {
+            id: "gpt-5".to_string(),
+            display_name: None,
+            enabled: true,
+            wire_api: None,
+            capabilities: Default::default(),
+        }];
+        assert_ne!(modelled.launch_revision(), baseline);
+    }
 
     #[test]
     fn model_wire_protocol_ids_round_trip_the_canonical_protocols() {

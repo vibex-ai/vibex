@@ -2071,6 +2071,7 @@ mod tests {
             configured_models: Vec::new(),
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 7,
+            launch_revision: 7,
         }
     }
 

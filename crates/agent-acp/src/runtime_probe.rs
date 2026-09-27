@@ -474,7 +474,7 @@ impl AcpRuntimeClient {
                     AcpProcessInstanceId::new(),
                     AcpProcessLaunch {
                         auth_source: &auth_source,
-                        auth_source_revision: profile.updated_at_ms,
+                        auth_source_revision: profile.launch_revision(),
                         agent_id: &profile.agent_id,
                         config: &config,
                         cwd: &cwd,

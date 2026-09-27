@@ -1315,7 +1315,7 @@ fn provider_auth_source_summaries(
                 agent.order_index,
                 RuntimeAuthSourceSummary {
                     source: RuntimeAuthSource::provider_profile(profile.id.clone()),
-                    auth_source_revision: profile.updated_at_ms,
+                    auth_source_revision: profile.launch_revision,
                     agent_id: profile.agent_id.clone(),
                     label: bounded_catalog_label(&profile.display_name),
                     kind: RuntimeAuthSourceKind::ProviderProfile,
@@ -2836,6 +2836,7 @@ mod tests {
             configured_models: Vec::new(),
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 1,
+            launch_revision: 1,
         };
 
         let catalog =
@@ -2883,6 +2884,7 @@ mod tests {
             ],
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 123,
+            launch_revision: 123,
         };
         let evidence = BTreeMap::from([(
             profile_id,
@@ -3038,6 +3040,7 @@ mod tests {
             }],
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 1,
+            launch_revision: 1,
         };
         let catalog = build_runtime_option_catalog(
             &[agent.clone()],
@@ -3095,6 +3098,7 @@ mod tests {
             }],
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 1,
+            launch_revision: 1,
         };
         let evidence = BTreeMap::from([(
             profile.id.clone(),
@@ -3150,6 +3154,7 @@ mod tests {
             configured_models: Vec::new(),
             secret_setup_state: ProviderSecretSetupState::Available,
             updated_at_ms: 1,
+            launch_revision: 1,
         };
         let evidence = BTreeMap::from([(
             profile.id.clone(),

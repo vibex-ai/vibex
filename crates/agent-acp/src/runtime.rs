@@ -7440,7 +7440,12 @@ impl AcpRuntimeSwitchBridge {
                         &selection.agent_id,
                         ProviderKind::Acp,
                     )?;
-                    (profile.updated_at_ms, config, runtime_resources, Vec::new())
+                    (
+                        profile.launch_revision(),
+                        config,
+                        runtime_resources,
+                        Vec::new(),
+                    )
                 }
                 RuntimeAuthSource::AgentAccount { auth_context_id } => {
                     let context = AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
@@ -8110,7 +8115,7 @@ impl AcpRuntimeSwitchBridge {
                     )
                     .with_diagnostic("providerProfileId", provider_profile_id.as_str())
                 })?
-                .updated_at_ms),
+                .launch_revision()),
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let conn = open_database(&self.db_path)?;
                 Ok(AgentAuthContextRepository::get_by_id(&conn, auth_context_id)?
@@ -11788,7 +11793,7 @@ impl AcpRuntimeClient {
                         .with_diagnostic("providerProfileId", provider_profile_id.as_str())
                     })?;
                 if profile.agent_id != *launch.agent_id
-                    || profile.updated_at_ms != launch.auth_source_revision
+                    || profile.launch_revision() != launch.auth_source_revision
                 {
                     return Err(VibexError::conflict(
                         "runtime_auth_source_changed",
@@ -12110,7 +12115,7 @@ impl AcpRuntimeClient {
                 binary_identity(&config.command)
             ),
             auth_source: RuntimeAuthSource::provider_profile(profile_id.clone()),
-            auth_source_revision: profile.updated_at_ms,
+            auth_source_revision: profile.launch_revision(),
             process_config_revision: 0,
             command: config.command.clone(),
             args: process_args,
@@ -14629,7 +14634,7 @@ impl AcpRuntimeClient {
                     ));
                 }
                 if binding.auth_source_revision != 0
-                    && binding.auth_source_revision != profile.updated_at_ms
+                    && binding.auth_source_revision != profile.launch_revision()
                 {
                     return Err(VibexError::conflict(
                         "runtime_auth_source_changed",
@@ -14648,7 +14653,8 @@ impl AcpRuntimeClient {
                             "Provider Profile was not found for ACP session launch",
                         )
                     })?;
-                (profile.agent_id, profile.updated_at_ms, config, Vec::new())
+                let auth_source_revision = profile.launch_revision();
+                (profile.agent_id, auth_source_revision, config, Vec::new())
             }
             RuntimeAuthSource::AgentAccount { auth_context_id } => {
                 let conn = open_database(self.config_service.database_path())?;
@@ -17008,7 +17014,7 @@ async fn launch_agent_auth_process(
             (
                 profile_id.clone(),
                 RuntimeAuthSource::provider_profile(profile_id.clone()),
-                profile.updated_at_ms,
+                profile.launch_revision(),
                 config,
                 cwd,
                 Vec::new(),
@@ -17856,7 +17862,7 @@ impl AcpClient for AcpRuntimeClient {
         let identity = self.attachment_identity_candidate(
             &request.session_id,
             &auth_source,
-            profile.updated_at_ms,
+            profile.launch_revision(),
         )?;
         let cwd = Self::resolve_workspace_cwd(&config, &request.workspace_root)?;
         let (effective_strategy, fallback_reason) =
@@ -17865,7 +17871,7 @@ impl AcpClient for AcpRuntimeClient {
         let lease = self
             .acquire_initialized_process(AcpProcessLaunch {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
@@ -18524,7 +18530,7 @@ impl AcpClient for AcpRuntimeClient {
             self,
             AcpAuthSourceLaunchContext {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 env_unsets: &[],
@@ -18562,7 +18568,7 @@ impl AcpClient for AcpRuntimeClient {
             self,
             AcpAuthSourceLaunchContext {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 env_unsets: &[],
@@ -18594,7 +18600,7 @@ impl AcpClient for AcpRuntimeClient {
             self,
             AcpAuthSourceLaunchContext {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 env_unsets: &[],
@@ -18653,7 +18659,7 @@ impl AcpClient for AcpRuntimeClient {
         self.list_runtime_model_capabilities_for_source(
             &profile.agent_id,
             &auth_source,
-            profile.updated_at_ms,
+            profile.launch_revision(),
             &config,
             &[],
         )
@@ -28370,9 +28376,9 @@ for line in sys.stdin:
         fixture.fixture.cleanup();
     }
 
-    /// Moves a Provider Profile revision past the binding committed for the
-    /// fixture session and detaches the live attachment, which is the state a
-    /// restart or an authority handover leaves behind.
+    /// Moves a Provider Profile launch revision past the binding committed for
+    /// the fixture session and detaches the live attachment, which is the state
+    /// a restart or an authority handover leaves behind.
     async fn move_profile_revision_past_binding(fixture: &RuntimeSwitchFixture) -> i64 {
         let previous = fixture
             .client
@@ -28380,17 +28386,34 @@ for line in sys.stdin:
             .unwrap();
         fixture.client.detach_attachment(previous.fence()).await;
 
-        // Any Provider Profile write restamps `updated_at_ms`, which is the
-        // auth-source revision the launch context is resolved from.
-        {
-            let conn = open_database(&fixture.fixture.db_path).unwrap();
-            conn.execute(
-                "UPDATE provider_profiles SET updated_at_ms = updated_at_ms + 1000
-                 WHERE provider_profile_id = ?1",
-                [fixture.source_binding.auth_source.id()],
-            )
+        // Only a change to the launch contract moves the auth-source revision;
+        // a cosmetic rewrite of the same Profile must not. Editing the endpoint
+        // is the smallest durable change that the launch context depends on.
+        fixture
+            .client
+            .config_service
+            .update_profile(vibex_core::ProviderProfileUpdateRequest {
+                provider_profile_id: fixture
+                    .source_binding
+                    .auth_source
+                    .provider_profile_id()
+                    .expect("fixture binding uses a provider profile")
+                    .clone(),
+                display_name: None,
+                status: None,
+                account_alias: None,
+                base_url: Some("https://revision-moved.example.test".to_string()),
+                default_model: None,
+                small_model: None,
+                large_model: None,
+                configured_models: None,
+                reasoning_effort: None,
+                sandbox_defaults: None,
+                network_defaults: None,
+                permission_defaults: None,
+                provider_options: None,
+            })
             .unwrap();
-        }
         let conn = open_database(&fixture.fixture.db_path).unwrap();
         let profile = vibex_db::ProviderProfileRepository::get(
             &conn,
@@ -28403,10 +28426,11 @@ for line in sys.stdin:
         .unwrap()
         .unwrap();
         assert_ne!(
-            profile.updated_at_ms, fixture.source_binding.auth_source_revision,
-            "the profile revision must have moved past the committed binding"
+            profile.launch_revision(),
+            fixture.source_binding.auth_source_revision,
+            "the profile launch revision must have moved past the committed binding"
         );
-        profile.updated_at_ms
+        profile.launch_revision()
     }
 
     /// Regression test for `restore_auth_source_revision_mismatch`: rebuilding a
@@ -30422,7 +30446,7 @@ for line in sys.stdin:
                 expected_current_binding_id: Some(binding_a.binding_id.clone()),
                 desired_selection_revision: selection_revision_b,
                 target_adapter_id: binding_a.adapter_id.clone(),
-                target_auth_source_revision: profile_b.updated_at_ms,
+                target_auth_source_revision: profile_b.launch_revision(),
                 target_selection: selection_b.clone(),
                 requested_policy: RuntimeSwitchPolicy::ForceFreshSession,
                 active_work_policy: Default::default(),
@@ -32196,7 +32220,7 @@ for line in sys.stdin:
             session_id: session_id.clone(),
             provider_kind: ProviderKind::Acp,
             auth_source: RuntimeAuthSource::provider_profile(fixture.profile_id.clone()),
-            auth_source_revision: profile.updated_at_ms,
+            auth_source_revision: profile.launch_revision(),
             native: vibex_core::ProviderNativeBinding {
                 native_session_id: Some("mock-import-session".to_string()),
                 native_thread_id: None,
@@ -34709,7 +34733,7 @@ for line in sys.stdin:
         let replacement = runtime
             .acquire_initialized_process(AcpProcessLaunch {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,
@@ -34797,7 +34821,7 @@ for line in sys.stdin:
             Duration::from_millis(400),
             client.acquire_initialized_process(AcpProcessLaunch {
                 auth_source: &auth_source,
-                auth_source_revision: profile.updated_at_ms,
+                auth_source_revision: profile.launch_revision(),
                 agent_id: &profile.agent_id,
                 config: &config,
                 cwd: &cwd,

@@ -250,13 +250,14 @@ fn create_e2e_durable_session(
         ..SessionRuntimeConfigState::default()
     };
     runtime_config.mark_generation_if_converged(0);
+    let auth_source_revision = profile.launch_revision();
     let binding = RuntimeBinding {
         binding_id: RuntimeBindingId::new(),
         session_id: session.id.clone(),
         agent_id,
         transport_kind: TransportKind::Acp,
         auth_source: vibex_core::RuntimeAuthSource::provider_profile(profile.id),
-        auth_source_revision: profile.updated_at_ms,
+        auth_source_revision,
         adapter_id: AcpAdapterId::parse("codex-acp")?,
         adapter_version: "e2e".to_string(),
         adapter_compatibility_identity: "adapter=codex-acp@e2e".to_string(),
