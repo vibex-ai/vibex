@@ -2777,8 +2777,18 @@ impl BrowserService {
         extended: bool,
     ) -> BrowserResult<ObservedPage> {
         let (max_elements, depth) = crate::service::observation_settings(max_elements, extended);
-        let (url, title, generation, pruned, truncated) =
-            observe_tab(self.inner(), tab_id, max_elements, depth, None).await?;
+        let crate::service::ObservedTab {
+            observation,
+            elements: pruned,
+        } = observe_tab(self.inner(), tab_id, max_elements, depth, None).await?;
+        let vibex_core::BrowserObservation {
+            url,
+            title,
+            generation,
+            truncated,
+            elements,
+            ..
+        } = observation;
         // Elements merged from a cross-origin frame are marked: the model has to
         // know that a field it cannot find on the main document came from an
         // embedded document, and the refs are still resolved the same way.
@@ -2786,7 +2796,6 @@ impl BrowserService {
             .iter()
             .map(|element| element.frame_session.is_some())
             .collect();
-        let elements = crate::ax::assign_references(&pruned, generation);
         refresh_tab_title(self.inner(), tab_id).await;
         let (url, title) = {
             let state = self.inner().state.lock().await;
@@ -2856,7 +2865,7 @@ impl BrowserService {
         name: Option<&str>,
         limit: usize,
     ) -> BrowserResult<Vec<vibex_core::BrowserElement>> {
-        let (_, _, generation, elements, _) = observe_tab(
+        let observed = observe_tab(
             self.inner(),
             tab_id,
             400,
@@ -2864,8 +2873,9 @@ impl BrowserService {
             None,
         )
         .await?;
-        let assigned = crate::ax::assign_references(&elements, generation);
-        Ok(assigned
+        let observed = observed.observation;
+        Ok(observed
+            .elements
             .into_iter()
             .filter(|element| {
                 role.map(|role| element.role.eq_ignore_ascii_case(role))

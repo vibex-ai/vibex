@@ -67,6 +67,20 @@ impl McpWireDelivery {
     pub fn forwards_servers(self) -> bool {
         matches!(self, Self::Delivered)
     }
+
+    /// Whether the tier may receive a **built-in** server over the wire.
+    ///
+    /// [`Self::NativeConfig`] agents read their own MCP file, and forwarding a
+    /// server that is also written there would register it twice. Vibex never
+    /// writes a built-in server to a native file — they are product
+    /// capabilities with a per-session endpoint and token, and a static file
+    /// could not hold either — so the double-registration reason does not apply
+    /// to them. Forwarding the built-ins is what makes the browser and
+    /// delegation tools reach the Agents whose CLI the runtime otherwise cannot
+    /// configure.
+    pub fn forwards_builtin_servers(self) -> bool {
+        matches!(self, Self::Delivered | Self::NativeConfig)
+    }
 }
 
 /// Where a dialect launch flag belongs relative to the configured arguments.

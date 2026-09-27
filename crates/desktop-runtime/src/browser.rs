@@ -370,12 +370,17 @@ impl BrowserRuntime {
                     BrowserToolDelivery::Http
                 }
             }
-            // These Agents never receive wire MCP servers today, so neither the
+            // A native-file Agent reads its own MCP configuration, so a user
+            // server is delivered by writing that file. The built-ins are never
+            // written there — they carry a per-session endpoint and token — so
+            // they travel over the wire like any other Agent's.
+            McpWireDelivery::NativeConfig => BrowserToolDelivery::Http,
+            // These Agents never receive wire MCP servers at all, so neither the
             // delegation tool nor the browser tool can reach them. Saying so is
             // better than listing tools that can never be called.
-            McpWireDelivery::NativeConfig
-            | McpWireDelivery::AcceptedButDropped
-            | McpWireDelivery::Rejected => BrowserToolDelivery::Unavailable,
+            McpWireDelivery::AcceptedButDropped | McpWireDelivery::Rejected => {
+                BrowserToolDelivery::Unavailable
+            }
         }
     }
 
@@ -788,11 +793,20 @@ mod tests {
             BrowserRuntime::tool_delivery_for_agent("codex"),
             BrowserToolDelivery::Http
         );
-        // These Agents read their own configuration file instead, so a wire MCP
-        // server never reaches them. Reporting `Unavailable` is the honest
-        // answer; listing tools that can never be called is worse than listing
-        // none.
-        for agent in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
+        // These Agents read their own configuration file instead, so a *user*
+        // server never reaches them over the wire. The built-ins do: they are
+        // never written to a native file, so the wire is their only path.
+        for agent in ["grok", "cursor", "hermes"] {
+            assert_eq!(
+                BrowserRuntime::tool_delivery_for_agent(agent),
+                BrowserToolDelivery::Http,
+                "{agent} receives the built-in browser server over the wire"
+            );
+        }
+        // An Agent that drops or rejects the field still receives nothing, and
+        // Reporting `Unavailable` is the honest answer there; listing tools that
+        // can never be called is worse than listing none.
+        for agent in ["pi", "factory-droid"] {
             assert_eq!(
                 BrowserRuntime::tool_delivery_for_agent(agent),
                 BrowserToolDelivery::Unavailable,
@@ -822,6 +836,12 @@ mod tests {
         assert_eq!(
             BrowserRuntime::tool_delivery_for_agent("pi"),
             BrowserToolDelivery::Unavailable
+        );
+        // A native-file Agent is not in the stdio-fallback set: its built-in
+        // server is forwarded over HTTP, which is what the label says.
+        assert_eq!(
+            BrowserRuntime::tool_delivery_for_agent("cursor"),
+            BrowserToolDelivery::Http
         );
     }
 
@@ -877,7 +897,16 @@ mod tests {
             BrowserRuntime::delivery_for("codex"),
             BrowserToolDelivery::Http
         );
-        for agent in ["grok", "cursor", "hermes", "pi", "factory-droid"] {
+        // A native-file Agent receives the built-ins over the wire even though
+        // a user server would have to go through its own file.
+        for agent in ["grok", "cursor", "hermes"] {
+            assert_eq!(
+                BrowserRuntime::delivery_for(agent),
+                BrowserToolDelivery::Http,
+                "{agent} receives the built-in browser server"
+            );
+        }
+        for agent in ["pi", "factory-droid"] {
             assert_eq!(
                 BrowserRuntime::delivery_for(agent),
                 BrowserToolDelivery::Unavailable,

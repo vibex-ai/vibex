@@ -2469,6 +2469,22 @@ impl CodeWorkbench {
         cx.notify();
     }
 
+    /// True when the panel is served by a paired remote runtime.
+    ///
+    /// Several panel controls have no wire representation yet, and the settings
+    /// that drive them have to say so rather than flip a switch that does
+    /// nothing on the machine the page is actually running on.
+    pub(crate) fn browser_panel_is_degraded(&self) -> bool {
+        self.browser_transport
+            .as_ref()
+            .and_then(|transport| {
+                transport
+                    .as_any()
+                    .downcast_ref::<crate::browser_transport::RemoteBrowserTransport>()
+            })
+            .is_some()
+    }
+
     /// Applies the browser preferences the settings own.
     ///
     /// The start page is read when a tab is opened, so only the search template

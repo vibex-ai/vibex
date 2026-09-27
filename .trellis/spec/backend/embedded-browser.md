@@ -87,7 +87,12 @@ agent acts on and what the user sees cannot diverge.
 
 9. **Downloads default to denied and file choosers are intercepted.** A page
    never chooses a write path and never opens a native dialog that does not
-   exist in headless mode.
+   exist in headless mode. When the reader allows downloads the behaviour is
+   `allowAndName` into `<runtime home>/downloads` — outside the workspace, so a
+   page cannot drop a file where a later build step would pick it up — and the
+   runtime renames Chrome's guid to `sanitize_download_filename`'s answer, so
+   the page influences the name and nothing else. Two downloads of the same name
+   are two files (`unique_download_path`), never one overwritten file.
 
 10. **The browser service is polled inside the Tokio runtime, always.**
    `BrowserService` is a Tokio citizen: it spawns Chrome, opens async pipes,
@@ -204,9 +209,17 @@ JSON-RPC to that endpoint. One handler serves both, so behaviour cannot drift.
   transport and a fallback. `wire_mcp_servers` keeps the first entry whose
   transport the agent supports and drops later entries with the same id;
   forwarding both would register the server twice.
-- Some agents (`grok`, `cursor`, `hermes`, `pi`, `factory-droid`) never receive
-  wire MCP servers at all. Report them as unavailable rather than listing tools
-  they can never call.
+- A **built-in** server also reaches the agents whose CLI reads its own MCP
+  file (`grok`, `cursor`, `hermes`). The double-registration reason for keeping
+  the wire empty on that tier applies to *user* servers, which are already in
+  the agent's file; a built-in is never written to a native file, because it
+  carries a per-session endpoint and token that a static file cannot hold. The
+  tier therefore forwards the built-ins only, and on the transport they declare
+  rather than on an `mcpCapabilities` answer those adapters have no reason to
+  give (`McpWireDelivery::forwards_builtin_servers`).
+- `pi` and `factory-droid` still receive nothing — one drops the field, the
+  other rejects it — and are reported as unavailable rather than listed with
+  tools they can never call.
 
 ## Element ↔ code
 
@@ -233,7 +246,29 @@ different answers about which file rendered an element.
   the parent document. That is the honest answer for a document this session
   cannot see into, and it is where a fuller per-frame lookup would start.
 
+The reverse direction is the editor's Alt+click, and it is a separate seam:
+`BrowserTransport::highlight_source` marks every element the framework says came
+from that file, picks the closest line, scrolls it into view and draws the same
+`Overlay.highlightNode` box an agent's action uses, so a watcher never has to
+ask which of the two they are looking at. Four rules matter:
+
+- **The page is not rewritten.** The lookup sets one marker attribute on the
+  matched element and clears it afterwards; nothing is inserted into a
+  framework's tree.
+- **A miss is visible.** No framework hook, no matching line, an approximate
+  file-only answer (Vue) and a transport error all reach the reader as a hint —
+  "I pressed it and nothing happened" is the failure this feature must not have.
+- **Every visible panel is asked.** Two panes can each show a browser tab and
+  only one renders the file; the tabs are tried in order and the first hit wins.
+- **The line comes from the caret, not the pointer.** The click has already
+  moved the caret by the time the button is released, so the line is the one the
+  reader aimed at even when the pointer sat on a wrapped row.
+
 ## Panel wiring (the parts that are easy to leave dangling)
+
+The preview tab strip marks a tab an Agent opened (`IconName::Bot`, from
+`BrowserTab.owner`), because a page can move on its own and the reader should
+not have to guess whether they drove it.
 
 The runtime already owns the browser; the panel is a subscriber. Three wires
 have been dropped once and must stay:
@@ -350,7 +385,11 @@ page. Each one needs a panel-side answer:
 | File chooser | card from `FileChooserOpened`; the Agent attaches files with `browser_upload`, the human cancels through `resolve_file_chooser` |
 | `<select>` popup | `probe_select_hint` on hover, then the panel's own list; `select_menu_at` / `choose_select_option` apply the choice and dispatch `input` + `change` |
 | Clipboard | Ctrl/Cmd+C reads the selection with `selection_text` and writes the system clipboard; Ctrl/Cmd+V types the system clipboard into the page with `Input.insertText`; Shift/Alt combinations stay with the page |
-| Downloads, permissions, HTTP auth | denied by policy or by Chrome itself (see Security rules) |
+| Downloads | denied by default; when allowed, `Browser.setDownloadBehavior` is `allowAndName` into the runtime's own directory and `Browser.downloadWillBegin` / `Browser.downloadProgress` rename the guid to the sanitized name. Both events are browser-level, so they are dispatched *before* the session-id early return in the event pump |
+| Permissions, HTTP auth | denied by Chrome itself (see Security rules) |
+| Find in page | no browser UI exists, so the panel owns Ctrl/Cmd+F. `find_in_page` walks text nodes and paints with the CSS Custom Highlight API, never by wrapping hits in `<mark>`: a foreign node inside a framework's tree makes its next render throw. The active hit is marked with one attribute because Chrome will not scroll to a bare range |
+| Mouse cursor | a frame carries no cursor, so `cursor_at` reads `getComputedStyle(el).cursor` at the hovered point and the panel maps it onto a native shape (`cursor_style_for`). Throttled to one probe per round trip; a keyword the platform cannot express falls back to the arrow |
+| Frame quality | JPEG 80 by default; the panel's HD toggle restarts the screencast as lossless PNG (`BrowserCaptureQuality`). The choice is a preference, so the panels follow each other and it survives a restart |
 
 The `<select>` probe runs on hover rather than on click on purpose: a click that
 waited for a round trip would reach the page after its own release, and Chrome

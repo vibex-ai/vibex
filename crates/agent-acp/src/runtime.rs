@@ -817,6 +817,60 @@ fn build_session_resume_params(
     params
 }
 
+/// Chooses the descriptors that actually travel on `session/new`.
+///
+/// Split from [`AcpProcess::wire_mcp_servers`] so the two rules that matter can
+/// be tested without a live process: which tier receives anything at all, and
+/// which of a tier's servers may travel. `skipped` counts the entries the
+/// transport gate dropped, so the caller can warn once per dropped server
+/// without this function needing a log context.
+fn select_wire_mcp_servers(
+    delivery: McpWireDelivery,
+    servers: &[AcpMcpServerDescriptor],
+    supports_http: bool,
+    supports_sse: bool,
+) -> (Vec<AcpMcpServerDescriptor>, usize) {
+    if servers.is_empty() || !delivery.forwards_builtin_servers() {
+        return (Vec::new(), 0);
+    }
+    // On the native-file tier only the built-ins travel: a user's own server is
+    // already in the Agent's file, and the wire copy would register it twice.
+    let builtin_only = !delivery.forwards_servers();
+    // A built-in server may be described more than once so the runtime can
+    // offer a preferred transport and a fallback. Keep the first entry whose
+    // transport the Agent supports and drop later entries with the same id:
+    // forwarding both would register the same server twice.
+    let mut seen_ids: Vec<String> = Vec::with_capacity(servers.len());
+    let mut forwarded = Vec::with_capacity(servers.len());
+    let mut skipped = 0usize;
+    for server in servers {
+        if seen_ids.contains(&server.id) {
+            continue;
+        }
+        if builtin_only && !vibex_core::is_builtin_mcp_server_id(&server.id) {
+            continue;
+        }
+        let allowed = match &server.transport {
+            AcpMcpTransportDescriptor::Stdio { .. } => true,
+            // A native-file Agent's `mcpCapabilities` is unreliable — the CLI
+            // answers its own file, so its adapter has little reason to
+            // advertise a transport it is never offered. The built-in endpoint
+            // is the case this tier exists for, so it travels on the transport
+            // it declares rather than on a capability the Agent may simply not
+            // report.
+            AcpMcpTransportDescriptor::Http { .. } => supports_http || builtin_only,
+            AcpMcpTransportDescriptor::Sse { .. } => supports_sse || builtin_only,
+        };
+        if allowed {
+            seen_ids.push(server.id.clone());
+            forwarded.push(server.clone());
+        } else {
+            skipped += 1;
+        }
+    }
+    (forwarded, skipped)
+}
+
 fn resolve_acp_mcp_descriptors(
     config: &AcpProviderConfig,
     resources: &ProviderRuntimeResources,
@@ -5239,7 +5293,12 @@ impl AcpProcess {
         if !delivery.forwards_servers() {
             self.log_context.for_operation("session/new").emit(
                 RuntimeLogLevel::Info,
-                "acp_mcp_wire_forwarding_skipped",
+                if delivery.forwards_builtin_servers() {
+                    // The native-file tier still receives the built-ins.
+                    "acp_mcp_wire_forwarding_builtin_only"
+                } else {
+                    "acp_mcp_wire_forwarding_skipped"
+                },
                 RuntimeMetricResult::Success,
                 Some(match delivery {
                     McpWireDelivery::NativeConfig => "acp_mcp_native_config",
@@ -5249,33 +5308,22 @@ impl AcpProcess {
                 }),
                 None,
             );
-            return Vec::new();
+            if !delivery.forwards_builtin_servers() {
+                return Vec::new();
+            }
         }
         let (supports_http, supports_sse) = self
             .shared
             .lock()
             .map(|shared| (shared.supports_mcp_http, shared.supports_mcp_sse))
             .unwrap_or((false, false));
-        // A built-in server may be described more than once so the runtime can
-        // offer a preferred transport and a fallback. Keep the first entry whose
-        // transport the Agent supports and drop later entries with the same id:
-        // forwarding both would register the same server twice.
-        let mut seen_ids: Vec<String> = Vec::with_capacity(self.mcp_servers.len());
-        let mut forwarded = Vec::with_capacity(self.mcp_servers.len());
-        for server in &self.mcp_servers {
-            if seen_ids.contains(&server.id) {
-                continue;
-            }
-            let allowed = match &server.transport {
-                AcpMcpTransportDescriptor::Stdio { .. } => true,
-                AcpMcpTransportDescriptor::Http { .. } => supports_http,
-                AcpMcpTransportDescriptor::Sse { .. } => supports_sse,
-            };
-            if allowed {
-                seen_ids.push(server.id.clone());
-                forwarded.push(server.clone());
-                continue;
-            }
+        let (forwarded, skipped) = select_wire_mcp_servers(
+            delivery,
+            &self.mcp_servers,
+            supports_http,
+            supports_sse,
+        );
+        for _ in 0..skipped {
             self.log_context.for_operation("session/new").emit(
                 RuntimeLogLevel::Warn,
                 "acp_mcp_transport_unsupported",
@@ -22475,6 +22523,108 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
     }
 
     #[test]
+    /// The browser and delegation servers are product capabilities that live
+    /// only on the wire: a native-file Agent's own MCP file cannot hold a
+    /// per-session endpoint and token. Forwarding them is what makes the tools
+    /// reach grok, cursor and hermes at all — while a *user* server stays out of
+    /// the wire for those Agents, because their file already has it.
+    #[test]
+    fn a_native_file_agent_receives_the_builtins_but_not_the_user_servers() {
+        let servers = vec![
+            AcpMcpServerDescriptor {
+                id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+                name: "Embedded browser".to_string(),
+                transport: AcpMcpTransportDescriptor::Http {
+                    url: "http://127.0.0.1:9/mcp".to_string(),
+                    headers: Vec::new(),
+                },
+            },
+            AcpMcpServerDescriptor {
+                id: "user-filesystem".to_string(),
+                name: "Filesystem".to_string(),
+                transport: AcpMcpTransportDescriptor::Stdio {
+                    command: "/usr/bin/npx".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                },
+            },
+        ];
+
+        // The capability the adapter may or may not advertise is irrelevant on
+        // this tier: the built-in endpoint is forwarded on the transport it
+        // declares.
+        let (forwarded, skipped) = select_wire_mcp_servers(
+            McpWireDelivery::NativeConfig,
+            &servers,
+            false,
+            false,
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![vibex_core::BROWSER_MCP_SERVER_ID],
+            "only the built-in travels on the native-file tier"
+        );
+
+        // A delivered Agent still receives both, and the transport gate still
+        // applies to the user's own HTTP server.
+        let (forwarded, skipped) = select_wire_mcp_servers(
+            McpWireDelivery::Delivered,
+            &servers,
+            true,
+            true,
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(forwarded.len(), 2);
+    }
+
+    #[test]
+    fn a_tier_that_drops_the_field_receives_nothing() {
+        for delivery in [
+            McpWireDelivery::AcceptedButDropped,
+            McpWireDelivery::Rejected,
+        ] {
+            let (forwarded, skipped) = select_wire_mcp_servers(
+                delivery,
+                &[AcpMcpServerDescriptor {
+                    id: vibex_core::BROWSER_MCP_SERVER_ID.to_string(),
+                    name: "Embedded browser".to_string(),
+                    transport: AcpMcpTransportDescriptor::Stdio {
+                        command: "/usr/bin/true".to_string(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                    },
+                }],
+                true,
+                true,
+            );
+            assert!(forwarded.is_empty(), "{delivery:?} must receive nothing");
+            assert_eq!(skipped, 0);
+        }
+    }
+
+    #[test]
+    fn the_transport_gate_still_warns_about_an_unsupported_server() {
+        let (forwarded, skipped) = select_wire_mcp_servers(
+            McpWireDelivery::Delivered,
+            &[AcpMcpServerDescriptor {
+                id: "remote".to_string(),
+                name: "Remote".to_string(),
+                transport: AcpMcpTransportDescriptor::Http {
+                    url: "https://example.invalid/mcp".to_string(),
+                    headers: Vec::new(),
+                },
+            }],
+            false,
+            false,
+        );
+        assert!(forwarded.is_empty());
+        assert_eq!(skipped, 1, "the dropped entry is what the warning counts");
+    }
+
     fn session_request_builders_include_mcp_descriptors() {
         let cwd = PathBuf::from("/tmp/vibex-workspace");
         let servers = vec![

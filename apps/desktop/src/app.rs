@@ -65056,6 +65056,72 @@ impl FoundationSettings {
                 cx,
             ));
         }
+        // A paired remote runtime serves the panel's frames over a channel that
+        // does not exist yet, and nothing in this group has a wire
+        // representation either. Saying so is better than a switch that appears
+        // to work and changes nothing on the machine running the page.
+        let degraded = self
+            .workbench
+            .read_with(cx, |workbench, _| workbench.browser_panel_is_degraded())
+            .unwrap_or(false);
+        let mut display_rows = vec![setting_row(
+            locale::text("Lossless frames", "无损画面", "無損畫面"),
+            locale::text(
+                "Stream the page as PNG instead of JPEG. Text is sharper, and the stream is larger \
+                 and slower; the panel's HD button switches the same setting.",
+                "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
+                "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
+            ),
+            Switch::new("browser-lossless-frames")
+                .small()
+                .checked(browser.capture_quality == BrowserCaptureQuality::High)
+                .on_click(cx.listener(|this, enabled, _, cx| {
+                    this.set_browser_capture_quality(
+                        if *enabled {
+                            BrowserCaptureQuality::High
+                        } else {
+                            BrowserCaptureQuality::Standard
+                        },
+                        cx,
+                    )
+                })),
+            stacked,
+            cx,
+        )];
+        display_rows.push(setting_row(
+            locale::text("Allow downloads", "允许下载", "允許下載"),
+            locale::text(
+                "Let a page save a file into the runtime's own downloads directory. Off by \
+                 default: a download writes to this machine, and the page cannot choose where.",
+                "允许页面把文件保存到 runtime 自己的下载目录。默认关闭：下载会写入本机，且页面无法决定写入位置。",
+                "允許頁面把檔案儲存到 runtime 自己的下載目錄。預設關閉：下載會寫入本機，且頁面無法決定寫入位置。",
+            ),
+            Switch::new("browser-allow-downloads")
+                .small()
+                .checked(browser.downloads_enabled)
+                .on_click(
+                    cx.listener(|this, enabled, _, cx| {
+                        this.set_browser_downloads_enabled(*enabled, cx)
+                    }),
+                ),
+            stacked,
+            cx,
+        ));
+        if degraded {
+            display_rows.push(
+                div()
+                    .max_w(px(560.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "This client is paired with a remote runtime. The panel's frames and these \
+                         display settings travel over a channel that is not implemented yet, so \
+                         the choices here apply to the next local runtime instead.",
+                        "此客户端连接的是远程 runtime。面板画面与这些显示设置所依赖的通道尚未实现，因此这里的选项会在下次使用本机 runtime 时生效。",
+                        "此客戶端連接的是遠端 runtime。面板畫面與這些顯示設定所依賴的通道尚未實作，因此這裡的選項會在下次使用本機 runtime 時生效。",
+                    )),
+            );
+        }
         settings_page(
             locale::text("Browser", "浏览器", "瀏覽器"),
             locale::text(
@@ -65069,53 +65135,7 @@ impl FoundationSettings {
                     new_tab_rows,
                 ),
                 SettingsGroup::new(locale::text("Search", "搜索", "搜尋"), search_rows),
-                SettingsGroup::new(
-                    locale::text("Display", "显示", "顯示"),
-                    vec![
-                        setting_row(
-                            locale::text("Lossless frames", "无损画面", "無損畫面"),
-                            locale::text(
-                                "Stream the page as PNG instead of JPEG. Text is sharper, and the \
-                             stream is larger and slower; the panel's HD button switches the \
-                             same setting.",
-                                "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
-                                "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
-                            ),
-                            Switch::new("browser-lossless-frames")
-                                .small()
-                                .checked(browser.capture_quality == BrowserCaptureQuality::High)
-                                .on_click(cx.listener(|this, enabled, _, cx| {
-                                    this.set_browser_capture_quality(
-                                        if *enabled {
-                                            BrowserCaptureQuality::High
-                                        } else {
-                                            BrowserCaptureQuality::Standard
-                                        },
-                                        cx,
-                                    )
-                                })),
-                            stacked,
-                            cx,
-                        ),
-                        setting_row(
-                            locale::text("Allow downloads", "允许下载", "允許下載"),
-                            locale::text(
-                                "Let a page save a file into the runtime's own downloads directory.                              Off by default: a download writes to this machine, and the page \
-                             cannot choose where.",
-                                "允许页面把文件保存到 runtime 自己的下载目录。默认关闭：下载会写入本机，且页面无法决定写入位置。",
-                                "允許頁面把檔案儲存到 runtime 自己的下載目錄。預設關閉：下載會寫入本機，且頁面無法決定寫入位置。",
-                            ),
-                            Switch::new("browser-allow-downloads")
-                                .small()
-                                .checked(browser.downloads_enabled)
-                                .on_click(cx.listener(|this, enabled, _, cx| {
-                                    this.set_browser_downloads_enabled(*enabled, cx)
-                                })),
-                            stacked,
-                            cx,
-                        ),
-                    ],
-                ),
+                SettingsGroup::new(locale::text("Display", "显示", "顯示"), display_rows),
             ],
             cx,
         )

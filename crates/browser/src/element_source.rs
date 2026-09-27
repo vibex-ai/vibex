@@ -122,16 +122,6 @@ pub fn marker_setup_script() -> &'static str {
 })()"#
 }
 
-/// Builds the runtime call that tags an element by backend node id.
-pub fn mark_target_script() -> &'static str {
-    r#"(() => {
-  document.querySelectorAll('[data-vibex-source-target="1"]').forEach((node) => {
-    node.removeAttribute('data-vibex-source-target');
-  });
-  return true;
-})()"#
-}
-
 /// Parses a probe result into the public contract.
 pub fn parse_probe_result(value: &Value) -> BrowserElementSource {
     let framework = value

@@ -780,7 +780,10 @@ impl BrowserTransport for RemoteBrowserTransport {
     }
 
     fn set_downloads_enabled(&self, _enabled: bool) -> BrowserTransportFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        // The browser this would configure lives on the paired machine, and the
+        // policy has no wire representation yet. Failing is the honest answer:
+        // reporting success would flip a switch that does nothing.
+        Box::pin(async move { Self::unavailable() })
     }
 
     fn cursor_at(

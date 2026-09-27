@@ -3662,7 +3662,7 @@ pub(crate) async fn observe_tab(
     max_elements: usize,
     depth: u16,
     filter: Option<(Option<String>, Option<String>)>,
-) -> BrowserResult<(String, String, u64, Vec<PrunedElement>, bool)> {
+) -> BrowserResult<ObservedTab> {
     let (connection, session) = inner.tab_session(tab_id).await?;
     let result = cdp(
         &session,
@@ -3746,7 +3746,34 @@ pub(crate) async fn observe_tab(
         tab.last_activity_at_ms = unix_timestamp_ms();
         (tab.url.clone(), tab.title.clone(), tab.generation)
     };
-    Ok((url, title, generation, pruned.elements, pruned.truncated))
+    Ok(ObservedTab {
+        observation: vibex_core::BrowserObservation {
+            tab_id: tab_id.clone(),
+            url,
+            title,
+            generation,
+            // Assignment happens here so the public DTO is the one the callers
+            // hand on: refs are part of the observation contract, not a detail
+            // of how the tool formats it.
+            elements: crate::ax::assign_references(&pruned.elements, generation),
+            truncated: pruned.truncated,
+            // Frames that answered with elements are the ones the model can
+            // actually reach; a frame that contributed nothing is not worth
+            // listing, because its refs do not exist.
+            frames,
+        },
+        elements: pruned.elements,
+    })
+}
+
+/// One tab's observation, with the raw elements kept for ref assignment.
+///
+/// The public [`vibex_core::BrowserObservation`] is the contract; the pruned
+/// elements stay alongside it because reference assignment needs the frame each
+/// element came from, which the public DTO deliberately does not carry.
+pub(crate) struct ObservedTab {
+    pub(crate) observation: vibex_core::BrowserObservation,
+    pub(crate) elements: Vec<PrunedElement>,
 }
 
 /// Refreshes a tab's title from the document.
