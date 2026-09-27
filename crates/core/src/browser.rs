@@ -296,6 +296,7 @@ pub enum BrowserActionKind {
     SnapshotBaseline,
     CompareBaseline,
     ElementToSource,
+    Download,
     #[serde(other)]
     Unknown,
 }
@@ -331,6 +332,7 @@ impl BrowserActionKind {
             Self::SnapshotBaseline => "snapshot_baseline",
             Self::CompareBaseline => "compare_baseline",
             Self::ElementToSource => "element_to_source",
+            Self::Download => "download",
             Self::Unknown => "unknown",
         }
     }

@@ -20,11 +20,13 @@
 
 pub mod ax;
 pub mod cdp;
+pub mod cursor;
 pub mod devserver;
 pub mod discovery;
 pub mod element_source;
 pub mod error;
 pub mod execute;
+pub mod find;
 pub mod http;
 pub mod mcp;
 pub mod policy;

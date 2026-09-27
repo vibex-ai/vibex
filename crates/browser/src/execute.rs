@@ -2134,6 +2134,73 @@ impl BrowserService {
         self.probe_element_source(&session, backend_node_id).await
     }
 
+    /// Reads the page's computed cursor at a viewport point.
+    ///
+    /// A screencast frame has no cursor, so the panel would show an arrow
+    /// everywhere. This is the answer a real browser would act on, read from
+    /// the hovered element.
+    pub async fn cursor_at(&self, tab_id: &BrowserTabId, x: f64, y: f64) -> BrowserResult<String> {
+        let (_, session) = self.inner().tab_session(tab_id).await?;
+        let answer = cdp(
+            &session,
+            "Runtime.evaluate",
+            crate::cursor::cursor_probe_params(x, y),
+            SHORT_TIMEOUT_MS,
+        )
+        .await?;
+        let value = answer
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(crate::cursor::parse_cursor(&value).unwrap_or_else(|| "auto".to_string()))
+    }
+
+    /// Runs the panel's find-in-page search.
+    ///
+    /// `forward` steps to the next match when the query has not changed since
+    /// the last call, which is what Enter and Shift+Enter do. The search never
+    /// touches the page's own tree — see [`crate::find`] — so a framework's
+    /// next render cannot be broken by having searched.
+    pub async fn find_in_page(
+        &self,
+        tab_id: &BrowserTabId,
+        query: &str,
+        forward: bool,
+    ) -> BrowserResult<(u32, u32)> {
+        let (_, session) = self.inner().tab_session(tab_id).await?;
+        let answer = cdp(
+            &session,
+            "Runtime.evaluate",
+            crate::find::evaluate_params(crate::find::find_script(query, forward)),
+            BROWSER_CDP_COMMAND_TIMEOUT_MS,
+        )
+        .await?;
+        let value = answer
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(crate::find::parse_find_result(&value))
+    }
+
+    /// Removes the find-in-page highlights and the style they injected.
+    ///
+    /// Best effort by design: the bar is closing, and a page that has already
+    /// navigated away has nothing left to clear.
+    pub async fn clear_find_in_page(&self, tab_id: &BrowserTabId) {
+        let Ok((_, session)) = self.inner().tab_session(tab_id).await else {
+            return;
+        };
+        let _ = cdp(
+            &session,
+            "Runtime.evaluate",
+            crate::find::evaluate_params(crate::find::clear_find_script()),
+            SHORT_TIMEOUT_MS,
+        )
+        .await;
+    }
+
     /// Highlights the element a source line rendered.
     ///
     /// The editor's Alt+click asks this: the human points at code and the page

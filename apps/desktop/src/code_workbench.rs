@@ -50,20 +50,21 @@ use vibex_content::{
     ContentSurfaceKind, ContentSurfaceLifecycle, ContentSurfaceOrigin, LogicalSurfaceBounds,
 };
 use vibex_core::{
-    BrowserCaptureQuality, BrowserSessionId, BrowserTab, BrowserTabId, FileEncoding, FileEntryKind,
-    FileLineEnding, FileMutationRequest, FilePreviewKind, FileReadRequest, FileReadResponse,
-    FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    GitBranchSummary, GitChange, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
-    GitCommitSummary, GitDiffRequest, GitDiffResponse, GitHistoryAuthor, GitHistoryRequest,
-    GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitRemoteSummary,
-    GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictFile,
-    GitWorktreeConflictKind, GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest,
-    GitWorktreeConflictVersion, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
-    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
-    GitWorktreeMergeStrategy, GitWorktreeOperationRecord, GitWorktreeOperationRequest,
-    GitWorktreeOperationStatus, GitWorktreeReadinessRequest, GitWorktreeReadinessState,
-    GitWorktreeRestoreRequest, GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId,
-    TerminalSession, TerminalStatus, VibexError, WorkspaceId, unix_timestamp_ms,
+    BrowserCaptureQuality, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabOwner,
+    FileEncoding, FileEntryKind, FileLineEnding, FileMutationRequest, FilePreviewKind,
+    FileReadRequest, FileReadResponse, FileSearchRequest, FileSearchResult, FileTreeEntry,
+    FileTreeRequest, FileWriteRequest, GitBranchSummary, GitChange, GitChangeKind,
+    GitCommitDetailRequest, GitCommitRequest, GitCommitSummary, GitDiffRequest, GitDiffResponse,
+    GitHistoryAuthor, GitHistoryRequest, GitManagedWorktreeStatus, GitRemoteActionKind,
+    GitRemoteActionRequest, GitRemoteSummary, GitStageRequest, GitStatusSummary,
+    GitWorktreeArchiveRequest, GitWorktreeConflictFile, GitWorktreeConflictKind,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeConflictVersion,
+    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
+    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeMergeStrategy,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
+    GitWorktreeReadinessRequest, GitWorktreeReadinessState, GitWorktreeRestoreRequest,
+    GitWorktreeRisk, GitWorktreeRiskKind, RequestId, TerminalId, TerminalSession, TerminalStatus,
+    VibexError, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     BoundedImageCache, BrowserUiState, ContentPreviewKind, DEFAULT_EDITOR_AUTOSAVE_DELAY_MS,
@@ -1051,6 +1052,8 @@ struct BrowserTabLabel {
     loading: bool,
     /// The page's icon, decoded by the surface that owns the tab.
     favicon: Option<Arc<RenderImage>>,
+    /// Who opened the tab, so the strip can mark an Agent's own tabs.
+    owner: Option<BrowserTabOwner>,
 }
 
 /// The browser transport slice of the desktop bundle.
@@ -2438,6 +2441,17 @@ impl CodeWorkbench {
         cx: &mut Context<Self>,
     ) {
         self.browser_transport = transport;
+        // The policy lives on the runtime's browser, not on a panel: applying
+        // it here means a reader who allowed downloads keeps that across a
+        // restart without opening a tab first.
+        if let Some(transport) = self.browser_transport.clone() {
+            let enabled = self.browser_preferences.downloads_enabled;
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = transport.set_downloads_enabled(enabled).await;
+                })
+                .detach();
+        }
         if self.browser_transport.is_none() {
             self.retire_browser_surfaces(cx);
             self.active_browser_surface_ids.clear();
@@ -2468,9 +2482,19 @@ impl CodeWorkbench {
         if self.browser_preferences == preferences {
             return;
         }
+        let downloads_changed =
+            self.browser_preferences.downloads_enabled != preferences.downloads_enabled;
         self.browser_preferences = preferences;
         let template = self.browser_preferences.resolved_search_url().to_string();
         let quality = self.browser_preferences.capture_quality;
+        if downloads_changed && let Some(transport) = self.browser_transport.clone() {
+            let enabled = self.browser_preferences.downloads_enabled;
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = transport.set_downloads_enabled(enabled).await;
+                })
+                .detach();
+        }
         let surfaces = self.browser_surfaces.values().cloned().collect::<Vec<_>>();
         for surface in surfaces {
             surface.update(cx, |surface, cx| {
@@ -4574,13 +4598,14 @@ impl CodeWorkbench {
             window,
             |workbench, surface, event: &BrowserSurfaceEvent, window, cx| {
                 if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
-                    let (title, loading, favicon, url) = {
+                    let (title, loading, favicon, url, owner) = {
                         let surface = surface.read(cx);
                         (
                             surface.page_title().unwrap_or_default(),
                             surface.is_loading(),
                             surface.favicon(),
                             surface.page_url(),
+                            surface.tab_owner(),
                         )
                     };
                     workbench.browser_tab_labels.insert(
@@ -4589,6 +4614,7 @@ impl CodeWorkbench {
                             title,
                             loading,
                             favicon,
+                            owner,
                         },
                     );
                     // The address is the one piece of page state a restart can
@@ -8125,6 +8151,17 @@ impl CodeWorkbench {
                 .and_then(|label| label.favicon.clone()),
             _ => None,
         };
+        // An Agent's tab is marked in the strip: the page can move on its own,
+        // and the reader should not have to guess whether they drove it.
+        let agent_browser_tab = matches!(
+            &tab.target,
+            PreviewTarget::Browser { browser_tab_id, .. }
+                if self
+                    .browser_tab_labels
+                    .get(browser_tab_id)
+                    .and_then(|label| label.owner)
+                    == Some(BrowserTabOwner::Agent)
+        );
         let target_icon = preview_target_icon(&tab.target, browser_favicon, cx);
         let file_path = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
@@ -8373,6 +8410,13 @@ impl CodeWorkbench {
                     .into_any_element()
             } else {
                 target_icon
+            })
+            .when(agent_browser_tab, |this| {
+                this.child(
+                    Icon::new(IconName::Bot)
+                        .size(px(11.0))
+                        .text_color(cx.theme().muted_foreground),
+                )
             })
             .when(pinned, |this| {
                 this.child(
@@ -9428,7 +9472,7 @@ impl CodeWorkbench {
                                         .editor_bindings
                                         .get(&reveal_path)
                                         .map(|binding| {
-                                            binding.input.read(cx).cursor_position().line as u32 + 1
+                                            binding.input.read(cx).cursor_position().line + 1
                                         })
                                         .unwrap_or(1);
                                     this.reveal_source_in_browser(
@@ -18752,6 +18796,10 @@ mod tests {
         reveals: Arc<std::sync::Mutex<Vec<(String, String, u32)>>>,
         /// Answers `highlight_source` with a hit once set.
         reveal_hits: Arc<std::sync::atomic::AtomicBool>,
+        /// The download policy the workbench asked the runtime for.
+        downloads_enabled: Arc<std::sync::atomic::AtomicBool>,
+        /// How many times the policy was set, so a no-op is recognizable.
+        downloads_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl crate::browser_transport::BrowserTransport for IdleBrowserTransport {
@@ -18788,6 +18836,38 @@ mod tests {
                     "no element source",
                 ))
             })
+        }
+        fn set_downloads_enabled(
+            &self,
+            enabled: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            self.downloads_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.downloads_enabled
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn cursor_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
+            Box::pin(async { Ok("auto".to_string()) })
+        }
+        fn find_in_page(
+            &self,
+            _tab_id: &BrowserTabId,
+            _query: &str,
+            _forward: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, (u32, u32)> {
+            Box::pin(async { Ok((0, 0)) })
+        }
+        fn clear_find_in_page(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
         }
         fn highlight_source(
             &self,
@@ -19172,6 +19252,59 @@ mod tests {
                 "the HD setting reaches a panel that is already open"
             );
         });
+    }
+
+    // Downloads are a write to this machine, so the policy is off until the
+    // reader turns it on — and the runtime hears about it either way.
+    #[gpui::test]
+    fn the_download_policy_reaches_the_runtime(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        let policy = transport.downloads_enabled.clone();
+        let calls = transport.downloads_calls.clone();
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !policy.load(std::sync::atomic::Ordering::SeqCst),
+            "a fresh runtime is told the default: no downloads"
+        );
+
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_preferences(
+                BrowserUiState {
+                    downloads_enabled: true,
+                    ..BrowserUiState::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            policy.load(std::sync::atomic::Ordering::SeqCst),
+            "the setting reaches the browser"
+        );
+
+        // A preference change that does not touch downloads must not re-send
+        // the policy: the call is a CDP round trip on a live browser.
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_browser_preferences(
+                BrowserUiState {
+                    downloads_enabled: true,
+                    search_engine_url: "https://example.com/find?q={query}".to_string(),
+                    ..BrowserUiState::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "an unrelated preference does not resend the download policy"
+        );
     }
 
     // The startup order is not fixed: the layout and its surfaces can exist

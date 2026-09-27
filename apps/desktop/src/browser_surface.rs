@@ -43,8 +43,8 @@ use vibex_browser::BrowserInput;
 use vibex_core::{
     BrowserActionKind, BrowserActionRecord, BrowserAvailability, BrowserCaptureQuality,
     BrowserDialogRequest, BrowserExecutionSource, BrowserFrame, BrowserFrameMetadata,
-    BrowserOperationStatus, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabStatus,
-    BrowserUnavailableReason, unix_timestamp_ms,
+    BrowserOperationStatus, BrowserSessionId, BrowserTab, BrowserTabId, BrowserTabOwner,
+    BrowserTabStatus, BrowserUnavailableReason, unix_timestamp_ms,
 };
 
 use vibex_desktop_model::SEARCH_QUERY_PLACEHOLDER;
@@ -88,6 +88,7 @@ fn activity_kind(kind: BrowserActionKind) -> &'static str {
         BrowserActionKind::SnapshotBaseline => "baseline",
         BrowserActionKind::CompareBaseline => "compare",
         BrowserActionKind::ElementToSource => "source",
+        BrowserActionKind::Download => "download",
         BrowserActionKind::Unknown => "other",
     }
 }
@@ -204,6 +205,17 @@ pub struct BrowserSurface {
     select_hint: Option<SelectHint>,
     /// The open fallback menu, anchored where the click landed.
     select_menu: Option<OpenSelectMenu>,
+    /// True while the find bar is open. The page keeps its highlights until the
+    /// bar closes, so the reader can step through hits and still see them.
+    find_open: bool,
+    /// What the reader typed into the find bar.
+    find_input: Entity<InputState>,
+    /// The match counter, as the page reported it: `current` of `total`.
+    find_total: u32,
+    find_current: u32,
+    /// True while a search is in flight, so the bar can say so instead of
+    /// showing a count that is about to change.
+    find_pending: bool,
     /// The session's redacted operation ledger, newest last.
     ///
     /// This is what lets a human see what the Agent did without having watched
@@ -224,6 +236,16 @@ pub struct BrowserSurface {
     recording: bool,
     /// True while a hover probe is outstanding.
     select_probe_in_flight: bool,
+    /// The cursor the page asked for at the last hovered point.
+    ///
+    /// The screencast carries no cursor, so without this the panel shows an
+    /// arrow over every link, text field and resize handle alike.
+    hover_cursor: gpui::CursorStyle,
+    /// True while a cursor probe is outstanding, and when the last one ran.
+    cursor_probe_in_flight: bool,
+    cursor_probed_at: Option<std::time::Instant>,
+    /// The frame's hitbox, shared with the paint that applies the cursor.
+    frame_hitbox: std::rc::Rc<std::cell::RefCell<Option<gpui::Hitbox>>>,
     /// Who the runtime says is driving this tab.
     execution_source: Option<BrowserExecutionSource>,
     /// True while a human's own input has paused the Agent on this tab, so the
@@ -259,6 +281,25 @@ impl BrowserSurface {
                 .submit_on_enter(true)
                 .placeholder("Enter a URL")
         });
+        let find_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .submit_on_enter(true)
+                .placeholder("Find in page")
+        });
+        // Enter steps forward, Shift+Enter back — the same contract as the
+        // browser's own find bar. The page is searched as the reader types, so
+        // there is nothing to submit besides the step.
+        let find_subscription = cx.subscribe_in(
+            &find_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.run_find(false, true, cx),
+                InputEvent::PressEnter { shift, .. } => this.run_find(*shift, false, cx),
+                _ => {
+                    let _ = window;
+                }
+            },
+        );
         // Enter in the address bar navigates. The subscription lives on the
         // surface so a keyboard-only reader never has to reach for the mouse.
         let address_subscription = cx.subscribe_in(
@@ -297,6 +338,15 @@ impl BrowserSurface {
             file_chooser_pending: false,
             select_hint: None,
             select_menu: None,
+            hover_cursor: gpui::CursorStyle::Arrow,
+            cursor_probe_in_flight: false,
+            cursor_probed_at: None,
+            frame_hitbox: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            find_open: false,
+            find_input,
+            find_total: 0,
+            find_current: 0,
+            find_pending: false,
             ledger: Vec::new(),
             ledger_open: false,
             ledger_pending: false,
@@ -310,7 +360,7 @@ impl BrowserSurface {
             focus: cx.focus_handle(),
             marked_text: None,
             active: false,
-            _subscriptions: vec![address_subscription],
+            _subscriptions: vec![address_subscription, find_subscription],
             address_input,
             search_template: vibex_desktop_model::BrowserUiState::default()
                 .resolved_search_url()
@@ -374,6 +424,15 @@ impl BrowserSurface {
     /// The page's icon, for the preview tab.
     pub fn favicon(&self) -> Option<Arc<RenderImage>> {
         self.favicon.clone()
+    }
+
+    /// Who opened this tab, as the runtime reports it.
+    ///
+    /// The preview tab strip marks an Agent's tabs: a human watching a page
+    /// move on its own should be able to tell, at a glance, that an Agent is
+    /// driving rather than a stray click.
+    pub fn tab_owner(&self) -> Option<BrowserTabOwner> {
+        self.tab.as_ref().map(|tab| tab.owner)
     }
 
     /// Fetches the page's icon once per URL.
@@ -917,6 +976,18 @@ impl BrowserSurface {
         {
             return;
         }
+        // Find is the panel's: headless Chrome has no find bar of its own, so
+        // forwarding the shortcut would do nothing at all.
+        if is_find_shortcut(&event.keystroke) {
+            self.open_find(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape" && self.find_open {
+            self.close_find(cx);
+            cx.stop_propagation();
+            return;
+        }
         // Copy and paste belong to the panel: headless Chrome has its own
         // clipboard, so forwarding the shortcut would copy into a buffer the
         // human can never reach.
@@ -938,6 +1009,45 @@ impl BrowserSurface {
         };
         self.dispatch(input, cx);
         cx.stop_propagation();
+    }
+
+    /// Asks the page what cursor the hovered element wants.
+    ///
+    /// Throttled rather than run per motion event: a pointer crossing the panel
+    /// fires dozens of moves, and one probe per round trip is already finer than
+    /// the eye. The previous cursor stays until an answer arrives, so a moving
+    /// pointer does not flicker.
+    fn probe_cursor(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
+        const CURSOR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+        if self.cursor_probe_in_flight {
+            return;
+        }
+        if self
+            .cursor_probed_at
+            .is_some_and(|at| at.elapsed() < CURSOR_PROBE_INTERVAL)
+        {
+            return;
+        }
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        self.cursor_probe_in_flight = true;
+        self.cursor_probed_at = Some(std::time::Instant::now());
+        cx.spawn(async move |this, cx| {
+            let cursor = transport.cursor_at(&tab_id, x, y).await.ok();
+            let _ = this.update(cx, |surface, cx| {
+                surface.cursor_probe_in_flight = false;
+                let Some(cursor) = cursor else {
+                    return;
+                };
+                let style = cursor_style_for(&cursor);
+                if surface.hover_cursor != style {
+                    surface.hover_cursor = style;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Asks the page whether a `<select>` sits under the pointer.
@@ -1073,6 +1183,142 @@ impl BrowserSurface {
             });
         })
         .detach();
+    }
+
+    /// Opens the find bar and puts the caret in it.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        window.focus(&self.find_input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Closes the find bar and takes its highlights off the page.
+    ///
+    /// The page is the one that has to forget: an attribute and an injected
+    /// style sheet outlive the panel's own state otherwise.
+    pub fn close_find(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.find_total = 0;
+        self.find_current = 0;
+        self.find_pending = false;
+        if let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) {
+            cx.background_executor()
+                .spawn(async move { transport.clear_find_in_page(&tab_id).await })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// Searches the page for what the find bar holds.
+    ///
+    /// `restart` is a fresh search of the typed text; without it this is a step
+    /// to the next (or previous) match. `backward` is Shift+Enter.
+    fn run_find(&mut self, backward: bool, restart: bool, cx: &mut Context<Self>) {
+        let query = self.find_input.read(cx).value().to_string();
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        if restart && query.is_empty() {
+            // An emptied field is a cleared search, not a search for "".
+            self.find_total = 0;
+            self.find_current = 0;
+            if let Some(tab_id) = self.tab_id.clone() {
+                cx.background_executor()
+                    .spawn(async move { transport.clear_find_in_page(&tab_id).await })
+                    .detach();
+            }
+            let _ = tab_id;
+            cx.notify();
+            return;
+        }
+        self.find_pending = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = transport.find_in_page(&tab_id, &query, !backward).await;
+            let _ = this.update(cx, |surface, cx| {
+                surface.find_pending = false;
+                match result {
+                    Ok((total, current)) => {
+                        surface.find_total = total;
+                        surface.find_current = current;
+                    }
+                    Err(error) => {
+                        surface.find_total = 0;
+                        surface.find_current = 0;
+                        surface.message = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The find bar, drawn under the toolbar.
+    fn render_find_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.find_open {
+            return None;
+        }
+        let counter = if self.find_pending {
+            "…".to_string()
+        } else if self.find_total == 0 {
+            locale::text("No matches", "无匹配", "無相符").to_string()
+        } else {
+            format!("{} / {}", self.find_current, self.find_total)
+        };
+        Some(
+            h_flex()
+                .id("browser-find")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.find_input).small()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(counter),
+                )
+                .child(
+                    Button::new("browser-find-previous")
+                        .icon(Icon::new(IconName::ArrowUp))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Previous match", "上一个匹配", "上一個相符"))
+                        .on_click(cx.listener(|this, _, _, cx| this.run_find(true, false, cx))),
+                )
+                .child(
+                    Button::new("browser-find-next")
+                        .icon(Icon::new(IconName::ArrowDown))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Next match", "下一个匹配", "下一個相符"))
+                        .on_click(cx.listener(|this, _, _, cx| this.run_find(false, false, cx))),
+                )
+                .child(
+                    Button::new("browser-find-close")
+                        .icon(Icon::new(IconName::Close))
+                        .ghost()
+                        .xsmall()
+                        .tooltip(locale::text("Close find", "关闭查找", "關閉尋找"))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_find(cx))),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Keeps the address bar in step with the page while the reader is not
@@ -1298,6 +1544,9 @@ impl BrowserSurface {
         let can_go_back = self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
         let can_go_forward = self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
         let prepaint_entity = input_entity.clone();
+        let prepaint_hitbox = self.frame_hitbox.clone();
+        let frame_hitbox = self.frame_hitbox.clone();
+        let hover_cursor = self.hover_cursor;
         let active = self.active;
         let has_frame = self.frame_image.is_some();
         let phase_message = self.phase_message();
@@ -1425,6 +1674,7 @@ impl BrowserSurface {
                 let buttons = if event.dragging() { 1 } else { 0 };
                 this.dispatch(vibex_browser::BrowserInput::MouseMove { x, y, buttons }, cx);
                 this.probe_select_hint(x, y, cx);
+                this.probe_cursor(x, y, cx);
             }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let Some((x, y)) = this.to_viewport_point(event.position) else {
@@ -1458,6 +1708,11 @@ impl BrowserSurface {
                         // page has to render at the density it is displayed at,
                         // or a HiDPI panel shows a page laid out at 1x.
                         let scale_factor = window.scale_factor();
+                        // The hitbox is what the paint below attaches the
+                        // page's cursor to; it has to be the frame's own
+                        // bounds, or the cursor would change over the toolbar.
+                        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+                        *prepaint_hitbox.borrow_mut() = Some(hitbox);
                         prepaint_entity.update(cx, |this, cx| {
                             this.frame_bounds = Some(bounds);
                             this.schedule_viewport(
@@ -1469,6 +1724,9 @@ impl BrowserSurface {
                         });
                     },
                     move |bounds, _, window, cx| {
+                        if let Some(hitbox) = frame_hitbox.borrow().as_ref() {
+                            window.set_cursor_style(hover_cursor, hitbox);
+                        }
                         if active {
                             window.handle_input(
                                 &focus,
@@ -2523,6 +2781,51 @@ fn clipboard_command(keystroke: &Keystroke) -> Option<ClipboardCommand> {
     }
 }
 
+/// Maps a CSS `cursor` keyword onto the native cursor closest to it.
+///
+/// Several CSS values have no platform equivalent — `zoom-in`, `help`,
+/// `wait` — and those fall back to the arrow rather than guessing at something
+/// the page did not ask for.
+pub fn cursor_style_for(cursor: &str) -> gpui::CursorStyle {
+    use gpui::CursorStyle as Style;
+    match cursor.trim().to_ascii_lowercase().as_str() {
+        "text" => Style::IBeam,
+        "vertical-text" => Style::IBeamCursorForVerticalLayout,
+        "crosshair" | "cell" => Style::Crosshair,
+        "pointer" | "hand" => Style::PointingHand,
+        "grab" | "all-scroll" => Style::OpenHand,
+        "grabbing" => Style::ClosedHand,
+        "not-allowed" | "no-drop" => Style::OperationNotAllowed,
+        "col-resize" | "ew-resize" => Style::ResizeLeftRight,
+        "row-resize" | "ns-resize" => Style::ResizeUpDown,
+        "e-resize" => Style::ResizeRight,
+        "w-resize" => Style::ResizeLeft,
+        "n-resize" | "up-arrow" => Style::ResizeUp,
+        "s-resize" | "down-arrow" => Style::ResizeDown,
+        "nesw-resize" => Style::ResizeUpRightDownLeft,
+        "nwse-resize" => Style::ResizeUpLeftDownRight,
+        "context-menu" => Style::ContextualMenu,
+        "alias" => Style::DragLink,
+        "copy" => Style::DragCopy,
+        _ => Style::Arrow,
+    }
+}
+
+/// Whether a keystroke is the panel's find shortcut.
+///
+/// Control on Linux and Windows, Command on macOS. Shift is included because
+/// "find previous" is a different key in a browser but the same one here: the
+/// bar is opened either way, and the step is decided inside it.
+fn is_find_shortcut(keystroke: &Keystroke) -> bool {
+    if keystroke.modifiers.alt || keystroke.modifiers.function {
+        return false;
+    }
+    if !(keystroke.modifiers.control || keystroke.modifiers.platform) {
+        return false;
+    }
+    matches!(keystroke.key.as_str(), "f" | "F")
+}
+
 fn key_input(keystroke: &Keystroke, event_type: &str) -> Option<BrowserInput> {
     let identity = named_page_key(keystroke.key.as_str()).or_else(|| {
         let shortcut =
@@ -2709,6 +3012,7 @@ impl Render for BrowserSurface {
         }
         self.sync_address_field(window, cx);
         let toolbar = self.render_toolbar(cx);
+        let find_bar = self.render_find_bar(cx);
         let takeover = self.render_takeover(cx);
         let recording = self.render_recording(cx);
         let source_notice = self.render_source_notice(cx);
@@ -2728,6 +3032,7 @@ impl Render for BrowserSurface {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(toolbar)
+            .when_some(find_bar, |this, bar| this.child(bar))
             .when_some(takeover, |this, takeover| this.child(takeover))
             .when_some(recording, |this, recording| this.child(recording))
             .when_some(source_notice, |this, notice| this.child(notice))
@@ -3393,6 +3698,12 @@ mod tests {
         subscribe_failures: Arc<std::sync::atomic::AtomicUsize>,
         /// History moves, `true` for forward.
         history_moves: Arc<std::sync::Mutex<Vec<bool>>>,
+        /// Find-in-page searches as `(query, forward)`, in call order.
+        find_calls: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        /// What `find_in_page` answers: `(total, current)`.
+        find_answer: Arc<std::sync::Mutex<(u32, u32)>>,
+        /// How many times the page was asked to drop its highlights.
+        find_clears: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Default for RecordingTransport {
@@ -3408,6 +3719,9 @@ mod tests {
                 subscribe_qualities: Arc::new(std::sync::Mutex::new(Vec::new())),
                 subscribe_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 history_moves: Arc::new(std::sync::Mutex::new(Vec::new())),
+                find_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                find_answer: Arc::new(std::sync::Mutex::new((0, 0))),
+                find_clears: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -3441,6 +3755,41 @@ mod tests {
         > {
             let ledger = self.ledger.lock().unwrap().clone();
             Box::pin(async move { Ok(ledger) })
+        }
+        fn set_downloads_enabled(
+            &self,
+            _enabled: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn cursor_at(
+            &self,
+            _tab_id: &BrowserTabId,
+            _x: f64,
+            _y: f64,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, String> {
+            Box::pin(async { Ok("auto".to_string()) })
+        }
+        fn find_in_page(
+            &self,
+            _tab_id: &BrowserTabId,
+            query: &str,
+            forward: bool,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, (u32, u32)> {
+            self.find_calls
+                .lock()
+                .unwrap()
+                .push((query.to_string(), forward));
+            let answer = *self.find_answer.lock().unwrap();
+            Box::pin(async move { Ok(answer) })
+        }
+        fn clear_find_in_page(
+            &self,
+            _tab_id: &BrowserTabId,
+        ) -> crate::browser_transport::BrowserTransportFuture<'_, ()> {
+            self.find_clears
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
         }
         fn highlight_source(
             &self,
@@ -3680,6 +4029,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn css_cursors_map_to_the_nearest_native_shape() {
+        assert_eq!(cursor_style_for("pointer"), gpui::CursorStyle::PointingHand);
+        assert_eq!(cursor_style_for(" Text "), gpui::CursorStyle::IBeam);
+        assert_eq!(cursor_style_for("grab"), gpui::CursorStyle::OpenHand);
+        assert_eq!(
+            cursor_style_for("col-resize"),
+            gpui::CursorStyle::ResizeLeftRight
+        );
+        // Values the platform cannot express fall back to the arrow instead of
+        // guessing at a shape the page never asked for.
+        for unknown in ["auto", "default", "zoom-in", "help", "wait", ""] {
+            assert_eq!(
+                cursor_style_for(unknown),
+                gpui::CursorStyle::Arrow,
+                "{unknown:?} has no native equivalent"
+            );
+        }
+    }
+
+    // Find in page: headless Chrome has no find bar, so the panel owns both the
+    // shortcut and the search. The count has to come from the page — a client
+    // that counted locally would disagree with the highlights on screen.
+    #[gpui::test]
+    fn the_find_bar_searches_the_page_and_clears_it_on_close(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport {
+            find_answer: Arc::new(std::sync::Mutex::new((7, 3))),
+            ..Default::default()
+        });
+        let calls = transport.find_calls.clone();
+        let clears = transport.find_clears.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+
+        surface.update_in(&mut cx, |surface, window, cx| {
+            assert!(!surface.find_open);
+            surface.open_find(window, cx);
+            assert!(surface.find_open, "the shortcut opens the bar");
+            surface.find_input.update(cx, |input, cx| {
+                input.set_value("needle", window, cx);
+                // `set_value` deliberately suppresses the change event, so the
+                // subscription is driven the way typing drives it.
+                cx.emit(InputEvent::Change);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![("needle".to_string(), true)],
+            "typing searches forward from the top"
+        );
+        surface.read_with(&cx, |surface, _| {
+            assert_eq!((surface.find_total, surface.find_current), (7, 3));
+        });
+
+        // Shift+Enter is the previous step, and the query is what decides
+        // whether this is a step or a new search.
+        surface.update_in(&mut cx, |surface, _, cx| surface.run_find(true, false, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().last().cloned(),
+            Some(("needle".to_string(), false))
+        );
+
+        surface.update(&mut cx, |surface, cx| surface.close_find(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            clears.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "closing the bar takes the highlights off the page"
+        );
+        surface.read_with(&cx, |surface, _| {
+            assert!(!surface.find_open);
+            assert_eq!((surface.find_total, surface.find_current), (0, 0));
+        });
+    }
+
+    // An emptied field is a cleared search, not a search for the empty string —
+    // which would match everywhere and highlight the whole page.
+    #[gpui::test]
+    fn emptying_the_find_field_clears_the_page(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let transport = Arc::new(RecordingTransport {
+            find_answer: Arc::new(std::sync::Mutex::new((7, 3))),
+            ..Default::default()
+        });
+        let calls = transport.find_calls.clone();
+        let clears = transport.find_clears.clone();
+        let transport: Arc<dyn BrowserTransport> = transport;
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut surface = BrowserSurface::new("probe".to_string(), window, cx);
+                    surface.attach(transport, BrowserSessionId::new(), BrowserTabId::new(), cx);
+                    surface.set_active(true, cx);
+                    surface
+                })
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        cx.run_until_parked();
+
+        surface.update_in(&mut cx, |surface, window, cx| {
+            surface.open_find(window, cx);
+            surface.find_input.update(cx, |input, cx| {
+                input.set_value("needle", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        });
+        cx.run_until_parked();
+        let after_typing = calls.lock().unwrap().len();
+
+        surface.update_in(&mut cx, |surface, window, cx| {
+            surface.find_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            after_typing,
+            "an empty query never reaches the page"
+        );
+        assert!(
+            clears.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the page is told to drop the highlights"
+        );
+        surface.read_with(&cx, |surface, _| {
+            assert_eq!((surface.find_total, surface.find_current), (0, 0));
+        });
+    }
+
     // The HD toggle is only honest if the encoder really changes: a live JPEG
     // stream would keep painting over the choice, so the switch has to restart
     // the subscription with the new mode.
@@ -3770,12 +4268,21 @@ mod tests {
         title: &str,
         status: BrowserTabStatus,
     ) -> vibex_core::BrowserTab {
+        tab_owned_by(tab_id, title, status, vibex_core::BrowserTabOwner::User)
+    }
+
+    fn tab_owned_by(
+        tab_id: &BrowserTabId,
+        title: &str,
+        status: BrowserTabStatus,
+        owner: vibex_core::BrowserTabOwner,
+    ) -> vibex_core::BrowserTab {
         vibex_core::BrowserTab {
             tab_id: tab_id.clone(),
             url: "https://example.com/".to_string(),
             title: title.to_string(),
             status,
-            owner: vibex_core::BrowserTabOwner::User,
+            owner,
             agent_session_id: None,
             created_at_ms: 0,
             last_activity_at_ms: 0,
@@ -3783,6 +4290,57 @@ mod tests {
             can_go_back: false,
             can_go_forward: false,
         }
+    }
+
+    // An Agent's tab is marked in the strip, so the panel has to report who
+    // opened it alongside the title.
+    #[gpui::test]
+    fn the_panel_reports_who_opened_the_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let tab_id = BrowserTabId::new();
+        let snapshot = Arc::new(std::sync::Mutex::new(Some(snapshot_with(vec![
+            tab_owned_by(
+                &tab_id,
+                "Agent page",
+                BrowserTabStatus::Ready,
+                vibex_core::BrowserTabOwner::Agent,
+            ),
+        ]))));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            snapshot: snapshot.clone(),
+            ..Default::default()
+        });
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| BrowserSurface::new(tab_id.as_str().to_string(), window, cx))
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        surface.update(&mut cx, |surface, cx| {
+            surface.attach(transport, BrowserSessionId::new(), tab_id.clone(), cx);
+            surface.refresh_tab(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tab_owner()),
+            Some(vibex_core::BrowserTabOwner::Agent)
+        );
+
+        // A tab the human opened is not marked.
+        *snapshot.lock().unwrap() = Some(snapshot_with(vec![tab_owned_by(
+            &tab_id,
+            "Mine",
+            BrowserTabStatus::Ready,
+            vibex_core::BrowserTabOwner::User,
+        )]));
+        surface.update(&mut cx, |surface, cx| surface.refresh_tab(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            surface.read_with(&cx, |surface, _| surface.tab_owner()),
+            Some(vibex_core::BrowserTabOwner::User)
+        );
     }
 
     // The preview tab shows the page's title, and a spinner while it loads, so

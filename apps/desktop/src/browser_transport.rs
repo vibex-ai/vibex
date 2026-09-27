@@ -243,6 +243,37 @@ pub trait BrowserTransport: Send + Sync + 'static {
         y: f64,
     ) -> BrowserTransportFuture<'_, BrowserElementSource>;
 
+    /// Allows or denies downloads for the browser behind this transport.
+    ///
+    /// Denied by default; when allowed the file lands in the runtime's own
+    /// download directory under a name the runtime sanitized.
+    fn set_downloads_enabled(&self, enabled: bool) -> BrowserTransportFuture<'_, ()>;
+
+    /// The page's computed cursor at a viewport point.
+    ///
+    /// The screencast has no cursor of its own, so the panel asks the page what
+    /// a real browser would show there.
+    fn cursor_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, String>;
+
+    /// Searches the page for `query`, returning `(total, current)`.
+    ///
+    /// `forward` steps to the next match when the query has not changed since
+    /// the previous call; that is what Enter and Shift+Enter mean.
+    fn find_in_page(
+        &self,
+        tab_id: &BrowserTabId,
+        query: &str,
+        forward: bool,
+    ) -> BrowserTransportFuture<'_, (u32, u32)>;
+
+    /// Removes the find highlights and the style the search injected.
+    fn clear_find_in_page(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()>;
+
     /// Highlights the element a source line rendered.
     ///
     /// The reverse of [`Self::element_source_at`]: the editor points at code and
@@ -399,6 +430,53 @@ impl BrowserTransport for LocalBrowserTransport {
                 .element_source_at(&tab_id, x, y)
                 .await
                 .map_err(Into::into)
+        }))
+    }
+
+    fn set_downloads_enabled(&self, enabled: bool) -> BrowserTransportFuture<'_, ()> {
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.set_downloads_enabled(enabled).await;
+            Ok(())
+        }))
+    }
+
+    fn cursor_at(
+        &self,
+        tab_id: &BrowserTabId,
+        x: f64,
+        y: f64,
+    ) -> BrowserTransportFuture<'_, String> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(
+            self.run(async move { service.cursor_at(&tab_id, x, y).await.map_err(Into::into) }),
+        )
+    }
+
+    fn find_in_page(
+        &self,
+        tab_id: &BrowserTabId,
+        query: &str,
+        forward: bool,
+    ) -> BrowserTransportFuture<'_, (u32, u32)> {
+        let tab_id = tab_id.clone();
+        let query = query.to_string();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service
+                .find_in_page(&tab_id, &query, forward)
+                .await
+                .map_err(Into::into)
+        }))
+    }
+
+    fn clear_find_in_page(&self, tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        let tab_id = tab_id.clone();
+        let service = self.service.clone();
+        Box::pin(self.run(async move {
+            service.clear_find_in_page(&tab_id).await;
+            Ok(())
         }))
     }
 
@@ -699,6 +777,38 @@ impl BrowserTransport for RemoteBrowserTransport {
                 .await
                 .map_err(Into::into)
         })
+    }
+
+    fn set_downloads_enabled(&self, _enabled: bool) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cursor_at(
+        &self,
+        _tab_id: &BrowserTabId,
+        _x: f64,
+        _y: f64,
+    ) -> BrowserTransportFuture<'_, String> {
+        Box::pin(async { Ok("auto".to_string()) })
+    }
+
+    fn find_in_page(
+        &self,
+        _tab_id: &BrowserTabId,
+        _query: &str,
+        _forward: bool,
+    ) -> BrowserTransportFuture<'_, (u32, u32)> {
+        Box::pin(async {
+            Err(BrowserTransportError::new(
+                "remote_browser_unavailable",
+                "The paired runtime is remote; searching the page needs the live panel transport, \
+                 which is not implemented yet.",
+            ))
+        })
+    }
+
+    fn clear_find_in_page(&self, _tab_id: &BrowserTabId) -> BrowserTransportFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     fn highlight_source(

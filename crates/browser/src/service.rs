@@ -23,7 +23,7 @@
 //! works locally and over a remote transport.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -570,6 +570,35 @@ impl BrowserToolOutcome {
     }
 }
 
+/// Download policy and the bookkeeping a completion needs.
+#[derive(Debug)]
+pub(crate) struct DownloadsState {
+    /// False by default: a page never chooses to write to this machine.
+    pub(crate) enabled: bool,
+    /// The runtime's own download directory, created on first use.
+    pub(crate) dir: PathBuf,
+    /// In-flight downloads by Chrome's guid, holding the name the runtime
+    /// chose for the finished file.
+    pub(crate) pending: HashMap<String, PendingDownload>,
+}
+
+/// One download Chrome has announced.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDownload {
+    pub(crate) tab_id: BrowserTabId,
+    pub(crate) session_id: String,
+    pub(crate) file_name: String,
+    pub(crate) url: String,
+}
+
+/// The runtime's download directory under its data home.
+///
+/// Deliberately outside the workspace: a page must not be able to drop a file
+/// into a project directory where a later build step might pick it up.
+fn downloads_dir(home_dir: &Path) -> PathBuf {
+    home_dir.join("downloads")
+}
+
 pub(crate) struct BrowserInner {
     pub(crate) config: RwLock<BrowserServiceConfig>,
     pub(crate) state: Mutex<ServiceState>,
@@ -587,6 +616,13 @@ pub(crate) struct BrowserInner {
     shutting_down: AtomicBool,
     /// One dev-server scanner per workspace, fed by the runtime's PTY reader.
     dev_servers: std::sync::Mutex<HashMap<WorkspaceId, crate::devserver::DevServerScanner>>,
+    /// Where a permitted download lands, and whether downloads are permitted.
+    ///
+    /// The directory is the runtime's, never the page's: with downloads allowed
+    /// Chrome saves under the guid it reports and the runtime renames the file
+    /// to the sanitized name it chose. A page can therefore influence the name
+    /// and nothing else.
+    downloads: Mutex<DownloadsState>,
     /// The runtime the readiness probes are spawned on. `None` when the service
     /// was built outside a Tokio runtime, where the detector stays dormant.
     runtime: Option<tokio::runtime::Handle>,
@@ -611,6 +647,7 @@ impl BrowserService {
     pub fn new(config: BrowserServiceConfig) -> Self {
         let (events, _) = broadcast::channel(256);
         let granted_origins = config.origin_grants.clone();
+        let home_dir = config.home_dir.clone();
         let inner = Arc::new(BrowserInner {
             config: RwLock::new(config),
             state: Mutex::new(ServiceState {
@@ -630,6 +667,11 @@ impl BrowserService {
             reaper_task: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             dev_servers: std::sync::Mutex::new(HashMap::new()),
+            downloads: Mutex::new(DownloadsState {
+                enabled: false,
+                dir: downloads_dir(&home_dir),
+                pending: HashMap::new(),
+            }),
             runtime: tokio::runtime::Handle::try_current().ok(),
         });
         Self { inner }
@@ -673,6 +715,51 @@ impl BrowserService {
             .events
             .send(BrowserServiceEvent::Availability(availability.clone()));
         availability
+    }
+
+    /// Allows or denies downloads for the browser this service runs.
+    ///
+    /// Denied by default, and the change reaches tabs that are already open:
+    /// the policy is a property of the browser, and a page that was opened
+    /// before the setting changed must not keep the old one.
+    pub async fn set_downloads_enabled(&self, enabled: bool) {
+        let behavior = {
+            let mut downloads = self.inner.downloads.lock().await;
+            if downloads.enabled == enabled {
+                return;
+            }
+            downloads.enabled = enabled;
+            download_behavior(downloads.enabled, &downloads.dir)
+        };
+        // The directory has to exist before Chrome is told to write into it;
+        // creating it lazily would drop the first download.
+        if enabled {
+            let dir = self.inner.downloads.lock().await.dir.clone();
+            let _ = tokio::fs::create_dir_all(&dir).await;
+        }
+        let connection = {
+            let state = self.inner.state.lock().await;
+            state.process.as_ref().map(BrowserProcess::connection)
+        };
+        if let Some(connection) = connection {
+            let _ = connection
+                .command(
+                    "Browser.setDownloadBehavior",
+                    behavior,
+                    Duration::from_millis(BROWSER_CDP_COMMAND_TIMEOUT_MS),
+                )
+                .await;
+        }
+    }
+
+    /// Whether downloads are currently allowed.
+    pub async fn downloads_enabled(&self) -> bool {
+        self.inner.downloads.lock().await.enabled
+    }
+
+    /// The directory permitted downloads are written to.
+    pub async fn downloads_dir(&self) -> PathBuf {
+        self.inner.downloads.lock().await.dir.clone()
     }
 
     /// Records the origins the runtime identified as one workspace's
@@ -1720,7 +1807,11 @@ impl BrowserService {
             cdp_session_id.clone(),
             target_id.clone(),
         );
-        prepare_tab_session(&session).await?;
+        let downloads = {
+            let downloads = self.inner.downloads.lock().await;
+            download_behavior(downloads.enabled, &downloads.dir)
+        };
+        prepare_tab_session(&session, downloads).await?;
 
         let now = unix_timestamp_ms();
         let tab_id = BrowserTabId::new();
@@ -2371,9 +2462,27 @@ pub(crate) async fn cdp(
         .await
 }
 
+/// The `Browser.setDownloadBehavior` params for a download policy.
+///
+/// `allowAndName` writes each file under the guid Chrome reports, so the
+/// runtime keeps control of the final name: it renames the file once the
+/// download completes. `allow` would let the page's own suggested name reach
+/// the disk, which is exactly the filename the policy exists to sanitize.
+fn download_behavior(enabled: bool, dir: &Path) -> Value {
+    if enabled {
+        json!({
+            "behavior": "allowAndName",
+            "downloadPath": dir.to_string_lossy(),
+            "eventsEnabled": true,
+        })
+    } else {
+        json!({ "behavior": "deny", "eventsEnabled": false })
+    }
+}
+
 /// Enables the domains a tab needs for observation, diagnostics and the
 /// browser-shell replacements a headless browser cannot provide natively.
-async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
+async fn prepare_tab_session(session: &CdpSession, downloads: Value) -> BrowserResult<()> {
     for (method, params) in [
         ("Page.enable", json!({})),
         ("Runtime.enable", json!({})),
@@ -2393,11 +2502,10 @@ async fn prepare_tab_session(session: &CdpSession) -> BrowserResult<()> {
         // `Fetch` interception is installed: `Fetch.authRequired` only fires for
         // requests the patterns match, and enabling it without patterns pauses
         // every request. The behaviour is pinned by the live transport test.
-        // Downloads default to denied. A page never chooses a write path.
-        (
-            "Browser.setDownloadBehavior",
-            json!({ "behavior": "deny", "eventsEnabled": false }),
-        ),
+        // Downloads default to denied. A page never chooses a write path;
+        // when they are allowed the file lands in the runtime's own directory
+        // under a name the runtime sanitized.
+        ("Browser.setDownloadBehavior", downloads),
         // A headless browser has no window focus, and Blink only runs the text
         // selection gesture in a frame it believes is focused — dragging across
         // a paragraph selected nothing without this. Puppeteer enables it for
@@ -2580,6 +2688,20 @@ async fn handle_cdp_event(
         }
         "Target.targetDestroyed" if event.session_id.is_none() => {
             handle_target_destroyed(inner, &event.params).await;
+            return;
+        }
+        _ => {}
+    }
+    // `Browser.*` events are browser-level: they carry no session id, so the
+    // early return below would drop them. Downloads are the only ones the
+    // runtime subscribes to today.
+    match event.method.as_str() {
+        "Browser.downloadWillBegin" => {
+            handle_download_will_begin(inner, &event.params).await;
+            return;
+        }
+        "Browser.downloadProgress" => {
+            handle_download_progress(inner, &event.params).await;
             return;
         }
         _ => {}
@@ -3021,7 +3143,11 @@ async fn adopt_discovered_target(
         cdp_session_id.clone(),
         target_id.to_string(),
     );
-    let _ = prepare_tab_session(&session).await;
+    let downloads = {
+        let downloads = inner.downloads.lock().await;
+        download_behavior(downloads.enabled, &downloads.dir)
+    };
+    let _ = prepare_tab_session(&session, downloads).await;
     let _ = cdp(
         &session,
         "Emulation.setDeviceMetricsOverride",
@@ -3291,6 +3417,177 @@ async fn push_console(
     }
 }
 
+/// Records a download the page started.
+///
+/// The name is decided here, not by the page: `sanitize_download_filename`
+/// keeps the write inside the runtime's download directory, and the guid Chrome
+/// actually writes under is only an implementation detail of the rename.
+async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
+    let Some(guid) = params.get("guid").and_then(Value::as_str) else {
+        return;
+    };
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let suggested = params
+        .get("suggestedFilename")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let file_name = crate::policy::sanitize_download_filename(suggested, unix_timestamp_ms());
+    // Chrome reports the frame, not the target, and the runtime does not track
+    // frame ids. A download starts from the page the human or the Agent just
+    // touched, which is the tab the state already calls most recently active.
+    let tab = {
+        let state = inner.state.lock().await;
+        state
+            .tabs
+            .values()
+            .max_by_key(|tab| tab.last_activity_at_ms)
+            .map(|tab| (tab.tab_id.clone(), tab.session_id.clone()))
+    };
+    let Some((tab_id, session_id)) = tab else {
+        return;
+    };
+    let record = {
+        let mut downloads = inner.downloads.lock().await;
+        if !downloads.enabled {
+            // The behaviour was already denied at the browser; a page that
+            // started a download anyway is not written anywhere.
+            return;
+        }
+        downloads.pending.insert(
+            guid.to_string(),
+            PendingDownload {
+                tab_id: tab_id.clone(),
+                session_id: session_id.clone(),
+                file_name: file_name.clone(),
+                url: url.clone(),
+            },
+        );
+        download_record(
+            &session_id,
+            &tab_id,
+            format!("started a download named {file_name}"),
+            // Chrome accepted it and is writing the file; nothing is
+            // verified until `Browser.downloadProgress` says completed.
+            vibex_core::BrowserOperationStatus::Dispatched,
+            &url,
+        )
+    };
+    inner.state.lock().await.push_ledger(record);
+}
+
+/// Moves a finished download into place and records it.
+async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
+    let Some(guid) = params.get("guid").and_then(Value::as_str) else {
+        return;
+    };
+    let state_name = params
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if state_name != "completed" && state_name != "canceled" {
+        return;
+    }
+    let (dir, pending) = {
+        let mut downloads = inner.downloads.lock().await;
+        let pending = downloads.pending.remove(guid);
+        (downloads.dir.clone(), pending)
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let (summary, status) = if state_name == "completed" {
+        // The guid is what Chrome wrote; the reader gets the sanitized name.
+        let _ = tokio::fs::rename(
+            dir.join(guid),
+            unique_download_path(&dir, &pending.file_name),
+        )
+        .await;
+        (
+            format!("saved a download as {}", pending.file_name),
+            vibex_core::BrowserOperationStatus::Verified,
+        )
+    } else {
+        (
+            format!("a download of {} was canceled", pending.file_name),
+            vibex_core::BrowserOperationStatus::Failed,
+        )
+    };
+    let record = download_record(
+        &pending.session_id,
+        &pending.tab_id,
+        summary,
+        status,
+        &pending.url,
+    );
+    inner.state.lock().await.push_ledger(record);
+}
+
+/// Builds the ledger row a download produces.
+fn download_record(
+    session_id: &str,
+    tab_id: &BrowserTabId,
+    summary: String,
+    status: vibex_core::BrowserOperationStatus,
+    url: &str,
+) -> vibex_core::BrowserActionRecord {
+    vibex_core::BrowserActionRecord {
+        id: next_download_record_id(),
+        session_id: BrowserSessionId::parse(session_id).unwrap_or_default(),
+        tab_id: tab_id.clone(),
+        kind: vibex_core::BrowserActionKind::Download,
+        summary,
+        at_ms: unix_timestamp_ms(),
+        status,
+        domain: url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string)),
+        execution_source: vibex_core::BrowserExecutionSource::User,
+    }
+}
+
+/// A ledger id for a download, which no tool call produced.
+fn next_download_record_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "braction_dl_{}_{}",
+        unix_timestamp_ms(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// A path in `dir` that does not overwrite an existing file.
+///
+/// Two downloads of `report.pdf` are two files, not one: silently replacing the
+/// first would lose something the reader asked to keep.
+fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("download");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for suffix in 1..=9999u32 {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(file_name)
+}
+
 async fn handle_screencast_frame(inner: &Arc<BrowserInner>, cdp_session_id: &str, params: &Value) {
     use base64::Engine as _;
     let Some(data) = params.get("data").and_then(Value::as_str) else {
@@ -3488,6 +3785,67 @@ pub(crate) fn observation_settings(max_elements: Option<u32>, extended: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloads_are_denied_until_the_setting_says_otherwise() {
+        let dir = std::path::Path::new("/tmp/vibex-downloads");
+        assert_eq!(
+            download_behavior(false, dir),
+            json!({ "behavior": "deny", "eventsEnabled": false }),
+            "a page never chooses a write path"
+        );
+        assert_eq!(
+            download_behavior(true, dir),
+            json!({
+                "behavior": "allowAndName",
+                "downloadPath": "/tmp/vibex-downloads",
+                "eventsEnabled": true,
+            }),
+            "an allowed download is named by the runtime, not the page"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_download_policy_defaults_to_denied_and_is_remembered() {
+        let service = BrowserService::new(BrowserServiceConfig::new(
+            std::env::temp_dir().join("vibex-browser-downloads-test"),
+        ));
+        assert!(!service.downloads_enabled().await);
+        assert_eq!(
+            service.downloads_dir().await,
+            std::env::temp_dir()
+                .join("vibex-browser-downloads-test")
+                .join("downloads")
+        );
+        service.set_downloads_enabled(true).await;
+        assert!(service.downloads_enabled().await);
+        service.set_downloads_enabled(false).await;
+        assert!(!service.downloads_enabled().await);
+    }
+
+    #[test]
+    fn two_downloads_of_the_same_name_do_not_replace_each_other() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-download-paths-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("the download directory");
+        let first = unique_download_path(&dir, "report.pdf");
+        assert_eq!(first, dir.join("report.pdf"));
+        std::fs::write(&first, b"one").expect("the first file");
+        let second = unique_download_path(&dir, "report.pdf");
+        assert_eq!(second, dir.join("report (1).pdf"));
+        std::fs::write(&second, b"two").expect("the second file");
+        assert_eq!(
+            unique_download_path(&dir, "report.pdf"),
+            dir.join("report (2).pdf")
+        );
+        // A name with no extension still gets a distinct path.
+        std::fs::write(dir.join("notes"), b"x").expect("a file with no extension");
+        assert_eq!(unique_download_path(&dir, "notes"), dir.join("notes (1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A dev server only joins the allow-list once its port answers, and the
     /// runtime is told exactly once.

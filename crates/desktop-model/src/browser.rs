@@ -130,6 +130,11 @@ pub struct BrowserUiState {
     /// lossless frames.
     #[serde(default)]
     pub capture_quality: BrowserCaptureQuality,
+    /// Whether the panel lets a page write a file to the runtime's download
+    /// directory. Off by default: a download is a write to this machine and the
+    /// reader has to ask for it.
+    #[serde(default)]
+    pub downloads_enabled: bool,
 }
 
 impl BrowserUiState {
@@ -399,6 +404,7 @@ mod tests {
             // The HD toggle is part of the same file, so a round trip that
             // dropped it would silently reset the reader's choice.
             capture_quality: BrowserCaptureQuality::High,
+            downloads_enabled: true,
         };
         let encoded = serde_json::to_value(&state).expect("the preferences serialize");
         assert_eq!(
@@ -409,6 +415,7 @@ mod tests {
                 "searchEngine": "duck_duck_go",
                 "searchEngineUrl": "https://example.com/?q={query}",
                 "captureQuality": "high",
+                "downloadsEnabled": true,
             })
         );
         let decoded: BrowserUiState =

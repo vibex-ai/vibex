@@ -31793,6 +31793,19 @@ impl VibexWorkbench {
         self.apply_browser_preferences(next, cx);
     }
 
+    /// Stores whether the panel lets a page download a file.
+    pub(crate) fn set_browser_downloads_enabled(
+        &mut self,
+        downloads_enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = BrowserUiState {
+            downloads_enabled,
+            ..self.ui_state.browser.clone()
+        };
+        self.apply_browser_preferences(next, cx);
+    }
+
     /// Stores the panel's HD toggle.
     ///
     /// The panel already restarted its own encoder; going through the same
@@ -62502,6 +62515,13 @@ impl FoundationSettings {
         cx.notify();
     }
 
+    fn set_browser_downloads_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let _ = self.workbench.update(cx, |this, cx| {
+            this.set_browser_downloads_enabled(enabled, cx)
+        });
+        cx.notify();
+    }
+
     fn network_proxy(&self, cx: &App) -> NetworkProxyUiState {
         self.workbench
             .read_with(cx, |this, _| this.ui_state.network_proxy.clone())
@@ -65051,31 +65071,50 @@ impl FoundationSettings {
                 SettingsGroup::new(locale::text("Search", "搜索", "搜尋"), search_rows),
                 SettingsGroup::new(
                     locale::text("Display", "显示", "顯示"),
-                    vec![setting_row(
-                        locale::text("Lossless frames", "无损画面", "無損畫面"),
-                        locale::text(
-                            "Stream the page as PNG instead of JPEG. Text is sharper, and the \
+                    vec![
+                        setting_row(
+                            locale::text("Lossless frames", "无损画面", "無損畫面"),
+                            locale::text(
+                                "Stream the page as PNG instead of JPEG. Text is sharper, and the \
                              stream is larger and slower; the panel's HD button switches the \
                              same setting.",
-                            "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
-                            "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
+                                "以 PNG 而不是 JPEG 传输页面。文字更清晰，但画面更大、更慢；面板上的 HD 按钮切换的是同一个设置。",
+                                "以 PNG 而不是 JPEG 傳輸頁面。文字更清晰，但畫面更大、更慢；面板上的 HD 按鈕切換的是同一個設定。",
+                            ),
+                            Switch::new("browser-lossless-frames")
+                                .small()
+                                .checked(browser.capture_quality == BrowserCaptureQuality::High)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_browser_capture_quality(
+                                        if *enabled {
+                                            BrowserCaptureQuality::High
+                                        } else {
+                                            BrowserCaptureQuality::Standard
+                                        },
+                                        cx,
+                                    )
+                                })),
+                            stacked,
+                            cx,
                         ),
-                        Switch::new("browser-lossless-frames")
-                            .small()
-                            .checked(browser.capture_quality == BrowserCaptureQuality::High)
-                            .on_click(cx.listener(|this, enabled, _, cx| {
-                                this.set_browser_capture_quality(
-                                    if *enabled {
-                                        BrowserCaptureQuality::High
-                                    } else {
-                                        BrowserCaptureQuality::Standard
-                                    },
-                                    cx,
-                                )
-                            })),
-                        stacked,
-                        cx,
-                    )],
+                        setting_row(
+                            locale::text("Allow downloads", "允许下载", "允許下載"),
+                            locale::text(
+                                "Let a page save a file into the runtime's own downloads directory.                              Off by default: a download writes to this machine, and the page \
+                             cannot choose where.",
+                                "允许页面把文件保存到 runtime 自己的下载目录。默认关闭：下载会写入本机，且页面无法决定写入位置。",
+                                "允許頁面把檔案儲存到 runtime 自己的下載目錄。預設關閉：下載會寫入本機，且頁面無法決定寫入位置。",
+                            ),
+                            Switch::new("browser-allow-downloads")
+                                .small()
+                                .checked(browser.downloads_enabled)
+                                .on_click(cx.listener(|this, enabled, _, cx| {
+                                    this.set_browser_downloads_enabled(*enabled, cx)
+                                })),
+                            stacked,
+                            cx,
+                        ),
+                    ],
                 ),
             ],
             cx,
@@ -71359,6 +71398,7 @@ mod tests {
             configured_models,
             secret_setup_state: vibex_core::ProviderSecretSetupState::Available,
             updated_at_ms: 1,
+            launch_revision: 1,
         }
     }
 
