@@ -10352,6 +10352,10 @@ impl Render for CodeWorkbench {
         let is_fullscreen = self.preview_panel_fullscreen;
         let is_detached = self.preview_detached;
         let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
+        let browser_available = self.workspace.is_some() && self.browser_transport.is_some();
+        // The browser entry is an icon, so the pointer reads the tooltip and
+        // assistive technology reads the same words as its name.
+        let new_browser_label = locale::text("New browser", "新建浏览器", "新增瀏覽器");
         let root = self.preview.root.clone();
         let side_preview = self.preview.side_preview_tab_id.clone();
         v_flex()
@@ -10433,6 +10437,7 @@ impl Render for CodeWorkbench {
                                         "新建终端",
                                         "新增終端",
                                     ))
+                                    .debug_selector(|| "preview-new-terminal".to_string())
                                     .disabled(!terminal_available)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.request_new_preview_terminal(
@@ -10441,6 +10446,25 @@ impl Render for CodeWorkbench {
                                             None,
                                             cx,
                                         )
+                                    })),
+                            )
+                            // The header keeps the browser one click away, the
+                            // way it already does for the terminal: a reader
+                            // should not have to find the tab strip's "+" menu
+                            // to start a page in the pane in front of them.
+                            .child(
+                                Button::new("preview-new-browser")
+                                    .small()
+                                    .ghost()
+                                    .compact()
+                                    .size(px(28.0))
+                                    .icon(IconName::Globe)
+                                    .tooltip(new_browser_label)
+                                    .accessibility_label(new_browser_label)
+                                    .debug_selector(|| "preview-new-browser".to_string())
+                                    .disabled(!browser_available)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_browser_new_tab(None, window, cx)
                                     })),
                             )
                             .child(div().mx_1().h(px(20.0)).w(px(1.0)).bg(cx.theme().border))
@@ -19219,6 +19243,45 @@ mod tests {
                 Some("https://example.com/home".to_string()),
             ],
             "an explicit address is kept, and a tab opened without one uses the configured start page"
+        );
+    }
+
+    // The editor header keeps the browser entry beside the terminal one, in the
+    // create group that precedes the window controls. One click there opens a
+    // page in the pane in front of the reader instead of making them find the
+    // tab strip's "+" menu.
+    #[gpui::test]
+    fn the_editor_header_offers_the_browser_beside_the_terminal(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        let transport = std::sync::Arc::new(IdleBrowserTransport::default());
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(Some(transport), cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let terminal = cx
+            .debug_bounds("preview-new-terminal")
+            .expect("the header's terminal entry should be laid out");
+        let browser = cx
+            .debug_bounds("preview-new-browser")
+            .expect("the header's browser entry should be laid out");
+
+        assert_eq!(
+            browser.size, terminal.size,
+            "the two create actions share one control size"
+        );
+        assert_eq!(
+            browser.center().y,
+            terminal.center().y,
+            "the browser sits on the terminal's row"
+        );
+        assert!(
+            browser.origin.x > terminal.origin.x,
+            "the browser follows the terminal inside the create group"
         );
     }
 
