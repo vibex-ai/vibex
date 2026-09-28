@@ -4,6 +4,10 @@
 //! box that doubles as a path field, breadcrumb navigation, and a keyboard-
 //! navigable folder list. Picking a folder hands the resolved path back to
 //! the workbench; the caller owns opening the workspace.
+//!
+//! The same browser serves the preview panel's file picker: in
+//! [`PickerSelection::File`] the listing adds files, a row click selects one
+//! instead of descending, and the confirmed path is a file.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +39,19 @@ use crate::spinner::Spinner;
 pub struct DirectoryEntry {
     pub name: String,
     pub path: PathBuf,
+    /// Whether the entry is a directory. A file row only exists in a picker
+    /// that was asked for a file.
+    pub is_dir: bool,
+}
+
+/// What a confirmation returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerSelection {
+    /// Folders only; the confirmed path is a directory.
+    Directory,
+    /// Files, plus the folders that lead to them; the confirmed path is a
+    /// file.
+    File,
 }
 
 /// What the picker shows instead of a folder listing.
@@ -87,11 +104,19 @@ impl DirectoryBrowseTarget {
 
     /// Lists `target`, or the authority's first browse root when it is `None`.
     /// Runs on the tokio runtime; keep it free of GPUI state.
-    async fn list(&self, target: Option<PathBuf>) -> Result<DirectoryListing, String> {
+    ///
+    /// `include_files` only reaches a local listing: the authority's wire
+    /// answer is the directories a paired client may browse, so a file picker
+    /// never runs against one.
+    async fn list(
+        &self,
+        target: Option<PathBuf>,
+        include_files: bool,
+    ) -> Result<DirectoryListing, String> {
         match self {
             Self::Local => {
                 let target = target.unwrap_or_default();
-                let entries = list_directories(&target)?;
+                let entries = list_entries(&target, include_files)?;
                 Ok(DirectoryListing {
                     parent: target.parent().map(Path::to_path_buf),
                     path: target,
@@ -115,6 +140,7 @@ impl DirectoryBrowseTarget {
                         .map(|entry| DirectoryEntry {
                             name: entry.name,
                             path: PathBuf::from(entry.path),
+                            is_dir: true,
                         })
                         .collect(),
                     roots: listing.roots.into_iter().map(PathBuf::from).collect(),
@@ -135,6 +161,7 @@ struct PickerText {
     unstar_folder: &'static str,
     home: &'static str,
     choose_here: &'static str,
+    choose_file: &'static str,
     cancel: &'static str,
     retry: &'static str,
     loading: &'static str,
@@ -142,10 +169,15 @@ struct PickerText {
     no_matches: &'static str,
 }
 
-fn text(locale: ResolvedLocale) -> PickerText {
+fn text(locale: ResolvedLocale, selection: PickerSelection) -> PickerText {
+    let files = selection == PickerSelection::File;
     match locale {
         ResolvedLocale::En => PickerText {
-            search_placeholder: "Filter folders, or type a path and press Enter",
+            search_placeholder: if files {
+                "Filter files, or type a path and press Enter"
+            } else {
+                "Filter folders, or type a path and press Enter"
+            },
             go_up: "Up",
             open_path: "Open this path",
             places: "Places",
@@ -154,14 +186,27 @@ fn text(locale: ResolvedLocale) -> PickerText {
             unstar_folder: "Remove from starred",
             home: "Home",
             choose_here: "Open",
+            choose_file: "Choose a file",
             cancel: "Cancel",
             retry: "Retry",
             loading: "Loading…",
-            empty: "No folders here",
-            no_matches: "No folders match",
+            empty: if files {
+                "No files here"
+            } else {
+                "No folders here"
+            },
+            no_matches: if files {
+                "No files match"
+            } else {
+                "No folders match"
+            },
         },
         ResolvedLocale::ZhCn => PickerText {
-            search_placeholder: "筛选文件夹，或输入路径后按 Enter",
+            search_placeholder: if files {
+                "筛选文件，或输入路径后按 Enter"
+            } else {
+                "筛选文件夹，或输入路径后按 Enter"
+            },
             go_up: "上一级",
             open_path: "打开该路径",
             places: "位置",
@@ -170,14 +215,27 @@ fn text(locale: ResolvedLocale) -> PickerText {
             unstar_folder: "取消收藏",
             home: "主目录",
             choose_here: "打开",
+            choose_file: "请选择文件",
             cancel: "取消",
             retry: "重试",
             loading: "正在加载…",
-            empty: "这里没有文件夹",
-            no_matches: "没有匹配的文件夹",
+            empty: if files {
+                "这里没有文件"
+            } else {
+                "这里没有文件夹"
+            },
+            no_matches: if files {
+                "没有匹配的文件"
+            } else {
+                "没有匹配的文件夹"
+            },
         },
         ResolvedLocale::ZhTw => PickerText {
-            search_placeholder: "篩選資料夾，或輸入路徑後按 Enter",
+            search_placeholder: if files {
+                "篩選檔案，或輸入路徑後按 Enter"
+            } else {
+                "篩選資料夾，或輸入路徑後按 Enter"
+            },
             go_up: "上一層",
             open_path: "開啟該路徑",
             places: "位置",
@@ -186,11 +244,20 @@ fn text(locale: ResolvedLocale) -> PickerText {
             unstar_folder: "取消收藏",
             home: "主資料夾",
             choose_here: "開啟",
+            choose_file: "請選擇檔案",
             cancel: "取消",
             retry: "重試",
             loading: "載入中…",
-            empty: "這裡沒有資料夾",
-            no_matches: "沒有符合的資料夾",
+            empty: if files {
+                "這裡沒有檔案"
+            } else {
+                "這裡沒有資料夾"
+            },
+            no_matches: if files {
+                "沒有符合的檔案"
+            } else {
+                "沒有符合的資料夾"
+            },
         },
     }
 }
@@ -212,6 +279,8 @@ const FAVORITE_QUICK_LOCATION_ROW_OFFSET: usize = 2048;
 
 pub struct DirectoryPickerDialog {
     locale_mode: LocaleMode,
+    /// Whether the dialog returns a folder or a file.
+    selection: PickerSelection,
     /// Filesystem the listings come from.
     source: DirectoryBrowseTarget,
     /// Confirm-with-the-primary-action candidate; tracks the browse root.
@@ -243,7 +312,10 @@ pub struct DirectoryPickerDialog {
     list_scroll: ScrollHandle,
     rail_scroll: ScrollHandle,
     on_pick: DirectoryPickHandler,
-    on_favorites_change: DirectoryFavoritesHandler,
+    /// Absent when the host owns no favorites store, which is the case for the
+    /// preview panel's file picker: the star affordances are then left out
+    /// instead of shown and silently forgotten.
+    on_favorites_change: Option<DirectoryFavoritesHandler>,
     _search_events: gpui::Subscription,
 }
 
@@ -262,8 +334,58 @@ impl DirectoryPickerDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(
+            PickerSelection::Directory,
+            locale_mode,
+            initial_dir,
+            favorites,
+            source,
+            on_pick,
+            Some(on_favorites_change),
+            window,
+            cx,
+        )
+    }
+
+    /// The same browser, opened to choose a file.
+    ///
+    /// It browses this machine: the runtime lists files for a local workspace
+    /// only, and the host that opened a workspace picker owns the favorites
+    /// store, so this entry point shows no stars.
+    pub fn new_file_picker(
+        locale_mode: LocaleMode,
+        initial_dir: Option<PathBuf>,
+        on_pick: DirectoryPickHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            PickerSelection::File,
+            locale_mode,
+            initial_dir,
+            Vec::new(),
+            DirectoryBrowseTarget::Local,
+            on_pick,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        selection: PickerSelection,
+        locale_mode: LocaleMode,
+        initial_dir: Option<PathBuf>,
+        favorites: Vec<String>,
+        source: DirectoryBrowseTarget,
+        on_pick: DirectoryPickHandler,
+        on_favorites_change: Option<DirectoryFavoritesHandler>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let locale = locale::resolve_locale(locale_mode, locale::system_locale());
-        let placeholder = text(locale).search_placeholder;
+        let placeholder = text(locale, selection).search_placeholder;
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let search_events = cx.subscribe(&search_input, |_, _, event: &InputEvent, cx| {
             // Only the filter reset is handled here. Enter and Escape are
@@ -277,6 +399,7 @@ impl DirectoryPickerDialog {
         let local = !source.is_authority();
         let mut dialog = Self {
             locale_mode,
+            selection,
             source,
             selected: None,
             browse_root: None,
@@ -304,6 +427,16 @@ impl DirectoryPickerDialog {
             dialog.load_drives(cx);
         }
         dialog
+    }
+
+    /// Whether this host can persist stars at all.
+    fn starring(&self) -> bool {
+        self.on_favorites_change.is_some()
+    }
+
+    /// Whether the picker is choosing files.
+    fn picking_files(&self) -> bool {
+        self.selection == PickerSelection::File
     }
 
     fn locale(&self) -> ResolvedLocale {
@@ -344,16 +477,24 @@ impl DirectoryPickerDialog {
         self.active = 0;
         self.browse_task = Some({
             let source = self.source.clone();
+            let include_files = self.picking_files();
             let browse_target = target;
-            let runner =
-                gpui_tokio::Tokio::spawn(cx, async move { source.list(browse_target).await });
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                source.list(browse_target, include_files).await
+            });
             cx.spawn(async move |this, cx| {
                 let listing = runner.await.unwrap_or_else(|error| Err(error.to_string()));
                 let _ = this.update(cx, |this, cx| {
                     match listing {
                         Ok(listing) => {
                             this.browse_root = Some(listing.path.clone());
-                            this.selected = Some(listing.path);
+                            // A folder picker confirms the directory it is
+                            // showing; a file picker confirms a file, and the
+                            // reader has not pointed at one yet.
+                            this.selected = match this.selection {
+                                PickerSelection::Directory => Some(listing.path),
+                                PickerSelection::File => None,
+                            };
                             this.parent = listing.parent;
                             if !listing.roots.is_empty() {
                                 this.roots = listing.roots;
@@ -403,12 +544,13 @@ impl DirectoryPickerDialog {
         });
     }
 
-    /// Follows the search query as a path when it names a directory.
+    /// Follows the search query as a path.
     ///
     /// A local browse can check the filesystem before asking for a listing; an
     /// authority browse cannot, so the query goes to the runtime, which either
-    /// resolves it or explains why it will not.
-    fn descend_into_query(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// resolves it or explains why it will not. Returns `true` when the query
+    /// named a file and the dialog should close.
+    fn open_query_path(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let query = self.search_input.read(cx).value().trim().to_string();
         let query = if self.source.is_authority() {
             query
@@ -421,29 +563,37 @@ impl DirectoryPickerDialog {
         if self.source.is_authority() {
             self.clear_query(window, cx);
             self.browse(Some(PathBuf::from(query)), cx);
-            return true;
+            return false;
         }
         let path = PathBuf::from(&query);
         if path.is_dir() {
             let path = path.canonicalize().unwrap_or(path);
             self.clear_query(window, cx);
             self.browse(Some(path), cx);
-            return true;
+            return false;
+        }
+        if self.picking_files() && path.is_file() {
+            self.selected = Some(path.canonicalize().unwrap_or(path));
+            self.clear_query(window, cx);
+            return self.confirm(window, cx);
         }
         false
     }
 
-    /// Enter in the search field: descend into the highlighted row, else
-    /// follow the query as a path.
-    fn activate_focused_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Enter in the search field: follow the highlighted row, else the query
+    /// as a path. Returns `true` when the dialog should close.
+    fn activate_focused_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let rows = self.filtered_entries(cx);
-        if let Some(entry) = rows.get(self.active) {
-            let path = entry.path.clone();
+        if let Some(entry) = rows.get(self.active).cloned() {
             self.clear_query(window, cx);
-            self.browse(Some(path), cx);
-            return;
+            if entry.is_dir {
+                self.browse(Some(entry.path), cx);
+                return false;
+            }
+            self.selected = Some(entry.path);
+            return self.confirm(window, cx);
         }
-        self.descend_into_query(window, cx);
+        self.open_query_path(window, cx)
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
@@ -471,18 +621,24 @@ impl DirectoryPickerDialog {
     /// Stars/unstars `path`, then hands the whole list to the host, which owns
     /// persistence. The newest star leads so the rail shows it at once.
     fn toggle_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(on_favorites_change) = self.on_favorites_change.clone() else {
+            return;
+        };
         toggle_favorite_path(&mut self.favorites, path);
         let favorites = self
             .favorites
             .iter()
             .map(|favorite| favorite.to_string_lossy().into_owned())
             .collect();
-        (self.on_favorites_change)(favorites, cx);
+        on_favorites_change(favorites, cx);
         cx.notify();
     }
 
     /// ⌘D on the highlighted row: the keyboard path to that row's star.
     fn toggle_active_favorite(&mut self, cx: &mut Context<Self>) {
+        if !self.starring() {
+            return;
+        }
         let Some(entry) = self.filtered_entries(cx).get(self.active).cloned() else {
             return;
         };
@@ -503,9 +659,9 @@ impl DirectoryPickerDialog {
     }
 
     /// Primary action: confirm the directory currently browsed (the path the
-    /// footer displays). Highlighted rows are only a navigation target —
-    /// Enter descends into them. Returns `true` when the dialog should
-    /// close.
+    /// footer displays), or the file the reader picked. Highlighted rows are
+    /// only a navigation target — Enter descends into them, or confirms the
+    /// file it points at. Returns `true` when the dialog should close.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.phase != BrowsePhase::Ready {
             return false;
@@ -513,6 +669,9 @@ impl DirectoryPickerDialog {
         let Some(target) = self.selected.clone() else {
             return false;
         };
+        if self.picking_files() && !target.is_file() {
+            return false;
+        }
         self.clear_query(window, cx);
         self.submit(target, window, cx)
     }
@@ -524,15 +683,24 @@ impl DirectoryPickerDialog {
     }
 
     pub fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let strings = text(self.locale());
+        let strings = text(self.locale(), self.selection);
         let is_dark = cx.theme().is_dark();
         let foreground = crate::theme::semantic_color("popover-foreground", is_dark);
         let primary = cx.theme().primary;
-        let selected_label = self
-            .selected
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| strings.loading.to_string());
+        // A file picker has nothing to confirm until a file row is chosen, so
+        // the footer asks for one instead of showing the browsed directory.
+        let selected_label = match self.selected.as_ref() {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None if self.phase == BrowsePhase::Ready && self.picking_files() => {
+                strings.choose_file.to_string()
+            }
+            None => strings.loading.to_string(),
+        };
+        let footer_icon = if self.picking_files() && self.selected.is_some() {
+            IconName::File
+        } else {
+            IconName::FolderOpen
+        };
         h_flex()
             .w_full()
             .items_center()
@@ -544,7 +712,7 @@ impl DirectoryPickerDialog {
                     .items_center()
                     .gap_1p5()
                     .child(
-                        Icon::new(IconName::FolderOpen)
+                        Icon::new(footer_icon)
                             .size(px(13.0))
                             .flex_none()
                             .text_color(primary),
@@ -575,7 +743,7 @@ impl DirectoryPickerDialog {
                             .small()
                             .primary()
                             .label(strings.choose_here)
-                            .disabled(self.phase != BrowsePhase::Ready)
+                            .disabled(self.phase != BrowsePhase::Ready || self.selected.is_none())
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 if this.confirm(window, cx) {
                                     window.close_dialog(cx);
@@ -653,7 +821,7 @@ impl DirectoryPickerDialog {
             row = row.child(favorite_star(
                 ("directory-picker-location-star", row_key),
                 true,
-                SharedString::from(text(self.locale()).unstar_folder),
+                SharedString::from(text(self.locale(), self.selection).unstar_folder),
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(path) = this.favorites.get(index).cloned() {
                         this.toggle_favorite(path, cx);
@@ -744,7 +912,7 @@ impl gpui::Render for DirectoryPickerDialog {
             let handle = self.search_input.focus_handle(cx);
             window.focus(&handle, cx);
         }
-        let strings = text(self.locale());
+        let strings = text(self.locale(), self.selection);
         let is_dark = cx.theme().is_dark();
         let foreground = crate::theme::semantic_color("popover-foreground", is_dark);
         let muted = crate::theme::semantic_color("muted-foreground", is_dark);
@@ -918,9 +1086,13 @@ impl gpui::Render for DirectoryPickerDialog {
                                 .rounded(px(12.0))
                                 .bg(muted_bg.opacity(0.4))
                                 .child(
-                                    Icon::new(IconName::FolderOpen)
-                                        .size(px(20.0))
-                                        .text_color(muted),
+                                    Icon::new(if self.picking_files() {
+                                        IconName::File
+                                    } else {
+                                        IconName::FolderOpen
+                                    })
+                                    .size(px(20.0))
+                                    .text_color(muted),
                                 ),
                         )
                         .description(EmptyDescription::new().text_color(muted).child(
@@ -938,7 +1110,9 @@ impl gpui::Render for DirectoryPickerDialog {
                             .outline()
                             .label(strings.open_path)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.descend_into_query(window, cx);
+                                if this.open_query_path(window, cx) {
+                                    window.close_dialog(cx);
+                                }
                             })),
                     )
                 }))
@@ -957,6 +1131,7 @@ impl gpui::Render for DirectoryPickerDialog {
                 .pb(px(4.0))
                 .children(entries.into_iter().enumerate().map(|(ix, entry)| {
                     let is_active = ix == self.active;
+                    let is_dir = entry.is_dir;
                     let name: SharedString = entry.name.clone().into();
                     let path = entry.path.clone();
                     let star_path = path.clone();
@@ -976,33 +1151,62 @@ impl gpui::Render for DirectoryPickerDialog {
                             row.text_color(foreground.opacity(0.9))
                                 .hover(|style| style.bg(muted_bg.opacity(0.6)))
                         })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             this.active = ix;
-                            this.clear_query(window, cx);
-                            this.browse(Some(path.clone()), cx);
+                            if is_dir {
+                                this.clear_query(window, cx);
+                                this.browse(Some(path.clone()), cx);
+                                return;
+                            }
+                            // A file row is the answer this dialog is asking
+                            // for: the first click names it, a double click
+                            // takes it, the same way a native file dialog
+                            // behaves.
+                            this.selected = Some(path.clone());
+                            let double_click = matches!(
+                                event,
+                                ClickEvent::Mouse(mouse) if mouse.up.click_count > 1
+                            );
+                            if double_click && this.confirm(window, cx) {
+                                window.close_dialog(cx);
+                                return;
+                            }
+                            cx.notify();
                         }))
                         .child(
-                            Icon::new(IconName::Folder)
-                                .size(px(15.0))
-                                .flex_none()
-                                .text_color(if is_active { primary } else { muted }),
+                            Icon::new(if is_dir {
+                                IconName::Folder
+                            } else {
+                                IconName::File
+                            })
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(if is_active {
+                                primary
+                            } else {
+                                muted
+                            }),
                         )
                         // The name owns the free width so the star stays pinned
                         // to the row's trailing edge however long the name is.
                         .child(div().min_w_0().flex_1().truncate().child(name))
-                        .child(favorite_star(
-                            ("directory-picker-row-star", ix),
-                            starred,
-                            SharedString::from(if starred {
-                                strings.unstar_folder
-                            } else {
-                                strings.star_folder
-                            }),
-                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.toggle_favorite(star_path.clone(), cx);
-                            }),
-                            cx,
-                        ))
+                        // Only a folder can be starred, and only when the host
+                        // has somewhere to keep the star.
+                        .when(is_dir && self.starring(), |row| {
+                            row.child(favorite_star(
+                                ("directory-picker-row-star", ix),
+                                starred,
+                                SharedString::from(if starred {
+                                    strings.unstar_folder
+                                } else {
+                                    strings.star_folder
+                                }),
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.toggle_favorite(star_path.clone(), cx);
+                                }),
+                                cx,
+                            ))
+                        })
                 }))
                 .into_any_element()
         };
@@ -1106,7 +1310,11 @@ impl gpui::Render for DirectoryPickerDialog {
                             window.close_dialog(cx);
                         }
                     }
-                    "enter" => this.activate_focused_row(window, cx),
+                    "enter" => {
+                        if this.activate_focused_row(window, cx) {
+                            window.close_dialog(cx);
+                        }
+                    }
                     "escape" => window.close_dialog(cx),
                     _ => {}
                 }
@@ -1208,10 +1416,11 @@ fn breadcrumb_segments(path: &Path, home: Option<&Path>, home_label: &str) -> Ve
     segments
 }
 
-/// Lists the subdirectories of `path`, hidden entries excluded, sorted
-/// case-insensitively. Runs on the tokio runtime; keep it free of GPUI
-/// state.
-fn list_directories(path: &Path) -> Result<Vec<DirectoryEntry>, String> {
+/// Lists `path`, hidden entries excluded, sorted case-insensitively with the
+/// folders first. `include_files` adds file rows, which is what a file picker
+/// browses; a folder picker only ever shows directories. Runs on the tokio
+/// runtime; keep it free of GPUI state.
+fn list_entries(path: &Path, include_files: bool) -> Result<Vec<DirectoryEntry>, String> {
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(path).map_err(|error| error.to_string())?;
     for entry in read_dir.flatten() {
@@ -1229,7 +1438,7 @@ fn list_directories(path: &Path) -> Result<Vec<DirectoryEntry>, String> {
         } else {
             file_type.is_dir()
         };
-        if !is_dir {
+        if !is_dir && !include_files {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1239,12 +1448,14 @@ fn list_directories(path: &Path) -> Result<Vec<DirectoryEntry>, String> {
         entries.push(DirectoryEntry {
             name,
             path: entry.path(),
+            is_dir,
         });
     }
     entries.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(entries)
@@ -1418,6 +1629,38 @@ fn user_home_directory() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory holding one folder, one file and one hidden file.
+    fn listing_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(dir.path().join("nested")).expect("nested directory");
+        std::fs::write(dir.path().join("notes.txt"), b"x").expect("visible file");
+        std::fs::write(dir.path().join(".env"), b"x").expect("hidden file");
+        dir
+    }
+
+    #[test]
+    fn a_directory_listing_hides_files() {
+        let dir = listing_fixture();
+        let entries = list_entries(dir.path(), false).expect("listing");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["nested"], "the folder picker list is folders");
+        assert!(entries[0].is_dir);
+    }
+
+    #[test]
+    fn a_file_listing_adds_files_after_the_folders() {
+        let dir = listing_fixture();
+        let entries = list_entries(dir.path(), true).expect("listing");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["nested", "notes.txt"],
+            "folders lead, files follow, and a hidden file stays hidden"
+        );
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+    }
 
     #[test]
     fn breadcrumb_segments_under_home_stay_absolute() {

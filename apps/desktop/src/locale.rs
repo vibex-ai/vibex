@@ -882,6 +882,19 @@ pub fn current_locale() -> ResolvedLocale {
     ResolvedLocale::from_code(CURRENT_LOCALE.load(Ordering::Relaxed))
 }
 
+/// The resolved locale expressed as the preference a dialog can hold.
+///
+/// A component that resolves its own strings from a [`LocaleMode`] — the
+/// directory picker does — needs the mode that is in force, and the resolved
+/// locale is the only thing this module keeps.
+pub fn current_locale_mode() -> LocaleMode {
+    match current_locale() {
+        ResolvedLocale::En => LocaleMode::En,
+        ResolvedLocale::ZhCn => LocaleMode::ZhCn,
+        ResolvedLocale::ZhTw => LocaleMode::ZhTw,
+    }
+}
+
 pub fn current_strings() -> &'static Strings {
     strings(current_locale())
 }

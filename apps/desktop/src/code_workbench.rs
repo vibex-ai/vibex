@@ -89,6 +89,7 @@ use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
+use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
@@ -1143,6 +1144,10 @@ pub struct CodeWorkbench {
     /// The runtime's browser event stream, started with the first surface.
     browser_events_task: Option<Task<()>>,
     workspace: Option<WorkbenchWorkspace>,
+    /// The project directory when it lives on this machine, which is what the
+    /// preview panel's file browser starts from. A workspace on a paired
+    /// runtime has no local directory, so the browser is not offered there.
+    local_workspace_root: Option<PathBuf>,
     pending_workspace: Option<PendingWorkspace>,
     workspace_generation: u64,
     restored_workspace_id: Option<String>,
@@ -1339,6 +1344,7 @@ impl CodeWorkbench {
             browser_preferences: BrowserUiState::default(),
             browser_events_task: None,
             workspace: None,
+            local_workspace_root: None,
             pending_workspace: None,
             workspace_generation: 0,
             restored_workspace_id,
@@ -1466,6 +1472,9 @@ impl CodeWorkbench {
         );
         let workspace_id = WorkspaceId::new();
         this.workspace_generation = 1;
+        // The fixture's project root is the directory the test runs in, which
+        // is a real directory, so the file browser is available to it.
+        this.local_workspace_root = Some(PathBuf::from("."));
         this.workspace = Some(WorkbenchWorkspace {
             id: workspace_id.clone(),
             root: PathBuf::from("."),
@@ -2624,6 +2633,13 @@ impl CodeWorkbench {
         self.reset_preview_surface_state();
         self.restored_workspace_id = None;
         self.workspace_generation = self.workspace_generation.saturating_add(1).max(1);
+        // The file browser reads the local disk, so a project that is not on
+        // this machine leaves it unavailable rather than pointing it at a path
+        // the local filesystem does not have. The root is canonical so the
+        // paths the browser reports can be measured against it.
+        self.local_workspace_root = root
+            .is_dir()
+            .then(|| root.canonicalize().unwrap_or_else(|_| root.clone()));
         self.workspace = Some(WorkbenchWorkspace {
             id: workspace_id.clone(),
             root,
@@ -2879,6 +2895,118 @@ impl CodeWorkbench {
                 parent.set_preview_window_detached(window_handle, detached, cx)
             });
         });
+    }
+
+    /// Opens the preview panel's file browser.
+    ///
+    /// It is the dialog the project picker uses, opened for a file: the
+    /// listing starts at the project directory, files sit beside the folders,
+    /// and the confirmed file opens as a tab in `pane_id`.
+    fn open_preview_file_picker(
+        &mut self,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(initial_dir) = self.local_workspace_root.clone() else {
+            return;
+        };
+        let workbench = cx.weak_entity();
+        let on_pick: DirectoryPickHandler = Arc::new(move |path, window, cx| {
+            workbench
+                .update(cx, |workbench, cx| {
+                    workbench.open_picked_preview_file(path, pane_id.clone(), window, cx)
+                })
+                .unwrap_or(false)
+        });
+        let dialog_view = cx.new(|cx| {
+            DirectoryPickerDialog::new_file_picker(
+                locale::current_locale_mode(),
+                Some(initial_dir),
+                on_pick,
+                window,
+                cx,
+            )
+        });
+        let title = locale::text("Open file", "打开文件", "開啟檔案");
+        let viewport = window.viewport_size();
+        let dialog_width = (f32::from(viewport.width) - 48.0).clamp(420.0, 640.0);
+        let dialog_height = (f32::from(viewport.height) - 48.0).clamp(1.0, 520.0);
+        let dialog_entity = dialog_view.downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let is_dark = cx.theme().is_dark();
+            let popover = crate::theme::semantic_color("popover", is_dark);
+            let popover_foreground = crate::theme::semantic_color("popover-foreground", is_dark);
+            // Rebuilt on every dialog render so the footer always reflects the
+            // picker's live selection.
+            let footer = dialog_entity
+                .update(cx, |picker, cx| picker.render_footer(cx).into_any_element())
+                .unwrap_or_else(|_| div().into_any_element());
+            let content_view = dialog_view.clone();
+            dialog
+                .title(title)
+                .w(px(dialog_width))
+                .max_w(px(dialog_width))
+                .h(px(dialog_height))
+                .rounded(px(14.0))
+                .bg(popover)
+                .text_color(popover_foreground)
+                .border_color(popover_foreground.opacity(0.10))
+                // The picker owns Enter/Escape through its own key handler;
+                // the dialog defaults would confirm on every propagated
+                // keystroke before the browser sees it.
+                .keyboard(false)
+                .overlay(true)
+                .overlay_closable(true)
+                .content(move |content, _, _| {
+                    content
+                        .min_h_0()
+                        .overflow_hidden()
+                        .pt(px(4.0))
+                        .child(content_view.clone())
+                })
+                .footer(footer)
+        });
+        cx.notify();
+    }
+
+    /// Opens the file the reader chose in the preview panel's browser.
+    ///
+    /// The browser reports absolute paths and the preview reads
+    /// workspace-relative ones, so a file outside the project is refused with
+    /// a hint instead of being read as a bogus relative path. Returns `true`
+    /// when the file was accepted, which is what closes the browser.
+    pub(crate) fn open_picked_preview_file(
+        &mut self,
+        path: String,
+        pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(relative) = self
+            .local_workspace_root
+            .clone()
+            .and_then(|root| workspace_relative_pick(&root, Path::new(&path)))
+        else {
+            window.push_notification(
+                hint_notification(
+                    NotificationType::Info,
+                    locale::text(
+                        "Choose a file inside the project to preview it",
+                        "请选择项目目录内的文件再预览",
+                        "請選擇專案目錄內的檔案再預覽",
+                    ),
+                    cx,
+                ),
+                cx,
+            );
+            return false;
+        };
+        self.open_file_in_pane(relative, pane_id, false, window, cx);
+        true
     }
 
     fn request_new_preview_terminal(
@@ -4302,6 +4430,19 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_file_in_pane(path, None, temporary, window, cx);
+    }
+
+    /// Opens a workspace file as a preview tab, in `pane_id` when one is
+    /// named and in the focused pane otherwise.
+    pub(crate) fn open_file_in_pane(
+        &mut self,
+        path: String,
+        pane_id: Option<String>,
+        temporary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = normalized_relative_path(&path) else {
             return;
         };
@@ -4317,11 +4458,11 @@ impl CodeWorkbench {
         self.file_tree.select(&path, false, false);
         let tab_id = if temporary {
             self.preview
-                .preview_file(path.clone(), None, unix_timestamp_ms())
+                .preview_file(path.clone(), pane_id.as_deref(), unix_timestamp_ms())
         } else {
             self.preview.open(
                 PreviewTarget::File { path: path.clone() },
-                None,
+                pane_id.as_deref(),
                 unix_timestamp_ms(),
             )
         };
@@ -7640,6 +7781,8 @@ impl CodeWorkbench {
         let new_terminal_pane_id = pane_id.clone();
         let new_browser_entity = cx.weak_entity();
         let new_browser_pane_id = pane_id.clone();
+        let open_file_entity = cx.weak_entity();
+        let open_file_pane_id = pane_id.clone();
         let empty_terminal_entity = cx.weak_entity();
         let empty_terminal_pane_id = pane_id.clone();
         let empty_browser_entity = cx.weak_entity();
@@ -7648,6 +7791,9 @@ impl CodeWorkbench {
         let tabs_menu_pane_id = pane_id.clone();
         let terminal_available = self.workspace.is_some() && self.terminal_transport.is_some();
         let browser_available = self.workspace.is_some() && self.browser_transport.is_some();
+        // The file browser reads this machine's disk, so it is only offered
+        // while the project itself is on this machine.
+        let file_browser_available = self.local_workspace_root.is_some();
         let tab_group_drop_active = cx.has_active_drag()
             && self
                 .preview_pane_drop_target
@@ -7812,6 +7958,8 @@ impl CodeWorkbench {
                                 let terminal_pane_id = new_terminal_pane_id.clone();
                                 let browser_entity = new_browser_entity.clone();
                                 let browser_pane_id = new_browser_pane_id.clone();
+                                let file_entity = open_file_entity.clone();
+                                let file_pane_id = open_file_pane_id.clone();
                                 menu.min_w(px(176.0)).max_w(px(176.0))
                                     .item(
                                         PopupMenuItem::new(locale::text(
@@ -7846,6 +7994,24 @@ impl CodeWorkbench {
                                             let _ = browser_entity.update(cx, |this, cx| {
                                                 this.open_browser_new_tab(
                                                     Some(browser_pane_id.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(locale::text(
+                                            "Open file",
+                                            "打开文件",
+                                            "開啟檔案",
+                                        ))
+                                        .icon(IconName::File)
+                                        .disabled(!file_browser_available)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = file_entity.update(cx, |this, cx| {
+                                                this.open_preview_file_picker(
+                                                    Some(file_pane_id.clone()),
                                                     window,
                                                     cx,
                                                 )
@@ -17818,6 +17984,18 @@ fn normalized_relative_path(path: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// The workspace-relative form of a file the preview panel's browser picked.
+///
+/// The browser hands back an absolute path and the preview, the backend and the
+/// file tree all speak workspace-relative ones, so a file outside the project
+/// has no answer here and the caller refuses it instead of reading a path that
+/// only looks relative.
+fn workspace_relative_pick(root: &Path, picked: &Path) -> Option<String> {
+    let relative = picked.strip_prefix(root).ok()?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
 fn relative_parent_path(path: &str) -> &str {
     path.rsplit_once('/')
         .map(|(parent, _)| parent)
@@ -18442,6 +18620,59 @@ mod tests {
                 staged: false,
             }),
             ContentSurfaceKind::GitDiff
+        );
+    }
+
+    /// The file browser reports absolute paths and the preview reads
+    /// workspace-relative ones; only a file inside the project has an answer.
+    #[test]
+    fn a_picked_file_becomes_a_workspace_relative_path() {
+        let root = Path::new("/home/ada/projects/vibex");
+        assert_eq!(
+            workspace_relative_pick(root, Path::new("/home/ada/projects/vibex/src/lib.rs")),
+            Some("src/lib.rs".to_string())
+        );
+        assert_eq!(
+            workspace_relative_pick(root, Path::new("/home/ada/projects/vibex/README.md")),
+            Some("README.md".to_string())
+        );
+        assert_eq!(
+            workspace_relative_pick(root, Path::new("/home/ada/projects/other/src/lib.rs")),
+            None,
+            "a sibling project is not inside this one"
+        );
+        assert_eq!(
+            workspace_relative_pick(root, root),
+            None,
+            "the project directory itself is not a file to open"
+        );
+    }
+
+    /// The "+" menu's file entry opens the project picker's dialog in its file
+    /// mode when the project is on this machine, and stays inert when it is
+    /// not: the browser reads the local disk, so it has nothing to show for a
+    /// workspace that lives on a paired runtime.
+    #[gpui::test]
+    fn the_preview_file_browser_opens_only_for_a_local_project(cx: &mut gpui::TestAppContext) {
+        // The picker lists a directory on the tokio runtime before it paints.
+        cx.update(gpui_tokio::init);
+        let (workbench, cx) = fixture_workbench_with_root(cx);
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_preview_file_picker(None, window, cx);
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "a local project opens the file browser"
+        );
+
+        let (workbench, cx) = fixture_workbench_with_root(cx);
+        workbench.update(cx, |workbench, _| workbench.local_workspace_root = None);
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.open_preview_file_picker(None, window, cx);
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "a project that is not on this machine has nothing to browse"
         );
     }
 
