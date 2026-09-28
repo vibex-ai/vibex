@@ -24,7 +24,7 @@ use gpui::{
     GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId, IntoElement,
     KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, Rgba, Role, ScrollAnchor,
-    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size, Stateful,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
@@ -700,6 +700,14 @@ const COMPOSER_SUGGESTION_MENU_MAX_HEIGHT: f32 = 360.0;
 const COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT: f32 = 72.0;
 const COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT: f32 = 32.0;
 const COMPOSER_SUGGESTION_MENU_ROW_HEIGHT: f32 = 40.0;
+/// A quick phrase spends a second line on the text it would insert, because
+/// that text — not the Prompt's name — is what the user is choosing between.
+/// The first line still carries the name and the source badge.
+const COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT: f32 = 52.0;
+/// Share of a row's text column a name may claim before it truncates. A name is
+/// free text, so without a cap a long one takes the whole row: the preview
+/// collapses to nothing and the source badge is pushed out of the row.
+const COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION: f32 = 0.45;
 const COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING: f32 = 8.0;
 /// Height of the quick-phrase footer that owns the manage action. The list
 /// gives up this much of the menu so the footer never squeezes the rows.
@@ -926,6 +934,113 @@ fn composer_suggestion_description(entry: &AgentCommandEntry) -> Option<String> 
         .description
         .clone()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// One row of the composer's `/` popup, without the app-specific handlers the
+/// caller attaches.
+///
+/// A command row stays one line: the name and its provider-written description.
+/// A quick phrase row previews the text the phrase inserts — the thing the user
+/// is actually choosing between — on a wrapped second line, so a phrase that is
+/// a whole instruction is readable in a narrow window instead of ending in an
+/// ellipsis halfway through.
+///
+/// Both layouts keep the row's promise that nothing runs off its right edge:
+/// the name is capped at [`COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION`] and
+/// truncates, the preview takes the rest and truncates when even the wrapped
+/// lines are not enough, and the source badge keeps its own width. The
+/// Config Center holds the unabridged text.
+fn composer_suggestion_row(
+    target: ComposerTarget,
+    entry: &AgentCommandEntry,
+    selected: bool,
+    phrase_layout: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let source_label = command_source_label(entry.source_kind);
+    let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
+    let description = composer_suggestion_description(entry);
+    let aria_label = description
+        .as_ref()
+        .map(|description| format!("{display_label}, {description}"))
+        .unwrap_or_else(|| display_label.clone());
+
+    let name = div()
+        // The debug selector is a flat key because `debug_bounds` takes a
+        // `&'static str`; the tests that read it render a single row.
+        .debug_selector(|| "composer-suggestion-name".to_string())
+        .min_w_0()
+        .max_w(relative(COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION))
+        .flex_none()
+        .truncate()
+        .text_sm()
+        .font_medium()
+        .child(display_label);
+
+    let description = description.map(|description| {
+        div()
+            .debug_selector(|| "composer-suggestion-description".to_string())
+            .min_w_0()
+            .flex_1()
+            .pl_2()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .when(phrase_layout, |this| {
+                // Wrapping is what buys the room: two short lines hold more of
+                // the phrase than one long line that has to truncate.
+                this.whitespace_normal().line_clamp(2)
+            })
+            .when(!phrase_layout, |this| this.truncate())
+            .child(description)
+    });
+
+    h_flex()
+        .id(format!("composer-suggestion:{}:{}", target.id(), entry.id))
+        .debug_selector(|| "composer-suggestion-row".to_string())
+        .role(Role::ListBoxOption)
+        .aria_selected(selected)
+        .aria_label(aria_label)
+        .w_full()
+        .h(px(composer_suggestion_row_height(phrase_layout)))
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .rounded(px(7.0))
+        .px(px(9.0))
+        .cursor_pointer()
+        .text_color(theme.popover_foreground)
+        .when(selected, |this| {
+            this.bg(theme.accent).text_color(theme.accent_foreground)
+        })
+        .hover(|this| this.bg(theme.accent).text_color(theme.accent_foreground))
+        .child(
+            div()
+                .size(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(command_source_icon(entry.source_kind))
+                        .small()
+                        .text_color(theme.muted_foreground),
+                ),
+        )
+        .child(
+            h_flex()
+                .min_w_0()
+                .flex_1()
+                .child(name)
+                .when_some(description, |this, description| this.child(description)),
+        )
+        .child(
+            div()
+                .debug_selector(|| "composer-suggestion-source".to_string())
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(source_label),
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1393,21 +1508,42 @@ fn new_session_project_menu_height(row_count: usize) -> f32 {
         .min(NEW_SESSION_PROJECT_MENU_MAX_HEIGHT)
 }
 
-fn composer_suggestion_menu_height(row_count: usize) -> f32 {
-    if row_count == 0 {
+/// Height of one `/` popup row for the tab that is showing.
+///
+/// The tab owns the row height because a quick phrase previews the text it
+/// inserts on a second line, while a command keeps its name and description on
+/// one. The menu's own height is estimated from the same figure, so a phrase
+/// list is never measured as if its rows were one line tall.
+fn composer_suggestion_row_height(phrase_layout: bool) -> f32 {
+    if phrase_layout {
+        COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT
+    } else {
+        COMPOSER_SUGGESTION_MENU_ROW_HEIGHT
+    }
+}
+
+/// Height the `/` popup wants for `row_count` rows.
+///
+/// The quick-phrase footer is part of the popup, so it is part of this figure:
+/// leaving it out capped the popup 30px below its own content, which clamped
+/// the list to a sliver and cut the phrase rows it was meant to show.
+fn composer_suggestion_menu_height(row_count: usize, row_height: f32, footer_height: f32) -> f32 {
+    let content_height = if row_count == 0 {
         COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
     } else {
-        (COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+        COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
             + COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
-            + COMPOSER_SUGGESTION_MENU_ROW_HEIGHT * row_count as f32)
-            .min(COMPOSER_SUGGESTION_MENU_MAX_HEIGHT)
-    }
+            + row_height * row_count as f32
+    };
+    (content_height + footer_height).min(COMPOSER_SUGGESTION_MENU_MAX_HEIGHT)
 }
 
 fn composer_suggestion_menu_placement(
     surface_bounds: Bounds<Pixels>,
     viewport_height: f32,
     row_count: usize,
+    row_height: f32,
+    footer_height: f32,
 ) -> ComposerSuggestionMenuPlacement {
     // Suggestions belong to the composer surface, rather than the caret. Keeping
     // the overlay above the whole surface lets it cover queue/plan extensions
@@ -1418,7 +1554,8 @@ fn composer_suggestion_menu_placement(
             .max(1.0);
     let window_edge_offset = viewport_height - surface_top + COMPOSER_SUGGESTION_MENU_TRIGGER_GAP;
     ComposerSuggestionMenuPlacement {
-        max_height: composer_suggestion_menu_height(row_count).min(available_above),
+        max_height: composer_suggestion_menu_height(row_count, row_height, footer_height)
+            .min(available_above),
         window_edge_offset,
     }
 }
@@ -50490,7 +50627,10 @@ impl VibexWorkbench {
             .clamp(COMPOSER_SUGGESTION_MENU_HORIZONTAL_MARGIN, max_left);
         let tabs_available = context.request.trigger == Some(AgentCommandTrigger::Slash);
         let active_tab = self.active_suggestion_tab();
-        let tab_footer_height = if tabs_available && active_tab == ComposerSuggestionTab::Phrases {
+        // The phrase tab is the only one whose rows carry wrapped content, so
+        // both the row height and the menu's estimate follow the tab.
+        let phrase_layout = tabs_available && active_tab == ComposerSuggestionTab::Phrases;
+        let tab_footer_height = if phrase_layout {
             COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT
         } else {
             0.0
@@ -50499,8 +50639,13 @@ impl VibexWorkbench {
         // anyway, and this keeps the list borrow out of the element closures.
         let visible_entries = self.visible_suggestions().to_vec();
         let visible_row_count = visible_entries.len().min(10);
-        let menu_placement =
-            composer_suggestion_menu_placement(surface_bounds, viewport_height, visible_row_count);
+        let menu_placement = composer_suggestion_menu_placement(
+            surface_bounds,
+            viewport_height,
+            visible_row_count,
+            composer_suggestion_row_height(phrase_layout),
+            tab_footer_height,
+        );
         let list_max_height = (menu_placement.max_height
             - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
             - tab_footer_height)
@@ -50536,79 +50681,7 @@ impl VibexWorkbench {
             .map(|(index, entry)| {
                 let selected = self.suggestion_selection.selected_index == Some(index);
                 let selected_entry = entry.clone();
-                let source_label = command_source_label(entry.source_kind);
-                let display_label = entry.label.trim_start_matches(['/', '$', '@']).to_string();
-                let description = composer_suggestion_description(&entry);
-                let aria_label = description
-                    .as_ref()
-                    .map(|description| format!("{display_label}, {description}"))
-                    .unwrap_or_else(|| display_label.clone());
-                h_flex()
-                    .id(format!("composer-suggestion:{}:{}", target.id(), entry.id))
-                    .role(Role::ListBoxOption)
-                    .aria_selected(selected)
-                    .aria_label(aria_label)
-                    .w_full()
-                    .h(px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT))
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(7.0))
-                    .px(px(9.0))
-                    .cursor_pointer()
-                    .text_color(cx.theme().popover_foreground)
-                    .when(selected, |this| {
-                        this.bg(cx.theme().accent)
-                            .text_color(cx.theme().accent_foreground)
-                    })
-                    .hover(|this| {
-                        this.bg(cx.theme().accent)
-                            .text_color(cx.theme().accent_foreground)
-                    })
-                    .child(
-                        div()
-                            .size(px(22.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(command_source_icon(entry.source_kind))
-                                    .small()
-                                    .text_color(cx.theme().muted_foreground),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(display_label),
-                            )
-                            .when_some(description, |this, description| {
-                                this.child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .pl_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(description),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(source_label),
-                    )
+                composer_suggestion_row(target, &entry, selected, phrase_layout, cx.theme())
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
                         window.prevent_default();
                         cx.stop_propagation();
@@ -70792,6 +70865,26 @@ mod tests {
         }
     }
 
+    /// Lays one composer suggestion row out at a chosen width, so the boxes its
+    /// name, preview and source badge resolve to can be measured.
+    struct ComposerSuggestionRowProbe {
+        entry: AgentCommandEntry,
+        phrase_layout: bool,
+        width: Pixels,
+    }
+
+    impl Render for ComposerSuggestionRowProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex().w(self.width).child(composer_suggestion_row(
+                ComposerTarget::Session,
+                &self.entry,
+                false,
+                self.phrase_layout,
+                cx.theme(),
+            ))
+        }
+    }
+
     /// Lays a composer textarea out at a chosen size, so the boxes the token
     /// highlight derives from a real layout can be measured.
     struct ComposerTokenGeometryProbe {
@@ -71690,6 +71783,128 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["phrase:one"]
         );
+    }
+
+    /// Lays a single suggestion row out and reports the boxes it painted.
+    ///
+    /// The row builders register flat `debug_selector` keys, so this only makes
+    /// sense for a probe that renders one row.
+    fn composer_suggestion_row_bounds(
+        cx: &mut TestAppContext,
+        entry: AgentCommandEntry,
+        phrase_layout: bool,
+        width: f32,
+    ) -> (
+        Bounds<Pixels>,
+        Bounds<Pixels>,
+        Bounds<Pixels>,
+        Bounds<Pixels>,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, _| ComposerSuggestionRowProbe {
+            entry,
+            phrase_layout,
+            width: px(width),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let mut bounds = |selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"))
+        };
+        (
+            bounds("composer-suggestion-row"),
+            bounds("composer-suggestion-name"),
+            bounds("composer-suggestion-description"),
+            bounds("composer-suggestion-source"),
+        )
+    }
+
+    /// A quick phrase is the text it inserts, so the phrase row has to show that
+    /// text. A free-text name used to claim the whole row, which collapsed the
+    /// preview to nothing and pushed the source badge out of the popup.
+    #[gpui::test]
+    fn quick_phrase_rows_keep_a_long_phrase_inside_the_row(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let body = "开始处理这些问题，不用建任务。完成后我来看即可，不用截图。\
+                    修改完提交，commit 使用 type(scope): subject 的格式，subject 用英文";
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            None,
+        );
+        phrase.id = "phrase:probe".into();
+        // A name that is itself a paragraph: the row still owes the preview its
+        // own room and the badge its own width.
+        phrase.label = format!("{body} 的完整说明与后续步骤都写在名称里");
+        phrase.description = Some(body.to_string());
+        phrase.insertion_text = body.to_string();
+        phrase.execution_behavior = AgentCommandExecutionBehavior::None;
+
+        let (row, name, preview, source) = composer_suggestion_row_bounds(cx, phrase, true, 420.0);
+
+        assert_eq!(
+            row.size.height,
+            px(COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT),
+            "a phrase row owns two lines of preview"
+        );
+        assert!(
+            source.right() <= row.right() + px(0.5),
+            "source badge {} escaped the row {}",
+            source.right(),
+            row.right()
+        );
+        assert!(
+            preview.right() <= source.left() + px(0.5),
+            "preview {} ran under the source badge {}",
+            preview.right(),
+            source.left()
+        );
+        assert!(
+            name.right() <= preview.left() + px(0.5),
+            "name {} ran under the preview {}",
+            name.right(),
+            preview.left()
+        );
+        assert!(
+            name.size.width <= row.size.width * COMPOSER_SUGGESTION_NAME_WIDTH_FRACTION + px(1.0),
+            "name took {} of a {} row",
+            name.size.width,
+            row.size.width
+        );
+        assert!(
+            preview.size.width > px(80.0),
+            "preview collapsed to {}",
+            preview.size.width
+        );
+    }
+
+    /// The command tab keeps its one-line rows: the phrase tab's second line is
+    /// paid for only where it carries the inserted text.
+    #[gpui::test]
+    fn command_rows_stay_one_line_tall(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut command = command_entry(
+            AgentCommandSourceKind::Provider,
+            AgentCommandTrigger::Slash,
+            Some("review"),
+        );
+        command.id = "command:probe".into();
+        command.label = "/review".into();
+        command.description = Some("Review the changes on this branch".into());
+
+        let (row, name, preview, source) =
+            composer_suggestion_row_bounds(cx, command, false, 420.0);
+
+        assert_eq!(
+            row.size.height,
+            px(COMPOSER_SUGGESTION_MENU_ROW_HEIGHT),
+            "a command row stays one line"
+        );
+        assert!(source.right() <= row.right() + px(0.5));
+        assert!(preview.right() <= source.left() + px(0.5));
+        assert!(name.right() <= preview.left() + px(0.5));
     }
 
     #[test]
@@ -79344,28 +79559,111 @@ mod tests {
     #[test]
     fn composer_suggestion_menu_stays_attached_above_the_composer_surface() {
         let viewport_height = 900.0;
-        for row_count in [0, 1] {
-            let surface_bounds = Bounds {
-                origin: gpui::Point {
-                    x: px(120.0),
-                    y: px(780.0),
-                },
-                size: Size {
-                    width: px(680.0),
-                    height: px(96.0),
-                },
+        for phrase_layout in [false, true] {
+            let row_height = composer_suggestion_row_height(phrase_layout);
+            let footer_height = if phrase_layout {
+                COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT
+            } else {
+                0.0
             };
-            let placement =
-                composer_suggestion_menu_placement(surface_bounds, viewport_height, row_count);
+            // A phrase list is taller per row, so it reaches the menu's own cap
+            // with fewer rows than a command list does.
+            for row_count in [0, 1, 4] {
+                let surface_bounds = Bounds {
+                    origin: gpui::Point {
+                        x: px(120.0),
+                        y: px(780.0),
+                    },
+                    size: Size {
+                        width: px(680.0),
+                        height: px(96.0),
+                    },
+                };
+                let placement = composer_suggestion_menu_placement(
+                    surface_bounds,
+                    viewport_height,
+                    row_count,
+                    row_height,
+                    footer_height,
+                );
 
-            let menu_bottom = viewport_height - placement.window_edge_offset;
-            let gap = f32::from(surface_bounds.origin.y) - menu_bottom;
-            assert_eq!(gap, COMPOSER_SUGGESTION_MENU_TRIGGER_GAP);
-            assert_eq!(
-                placement.max_height,
-                composer_suggestion_menu_height(row_count)
+                let menu_bottom = viewport_height - placement.window_edge_offset;
+                let gap = f32::from(surface_bounds.origin.y) - menu_bottom;
+                assert_eq!(gap, COMPOSER_SUGGESTION_MENU_TRIGGER_GAP);
+                assert_eq!(
+                    placement.max_height,
+                    composer_suggestion_menu_height(row_count, row_height, footer_height)
+                );
+            }
+        }
+    }
+
+    /// The list is only as tall as the popup minus its chrome, so a height that
+    /// forgets the footer hands the list less room than its rows need — which is
+    /// exactly how a quick phrase row ended up cut in half.
+    #[test]
+    fn composer_suggestion_menu_height_fits_its_own_rows_and_footer() {
+        for (row_count, phrase_layout) in [(0, true), (1, true), (3, true), (1, false), (5, false)]
+        {
+            let row_height = composer_suggestion_row_height(phrase_layout);
+            let footer_height = if phrase_layout {
+                COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT
+            } else {
+                0.0
+            };
+            let menu_height = composer_suggestion_menu_height(row_count, row_height, footer_height);
+            let list_height = menu_height - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT - footer_height;
+            let list_content = if row_count == 0 {
+                COMPOSER_SUGGESTION_MENU_EMPTY_HEIGHT
+                    - COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+                    - COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+            } else {
+                COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING + row_height * row_count as f32
+            };
+            assert!(
+                list_height >= list_content,
+                "{row_count} row(s) at {row_height}px need {list_content}px but the list got {list_height}px"
             );
         }
+    }
+
+    #[test]
+    fn composer_suggestion_menu_measures_a_phrase_row_as_two_lines() {
+        // One command row and one phrase row must be estimated from their own
+        // height, or the phrase tab would reserve too little room and scroll
+        // its own last row out of the popup.
+        assert_eq!(
+            composer_suggestion_row_height(false),
+            COMPOSER_SUGGESTION_MENU_ROW_HEIGHT
+        );
+        assert_eq!(
+            composer_suggestion_row_height(true),
+            COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT
+        );
+        assert!(
+            composer_suggestion_row_height(true) > composer_suggestion_row_height(false),
+            "a phrase row is taller than a command row"
+        );
+        assert_eq!(
+            composer_suggestion_menu_height(1, composer_suggestion_row_height(true), 0.0),
+            COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+                + COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+                + COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT
+        );
+        assert_eq!(
+            composer_suggestion_menu_height(1, composer_suggestion_row_height(true), 30.0),
+            COMPOSER_SUGGESTION_MENU_HEADER_HEIGHT
+                + COMPOSER_SUGGESTION_MENU_VERTICAL_PADDING
+                + COMPOSER_SUGGESTION_MENU_PHRASE_ROW_HEIGHT
+                + 30.0
+        );
+        assert!(
+            composer_suggestion_menu_height(
+                9,
+                composer_suggestion_row_height(true),
+                COMPOSER_SUGGESTION_MENU_FOOTER_HEIGHT
+            ) <= COMPOSER_SUGGESTION_MENU_MAX_HEIGHT
+        );
     }
 
     #[gpui::test]
