@@ -84,6 +84,7 @@ mod native_surface;
 mod provider_projection;
 pub use provider_projection::*;
 pub mod secrets;
+mod skill_bundle;
 pub mod skills;
 
 pub const CODEX_MODEL_PROVIDER_ID_OPTION_KEY: &str = "codexModelProviderId";

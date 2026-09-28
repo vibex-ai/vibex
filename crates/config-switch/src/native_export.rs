@@ -79,6 +79,13 @@ struct NativeExportRoots {
     claude_root: Option<PathBuf>,
     agent_home: Option<PathBuf>,
     skill_root: Option<PathBuf>,
+    /// Where Vibex keeps the Skill folders it installed from a market.
+    ///
+    /// A market-installed Skill has no folder the user chose, so its assets
+    /// live in this runtime's own store while `source_uri` keeps the registry
+    /// identity the market needs. Both have to be resolved from the same
+    /// place, which is why the store root travels with the roots.
+    market_skill_store: Option<PathBuf>,
 }
 
 impl ProviderConfigService {
@@ -126,7 +133,12 @@ impl ProviderConfigService {
     /// back — that round trip is what the preview's diff is checked against in
     /// the tests.
     fn native_export_roots(&self, agent_id: &AgentId) -> NativeExportRoots {
-        let mut roots = NativeExportRoots::default();
+        let mut roots = NativeExportRoots {
+            market_skill_store: Some(crate::skill_bundle::market_skill_store_root(
+                self.database_path(),
+            )),
+            ..NativeExportRoots::default()
+        };
         if let Ok(mut agents) = self.import_scan_agents(Some(agent_id.clone()))
             && let Some(agent) = agents.pop()
         {
@@ -747,6 +759,7 @@ fn skills_export_plans(
             request.source,
             skill,
             &skill_root,
+            roots.market_skill_store.as_deref(),
             diagnostics,
         )?);
     }
@@ -758,6 +771,7 @@ fn skill_export_plans(
     source: ProviderNativeExportSource,
     skill: &Skill,
     skill_root: &Path,
+    market_skill_store: Option<&Path>,
     diagnostics: &mut Vec<ProviderBindingMetadata>,
 ) -> VibexResult<Vec<ProviderNativeExportFilePlan>> {
     let slug = crate::skills::command_token_from_skill_name(&skill.display_name);
@@ -793,13 +807,10 @@ fn skill_export_plans(
     )];
 
     // A Skill folder may carry references, scripts and templates. They are part
-    // of the Skill, so the text ones travel with the manifest.
-    let Some(source_dir) = skill
-        .source_uri
-        .as_deref()
-        .map(PathBuf::from)
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-    else {
+    // of the Skill, so the text ones travel with the manifest. A market install
+    // keeps that folder in Vibex's own store; a folder the user imported keeps
+    // it where they put it.
+    let Some(source_dir) = crate::skill_bundle::skill_source_dir(skill, market_skill_store) else {
         return Ok(plans);
     };
     if source_dir == target_dir {
@@ -2289,6 +2300,141 @@ mod tests {
             diagnostic.key == "provider_native_export_skill_file_skipped"
                 && diagnostic.value.contains("not UTF-8")
         }));
+    }
+
+    /// Every Agent receives a market-installed Skill's assets, not just its
+    /// manifest.
+    ///
+    /// A Skill installed from the registry is stored by Vibex rather than
+    /// imported from a folder the user picked, so its assets are found in the
+    /// runtime's own store. The export planner is the one every Agent shares,
+    /// which is what makes the assets travel to all of them; this pins that,
+    /// because a Skill whose scripts stayed behind is a different Skill.
+    #[test]
+    fn a_market_skill_carries_its_bundle_to_every_agent() {
+        use vibex_core::SkillMarketBundleFile;
+
+        let dir = tempdir().unwrap();
+        let store_root = dir.path().join("market-skills");
+        let mut skill = manual_skill(
+            "Pdf Forms",
+            "---\nname: Pdf Forms\n---\n\nFill forms.\n",
+            Some("market:awspace/pdf".to_string()),
+        );
+        skill.source_kind = vibex_core::SkillSourceKind::Marketplace;
+        let bundle_dir = crate::skill_bundle::market_skill_dir(&store_root, &skill.id);
+        crate::skill_bundle::write_skill_bundle(
+            &bundle_dir,
+            "---\nname: Pdf Forms\n---\n\nFill forms.\n",
+            &[
+                SkillMarketBundleFile {
+                    path: "references/api.md".to_string(),
+                    content: "api notes".to_string(),
+                    bytes: 9,
+                },
+                SkillMarketBundleFile {
+                    path: "scripts/fill.py".to_string(),
+                    content: "print('fill')".to_string(),
+                    bytes: 13,
+                },
+            ],
+        )
+        .unwrap();
+
+        // The manifest stays in the database and the assets come from the
+        // store, so the two sources have to line up at the same target folder.
+        for (agent_id, source) in [
+            ("claude", ProviderNativeExportSource::Claude),
+            ("codex", ProviderNativeExportSource::Codex),
+            ("cursor", ProviderNativeExportSource::Cursor),
+            ("gemini", ProviderNativeExportSource::Gemini),
+            ("opencode", ProviderNativeExportSource::OpenCode),
+            ("agent-default", ProviderNativeExportSource::AgentDefault),
+        ] {
+            let home = dir.path().join(format!("{agent_id}-home"));
+            let preview = preview_native_export_with_roots(
+                &agent_profile(agent_id),
+                export_request(ProviderNativeExportMode::Skills, source),
+                NativeExportRoots {
+                    agent_home: Some(home.clone()),
+                    skill_root: Some(home.join("skills")),
+                    market_skill_store: Some(store_root.clone()),
+                    ..Default::default()
+                },
+                NativeExportResources {
+                    mcp_servers: Vec::new(),
+                    skills: vec![skill.clone()],
+                },
+            )
+            .unwrap();
+
+            let apply = apply_preview(preview);
+            assert_eq!(
+                apply.status,
+                ProviderNativeExportApplyStatus::Applied,
+                "{agent_id} did not receive the Skill"
+            );
+            let target = home.join("skills").join("pdf-forms");
+            assert_eq!(
+                fs::read_to_string(target.join("SKILL.md")).unwrap(),
+                skill.body.as_deref().unwrap(),
+                "{agent_id} did not receive the manifest"
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("references").join("api.md")).unwrap(),
+                "api notes",
+                "{agent_id} did not receive the reference"
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("scripts").join("fill.py")).unwrap(),
+                "print('fill')",
+                "{agent_id} did not receive the script"
+            );
+        }
+    }
+
+    /// A Skill row that outlived its folder still exports its instructions.
+    ///
+    /// The bundle directory is checked rather than assumed: a Skill whose store
+    /// entry was removed must degrade to a manifest-only export, because the
+    /// instructions are the part an Agent cannot work without.
+    #[test]
+    fn a_market_skill_without_its_folder_still_exports_its_manifest() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let mut skill = manual_skill(
+            "Orphan",
+            "---\nname: Orphan\n---\n\nBody\n",
+            Some("market:someone/orphan".to_string()),
+        );
+        skill.source_kind = vibex_core::SkillSourceKind::Marketplace;
+
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                // The store exists but holds nothing for this Skill.
+                market_skill_store: Some(dir.path().join("market-skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![skill.clone()],
+            },
+        )
+        .unwrap();
+
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+        assert_eq!(
+            fs::read_to_string(home.join("skills").join("orphan").join("SKILL.md")).unwrap(),
+            skill.body.as_deref().unwrap()
+        );
     }
 
     #[test]

@@ -81,23 +81,91 @@ pub struct McpMarketEntry {
     pub updated_at: Option<String>,
 }
 
-/// One installable Skill as the public index lists it.
+/// One installable Skill as the registry lists it.
 ///
-/// The index publishes a name, the repository it lives in, and an install
-/// count; it does not publish the document or a description. The document is
-/// resolved when the user asks to see one, so a search stays a single request.
+/// The registry publishes a name, a publisher, and the counters it ranks by; it
+/// does not publish the document. The document is resolved when the user asks
+/// to see one, so a search stays a single request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketEntry {
-    /// Index id, `owner/repo/skill`.
+    /// Registry identity, `ownerHandle/slug`, or the bare slug when the
+    /// registry did not name a publisher.
+    ///
+    /// This is what a stored Skill records as its origin, so it has to be
+    /// stable across a rename of the display name.
     pub id: String,
-    /// Directory name of the skill inside its repository.
-    pub skill_id: String,
+    /// Routable slug. The registry keys a Skill by this, and it is what the
+    /// document and download endpoints take.
+    pub slug: String,
+    /// Publisher handle.
+    ///
+    /// A slug is not unique across publishers: the registry answers with the
+    /// candidate handles rather than a document when several owners hold the
+    /// same one, so the handle travels with every request that resolves a slug.
+    #[serde(default)]
+    pub owner_handle: Option<String>,
     pub name: String,
-    /// Repository the skill lives in, `owner/repo`.
-    pub source: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub downloads: u64,
     #[serde(default)]
     pub installs: u64,
+    #[serde(default)]
+    pub stars: u64,
+    /// Registry update time, epoch milliseconds.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+/// Ranking a Skill search asks the registry for.
+///
+/// The registry ranks its own catalog, so an empty query returns its order
+/// rather than the caller's; asking for a ranking is therefore how a browse
+/// view states what it wants to see first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillMarketSort {
+    /// The registry's own default ranking.
+    Recommended,
+    Downloads,
+    Stars,
+    Installs,
+    Updated,
+    Newest,
+    Trending,
+}
+
+impl SkillMarketSort {
+    /// The registry's own name for this ranking. Sending anything else is a
+    /// bad request, so the vocabulary is closed here rather than at the call.
+    pub fn as_registry_value(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::Downloads => "downloads",
+            Self::Stars => "stars",
+            Self::Installs => "installs",
+            Self::Updated => "updated",
+            Self::Newest => "newest",
+            Self::Trending => "trending",
+        }
+    }
+}
+
+/// One text file a Skill bundle carries beside its manifest.
+///
+/// The content travels with the document so the bytes disclosed by the preview
+/// are the bytes the install writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillMarketBundleFile {
+    /// Path inside the Skill folder, `/`-separated and relative.
+    pub path: String,
+    pub content: String,
+    pub bytes: u64,
 }
 
 /// A fetched Skill document split from its frontmatter.
@@ -117,6 +185,22 @@ pub struct SkillMarketDocument {
     /// True when the document exceeds the Skill write limit. The UI refuses the
     /// install instead of letting the host reject it after the fact.
     pub too_large: bool,
+    /// Text files the bundle carries beside its manifest, in write order.
+    ///
+    /// A published Skill is a folder, not one file: references, scripts and
+    /// templates are part of the instructions. They travel here so an install
+    /// writes the same bundle the preview disclosed.
+    #[serde(default)]
+    pub files: Vec<SkillMarketBundleFile>,
+    /// Bytes the whole bundle occupies, manifest included.
+    #[serde(default)]
+    pub bundle_bytes: u64,
+    /// Files the bundle carried that Vibex will not write, each with the reason.
+    ///
+    /// Reported rather than dropped silently: a Skill whose scripts did not
+    /// arrive is not the Skill the publisher described.
+    #[serde(default)]
+    pub skipped_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -196,34 +280,46 @@ pub struct SkillMarketSearchRequest {
     pub query: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Cursor the registry handed back with the previous page.
+    ///
+    /// The registry pages by an opaque cursor rather than by an offset, so a
+    /// caller that wants the next page sends back exactly what it was given.
     #[serde(default)]
-    pub offset: Option<u32>,
+    pub cursor: Option<String>,
+    /// Ranking to ask for. Absent means the registry's own default order.
+    #[serde(default)]
+    pub sort: Option<SkillMarketSort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketSearchResponse {
     pub entries: Vec<SkillMarketEntry>,
-    /// How many entries this response carries.
+    /// Cursor for the page after this one, absent at the end of the catalog.
     ///
-    /// The index reports a count capped at the page size and ignores the
-    /// pagination offset, so there is no grand total to report and no second
-    /// page to fetch. This equals `entries.len()`.
-    pub total: u64,
-    /// Always false for this market: the index cannot serve a further page.
+    /// An opaque registry value the caller echoes back untouched; nothing here
+    /// interprets it.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// True when the registry reported another page beyond this one.
     pub has_more: bool,
 }
 
 /// Resolve one Skill document.
 ///
-/// The repository and directory are carried explicitly rather than parsed back
-/// out of the entry id, because a directory name may itself contain a slash.
+/// The registry identity is carried explicitly rather than parsed back out of
+/// the entry id, because a slug may itself contain a slash and a publisher
+/// handle is what disambiguates a slug several owners hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMarketDocumentRequest {
     pub entry_id: String,
-    pub source: String,
-    pub skill_id: String,
+    pub slug: String,
+    #[serde(default)]
+    pub owner_handle: Option<String>,
+    /// Version to resolve. Absent means the registry's latest release.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// Install one market entry as a real MCP server.
@@ -284,6 +380,28 @@ pub struct SkillMarketInstallResult {
 /// market refuses anything larger than the host will accept.
 pub const MAX_SKILL_MARKET_DOCUMENT_BYTES: u64 = 128 * 1024;
 
+/// Text files one Skill bundle may contribute beside its manifest.
+///
+/// A published Skill is a folder of references, scripts and templates. The
+/// ceiling is set well above what the registry's own bundles carry so a real
+/// Skill is never truncated, while a hostile archive still cannot turn one
+/// install into an unbounded write.
+pub const MAX_SKILL_MARKET_BUNDLE_FILES: usize = 128;
+
+/// Largest single file a bundle may contribute.
+pub const MAX_SKILL_MARKET_BUNDLE_FILE_BYTES: u64 = 512 * 1024;
+
+/// Largest total a bundle's files may occupy once written.
+pub const MAX_SKILL_MARKET_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Upper bound on a catalog response body. A catalog is a list of small
 /// records; anything larger is a misconfigured or hostile source.
 pub const MAX_MARKET_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Upper bound on a Skill bundle download.
+///
+/// The registry serves bundles as zip archives, so this bounds the compressed
+/// bytes; the uncompressed side is bounded separately by the per-file and
+/// per-bundle limits above, which is what makes a decompression bomb a refused
+/// file rather than an exhausted process.
+pub const MAX_SKILL_MARKET_BUNDLE_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;

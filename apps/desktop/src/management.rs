@@ -876,6 +876,15 @@ pub struct ManagementCenter {
     skill_market_scroll: ScrollHandle,
     skill_market_loading: bool,
     skill_market_error: Option<String>,
+    /// Ranking the browse list asks the registry for.
+    skill_market_sort: vibex_core::SkillMarketSort,
+    /// The cursor the registry handed back with the last page.
+    ///
+    /// It is an opaque registry value, so it is stored exactly as it arrived
+    /// and echoed back untouched rather than reconstructed.
+    skill_market_next_cursor: Option<String>,
+    /// True while the next page is being appended to the list already shown.
+    skill_market_loading_more: bool,
     /// Entry the install form is configuring; `None` while browsing.
     skill_market_install_target: Option<vibex_core::SkillMarketEntry>,
     skill_market_install_agents: BTreeSet<String>,
@@ -1679,6 +1688,9 @@ impl ManagementCenter {
             skill_market_scroll: ScrollHandle::new(),
             skill_market_loading: false,
             skill_market_error: None,
+            skill_market_sort: vibex_core::SkillMarketSort::Recommended,
+            skill_market_next_cursor: None,
+            skill_market_loading_more: false,
             skill_market_install_target: None,
             skill_market_install_agents: BTreeSet::new(),
             skill_market_document: None,
@@ -8118,10 +8130,13 @@ impl ManagementCenter {
             return;
         };
         let query = self.skill_market_query.read(cx).value().trim().to_string();
+        let sort = self.skill_market_sort;
         self.skill_market_loading = true;
         self.skill_market_error = None;
-        // A new search is a new result set, so it starts from the first screen.
+        // A new search is a new result set, so it starts from the first screen
+        // and forgets the page the previous one had reached.
         self.skill_market_page = 1;
+        self.skill_market_next_cursor = None;
         let entity = cx.weak_entity();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             backend
@@ -8129,7 +8144,8 @@ impl ManagementCenter {
                 .search_skill_market(vibex_core::SkillMarketSearchRequest {
                     query: (!query.is_empty()).then_some(query),
                     limit: Some(SKILL_MARKET_FETCH_LIMIT),
-                    offset: None,
+                    cursor: None,
+                    sort: Some(sort),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -8141,6 +8157,69 @@ impl ManagementCenter {
                 match outcome {
                     Ok(Ok(response)) => {
                         this.skill_market_entries = response.entries;
+                        this.skill_market_next_cursor = response.next_cursor;
+                    }
+                    Ok(Err(error)) => {
+                        this.skill_market_error =
+                            Some(format!("{}: {}", error.code, error.message));
+                    }
+                    Err(error) => this.skill_market_error = Some(format!("{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Append the registry's next page to the list already on screen.
+    ///
+    /// Only the browse list pages: a ranked search is answered in one response,
+    /// so it has no cursor to follow and the control is not offered.
+    fn load_more_skill_market(&mut self, cx: &mut Context<Self>) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let Some(cursor) = self.skill_market_next_cursor.clone() else {
+            return;
+        };
+        if self.skill_market_loading_more {
+            return;
+        }
+        let query = self.skill_market_query.read(cx).value().trim().to_string();
+        let sort = self.skill_market_sort;
+        self.skill_market_loading_more = true;
+        self.skill_market_error = None;
+        let entity = cx.weak_entity();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            backend
+                .management()
+                .search_skill_market(vibex_core::SkillMarketSearchRequest {
+                    query: (!query.is_empty()).then_some(query),
+                    limit: Some(SKILL_MARKET_FETCH_LIMIT),
+                    cursor: Some(cursor),
+                    sort: Some(sort),
+                })
+                .await
+                .map_err(crate::app::remote_error_into_vibex)
+        });
+        self.mutation_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = runner.await;
+            let _ = entity.update(cx, |this, cx| {
+                this.skill_market_loading_more = false;
+                match outcome {
+                    Ok(Ok(response)) => {
+                        // The registry's cursor pages do not overlap, but a
+                        // republished catalog can repeat an entry across them,
+                        // and a duplicated card is worse than a missing one.
+                        for entry in response.entries {
+                            if !this
+                                .skill_market_entries
+                                .iter()
+                                .any(|existing| existing.id == entry.id)
+                            {
+                                this.skill_market_entries.push(entry);
+                            }
+                        }
+                        this.skill_market_next_cursor = response.next_cursor;
                     }
                     Ok(Err(error)) => {
                         this.skill_market_error =
@@ -8175,8 +8254,9 @@ impl ManagementCenter {
                 .management()
                 .skill_market_document(vibex_core::SkillMarketDocumentRequest {
                     entry_id: entry.id.clone(),
-                    source: entry.source.clone(),
-                    skill_id: entry.skill_id.clone(),
+                    slug: entry.slug.clone(),
+                    owner_handle: entry.owner_handle.clone(),
+                    version: entry.version.clone(),
                 })
                 .await
                 .map_err(crate::app::remote_error_into_vibex)
@@ -11026,7 +11106,7 @@ impl ManagementCenter {
                 state,
                 meta,
                 Some(description),
-                Some(market_transport_label(entry.transport)),
+                Some(market_transport_label(entry.transport).to_string()),
                 quiet_meta,
                 market_entry_env_summary(&entry),
                 (!endpoint.trim().is_empty()).then(|| MarketCardEndpoint {
@@ -11340,8 +11420,11 @@ impl ManagementCenter {
         let install_target = self.skill_market_install_target.clone();
         let document = self.skill_market_document.clone();
         let query_input = self.skill_market_query.clone();
-        // The index cannot search for fewer than two characters, so a shorter
-        // query shows the browse list rather than an empty result.
+        let sort = self.skill_market_sort;
+        let next_cursor = self.skill_market_next_cursor.clone();
+        let loading_more = self.skill_market_loading_more;
+        // The registry's search refuses fewer than two characters, so a shorter
+        // query shows the ranked browse list rather than an empty result.
         let browsing = query_input.read(cx).value().trim().chars().count() < 2;
 
         if let Some(target) = install_target {
@@ -11407,9 +11490,28 @@ impl ManagementCenter {
             loading,
             pending,
             cx.listener(|this, _, window, cx| this.search_skill_market(window, cx)),
-            // The Skill index has nothing to narrow by: it is ranked by install
-            // count, not classified, so it carries no filter row.
-            None,
+            // The ranking is the registry's, so it is part of the request. A
+            // ranked search is the registry's own relevance order, which is why
+            // the chips are only offered while browsing.
+            browsing.then(|| {
+                management_market_sort_filters(
+                    "management-skill-market-sort",
+                    sort,
+                    pending || loading,
+                    cx.listener(|this, sort, window, cx| {
+                        if this.skill_market_sort == *sort {
+                            return;
+                        }
+                        this.skill_market_sort = *sort;
+                        // A different ranking is a different list, so the grid
+                        // returns to the top before the new one arrives.
+                        this.skill_market_scroll
+                            .set_offset(gpui::point(px(0.0), px(0.0)));
+                        this.search_skill_market(window, cx);
+                    }),
+                    cx,
+                )
+            }),
             cx,
         ));
 
@@ -11439,15 +11541,15 @@ impl ManagementCenter {
                         management_market_result_count(shown_count, total),
                         if browsing {
                             management_locale_text(
-                                "Ranked by installs. Type 2 or more characters to search.",
-                                "按安装量排序，输入 2 个及以上字符即可搜索。",
-                                "按安裝量排序，輸入 2 個及以上字元即可搜尋。",
+                                "Type 2 or more characters to search.",
+                                "输入 2 个及以上字符即可搜索。",
+                                "輸入 2 個及以上字元即可搜尋。",
                             )
                         } else {
                             management_locale_text(
-                                "Ranked by install count.",
-                                "按安装量排序。",
-                                "按安裝量排序。",
+                                "Ranked by relevance.",
+                                "按相关度排序。",
+                                "按相關度排序。",
                             )
                         }
                     )),
@@ -11479,20 +11581,30 @@ impl ManagementCenter {
             let entry_id = entry.id.clone();
             let install_entry = entry.clone();
             let install_id = entry.id.clone();
+            // The registry sorts a catalog item's counters by what the market
+            // ranks by; installs lead because that is the counter the browse
+            // chips name, and the rest are shown only when they are there.
+            let counter = (entry.installs > 0)
+                .then(|| market_installs_label(entry.installs))
+                .or_else(|| (entry.downloads > 0).then(|| format!("{} ↓", entry.downloads)))
+                .or_else(|| (entry.stars > 0).then(|| format!("{} ★", entry.stars)));
             grid = grid.child(management_market_card(
                 entry_id,
                 "icons/vibex/book-open.svg",
                 entry.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
-                Some(entry.source.clone()),
-                // A Skill carries no description in the index; the directory it
-                // installs as is what tells two Skills of one repository apart.
-                None,
-                None,
-                (entry.installs > 0).then(|| market_installs_label(entry.installs)),
+                // The publisher is what tells two Skills of one slug apart,
+                // which is the same thing the registry needs to resolve one.
+                Some(match entry.owner_handle.as_deref() {
+                    Some(owner) => format!("@{owner}"),
+                    None => entry.slug.clone(),
+                }),
+                entry.summary.clone(),
+                entry.version.clone(),
+                counter,
                 None,
                 Some(MarketCardEndpoint {
-                    text: entry.skill_id.clone(),
+                    text: entry.slug.clone(),
                     icon_path: "icons/vibex/book-open.svg",
                 }),
                 None,
@@ -11552,6 +11664,31 @@ impl ManagementCenter {
                 cx,
             ));
         }
+
+        // The registry serves one page per cursor, so reaching the catalog
+        // beyond what is already in hand is a request rather than a scroll.
+        // The pager above pages what has been fetched; this extends it, and the
+        // control is offered only when the registry named a further page.
+        if !first_load && browsing && next_cursor.is_some() {
+            content = content.child(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .justify_center()
+                    .pr(SCROLLBAR_GUTTER)
+                    .child(
+                        Button::new("management-skill-market-load-more")
+                            .small()
+                            .outline()
+                            .label(management_locale_text("Load more", "加载更多", "載入更多"))
+                            .loading(loading_more)
+                            .disabled(pending || loading_more)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_more_skill_market(cx);
+                            })),
+                    ),
+            );
+        }
         content.into_any_element()
     }
 
@@ -11604,8 +11741,15 @@ impl ManagementCenter {
                 management_market_glyph("icons/vibex/book-open.svg", cx),
                 target.name.clone(),
                 installed.then_some(MarketEntryState::Installed),
-                Some(target.source.clone()),
-                Some(target.skill_id.clone()),
+                Some(
+                    match (target.owner_handle.as_deref(), target.version.as_deref()) {
+                        (Some(owner), Some(version)) => format!("@{owner} · v{version}"),
+                        (Some(owner), None) => format!("@{owner}"),
+                        (None, Some(version)) => format!("{} · v{version}", target.slug),
+                        (None, None) => target.slug.clone(),
+                    },
+                ),
+                target.summary.clone(),
                 None,
                 cx,
             ),
@@ -11674,6 +11818,16 @@ impl ManagementCenter {
                 )
                 .to_string(),
             ));
+        }
+
+        // A published Skill is a folder. The assets travel with the manifest
+        // and are listed here rather than hidden, because "what will be
+        // written" is the thing the install is being approved for — and a file
+        // that was refused has to be visible before the commit, not after.
+        if let Some(document) = document
+            && (!document.files.is_empty() || !document.skipped_files.is_empty())
+        {
+            form = form.child(management_skill_bundle_section(document, cx));
         }
 
         let agents = self.snapshot.agents.clone();
@@ -21072,12 +21226,12 @@ fn management_market_glyph(icon_path: &str, cx: &App) -> AnyElement {
 ///
 /// Outline-only and muted on purpose. A card carries at most one of these, so
 /// the tag that reports state is the only thing on it allowed to be loud.
-fn management_market_chip(label: &'static str, cx: &App) -> AnyElement {
+fn management_market_chip(label: impl Into<SharedString>, cx: &App) -> AnyElement {
     Tag::secondary()
         .outline()
         .xsmall()
         .text_color(cx.theme().muted_foreground)
-        .child(label)
+        .child(label.into())
         .into_any_element()
 }
 
@@ -21130,7 +21284,7 @@ fn management_market_card(
     state: Option<MarketEntryState>,
     meta: Option<String>,
     description: Option<String>,
-    chip: Option<&'static str>,
+    chip: Option<String>,
     quiet_meta: Option<String>,
     caution: Option<String>,
     endpoint: Option<MarketCardEndpoint>,
@@ -21461,9 +21615,12 @@ const MARKET_PAGE_SIZE: usize = 20;
 
 /// Entries the Skill market fetches in one go.
 ///
-/// Its index caps `count` at its own page size and ignores `offset`, so this is
-/// the whole of what it will hand over; the grid pages through it locally.
-const SKILL_MARKET_FETCH_LIMIT: u32 = 500;
+/// This is one page of the registry's catalog, and the registry caps a page
+/// below it: the runtime clamps the request to what the registry will serve, so
+/// asking for more would only misreport what arrived. The grid pages through
+/// what it holds locally, and the rest of the catalog is reached by following
+/// the cursor the registry hands back with each page.
+const SKILL_MARKET_FETCH_LIMIT: u32 = 60;
 
 /// The width a market card refuses to go under.
 ///
@@ -21601,6 +21758,104 @@ fn management_market_command_preview(command: &str, cx: &App) -> AnyElement {
 /// `actions` are shortcuts that answer the whole section at once — they sit on
 /// the heading's trailing edge rather than under the list, because they act on
 /// the section as a whole and the list is what deserves the vertical space.
+/// What a Skill bundle carries beside its manifest.
+///
+/// The files are part of the Skill — its references, scripts and templates —
+/// so they are listed by path and size rather than summarised as a count. A
+/// file the host refused is listed too, with the reason, because a Skill whose
+/// scripts quietly did not arrive is not the Skill that was described.
+fn management_skill_bundle_section(
+    document: &vibex_core::SkillMarketDocument,
+    cx: &App,
+) -> AnyElement {
+    let mut list = v_flex().w_full().min_w_0().gap_1();
+    for file in &document.files {
+        list = list.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::File)
+                        .size(px(14.0))
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .child(file.path.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(management_byte_size(file.bytes)),
+                ),
+        );
+    }
+    for skipped in &document.skipped_files {
+        list = list.child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(px(14.0))
+                        .text_color(cx.theme().warning),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(skipped.clone()),
+                ),
+        );
+    }
+
+    let count = document.files.len();
+    management_market_section(
+        management_locale_text("Bundled files", "附带文件", "附帶檔案"),
+        Some(management_locale_text(
+            "These files are written beside SKILL.md.",
+            "这些文件会随 SKILL.md 一起写入。",
+            "這些檔案會隨 SKILL.md 一起寫入。",
+        )),
+        Some(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{count} · {}",
+                    management_byte_size(document.bundle_bytes)
+                ))
+                .into_any_element(),
+        ),
+        list.into_any_element(),
+        cx,
+    )
+}
+
+/// A byte count as a short human-readable size.
+fn management_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    match bytes {
+        bytes if bytes >= MIB => format!("{:.1} MB", bytes as f64 / MIB as f64),
+        bytes if bytes >= KIB => format!("{:.1} KB", bytes as f64 / KIB as f64),
+        bytes => format!("{bytes} B"),
+    }
+}
+
 fn management_market_section(
     title: &'static str,
     description: Option<&'static str>,
@@ -21946,6 +22201,65 @@ fn management_market_transport_filters(
         ));
     }
     row.into_any_element()
+}
+
+/// The Skill market's ranking as a row of mutually exclusive chips.
+///
+/// The registry ranks its own catalog, so the ranking is part of the request
+/// rather than a sort applied to the page already in hand: switching it asks
+/// again from the first page. Only the browse list offers it — a ranked search
+/// is the registry's own relevance order and has nothing to re-rank.
+fn management_market_sort_filters(
+    id_prefix: &'static str,
+    selected: vibex_core::SkillMarketSort,
+    disabled: bool,
+    on_select: impl Fn(&vibex_core::SkillMarketSort, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let on_select = std::rc::Rc::new(on_select);
+    let mut row = h_flex().min_w_0().flex_none().gap_1();
+    for sort in MARKET_SKILL_SORTS {
+        let checked = selected == sort;
+        row = row.child(management_option_chip(
+            SharedString::from(format!("{id_prefix}-{sort:?}")),
+            SharedString::from(management_skill_sort_label(sort)),
+            checked,
+            disabled,
+            None,
+            {
+                let on_select = on_select.clone();
+                move |_, window, cx| on_select(&sort, window, cx)
+            },
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// The ways the Skill market lets a browse list be ordered.
+const MARKET_SKILL_SORTS: [vibex_core::SkillMarketSort; 6] = [
+    vibex_core::SkillMarketSort::Recommended,
+    vibex_core::SkillMarketSort::Installs,
+    vibex_core::SkillMarketSort::Downloads,
+    vibex_core::SkillMarketSort::Stars,
+    vibex_core::SkillMarketSort::Trending,
+    vibex_core::SkillMarketSort::Newest,
+];
+
+fn management_skill_sort_label(sort: vibex_core::SkillMarketSort) -> &'static str {
+    use vibex_core::SkillMarketSort as Sort;
+    match sort {
+        Sort::Recommended => management_locale_text("Recommended", "推荐", "推薦"),
+        Sort::Installs => management_locale_text("Installs", "安装量", "安裝量"),
+        Sort::Downloads => management_locale_text("Downloads", "下载量", "下載量"),
+        Sort::Stars => management_locale_text("Stars", "收藏", "收藏"),
+        Sort::Trending => management_locale_text("Trending", "趋势", "趨勢"),
+        Sort::Newest => management_locale_text("Newest", "最新", "最新"),
+        // The registry also ranks by update time; the browse chips above cover
+        // the orderings a user picks between, so this one is reachable only by
+        // a caller that asks for it directly.
+        Sort::Updated => management_locale_text("Updated", "更新时间", "更新時間"),
+    }
 }
 
 /// The way back out of a market view.
