@@ -14,6 +14,10 @@
 //! Every command carries a deadline. The DevTools channel is known never to
 //! settle when the target page is wedged, so a command without a timeout is a
 //! hang waiting to happen.
+//!
+//! Message framing belongs to the transport and never to a caller: the pipe
+//! separates messages with a NUL byte, the websocket carries one JSON document
+//! per text frame. See [`CdpWriter`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +63,16 @@ enum CdpWriter {
 }
 
 impl CdpWriter {
+    /// Writes one CDP message, in the framing its transport uses.
+    ///
+    /// `payload` is the JSON document and nothing else. The pipe transport
+    /// appends its own NUL terminator; the websocket transport sends the same
+    /// bytes as one text frame. Framing is decided here, once, because the two
+    /// transports disagree: a NUL that reaches the websocket makes Chrome answer
+    /// `-32700 JSON: unprocessed input remains`, and since that response carries
+    /// no `id` it cannot be matched to the pending command — every command then
+    /// dies as a timeout instead of an error, which is exactly how the Windows
+    /// panel failed to open a tab while the pipe-based platforms were fine.
     async fn write_message(&self, payload: &[u8]) -> BrowserResult<()> {
         match self {
             #[cfg(unix)]
@@ -66,6 +80,7 @@ impl CdpWriter {
                 use tokio::io::AsyncWriteExt;
                 let mut guard = stream.lock().await;
                 guard.write_all(payload).await?;
+                guard.write_all(&[0u8]).await?;
                 guard.flush().await?;
                 Ok(())
             }
@@ -130,6 +145,17 @@ impl CdpInner {
             return;
         }
         let Some(method) = message.get("method").and_then(Value::as_str) else {
+            // A response with no `id` names no caller, so it cannot be routed.
+            // Chrome answers a command it could not parse exactly this way, and
+            // dropping it silently turns a protocol error into an unexplained
+            // command timeout — the shape the websocket framing defect had.
+            if let Some(error) = message.get("error") {
+                tracing::warn!(
+                    target: "vibex_browser",
+                    error = %error,
+                    "the browser rejected a command it could not attribute"
+                );
+            }
             return;
         };
         let _ = self.events.send(CdpEvent {
@@ -269,7 +295,7 @@ impl CdpConnection {
         if let Some(session_id) = session_id {
             message["sessionId"] = Value::String(session_id.to_string());
         }
-        let mut encoded = serde_json::to_vec(&message)
+        let encoded = serde_json::to_vec(&message)
             .map_err(|error| BrowserError::cdp("cdp_message_encode_failed", error.to_string()))?;
         if encoded.len() > MAX_CDP_MESSAGE_BYTES {
             self.forget(id);
@@ -278,7 +304,6 @@ impl CdpConnection {
                 "the CDP command exceeds the maximum message size",
             ));
         }
-        encoded.push(0);
         if let Err(error) = self.inner.writer.write_message(&encoded).await {
             self.forget(id);
             return Err(error);
@@ -391,6 +416,11 @@ impl NullDelimitedFramer {
     }
 }
 
+/// Reads a pipe connection's NUL-delimited frames.
+///
+/// Unix-only, like the pipe transport itself: the loopback websocket transports
+/// whole messages and never needs a framer.
+#[cfg(unix)]
 async fn pump_null_delimited<R>(connection: Arc<CdpInner>, mut reader: R)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -576,5 +606,93 @@ mod tests {
         assert_eq!(parse_devtools_active_port("0\n/devtools/browser/abc"), None);
         assert_eq!(parse_devtools_active_port(""), None);
         assert_eq!(parse_devtools_active_port("not-a-port"), None);
+    }
+
+    /// The websocket transport is the one Windows uses, and the pipe's NUL
+    /// terminator must not reach it: Chrome rejects such a frame with `-32700`,
+    /// a response without an `id`, which surfaces as a timeout on every command
+    /// — the panel could not open a single tab on Windows.
+    #[tokio::test]
+    async fn a_websocket_command_is_one_json_frame_without_the_pipe_terminator() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("a client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let frame = socket.next().await.expect("a frame").expect("a message");
+            let text = frame.into_text().expect("a text frame");
+            socket
+                .send(Message::text("{\"id\":1,\"result\":{\"ok\":true}}"))
+                .await
+                .expect("the reply");
+            text
+        });
+
+        let (sink, read) = connect_websocket(&format!("ws://{address}/devtools/browser/probe"))
+            .await
+            .expect("the client connects");
+        let connection = CdpConnection::from_websocket(sink, read);
+        let result = connection
+            .command("Target.getTargets", json!({}), Duration::from_secs(5))
+            .await
+            .expect("the browser answers");
+        assert_eq!(result["ok"], true);
+
+        let sent = server.await.expect("the server task");
+        assert!(
+            !sent.contains('\0'),
+            "the pipe terminator reached the websocket frame: {sent:?}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&sent).expect("one JSON document per frame"),
+            json!({ "id": 1, "method": "Target.getTargets", "params": {} })
+        );
+    }
+
+    /// The other half of the same rule: the pipe really does need its
+    /// terminator, so the fix must not have removed it from both transports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pipe_command_is_terminated_with_a_nul() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (parent_write, mut child_read) = tokio::net::UnixStream::pair().expect("writer pair");
+        let (mut child_write, parent_read) = tokio::net::UnixStream::pair().expect("reader pair");
+        let connection = CdpConnection::from_pipe(parent_write, parent_read);
+        let answer = tokio::spawn(async move {
+            let mut frame = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !frame.contains(&0) {
+                let read = child_read
+                    .read(&mut buffer)
+                    .await
+                    .expect("the command arrives");
+                assert!(read > 0, "the command never arrived");
+                frame.extend_from_slice(&buffer[..read]);
+            }
+            assert_eq!(frame.last(), Some(&0), "the pipe frame is NUL terminated");
+            let payload = std::str::from_utf8(&frame[..frame.len() - 1]).expect("utf8");
+            let message: Value = serde_json::from_str(payload).expect("json");
+            let id = message["id"].as_i64().expect("an id");
+            child_write
+                .write_all(format!("{{\"id\":{id},\"result\":{{\"ok\":true}}}}\0").as_bytes())
+                .await
+                .expect("the reply");
+            child_write.flush().await.expect("flush");
+        });
+
+        let result = connection
+            .command("Target.getTargets", json!({}), Duration::from_secs(5))
+            .await
+            .expect("the browser answers");
+        assert_eq!(result["ok"], true);
+        answer.await.expect("the server task");
     }
 }

@@ -81,6 +81,17 @@ impl BrowserError {
     pub fn is_code(&self, code: &str) -> bool {
         self.code == code
     }
+
+    /// True when the failure says this machine has no usable browser.
+    ///
+    /// This is the only condition a caller may report as "the embedded browser
+    /// is unavailable here". Every other failure — a spawn that failed, a CDP
+    /// command that timed out, a transport that broke — is a defect and has to
+    /// surface: treating them all as a missing browser is how a broken Windows
+    /// transport stayed hidden behind tests that skipped themselves.
+    pub fn is_browser_missing(&self) -> bool {
+        self.code == "browser_unavailable" || self.code == "browser_feature_disabled"
+    }
 }
 
 /// Raised when an agent action is stopped by a human taking over.
@@ -146,5 +157,19 @@ mod tests {
         assert_eq!(mapped.code, "browser_test");
         assert_eq!(mapped.category, ErrorCategory::Validation);
         assert_eq!(mapped.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn only_a_missing_browser_reads_as_an_environment_without_one() {
+        assert!(BrowserError::capability("browser_unavailable", "none").is_browser_missing());
+        assert!(
+            BrowserError::capability("browser_feature_disabled", "off").is_browser_missing(),
+            "a disabled feature is still not a broken browser"
+        );
+        assert!(
+            !BrowserError::timeout("cdp_command_timeout", "no answer").is_browser_missing(),
+            "a transport failure must never be reported as a machine without a browser"
+        );
+        assert!(!BrowserError::process("browser_spawn_failed", "no").is_browser_missing());
     }
 }

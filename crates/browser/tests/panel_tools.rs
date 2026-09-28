@@ -2,9 +2,9 @@
 //!
 //! Find-in-page, the hover cursor and downloads exist only as CDP calls into a
 //! live page, so a unit test of the script string proves nothing about whether
-//! Chrome accepts it or what it does to the DOM. The tests skip themselves when
-//! the machine has no browser — that is the environment where the whole feature
-//! is explicitly unavailable.
+//! Chrome accepts it or what it does to the DOM. A machine with no browser
+//! skips the tests — that is the environment where the whole feature is
+//! explicitly unavailable. Every other failure is a defect and fails the test.
 
 use std::time::{Duration, Instant};
 
@@ -71,10 +71,11 @@ async fn service_with_page() -> Option<Fixture> {
         .await
     {
         Ok(session_id) => session_id,
-        Err(error) => {
+        Err(error) if error.is_browser_missing() => {
             eprintln!("skipping the browser panel test: no usable browser ({error})");
             return None;
         }
+        Err(error) => panic!("the embedded browser did not start: {error}"),
     };
     let url = format!("http://127.0.0.1:{}/", serve_page());
     let tab = service
@@ -85,9 +86,44 @@ async fn service_with_page() -> Option<Fixture> {
         .set_viewport(&tab, 900, 600, 1.0)
         .await
         .expect("a viewport");
-    // The page has to be laid out before a point probe means anything.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The page has to be parsed, laid out and — for the name lookups — present
+    // in the accessibility tree before any of these tests means anything. A
+    // fixed sleep is not enough when four browsers start at once: the tree is
+    // built a frame or two behind layout, and the download test then looked for
+    // a link that was on screen but not yet in the tree. The wait uses the same
+    // path the tests do — `browser_find` resolves through the AX snapshot, as
+    // `browser_click_by_name` does.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let found = service
+            .call_tool(
+                &tool_context(&session_id),
+                "browser_find",
+                &serde_json::json!({ "tab_id": tab.as_str(), "query": "save file" }),
+            )
+            .await;
+        if !found.is_error && reported_matches(&found.text).is_some_and(|count| count > 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture page never reached the accessibility tree: {}",
+            found.text
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     Some((service, home, session_id, tab))
+}
+
+/// The match count `browser_find` reports, or `None` when it did not answer with
+/// a count at all.
+fn reported_matches(text: &str) -> Option<usize> {
+    text.split("Found ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[tokio::test]
@@ -217,26 +253,43 @@ async fn an_allowed_download_lands_under_a_sanitized_name() {
         clicked.text
     );
 
+    // Chrome writes the file under the guid it reported (`allowAndName`), and
+    // the runtime renames it once `Browser.downloadProgress` says completed, so
+    // both names exist on disk for a moment. Waiting for the first file to
+    // appear raced that rename and asserted on Chrome's guid; the wait is for
+    // the sanitized name, and the directory is checked afterwards too, so a
+    // leftover guid beside it would still fail.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut landed = None;
     while Instant::now() < deadline {
-        if let Ok(entries) = std::fs::read_dir(&downloads) {
-            let names = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().to_string())
-                .filter(|name| !name.ends_with(".crdownload"))
-                .collect::<Vec<_>>();
-            if let Some(name) = names.into_iter().next() {
-                landed = Some(name);
-                break;
-            }
+        let renamed = std::fs::read_dir(&downloads)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .find(|name| name == "re_port_.txt");
+        if let Some(name) = renamed {
+            landed = Some(name);
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let landed = landed.expect("the download lands in the runtime's own directory");
+    let landed =
+        landed.expect("the download lands under the runtime's sanitized name, not Chrome's guid");
     assert_eq!(
         landed, "re_port_.txt",
         "path separators and reserved characters never reach the disk"
+    );
+    let remaining = std::fs::read_dir(&downloads)
+        .expect("the download directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remaining,
+        vec!["re_port_.txt".to_string()],
+        "the guid Chrome named is renamed away, not left beside the sanitized file"
     );
     assert!(
         downloads.starts_with(home.path()),

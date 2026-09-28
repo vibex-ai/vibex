@@ -13,14 +13,17 @@
 //!   user's real profile would hand the agent their live cookies.
 //! * `--remote-debugging-pipe` is used wherever it is available, so no TCP port
 //!   is opened at all. The loopback port fallback exists only for platforms
-//!   where the pipe transport is not implemented.
+//!   where the pipe transport is not implemented, and it reads its endpoint out
+//!   of `DevToolsActivePort` in the profile directory — a file the previous run
+//!   leaves behind, so the launch clears it and refuses anything older than
+//!   itself.
 //! * `--no-sandbox` is never passed. In a container, user namespaces or seccomp
 //!   are the right answer.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use tokio::process::Command;
@@ -261,14 +264,23 @@ async fn launch_with_pipe(_config: &BrowserLaunchConfig) -> BrowserResult<Browse
 }
 
 async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<BrowserProcess> {
+    // The endpoint is not in the command line — port 0 lets the OS pick one —
+    // so it is read back from the profile directory. A browser that was killed
+    // rather than closed leaves the previous run's file there, and a read of
+    // that leftover points the connection at a port nobody listens on and a
+    // `/devtools/browser/<uuid>` only the dead browser knew. The file is
+    // therefore removed before the launch, and a file written before it is
+    // refused even if the removal failed.
+    let active_port = config.user_data_dir.join("DevToolsActivePort");
+    let launched_at = SystemTime::now();
+    let _ = tokio::fs::remove_file(&active_port).await;
+
     let mut command = Command::new(&config.installation.executable);
     command
         .arg(format!(
             "--user-data-dir={}",
             config.user_data_dir.to_string_lossy()
         ))
-        // Port 0 asks the OS for a free port; the real value is read back from
-        // the profile directory so nothing is guessed.
         .arg("--remote-debugging-port=0")
         .arg("--remote-allow-origins=http://127.0.0.1")
         .args(BROWSER_BASE_FLAGS)
@@ -289,7 +301,6 @@ async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<Browser
     let child = spawn_grouped(&mut command, &config.installation.label).await?;
     let pid = child.id();
 
-    let active_port = config.user_data_dir.join("DevToolsActivePort");
     let deadline = tokio::time::Instant::now() + BROWSER_START_TIMEOUT;
     let endpoint = loop {
         if tokio::time::Instant::now() >= deadline {
@@ -300,7 +311,9 @@ async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<Browser
                 "the browser did not publish its debugging endpoint in time",
             ));
         }
-        if let Ok(contents) = tokio::fs::read_to_string(&active_port).await
+        if let Ok(metadata) = tokio::fs::metadata(&active_port).await
+            && written_since(&metadata, launched_at)
+            && let Ok(contents) = tokio::fs::read_to_string(&active_port).await
             && let Some((port, Some(path))) = crate::cdp::parse_devtools_active_port(&contents)
         {
             break (port, path);
@@ -317,6 +330,18 @@ async fn launch_with_port(config: &BrowserLaunchConfig) -> BrowserResult<Browser
         user_data_dir: config.user_data_dir.clone(),
         pid,
     })
+}
+
+/// True when a file was written at or after `since`.
+///
+/// The endpoint file has to belong to the launch that is waiting for it, and a
+/// filesystem that cannot report a modification time cannot prove that; such a
+/// file is treated as stale rather than trusted.
+fn written_since(metadata: &std::fs::Metadata, since: SystemTime) -> bool {
+    metadata
+        .modified()
+        .map(|modified| modified >= since)
+        .unwrap_or(false)
 }
 
 async fn spawn_grouped(command: &mut Command, label: &str) -> BrowserResult<AsyncGroupChild> {
@@ -504,6 +529,23 @@ mod tests {
     fn process_group_probe_is_false_for_an_unused_pid() {
         // PID 0x7fff_fffe is above any realistic pid_max.
         assert!(!process_group_has_members(0x7fff_fffe));
+    }
+
+    #[test]
+    fn an_endpoint_file_written_before_the_launch_is_not_this_launchs() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let file = directory.path().join("DevToolsActivePort");
+        std::fs::write(&file, "65095\n/devtools/browser/old-run\n").expect("write");
+        let metadata = std::fs::metadata(&file).expect("metadata");
+        let modified = metadata.modified().expect("a modification time");
+        assert!(
+            written_since(&metadata, modified - Duration::from_secs(1)),
+            "a file written after the launch belongs to it"
+        );
+        assert!(
+            !written_since(&metadata, modified + Duration::from_secs(1)),
+            "the previous run's leftover must never be read as this launch's endpoint"
+        );
     }
 
     fn environment(entries: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

@@ -207,30 +207,84 @@ pub fn detect_installations() -> Vec<BrowserInstallation> {
     found
 }
 
+/// How long a version probe may take before the browser is killed.
+///
+/// The version is display metadata, so an unresponsive browser must not hold
+/// the runtime's startup: overrunning the deadline reports "unknown version".
+#[cfg(not(windows))]
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Reads the browser's reported version, tolerating every failure mode.
 ///
 /// A version probe must never block startup or fail detection, so a browser
-/// that will not answer `--version` is still usable.
+/// that will not answer `--version` — or answers too slowly — is still usable
+/// and simply reports no version.
+#[cfg(not(windows))]
 fn probe_version(executable: &Path) -> Option<String> {
+    probe_version_within(executable, VERSION_PROBE_TIMEOUT)
+}
+
+/// The probe itself, with the deadline injectable so a test can prove that a
+/// browser which never exits is killed and reported as unknown rather than
+/// waited on.
+#[cfg(not(windows))]
+fn probe_version_within(executable: &Path, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+
     let mut command = std::process::Command::new(executable);
-    command.arg("--version");
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     crate::process::detach_from_controlling_terminal(&mut command);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::process::WINDOWS_CREATE_NO_WINDOW);
-    }
-    let output = command.output().ok()?;
-    if !output.status.success() {
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
     let version = text.split_whitespace().last()?.trim().to_string();
     if version.is_empty() {
         None
     } else {
         Some(version)
     }
+}
+
+/// Windows browsers are never asked for their version.
+///
+/// `chrome.exe --version` is not a version switch on Windows: Chrome ignores it
+/// and boots the whole browser, and because the probe passes no
+/// `--user-data-dir` it boots the user's own profile and exits only when the
+/// user closes that window. Detection runs on every runtime start
+/// (`BrowserService::new`), so probing here opened a browser window out of
+/// nowhere on every launch — and with no browser already running, waiting for
+/// the process blocked the startup for as long as the window stayed open. The
+/// version has no consumer in the product, so Windows reports it as unknown
+/// instead of starting a browser to find out.
+#[cfg(windows)]
+fn probe_version(_executable: &Path) -> Option<String> {
+    None
 }
 
 /// Returns the process-wide cached detection result.
@@ -337,5 +391,52 @@ mod tests {
         let first = cached_installations().len();
         let second = cached_installations().len();
         assert_eq!(first, second);
+    }
+
+    /// The probe runs on every startup, so a browser that never answers must not
+    /// be able to hold it: the deadline kills it and reports no version.
+    #[cfg(unix)]
+    #[test]
+    fn a_browser_that_never_answers_the_probe_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("hanging-browser");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").expect("write");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe_version_within(&executable, std::time::Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the probe waited for the browser instead of killing it"
+        );
+    }
+
+    /// Windows is the platform where `--version` starts a browser, so the probe
+    /// must not run one at all — proved with a stand-in that would leave a file
+    /// behind if it were ever executed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_never_starts_a_browser_to_read_its_version() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let marker = directory.path().join("spawned.txt");
+        let stand_in = directory.path().join("stand-in.cmd");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "@echo off\r\necho 1 > \"{}\"\r\necho Google Chrome 999.0.0.0\r\n",
+                marker.display()
+            ),
+        )
+        .expect("write");
+        assert_eq!(probe_version(&stand_in), None);
+        assert!(
+            !marker.exists(),
+            "the version probe executed a browser on Windows"
+        );
     }
 }

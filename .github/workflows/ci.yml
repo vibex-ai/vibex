@@ -56,19 +56,27 @@ jobs:
         run: pnpm check
 
   browser-smoke:
-    name: Embedded browser smoke
-    runs-on: ubuntu-latest
+    name: Embedded browser smoke (${{ matrix.os }})
+    # Windows is the only platform whose CDP transport is the loopback debugging
+    # port rather than the pipe, so the smoke runs there as well as on Linux.
+    # The suite skips only on a machine with no browser at all; any other failure
+    # is a real one — a broken transport used to be skipped as "no browser",
+    # which is how the Windows panel shipped unable to open a tab.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang g++ gcc pkg-config libssl-dev
       - name: Run the embedded browser smoke
-        # The suite skips itself when the runner has no Chrome/Chromium, which
-        # is the same explicit degradation the panel shows. A SKIP is a pass.
-        run: cargo test -p vibex-browser --locked --test page_tabs -- --nocapture
+        run: cargo test -p vibex-browser --locked --test page_tabs --test panel_tools -- --nocapture
 
   smoke-placeholders:
     name: Scripted smoke entrypoints

@@ -22,6 +22,24 @@ A client never holds a CDP connection. It reaches the browser through
 `BrowserBackend` (native: in-process service; remote: Remote v2), which mirrors
 the `TerminalBackend` seam.
 
+## Detection
+
+`discovery::detect_installations` walks `PATH`, the macOS bundles and the Windows
+install directories, and the answer is cached for the process. It is called from
+`BrowserService::new`, so it runs on **every** runtime start — which is why
+nothing in it may start a browser:
+
+- **`--version` is only a version switch on Unix.** Windows Chrome ignores it
+  and boots the whole browser instead, and because the probe passes no
+  `--user-data-dir` it boots the user's own profile and exits only when that
+  window is closed. Detection therefore started a browser window on every launch
+  of the app, and with no browser already running, waiting for that process
+  blocked the runtime's construction for as long as the window stayed open.
+  Windows reports no version at all; nothing in the product reads the field.
+- On Unix the probe runs against a deadline: a browser that never answers is
+  killed and reported as an unknown version, because the version is display
+  metadata and must never hold the startup.
+
 ## Two channels, one target
 
 - **Humans** watch `Page.startScreencast` frames rendered as GPUI textures.
@@ -107,6 +125,32 @@ agent acts on and what the user sees cannot diverge.
    the service, and `BrowserFrameStream::next` needs it too because the frame
    stream is awaited outside the transport.
 
+11. **Framing belongs to the transport, never to a caller.** The pipe separates
+   messages with a NUL byte; the loopback websocket carries one JSON document per
+   text frame. `CdpWriter` owns that difference, so no caller appends a
+   terminator. A NUL that reaches the websocket makes Chrome answer
+   `-32700 JSON: unprocessed input remains` — a response with **no `id`**, which
+   `CdpInner::route` cannot attribute to a pending command, so it is dropped and
+   the command dies as an eight-second `cdp_command_timeout` instead of an error.
+   Every command failed that way on the websocket transport, which is the
+   Windows one: the panel could not open a single tab there while the pipe-based
+   platforms were unaffected. `cdp::tests` pins both halves (a real websocket
+   server must receive a terminator-free frame, a pipe pair a NUL-terminated
+   one), and `route` now logs an error response it cannot attribute rather than
+   letting a protocol error look like a timeout.
+
+12. **The loopback endpoint is read only from a file this launch wrote.**
+   `--remote-debugging-port=0` publishes the real port in
+   `<profile>/DevToolsActivePort`, and the runtime keeps one profile directory
+   per browser family for the life of the install. A browser that was killed
+   (`shutdown_inner` kills the process group; it does not ask Chrome to exit)
+   leaves that file behind, and reading the leftover connects to a dead port and
+   a `/devtools/browser/<uuid>` only the dead browser knew: the browser started
+   and the tab still never opened, on every run after the first.
+   `launch_with_port` removes the file before spawning and refuses a file older
+   than the launch, because "the file exists" is not the same statement as "this
+   browser wrote it".
+
 ## Security rules
 
 - **Isolated profile, always.** `--user-data-dir` points under the runtime data
@@ -115,7 +159,8 @@ agent acts on and what the user sees cannot diverge.
   anyway.
 - **`--remote-debugging-pipe` wherever it is available**, so no TCP port is
   opened. The loopback port fallback exists only for platforms where the pipe
-  transport is not implemented and is read back from `DevToolsActivePort`.
+  transport is not implemented and is read back from `DevToolsActivePort`
+  (invariant 12 covers which of that file's contents may be trusted).
 - **Never `--no-sandbox`.** In a container, configure user namespaces or seccomp
   instead.
 - **Loopback is not blanket-trusted.** Only origins the runtime positively
@@ -441,12 +486,39 @@ covers coordinate conversion and decode layout. `apps/desktop` exposes an
 explicit, the tier ladder is monotonic, the frame drop is present, and audited
 records carry no page content.
 
+`cdp::tests` pins the framing rule of invariant 11 against both transports: a
+real websocket server must receive one JSON text frame with no NUL, and a pipe
+pair must receive a NUL-terminated one. `process::tests` pins that an endpoint
+file written before the launch is not this launch's (invariant 12), and
+`discovery::tests` pins that a browser which never answers `--version` is killed
+at the deadline — and that Windows never starts one to find out.
+
+**A machine without a browser is the only reason a browser test may skip.**
+`BrowserError::is_browser_missing` is the one predicate for that, and every other
+failure panics: the integration tests used to swallow any error from
+`ensure_session` as "no usable browser", so a transport that could not open a
+single tab read as a machine that had no Chrome. That is how the Windows
+transport shipped broken, and `page_tabs` now also carries the restart case — a
+second service on the same profile directory has to open a tab after the first
+browser was killed — because it is the only test that covers the leftover
+endpoint file.
+
+The CI browser smoke (`.github/workflows/ci.yml`) runs on `ubuntu-latest` and
+`windows-latest` for the same reason: Windows is the only platform whose CDP
+transport is the loopback port, and the job exists so that path is exercised
+under its own name.
+
 `browser_transport::tests` guards the executor seam described in invariant 10:
 one test polls runtime-bound work (a process spawn plus a timer) from a thread
 with no Tokio context, and one opens a real session and tab through
-`LocalBrowserTransport` from such a thread. The second skips itself when no
-system browser is installed — that is the environment where the whole feature is
-explicitly unavailable — and is the regression test for the first-click crash.
+`LocalBrowserTransport` from such a thread. That second one skips when detection
+finds no browser at all — the environment where the whole feature is explicitly
+unavailable — and is the regression test for the first-click crash.
+
+`panel_tools` waits for its fixture page to reach the accessibility tree instead
+of sleeping a fixed interval: the tree is built a frame or two behind layout, and
+with four browsers starting at once the name lookup of `browser_click_by_name`
+otherwise ran before the link it was looking for existed there.
 
 `process::tests` pins the launch-time proxy decision (invariant-adjacent, see the
 Security rules): `all_proxy` alone or beside one scheme variable becomes a

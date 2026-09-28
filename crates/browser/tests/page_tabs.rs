@@ -1,9 +1,11 @@
-//! Page-opened tabs, tab closing and screencast restart, against the system
-//! Chrome.
+//! Page-opened tabs, tab closing, screencast restart and a browser restart,
+//! against the system Chrome.
 //!
 //! These behaviours only exist in the CDP target lifecycle, so they are checked
-//! against a real browser. The test skips itself when the machine has none —
-//! that is the environment where the whole feature is explicitly unavailable.
+//! against a real browser. A machine that has none skips them — that is the
+//! environment where the whole feature is explicitly unavailable. Any other
+//! failure is a defect and fails the test: a broken transport reported as "no
+//! browser" is how the Windows panel shipped unable to open a single tab.
 
 use std::time::{Duration, Instant};
 
@@ -11,6 +13,21 @@ use vibex_browser::{
     BrowserInput, BrowserService, BrowserServiceConfig, BrowserServiceEvent, BrowserSessionKey,
 };
 use vibex_core::{BrowserCaptureQuality, BrowserTabOwner};
+
+/// Opens a session, or skips when this machine has no browser to open one in.
+async fn session_or_skip(service: &BrowserService) -> Option<vibex_core::BrowserSessionId> {
+    match service
+        .ensure_session(BrowserSessionKey::Anonymous, None)
+        .await
+    {
+        Ok(session_id) => Some(session_id),
+        Err(error) if error.is_browser_missing() => {
+            eprintln!("skipping the browser tab test: no usable browser ({error})");
+            None
+        }
+        Err(error) => panic!("the embedded browser did not start: {error}"),
+    }
+}
 
 /// A page whose whole viewport is a `target="_blank"` link.
 const PAGE: &str = "data:text/html,<a id=l href='about:blank' target='_blank' \
@@ -20,15 +37,8 @@ style='position:fixed;inset:0;display:block'>open</a>";
 async fn a_page_opened_tab_is_adopted_and_closed_like_any_other() {
     let home = tempfile::tempdir().expect("temp home");
     let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
-    let session_id = match service
-        .ensure_session(BrowserSessionKey::Anonymous, None)
-        .await
-    {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            eprintln!("skipping the browser tab test: no usable browser ({error})");
-            return;
-        }
+    let Some(session_id) = session_or_skip(&service).await else {
+        return;
     };
     let mut events = service.subscribe();
     let first = service
@@ -49,6 +59,7 @@ async fn a_page_opened_tab_is_adopted_and_closed_like_any_other() {
     }
 
     // Clicking the full-viewport link opens a tab of its own.
+    wait_for_link_at(&service, &first, 100.0).await;
     for input in [
         BrowserInput::MouseDown {
             x: 100.0,
@@ -130,15 +141,8 @@ async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
     let home = tempfile::tempdir().expect("temp home");
     let port = serve_pages();
     let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
-    let session_id = match service
-        .ensure_session(BrowserSessionKey::Anonymous, None)
-        .await
-    {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            eprintln!("skipping the browser tab test: no usable browser ({error})");
-            return;
-        }
+    let Some(session_id) = session_or_skip(&service).await else {
+        return;
     };
     let page = format!("http://127.0.0.1:{port}/");
     let mut events = service.subscribe();
@@ -151,7 +155,10 @@ async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
         .subscribe_frames(&opener, BrowserCaptureQuality::Standard)
         .await
         .ok();
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // The click is synthesized at a point, so the page has to be laid out before
+    // it means anything. A fixed sleep here clicked into an empty document when
+    // four browsers started at once, and the popup then never opened.
+    wait_for_link_at(&service, &opener, 150.0).await;
 
     // The tab this test created announces itself first.
     let (created_session, created_tab) = wait_for_opened_tab(&mut events).await;
@@ -167,24 +174,55 @@ async fn the_opener_keeps_receiving_input_after_it_opens_a_tab() {
     assert_ne!(opened_tab, opener);
     tokio::time::sleep(Duration::from_millis(300)).await;
     click_at(&service, &opener, 500.0).await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
 
-    let snapshot = service
-        .session_snapshot(&session_id)
-        .await
-        .expect("snapshot");
-    let url = snapshot
-        .session
-        .tabs
-        .iter()
-        .find(|tab| tab.tab_id == opener)
-        .map(|tab| tab.url.clone())
-        .unwrap_or_default();
+    // A same-tab navigation commits asynchronously: the address is the signal
+    // that it did, and waiting a fixed interval raced it under load.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let url = loop {
+        let snapshot = service
+            .session_snapshot(&session_id)
+            .await
+            .expect("snapshot");
+        let url = snapshot
+            .session
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == opener)
+            .map(|tab| tab.url.clone())
+            .unwrap_or_default();
+        if url.ends_with("/landed") || Instant::now() >= deadline {
+            break url;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(
         url.ends_with("/landed"),
         "the opener ignored the click after its page opened a tab: {url}"
     );
     service.shutdown().await;
+}
+
+/// Waits until a link is laid out under the point a test is about to click.
+///
+/// `cursor_at` reads `getComputedStyle(el).cursor` at the point, so a
+/// `pointer` answer is proof that the link is where the click will land — the
+/// same question `elementFromPoint` answers for the synthesized click itself.
+async fn wait_for_link_at(service: &BrowserService, tab: &vibex_core::BrowserTabId, y: f64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cursor = service
+            .cursor_at(tab, 60.0, y)
+            .await
+            .unwrap_or_else(|error| panic!("the cursor probe answers: {error}"));
+        if cursor == "pointer" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture page never laid out a link at y={y}: the cursor there is `{cursor}`"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn click_at(service: &BrowserService, tab: &vibex_core::BrowserTabId, y: f64) {
@@ -253,15 +291,8 @@ fn serve_pages() -> u16 {
 async fn a_tab_created_for_an_agent_is_announced() {
     let home = tempfile::tempdir().expect("temp home");
     let service = BrowserService::new(BrowserServiceConfig::new(home.path()));
-    let session_id = match service
-        .ensure_session(BrowserSessionKey::Anonymous, None)
-        .await
-    {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            eprintln!("skipping the browser tab test: no usable browser ({error})");
-            return;
-        }
+    let Some(session_id) = session_or_skip(&service).await else {
+        return;
     };
     let mut events = service.subscribe();
     let tab = service
@@ -272,4 +303,41 @@ async fn a_tab_created_for_an_agent_is_announced() {
     assert_eq!(announced_session, session_id);
     assert_eq!(announced_tab, tab, "the panel is told which tab appeared");
     service.shutdown().await;
+}
+
+/// A second browser on the same profile directory must not be handed the
+/// endpoint of the one that was just killed.
+///
+/// The runtime owns one profile directory per browser family for the life of
+/// the install, and a browser it terminated leaves `DevToolsActivePort` behind.
+/// The loopback-port transport — the one Windows uses — reads that file to find
+/// the endpoint, so the leftover pointed every later run at a dead port and a
+/// `/devtools/browser/<uuid>` nobody answered: the browser started, and the tab
+/// still never opened.
+#[tokio::test]
+async fn a_restarted_browser_reopens_a_tab_on_the_same_profile() {
+    let home = tempfile::tempdir().expect("temp home");
+    let first = BrowserService::new(BrowserServiceConfig::new(home.path()));
+    let Some(session_id) = session_or_skip(&first).await else {
+        return;
+    };
+    let tab = first
+        .create_tab(&session_id, Some("about:blank"), BrowserTabOwner::User)
+        .await
+        .expect("a tab in the first browser");
+    first.close_tab(&tab).await.expect("close");
+    // Killing the browser is what leaves the endpoint file behind.
+    first.shutdown().await;
+
+    let second = BrowserService::new(BrowserServiceConfig::new(home.path()));
+    let session_id = second
+        .ensure_session(BrowserSessionKey::Anonymous, None)
+        .await
+        .expect("the restarted browser starts");
+    let tab = second
+        .create_tab(&session_id, Some("about:blank"), BrowserTabOwner::User)
+        .await
+        .expect("a tab in the restarted browser");
+    second.close_tab(&tab).await.expect("close");
+    second.shutdown().await;
 }
