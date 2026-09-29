@@ -41,6 +41,7 @@ use vibex_terminal::{
     TerminalFrameSnapshot, TerminalGridPoint, TerminalManager,
 };
 
+use crate::motion;
 use crate::terminal_transport::{
     LocalTerminalTransport, TerminalTransport, TerminalTransportError, TerminalTransportFuture,
     TerminalTransportResult,
@@ -449,12 +450,17 @@ impl TerminalSurface {
         };
         // A blinking cursor is a 500ms notify loop per terminal. An inactive
         // window cannot show it, so the loop is dropped while the window is
-        // away and restarted (from a lit cursor) when it comes back.
+        // away and restarted (from a lit cursor) when it comes back — but only
+        // while the appearance preference asks an inactive window to stop
+        // animating: with the preference off (the default) the cursor keeps
+        // blinking in the background, and only the platform's own throttling
+        // applies.
         let window_activation = cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
+            let window_active = window.is_window_active();
+            if window_active {
                 this.cursor_visible = true;
                 this.start_cursor_blink(cx);
-            } else {
+            } else if motion::pauses_while_inactive(!window_active) {
                 this.blink_task = None;
             }
         });

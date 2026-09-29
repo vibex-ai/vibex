@@ -19520,11 +19520,13 @@ impl VibexWorkbench {
                     return;
                 }
                 this.timeline_duration_tick_task = None;
-                if motion::window_is_inactive() {
+                if motion::pauses_while_inactive(motion::window_is_inactive()) {
                     // Nobody can see the elapsed-time label while the window is
                     // in the background: keep the tick armed but skip the
                     // repaint. Coming back to the window repaints anyway, and
-                    // the label is rebuilt from wall time.
+                    // the label is rebuilt from wall time. With the appearance
+                    // preference off — the default — the label keeps counting
+                    // in the background.
                     this.sync_timeline_duration_tick(true, cx);
                     return;
                 }

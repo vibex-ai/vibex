@@ -25,6 +25,12 @@
 //! while the "pause animation when inactive" setting is on — the window not
 //! being active.
 //!
+//! That flag only reaches elements built on `with_animation`. Animation-driven
+//! frames the app schedules itself (status spinners, the terminal cursor blink,
+//! the turn timer) are not covered by it, so each one asks
+//! [`pauses_while_inactive`] before standing still — they save power in a
+//! backgrounded window only when the user asked for that trade.
+//!
 //! translateY is implemented as a `top` inset: taffy applies relative insets
 //! after layout, so — like a CSS transform — siblings never move. Entrances
 //! never set `position` themselves; an element's own positioning (relative is
@@ -592,6 +598,29 @@ pub fn set_pause_inactive_animation(enabled: bool, cx: &mut App) {
     sync_reduce_motion(cx);
 }
 
+/// Whether a window that is not active should stand rendering still right now.
+///
+/// [`sync_reduce_motion`] already folds the preference into gpui's global
+/// `App::reduce_motion` flag, which covers every `with_animation` element.
+/// Callers that drive their own frames — the status spinners, the terminal
+/// cursor blink, the turn timer — are not covered by it and ask through here
+/// instead, with their own reading of the window state. Skipping that work
+/// whenever the window is inactive freezes a backgrounded window the user
+/// asked to keep animating, which is why the preference has to be part of the
+/// decision.
+pub fn pauses_while_inactive(window_inactive: bool) -> bool {
+    inactive_window_pause(
+        PAUSE_INACTIVE_ANIMATION.load(Ordering::Relaxed),
+        window_inactive,
+    )
+}
+
+/// The decision [`pauses_while_inactive`] makes, as a pure function so the
+/// truth table is testable without an `App`.
+fn inactive_window_pause(pause_inactive_animation: bool, window_inactive: bool) -> bool {
+    pause_inactive_animation && window_inactive
+}
+
 /// Record whether the workbench window is active. While it is not — and the
 /// setting asks for it — every `with_animation` element snaps to its rest state
 /// and schedules no frames; gpui already implements that behind
@@ -625,7 +654,7 @@ fn effective_reduced_motion(
     pause_inactive_animation: bool,
     window_inactive: bool,
 ) -> bool {
-    user_reduced_motion || (pause_inactive_animation && window_inactive)
+    user_reduced_motion || inactive_window_pause(pause_inactive_animation, window_inactive)
 }
 
 #[cfg(test)]
@@ -846,6 +875,31 @@ mod tests {
             "the user's own preference still snaps animations"
         );
         assert!(effective_reduced_motion(true, true, true));
+    }
+
+    /// Frame drivers the motion gate cannot reach — the status spinners, the
+    /// terminal cursor blink, the turn timer — go through
+    /// [`pauses_while_inactive`], and it has to answer the same way: an
+    /// inactive window only holds those frames when the setting asks for it.
+    ///
+    /// The regression this pins is a driver that skipped its work because the
+    /// window was inactive while the preference was off, which froze a
+    /// backgrounded workbench the user had asked to keep animating.
+    #[test]
+    fn self_driven_frames_pause_only_when_the_setting_asks() {
+        assert!(
+            !inactive_window_pause(false, true),
+            "the preference off never pauses, however inactive the window is"
+        );
+        assert!(!inactive_window_pause(false, false));
+        assert!(
+            inactive_window_pause(true, true),
+            "the preference pauses an inactive window"
+        );
+        assert!(
+            !inactive_window_pause(true, false),
+            "the preference says nothing about an active window"
+        );
     }
 
     #[test]

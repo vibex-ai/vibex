@@ -11,13 +11,16 @@
 //! a second instead of every refresh. The sweep is far slower than the sample
 //! rate, so the throttle is invisible at the sizes the app draws.
 //!
-//! A spinner in a window nobody is looking at is not animated at all: the
-//! icon is drawn from the same rest angle, repeating animation and all. An
-//! inactive window still gets its frames throttled by the platform, but a
-//! parked workbench with a running session would keep asking for them forever;
-//! drawing still is what actually stops the clock. Window activation itself
-//! repaints the window (gpui refreshes on every active-status change), so the
-//! rotation resumes the moment the window comes back.
+//! A spinner in a window nobody is looking at is not animated — but only when
+//! the "pause animation when inactive" appearance preference is on: the icon is
+//! drawn from the same rest angle, repeating animation and all. An inactive
+//! window still gets its frames throttled by the platform, but a parked
+//! workbench with a running session would keep asking for them forever; drawing
+//! still is what actually stops the clock. Window activation itself repaints the
+//! window (gpui refreshes on every active-status change), so the rotation
+//! resumes the moment the window comes back. With the preference off — the
+//! default — a backgrounded window keeps spinning, because that is what the
+//! user chose.
 
 use std::time::Duration;
 
@@ -26,6 +29,8 @@ use gpui::{
     Styled as _, Transformation, Window, div, ease_in_out, percentage, prelude::FluentBuilder as _,
 };
 use gpui_component::{Icon, IconName, Sizable, Size};
+
+use crate::motion;
 
 /// Frames per second a sidebar status spinner is sampled at.
 ///
@@ -129,7 +134,7 @@ impl RenderOnce for Spinner {
         let icon = icon
             .with_size(size)
             .when_some(color, |this, color| this.text_color(color));
-        if !window.is_window_active() {
+        if motion::pauses_while_inactive(!window.is_window_active()) {
             return div().child(icon).into_any_element();
         }
         div()
