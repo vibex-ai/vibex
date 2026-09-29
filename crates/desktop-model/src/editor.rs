@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use vibex_core::{
@@ -519,11 +519,14 @@ fn normalize_line_endings(content: &str) -> String {
 }
 
 fn normalize_path(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
-        .trim_matches('/')
-        .trim_start_matches("./")
-        .to_string()
+    let path = path.trim().replace('\\', "/");
+    let absolute = Path::new(&path).is_absolute() || path.starts_with('/');
+    let path = path.trim_start_matches("./");
+    if absolute {
+        path.to_string()
+    } else {
+        path.trim_matches('/').to_string()
+    }
 }
 
 fn path_is_equal_or_descendant(candidate: &str, ancestor: &str) -> bool {
@@ -668,5 +671,11 @@ mod tests {
         buffer.update_content("one\nthree\n");
         let request = buffer.begin_save(1).unwrap().into_request(workspace_id);
         assert_eq!(request.line_ending, Some(FileLineEnding::Crlf));
+    }
+
+    #[test]
+    fn absolute_local_preview_paths_are_not_trimmed_into_relative_paths() {
+        let buffer = EditorBufferModel::from_read(read("/tmp/outside.rs", "one\n", "r1"));
+        assert_eq!(buffer.path, "/tmp/outside.rs");
     }
 }

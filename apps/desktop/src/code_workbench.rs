@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -2975,10 +2976,10 @@ impl CodeWorkbench {
 
     /// Opens the file the reader chose in the preview panel's browser.
     ///
-    /// The browser reports absolute paths and the preview reads
-    /// workspace-relative ones, so a file outside the project is refused with
-    /// a hint instead of being read as a bogus relative path. Returns `true`
-    /// when the file was accepted, which is what closes the browser.
+    /// The browser reports absolute paths. Files inside the project keep the
+    /// workspace-relative form used by the backend; files elsewhere stay
+    /// absolute and are read directly by this local desktop client. Returns
+    /// `true` when the file was accepted, which is what closes the browser.
     pub(crate) fn open_picked_preview_file(
         &mut self,
         path: String,
@@ -2986,26 +2987,16 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(relative) = self
-            .local_workspace_root
-            .clone()
-            .and_then(|root| workspace_relative_pick(&root, Path::new(&path)))
-        else {
-            window.push_notification(
-                hint_notification(
-                    NotificationType::Info,
-                    locale::text(
-                        "Choose a file inside the project to preview it",
-                        "请选择项目目录内的文件再预览",
-                        "請選擇專案目錄內的檔案再預覽",
-                    ),
-                    cx,
-                ),
-                cx,
-            );
+        let picked = PathBuf::from(path);
+        let Some(picked) = picked.canonicalize().ok().filter(|picked| picked.is_file()) else {
             return false;
         };
-        self.open_file_in_pane(relative, pane_id, false, window, cx);
+        let preview_path = self
+            .local_workspace_root
+            .as_deref()
+            .and_then(|root| workspace_relative_pick(root, &picked))
+            .unwrap_or_else(|| picked.to_string_lossy().into_owned());
+        self.open_file_in_pane(preview_path, pane_id, false, window, cx);
         true
     }
 
@@ -4443,19 +4434,22 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = normalized_relative_path(&path) else {
+        let Some(path) = normalized_preview_path(&path) else {
             return;
         };
-        if self
-            .pending_file_search_reveal
-            .as_ref()
-            .is_some_and(|reveal| reveal.path != path)
-        {
-            self.pending_file_search_reveal = None;
+        let external = is_local_external_path(&path);
+        if !external {
+            if self
+                .pending_file_search_reveal
+                .as_ref()
+                .is_some_and(|reveal| reveal.path != path)
+            {
+                self.pending_file_search_reveal = None;
+            }
+            self.selected_file_path = Some(path.clone());
+            self.file_tree.clear_selected_directory();
+            self.file_tree.select(&path, false, false);
         }
-        self.selected_file_path = Some(path.clone());
-        self.file_tree.clear_selected_directory();
-        self.file_tree.select(&path, false, false);
         let tab_id = if temporary {
             self.preview
                 .preview_file(path.clone(), pane_id.as_deref(), unix_timestamp_ms())
@@ -5474,32 +5468,27 @@ impl CodeWorkbench {
     }
 
     fn open_pdf(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            self.presentations.insert(
-                path,
-                FilePresentation::Error {
-                    code: "workspace_not_selected".into(),
-                    message: "select a workspace before opening a file".into(),
-                },
-            );
-            return;
-        };
-        let Some(workspace) = self.workspace.clone() else {
-            self.presentations.insert(
-                path,
-                FilePresentation::Error {
-                    code: "workspace_not_selected".into(),
-                    message: "select a workspace before opening a file".into(),
-                },
-            );
-            return;
-        };
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
         let request_path = path.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            materialize_preview_file(&backend, &workspace.id, &request_path).await
-        });
+        let runner = if is_local_external_path(&path) {
+            gpui_tokio::Tokio::spawn(cx, async move { local_external_file_path(&request_path) })
+        } else {
+            let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
+            else {
+                self.presentations.insert(
+                    path,
+                    FilePresentation::Error {
+                        code: "workspace_not_selected".into(),
+                        message: "select a workspace before opening a file".into(),
+                    },
+                );
+                return;
+            };
+            gpui_tokio::Tokio::spawn(cx, async move {
+                materialize_preview_file(&backend, &workspace.id, &request_path).await
+            })
+        };
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -5540,32 +5529,27 @@ impl CodeWorkbench {
     }
 
     fn open_office(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
-            self.presentations.insert(
-                path,
-                FilePresentation::Error {
-                    code: "workspace_not_selected".into(),
-                    message: "select a workspace before opening a file".into(),
-                },
-            );
-            return;
-        };
-        let Some(workspace) = self.workspace.clone() else {
-            self.presentations.insert(
-                path,
-                FilePresentation::Error {
-                    code: "workspace_not_selected".into(),
-                    message: "select a workspace before opening a file".into(),
-                },
-            );
-            return;
-        };
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
         let request_path = path.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            materialize_preview_file(&backend, &workspace.id, &request_path).await
-        });
+        let runner = if is_local_external_path(&path) {
+            gpui_tokio::Tokio::spawn(cx, async move { local_external_file_path(&request_path) })
+        } else {
+            let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
+            else {
+                self.presentations.insert(
+                    path,
+                    FilePresentation::Error {
+                        code: "workspace_not_selected".into(),
+                        message: "select a workspace before opening a file".into(),
+                    },
+                );
+                return;
+            };
+            gpui_tokio::Tokio::spawn(cx, async move {
+                materialize_preview_file(&backend, &workspace.id, &request_path).await
+            })
+        };
         let task_path = path.clone();
         let task = cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
@@ -5792,27 +5776,38 @@ impl CodeWorkbench {
     }
 
     fn load_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
-        else {
-            return;
-        };
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
-        let request = FileReadRequest {
-            workspace_id: workspace.id.clone(),
-            path: path.clone(),
-            max_bytes: Some(FILE_PREVIEW_MAX_BYTES),
+        let workspace = self.workspace.clone();
+        let workspace_generation = workspace.as_ref().map(|workspace| workspace.generation);
+        let runner = if is_local_external_path(&path) {
+            let path = path.clone();
+            let workspace_id = workspace
+                .as_ref()
+                .map(|workspace| workspace.id.clone())
+                .unwrap_or_default();
+            gpui_tokio::Tokio::spawn(cx, async move {
+                read_local_preview_file(Path::new(&path), workspace_id)
+            })
+        } else {
+            let (Some(backend), Some(workspace)) = (self.backend.clone(), workspace) else {
+                return;
+            };
+            let request = FileReadRequest {
+                workspace_id: workspace.id.clone(),
+                path: path.clone(),
+                max_bytes: Some(FILE_PREVIEW_MAX_BYTES),
+            };
+            gpui_tokio::Tokio::spawn(cx, async move { backend.file().read_file(request).await })
         };
-        let runner =
-            gpui_tokio::Tokio::spawn(cx, async move { backend.file().read_file(request).await });
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update_in(cx, |this, window, cx| {
                 this.file_tasks.remove(&task_path);
-                if this.workspace.as_ref().map(|current| current.generation)
-                    != Some(workspace.generation)
-                {
+                if workspace_generation.is_some_and(|generation| {
+                    this.workspace.as_ref().map(|current| current.generation) != Some(generation)
+                }) {
                     return;
                 }
                 match outcome {
@@ -5968,10 +5963,6 @@ impl CodeWorkbench {
     }
 
     fn load_image(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
-        else {
-            return;
-        };
         let Some(format) = image_format_for_path(&path) else {
             self.presentations.insert(
                 path,
@@ -5981,34 +5972,56 @@ impl CodeWorkbench {
         };
         self.presentations
             .insert(path.clone(), FilePresentation::Loading);
-        let workspace_id = workspace.id.clone();
+        let workspace = self.workspace.clone();
+        let workspace_generation = workspace.as_ref().map(|workspace| workspace.generation);
         let svg_renderer = cx.svg_renderer();
-        let request = FileReadRequest {
-            workspace_id: workspace_id.clone(),
-            path: path.clone(),
-            max_bytes: Some(1),
+        let runner = if is_local_external_path(&path) {
+            let local_path = path.clone();
+            let workspace_id = workspace
+                .as_ref()
+                .map(|workspace| workspace.id.clone())
+                .unwrap_or_default();
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let metadata = read_local_preview_file(Path::new(&local_path), workspace_id)?;
+                let bytes = read_local_file_bytes(Path::new(&local_path), IMAGE_SOURCE_MAX_BYTES)?;
+                let image = Image::from_bytes(format, bytes);
+                let rendered = image.to_image_data(svg_renderer).map_err(|error| {
+                    BackendError::failed("image_decode_failed", error.to_string())
+                })?;
+                Ok::<_, BackendError>((metadata, rendered))
+            })
+        } else {
+            let (Some(backend), Some(workspace)) = (self.backend.clone(), workspace) else {
+                return;
+            };
+            let workspace_id = workspace.id.clone();
+            let request = FileReadRequest {
+                workspace_id: workspace_id.clone(),
+                path: path.clone(),
+                max_bytes: Some(1),
+            };
+            let byte_path = path.clone();
+            gpui_tokio::Tokio::spawn(cx, async move {
+                let metadata = backend.file().read_file(request).await?;
+                let bytes = backend
+                    .file()
+                    .read_file_bytes(workspace_id, byte_path, IMAGE_SOURCE_MAX_BYTES)
+                    .await?;
+                let image = Image::from_bytes(format, bytes);
+                let rendered = image.to_image_data(svg_renderer).map_err(|error| {
+                    BackendError::failed("image_decode_failed", error.to_string())
+                })?;
+                Ok::<_, BackendError>((metadata, rendered))
+            })
         };
-        let byte_path = path.clone();
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let metadata = backend.file().read_file(request).await?;
-            let bytes = backend
-                .file()
-                .read_file_bytes(workspace_id, byte_path, IMAGE_SOURCE_MAX_BYTES)
-                .await?;
-            let image = Image::from_bytes(format, bytes);
-            let rendered = image
-                .to_image_data(svg_renderer)
-                .map_err(|error| BackendError::failed("image_decode_failed", error.to_string()))?;
-            Ok::<_, BackendError>((metadata, rendered))
-        });
         let task_path = path.clone();
         let task = cx.spawn_in(window, async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update_in(cx, |this, _window, cx| {
                 this.file_tasks.remove(&task_path);
-                if this.workspace.as_ref().map(|current| current.generation)
-                    != Some(workspace.generation)
-                {
+                if workspace_generation.is_some_and(|generation| {
+                    this.workspace.as_ref().map(|current| current.generation) != Some(generation)
+                }) {
                     return;
                 }
                 match outcome {
@@ -6338,6 +6351,18 @@ impl CodeWorkbench {
     /// Start writing an editor buffer back to disk. Returns whether a write was
     /// actually queued, so autosave can tell a started save from a refused one.
     pub(crate) fn save_editor(&mut self, path: String, cx: &mut Context<Self>) -> bool {
+        if is_local_external_path(&path) {
+            self.error = Some(
+                locale::text(
+                    "Files outside the project are read-only previews",
+                    "项目外文件仅支持只读预览",
+                    "專案外檔案僅支援唯讀預覽",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             return false;
@@ -7220,6 +7245,12 @@ impl CodeWorkbench {
         path: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Result<PathBuf, BackendError>, tokio::task::JoinError>>> {
+        if is_local_external_path(path) {
+            let path = path.to_string();
+            return Some(gpui_tokio::Tokio::spawn(cx, async move {
+                local_external_file_path(&path)
+            }));
+        }
         let (Some(backend), Some(workspace)) = (self.backend.clone(), self.workspace.clone())
         else {
             let this = cx.entity();
@@ -8352,23 +8383,32 @@ impl CodeWorkbench {
             _ => None,
         };
         let reveal_path = match &tab.target {
-            PreviewTarget::File { path } => Some(path.clone()),
+            PreviewTarget::File { path } if !is_local_external_path(path) => Some(path.clone()),
             _ => None,
         };
         let copy_paths = file_path.as_ref().map(|path| {
+            let external = is_local_external_path(path);
             let absolute = self
                 .workspace
                 .as_ref()
+                .filter(|_| !external)
                 .map(|workspace| workspace.root.join(path))
                 .unwrap_or_else(|| PathBuf::from(path));
-            (path.clone(), absolute.to_string_lossy().to_string())
+            (
+                (!external).then(|| path.clone()),
+                absolute.to_string_lossy().to_string(),
+            )
         });
         let open_in_editor = matches!(tab.target, PreviewTarget::GitDiff { .. });
         let open_in_editor_available = file_path
             .as_deref()
             .is_some_and(|path| file_can_open_in_editor(path, FileEntryKind::File));
         let workspace_available = self.workspace.is_some();
-        let terminal_available = workspace_available && self.terminal_transport.is_some();
+        let terminal_available = workspace_available
+            && self.terminal_transport.is_some()
+            && file_path
+                .as_deref()
+                .is_none_or(|path| !is_local_external_path(path));
         let dirty = tab
             .id
             .strip_prefix("file:")
@@ -8892,9 +8932,9 @@ impl CodeWorkbench {
                     );
                 }
                 if let Some((relative_path, absolute_path)) = copy_paths.clone() {
-                    menu = menu
-                        .separator()
-                        .item(
+                    menu = menu.separator();
+                    if let Some(relative_path) = relative_path {
+                        menu = menu.item(
                             PopupMenuItem::new(locale::text(
                                 "Copy relative path",
                                 "复制相对路径",
@@ -8906,26 +8946,29 @@ impl CodeWorkbench {
                                     relative_path.clone(),
                                 ));
                             }),
-                        )
-                        .item(
-                            PopupMenuItem::new(locale::text(
-                                "Copy absolute path",
-                                "复制完整路径",
-                                "複製完整路徑",
-                            ))
-                            .icon(IconName::Copy)
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    absolute_path.clone(),
-                                ));
-                            }),
                         );
+                    }
+                    menu = menu.item(
+                        PopupMenuItem::new(locale::text(
+                            "Copy absolute path",
+                            "复制完整路径",
+                            "複製完整路徑",
+                        ))
+                        .icon(IconName::Copy)
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(absolute_path.clone()));
+                        }),
+                    );
                 }
                 let file_open_path = file_path.clone();
                 if file_open_path.is_some() {
                     let submenu_entity = context_entity.clone();
                     let submenu_pane_id = context_pane_id.clone();
-                    let can_open_in_file_system = file_open_path.is_some() && workspace_available;
+                    let can_open_in_file_system = file_open_path.is_some()
+                        && (workspace_available
+                            || file_open_path
+                                .as_deref()
+                                .is_some_and(is_local_external_path));
                     let can_open_in_editor = open_in_editor_available && can_open_in_file_system;
                     menu =
                         menu.separator().submenu_with_icon(
@@ -9335,6 +9378,7 @@ impl CodeWorkbench {
                                         .ghost()
                                         .compact()
                                         .icon(Icon::default().path("icons/vibex/pencil.svg"))
+                                        .disabled(is_local_external_path(&path))
                                         .tooltip(locale::text(
                                             "Edit Markdown source",
                                             "编辑 Markdown 源文件",
@@ -9344,11 +9388,13 @@ impl CodeWorkbench {
                                             this.toggle_markdown_source(edit_path.clone(), cx)
                                         })),
                                 )
-                                .child(reveal_in_files_button(
-                                    format!("markdown-reveal:{path}"),
-                                    locate_path,
-                                    cx,
-                                )),
+                                .when(!is_local_external_path(&path), |this| {
+                                    this.child(reveal_in_files_button(
+                                        format!("markdown-reveal:{path}"),
+                                        locate_path,
+                                        cx,
+                                    ))
+                                }),
                         ),
                 )
                 .when(!workspace_links.is_empty(), |this| {
@@ -9396,15 +9442,26 @@ impl CodeWorkbench {
             let save_path = path.clone();
             let markdown_path = path.clone();
             let reveal_path = path.clone();
-            let editable = buffer.as_ref().is_some_and(|buffer| buffer.editable());
+            let external_file = is_local_external_path(&path);
+            let editable =
+                !external_file && buffer.as_ref().is_some_and(|buffer| buffer.editable());
             let dirty = buffer.as_ref().is_some_and(|buffer| buffer.dirty);
             let pending_save = buffer
                 .as_ref()
                 .is_some_and(|buffer| buffer.pending_save.is_some());
-            let status = buffer
-                .as_ref()
-                .map(editor_status)
-                .unwrap_or_else(|| "Loading".to_string());
+            let status = if external_file {
+                locale::text(
+                    "External file - read only",
+                    "项目外文件 - 只读",
+                    "專案外檔案 - 唯讀",
+                )
+                .to_string()
+            } else {
+                buffer
+                    .as_ref()
+                    .map(editor_status)
+                    .unwrap_or_else(|| "Loading".to_string())
+            };
             let file_name = Path::new(&path)
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -9624,11 +9681,13 @@ impl CodeWorkbench {
                                             let _ = this.save_editor(save_path.clone(), cx);
                                         })),
                                 )
-                                .child(reveal_in_files_button(
-                                    format!("editor-reveal:{path}"),
-                                    reveal_path,
-                                    cx,
-                                )),
+                                .when(!external_file, |this| {
+                                    this.child(reveal_in_files_button(
+                                        format!("editor-reveal:{path}"),
+                                        reveal_path,
+                                        cx,
+                                    ))
+                                }),
                         ),
                 )
                 .child(
@@ -16984,7 +17043,8 @@ fn tab_tooltip(target: &PreviewTarget, label: &str) -> String {
 const PREVIEW_MATERIALIZE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Materializes a workspace-relative file locally so a local renderer can open
-/// it.
+/// it. An absolute path is already local and is returned after checking that it
+/// still names a regular file.
 ///
 /// The authority owns the bytes and the desktop owns rendering, so a remote
 /// authority streams the file over the backend and the desktop caches it on
@@ -16995,6 +17055,9 @@ async fn materialize_preview_file(
     workspace_id: &WorkspaceId,
     path: &str,
 ) -> Result<PathBuf, BackendError> {
+    if is_local_external_path(path) {
+        return local_external_file_path(path);
+    }
     let bytes = backend
         .file()
         .read_file_bytes(
@@ -17034,6 +17097,184 @@ async fn materialize_preview_file(
 
 fn preview_cache_directory() -> PathBuf {
     std::env::temp_dir().join("vibex-desktop-preview-cache")
+}
+
+fn local_external_file_path(path: &str) -> Result<PathBuf, BackendError> {
+    let path = PathBuf::from(path);
+    let canonical = path.canonicalize().map_err(|error| {
+        BackendError::failed(
+            "local_file_missing",
+            format!("the selected file is no longer available: {error}"),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(BackendError::failed(
+            "local_file_not_file",
+            "the selected path is not a regular file",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn read_local_file_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        BackendError::failed(
+            "local_file_read_failed",
+            format!("failed to read the selected file: {error}"),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            BackendError::failed(
+                "local_file_read_failed",
+                format!("failed to read the selected file: {error}"),
+            )
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(BackendError::unsupported(
+            "local_file_too_large",
+            "the selected file exceeds the bounded preview size",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_local_preview_file(
+    path: &Path,
+    workspace_id: WorkspaceId,
+) -> Result<FileReadResponse, BackendError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        BackendError::failed(
+            "local_file_metadata_failed",
+            format!("failed to inspect the selected file: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(BackendError::failed(
+            "local_file_not_file",
+            "the selected path is not a regular file",
+        ));
+    }
+    let path_string = path.to_string_lossy().into_owned();
+    let content_kind = content_preview_kind_for_path(&path_string);
+    let mut preview_kind = match content_kind {
+        ContentPreviewKind::Markdown => FilePreviewKind::Markdown,
+        ContentPreviewKind::Image => FilePreviewKind::Image,
+        ContentPreviewKind::TextEditor => FilePreviewKind::Text,
+        ContentPreviewKind::Pdf
+        | ContentPreviewKind::Office
+        | ContentPreviewKind::MediaExternalOnly
+        | ContentPreviewKind::UnsupportedBinary => FilePreviewKind::Binary,
+    };
+    let bytes = read_local_file_prefix(path, FILE_PREVIEW_MAX_BYTES as usize)?;
+    let truncated = bytes.len() > FILE_PREVIEW_MAX_BYTES as usize;
+    let bytes = &bytes[..bytes.len().min(FILE_PREVIEW_MAX_BYTES as usize)];
+    let (content, mut encoding, mut line_ending) =
+        if preview_kind == FilePreviewKind::Text || preview_kind == FilePreviewKind::Markdown {
+            let (bytes, encoding) = bytes
+                .strip_prefix(&[0xEF, 0xBB, 0xBF])
+                .map(|bytes| (bytes, FileEncoding::Utf8Bom))
+                .unwrap_or((bytes, FileEncoding::Utf8));
+            let content = if !truncated {
+                std::str::from_utf8(bytes).ok().map(str::to_string)
+            } else {
+                let mut end = bytes.len();
+                loop {
+                    if end == 0 && !bytes.is_empty() {
+                        break None;
+                    }
+                    match std::str::from_utf8(&bytes[..end]) {
+                        Ok(content) => break Some(content.to_string()),
+                        Err(_) if end > 0 => end -= 1,
+                        Err(_) => break None,
+                    }
+                }
+            };
+            let line_ending = content
+                .as_deref()
+                .map(local_line_ending)
+                .unwrap_or(FileLineEnding::None);
+            (content, encoding, line_ending)
+        } else {
+            (None, FileEncoding::Binary, FileLineEnding::None)
+        };
+    let modified_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64);
+    let content_revision = format!(
+        "local:{}:{}",
+        metadata.len(),
+        modified_at_ms.unwrap_or_default()
+    );
+    if content.is_none() && preview_kind == FilePreviewKind::Text {
+        preview_kind = FilePreviewKind::Binary;
+        encoding = FileEncoding::Binary;
+        line_ending = FileLineEnding::None;
+    }
+    Ok(FileReadResponse {
+        workspace_id,
+        path: path_string.clone(),
+        name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&path_string)
+            .to_string(),
+        preview_kind,
+        content,
+        size_bytes: metadata.len(),
+        modified_at_ms,
+        language: Some(language_for_path(&path_string).to_string()),
+        truncated,
+        encoding,
+        line_ending,
+        content_revision,
+    })
+}
+
+fn read_local_file_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        BackendError::failed(
+            "local_file_read_failed",
+            format!("failed to read the selected file: {error}"),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            BackendError::failed(
+                "local_file_read_failed",
+                format!("failed to read the selected file: {error}"),
+            )
+        })?;
+    Ok(bytes)
+}
+
+fn local_line_ending(content: &str) -> FileLineEnding {
+    let bytes = content.as_bytes();
+    let crlf = bytes.windows(2).filter(|pair| *pair == b"\r\n").count();
+    let lf = bytes
+        .iter()
+        .enumerate()
+        .filter(|(index, byte)| **byte == b'\n' && (*index == 0 || bytes[*index - 1] != b'\r'))
+        .count();
+    let lone_cr = bytes
+        .iter()
+        .enumerate()
+        .filter(|(index, byte)| {
+            **byte == b'\r' && (*index + 1 == bytes.len() || bytes[*index + 1] != b'\n')
+        })
+        .count();
+    match (lf > 0, crlf > 0, lone_cr > 0) {
+        (false, false, false) => FileLineEnding::None,
+        (true, false, false) => FileLineEnding::Lf,
+        (false, true, false) => FileLineEnding::Crlf,
+        _ => FileLineEnding::Mixed,
+    }
 }
 
 fn git_diff_tab_id(key: &GitSelectionKey) -> String {
@@ -17125,6 +17366,9 @@ fn preview_tab_visual_status(
 }
 
 fn preview_paths_match(left: &str, right: &str) -> bool {
+    if is_local_external_path(left) || is_local_external_path(right) {
+        return false;
+    }
     normalized_relative_path(left) == normalized_relative_path(right)
 }
 
@@ -17984,12 +18228,28 @@ fn normalized_relative_path(path: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+fn normalized_preview_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    if is_local_external_path(&path) {
+        Some(path.trim_start_matches("./").to_string())
+    } else {
+        normalized_relative_path(&path)
+    }
+}
+
+fn is_local_external_path(path: &str) -> bool {
+    let path = path.trim().replace('\\', "/");
+    Path::new(&path).is_absolute()
+        || path.starts_with('/')
+        || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
 /// The workspace-relative form of a file the preview panel's browser picked.
-///
-/// The browser hands back an absolute path and the preview, the backend and the
-/// file tree all speak workspace-relative ones, so a file outside the project
-/// has no answer here and the caller refuses it instead of reading a path that
-/// only looks relative.
+/// A file outside the project returns `None` so the caller can retain its
+/// absolute local path for the desktop-only preview path.
 fn workspace_relative_pick(root: &Path, picked: &Path) -> Option<String> {
     let relative = picked.strip_prefix(root).ok()?;
     let relative = relative.to_string_lossy().replace('\\', "/");
@@ -18646,6 +18906,40 @@ mod tests {
             None,
             "the project directory itself is not a file to open"
         );
+    }
+
+    #[test]
+    fn external_preview_paths_stay_absolute_and_local() {
+        assert_eq!(
+            normalized_preview_path(" /tmp/shared/notes.md "),
+            Some("/tmp/shared/notes.md".to_string())
+        );
+        assert!(is_local_external_path("/tmp/shared/notes.md"));
+        assert!(!is_local_external_path("docs/notes.md"));
+    }
+
+    #[test]
+    fn local_external_text_files_use_the_read_only_preview_contract() {
+        let file = tempfile::NamedTempFile::new().expect("temporary external file");
+        std::fs::write(file.path(), "one\r\ntwo\r\n").expect("write temporary external file");
+        let response =
+            read_local_preview_file(file.path(), WorkspaceId::new()).expect("read local preview");
+        assert_eq!(response.path, file.path().to_string_lossy());
+        assert_eq!(response.preview_kind, FilePreviewKind::Text);
+        assert_eq!(response.content.as_deref(), Some("one\r\ntwo\r\n"));
+        assert_eq!(response.line_ending, FileLineEnding::Crlf);
+        assert!(!response.truncated);
+    }
+
+    #[test]
+    fn local_external_unknown_binary_files_are_not_offered_as_text() {
+        let file = tempfile::NamedTempFile::new().expect("temporary external file");
+        std::fs::write(file.path(), [0, 159, 146, 150]).expect("write binary file");
+        let response =
+            read_local_preview_file(file.path(), WorkspaceId::new()).expect("read local preview");
+        assert_eq!(response.preview_kind, FilePreviewKind::Binary);
+        assert_eq!(response.encoding, FileEncoding::Binary);
+        assert!(response.content.is_none());
     }
 
     /// The "+" menu's file entry opens the project picker's dialog in its file
