@@ -1697,6 +1697,12 @@ impl BrowserSurface {
         if self.downloads.is_empty() {
             return None;
         }
+        // The directory travels with every event, so the folder button works
+        // while a download is still running or was refused and no file exists.
+        let directory = self
+            .downloads
+            .last()
+            .map(|download| download.directory.clone());
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.downloads.len());
         for (index, download) in self.downloads.iter().enumerate() {
             rows.push(render_download_row(index, download, cx));
@@ -1727,25 +1733,72 @@ impl BrowserSurface {
                                 .child(locale::text("Downloads", "下载", "下載")),
                         )
                         .child(
-                            Button::new("browser-downloads-dismiss")
-                                .icon(Icon::new(IconName::Close))
-                                .ghost()
-                                .xsmall()
-                                .tooltip(locale::text(
-                                    "Hide the download list",
-                                    "隐藏下载列表",
-                                    "隱藏下載列表",
-                                ))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.downloads.clear();
-                                    this.downloads_hide_task = None;
-                                    cx.notify();
-                                })),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .when_some(directory, |this, directory| {
+                                    this.child(
+                                        Button::new("browser-downloads-folder")
+                                            .icon(Icon::new(IconName::FolderClosed))
+                                            .ghost()
+                                            .xsmall()
+                                            .tooltip(locale::text(
+                                                "Open the downloads folder",
+                                                "打开下载目录",
+                                                "開啟下載資料夾",
+                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_downloads_folder(directory.clone(), cx);
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    Button::new("browser-downloads-dismiss")
+                                        .icon(Icon::new(IconName::Close))
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip(locale::text(
+                                            "Hide the download list",
+                                            "隐藏下载列表",
+                                            "隱藏下載列表",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.downloads.clear();
+                                            this.downloads_hide_task = None;
+                                            cx.notify();
+                                        })),
+                                ),
                         ),
                 )
                 .children(rows)
                 .into_any_element(),
         )
+    }
+
+    /// Opens the runtime's download directory in the system file manager.
+    fn open_downloads_folder(&mut self, directory: std::path::PathBuf, cx: &mut Context<Self>) {
+        // The directory is created on demand: a reader whose every download was
+        // refused has none yet, and asking to see it is asking for it to exist.
+        let opened = std::fs::create_dir_all(&directory)
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                crate::platform::reveal_path_in_file_manager(&directory)
+                    .map_err(|error| error.message)
+            });
+        match opened {
+            Ok(()) => self.source_notice = None,
+            Err(error) => {
+                self.source_notice = Some(format!(
+                    "{}{error}",
+                    locale::text(
+                        "Could not open the downloads folder: ",
+                        "无法打开下载目录：",
+                        "無法開啟下載資料夾：",
+                    )
+                ));
+            }
+        }
+        cx.notify();
     }
 
     fn render_frame(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3729,6 +3782,7 @@ mod tests {
             total_bytes: 4096,
             state,
             path: None,
+            directory: std::path::PathBuf::from("/runtime/downloads"),
         };
 
         surface.update(&mut cx, |surface, cx| {
@@ -3753,6 +3807,15 @@ mod tests {
             assert_eq!(surface.downloads.len(), 1);
             assert_eq!(surface.downloads[0].state, BrowserDownloadState::Completed);
             assert_eq!(surface.downloads[0].received_bytes, 4096);
+            // The folder button opens the directory the runtime named, which
+            // every event carries even when no file exists yet.
+            assert_eq!(
+                surface
+                    .downloads
+                    .last()
+                    .map(|download| download.directory.clone()),
+                Some(std::path::PathBuf::from("/runtime/downloads"))
+            );
 
             // A second download is a second row, and the card holds only the
             // most recent few.

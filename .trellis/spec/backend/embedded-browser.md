@@ -113,7 +113,12 @@ agent acts on and what the user sees cannot diverge.
    are two files (`unique_download_path`), never one overwritten file. Events
    stay enabled while downloads are denied: a refused save is announced as
    `BrowserDownloadState::Blocked` so the panel can prompt the reader, instead of
-   a click that silently produces nothing.
+   a click that silently produces nothing. Chrome reports one download once per
+   session that carries a download behaviour, and the browser-level policy the
+   settings install is in force beside the per-tab one, so
+   `handle_download_will_begin` remembers the guids it has answered and drops the
+   repeats. Without that, one refused save produced two identical notifications
+   and two ledger rows.
 
 10. **The browser service is polled inside the Tokio runtime, always.**
    `BrowserService` is a Tokio citizen: it spawns Chrome, opens async pipes,
@@ -433,7 +438,7 @@ page. Each one needs a panel-side answer:
 | File chooser | card from `FileChooserOpened`; the human's "Choose file" opens the workbench's own file browser and the confirmed path goes through `resolve_file_chooser`, while the Agent attaches files with `browser_upload`; cancelling sends an empty list |
 | `<select>` popup | `probe_select_hint` on hover, then the panel's own list; `select_menu_at` / `choose_select_option` apply the choice and dispatch `input` + `change` |
 | Clipboard | Ctrl/Cmd+C reads the selection with `selection_text` and writes the system clipboard; Ctrl/Cmd+X does the same before letting the page cut, so the text is not stranded in Chrome's clipboard; Ctrl/Cmd+V types the system clipboard into the page with `Input.insertText`; Shift/Alt combinations stay with the page |
-| Downloads | denied by default; when allowed, `Browser.setDownloadBehavior` is `allowAndName` into the runtime's own directory and `Browser.downloadWillBegin` / `Browser.downloadProgress` rename the guid to the sanitized name. Both events are browser-level, so they are dispatched *before* the session-id early return in the event pump. The panel renders `Download` events as a popup with a progress bar and the saved path, and a refused save (events stay on under `deny`) becomes a `Blocked` row plus a notification |
+| Downloads | denied by default; when allowed, `Browser.setDownloadBehavior` is `allowAndName` into the runtime's own directory and `Browser.downloadWillBegin` / `Browser.downloadProgress` rename the guid to the sanitized name. Both events are browser-level, so they are dispatched *before* the session-id early return in the event pump. The panel renders `Download` events as a popup with a progress bar and the saved path, plus a folder button that reveals the directory the event carries (`BrowserDownload::directory`, created on demand) and a close button; a refused save (events stay on under `deny`) becomes a `Blocked` row plus a notification |
 | Permissions, HTTP auth | denied by Chrome itself (see Security rules) |
 | Find in page | no browser UI exists, so the panel owns Ctrl/Cmd+F. The chord is claimed before focus is consulted, so the host asks the focused surface first: `CodeWorkbench::open_focused_editor_find` / `open_focused_browser_find` answer for the file or page under the caret, and only a conversation that really has the keyboard opens the session search. `find_in_page` walks text nodes and paints with the CSS Custom Highlight API, never by wrapping hits in `<mark>`: a foreign node inside a framework's tree makes its next render throw. The active hit is marked with one attribute because Chrome will not scroll to a bare range |
 | Mouse cursor | a frame carries no cursor, so `cursor_at` reads `getComputedStyle(el).cursor` at the hovered point and the panel maps it onto a native shape (`cursor_style_for`). Throttled to one probe per round trip; a keyword the platform cannot express falls back to the arrow |

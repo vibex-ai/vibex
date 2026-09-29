@@ -586,7 +586,22 @@ pub(crate) struct DownloadsState {
     /// In-flight downloads by Chrome's guid, holding the name the runtime
     /// chose for the finished file.
     pub(crate) pending: HashMap<String, PendingDownload>,
+    /// Guids `Browser.downloadWillBegin` has already been handled for.
+    ///
+    /// Chrome announces one download once per session that carries a download
+    /// behaviour: the browser-level policy [`BrowserService::set_downloads_enabled`]
+    /// installs, and the per-tab behaviour every tab is prepared with both
+    /// apply. Every announcement carries the same guid, so the runtime keeps
+    /// the first and drops the repeats — otherwise one refused save produced
+    /// two notifications and two ledger rows.
+    pub(crate) announced: Vec<String>,
 }
+
+/// How many guid announcements are remembered.
+///
+/// A download can be announced twice in quick succession; nothing older than
+/// the last few downloads can still be waiting for its second announcement.
+const MAX_ANNOUNCED_DOWNLOADS: usize = 64;
 
 /// One download the panel can show.
 ///
@@ -607,6 +622,12 @@ pub struct BrowserDownload {
     pub state: BrowserDownloadState,
     /// Where the finished file landed.
     pub path: Option<PathBuf>,
+    /// The runtime's download directory.
+    ///
+    /// It travels with every event because the panel's "open downloads folder"
+    /// button needs it before a file exists — a download that is still running,
+    /// or one that was refused, has no `path` yet.
+    pub directory: PathBuf,
 }
 
 /// Where one download stands.
@@ -713,6 +734,7 @@ impl BrowserService {
                 enabled: false,
                 dir: downloads_dir(&home_dir),
                 pending: HashMap::new(),
+                announced: Vec::new(),
             }),
             runtime: tokio::runtime::Handle::try_current().ok(),
         });
@@ -3499,8 +3521,20 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
     let Some((tab_id, session_id)) = tab else {
         return;
     };
-    let record = {
+    let (record, directory) = {
         let mut downloads = inner.downloads.lock().await;
+        // The same download is announced once per session that carries a
+        // download behaviour, and both the browser-level policy and the tab's
+        // own settings are in force. The second announcement is the same
+        // download; answering it again would toast it twice.
+        if downloads.announced.iter().any(|seen| seen == guid) {
+            return;
+        }
+        downloads.announced.push(guid.to_string());
+        if downloads.announced.len() > MAX_ANNOUNCED_DOWNLOADS {
+            downloads.announced.remove(0);
+        }
+        let directory = downloads.dir.clone();
         if !downloads.enabled {
             // The behaviour was already denied at the browser, so nothing is
             // written. The panel is told anyway: a click that saves nothing
@@ -3517,6 +3551,7 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
                     total_bytes: 0,
                     state: BrowserDownloadState::Blocked,
                     path: None,
+                    directory,
                 })));
             return;
         }
@@ -3531,14 +3566,17 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
                 total_bytes: 0,
             },
         );
-        download_record(
-            &session_id,
-            &tab_id,
-            format!("started a download named {file_name}"),
-            // Chrome accepted it and is writing the file; nothing is
-            // verified until `Browser.downloadProgress` says completed.
-            vibex_core::BrowserOperationStatus::Dispatched,
-            &url,
+        (
+            download_record(
+                &session_id,
+                &tab_id,
+                format!("started a download named {file_name}"),
+                // Chrome accepted it and is writing the file; nothing is
+                // verified until `Browser.downloadProgress` says completed.
+                vibex_core::BrowserOperationStatus::Dispatched,
+                &url,
+            ),
+            directory,
         )
     };
     inner.state.lock().await.push_ledger(record);
@@ -3553,6 +3591,7 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
             total_bytes: 0,
             state: BrowserDownloadState::InProgress,
             path: None,
+            directory,
         })));
 }
 
@@ -3595,6 +3634,7 @@ async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
                 total_bytes,
                 state: BrowserDownloadState::InProgress,
                 path: None,
+                directory: downloads.dir.clone(),
             }
         };
         let _ = inner
@@ -3654,6 +3694,7 @@ async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
             total_bytes: total_bytes.max(pending.total_bytes),
             state,
             path,
+            directory: dir,
         })));
 }
 

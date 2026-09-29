@@ -414,6 +414,11 @@ async fn an_allowed_download_reports_progress_and_its_saved_path() {
         "the size Chrome reported travels with the event"
     );
     assert_eq!(completed.received_bytes, 5);
+    assert_eq!(
+        completed.directory,
+        service.downloads_dir().await,
+        "the panel is told which folder to open"
+    );
     service.shutdown().await;
 }
 
@@ -496,15 +501,24 @@ async fn a_chosen_file_reaches_the_pages_file_input() {
     service.shutdown().await;
 }
 
-/// A refused download is announced instead of silently doing nothing.
+/// A refused download is announced once, not once per session.
+///
+/// Setting the policy installs the behaviour at the browser level as well as
+/// the per-tab one every tab already carries, and Chrome reports the download
+/// on both. Answering both announcements is what put two identical
+/// notifications on screen for one refused save.
 #[tokio::test]
-async fn a_refused_download_is_announced() {
+async fn a_refused_download_is_announced_once() {
     let Some((service, home, session_id, tab)) = service_with_page().await else {
         return;
     };
     let _home = home;
     let downloads = service.downloads_dir().await;
     assert!(!service.downloads_enabled().await);
+    // The reader turned downloads on and then off again at some point; that is
+    // what leaves both behaviours in force.
+    service.set_downloads_enabled(true).await;
+    service.set_downloads_enabled(false).await;
     let mut events = service.subscribe();
 
     click_download_link(&service, &session_id, &tab).await;
@@ -521,6 +535,20 @@ async fn a_refused_download_is_announced() {
     assert_eq!(blocked.tab_id, tab);
     assert_eq!(blocked.file_name, "re_port_.txt");
     assert!(blocked.path.is_none(), "nothing was written for a refusal");
+    assert_eq!(
+        blocked.directory, downloads,
+        "the refused download still names the folder the button should open"
+    );
+
+    // The duplicate announcement, if any, arrives immediately after the first.
+    let quiet = Instant::now() + Duration::from_millis(600);
+    while let Some(download) = next_download(&mut events, quiet).await {
+        assert_ne!(
+            download.state,
+            vibex_browser::BrowserDownloadState::Blocked,
+            "one refused save is one announcement"
+        );
+    }
     let written = std::fs::read_dir(&downloads)
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or(0);
