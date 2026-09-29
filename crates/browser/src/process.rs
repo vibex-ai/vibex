@@ -422,6 +422,11 @@ fn apply_proxy_environment(command: &mut Command) {
 ///
 /// A browser launched from a terminal app can be stopped by `SIGTTIN` when it
 /// touches `/dev/tty`, which looks exactly like a hung page.
+///
+/// `setsid()` would detach the child too, but it cannot be used here: the child
+/// is spawned into its own process group, a session leader may not call
+/// `setpgid`, and the group spawn registers that call immediately after this
+/// hook. A `setsid()` in this hook would therefore fail every launch.
 #[cfg(unix)]
 pub fn detach_from_controlling_terminal(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
@@ -433,7 +438,16 @@ pub fn detach_from_controlling_terminal(command: &mut std::process::Command) {
             const DEV_TTY: &[u8] = b"/dev/tty\0";
             let fd = libc::open(DEV_TTY.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
             if fd >= 0 {
-                libc::ioctl(fd, libc::TIOCNOTTY);
+                // `libc` names `TIOCNOTTY` for Linux and the BSDs but not for
+                // Android, although the Android kernel implements the same
+                // request, so Android names Linux's `<asm-generic/ioctls.h>`
+                // value for itself instead of shipping without a detach.
+                #[cfg(target_os = "android")]
+                let request = 0x5422;
+                #[cfg(not(target_os = "android"))]
+                let request = libc::TIOCNOTTY;
+
+                libc::ioctl(fd, request);
                 libc::close(fd);
             }
             Ok(())

@@ -6,6 +6,11 @@ use std::process::Command;
 /// process-group hook moves it into the background. Some CLIs open `/dev/tty`
 /// for interactive services even in ACP mode; a background process group that
 /// does so is stopped by `SIGTTIN` and never answers the ACP handshake.
+///
+/// `setsid()` would detach the child too, but it cannot be used here: the child
+/// is spawned into its own process group, a session leader may not call
+/// `setpgid`, and the group spawn registers that call immediately after this
+/// hook. A `setsid()` in this hook would therefore fail every spawn.
 #[cfg(unix)]
 pub fn detach_from_controlling_terminal(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -19,7 +24,16 @@ pub fn detach_from_controlling_terminal(command: &mut Command) {
             // service or test process), so failure to open it is expected.
             let fd = libc::open(DEV_TTY.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
             if fd >= 0 {
-                libc::ioctl(fd, libc::TIOCNOTTY);
+                // `libc` names `TIOCNOTTY` for Linux and the BSDs but not for
+                // Android, although the Android kernel implements the same
+                // request, so Android names Linux's `<asm-generic/ioctls.h>`
+                // value for itself instead of shipping without a detach.
+                #[cfg(target_os = "android")]
+                let request = 0x5422;
+                #[cfg(not(target_os = "android"))]
+                let request = libc::TIOCNOTTY;
+
+                libc::ioctl(fd, request);
                 libc::close(fd);
             }
             Ok(())
