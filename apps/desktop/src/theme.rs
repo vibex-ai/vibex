@@ -217,125 +217,126 @@ pub fn apply_appearance(appearance: &AppearanceUiState, window: Option<&mut Wind
     // window keeps animating by default.
     set_user_reduced_motion(appearance.reduced_motion, cx);
     set_pause_inactive_animation(appearance.pause_inactive_animation, cx);
-    let theme = Theme::global_mut(cx);
-    theme.font_family = appearance
-        .interface_font
-        .family
-        .as_deref()
-        .unwrap_or(INTERFACE_TYPOGRAPHY.family)
-        .to_string()
-        .into();
-    theme.font_size = scaled_font_size(
-        appearance.interface_font.size,
-        appearance.window_scale_percent,
-    );
-    theme.mono_font_family = appearance
-        .code_font
-        .family
-        .as_deref()
-        .unwrap_or(shared_code_font_family())
-        .to_string()
-        .into();
-    theme.mono_font_size =
-        scaled_font_size(appearance.code_font.size, appearance.window_scale_percent);
-    theme.radius = px(RADII.control_px);
-    theme.radius_lg = px(RADII.large_px);
-    theme.shadow = SHADOWS_ENABLED;
-    let is_dark = theme.is_dark();
-    theme.highlight_theme = shared_highlight_theme(model_mode(is_dark));
-    apply_semantic_popover_colors(theme, is_dark);
-    apply_semantic_highlight_colors(theme, is_dark);
-    // Full semantic mapping — every interactive surface resolves from the
-    // shared token source so the two appearances stay in one tuned
-    // relationship (dark is the authored one; light flips tone, not layout).
-    let background = semantic_color("background", is_dark);
-    let foreground = semantic_color("foreground", is_dark);
-    let secondary = semantic_color("secondary", is_dark);
-    let secondary_foreground = semantic_color("secondary-foreground", is_dark);
-    let muted = semantic_color("muted", is_dark);
-    let muted_foreground = semantic_color("muted-foreground", is_dark);
-    let accent = semantic_color("accent", is_dark);
-    let border = semantic_color("border", is_dark);
-    let input = semantic_color("input", is_dark);
-    let ring = semantic_color("ring", is_dark);
-    let sidebar = semantic_color("sidebar", is_dark);
-    let sidebar_foreground = semantic_color("sidebar-foreground", is_dark);
-    let hover = hover_wash(is_dark);
-    let active = active_wash(is_dark);
+    Theme::update(cx, |theme| {
+        theme.font_family = appearance
+            .interface_font
+            .family
+            .as_deref()
+            .unwrap_or(INTERFACE_TYPOGRAPHY.family)
+            .to_string()
+            .into();
+        theme.font_size = scaled_font_size(
+            appearance.interface_font.size,
+            appearance.window_scale_percent,
+        );
+        theme.mono_font_family = appearance
+            .code_font
+            .family
+            .as_deref()
+            .unwrap_or(shared_code_font_family())
+            .to_string()
+            .into();
+        theme.mono_font_size =
+            scaled_font_size(appearance.code_font.size, appearance.window_scale_percent);
+        theme.radius = px(RADII.control_px);
+        theme.radius_lg = px(RADII.large_px);
+        theme.shadow = SHADOWS_ENABLED;
+        let is_dark = theme.is_dark();
+        theme.highlight_theme = shared_highlight_theme(model_mode(is_dark));
+        apply_semantic_popover_colors(theme, is_dark);
+        apply_semantic_highlight_colors(theme, is_dark);
+        // Full semantic mapping — every interactive surface resolves from the
+        // shared token source so the two appearances stay in one tuned
+        // relationship (dark is the authored one; light flips tone, not layout).
+        let background = semantic_color("background", is_dark);
+        let foreground = semantic_color("foreground", is_dark);
+        let secondary = semantic_color("secondary", is_dark);
+        let secondary_foreground = semantic_color("secondary-foreground", is_dark);
+        let muted = semantic_color("muted", is_dark);
+        let muted_foreground = semantic_color("muted-foreground", is_dark);
+        let accent = semantic_color("accent", is_dark);
+        let border = semantic_color("border", is_dark);
+        let input = semantic_color("input", is_dark);
+        let ring = semantic_color("ring", is_dark);
+        let sidebar = semantic_color("sidebar", is_dark);
+        let sidebar_foreground = semantic_color("sidebar-foreground", is_dark);
+        let hover = hover_wash(is_dark);
+        let active = active_wash(is_dark);
 
-    theme.background = background;
-    theme.tokens.background = background.into();
-    theme.foreground = foreground;
-    theme.tokens.foreground = foreground.into();
-    theme.secondary = secondary;
-    theme.tokens.secondary = secondary.into();
-    theme.secondary_foreground = secondary_foreground;
-    theme.tokens.secondary_foreground = secondary_foreground.into();
-    theme.muted = muted;
-    theme.tokens.muted = muted.into();
-    theme.muted_foreground = muted_foreground;
-    theme.tokens.muted_foreground = muted_foreground.into();
-    theme.primary = semantic_color("primary", is_dark);
-    theme.tokens.primary = theme.primary.into();
-    theme.primary_foreground = semantic_color("primary-foreground", is_dark);
-    theme.tokens.primary_foreground = theme.primary_foreground.into();
-    theme.border = border;
-    theme.tokens.border = border.into();
-    theme.input = input;
-    theme.tokens.input = input.into();
-    theme.ring = ring;
-    theme.tokens.ring = ring.into();
-    theme.sidebar = sidebar;
-    theme.tokens.sidebar = sidebar.into();
-    theme.sidebar_foreground = sidebar_foreground;
-    theme.tokens.sidebar_foreground = sidebar_foreground.into();
-    theme.sidebar_primary = semantic_color("sidebar-primary", is_dark);
-    theme.tokens.sidebar_primary = theme.sidebar_primary.into();
-    theme.sidebar_primary_foreground = semantic_color("sidebar-primary-foreground", is_dark);
-    theme.tokens.sidebar_primary_foreground = theme.sidebar_primary_foreground.into();
-    theme.sidebar_border = semantic_color("sidebar-border", is_dark);
-    theme.tokens.sidebar_border = theme.sidebar_border.into();
-    // Hover/active washes and their derived component plates. Component hover
-    // plates stay opaque-ready (raised pills never swap to translucent washes),
-    // so they compose the wash over the surface they sit on.
-    theme.accent = accent;
-    theme.accent_foreground = semantic_color("accent-foreground", is_dark);
-    theme.list_hover = hover;
-    theme.tokens.list_hover = hover.into();
-    theme.table_hover = hover;
-    theme.tokens.table_hover = hover.into();
-    theme.secondary_hover = mix(secondary, hover, 0.5);
-    theme.tokens.secondary_hover = theme.secondary_hover.into();
-    theme.button_hover = mix(secondary, hover, 0.5);
-    theme.tokens.button_hover = theme.button_hover.into();
-    theme.button_active = mix(secondary, active, 0.5);
-    theme.tokens.button_active = theme.button_active.into();
-    theme.primary_hover = mix(theme.primary, foreground, 0.08);
-    theme.tokens.primary_hover = theme.primary_hover.into();
-    theme.primary_active = mix(theme.primary, foreground, 0.16);
-    theme.tokens.primary_active = theme.primary_active.into();
-    // Modal scrim: darken what is behind it. A light-mode scrim of the dark
-    // strength reads as a blackout on a bright field, so light runs ~half.
-    theme.overlay = gpui::black().opacity(if is_dark { 0.60 } else { 0.32 });
-    theme.title_bar = sidebar;
-    theme.tokens.title_bar = sidebar.into();
-    theme.title_bar_border = semantic_color("sidebar-border", is_dark);
-    theme.tokens.title_bar_border = theme.title_bar_border.into();
-    if appearance.high_contrast {
-        let foreground = theme.foreground;
-        theme.border = foreground.alpha(if theme.is_dark() { 0.42 } else { 0.30 });
-        theme.ring = foreground.alpha(0.72);
-        theme.sidebar_border = theme.border;
-        theme.title_bar_border = theme.border;
-    }
-    // Everything above maps the product's own roles. The rest of the framework
-    // palette — switches, segmented tabs, outline buttons, scrollbars,
-    // skeletons, selections — would otherwise keep the stock neutral colors
-    // `Theme::change` loaded, which is why a themed window still showed grey
-    // chrome. Complete it from the same variant, then publish the result to the
-    // base layer that owns scrollbars, resize handles, and text view defaults.
-    vibex_ui::apply_component_palette(theme, active_theme(model_mode(is_dark)));
-    Theme::sync_base(cx);
+        theme.background = background;
+        theme.tokens.background = background.into();
+        theme.foreground = foreground;
+        theme.tokens.foreground = foreground.into();
+        theme.secondary = secondary;
+        theme.tokens.secondary = secondary.into();
+        theme.secondary_foreground = secondary_foreground;
+        theme.tokens.secondary_foreground = secondary_foreground.into();
+        theme.muted = muted;
+        theme.tokens.muted = muted.into();
+        theme.muted_foreground = muted_foreground;
+        theme.tokens.muted_foreground = muted_foreground.into();
+        theme.primary = semantic_color("primary", is_dark);
+        theme.tokens.primary = theme.primary.into();
+        theme.primary_foreground = semantic_color("primary-foreground", is_dark);
+        theme.tokens.primary_foreground = theme.primary_foreground.into();
+        theme.border = border;
+        theme.tokens.border = border.into();
+        theme.input = input;
+        theme.tokens.input = input.into();
+        theme.ring = ring;
+        theme.tokens.ring = ring.into();
+        theme.sidebar = sidebar;
+        theme.tokens.sidebar = sidebar.into();
+        theme.sidebar_foreground = sidebar_foreground;
+        theme.tokens.sidebar_foreground = sidebar_foreground.into();
+        theme.sidebar_primary = semantic_color("sidebar-primary", is_dark);
+        theme.tokens.sidebar_primary = theme.sidebar_primary.into();
+        theme.sidebar_primary_foreground = semantic_color("sidebar-primary-foreground", is_dark);
+        theme.tokens.sidebar_primary_foreground = theme.sidebar_primary_foreground.into();
+        theme.sidebar_border = semantic_color("sidebar-border", is_dark);
+        theme.tokens.sidebar_border = theme.sidebar_border.into();
+        // Hover/active washes and their derived component plates. Component hover
+        // plates stay opaque-ready (raised pills never swap to translucent washes),
+        // so they compose the wash over the surface they sit on.
+        theme.accent = accent;
+        theme.accent_foreground = semantic_color("accent-foreground", is_dark);
+        theme.list_hover = hover;
+        theme.tokens.list_hover = hover.into();
+        theme.table_hover = hover;
+        theme.tokens.table_hover = hover.into();
+        theme.secondary_hover = mix(secondary, hover, 0.5);
+        theme.tokens.secondary_hover = theme.secondary_hover.into();
+        theme.button_hover = mix(secondary, hover, 0.5);
+        theme.tokens.button_hover = theme.button_hover.into();
+        theme.button_active = mix(secondary, active, 0.5);
+        theme.tokens.button_active = theme.button_active.into();
+        theme.primary_hover = mix(theme.primary, foreground, 0.08);
+        theme.tokens.primary_hover = theme.primary_hover.into();
+        theme.primary_active = mix(theme.primary, foreground, 0.16);
+        theme.tokens.primary_active = theme.primary_active.into();
+        // Modal scrim: darken what is behind it. A light-mode scrim of the dark
+        // strength reads as a blackout on a bright field, so light runs ~half.
+        theme.overlay = gpui::black().opacity(if is_dark { 0.60 } else { 0.32 });
+        theme.title_bar = sidebar;
+        theme.tokens.title_bar = sidebar.into();
+        theme.title_bar_border = semantic_color("sidebar-border", is_dark);
+        theme.tokens.title_bar_border = theme.title_bar_border.into();
+        if appearance.high_contrast {
+            let foreground = theme.foreground;
+            theme.border = foreground.alpha(if theme.is_dark() { 0.42 } else { 0.30 });
+            theme.ring = foreground.alpha(0.72);
+            theme.sidebar_border = theme.border;
+            theme.title_bar_border = theme.border;
+        }
+        // Everything above maps the product's own roles. The rest of the framework
+        // palette — switches, segmented tabs, outline buttons, scrollbars,
+        // skeletons, selections — would otherwise keep the stock neutral colors
+        // `Theme::change` loaded, which is why a themed window still showed grey
+        // chrome. Complete it from the same variant. `Theme::update` then publishes
+        // the result to the base layer that owns scrollbars, resize handles, and
+        // text view defaults, and refreshes every window.
+        vibex_ui::apply_component_palette(theme, active_theme(model_mode(is_dark)));
+    });
     apply_code_font_weight(appearance.code_font.weight, cx);
 }
 

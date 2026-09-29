@@ -54,7 +54,7 @@ vibex-markdown = { path = "../../crates/vibex-markdown" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.5" }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.7" }
 libc.workspace = true
 gtk = { version = "0.18" }
 tray-icon = { workspace = true, features = ["gtk"] }

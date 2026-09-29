@@ -28,8 +28,8 @@ use gpui::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowId, WindowOptions, canvas, deferred, div, fill, img, linear_color_stop, linear_gradient,
-    point, prelude::*, px, relative, rgb, size,
+    WindowId, WindowOptions, canvas, div, fill, img, linear_color_stop, linear_gradient, point,
+    prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -184,6 +184,7 @@ use crate::gpui_ext::{
     DOCS_SELF_HOSTED_SERVER_URL, ScrollGutter as _, button_with_aria_label, docs_help_button,
     hint_notification, solid_empty_border,
 };
+use crate::hint_layer;
 use crate::image_editor::{
     ImageEditSession, ImageEditTool, apply_arrow, apply_brush, apply_circle, apply_crop,
     apply_mosaic, apply_rectangle, apply_text,
@@ -2095,37 +2096,6 @@ fn ambiguous_message_submission_notice() -> &'static str {
     )
 }
 
-/// Deferred paint priority for the notification layer.
-///
-/// Tree order does not decide z-order in GPUI: the kit renders dialogs as
-/// deferred draws at priority `10 + layer`, popups (menus, selects, popovers)
-/// at `gpui_base::POPUP_PRIORITY` (100), and tooltips at 200. An inline layer
-/// therefore paints under a dialog's backdrop, which is what dimmed every hint
-/// pushed while a dialog was still open. The layer takes the gap between the
-/// dialog band and the popup band: above every dialog backdrop, below the menus
-/// and tooltips the user is actively pointing at.
-const NOTIFICATION_LAYER_PRIORITY: usize = 99;
-
-/// The workbench's top-centered hint layer.
-///
-/// The hints it hosts answer an action the user just took, and the dialog that
-/// asked for the action is often still open, so the layer is deferred at
-/// [`NOTIFICATION_LAYER_PRIORITY`] instead of relying on where the root happens
-/// to mount it.
-fn render_top_centered_notification_layer(window: &Window, cx: &App) -> impl IntoElement + use<> {
-    deferred(
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(Root::read(window, cx).notification.clone()),
-    )
-    .with_priority(NOTIFICATION_LAYER_PRIORITY)
-}
-
 impl VibexWorkbench {
     fn present_persistence_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(note) = self.persistence_note.take() else {
@@ -2133,7 +2103,8 @@ impl VibexWorkbench {
         };
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(
                     NotificationType::Info,
                     locale::localize_ui_message(&note),
@@ -2175,7 +2146,8 @@ impl VibexWorkbench {
                     hint_notification(NotificationType::Error, notice.message, cx)
                 }
             };
-            window.push_notification(
+            hint_layer::push(
+                window,
                 notification
                     .id::<SettingsOperationNotification>()
                     .autohide(true)
@@ -15252,7 +15224,8 @@ impl VibexWorkbench {
         };
         self.sidebar_session_drag_state = None;
         if group.workspace_id != drag_workspace_id {
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(
                     NotificationType::Error,
                     self.strings().sidebar_group_other_worktree,
@@ -18438,7 +18411,7 @@ impl VibexWorkbench {
             let message = SharedString::from(body.clone());
             let delivered = cx
                 .update_window(handle, move |_, window, cx| {
-                    window.push_notification(hint_notification(tone, message, cx), cx);
+                    hint_layer::push(window, hint_notification(tone, message, cx), cx);
                 })
                 .is_ok();
             if delivered {
@@ -22023,7 +21996,8 @@ impl VibexWorkbench {
             ambiguous_any |= state.status == MessageSubmissionStatus::AmbiguousPromptDispatch;
         }
         if ambiguous_any {
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(
                     NotificationType::Warning,
                     ambiguous_message_submission_notice(),
@@ -23539,7 +23513,7 @@ impl VibexWorkbench {
         let opened = cx.open_window(options, move |window, cx| {
             theme::apply_appearance(&appearance, Some(window), cx);
             let host = cx.new(|cx| PreviewWindowHost::new(code_workbench, window, cx));
-            cx.new(|cx| Root::new(host, window, cx).bordered(false))
+            cx.new(|cx| Root::new(host, window, cx))
         });
         let handle = match opened {
             Ok(handle) => handle,
@@ -23551,7 +23525,8 @@ impl VibexWorkbench {
                 let message = format!("failed to open the preview window: {error}");
                 eprintln!("{message}");
                 let _ = origin_window.update(cx, |_, window, cx| {
-                    window.push_notification(
+                    hint_layer::push(
+                        window,
                         hint_notification(NotificationType::Error, message.clone(), cx),
                         cx,
                     );
@@ -25234,7 +25209,8 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         self.fork_session_pending = true;
         self.agent_error = None;
-        window.push_notification(
+        hint_layer::push(
+            window,
             hint_notification(
                 NotificationType::Info,
                 locale::text(
@@ -25295,7 +25271,8 @@ impl VibexWorkbench {
                             if source_still_selected {
                                 this.select_session_with_history(session_id, false, cx);
                             }
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Info,
                                     locale::text(
@@ -25350,7 +25327,8 @@ impl VibexWorkbench {
                                 );
                                 this.refresh_selected_agent_timeline(cx);
                             }
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Success,
                                     locale::text(
@@ -25389,7 +25367,8 @@ impl VibexWorkbench {
                                     "無法建立分支會話",
                                 )
                             };
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(NotificationType::Error, message, cx)
                                     .id::<ForkSessionNotification>()
                                     .autohide(false),
@@ -25403,7 +25382,8 @@ impl VibexWorkbench {
                                 this.agent_error =
                                     Some(format!("session fork task failed: {error}"));
                             }
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Error,
                                     locale::text(
@@ -27617,7 +27597,8 @@ impl VibexWorkbench {
         self.agent_action_pending = true;
         self.fork_session_pending = true;
         self.agent_error = None;
-        window.push_notification(
+        hint_layer::push(
+            window,
             hint_notification(
                 NotificationType::Info,
                 locale::text(
@@ -27654,7 +27635,8 @@ impl VibexWorkbench {
                         Ok(Ok(session)) => {
                             this.upsert_session_snapshot(session.clone());
                             this.reconcile_sidebar_state();
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Info,
                                     locale::text(
@@ -30742,7 +30724,8 @@ impl VibexWorkbench {
             return;
         }
         let Some(home) = self.config.as_ref().map(|config| config.home_dir.clone()) else {
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(
                     NotificationType::Error,
                     locale::text(
@@ -30793,7 +30776,8 @@ impl VibexWorkbench {
                         }
                         Ok(Ok(None)) => {}
                         Ok(Err(error)) => {
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Error,
                                     format!(
@@ -30810,7 +30794,8 @@ impl VibexWorkbench {
                             );
                         }
                         Err(error) => {
-                            window.push_notification(
+                            hint_layer::push(
+                                window,
                                 hint_notification(
                                     NotificationType::Error,
                                     format!(
@@ -39259,12 +39244,9 @@ impl VibexWorkbench {
             }))
             .trigger(trigger)
             .child(menu_panel)
-            .map(|popover| match menu_placement.anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                    popover.top(px(menu_placement.trigger_offset))
-                }
-                _ => popover.bottom(px(menu_placement.trigger_offset)),
-            });
+            // 0.7.0 measures the trigger gap with `offset`; the anchor alone
+            // picks the side. The legacy `top`/`bottom` inset would add to it.
+            .offset(px(menu_placement.trigger_offset));
         div().flex_none().child(popover).into_any_element()
     }
 
@@ -40861,12 +40843,9 @@ impl VibexWorkbench {
                 closing,
                 menu_panel,
             ))
-            .map(|popover| match menu_placement.anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                    popover.top(px(menu_placement.trigger_offset))
-                }
-                _ => popover.bottom(px(menu_placement.trigger_offset)),
-            });
+            // 0.7.0 measures the trigger gap with `offset`; the anchor alone
+            // picks the side. The legacy `top`/`bottom` inset would add to it.
+            .offset(px(menu_placement.trigger_offset));
         div().flex_none().child(popover).into_any_element()
     }
 
@@ -41403,12 +41382,9 @@ impl VibexWorkbench {
             }))
             .trigger(workspace_trigger)
             .child(project_menu_content)
-            .map(|popover| match project_menu_placement.anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                    popover.top(px(project_menu_placement.trigger_offset))
-                }
-                _ => popover.bottom(px(project_menu_placement.trigger_offset)),
-            })
+            // 0.7.0 measures the trigger gap with `offset`; the anchor alone
+            // picks the side. The legacy `top`/`bottom` inset would add to it.
+            .offset(px(project_menu_placement.trigger_offset))
             .into_any_element();
 
         let can_create_worktree = self.backend.as_ref().is_some_and(|backend| {
@@ -43700,12 +43676,9 @@ impl VibexWorkbench {
                 closing,
                 menu_panel,
             ))
-            .map(|popover| match menu_placement.anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                    popover.top(px(menu_placement.trigger_offset))
-                }
-                _ => popover.bottom(px(menu_placement.trigger_offset)),
-            });
+            // 0.7.0 measures the trigger gap with `offset`; the anchor alone
+            // picks the side. The legacy `top`/`bottom` inset would add to it.
+            .offset(px(menu_placement.trigger_offset));
         div().flex_none().child(popover).into_any_element()
     }
 
@@ -67108,9 +67081,6 @@ impl Render for VibexWorkbench {
         let composer_suggestion_overlay =
             suggestion_target.map(|target| self.render_composer_suggestions(target, window, cx));
         let attachment_image_preview = self.render_attachment_image_preview(cx);
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = render_top_centered_notification_layer(window, cx);
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
@@ -67282,9 +67252,6 @@ impl Render for VibexWorkbench {
             .when_some(composer_suggestion_overlay, |this, overlay| {
                 this.child(overlay)
             })
-            .children(sheet_layer)
-            .children(dialog_layer)
-            .child(notification_layer)
             .when_some(attachment_image_preview, |this, preview| {
                 this.child(preview)
             })
@@ -67419,7 +67386,7 @@ pub fn open_workbench_window(cx: &mut App) -> Result<(), String> {
             cx.set_quit_mode(gpui::QuitMode::LastWindowClosed);
         }
         window.on_window_should_close(cx, crate::system_tray::handle_window_close);
-        cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
+        cx.new(|cx| Root::new(workbench, window, cx))
     })
     .map_err(|error| format!("failed to open Vibex workbench: {error}"))?;
     Ok(())
@@ -71255,12 +71222,7 @@ mod tests {
                     .open(true)
                     .trigger(trigger)
                     .child(menu)
-                    .map(|popover| match self.placement.anchor {
-                        Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => {
-                            popover.top(px(self.placement.trigger_offset))
-                        }
-                        _ => popover.bottom(px(self.placement.trigger_offset)),
-                    }),
+                    .offset(px(self.placement.trigger_offset)),
             )
         }
     }
@@ -77554,17 +77516,19 @@ mod tests {
     #[test]
     fn ambiguous_submission_uses_a_top_centered_click_dismissable_autohide_notification() {
         let source = include_str!("app.rs");
-        let notification_layer = source
-            .split_once("fn render_top_centered_notification_layer(")
-            .and_then(|(_, tail)| tail.split_once("\nfn runtime_status_banner_is_visible("))
+        let hint_layer = include_str!("hint_layer.rs");
+        let hint_layer = hint_layer
+            .split_once("impl Render for HintLayer {")
+            .and_then(|(_, tail)| tail.split_once("\nimpl RootPlugin"))
             .map(|(body, _)| body)
-            .expect("notification layer should remain inspectable");
-        assert!(notification_layer.contains(".left_0()"));
-        assert!(notification_layer.contains(".right_0()"));
-        assert!(notification_layer.contains(".justify_center()"));
-        assert!(notification_layer.contains("Root::read(window, cx).notification.clone()"));
+            .expect("the hint layer should remain inspectable");
+        assert!(hint_layer.contains(".top_0()"));
+        assert!(hint_layer.contains(".left_0()"));
+        assert!(hint_layer.contains(".right_0()"));
+        assert!(hint_layer.contains(".justify_center()"));
+        assert!(hint_layer.contains(".child(self.list.clone())"));
         assert!(
-            notification_layer.contains(".with_priority(NOTIFICATION_LAYER_PRIORITY)"),
+            hint_layer.contains(".with_priority(HINT_LAYER_PRIORITY)"),
             "the layer must be a deferred draw, or an open dialog paints over the hint"
         );
 
@@ -77600,20 +77564,18 @@ mod tests {
         assert!(!renderer.contains("Review the Timeline before sending again"));
     }
 
-    /// Renders the notification layer the way the workbench root does — the
-    /// dialog layer first, the hint layer after it — so a test can read the
-    /// painted scene and see which one actually ended up on top.
+    /// A bare surface for the window the kit's overlay layers paint over.
+    ///
+    /// Since GPUI Kit 0.7.0 `Root` mounts the dialog and hint layers itself, so
+    /// the probe only has to fill the window they cover.
     struct NotificationLayerOrderProbe;
 
     impl Render for NotificationLayerOrderProbe {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let dialog_layer = Root::render_dialog_layer(window, cx);
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             v_flex()
                 .id("notification-layer-order-probe")
                 .size_full()
                 .child(div().size_full().bg(gpui::black()))
-                .children(dialog_layer)
-                .child(render_top_centered_notification_layer(window, cx))
         }
     }
 
@@ -77626,17 +77588,18 @@ mod tests {
     }
 
     /// A dialog that is still open when a hint is pushed must not hide it: the
-    /// dialog's backdrop is a deferred draw, so an inline notification layer
-    /// paints underneath it and the hint only shows through the dimmed
-    /// backdrop. This asserts the hint's quad reaches the scene after the
+    /// dialog's backdrop is a deferred draw, and the workbench defers its hint
+    /// layer above that band, so the hint only stays readable while that
+    /// priority holds. This asserts the hint's quad reaches the scene after the
     /// dialog body's quad, which is the paint order that keeps it readable.
     #[gpui::test]
     fn the_notification_layer_paints_above_an_open_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
         cx.update(|cx| Theme::global_mut(cx).notification.placement = Anchor::TopCenter);
         let (_, cx) = cx.add_window_view(|window, cx| {
             let probe = cx.new(|_| NotificationLayerOrderProbe);
-            Root::new(probe, window, cx).bordered(false)
+            Root::new(probe, window, cx)
         });
 
         cx.update(|window, cx| {
@@ -77663,7 +77626,8 @@ mod tests {
         }
 
         cx.update(|window, cx| {
-            window.push_notification(
+            hint_layer::push(
+                window,
                 Notification::new().autohide(false).content(|_, _, _| {
                     div()
                         .w(px(160.0))
@@ -77709,8 +77673,8 @@ mod tests {
     /// from racing the animation.
     const HINT_DISMISS_SETTLE: Duration = Duration::from_millis(400);
 
-    /// Renders the hint layer the way the workbench root does, over a
-    /// focusable surface that stands in for the caret the user was typing at.
+    /// A focusable surface that stands in for the caret the user was typing at
+    /// while the hint layer paints over it.
     struct SelectableHintProbe {
         anchor_focus: FocusHandle,
     }
@@ -77724,28 +77688,25 @@ mod tests {
     }
 
     impl Render for SelectableHintProbe {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            v_flex()
-                .id("selectable-hint-probe")
-                .size_full()
-                .child(
-                    div()
-                        .id("selectable-hint-focus-anchor")
-                        .track_focus(&self.anchor_focus)
-                        .size_full()
-                        .bg(gpui::black()),
-                )
-                .child(render_top_centered_notification_layer(window, cx))
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().id("selectable-hint-probe").size_full().child(
+                div()
+                    .id("selectable-hint-focus-anchor")
+                    .track_focus(&self.anchor_focus)
+                    .size_full()
+                    .bg(gpui::black()),
+            )
         }
     }
 
-    /// Pushes one hint onto a window that renders the real notification layer,
-    /// with the probe's focusable surface holding focus behind it.
+    /// Pushes one hint onto a window whose root mounts the workbench's hint
+    /// layer, with the probe's focusable surface holding focus behind it.
     fn selectable_hint_window<'a>(
         message: &'static str,
         cx: &'a mut TestAppContext,
     ) -> (&'a mut VisualTestContext, FocusHandle) {
         cx.update(gpui_component::init);
+        cx.update(hint_layer::init);
         cx.update(|cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
             // The hint's enter animation is wall-clock driven and would leave
@@ -77754,13 +77715,14 @@ mod tests {
         });
         let probe = cx.update(|cx| cx.new(SelectableHintProbe::new));
         let anchor_focus = probe.read_with(cx, |probe, _| probe.anchor_focus.clone());
-        let (_, cx) = cx.add_window_view(|window, cx| Root::new(probe, window, cx).bordered(false));
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(probe, window, cx));
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
         cx.update(|window, cx| {
             window.focus(&anchor_focus, cx);
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(NotificationType::Error, message, cx)
                     .autohide(false)
                     // The workbench's dismissable hints carry this handler, and
@@ -77780,8 +77742,8 @@ mod tests {
 
     fn mounted_hint_count(cx: &mut VisualTestContext) -> usize {
         cx.update(|window, cx| {
-            Root::read(window, cx)
-                .notification
+            hint_layer::list(window, cx)
+                .expect("the hint layer should be mounted on the probe window")
                 .read(cx)
                 .notifications()
                 .len()
@@ -77837,7 +77799,10 @@ mod tests {
         // The hint is about to unmount, and it is holding the focus the drag
         // took so the copy shortcut could reach the selection. Closing it hands
         // that focus back instead of leaving the window with no caret.
-        let list = cx.update(|window, cx| Root::read(window, cx).notification.clone());
+        let list = cx.update(|window, cx| {
+            hint_layer::list(window, cx)
+                .expect("the hint layer should be mounted on the probe window")
+        });
         cx.update(|window, cx| {
             list.update(cx, |list, cx| list.clear(window, cx));
         });

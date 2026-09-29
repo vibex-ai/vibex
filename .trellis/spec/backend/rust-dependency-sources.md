@@ -22,13 +22,13 @@ vendored Android IME host.
 ```toml
 # Cargo.toml
 [workspace.dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.6.4"
-gpui-fps = "0.6.4"
-gpui-kit-assets = "0.6.4"
-gpui-base = "0.6.4"
+gpui-component = "0.7.0"
+gpui-fps = "0.7.0"
+gpui-kit-assets = "0.7.0"
+gpui-base = "0.7.0"
 ```
 
 ```toml
@@ -51,7 +51,7 @@ pnpm check:mobile-native              native mobile crate and project contract
 
 ### 3. Contracts
 
-- The `gpui-pre` family resolves from crates.io at the exact `=0.3.5` pins. Do not
+- The `gpui-pre` family resolves from crates.io at the exact `=0.3.7` pins. Do not
   reintroduce a `[patch.crates-io]` block that redirects it to a local fork, and do
   not rename a fork to satisfy the version constraint.
 - `gpui-pre-mobile` resolves from its pinned Git revision; the pin moves only with
@@ -145,9 +145,9 @@ This reintroduces a renamed GPUI fork and a vendored component tree.
 #### Correct
 
 ```toml
-gpui = { package = "gpui-pre", version = "=0.3.5" }
+gpui = { package = "gpui-pre", version = "=0.3.7" }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.6.4"
+gpui-component = "0.7.0"
 ```
 
 ## Scenario: Redistributed Native Runtime With A Bounded Package Transform

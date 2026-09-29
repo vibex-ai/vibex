@@ -92,6 +92,7 @@ use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_i
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
+use crate::hint_layer;
 use crate::locale;
 use crate::motion::{hover_blend, hover_listener};
 use crate::office_surface::OfficeSurface;
@@ -186,7 +187,8 @@ fn push_git_mutation_result_notice(kind: GitMutationKind, window: &mut Window, c
         return;
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-    window.push_notification(
+    hint_layer::push(
+        window,
         hint_notification(NotificationType::Success, message, cx)
             .id::<GitMutationNotification>()
             .autohide(true)
@@ -205,7 +207,8 @@ fn push_git_mutation_failure_notice(
         return;
     };
     Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-    window.push_notification(
+    hint_layer::push(
+        window,
         hint_notification(
             NotificationType::Error,
             format!("{label}: {}", locale::localize_error_message(error)),
@@ -5225,7 +5228,8 @@ impl CodeWorkbench {
                 if download.state == vibex_browser::BrowserDownloadState::Blocked {
                     let message =
                         locale::text("Download blocked: ", "下载已被阻止：", "下載已被阻止：");
-                    window.push_notification(
+                    hint_layer::push(
+                        window,
                         hint_notification(
                             NotificationType::Warning,
                             format!(
@@ -5292,7 +5296,8 @@ impl CodeWorkbench {
         Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
         let workbench = cx.entity().downgrade();
         let opened = origin.clone();
-        window.push_notification(
+        hint_layer::push(
+            window,
             hint_notification(
                 NotificationType::Info,
                 format!(
@@ -9394,7 +9399,8 @@ impl CodeWorkbench {
             return;
         };
         if candidates.is_empty() {
-            window.push_notification(
+            hint_layer::push(
+                window,
                 hint_notification(
                     NotificationType::Info,
                     locale::text(
@@ -9434,7 +9440,8 @@ impl CodeWorkbench {
                 if let Some(message) = message {
                     // A miss has to be visible: "I pressed it and nothing
                     // happened" is the failure this feature must not have.
-                    window.push_notification(
+                    hint_layer::push(
+                        window,
                         hint_notification(NotificationType::Info, message, cx),
                         cx,
                     );
@@ -11222,7 +11229,10 @@ impl CodeRightRail {
             &history_date_picker,
             |this, _, event: &DatePickerEvent, cx| {
                 let DatePickerEvent::Change(date) = event;
-                let (after_ms, before_ms) = git_history_date_bounds(*date);
+                // The picker is a date range without a time precision, so only
+                // the calendar day is taken; 0.7.0 hands the event its
+                // `default_time` alongside it.
+                let (after_ms, before_ms) = git_history_date_bounds(date.date());
                 this.update_workbench(cx, |workbench, cx| {
                     workbench.set_history_date_range(after_ms, before_ms, cx)
                 });
@@ -21575,14 +21585,16 @@ mod tests {
 
     /// The same fixture under the kit's `Root`.
     ///
-    /// Anything that pushes a notification needs this: `push_notification`
-    /// resolves the window's first layer as `gpui_component::Root` and panics
-    /// without one. The production shell always installs it, so a test that
-    /// skips it is testing a window the app never builds.
+    /// Anything that pushes a notification needs this: `hint_layer::push`
+    /// resolves the hint layer from the window's first layer and panics without
+    /// a `gpui_component::Root` carrying the registered plugin. The production
+    /// shell always installs both, so a test that skips them is testing a
+    /// window the app never builds.
     fn fixture_workbench_with_root(
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<CodeWorkbench>, &mut gpui::VisualTestContext) {
         cx.update(gpui_component::init);
+        cx.update(crate::hint_layer::init);
         let captured: std::rc::Rc<std::cell::RefCell<Option<Entity<CodeWorkbench>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let slot = captured.clone();
@@ -21590,7 +21602,7 @@ mod tests {
             let fixture =
                 cx.new(|cx| CodeWorkbenchFixture::new(CodeWorkbenchFixtureKind::Diff, window, cx));
             *slot.borrow_mut() = Some(fixture.read(cx).workbench.clone());
-            gpui_component::Root::new(fixture, window, cx).bordered(false)
+            gpui_component::Root::new(fixture, window, cx)
         });
         let workbench = captured
             .borrow()

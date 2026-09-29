@@ -39,7 +39,7 @@ use vibex_desktop_runtime::{
 
 use crate::{
     gpui_ext::{DOCS_REMOTE_MOBILE_URL, docs_help_button},
-    locale,
+    hint_layer, locale,
     spinner::Spinner,
     theme,
 };
@@ -4095,7 +4095,8 @@ impl RemoteAccessPairing {
                 RemoteAccessNoticeTone::Success => Notification::success(notice.message),
                 RemoteAccessNoticeTone::Error => Notification::error(notice.message),
             };
-            window.push_notification(
+            hint_layer::push(
+                window,
                 notification
                     .id::<RemoteAccessNoticeNotification>()
                     .autohide(true)

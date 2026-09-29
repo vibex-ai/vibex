@@ -79,15 +79,15 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
-gpui = { package = "gpui-pre", version = "=0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.6.4"
-gpui-fps = "0.6.4"
-gpui-kit-assets = "0.6.4"
+gpui-component = "0.7.0"
+gpui-fps = "0.7.0"
+gpui-kit-assets = "0.7.0"
 # The kit's motion layer, which `Plot::hover` implementations sample. Same
 # version the component crate already resolves, so the graph keeps one copy.
-gpui-base = "0.6.4"
+gpui-base = "0.7.0"
 image = { version = "=0.25.10", default-features = false }
 tray-icon = { version = "0.24.2", default-features = false }
 markdown = { version = "=1.0.0", features = ["serde"] }

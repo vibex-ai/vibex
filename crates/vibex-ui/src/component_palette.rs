@@ -11,9 +11,9 @@
 //! [`apply_component_palette`] closes the gap. It runs after the client's core
 //! mapping and fills in every remaining framework color from the same theme:
 //! directly where the catalog owns a matching role, and derived from the
-//! theme's own surface, foreground, or accent where it does not. The clients
-//! then publish the result to the framework's base layer
-//! (`Theme::sync_base`), which owns scrollbars, resize handles, and the text
+//! theme's own surface, foreground, or accent where it does not. The client
+//! edits the theme through `Theme::update`, which publishes the result to the
+//! framework's base layer and owns scrollbars, resize handles, and the text
 //! view defaults.
 //!
 //! The split is explicit: [`CORE_TOKENS`] is what a client must have mapped
@@ -109,6 +109,7 @@ pub const COMPONENT_TOKENS: &[&str] = &[
     "chart_5",
     "chart_bearish",
     "chart_bullish",
+    "chart_grid",
     "cyan",
     "cyan_light",
     "danger",
@@ -395,6 +396,11 @@ pub fn apply_component_palette(theme: &mut Theme, definition: &GpuiThemeDefiniti
         chart_5 = role("chart-5");
         chart_bullish = success;
         chart_bearish = destructive;
+        // GPUI Kit 0.7.0 gives the grid its own token, which both the kit's
+        // charts and the Usage charts draw with. The product's own charts have
+        // always drawn that hairline in the border color, so the token takes it
+        // and the two families of charts keep one grid.
+        chart_grid = border;
 
         // Base swatches the kit paints outside charts (badges, labels, the
         // color picker) plus their soft variants.

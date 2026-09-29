@@ -16,8 +16,8 @@ use gpui_base::{Spring, spring};
 use gpui_component::{
     ActiveTheme as _,
     plot::{
-        AXIS_GAP, AxisText, Grid, IntoPlot, Plot, PlotAxis,
-        label::TEXT_GAP,
+        AxisText, Grid, IntoPlot, Plot, PlotAxis, axis_gutter,
+        label::{TEXT_GAP, TEXT_SIZE},
         scale::{Scale, ScaleBand, ScaleLinear},
         shape::{Bar, Stack, StackSeries},
         tooltip::{CrossLine, PlotHover, Tooltip, TooltipState},
@@ -25,6 +25,14 @@ use gpui_component::{
 };
 
 use crate::{locale, usage::format_full_number};
+
+/// Font size the charts draw their axis tick labels at.
+///
+/// [`AxisText::new`] leaves `font_size` at the kit's default, so the height an
+/// x axis reserves is [`axis_gutter`] at that same size. GPUI Kit 0.7.0 replaced
+/// the fixed `AXIS_GAP` with the measurement so a styled layer drawing larger
+/// labels reserves more room instead of clipping them.
+const AXIS_LABEL_SIZE: Pixels = px(TEXT_SIZE);
 
 /// Left gutter the trend chart reserves for its K-unit Token axis.
 const TREND_AXIS_GUTTER: f32 = 48.0;
@@ -162,17 +170,14 @@ impl TrendChart {
     /// the crosshair always lands on the band the bars were painted into.
     fn layout(&self, bounds: Bounds<Pixels>) -> TrendLayout {
         let plot_width = (bounds.size.width.as_f32() - TREND_AXIS_GUTTER).max(1.0);
-        let plot_height = (bounds.size.height.as_f32() - AXIS_GAP).max(1.0);
+        let plot_height = (bounds.size.height.as_f32() - axis_gutter(AXIS_LABEL_SIZE)).max(1.0);
         let plot_bounds = Bounds {
             origin: bounds.origin + point(px(TREND_AXIS_GUTTER), px(0.)),
             size: size(px(plot_width), px(plot_height)),
         };
         let x = ScaleBand::new(
-            self.buckets
-                .iter()
-                .map(|bucket| bucket.label.clone())
-                .collect(),
-            vec![0., plot_width],
+            self.buckets.iter().map(|bucket| bucket.label.clone()),
+            [0., plot_width],
         )
         .padding_inner(0.4)
         .padding_outer(0.2);
@@ -205,7 +210,7 @@ impl Plot for TrendChart {
         } = self.layout(bounds);
         let y = ScaleLinear::new(
             vec![0., self.axis_maximum as f64],
-            vec![plot_height, VALUE_HEADROOM],
+            [plot_height, VALUE_HEADROOM],
         );
 
         // Left K-unit Token axis: the labels sit in the gutter the band scale
@@ -239,7 +244,7 @@ impl Plot for TrendChart {
             .collect::<Vec<_>>();
         Grid::new()
             .y(grid_lines)
-            .stroke(cx.theme().border)
+            .stroke(cx.theme().chart_grid)
             .dash_array(&[px(4.), px(2.)])
             .paint(&plot_bounds, window);
 
@@ -314,7 +319,7 @@ impl Plot for TrendChart {
         if position.x < px(TREND_AXIS_GUTTER) || position.y > px(plot_height) {
             return None;
         }
-        let index = x.least_index(position.x.as_f32() - TREND_AXIS_GUTTER);
+        let index = x.nearest_index(position.x.as_f32() - TREND_AXIS_GUTTER);
         let center =
             x.tick(&self.buckets.get(index)?.label)? + band_width / 2.0 + TREND_AXIS_GUTTER;
         Some(TooltipState::new(
@@ -437,14 +442,14 @@ impl ModelChart {
 
     fn layout(&self, bounds: Bounds<Pixels>) -> ModelLayout {
         let plot_width = (bounds.size.width.as_f32() - MODEL_AXIS_GUTTER).max(1.0);
-        let plot_height = (bounds.size.height.as_f32() - AXIS_GAP).max(1.0);
+        let plot_height = (bounds.size.height.as_f32() - axis_gutter(AXIS_LABEL_SIZE)).max(1.0);
         let plot_bounds = Bounds {
             origin: bounds.origin + point(px(MODEL_AXIS_GUTTER), px(0.)),
             size: size(px(plot_width), px(plot_height)),
         };
         let x = ScaleBand::new(
-            self.days.iter().map(|day| day.label.clone()).collect(),
-            vec![0., plot_width],
+            self.days.iter().map(|day| day.label.clone()),
+            [0., plot_width],
         )
         .padding_inner(0.3)
         .padding_outer(0.1);
@@ -475,7 +480,7 @@ impl Plot for ModelChart {
             band_width,
             x,
         } = self.layout(bounds);
-        let y = ScaleLinear::new(vec![0., 1.], vec![plot_height, 0.]);
+        let y = ScaleLinear::new(vec![0., 1.], [plot_height, 0.]);
 
         // 0–100% axis in the left gutter.
         PlotAxis::new()
@@ -497,7 +502,7 @@ impl Plot for ModelChart {
         // The floor grid line is the band axis itself.
         Grid::new()
             .y(vec![0.0, plot_height / 2.0])
-            .stroke(cx.theme().border)
+            .stroke(cx.theme().chart_grid)
             .dash_array(&[px(4.), px(2.)])
             .paint(&plot_bounds, window);
 
@@ -557,7 +562,7 @@ impl Plot for ModelChart {
         if position.x < px(MODEL_AXIS_GUTTER) || position.y > px(plot_height) {
             return None;
         }
-        let index = x.least_index(position.x.as_f32() - MODEL_AXIS_GUTTER);
+        let index = x.nearest_index(position.x.as_f32() - MODEL_AXIS_GUTTER);
         let center = x.tick(&self.days.get(index)?.label)? + band_width / 2.0 + MODEL_AXIS_GUTTER;
         Some(TooltipState::new(
             index,

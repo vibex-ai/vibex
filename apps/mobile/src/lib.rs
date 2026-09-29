@@ -65,8 +65,9 @@ fn open_root_window(data_dir: PathBuf, cx: &mut App) {
             let view = cx.new(|cx| app::MobileApp::new(data_dir, window, cx));
             // `Root` owns the overlay layers (sheets, dialogs,
             // notifications, menus) and restores focus after one
-            // closes. Phone windows are fullscreen, so no border.
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            // closes. A fullscreen phone window is not client
+            // decorated, so the kit's window frame draws nothing.
+            cx.new(|cx| gpui_component::Root::new(view, window, cx))
         },
     )
     .expect("failed to open Vibex mobile window");

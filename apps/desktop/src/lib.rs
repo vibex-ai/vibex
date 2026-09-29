@@ -9,6 +9,7 @@ pub mod browser_transport;
 pub mod code_workbench;
 pub mod directory_picker;
 pub mod gpui_ext;
+pub mod hint_layer;
 pub mod image_editor;
 pub mod local_history_import;
 pub mod locale;

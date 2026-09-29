@@ -235,23 +235,24 @@ and the user has to tap the field before the keyboard appears.
 
 Transient feedback that answers an action the user just took — a link copied, a
 device paired, storage cleared, a setting rejected — is a light hint and must be
-shown through the kit's `Notification` on the notification layer
-(`window.push_notification`). Do not hand-roll a banner, strip, or colored box in
-the page for it.
+shown through the kit's `Notification` on the workbench's hint layer
+(`hint_layer::push`). Do not hand-roll a banner, strip, or colored box in the
+page for it.
 
-The reasons are the ones the kit component already solves: the notification layer
-stacks above sheets and dialogs, it auto-hides, it is click-dismissable, and a
-hint pushed with the same `.id::<T>()` replaces the previous one instead of
-stacking duplicates. A page banner has none of that and needs the page to
-remember to clear it on the next action. That the hint clears a dialog backdrop
-is not free — it comes from the layer's deferred priority, so read "Overlay Layer
-Z-Order" before moving or re-mounting the layer.
+The reasons are the ones the kit component already solves: the hint layer stacks
+above sheets and dialogs, it auto-hides, it is click-dismissable, and a hint
+pushed with the same `.id::<T>()` replaces the previous one instead of stacking
+duplicates. A page banner has none of that and needs the page to remember to
+clear it on the next action. That the hint clears a dialog backdrop is not free —
+it comes from the layer's deferred priority, so read "Overlay Layer Z-Order"
+before moving or re-mounting the layer.
 
 ```rust
 struct GitMutationNotification;
 
 Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-window.push_notification(
+hint_layer::push(
+    window,
     hint_notification(NotificationType::Success, message, cx)
         .id::<GitMutationNotification>()
         .autohide(true)
@@ -319,39 +320,50 @@ prove scroll behavior.
 
 ### Overlay Layer Z-Order
 
-Production GPUI workbench roots must mount the component overlay hosts after the
-main shell content. Append `Root::render_sheet_layer`,
-`Root::render_dialog_layer`, and `Root::render_notification_layer` in that
-stacking order from the root view that owns the window. Calling
-`gpui_component::init`, constructing `Root`, or invoking `window.open_sheet`
-alone is not evidence that the corresponding layer is rendered. Keep sheet
-state in the window/root owner (`has_active_sheet`, `close_sheet`) so title-bar
-buttons, Escape/outside close, and programmatic startup all observe one overlay.
+Since GPUI Kit 0.7.0 the window root owns the overlay layers: `gpui_base::Root`
+— the type `gpui_component::Root` re-exports — mounts the sheet, dialog and
+notification layers itself. Application views must not render them:
+`Root::render_sheet_layer`, `Root::render_dialog_layer` and
+`Root::render_notification_layer` no longer exist, and `Root` no longer exposes
+the notification list. Calling `gpui_component::init`, constructing `Root`, or
+invoking `window.open_sheet` alone is still not evidence that the corresponding
+layer is rendered. Keep sheet state in the window/root owner
+(`has_active_sheet`, `close_sheet`) so title-bar buttons, Escape/outside close,
+and programmatic startup all observe one overlay.
 
 Mounting order is not z-order. Only inline content paints in tree order: the kit
 renders dialogs through `gpui_base::Dialog`, which is a `deferred` draw at
 priority `10 + layer`, popups (menus, selects, popovers, `gpui_base::Popup`) at
-`POPUP_PRIORITY` (100), and tooltips at 200. A layer left inline therefore paints
-*under* every dialog backdrop, which dims anything it hosts. Any overlay whose
-content must stay readable over a dialog — the workbench's top-centered
-notification layer, for example — has to be deferred at a priority inside the
-band it belongs to:
+`POPUP_PRIORITY` (100), and tooltips at 200. The kit's own notification layer is
+inline inside `Root`, so a hint left there paints *under* every dialog backdrop
+and is dimmed by it.
+
+Any overlay whose content must stay readable over a dialog — the workbench's
+top-centered hint layer, for example — therefore has to be deferred at a priority
+inside the band it belongs to. The workbench mounts its own as a root plugin:
+`apps/desktop/src/hint_layer.rs` registers a `gpui_base::RootPlugin` through
+`hint_layer::init`, hosts a kit `NotificationList`, and defers it at
+`HINT_LAYER_PRIORITY` (99). Deliver hints with `hint_layer::push`, not
+`window.push_notification`, so they reach that layer instead of the inline one:
 
 ```rust
-const NOTIFICATION_LAYER_PRIORITY: usize = 99;
+// apps/desktop/src/hint_layer.rs
+const HINT_LAYER_PRIORITY: usize = 99;
 
-fn render_notification_layer(window: &Window, cx: &App) -> impl IntoElement + use<> {
-    deferred(
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(Root::read(window, cx).notification.clone()),
-    )
-    .with_priority(NOTIFICATION_LAYER_PRIORITY)
+impl Render for HintLayer {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        deferred(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(self.list.clone()),
+        )
+        .with_priority(HINT_LAYER_PRIORITY)
+    }
 }
 ```
 
@@ -535,6 +547,25 @@ Button::new("runtime-selector").w(px(112.0)).child(truncated_label);
 // Correct: the selected label contributes its full intrinsic width.
 let trigger = Button::new("runtime-selector").px_2().child(intrinsic_content);
 div().flex_none().child(Popover::new("runtime-menu").trigger(trigger));
+```
+
+The trigger gap is `Popover::offset`, not a `top`/`bottom` inset. Since GPUI Kit
+0.7.0 the popover subtracts `offset` (default `0.25rem`) from the trigger edge
+itself, so a legacy `.top(px(gap))` / `.bottom(px(gap))` adds to that default and
+doubles the gap. `RenderPopoverLayoutProbe` in `app.rs` measures the real laid-out
+gap for the runtime menus and fails when it drifts:
+
+```rust
+// Wrong: 4px inset on top of the default 4px offset reads as 8px.
+let popover = Popover::new(id).anchor(anchor).trigger(trigger).child(panel)
+    .map(|popover| match anchor {
+        Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => popover.top(px(4.0)),
+        _ => popover.bottom(px(4.0)),
+    });
+
+// Correct: the anchor picks the side, `offset` is the gap.
+let popover = Popover::new(id).anchor(anchor).trigger(trigger).child(panel)
+    .offset(px(RUNTIME_MENU_TRIGGER_GAP));
 ```
 
 ## Timeline Cards
@@ -1020,11 +1051,14 @@ to sRGB, and emits `crates/vibex-ui/src/generated_tokens.rs`.
   `Theme::change` reloads gpui-component's own palette, so every token an
   appearance pass does not assign keeps a stock neutral color. After mapping
   the product roles, a client calls
-  `vibex_ui::apply_component_palette(theme, active_theme)` and then
-  `Theme::sync_base(cx)`, which publishes the result to the base layer that
-  owns scrollbars, resize handles, and the text view defaults. Skipping either
-  step is what leaves switches, segmented tabs, outline buttons, and skeletons
-  grey under a tinted palette.
+  `vibex_ui::apply_component_palette(theme, active_theme)` inside
+  `Theme::update(cx, |theme| ...)`, which publishes the result to the base layer
+  that owns scrollbars, resize handles, and the text view defaults and refreshes
+  every window. Skipping either step is what leaves switches, segmented tabs,
+  outline buttons, and skeletons grey under a tinted palette. Write the theme
+  through `Theme::update`, not `Theme::global_mut` plus a manual
+  `Theme::sync_base`: only the kit's write path also reconciles the color and
+  token maps and keeps the projection in step.
 - **Token ownership is explicit.** `CORE_TOKENS` is what a client maps before
   the bridge runs (surfaces, text, borders, washes, high-contrast overrides);
   `COMPONENT_TOKENS` is what the bridge owns. The two must together cover every

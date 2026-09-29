@@ -161,7 +161,7 @@ impl SystemTray {
             };
         let visible_window = match cx.open_window(visible_options, move |window, cx| {
             window.on_window_should_close(cx, handle_window_close);
-            cx.new(|cx| Root::new(workbench, window, cx).bordered(false))
+            cx.new(|cx| Root::new(workbench, window, cx))
         }) {
             Ok(window) => window,
             Err(error) => {

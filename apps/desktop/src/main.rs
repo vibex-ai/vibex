@@ -12,7 +12,7 @@ use vibex_browser::stdio::run_browser_mcp_stdio;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
-    first_frame_probe, system_tray, terminal_surface, theme,
+    first_frame_probe, hint_layer, system_tray, terminal_surface, theme,
 };
 use vibex_desktop_model::{AppearanceUiState, ThemeMode};
 use vibex_terminal::run_terminal_feasibility;
@@ -342,6 +342,7 @@ fn main() {
         .run(move |cx: &mut App| {
             gpui_tokio::init(cx);
             gpui_component::init(cx);
+            hint_layer::init(cx);
             if !matches!(launch_mode, LaunchMode::Workbench) {
                 terminal_surface::bind_terminal_keys(cx);
             }
@@ -428,7 +429,7 @@ fn main() {
                         unreachable!("workbench launches through its app root")
                     }
                 };
-                cx.new(|cx| Root::new(view, window, cx).bordered(false))
+                cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open Vibex preview window");
             cx.activate(true);

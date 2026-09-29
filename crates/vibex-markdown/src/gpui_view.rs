@@ -4192,19 +4192,16 @@ mod tests {
     }
 
     impl Render for MarkdownFullscreenDialogProbe {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let background_clicked = self.background_clicked.clone();
-            let dialog_layer = Root::render_dialog_layer(window, cx);
-            div()
-                .id("fullscreen-dialog-probe-root")
-                .size_full()
-                .child(
-                    Button::new("fullscreen-dialog-probe-background")
-                        .label("Background")
-                        .debug_selector(|| "fullscreen-dialog-probe-background".to_string())
-                        .on_click(move |_, _, _| background_clicked.set(true)),
-                )
-                .children(dialog_layer)
+            // The kit's `Root` mounts the dialog layer itself since 0.7.0, so
+            // the probe only draws the surface the dialog opens over.
+            div().id("fullscreen-dialog-probe-root").size_full().child(
+                Button::new("fullscreen-dialog-probe-background")
+                    .label("Background")
+                    .debug_selector(|| "fullscreen-dialog-probe-background".to_string())
+                    .on_click(move |_, _, _| background_clicked.set(true)),
+            )
         }
     }
 

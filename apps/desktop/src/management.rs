@@ -78,6 +78,7 @@ use crate::gpui_ext::{
     SCROLLBAR_GUTTER, ScrollGutter as _, button_with_aria_label, hint_notification,
     solid_empty_border,
 };
+use crate::hint_layer;
 use crate::locale::{self, ResolvedLocale};
 use crate::motion::hover_listener;
 use crate::resize_seam;
@@ -7236,7 +7237,8 @@ impl ManagementCenter {
 
         window.defer(cx, move |window, cx| {
             Theme::global_mut(cx).notification.placement = Anchor::TopCenter;
-            window.push_notification(
+            hint_layer::push(
+                window,
                 notification
                     .id::<ManagementCenterFeedbackNotification>()
                     .autohide(true)

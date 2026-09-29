@@ -578,89 +578,89 @@ pub fn apply_component_theme(window: Option<&mut Window>, cx: &mut App) {
         cx,
     );
 
-    let theme = Theme::global_mut(cx);
     let token = |name: &str| semantic_color(name, dark);
+    Theme::update(cx, |theme| {
+        // The phone runs one step denser than the desktop shell; keep kit controls
+        // on the compact end so they sit in the same rhythm as the hand-built rows.
+        theme.font_family = "IBM Plex Sans".into();
+        theme.font_size = px(15.0);
+        theme.mono_font_size = px(13.0);
+        theme.radius = px(RADIUS_CONTROL);
+        theme.radius_lg = px(RADIUS_CARD);
 
-    // The phone runs one step denser than the desktop shell; keep kit controls
-    // on the compact end so they sit in the same rhythm as the hand-built rows.
-    theme.font_family = "IBM Plex Sans".into();
-    theme.font_size = px(15.0);
-    theme.mono_font_size = px(13.0);
-    theme.radius = px(RADIUS_CONTROL);
-    theme.radius_lg = px(RADIUS_CARD);
+        let background = token("background");
+        let foreground = token("foreground");
+        let secondary = token("secondary");
+        let muted = token("muted");
+        let muted_foreground = token("muted-foreground");
+        let border = token("border");
+        let input = token("input");
+        let sidebar = token("sidebar");
+        let hover = row_pressed_bg();
+        let active = row_active_bg();
 
-    let background = token("background");
-    let foreground = token("foreground");
-    let secondary = token("secondary");
-    let muted = token("muted");
-    let muted_foreground = token("muted-foreground");
-    let border = token("border");
-    let input = token("input");
-    let sidebar = token("sidebar");
-    let hover = row_pressed_bg();
-    let active = row_active_bg();
-
-    theme.background = background;
-    theme.tokens.background = background.into();
-    theme.foreground = foreground;
-    theme.tokens.foreground = foreground.into();
-    theme.secondary = secondary;
-    theme.tokens.secondary = secondary.into();
-    theme.secondary_foreground = token("secondary-foreground");
-    theme.tokens.secondary_foreground = theme.secondary_foreground.into();
-    theme.muted = muted;
-    theme.tokens.muted = muted.into();
-    theme.muted_foreground = muted_foreground;
-    theme.tokens.muted_foreground = muted_foreground.into();
-    theme.primary = token("primary");
-    theme.tokens.primary = theme.primary.into();
-    theme.primary_foreground = token("primary-foreground");
-    theme.tokens.primary_foreground = theme.primary_foreground.into();
-    theme.border = border;
-    theme.tokens.border = border.into();
-    theme.input = input;
-    theme.tokens.input = input.into();
-    theme.ring = token("ring");
-    theme.tokens.ring = theme.ring.into();
-    theme.sidebar = sidebar;
-    theme.tokens.sidebar = sidebar.into();
-    theme.sidebar_foreground = token("sidebar-foreground");
-    theme.tokens.sidebar_foreground = theme.sidebar_foreground.into();
-    theme.sidebar_border = token("sidebar-border");
-    theme.tokens.sidebar_border = theme.sidebar_border.into();
-    theme.accent = token("accent");
-    theme.tokens.accent = theme.accent.into();
-    theme.accent_foreground = token("accent-foreground");
-    theme.tokens.accent_foreground = theme.accent_foreground.into();
-    // Hover and pressed plates. The phone's washes are translucent by design
-    // (`row_pressed_bg`), so the kit picks up the same wash the hand-built rows
-    // already paint.
-    theme.list_hover = hover;
-    theme.tokens.list_hover = hover.into();
-    theme.table_hover = hover;
-    theme.tokens.table_hover = hover.into();
-    theme.secondary_hover = hover;
-    theme.tokens.secondary_hover = hover.into();
-    theme.button_hover = hover;
-    theme.tokens.button_hover = hover.into();
-    theme.button_active = active;
-    theme.tokens.button_active = active.into();
-    theme.primary_hover = token("primary");
-    theme.tokens.primary_hover = theme.primary_hover.into();
-    theme.primary_active = token("primary");
-    theme.tokens.primary_active = theme.primary_active.into();
-    // The scrim darkens what is behind it, so light mode runs about half.
-    theme.overlay = gpui::black().opacity(if dark { 0.60 } else { 0.32 });
-    theme.title_bar = sidebar;
-    theme.tokens.title_bar = sidebar.into();
-    theme.title_bar_border = token("sidebar-border");
-    theme.tokens.title_bar_border = theme.title_bar_border.into();
-    // Everything above maps the product's own roles; the rest of the framework
-    // palette would keep the stock neutral colors `Theme::change` loaded.
-    // Complete it from the same variant, then publish the result to the base
-    // layer that owns scrollbars, resize handles, and text view defaults.
-    vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
-    Theme::sync_base(cx);
+        theme.background = background;
+        theme.tokens.background = background.into();
+        theme.foreground = foreground;
+        theme.tokens.foreground = foreground.into();
+        theme.secondary = secondary;
+        theme.tokens.secondary = secondary.into();
+        theme.secondary_foreground = token("secondary-foreground");
+        theme.tokens.secondary_foreground = theme.secondary_foreground.into();
+        theme.muted = muted;
+        theme.tokens.muted = muted.into();
+        theme.muted_foreground = muted_foreground;
+        theme.tokens.muted_foreground = muted_foreground.into();
+        theme.primary = token("primary");
+        theme.tokens.primary = theme.primary.into();
+        theme.primary_foreground = token("primary-foreground");
+        theme.tokens.primary_foreground = theme.primary_foreground.into();
+        theme.border = border;
+        theme.tokens.border = border.into();
+        theme.input = input;
+        theme.tokens.input = input.into();
+        theme.ring = token("ring");
+        theme.tokens.ring = theme.ring.into();
+        theme.sidebar = sidebar;
+        theme.tokens.sidebar = sidebar.into();
+        theme.sidebar_foreground = token("sidebar-foreground");
+        theme.tokens.sidebar_foreground = theme.sidebar_foreground.into();
+        theme.sidebar_border = token("sidebar-border");
+        theme.tokens.sidebar_border = theme.sidebar_border.into();
+        theme.accent = token("accent");
+        theme.tokens.accent = theme.accent.into();
+        theme.accent_foreground = token("accent-foreground");
+        theme.tokens.accent_foreground = theme.accent_foreground.into();
+        // Hover and pressed plates. The phone's washes are translucent by design
+        // (`row_pressed_bg`), so the kit picks up the same wash the hand-built rows
+        // already paint.
+        theme.list_hover = hover;
+        theme.tokens.list_hover = hover.into();
+        theme.table_hover = hover;
+        theme.tokens.table_hover = hover.into();
+        theme.secondary_hover = hover;
+        theme.tokens.secondary_hover = hover.into();
+        theme.button_hover = hover;
+        theme.tokens.button_hover = hover.into();
+        theme.button_active = active;
+        theme.tokens.button_active = active.into();
+        theme.primary_hover = token("primary");
+        theme.tokens.primary_hover = theme.primary_hover.into();
+        theme.primary_active = token("primary");
+        theme.tokens.primary_active = theme.primary_active.into();
+        // The scrim darkens what is behind it, so light mode runs about half.
+        theme.overlay = gpui::black().opacity(if dark { 0.60 } else { 0.32 });
+        theme.title_bar = sidebar;
+        theme.tokens.title_bar = sidebar.into();
+        theme.title_bar_border = token("sidebar-border");
+        theme.tokens.title_bar_border = theme.title_bar_border.into();
+        // Everything above maps the product's own roles; the rest of the framework
+        // palette would keep the stock neutral colors `Theme::change` loaded.
+        // Complete it from the same variant. `Theme::update` then publishes the
+        // result to the base layer that owns scrollbars, resize handles, and text
+        // view defaults, and refreshes every window.
+        vibex_ui::apply_component_palette(theme, active_theme(model_mode(dark)));
+    });
 }
 
 #[cfg(test)]
