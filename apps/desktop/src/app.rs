@@ -82478,9 +82478,13 @@ mod tests {
         cx.simulate_mouse_up(drop, MouseButton::Left, Modifiers::none());
 
         assert!(moves.get() > 0, "the real FPS monitor must start its drag");
+        // A drag is recognised on the first move past the threshold, not on
+        // mouse-down, so the recorded start cursor is `armed`. The offset is
+        // the pointer delta since then: `armed -> drop` is -40 across and +20
+        // down, which is exactly how far the pointer was moved.
         assert_eq!(
             cx.update(|_, cx| probe.read(cx).offset),
-            FpsHudOffset { x: -40.0, y: 40.0 }
+            FpsHudOffset { x: -40.0, y: 20.0 }
         );
     }
 
