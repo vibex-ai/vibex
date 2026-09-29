@@ -2071,7 +2071,7 @@ impl BrowserService {
     ) -> BrowserResult<BrowserToolOutcome> {
         let reason = required_str(args, "reason")?;
         let tab_id = self.target_tab(ctx, args).await?;
-        // Handing the tab over is what raises the panel's takeover banner; the
+        // Handing the tab over is what raises the panel's paused banner; the
         // Agent then waits, because every later call on this tab is refused
         // until the human hands it back.
         self.request_human_help(&tab_id).await?;

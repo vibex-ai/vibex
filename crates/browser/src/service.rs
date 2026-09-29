@@ -1216,11 +1216,12 @@ impl BrowserService {
 
     /// Dispatches a panel input event to the page.
     ///
-    /// Deliberate human input takes the session over: `execution_source` flips
-    /// to `User` and the current agent run is cancelled with an explicit error
-    /// rather than silently racing. Pointer movement alone does not — a cursor
-    /// resting over the panel is not a takeover, and treating it as one would
-    /// pause the Agent the moment the frame appeared under the mouse.
+    /// Human input is not a takeover. A reader who scrolls, clicks or types
+    /// while the Agent works is doing what a browser is for, and the Agent's
+    /// next call must not fail because of it — the two only race when the human
+    /// asks for the wheel, through the panel's pause control or
+    /// `request_human_help`. The input still counts as activity, which is what
+    /// keeps the idle reaper off a tab somebody is using.
     pub async fn dispatch_input(
         &self,
         tab_id: &BrowserTabId,
@@ -1236,59 +1237,41 @@ impl BrowserService {
                 .set_viewport(tab_id, width, height, device_scale_factor)
                 .await;
         }
-        let takes_over = input_takes_over(&input);
         let now = unix_timestamp_ms();
-        let (session, changed) = {
+        let session = {
             let mut state = self.inner.state.lock().await;
             let connection = state
                 .process
                 .as_ref()
                 .map(BrowserProcess::connection)
                 .ok_or_else(browser_not_running)?;
-            let tab = state.tabs.get_mut(tab_id).ok_or_else(|| {
-                BrowserError::validation("browser_tab_not_found", "the browser tab was not found")
-            })?;
-            tab.last_activity_at_ms = now;
-            if takes_over {
-                tab.aborted.store(true, Ordering::SeqCst);
-            }
-            let session =
-                CdpSession::new(connection, tab.session_id.clone(), tab.target_id.clone());
-            let changed = if takes_over {
-                let session_ids = state.sessions_for_tab(tab_id);
-                for session_id in &session_ids {
-                    if let Some(session) = state.sessions.get_mut(session_id) {
-                        session.execution_source = BrowserExecutionSource::User;
-                        session.user_engaged = true;
-                        session.last_activity_at_ms = now;
-                    }
-                }
-                session_ids
-            } else {
-                Vec::new()
+            let (session_id, target_id) = {
+                let tab = state.tabs.get_mut(tab_id).ok_or_else(|| {
+                    BrowserError::validation(
+                        "browser_tab_not_found",
+                        "the browser tab was not found",
+                    )
+                })?;
+                tab.last_activity_at_ms = now;
+                (tab.session_id.clone(), tab.target_id.clone())
             };
             state.last_activity_ms = now;
-            (session, changed)
+            CdpSession::new(connection, session_id, target_id)
         };
-        for session_id in changed {
-            let _ = self
-                .inner
-                .events
-                .send(BrowserServiceEvent::SessionChanged(session_id));
-        }
         let (method, params) = input_to_cdp(input);
         cdp(&session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
         Ok(())
     }
 
-    /// Hands a tab to the human because the Agent asked for help.
+    /// Pauses the Agent's page actions on a tab at the human's request.
     ///
-    /// The hand-over has to be real in both directions: the panel only shows the
-    /// takeover banner for a session that is `user_engaged`, and the Agent can
-    /// only be said to be waiting if its next call on the tab is refused. That
-    /// is what `tab.aborted` does — every tool entry checks it — so the Agent
-    /// resumes exactly when the human hands the tab back.
-    pub async fn request_human_help(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+    /// The mirror of [`Self::resume_agent_operations`], and the only way a
+    /// human pauses the Agent: the tab is marked aborted — every tool entry
+    /// checks it and reports `browser_operation_aborted` — and the session is
+    /// marked user-engaged so the panel and every other client can say why.
+    /// `browser_request_help` uses the same pause when the Agent asks for a
+    /// hand.
+    pub async fn pause_agent_operations(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
         let now = unix_timestamp_ms();
         let changed = {
             let mut state = self.inner.state.lock().await;
@@ -1318,6 +1301,18 @@ impl BrowserService {
                 .send(BrowserServiceEvent::SessionChanged(session_id));
         }
         Ok(())
+    }
+
+    /// Hands a tab to the human because the Agent asked for help.
+    ///
+    /// The hand-over has to be real in both directions: the panel only shows the
+    /// paused banner for a session that is `user_engaged`, and the Agent can
+    /// only be said to be waiting if its next call on the tab is refused. That
+    /// is what `tab.aborted` does — every tool entry checks it — so the Agent
+    /// resumes exactly when the human hands the tab back. The human can also
+    /// pause the Agent themselves, which is the same state.
+    pub async fn request_human_help(&self, tab_id: &BrowserTabId) -> BrowserResult<()> {
+        self.pause_agent_operations(tab_id).await
     }
 
     /// Marks every tab of a session as busy for the duration of one tool call.
@@ -2593,22 +2588,6 @@ async fn prepare_tab_session(session: &CdpSession, downloads: Value) -> BrowserR
         cdp(session, method, params, BROWSER_CDP_COMMAND_TIMEOUT_MS).await?;
     }
     Ok(())
-}
-
-/// True when a panel input is deliberate enough to count as a human takeover.
-///
-/// Pointer movement is excluded: the panel forwards every hover so the page can
-/// show its own cursor affordances, and a takeover per hover would pause the
-/// Agent as soon as the pointer crossed the frame.
-pub(crate) fn input_takes_over(input: &BrowserInput) -> bool {
-    matches!(
-        input,
-        BrowserInput::MouseDown { .. }
-            | BrowserInput::MouseUp { .. }
-            | BrowserInput::Wheel { .. }
-            | BrowserInput::Key { .. }
-            | BrowserInput::InsertText { .. }
-    )
 }
 
 /// The CDP `buttons` bitmask for one button name.
@@ -4248,52 +4227,6 @@ mod tests {
         assert_eq!(depth, vibex_core::BROWSER_OBSERVE_AX_DEPTH);
         let (_, depth) = observation_settings(Some(10), true);
         assert_eq!(depth, vibex_core::BROWSER_OBSERVE_EXTENDED_AX_DEPTH);
-    }
-
-    #[test]
-    fn hovering_does_not_take_the_session_over() {
-        // The panel forwards every hover; a takeover per hover would pause the
-        // Agent the moment the pointer crossed the frame.
-        assert!(!input_takes_over(&BrowserInput::MouseMove {
-            x: 1.0,
-            y: 2.0,
-            buttons: 1,
-        }));
-        assert!(!input_takes_over(&BrowserInput::Resize {
-            width: 800,
-            height: 600,
-            device_scale_factor: 1.0,
-        }));
-        for deliberate in [
-            BrowserInput::MouseDown {
-                x: 1.0,
-                y: 2.0,
-                button: "left".to_string(),
-                click_count: 1,
-                modifiers: 0,
-            },
-            BrowserInput::MouseUp {
-                x: 1.0,
-                y: 2.0,
-                button: "left".to_string(),
-                click_count: 1,
-                modifiers: 0,
-            },
-            BrowserInput::Wheel {
-                x: 0.0,
-                y: 0.0,
-                delta_x: 0.0,
-                delta_y: -120.0,
-            },
-            BrowserInput::InsertText {
-                text: "hi".to_string(),
-            },
-        ] {
-            assert!(
-                input_takes_over(&deliberate),
-                "{deliberate:?} is deliberate input"
-            );
-        }
     }
 
     #[test]

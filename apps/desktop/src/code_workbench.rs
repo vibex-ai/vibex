@@ -1056,6 +1056,12 @@ struct BrowserTabLabel {
     favicon: Option<Arc<RenderImage>>,
     /// Who opened the tab, so the strip can mark an Agent's own tabs.
     owner: Option<BrowserTabOwner>,
+    /// Whether the Agent is driving the page right now.
+    ///
+    /// Separate from `owner`: a tab the reader opened can be handed to the
+    /// Agent, and an Agent's tab goes quiet while it is paused. The strip marks
+    /// the live case in green.
+    agent_driving: bool,
 }
 
 /// The browser transport slice of the desktop bundle.
@@ -4851,7 +4857,7 @@ impl CodeWorkbench {
             window,
             |workbench, surface, event: &BrowserSurfaceEvent, window, cx| {
                 if let BrowserSurfaceEvent::TabChanged { tab_id } = event {
-                    let (title, loading, favicon, url, owner) = {
+                    let (title, loading, favicon, url, owner, agent_driving) = {
                         let surface = surface.read(cx);
                         (
                             surface.page_title().unwrap_or_default(),
@@ -4859,6 +4865,7 @@ impl CodeWorkbench {
                             surface.favicon(),
                             surface.page_url(),
                             surface.tab_owner(),
+                            surface.agent_driving(),
                         )
                     };
                     workbench.browser_tab_labels.insert(
@@ -4868,6 +4875,7 @@ impl CodeWorkbench {
                             loading,
                             favicon,
                             owner,
+                            agent_driving,
                         },
                     );
                     // The address is the one piece of page state a restart can
@@ -5239,9 +5247,9 @@ impl CodeWorkbench {
                     surface.show_download((*download).clone(), cx)
                 });
             }
-            // The execution source flips under the panel — a human took over, or
-            // an Agent asked for help — so the takeover banner re-reads it from
-            // the runtime instead of assuming it still owns the tab.
+            // The execution source flips under the panel — the reader paused
+            // the Agent, or handed it back — so the paused banner re-reads it
+            // from the runtime instead of assuming who owns the tab.
             vibex_browser::BrowserServiceEvent::SessionChanged(session_id) => {
                 self.refresh_browser_session(&session_id, cx);
             }
@@ -8502,16 +8510,20 @@ impl CodeWorkbench {
             _ => None,
         };
         // An Agent's tab is marked in the strip: the page can move on its own,
-        // and the reader should not have to guess whether they drove it.
-        let agent_browser_tab = matches!(
-            &tab.target,
-            PreviewTarget::Browser { browser_tab_id, .. }
-                if self
-                    .browser_tab_labels
-                    .get(browser_tab_id)
-                    .and_then(|label| label.owner)
-                    == Some(BrowserTabOwner::Agent)
-        );
+        // and the reader should not have to guess whether they drove it. Green
+        // means the Agent is driving that page right now — a tab it owns but
+        // has paused, or has not touched, keeps the muted mark.
+        let (agent_browser_tab, agent_driving) = match &tab.target {
+            PreviewTarget::Browser { browser_tab_id, .. } => {
+                let label = self.browser_tab_labels.get(browser_tab_id);
+                (
+                    label.and_then(|label| label.owner) == Some(BrowserTabOwner::Agent)
+                        || label.is_some_and(|label| label.agent_driving),
+                    label.is_some_and(|label| label.agent_driving),
+                )
+            }
+            _ => (false, false),
+        };
         let target_icon = preview_target_icon(&tab.target, browser_favicon, cx);
         let file_path = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
@@ -8774,7 +8786,11 @@ impl CodeWorkbench {
                 this.child(
                     Icon::new(IconName::Bot)
                         .size(px(11.0))
-                        .text_color(cx.theme().muted_foreground),
+                        .text_color(if agent_driving {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
                 )
             })
             .when(pinned, |this| {

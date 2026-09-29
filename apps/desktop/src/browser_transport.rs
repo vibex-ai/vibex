@@ -1371,11 +1371,13 @@ mod tests {
                 transport.dispatch_input(&tab.tab_id, input).await?;
             }
             std::thread::sleep(Duration::from_millis(300));
-            // A human's wheel pauses the Agent on that tab, exactly as a click
-            // does; reading the page back needs the hand-back first.
-            transport
-                .run(transport.service().resume_agent_operations(&session))
-                .await;
+            // Human input is not a takeover any more: a reader may click,
+            // scroll and type while the Agent works, and the Agent keeps its
+            // turn until the reader pauses it on purpose.
+            assert!(
+                !transport.service().agent_operations_aborted(&session).await,
+                "a click or a wheel must not pause the Agent"
+            );
             let seen = evaluate(
                 &transport,
                 &session,

@@ -501,6 +501,99 @@ async fn a_chosen_file_reaches_the_pages_file_input() {
     service.shutdown().await;
 }
 
+/// Human input never pauses the Agent by itself.
+///
+/// The panel forwards every click, wheel and keystroke; a reader may use the
+/// page while the Agent works, and the Agent's next call has to keep working.
+/// Pausing is the panel's explicit control, which is the same state
+/// `browser_request_help` sets.
+#[tokio::test]
+async fn human_input_does_not_pause_the_agent() {
+    let Some((service, home, session_id, tab)) = service_with_page().await else {
+        return;
+    };
+    let _home = home;
+    assert!(!service.agent_operations_aborted(&session_id).await);
+
+    // A click, a wheel and a keystroke, exactly as the panel forwards them.
+    for input in [
+        // Empty page space: the fixture's download link would start a download
+        // and the file input would block on a chooser.
+        vibex_browser::BrowserInput::MouseDown {
+            x: 620.0,
+            y: 420.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+        vibex_browser::BrowserInput::MouseUp {
+            x: 620.0,
+            y: 420.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+        vibex_browser::BrowserInput::Wheel {
+            x: 400.0,
+            y: 300.0,
+            delta_x: 0.0,
+            delta_y: 120.0,
+        },
+        vibex_browser::BrowserInput::InsertText {
+            text: "typed by the reader".to_string(),
+        },
+        vibex_browser::BrowserInput::Key {
+            event_type: "keyDown".to_string(),
+            key: "a".to_string(),
+            code: "KeyA".to_string(),
+            text: Some("a".to_string()),
+            modifiers: 0,
+            windows_key_code: 65,
+        },
+    ] {
+        service
+            .dispatch_input(&tab, input)
+            .await
+            .expect("the panel input reaches the page");
+    }
+    assert!(
+        !service.agent_operations_aborted(&session_id).await,
+        "touching the page must not pause the Agent"
+    );
+
+    // The Agent's next call still runs, without a hand-back.
+    let read = service
+        .call_tool(
+            &tool_context(&session_id),
+            "browser_evaluate",
+            &serde_json::json!({ "tab_id": tab.as_str(), "script": "1 + 1" }),
+        )
+        .await;
+    assert!(
+        !read.is_error,
+        "the Agent keeps its turn through human input: {}",
+        read.text
+    );
+
+    // Only the explicit pause stops it, and the hand-back re-arms it.
+    service
+        .pause_agent_operations(&tab)
+        .await
+        .expect("the panel can pause the Agent");
+    assert!(service.agent_operations_aborted(&session_id).await);
+    let refused = service
+        .call_tool(
+            &tool_context(&session_id),
+            "browser_evaluate",
+            &serde_json::json!({ "tab_id": tab.as_str(), "script": "1 + 1" }),
+        )
+        .await;
+    assert!(refused.is_error, "a paused Agent's next call is refused");
+    service.resume_agent_operations(&session_id).await;
+    assert!(!service.agent_operations_aborted(&session_id).await);
+    service.shutdown().await;
+}
+
 /// A refused download is announced once, not once per session.
 ///
 /// Setting the policy installs the behaviour at the browser level as well as

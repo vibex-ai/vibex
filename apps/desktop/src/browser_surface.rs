@@ -23,11 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render, RenderImage, SharedString,
-    Styled as _, Subscription, Task, UTF16Selection, Window, canvas, div, img, prelude::*, px,
-    size,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, BoxShadow, Context, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels,
+    Point, Render, RenderImage, Role, SharedString, Styled as _, Subscription, Task,
+    UTF16Selection, Window, canvas, div, img, prelude::*, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
@@ -37,6 +37,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     progress::Progress,
+    tooltip::Tooltip,
     v_flex,
 };
 use image::Frame;
@@ -113,6 +114,10 @@ const VIEWPORT_DEBOUNCE: Duration = Duration::from_millis(160);
 /// Longest frame edge the panel will ask the browser to encode.
 const MAX_ENCODE_WIDTH: u32 = 2560;
 const MAX_ENCODE_HEIGHT: u32 = 1600;
+/// Diameter of the Agent's play/pause control.
+const AGENT_CONTROL_SIZE: f32 = 58.0;
+/// Distance the control keeps from the frame's corner.
+const AGENT_CONTROL_MARGIN: f32 = 20.0;
 
 /// Which page the surface is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,6 +718,7 @@ impl BrowserSurface {
             };
             let _ = this.update(cx, |surface, cx| {
                 let previous = surface.tab.clone();
+                let was_driving = surface.agent_driving();
                 if let Some(tab_id) = &tab_id {
                     surface.tab = snapshot
                         .session
@@ -730,9 +736,11 @@ impl BrowserSurface {
                 surface.agent_paused = snapshot.session.execution_source
                     == BrowserExecutionSource::User
                     && snapshot.session.user_engaged;
-                // The preview tab shows the page's title and whether it is
-                // still loading, so a change has to reach the owner.
-                if surface.tab != previous
+                // The preview tab shows the page's title, whether it is still
+                // loading, and whether the Agent is driving it, so a change to
+                // any of those has to reach the owner.
+                let driving_changed = surface.agent_driving() != was_driving;
+                if (surface.tab != previous || driving_changed)
                     && let Some(tab_id) = surface.tab_id.clone()
                 {
                     cx.emit(BrowserSurfaceEvent::TabChanged { tab_id });
@@ -1624,6 +1632,47 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Pauses the Agent's page actions on this tab.
+    ///
+    /// The only human gesture that stops the Agent: touching the page does not,
+    /// so the reader says so instead. The runtime refuses the Agent's next page
+    /// action with `browser_operation_aborted` while it is paused.
+    fn pause_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.tab_id.clone() else {
+            return;
+        };
+        let Some(local) = self.local_browser() else {
+            cx.notify();
+            return;
+        };
+        self.agent_paused = true;
+        cx.background_executor()
+            .spawn(async move {
+                let _ = local
+                    .run(local.service().pause_agent_operations(&tab_id))
+                    .await;
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Whether the Agent is driving this tab right now.
+    ///
+    /// The runtime is the authority: `execution_source` is read from the session
+    /// snapshot, and a paused Agent reports the human as the source even though
+    /// it will take the tab back the moment the reader steps away.
+    pub(crate) fn agent_driving(&self) -> bool {
+        self.execution_source == Some(BrowserExecutionSource::Agent) && !self.agent_paused
+    }
+
+    /// Whether the panel can offer the Agent's play/pause control at all.
+    ///
+    /// A paired runtime owns the Agent on the other machine; only the
+    /// in-process service can pause or resume it.
+    fn can_control_agent(&self) -> bool {
+        self.local_browser().is_some() && (self.agent_paused || self.agent_driving())
+    }
+
     /// Reflects a file chooser the page opened.
     pub fn show_file_chooser(&mut self, tab_id: &BrowserTabId, cx: &mut Context<Self>) {
         if self.tab_id.as_ref() != Some(tab_id) {
@@ -1712,7 +1761,11 @@ impl BrowserSurface {
                 .id("browser-downloads")
                 .absolute()
                 .right(px(12.0))
-                .bottom(px(12.0))
+                .bottom(px(if self.can_control_agent() {
+                    AGENT_CONTROL_MARGIN * 2.0 + AGENT_CONTROL_SIZE
+                } else {
+                    12.0
+                }))
                 .w(px(320.0))
                 .gap_1()
                 .p_2()
@@ -1771,6 +1824,107 @@ impl BrowserSurface {
                         ),
                 )
                 .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The Agent's play/pause control.
+    ///
+    /// A page the Agent is driving gets one obvious way to stop it: touching
+    /// the page does not pause anything any more, so the reader needs a control
+    /// that says so. The bloom behind the button is what makes it read as the
+    /// Agent being live rather than as another toolbar button, and it is drawn
+    /// from two blurred shadows so it fades outwards instead of ending on a
+    /// hard ring.
+    fn render_agent_control(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // A page dialog or a file chooser is a modal moment; the control is
+        // about the page behind it and would only float over the card.
+        if !self.can_control_agent() || self.dialog.is_some() || self.file_chooser_pending {
+            return None;
+        }
+        let paused = self.agent_paused;
+        // Green means "the Agent is working"; once paused the button turns to
+        // the accent that hands the page back.
+        let accent = if paused {
+            cx.theme().success
+        } else {
+            cx.theme().primary
+        };
+        let (icon, tooltip) = if paused {
+            (
+                IconName::Play,
+                locale::text(
+                    "Hand control back to the Agent",
+                    "把控制权交还给 Agent",
+                    "把控制權交還給 Agent",
+                ),
+            )
+        } else {
+            (
+                IconName::Pause,
+                locale::text(
+                    "Pause the Agent on this tab",
+                    "暂停 Agent 在此标签页的操作",
+                    "暫停 Agent 在此分頁的操作",
+                ),
+            )
+        };
+        let label = if paused {
+            locale::text("Agent paused", "Agent 已暂停", "Agent 已暫停")
+        } else {
+            locale::text("Agent is driving", "Agent 正在操作", "Agent 正在操作")
+        };
+        let button = div()
+            .id("browser-agent-control")
+            .size(px(AGENT_CONTROL_SIZE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(cx.theme().background)
+            .border_1()
+            .border_color(accent.opacity(0.6))
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(label)
+            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            .child(Icon::new(icon).size(px(26.0)).text_color(accent))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if paused {
+                    this.hand_back_to_agent(cx);
+                } else {
+                    this.pause_agent(cx);
+                }
+            }));
+        Some(
+            div()
+                .absolute()
+                .right(px(AGENT_CONTROL_MARGIN))
+                .bottom(px(AGENT_CONTROL_MARGIN))
+                .child(
+                    button.with_animation(
+                        "browser-agent-control-bloom",
+                        Animation::new(Duration::from_millis(2_200))
+                            .with_max_fps(30.0)
+                            .repeat(),
+                        move |this, delta| {
+                            // The bloom breathes outward: the halo grows and
+                            // fades over one cycle, and the base shadow keeps a
+                            // soft edge between frames.
+                            let spread = 1.0 + delta * 9.0;
+                            let blur = 12.0 + delta * 20.0;
+                            let alpha = 0.5 - delta * 0.32;
+                            this.shadow(vec![
+                                BoxShadow::new(px(0.0), px(0.0), accent.opacity(alpha))
+                                    .blur_radius(px(blur))
+                                    .spread_radius(px(spread)),
+                                BoxShadow::new(px(0.0), px(0.0), accent.opacity(0.18))
+                                    .blur_radius(px(28.0))
+                                    .spread_radius(px(2.0)),
+                            ])
+                        },
+                    ),
+                )
                 .into_any_element(),
         )
     }
@@ -2286,10 +2440,11 @@ impl BrowserSurface {
                         .text_xs()
                         .text_color(cx.theme().foreground)
                         .child(locale::text(
-                            "You are driving this tab; the Agent's page actions are paused. It can \
-                             still observe.",
-                            "你正在操作此标签页，Agent 的页面操作已暂停（仍可观察）。",
-                            "你正在操作此分頁，Agent 的頁面操作已暫停（仍可觀察）。",
+                            "The Agent's page actions are paused on this tab; it can still \
+                             observe. Use the play button, or hand the tab back, when you are \
+                             done.",
+                            "Agent 在此标签页的页面操作已暂停（仍可观察）。完成后点击播放按钮或交还给 Agent 即可继续。",
+                            "Agent 在此分頁的頁面操作已暫停（仍可觀察）。完成後點擊播放按鈕或交還給 Agent 即可繼續。",
                         )),
                 )
                 .when(can_hand_back, |this| {
@@ -3456,6 +3611,7 @@ impl Render for BrowserSurface {
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
         let downloads = self.render_downloads(cx);
+        let agent_control = self.render_agent_control(cx);
         v_flex()
             .id("browser-surface")
             .track_focus(&self.focus)
@@ -3492,6 +3648,7 @@ impl Render for BrowserSurface {
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
             .when_some(downloads, |this, downloads| this.child(downloads))
+            .when_some(agent_control, |this, control| this.child(control))
             .on_key_down(cx.listener(Self::on_page_key_down))
             .on_key_up(cx.listener(Self::on_page_key_up))
     }
@@ -4856,6 +5013,15 @@ mod tests {
     // every pointer position converted to a negative local coordinate and the
     // panel dropped all mouse input while still accepting IME text.
     fn snapshot_with(tabs: Vec<vibex_core::BrowserTab>) -> vibex_core::BrowserSessionSnapshot {
+        snapshot_with_source(tabs, vibex_core::BrowserExecutionSource::User, true)
+    }
+
+    /// A snapshot whose driver is named, for the takeover-state tests.
+    fn snapshot_with_source(
+        tabs: Vec<vibex_core::BrowserTab>,
+        execution_source: vibex_core::BrowserExecutionSource,
+        user_engaged: bool,
+    ) -> vibex_core::BrowserSessionSnapshot {
         vibex_core::BrowserSessionSnapshot {
             session: vibex_core::BrowserSession {
                 session_id: BrowserSessionId::new(),
@@ -4863,8 +5029,8 @@ mod tests {
                 tabs,
                 active_tab_id: None,
                 agent_tab_id: None,
-                execution_source: vibex_core::BrowserExecutionSource::User,
-                user_engaged: true,
+                execution_source,
+                user_engaged,
                 recording: false,
                 created_at_ms: 0,
                 last_activity_at_ms: 0,
@@ -5020,6 +5186,80 @@ mod tests {
             2,
             "a change has to reach the preview tab"
         );
+    }
+
+    /// The strip's green Agent mark follows the runtime's answer.
+    ///
+    /// Touching the page no longer pauses the Agent, so the tab strip is where
+    /// a reader can see who is driving: green means the Agent, and the mark
+    /// goes back to muted the moment it is paused.
+    #[gpui::test]
+    fn a_driving_agent_reaches_the_tab_strip(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let tab_id = BrowserTabId::new();
+        let snapshot = Arc::new(std::sync::Mutex::new(Some(snapshot_with(vec![tab_with(
+            &tab_id,
+            "Example",
+            BrowserTabStatus::Ready,
+        )]))));
+        let transport: Arc<dyn BrowserTransport> = Arc::new(RecordingTransport {
+            snapshot: snapshot.clone(),
+            ..Default::default()
+        });
+        let window = cx.update(|cx: &mut App| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| BrowserSurface::new(tab_id.as_str().to_string(), window, cx))
+            })
+            .expect("surface window")
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let surface = window.root(&mut cx).expect("surface");
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let seen_events = seen.clone();
+        let _subscription = surface.update(&mut cx, |_, cx| {
+            cx.subscribe_self(move |_, event: &BrowserSurfaceEvent, _| {
+                if matches!(event, BrowserSurfaceEvent::TabChanged { .. }) {
+                    *seen_events.lock().unwrap() += 1;
+                }
+            })
+        });
+        surface.update(&mut cx, |surface, cx| {
+            surface.attach(transport, BrowserSessionId::new(), tab_id.clone(), cx);
+            surface.refresh_tab(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !surface.read_with(&cx, |surface, _| surface.agent_driving()),
+            "a user-driven tab is not marked green"
+        );
+        let before = *seen.lock().unwrap();
+
+        *snapshot.lock().unwrap() = Some(snapshot_with_source(
+            vec![tab_with(&tab_id, "Example", BrowserTabStatus::Ready)],
+            vibex_core::BrowserExecutionSource::Agent,
+            false,
+        ));
+        surface.update(&mut cx, |surface, cx| surface.refresh_tab(cx));
+        cx.run_until_parked();
+        assert!(surface.read_with(&cx, |surface, _| surface.agent_driving()));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            before + 1,
+            "the strip hears that the Agent took over"
+        );
+
+        // Paused by the reader: the Agent still owns the tab, but it is not
+        // driving, and the mark goes back to muted.
+        *snapshot.lock().unwrap() = Some(snapshot_with_source(
+            vec![tab_with(&tab_id, "Example", BrowserTabStatus::Ready)],
+            vibex_core::BrowserExecutionSource::User,
+            true,
+        ));
+        surface.update(&mut cx, |surface, cx| surface.refresh_tab(cx));
+        cx.run_until_parked();
+        assert!(!surface.read_with(&cx, |surface, _| surface.agent_driving()));
+        assert!(surface.read_with(&cx, |surface, _| surface.agent_paused));
+        assert_eq!(*seen.lock().unwrap(), before + 2);
     }
 
     #[test]
