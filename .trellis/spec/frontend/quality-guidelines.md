@@ -46,6 +46,23 @@ Desktop:
   workbench, `xl:grid-cols-*` can still leave a form column too narrow when the
   right rail is open; keep dense forms stacked or wait until `2xl`/a proven
   container width before enabling secondary columns.
+- Settings rows decide stacked versus inline from the **page** width, not the
+  window width. The navigation turns vertical at
+  `SETTINGS_VERTICAL_TABS_MIN_WIDTH` and costs the page
+  `SETTINGS_NAVIGATION_WIDTH`, so a window wide enough for an inline row can
+  still hand it a page that is not: at 768px the page drops from 595px to 340px.
+  `settings_page_width` is the shared measure and
+  `SETTINGS_ROW_INLINE_MIN_PAGE_WIDTH` is the point below which rows stack.
+- An inline row owes its label column `SETTINGS_ROW_LABEL_MIN_WIDTH` and gives
+  the value the rest, so the value column must stay shrinkable. `flex_none` on
+  that column lets one long value take the whole row: the label wraps one
+  character per line and the value paints outside the panel.
+- A text child of a GPUI flex row is measured as a single unbreakable line
+  however narrow the row is, because its min-content size answers with the
+  full-line size. Text that has to wrap belongs in a `min_w_0().flex_1()` box or
+  a block container, which hands it a definite width; a flex item left on
+  `flex-basis: auto` keeps its one-line width and overflows the column it was
+  given.
 
 Native mobile:
 - Single-column list-to-detail flows.

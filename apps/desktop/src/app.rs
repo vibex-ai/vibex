@@ -732,7 +732,20 @@ const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 4.0;
 const IMAGE_PREVIEW_HORIZONTAL_PADDING: f32 = 24.0;
 const IMAGE_PREVIEW_VERTICAL_PADDING: f32 = 64.0;
-const SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH: f32 = 760.0;
+/// The page width an inline settings row needs, which is what decides whether
+/// a page's rows lay out side by side or stacked.
+///
+/// It is the label column's floor plus the row gap plus the widest control a
+/// row carries — the 280px proxy and browser fields — so an inline row has
+/// room for both before it has to squeeze either.
+const SETTINGS_ROW_INLINE_MIN_PAGE_WIDTH: f32 = 588.0;
+/// How much of an inline settings row the label column always keeps.
+///
+/// A value is free-form — a storage summary, a path, a list of facts — while
+/// the label is the row's identity. Without a floor the value's natural width
+/// wins the whole row and the label wraps one character per line, so the value
+/// is what narrows and wraps instead.
+const SETTINGS_ROW_LABEL_MIN_WIDTH: f32 = 220.0;
 /// One press of the autosave-delay stepper. The delay stays inside the bounds
 /// the editor model clamps to.
 const AUTOSAVE_DELAY_STEP_MS: i64 = 250;
@@ -61692,6 +61705,9 @@ fn settings_row_id(title: &str) -> String {
 
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    /// `U+00A0`, so a size that wraps onto a second line keeps its unit: a
+    /// value read as "33.4" / "MiB" is a value the reader has to reassemble.
+    const NO_BREAK_SPACE: char = '\u{00A0}';
     let mut value = bytes as f64;
     let mut unit = 0usize;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -61699,9 +61715,9 @@ fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
+        format!("{bytes}{NO_BREAK_SPACE}{}", UNITS[unit])
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1}{NO_BREAK_SPACE}{}", UNITS[unit])
     }
 }
 
@@ -66673,7 +66689,12 @@ impl Render for FoundationSettings {
         let strings = locale::strings(resolved_locale);
         let viewport_width = f32::from(window.viewport_size().width);
         let vertical_tabs = viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH;
-        let stacked_rows = viewport_width < SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH;
+        // The page decides how a row lays out, not the window: turning the
+        // navigation vertical at 768px takes 256px out of the page, so a window
+        // that is "wide enough" for inline rows can still hand them a page that
+        // is not.
+        let page_width = settings_page_width(viewport_width);
+        let stacked_rows = page_width < SETTINGS_ROW_INLINE_MIN_PAGE_WIDTH;
         self.settings_render_context
             .target_anchor
             .borrow_mut()
@@ -66687,13 +66708,9 @@ impl Render for FoundationSettings {
                 strings,
                 cx,
             ),
-            SettingsSection::Appearance => self.render_appearance_page(
-                &appearance,
-                stacked_rows,
-                settings_appearance_cards_width(viewport_width),
-                strings,
-                cx,
-            ),
+            SettingsSection::Appearance => {
+                self.render_appearance_page(&appearance, stacked_rows, page_width, strings, cx)
+            }
             SettingsSection::Session => {
                 self.render_session_page(&session, &desktop_behavior, stacked_rows, strings, cx)
             }
@@ -67453,13 +67470,13 @@ fn resolve_release_channel(
     Ok(packaged.or(runtime).unwrap_or(ReleaseChannel::Preview))
 }
 
-/// Width the appearance preview cards share: the settings page's content
-/// column, once the dialog margins, the navigation, and the page inset are
-/// removed.
+/// Width of a settings page's content column once the dialog margins, the
+/// navigation, and the page inset are removed.
 ///
-/// The cards flex to a third of this, so it only has to be close enough to give
-/// them their height; the row itself always fits the page.
-fn settings_appearance_cards_width(viewport_width: f32) -> f32 {
+/// Both the appearance preview cards, which flex to a third of it, and the
+/// stacked-or-inline decision for setting rows measure against this: what a row
+/// can hold depends on the page it is drawn on, not on the window around it.
+fn settings_page_width(viewport_width: f32) -> f32 {
     let dialog_width = (viewport_width - 32.0).clamp(1.0, SETTINGS_DIALOG_MAX_WIDTH);
     let navigation_width = if viewport_width >= SETTINGS_VERTICAL_TABS_MIN_WIDTH {
         SETTINGS_NAVIGATION_WIDTH
@@ -67666,9 +67683,15 @@ fn setting_row(
         })
         .child(
             v_flex()
+                .debug_selector(|| "settings-row-label".to_string())
                 .min_w_0()
                 .flex_1()
                 .gap_1()
+                // The floor only applies while the row is inline; a stacked row
+                // owns the page's whole width already.
+                .when(!stacked, |this| {
+                    this.min_w(px(SETTINGS_ROW_LABEL_MIN_WIDTH))
+                })
                 .child(div().text_sm().font_medium().child(title))
                 .child(
                     div()
@@ -67679,9 +67702,13 @@ fn setting_row(
                 ),
         )
         .child(
+            // No `flex_none` inline: a control that is wider than the room left
+            // over has to shrink and wrap its own text rather than push the
+            // label column aside and paint outside the panel.
             div()
-                .flex_none()
-                .when(stacked, |this| this.w_full())
+                .debug_selector(|| "settings-row-value".to_string())
+                .min_w_0()
+                .when(stacked, |this| this.flex_none().w_full())
                 .child(control),
         )
         .into_any_element()
@@ -67999,7 +68026,12 @@ fn settings_value_chip(text: impl Into<SharedString>) -> Tag {
         .whitespace_normal()
         .max_w_full()
         .font_medium()
-        .child(text.into())
+        // The chip is itself a flex row, and GPUI measures a text child of one
+        // as a single unbreakable line however narrow the row is: the text only
+        // wraps inside a box the flex algorithm hands a definite width to, and
+        // a `flex_1` box is that box. Without it the value kept its one-line
+        // width and painted outside the column it was given.
+        .child(div().min_w_0().flex_1().child(text.into()))
 }
 
 /// `sha256:…` fingerprint of a base64url DER certificate, so the operator can
@@ -81703,6 +81735,130 @@ mod tests {
         assert_eq!(data_page.matches(".disabled(cleanup_disabled)").count(), 3);
     }
 
+    /// Lays one settings row out at a chosen width and row layout, so the boxes
+    /// its label column and value column resolve to can be measured.
+    struct SettingsRowProbe {
+        width: Pixels,
+        stacked: bool,
+        value: String,
+    }
+
+    impl Render for SettingsRowProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex().w(self.width).child(setting_row(
+                "Local storage",
+                "Database, sessions, terminal records, attachments and diagnostics.",
+                settings_value_chip(self.value.clone()),
+                self.stacked,
+                cx,
+            ))
+        }
+    }
+
+    /// The boxes one settings row resolves its label column and its value
+    /// column to at `width`.
+    fn settings_row_bounds(
+        cx: &mut TestAppContext,
+        value: &str,
+        width: f32,
+        stacked: bool,
+    ) -> (Bounds<Pixels>, Bounds<Pixels>) {
+        let (_, cx) = cx.add_window_view(|_, _| SettingsRowProbe {
+            width: px(width),
+            stacked,
+            value: value.to_string(),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let mut bounds = |selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"))
+        };
+        (bounds("settings-row-label"), bounds("settings-row-value"))
+    }
+
+    /// The storage row's value is a summary of every store under the data
+    /// directory, so it can be longer than the row itself. It used to take the
+    /// room it wanted: the label column collapsed to one character per line and
+    /// the chip painted past the panel. The value wraps, and the label keeps a
+    /// readable column.
+    #[gpui::test]
+    fn settings_row_wraps_a_long_value_instead_of_crushing_its_label(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let long_value = "Total 10.6 GiB · DB 48.9 MiB · Sessions 33.4 MiB · Terminals 0 B · \
+                          Attachments 2.1 MiB · Diagnostics 5.2 MiB · Agent installations 10.1 GiB";
+
+        // A page this narrow stacks its rows: the label owns the page and the
+        // value wraps under it, across the whole row.
+        let (stacked_label, stacked_value) = settings_row_bounds(cx, long_value, 473.0, true);
+        assert!(
+            stacked_label.size.width >= px(SETTINGS_ROW_LABEL_MIN_WIDTH),
+            "a stacked label kept only {}",
+            stacked_label.size.width
+        );
+        assert!(
+            stacked_value.right() <= px(473.5),
+            "the stacked value {} ran past its row",
+            stacked_value.right()
+        );
+
+        // On the narrowest page that still lays a row out inline, the label
+        // keeps its floor and the value gets what is left, wrapped inside it.
+        let (label, value) = settings_row_bounds(cx, long_value, 588.0, false);
+        assert!(
+            value.right() <= px(588.5),
+            "the value column {} ran past its row",
+            value.right()
+        );
+        assert!(
+            label.size.width >= px(SETTINGS_ROW_LABEL_MIN_WIDTH - 1.0),
+            "the label column collapsed to {}",
+            label.size.width
+        );
+        assert!(
+            label.right() <= value.left() + px(0.5),
+            "the label {} ran under the value {}",
+            label.right(),
+            value.left()
+        );
+        assert!(
+            value.size.width > px(80.0),
+            "the value column collapsed to {}",
+            value.size.width
+        );
+        assert!(
+            stacked_value.size.width > value.size.width,
+            "a stacked value took {} against an inline value's {}",
+            stacked_value.size.width,
+            value.size.width
+        );
+
+        // A value that fits keeps the chip at its own width and one line tall,
+        // which is what makes the wrapped heights above the column's limit
+        // rather than the chip's own shape.
+        let (short_label, short_value) = settings_row_bounds(cx, "10.6 GiB", 588.0, false);
+        assert!(
+            short_value.size.width < value.size.width,
+            "a short chip stretched to {} beside a long one at {}",
+            short_value.size.width,
+            value.size.width
+        );
+        assert!(
+            short_value.size.height <= value.size.height - px(10.0),
+            "a short chip took {} of the long value's {}",
+            short_value.size.height,
+            value.size.height
+        );
+        assert!(
+            short_label.size.width > label.size.width,
+            "the label kept {} beside a short value instead of growing past {}",
+            short_label.size.width,
+            label.size.width
+        );
+    }
+
     #[test]
     fn data_settings_cleanup_requires_confirmation_and_refreshes_usage() {
         let source = include_str!("app.rs");
@@ -81839,7 +81995,7 @@ mod tests {
         assert_eq!(SETTINGS_NAVIGATION_WIDTH, 256.0);
         assert_eq!(SETTINGS_NAVIGATION_ROW_HEIGHT, 34.0);
         assert_eq!(SETTINGS_NAVIGATION_SECTION_GAP, 4.0);
-        assert_eq!(SETTINGS_ROW_INLINE_MIN_VIEWPORT_WIDTH, 760.0);
+        assert_eq!(SETTINGS_ROW_INLINE_MIN_PAGE_WIDTH, 588.0);
 
         let source = include_str!("app.rs");
         let navigation = source
