@@ -449,6 +449,15 @@ impl BrowserSurface {
         self.tab.as_ref().map(|tab| tab.owner)
     }
 
+    /// The Agent session behind an Agent tab, if the runtime named one.
+    ///
+    /// The tab strip uses it to draw the operating Agent's own mark rather than
+    /// a generic robot; the identity itself lives in the client, not in the
+    /// browser session.
+    pub fn agent_session_id(&self) -> Option<&vibex_core::VibexSessionId> {
+        self.tab.as_ref()?.agent_session_id.as_ref()
+    }
+
     /// Fetches the page's icon once per URL.
     ///
     /// The bytes come from the runtime, so a paired client shows the icon even

@@ -131,6 +131,11 @@ impl BrowserService {
         name: &str,
         args: &Value,
     ) -> BrowserResult<BrowserToolOutcome> {
+        // Every tool call is the Agent acting on its browser session. The panel
+        // shows the tab strip mark and the pause control from this, so it is
+        // marked here — once per call, whatever the tool touches — rather than
+        // in the handful of tools that happened to remember.
+        self.mark_source(ctx).await;
         match name {
             "browser_open_and_read" => self.tool_open_and_read(ctx, args).await,
             "browser_click_by_name" => self.tool_click_by_name(ctx, args).await,
@@ -220,10 +225,27 @@ impl BrowserService {
         Ok(())
     }
 
+    /// Marks the Agent as the driver of its browser session, once.
+    ///
+    /// The panel reads this from the session snapshot, so the transition has to
+    /// reach it: a client that only heard about the source on the next
+    /// navigation painted some tabs as Agent-driven and left others alone —
+    /// exactly the inconsistency switching tabs appeared to fix.
     async fn mark_source(&self, ctx: &BrowserToolContext) {
-        let mut state = self.inner().state.lock().await;
-        if let Some(session) = state.sessions.get_mut(&ctx.session_id) {
-            session.execution_source = BrowserExecutionSource::Agent;
+        let changed = {
+            let mut state = self.inner().state.lock().await;
+            let Some(session) = state.sessions.get_mut(&ctx.session_id) else {
+                return;
+            };
+            if session.execution_source == BrowserExecutionSource::Agent {
+                false
+            } else {
+                session.execution_source = BrowserExecutionSource::Agent;
+                true
+            }
+        };
+        if changed {
+            self.notify_session_changed(&ctx.session_id).await;
         }
     }
 
@@ -762,7 +784,6 @@ impl BrowserService {
         reference: &str,
     ) -> BrowserResult<BrowserToolOutcome> {
         self.ensure_not_aborted(tab_id).await?;
-        self.mark_source(ctx).await;
         let (backend_node_id, role, name) = self.resolve_element(tab_id, reference).await?;
         let (x, y) = self
             .element_center(tab_id, reference, backend_node_id)
@@ -850,7 +871,6 @@ impl BrowserService {
         let text = required_text(args, "text")?;
         let tab_id = self.target_tab(ctx, args).await?;
         self.ensure_not_aborted(&tab_id).await?;
-        self.mark_source(ctx).await;
         let (backend_node_id, role, name) = self.resolve_element(&tab_id, reference.trim()).await?;
         let session = self
             .inner()

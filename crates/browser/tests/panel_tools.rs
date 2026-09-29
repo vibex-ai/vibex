@@ -8,8 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-use vibex_browser::{BrowserService, BrowserServiceConfig, BrowserSessionKey};
-use vibex_core::BrowserTabOwner;
+use vibex_browser::{BrowserService, BrowserServiceConfig, BrowserServiceEvent, BrowserSessionKey};
+use vibex_core::{BrowserExecutionSource, BrowserTabOwner, WorkspaceId};
 
 /// A page with three known hits, a link and a download link.
 ///
@@ -498,6 +498,124 @@ async fn a_chosen_file_reaches_the_pages_file_input() {
         "the page's input holds the chosen file: {}",
         files.text
     );
+    service.shutdown().await;
+}
+
+/// The panel hears the moment the Agent becomes the driver.
+///
+/// The tab strip mark and the pause control are read from the session snapshot,
+/// and the snapshot only arrives when the runtime says something changed. The
+/// flip used to be silent, so a panel that had already drawn its tabs showed
+/// the mark on whichever tab happened to be repainted next — switching tabs
+/// appeared to fix it.
+#[tokio::test]
+async fn an_agent_action_announces_the_takeover_once() {
+    let Some((service, home, anonymous, _tab)) = service_with_page().await else {
+        return;
+    };
+    let _home = home;
+    // The fixture's readiness probe is itself an Agent action, so that session
+    // already reports the Agent as the driver.
+    assert_eq!(
+        service
+            .session_snapshot(&anonymous)
+            .await
+            .expect("snapshot")
+            .session
+            .execution_source,
+        BrowserExecutionSource::Agent,
+        "any tool call makes the Agent the driver, not just click and fill"
+    );
+
+    // A fresh session starts with the human as the driver.
+    let workspace = WorkspaceId::new();
+    let session = service
+        .ensure_session(
+            BrowserSessionKey::Workspace(workspace.clone()),
+            Some(workspace),
+        )
+        .await
+        .expect("a session");
+    let tab = service
+        .create_tab(
+            &session,
+            Some("data:text/html,<p>needle</p>"),
+            BrowserTabOwner::Agent,
+        )
+        .await
+        .expect("a tab");
+    assert_eq!(
+        service
+            .session_snapshot(&session)
+            .await
+            .expect("snapshot")
+            .session
+            .execution_source,
+        BrowserExecutionSource::User
+    );
+
+    let mut events = service.subscribe();
+    let found = service
+        .call_tool(
+            &tool_context(&session),
+            "browser_find",
+            &serde_json::json!({ "tab_id": tab.as_str(), "query": "needle" }),
+        )
+        .await;
+    assert!(!found.is_error, "the search runs: {}", found.text);
+
+    // The flip reaches the panel, and only the flip: a later action must not
+    // repeat it, or every tool call would repaint every tab.
+    let mut takeovers = 0;
+    let quiet = Instant::now() + Duration::from_millis(700);
+    loop {
+        let remaining = quiet.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(BrowserServiceEvent::SessionChanged(changed))) if changed == session => {
+                takeovers += 1;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert_eq!(takeovers, 1, "the takeover is announced exactly once");
+    assert_eq!(
+        service
+            .session_snapshot(&session)
+            .await
+            .expect("snapshot")
+            .session
+            .execution_source,
+        BrowserExecutionSource::Agent
+    );
+
+    let again = service
+        .call_tool(
+            &tool_context(&session),
+            "browser_find",
+            &serde_json::json!({ "tab_id": tab.as_str(), "query": "needle" }),
+        )
+        .await;
+    assert!(!again.is_error, "the second search runs: {}", again.text);
+    let mut repeated = 0;
+    let quiet = Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = quiet.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(BrowserServiceEvent::SessionChanged(changed))) if changed == session => {
+                repeated += 1;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert_eq!(repeated, 0, "the source only moves once");
     service.shutdown().await;
 }
 

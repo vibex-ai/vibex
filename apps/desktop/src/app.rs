@@ -29668,6 +29668,19 @@ impl VibexWorkbench {
         self.sessions.iter().find(|session| &session.id == selected)
     }
 
+    /// The Agent that owns a session.
+    ///
+    /// The embedded browser's tab strip names the Agent session behind a page
+    /// and asks here for the Agent itself, so the mark is the operating
+    /// Agent's own icon instead of a generic robot. A session this client has
+    /// not loaded answers `None`, which leaves the generic mark in place.
+    pub(crate) fn agent_id_for_session(&self, session_id: &VibexSessionId) -> Option<&AgentId> {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| &session.agent_id)
+    }
+
     /// The workspace state key the persisted UI state was written under.
     ///
     /// The session list is not loaded yet on the first frame, so project scope

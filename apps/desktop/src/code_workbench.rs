@@ -88,7 +88,9 @@ use vibex_terminal::TerminalManager;
 
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
-use crate::assets::{BUNDLED_SANS_FAMILY, file_tree_asset_icon, open_tool_brand_icon};
+use crate::assets::{
+    BUNDLED_SANS_FAMILY, agent_brand_glyph, file_tree_asset_icon, open_tool_brand_icon,
+};
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
 use crate::gpui_ext::{ScrollGutter as _, hint_notification, solid_empty_border};
@@ -1065,6 +1067,8 @@ struct BrowserTabLabel {
     /// Agent, and an Agent's tab goes quiet while it is paused. The strip marks
     /// the live case in green.
     agent_driving: bool,
+    /// The Agent that owns the page, so the strip draws its own mark.
+    agent_identity: Option<String>,
 }
 
 /// The browser transport slice of the desktop bundle.
@@ -1836,6 +1840,23 @@ impl CodeWorkbench {
         };
         input.update(cx, |input, cx| input.open_search(false, cx));
         true
+    }
+
+    /// The Agent that owns a browser session, for the tab strip's mark.
+    ///
+    /// The browser session names the Agent session; only the client's own
+    /// session list names the Agent. A client that cannot answer — the session
+    /// is not loaded, or a fixture has no host — keeps the generic robot.
+    fn agent_identity_for_session(
+        &self,
+        session_id: &vibex_core::VibexSessionId,
+        cx: &App,
+    ) -> Option<String> {
+        let parent = self.parent.as_ref()?.upgrade()?;
+        parent
+            .read(cx)
+            .agent_id_for_session(session_id)
+            .map(|agent_id| agent_id.as_str().to_string())
     }
 
     /// The browser panel that holds the keyboard, if this workbench draws it.
@@ -4871,6 +4892,10 @@ impl CodeWorkbench {
                             surface.agent_driving(),
                         )
                     };
+                    let agent_identity =
+                        surface.read(cx).agent_session_id().and_then(|session_id| {
+                            workbench.agent_identity_for_session(session_id, cx)
+                        });
                     workbench.browser_tab_labels.insert(
                         tab_id.as_str().to_string(),
                         BrowserTabLabel {
@@ -4879,6 +4904,7 @@ impl CodeWorkbench {
                             favicon,
                             owner,
                             agent_driving,
+                            agent_identity,
                         },
                     );
                     // The address is the one piece of page state a restart can
@@ -8518,17 +8544,32 @@ impl CodeWorkbench {
         // and the reader should not have to guess whether they drove it. Green
         // means the Agent is driving that page right now — a tab it owns but
         // has paused, or has not touched, keeps the muted mark.
-        let (agent_browser_tab, agent_driving) = match &tab.target {
+        let (agent_browser_tab, agent_driving, agent_identity) = match &tab.target {
             PreviewTarget::Browser { browser_tab_id, .. } => {
                 let label = self.browser_tab_labels.get(browser_tab_id);
+                let driving = label.is_some_and(|label| label.agent_driving);
                 (
-                    label.and_then(|label| label.owner) == Some(BrowserTabOwner::Agent)
-                        || label.is_some_and(|label| label.agent_driving),
-                    label.is_some_and(|label| label.agent_driving),
+                    label.and_then(|label| label.owner) == Some(BrowserTabOwner::Agent) || driving,
+                    driving,
+                    label.and_then(|label| label.agent_identity.clone()),
                 )
             }
-            _ => (false, false),
+            _ => (false, false, None),
         };
+        // The Agent's own mark, green while it is driving and muted while the
+        // tab is only its own; a client that cannot name the Agent falls back
+        // to the robot inside `agent_brand_glyph`.
+        let agent_mark = (agent_browser_tab || agent_driving).then(|| {
+            agent_brand_glyph(
+                agent_identity.as_deref().unwrap_or_default(),
+                px(11.0),
+                if agent_driving {
+                    cx.theme().success
+                } else {
+                    cx.theme().muted_foreground
+                },
+            )
+        });
         let target_icon = preview_target_icon(&tab.target, browser_favicon, cx);
         let file_path = match &tab.target {
             PreviewTarget::File { path } | PreviewTarget::GitDiff { path, .. } => {
@@ -8787,17 +8828,7 @@ impl CodeWorkbench {
             } else {
                 target_icon
             })
-            .when(agent_browser_tab, |this| {
-                this.child(
-                    Icon::new(IconName::Bot)
-                        .size(px(11.0))
-                        .text_color(if agent_driving {
-                            cx.theme().success
-                        } else {
-                            cx.theme().muted_foreground
-                        }),
-                )
-            })
+            .when_some(agent_mark, |this, mark| this.child(mark))
             .when(pinned, |this| {
                 this.child(
                     Icon::default()
