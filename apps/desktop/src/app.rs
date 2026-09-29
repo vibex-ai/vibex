@@ -120,9 +120,9 @@ use vibex_desktop_model::{
     BrowserSearchEngine, BrowserStartPage, BrowserUiState, ComposerAttachment,
     ComposerQueueSendMode, ComposerSuggestionSelection, ComposerToken, ComposerTrigger,
     DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
-    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, FpsMonitorPlacement, GitSelectionKey,
-    GitWorkbenchMode, LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS,
-    MessageSendKey, NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
+    DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
+    LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
+    NavigationHistory, NetworkProxyMode, NetworkProxyUiState, NewSessionLocation,
     NewSessionProjectTicket, NewSessionSubmissionStage, NewSessionWorkspaceState,
     PreviewWindowMode, RUNTIME_SELECTION_PREFERENCE_LIMIT, ReasoningDisplayMode,
     RuntimeCascadeChoice, RuntimeCascadeProjection, RuntimeModelFavorite,
@@ -3084,15 +3084,26 @@ impl Render for RightPanelResizeDrag {
     }
 }
 
-/// How much of the developer HUD has to stay inside the window, so that however
-/// far it is dragged it can always be grabbed again.
-const FPS_HUD_MIN_VISIBLE: f32 = 24.0;
+/// Where the developer HUD sits relative to the middle of the window, in
+/// logical pixels.
+///
+/// The middle is the HUD's home: every open puts it back there, a drag moves it
+/// by an offset from that home, and zero is the window's exact centre. An
+/// offset rather than a position keeps the HUD where it was dragged to when the
+/// window is resized, and means the HUD does not have to be measured to be
+/// placed — a collapsed HUD is as centred as an expanded one.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct FpsHudOffset {
+    x: f32,
+    y: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FpsHudDragState {
     /// Pointer position when the drag started, in window coordinates.
     start_cursor: Point<Pixels>,
-    placement: FpsMonitorPlacement,
+    /// The offset the HUD was drawn at when the drag started.
+    offset: FpsHudOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3104,40 +3115,41 @@ impl Render for FpsHudDrag {
     }
 }
 
-/// The placement a HUD drag lands on: the HUD follows the pointer by the same
-/// delta the pointer moved since the drag started, and stops with
-/// [`FPS_HUD_MIN_VISIBLE`] of itself still on screen.
-fn dragged_fps_hud_placement(
-    start: FpsMonitorPlacement,
+/// The offset a HUD drag lands on: the HUD follows the pointer by the same
+/// delta the pointer moved since the drag started.
+fn dragged_fps_hud_offset(
+    start: FpsHudOffset,
     start_cursor: Point<Pixels>,
     cursor: Point<Pixels>,
     viewport: Size<Pixels>,
-) -> FpsMonitorPlacement {
-    fps_hud_placement_within_window(
-        FpsMonitorPlacement {
-            top: start.top + f32::from(cursor.y - start_cursor.y),
-            right: start.right - f32::from(cursor.x - start_cursor.x),
+) -> FpsHudOffset {
+    fps_hud_offset_within_window(
+        FpsHudOffset {
+            x: start.x + f32::from(cursor.x - start_cursor.x),
+            y: start.y + f32::from(cursor.y - start_cursor.y),
         },
         viewport,
     )
 }
 
-/// Pulls a placement back inside the window it is about to be drawn in.
+/// Pulls an offset back to somewhere the window can still show the HUD.
 ///
-/// The stored insets are what the user dragged to; clamping here rather than
-/// writing back means shrinking the window brings the HUD back into view while
-/// growing it again returns the HUD to the corner that was chosen for it.
-fn fps_hud_placement_within_window(
-    placement: FpsMonitorPlacement,
-    viewport: Size<Pixels>,
-) -> FpsMonitorPlacement {
-    // The HUD hangs below the title bar, so its travel ends a title bar above
-    // the bottom edge.
-    let max_top = (f32::from(viewport.height) - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE).max(0.0);
-    let max_right = (f32::from(viewport.width) - FPS_HUD_MIN_VISIBLE).max(0.0);
-    FpsMonitorPlacement {
-        top: placement.top.clamp(0.0, max_top),
-        right: placement.right.clamp(0.0, max_right),
+/// The offset moves the HUD's centre, so keeping the centre inside the window —
+/// and below the title bar, where it cannot cover the window controls — is what
+/// guarantees a grabbable part of the HUD stays on screen however far it is
+/// dragged. Clamping here rather than writing back means shrinking the window
+/// brings the HUD back into view while growing it again returns the HUD to
+/// where it was left.
+fn fps_hud_offset_within_window(offset: FpsHudOffset, viewport: Size<Pixels>) -> FpsHudOffset {
+    let reach_x = (f32::from(viewport.width) / 2.0).max(0.0);
+    let reach_y = (f32::from(viewport.height) / 2.0).max(0.0);
+    // A window shorter than its own title bar leaves nowhere below the bar to
+    // put the HUD; the offset then simply stays inside the window rather than
+    // inverting the range, which would panic.
+    let below_title_bar = (TITLE_BAR_HEIGHT - reach_y).min(reach_y);
+    FpsHudOffset {
+        x: offset.x.clamp(-reach_x, reach_x),
+        y: offset.y.clamp(below_title_bar, reach_y),
     }
 }
 
@@ -6828,6 +6840,10 @@ pub struct VibexWorkbench {
     /// setting is on and dropped when it is turned off, which is also what
     /// releases GPUI's frame trace.
     fps_monitor: Option<Entity<FpsMonitor>>,
+    /// Where the HUD has been dragged to since it was opened. Reset every time
+    /// the Developer switch turns it on, so each open starts in the middle of
+    /// the window.
+    fps_hud_offset: FpsHudOffset,
     fps_hud_drag: Option<FpsHudDragState>,
     /// Records what the HUD measures into the diagnostics folder for as long as
     /// the Developer switch is on. Dropping the task stops the sampling.
@@ -7900,6 +7916,7 @@ impl VibexWorkbench {
             sidebar_resize_drag: None,
             right_panel_resize_drag: None,
             fps_monitor: None,
+            fps_hud_offset: FpsHudOffset::default(),
             fps_hud_drag: None,
             fps_monitor_recorder: None,
             pair_button_hovered: false,
@@ -30481,21 +30498,17 @@ impl VibexWorkbench {
             self.fps_hud_drag = None;
             return;
         }
-        let placement =
-            dragged_fps_hud_placement(drag.placement, drag.start_cursor, cursor, viewport);
-        if placement == self.ui_state.developer.fps_monitor_placement {
+        let offset = dragged_fps_hud_offset(drag.offset, drag.start_cursor, cursor, viewport);
+        if offset == self.fps_hud_offset {
             return;
         }
-        self.ui_state.developer.fps_monitor_placement = placement;
+        self.fps_hud_offset = offset;
         cx.notify();
     }
 
     fn finish_fps_hud_drag(&mut self, cx: &mut Context<Self>) {
-        let Some(drag) = self.fps_hud_drag.take() else {
+        if self.fps_hud_drag.take().is_none() {
             return;
-        };
-        if self.ui_state.developer.fps_monitor_placement != drag.placement {
-            self.queue_ui_state();
         }
         cx.notify();
     }
@@ -30503,6 +30516,9 @@ impl VibexWorkbench {
     fn set_fps_monitor_enabled(&mut self, enabled: bool, window: &Window, cx: &mut Context<Self>) {
         self.ui_state.developer.show_fps_monitor = enabled;
         if enabled {
+            // Every open starts from the middle of the window rather than
+            // wherever the last drag left the HUD.
+            self.fps_hud_offset = FpsHudOffset::default();
             self.start_fps_monitor_recording(window.window_handle().window_id(), cx);
         } else {
             // Dropping the monitor releases GPUI's frame trace and the HUD's
@@ -61079,9 +61095,9 @@ fn settings_search_candidates(strings: &'static Strings) -> Vec<SettingsSearchCa
             SettingsSection::Developer,
             locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
             locale::text(
-                "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it; while it is on, one sample a second is recorded to the diagnostics folder.",
-                "在工作台上叠加实时帧率、帧耗时与资源占用，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
-                "在工作台上疊加即時幀率、幀耗時與資源佔用，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
+                "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
+                "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
             ),
             &[
                 "fps",
@@ -66632,9 +66648,9 @@ impl FoundationSettings {
             vec![SettingsGroup::unlabeled(vec![setting_row(
                 locale::text("FPS monitor", "帧率监视器", "幀率監視器"),
                 locale::text(
-                    "Overlay realtime frame rate, frame time and resource usage on the workbench. Drag the HUD to move it; while it is on, one sample a second is recorded to the diagnostics folder.",
-                    "在工作台上叠加实时帧率、帧耗时与资源占用，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
-                    "在工作台上疊加即時幀率、幀耗時與資源佔用，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
+                    "Overlay realtime frame rate, frame time and resource usage on the workbench. The HUD opens in the middle of the window and can be dragged from there; while it is on, one sample a second is recorded to the diagnostics folder.",
+                    "在工作台上叠加实时帧率、帧耗时与资源占用，开启时显示在窗口正中，可拖动调整位置；开启期间每秒记录一次采样到诊断数据。",
+                    "在工作台上疊加即時幀率、幀耗時與資源佔用，開啟時顯示在視窗正中，可拖動調整位置；開啟期間每秒記錄一次取樣到診斷資料。",
                 ),
                 fps_monitor_switch,
                 stacked,
@@ -67078,43 +67094,50 @@ impl Render for VibexWorkbench {
         let startup_loading = self
             .startup_loading
             .then(|| startup_loading_overlay(self.startup_loading_indicator_visible, cx));
-        // The developer HUD hangs below the title bar so it never covers the
-        // window controls, and sits under every modal layer so an open dialog
-        // stays readable. Its own insets place it rather than the overlay's
-        // fixed anchor, which is what lets a drag move it.
+        // The developer HUD floats over the middle of the workbench: a
+        // full-window layer centres it there, so the HUD needs no measuring and
+        // a collapsed HUD stays as centred as an expanded one. The drag offset
+        // moves it from that home. The layer paints before the modal layers
+        // further down, so an open dialog stays readable.
         let fps_hud = self.ui_state.developer.show_fps_monitor.then(|| {
             let monitor = self
                 .fps_monitor
                 .get_or_insert_with(|| cx.new(|cx| FpsMonitor::new(window, cx)))
                 .clone();
-            let placement = fps_hud_placement_within_window(
-                self.ui_state.developer.fps_monitor_placement.clamped(),
-                window.viewport_size(),
-            );
+            let offset = fps_hud_offset_within_window(self.fps_hud_offset, window.viewport_size());
             let drag_target = cx.weak_entity();
             div()
-                .id("developer-fps-hud")
                 .absolute()
-                .top(px(TITLE_BAR_HEIGHT + placement.top))
-                .right(px(placement.right))
-                .cursor_move()
-                .on_drag(FpsHudDrag, move |_, _, window, cx| {
-                    let start_cursor = window.mouse_position();
-                    let _ = drag_target.update(cx, |this, cx| {
-                        this.fps_hud_drag = Some(FpsHudDragState {
-                            start_cursor,
-                            // Start from where the HUD is drawn, so a window too
-                            // small for the stored insets still drags smoothly.
-                            placement: fps_hud_placement_within_window(
-                                this.ui_state.developer.fps_monitor_placement.clamped(),
-                                window.viewport_size(),
-                            ),
-                        });
-                        cx.notify();
-                    });
-                    cx.new(|_| FpsHudDrag)
-                })
-                .child(monitor.cached(StyleRefinement::default().flex()))
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .id("developer-fps-hud")
+                        .relative()
+                        .left(px(offset.x))
+                        .top(px(offset.y))
+                        .cursor_move()
+                        .on_drag(FpsHudDrag, move |_, _, window, cx| {
+                            let start_cursor = window.mouse_position();
+                            let _ = drag_target.update(cx, |this, cx| {
+                                this.fps_hud_drag = Some(FpsHudDragState {
+                                    start_cursor,
+                                    // Start from where the HUD is drawn, so a
+                                    // window that shrank after the drag still
+                                    // moves it smoothly.
+                                    offset: fps_hud_offset_within_window(
+                                        this.fps_hud_offset,
+                                        window.viewport_size(),
+                                    ),
+                                });
+                                cx.notify();
+                            });
+                            cx.new(|_| FpsHudDrag)
+                        })
+                        .child(monitor.cached(StyleRefinement::default().flex())),
+                )
                 .into_any_element()
         });
         v_flex()
@@ -81867,6 +81890,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("developer switch should remain inspectable");
         assert!(switch.contains("self.ui_state.developer.show_fps_monitor = enabled"));
+        // Opening the monitor puts the HUD back in the middle of the window;
+        // where a drag left it is not carried into the next open, let alone
+        // into the stored state.
+        assert!(switch.contains("self.fps_hud_offset = FpsHudOffset::default()"));
+        assert!(!switch.contains("fps_monitor_placement"));
         assert!(switch.contains("self.fps_monitor = None"));
         assert!(switch.contains("self.fps_monitor_recorder = None"));
         assert!(
@@ -81915,7 +81943,14 @@ mod tests {
             .expect("workbench renderer should remain inspectable");
         assert!(render.contains("self.ui_state.developer.show_fps_monitor.then("));
         assert!(render.contains("FpsMonitor::new(window, cx)"));
-        assert!(render.contains("fps_hud_placement_within_window("));
+        // The HUD is centred by a full-window layer and moved from that middle
+        // by its drag offset, so nothing has to measure it.
+        assert!(render.contains(".inset_0()"));
+        assert!(render.contains(".items_center()"));
+        assert!(render.contains(".justify_center()"));
+        assert!(render.contains("fps_hud_offset_within_window("));
+        assert!(render.contains(".left(px(offset.x))"));
+        assert!(render.contains(".top(px(offset.y))"));
         assert!(render.contains(".on_drag(FpsHudDrag, move |_, _, window, cx|"));
         assert!(
             render.contains("this.drag_fps_hud(event.event.position, window.viewport_size(), cx)")
@@ -81937,58 +81972,47 @@ mod tests {
     }
 
     #[test]
-    fn dragging_the_fps_hud_follows_the_pointer_and_stops_at_the_window_edge() {
+    fn dragging_the_fps_hud_moves_it_from_the_middle_and_stops_at_the_window_edge() {
         let viewport = size(px(1200.0), px(800.0));
-        let start = FpsMonitorPlacement {
-            top: 12.0,
-            right: 12.0,
-        };
-        let press = point(px(1000.0), px(100.0));
+        // Every open starts here: zero offset is the middle of the window.
+        let start = FpsHudOffset::default();
+        let press = point(px(600.0), px(400.0));
 
         // The HUD moves by the delta the pointer moved, so it keeps the point
         // it was grabbed by under the cursor.
         assert_eq!(
-            dragged_fps_hud_placement(start, press, point(px(900.0), px(140.0)), viewport),
-            FpsMonitorPlacement {
-                top: 52.0,
-                right: 112.0,
-            }
+            dragged_fps_hud_offset(start, press, point(px(500.0), px(440.0)), viewport),
+            FpsHudOffset { x: -100.0, y: 40.0 }
         );
 
-        // Past an edge it parks against it with a grabbable strip still inside
-        // the window rather than leaving it off-screen.
-        let clamped =
-            dragged_fps_hud_placement(start, press, point(px(4000.0), px(4000.0)), viewport);
-        assert_eq!(clamped.top, 800.0 - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE);
-        assert_eq!(clamped.right, 0.0);
+        // Past an edge it parks against it with the HUD's own centre still
+        // inside the window, where it can always be grabbed again.
+        let clamped = dragged_fps_hud_offset(start, press, point(px(4000.0), px(4000.0)), viewport);
+        assert_eq!(clamped, FpsHudOffset { x: 600.0, y: 400.0 });
 
+        // Upwards the travel ends at the title bar, so a dragged HUD cannot
+        // come to rest over the window controls.
         let clamped =
-            dragged_fps_hud_placement(start, press, point(px(-4000.0), px(-4000.0)), viewport);
-        assert_eq!(clamped.top, 0.0);
-        assert_eq!(clamped.right, 1200.0 - FPS_HUD_MIN_VISIBLE);
+            dragged_fps_hud_offset(start, press, point(px(-4000.0), px(-4000.0)), viewport);
+        assert_eq!(clamped.x, -600.0);
+        assert_eq!(clamped.y, TITLE_BAR_HEIGHT - 400.0);
 
-        // A window shrunk after the HUD was parked in the far corner pulls it
-        // back into view instead of leaving it off-screen.
-        let parked = FpsMonitorPlacement {
-            top: 700.0,
-            right: 1100.0,
-        };
+        // A window shrunk after the HUD was dragged aside pulls it back to a
+        // place it can be grabbed from instead of leaving it off-screen.
+        let parked = FpsHudOffset { x: 550.0, y: 380.0 };
         assert_eq!(
-            fps_hud_placement_within_window(parked, size(px(600.0), px(400.0))),
-            FpsMonitorPlacement {
-                top: 400.0 - TITLE_BAR_HEIGHT - FPS_HUD_MIN_VISIBLE,
-                right: 600.0 - FPS_HUD_MIN_VISIBLE,
-            }
+            fps_hud_offset_within_window(parked, size(px(600.0), px(400.0))),
+            FpsHudOffset { x: 300.0, y: 200.0 }
         );
-        // Growing the window again returns it to the corner that was chosen.
-        assert_eq!(fps_hud_placement_within_window(parked, viewport), parked);
+        // Growing the window again returns it to where it was left.
+        assert_eq!(fps_hud_offset_within_window(parked, viewport), parked);
     }
 
     /// Mirrors the developer HUD's interaction: an inner element whose click
-    /// handler stands in for the monitor's collapse toggle, wrapped in the
-    /// draggable container that moves it.
+    /// handler stands in for the monitor's collapse toggle, inside the
+    /// full-window layer that centres the HUD and the offset that moves it.
     struct FpsHudDragProbe {
-        placement: FpsMonitorPlacement,
+        offset: FpsHudOffset,
         drag: Option<FpsHudDragState>,
         toggles: Rc<Cell<usize>>,
         moves: Rc<Cell<usize>>,
@@ -82000,12 +82024,14 @@ mod tests {
             v_flex()
                 .relative()
                 .size_full()
+                .items_center()
+                .justify_center()
                 .child(
                     div()
                         .id("fps-hud-drag-probe")
-                        .absolute()
-                        .top(px(TITLE_BAR_HEIGHT + self.placement.top))
-                        .right(px(self.placement.right))
+                        .relative()
+                        .left(px(self.offset.x))
+                        .top(px(self.offset.y))
                         .cursor_move()
                         .on_drag(FpsHudDrag, move |_, _, window, cx| {
                             let start_cursor = window.mouse_position();
@@ -82013,10 +82039,7 @@ mod tests {
                             let _ = drag_target.update(cx, |this, cx| {
                                 this.drag = Some(FpsHudDragState {
                                     start_cursor,
-                                    placement: fps_hud_placement_within_window(
-                                        this.placement,
-                                        viewport,
-                                    ),
+                                    offset: fps_hud_offset_within_window(this.offset, viewport),
                                 });
                                 cx.notify();
                             });
@@ -82038,8 +82061,8 @@ mod tests {
                         let Some(drag) = this.drag else {
                             return;
                         };
-                        this.placement = dragged_fps_hud_placement(
-                            drag.placement,
+                        this.offset = dragged_fps_hud_offset(
+                            drag.offset,
                             drag.start_cursor,
                             event.event.position,
                             window.viewport_size(),
@@ -82063,28 +82086,30 @@ mod tests {
         let toggles = Rc::new(Cell::new(0));
         let moves = Rc::new(Cell::new(0));
         let (probe, cx) = cx.add_window_view(|_, _| FpsHudDragProbe {
-            placement: FpsMonitorPlacement::default(),
+            offset: FpsHudOffset::default(),
             drag: None,
             toggles: toggles.clone(),
             moves: moves.clone(),
         });
         let viewport = cx.update(|window, _| window.viewport_size());
-        let grab = point(viewport.width - px(40.0), px(TITLE_BAR_HEIGHT + 24.0));
+        let middle = point(viewport.width / 2.0, viewport.height / 2.0);
 
-        // A plain click reaches the monitor, which is what collapses the HUD.
+        // A plain click reaches the monitor, which is what collapses the HUD —
+        // and it reaches it in the middle of the window, which is where the
+        // layer has to have put a HUD that has not been dragged.
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        cx.simulate_click(grab, Modifiers::none());
+        cx.simulate_click(middle, Modifiers::none());
         assert_eq!(toggles.get(), 1);
         assert_eq!(moves.get(), 0);
 
         // A drag moves the HUD by the pointer delta and must not also reach the
         // monitor's click handler, or every drag would collapse it. The first
         // move arms the drag, so it is the second one that moves anything.
-        let armed = point(viewport.width - px(40.0), px(TITLE_BAR_HEIGHT + 44.0));
-        let drop = point(viewport.width - px(140.0), px(TITLE_BAR_HEIGHT + 64.0));
-        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        let armed = point(middle.x, middle.y + px(20.0));
+        let drop = point(middle.x - px(40.0), middle.y + px(40.0));
+        cx.simulate_mouse_down(middle, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_move(armed, MouseButton::Left, Modifiers::none());
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -82101,14 +82126,11 @@ mod tests {
         assert_eq!(moves.get(), 1);
         assert!(
             cx.update(|_, cx| probe.read(cx).drag.is_none()),
-            "the mouse up has to finish the drag, which is what persists the placement"
+            "the mouse up has to finish the drag"
         );
         assert_eq!(
-            cx.update(|_, cx| probe.read(cx).placement),
-            FpsMonitorPlacement {
-                top: 32.0,
-                right: 112.0,
-            }
+            cx.update(|_, cx| probe.read(cx).offset),
+            FpsHudOffset { x: -40.0, y: 20.0 }
         );
         assert_eq!(toggles.get(), 1, "a drag must not also toggle the monitor");
 

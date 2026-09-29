@@ -1119,62 +1119,13 @@ const fn default_update_prompts_enabled() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct DeveloperUiState {
     /// Overlays the gpui-fps performance HUD on the workbench window.
+    ///
+    /// The HUD's position is deliberately not stored: the workbench opens it in
+    /// the middle of the window every time, so there is no placement to
+    /// restore.
     #[serde(default)]
     pub show_fps_monitor: bool,
-    /// Where the HUD sits once it has been dragged.
-    #[serde(default)]
-    pub fps_monitor_placement: FpsMonitorPlacement,
 }
-
-/// Where the developer FPS HUD sits, as insets from the workbench's top-right
-/// corner in logical pixels.
-///
-/// Insets rather than a position keep the HUD in the corner the user dragged it
-/// to when the window is resized, and make the default readable: the HUD is a
-/// corner overlay, so its natural state is "as close to the top-right as the
-/// margin allows".
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FpsMonitorPlacement {
-    pub top: f32,
-    pub right: f32,
-}
-
-impl Default for FpsMonitorPlacement {
-    fn default() -> Self {
-        Self {
-            top: FPS_MONITOR_DEFAULT_INSET,
-            right: FPS_MONITOR_DEFAULT_INSET,
-        }
-    }
-}
-
-impl FpsMonitorPlacement {
-    /// Keeps a persisted placement inside the window.
-    ///
-    /// The insets are measured from the top-right corner, so a negative or
-    /// non-finite value would park the HUD off-screen with no way to drag it
-    /// back; the upper bound only rejects values no display could produce.
-    pub fn clamped(self) -> Self {
-        Self {
-            top: clamped_fps_monitor_inset(self.top),
-            right: clamped_fps_monitor_inset(self.right),
-        }
-    }
-}
-
-fn clamped_fps_monitor_inset(inset: f32) -> f32 {
-    if !inset.is_finite() {
-        return FPS_MONITOR_DEFAULT_INSET;
-    }
-    inset.clamp(0.0, FPS_MONITOR_MAX_INSET)
-}
-
-/// The margin the HUD starts with, matching the overlay's own default.
-const FPS_MONITOR_DEFAULT_INSET: f32 = 12.0;
-
-/// Far beyond any real viewport; only there to bound a hand-edited state file.
-const FPS_MONITOR_MAX_INSET: f32 = 20_000.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1398,7 +1349,6 @@ impl DesktopUiStateV1 {
             })
             .take(KEYBOARD_SHORTCUT_OVERRIDE_LIMIT)
             .collect();
-        self.developer.fps_monitor_placement = self.developer.fps_monitor_placement.clamped();
         normalize_set(&mut self.session.auto_continue_project_ids, 1_000);
         normalize_set(&mut self.session.auto_continue_paused_session_ids, 1_000);
         self.session.auto_continue_session_overrides =
@@ -2592,70 +2542,30 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("developer");
         let legacy: DesktopUiStateV1 = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.developer.show_fps_monitor);
-        assert_eq!(
-            legacy.developer.fps_monitor_placement,
-            FpsMonitorPlacement::default()
-        );
+
+        // The HUD's placement used to be persisted as `fpsMonitorPlacement`.
+        // The workbench places it now, and a state file that still carries the
+        // old key has to keep loading rather than failing whole.
+        let mut stored: serde_json::Value =
+            serde_json::to_value(DesktopUiStateV1::default()).unwrap();
+        stored["developer"]["showFpsMonitor"] = serde_json::json!(true);
+        stored["developer"]["fpsMonitorPlacement"] =
+            serde_json::json!({ "top": 240.0, "right": 96.0 });
+        let loaded: DesktopUiStateV1 = serde_json::from_value(stored).unwrap();
+        assert!(loaded.developer.show_fps_monitor);
 
         let mut state = DesktopUiStateV1::default();
         state.developer.show_fps_monitor = true;
-        state.developer.fps_monitor_placement = FpsMonitorPlacement {
-            top: 240.0,
-            right: 96.0,
-        };
         state.normalize().unwrap();
         let serialized = serde_json::to_value(&state.developer).unwrap();
         assert_eq!(serialized["showFpsMonitor"], serde_json::json!(true));
-        assert_eq!(serialized["fpsMonitorPlacement"]["top"], 240.0);
-        assert_eq!(serialized["fpsMonitorPlacement"]["right"], 96.0);
+        assert!(
+            serialized.get("fpsMonitorPlacement").is_none(),
+            "the HUD opens in the middle of the window, so no placement is stored"
+        );
         let round_trip: DesktopUiStateV1 =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(round_trip.developer.show_fps_monitor);
-        assert_eq!(
-            round_trip.developer.fps_monitor_placement,
-            state.developer.fps_monitor_placement
-        );
-    }
-
-    #[test]
-    fn fps_monitor_placement_survives_only_insets_a_window_can_show() {
-        let mut state = DesktopUiStateV1::default();
-        state.developer.fps_monitor_placement = FpsMonitorPlacement {
-            top: -40.0,
-            right: -12.0,
-        };
-        state.normalize().unwrap();
-        assert_eq!(
-            state.developer.fps_monitor_placement,
-            FpsMonitorPlacement {
-                top: 0.0,
-                right: 0.0
-            }
-        );
-
-        // A value JSON cannot even carry (NaN/inf) falls back to the default
-        // corner rather than parking the HUD somewhere unreachable.
-        let mut state = DesktopUiStateV1::default();
-        state.developer.fps_monitor_placement = FpsMonitorPlacement {
-            top: f32::INFINITY,
-            right: f32::NAN,
-        };
-        state.normalize().unwrap();
-        assert_eq!(
-            state.developer.fps_monitor_placement,
-            FpsMonitorPlacement::default()
-        );
-
-        let mut state = DesktopUiStateV1::default();
-        state.developer.fps_monitor_placement = FpsMonitorPlacement {
-            top: 1.0e9,
-            right: 1.0e9,
-        };
-        state.normalize().unwrap();
-        assert!(
-            state.developer.fps_monitor_placement.top.is_finite()
-                && state.developer.fps_monitor_placement.right.is_finite()
-        );
     }
 
     #[test]
