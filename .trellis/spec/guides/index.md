@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Architecture Baseline](./architecture-baseline.md) | Cross-platform UI, adaptive shells, remote connectivity, pairing, release acceptance | Any change spanning desktop, Web, mobile, or the remote transport |
 | [ACP Runtime Architecture](./acp-runtime-architecture.md) | ACP as the only online Agent transport, host capabilities, process strategy, parity floor | Touching Agent runtime, ACP adapters, or parity fixtures |
+| [TUI Client Architecture](./tui-client-architecture.md) | Working on `crates/vibex-tui` or any `vibex`/`vibex-server tui`/`vibex-desktop tui` entry point. |
 | [Vibex Reference Materials](./reference-materials.md) | Locate the authoritative in-repo source for a domain | When a spec rule or implementation detail needs evidence |
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("warning=one-time code; it is not stored in plaintext");
         }
         Command::Serve { pairing } => serve(pairing).await?,
+        Command::Tui { local } => tui(local).await?,
         Command::Status => status()?,
         Command::Revoke { device_id, reason } => revoke(&device_id, reason.as_deref())?,
     }
@@ -66,6 +67,12 @@ enum Command {
     Version,
     Serve {
         pairing: bool,
+    },
+    /// Run the character-grid client against this deployment.
+    Tui {
+        /// Start (or reuse) the in-process runtime instead of attaching to an
+        /// already running daemon.
+        local: bool,
     },
     Status,
     PairingCode {
@@ -96,6 +103,9 @@ impl Command {
                 pairing: !args.iter().any(|arg| arg == "--no-pairing"),
             }),
             "status" => Ok(Self::Status),
+            "tui" => Ok(Self::Tui {
+                local: args.iter().any(|arg| arg == "--local"),
+            }),
             "config-check" => Ok(Self::ConfigCheck),
             "pairing-code" => {
                 let permission = option_value(&args, "--permission")
@@ -160,6 +170,39 @@ async fn serve(print_pairing: bool) -> Result<(), Box<dyn Error>> {
     runtime.shutdown().await?;
     println!("runtime=stopped");
     Ok(())
+}
+
+/// Run the character-grid client.
+///
+/// The home lock permits exactly one runtime per home, so the shape is decided
+/// by whether a daemon already owns it:
+///
+/// * no daemon — start one in this process and serve the interface from the
+///   in-process authority seat;
+/// * daemon already running — attach to it over loopback with a locally
+///   bootstrapped device credential.
+///
+/// `--local` forces the first shape and fails loudly when the home is taken,
+/// which is what a container operator scripting `docker exec` wants.
+async fn tui(local: bool) -> Result<(), Box<dyn Error>> {
+    let config = headless_config()?;
+    config_check(&config)?;
+    let request = vibex_client::seat::SeatRequest {
+        connect: None,
+        home: Some(config.home_dir.clone()),
+        prefer_authority: local,
+    };
+    let seat = vibex_client::seat::Seat::resolve(request).await?;
+    let options = vibex_tui::TuiOptions {
+        seat: seat.kind,
+        ..vibex_tui::TuiOptions::default()
+    };
+    let result = vibex_tui::run(seat.facade.clone(), options);
+    seat.shutdown().await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("{}: {}", error.code, error.message).into()),
+    }
 }
 
 async fn wait_for_shutdown_signal() -> Result<(), Box<dyn Error>> {
@@ -470,7 +513,7 @@ fn parse_permission(value: &str) -> Result<RemoteDevicePermissionLevel, VibexErr
 
 fn print_help() {
     println!("vibex-server {VERSION}");
-    println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check]");
+    println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check|tui]");
     println!("  --agent-delegation-mcp                run the Agent delegation MCP stdio sidecar");
     println!("  --browser-mcp                         run the embedded browser MCP stdio sidecar");
     println!("  serve [--no-pairing]                 run the authoritative headless runtime");
@@ -478,6 +521,10 @@ fn print_help() {
     println!("                                       mint a one-time code plus its pairing link");
     println!("  revoke DEVICE_ID [--reason TEXT]     revoke a paired device");
     println!("  config-check                          validate VIBEX_* deployment settings");
+    println!("  tui [--local]                        run the terminal client; attaches to a");
+    println!(
+        "                                        running daemon, or hosts the runtime with --local"
+    );
     println!("Environment: VIBEX_HOME, VIBEX_DB_PATH, VIBEX_BIND_ADDR, VIBEX_DEPLOYMENT_MODE,");
     println!("  VIBEX_PUBLIC_HOST, VIBEX_ALLOWED_HOSTS, VIBEX_ALLOWED_ORIGINS, VIBEX_TLS_MODE,");
     println!("  VIBEX_TLS_CERT_FILE, VIBEX_TLS_KEY_FILE and VIBEX_*_LIMIT settings.");

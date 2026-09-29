@@ -1,0 +1,38 @@
+[package]
+name = "vibex-tui"
+version = "0.1.0-rc.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Character-grid client for the Vibex DesktopRuntime"
+
+# The dependency boundary is a hard architectural rule: this crate is a
+# *client*. It consumes the `vibex-backend` domain traits and never starts,
+# owns, or reaches past the runtime. Keeping GPUI, the database, the browser
+# runtime and the PDF/Office content stack out of the manifest is what makes
+# the TUI linkable without a window server.
+[dependencies]
+crossterm.workspace = true
+qrcode.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-bidi.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+vibex-backend = { path = "../vibex-backend" }
+vibex-core = { path = "../core" }
+vibex-desktop-model = { path = "../desktop-model" }
+vibex-markdown = { path = "../vibex-markdown", default-features = false }
+vibex-terminal-ui = { path = "../vibex-terminal-ui" }
+vibex-ui = { path = "../vibex-ui", default-features = false }
+
+[dev-dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
+tempfile = "3"
+vibex-git = { path = "../git" }

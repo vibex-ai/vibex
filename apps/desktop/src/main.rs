@@ -70,6 +70,51 @@ fn configure_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn configure_allocator() {}
 
+/// Run the terminal client from the desktop binary.
+///
+/// The desktop home is channel-scoped (stable / rc / preview), so the resolver
+/// is given the same home the workbench would use. Without `--local` an already
+/// running desktop is attached to over loopback; with it, this process insists
+/// on owning the runtime and reports the actionable error when it cannot.
+fn run_tui(local: bool) {
+    let mut request = vibex_client::seat::SeatRequest {
+        connect: None,
+        home: None,
+        prefer_authority: local,
+    };
+    if let Some(home) = vibex_client::seat::resolve_home(None).ok() {
+        request.home = Some(home);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("could not start the runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let seat = match runtime.block_on(vibex_client::seat::Seat::resolve(request)) {
+        Ok(seat) => seat,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    let options = vibex_tui::TuiOptions {
+        seat: seat.kind,
+        ..vibex_tui::TuiOptions::default()
+    };
+    let result = vibex_tui::run(seat.facade.clone(), options);
+    runtime.block_on(seat.shutdown());
+    if let Err(error) = result {
+        eprintln!("{}: {}", error.code, error.message);
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     configure_allocator();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
@@ -88,6 +133,15 @@ fn main() {
             eprintln!("Browser MCP sidecar failed: {error}");
             std::process::exit(1);
         }
+        return;
+    }
+    // The character-grid client runs before any GPUI setup: on Linux the
+    // packaged binary is already on PATH, so `vibex-desktop tui` is the
+    // zero-install way to reach the runtime from a shell. On Windows and macOS
+    // the GUI subsystem binary cannot host a console, so the packages ship the
+    // standalone `vibex` client instead.
+    if arguments.first().is_some_and(|argument| argument == "tui") {
+        run_tui(arguments.iter().any(|argument| argument == "--local"));
         return;
     }
     if arguments.iter().any(|argument| argument == "--probe") {
@@ -308,7 +362,7 @@ fn main() {
         [] => LaunchMode::Workbench,
         _ => {
             eprintln!(
-                "usage: vibex-desktop [--probe|--agent-delegation-mcp|--browser-mcp|--code-workbench-fixture <files|diff|markdown>|--native-content-contract <output.json>|--native-content-switch-contract <output.json>|--native-content-document-interaction <pdfium-library> <fixture.pdf> <fixture.docx> <output.json>|--native-content-pdf-controller <pdfium-library> <fixture.pdf> <encrypted-fixture.pdf> <too-many-pages.pdf> <extreme-page.pdf> <oversized-source.pdf> <output.json>|--native-content-pdf-worker-once <pdfium-library> <fixture.pdf> <generation> <page-index> <target-width> <output-directory> <report.json> <none|crash|hang>|--native-content-pdf-worker-supervisor <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-worker-soak <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-workbench <pdfium-library> <fixture.pdf> [output.json]|--native-content-workbench [output.json]|--spike-acp-lifecycle <output.json>|--spike-composer <output.json>|--spike-terminal <output.json>|--spike-pdf <pdfium-library> <fixture.pdf> <output.json> <preview.rgba>]"
+                "usage: vibex-desktop [tui [--local]|--probe|--agent-delegation-mcp|--browser-mcp|--code-workbench-fixture <files|diff|markdown>|--native-content-contract <output.json>|--native-content-switch-contract <output.json>|--native-content-document-interaction <pdfium-library> <fixture.pdf> <fixture.docx> <output.json>|--native-content-pdf-controller <pdfium-library> <fixture.pdf> <encrypted-fixture.pdf> <too-many-pages.pdf> <extreme-page.pdf> <oversized-source.pdf> <output.json>|--native-content-pdf-worker-once <pdfium-library> <fixture.pdf> <generation> <page-index> <target-width> <output-directory> <report.json> <none|crash|hang>|--native-content-pdf-worker-supervisor <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-worker-soak <pdfium-library> <fixture.pdf> <output.json>|--native-content-pdf-workbench <pdfium-library> <fixture.pdf> [output.json]|--native-content-workbench [output.json]|--spike-acp-lifecycle <output.json>|--spike-composer <output.json>|--spike-terminal <output.json>|--spike-pdf <pdfium-library> <fixture.pdf> <output.json> <preview.rgba>]"
             );
             std::process::exit(2);
         }

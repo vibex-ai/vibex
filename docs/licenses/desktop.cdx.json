@@ -809,6 +809,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:approx@0.5.1:c19b7c6f923b580a",
+      "name": "approx",
+      "version": "0.5.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/approx@0.5.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/brendanzab/approx"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:arbitrary@1.4.2:c19b7c6f923b580a",
       "name": "arbitrary",
       "version": "1.4.2",
@@ -3473,6 +3509,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:by_address@1.2.1:c19b7c6f923b580a",
+      "name": "by_address",
+      "version": "1.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/by_address@1.2.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mbrubeck/by_address"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
       "name": "bytemuck",
       "version": "1.25.0",
@@ -3828,6 +3900,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/smithay/calloop-wayland-source"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:castaway@0.2.4:c19b7c6f923b580a",
+      "name": "castaway",
+      "version": "0.2.4",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/castaway@0.2.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sagebind/castaway"
         }
       ]
     },
@@ -4620,6 +4728,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/watchexec/command-group"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:compact_str@0.9.1:c19b7c6f923b580a",
+      "name": "compact_str",
+      "version": "0.9.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/compact_str@0.9.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ParkMyCar/compact_str"
         }
       ]
     },
@@ -5813,6 +5957,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:crossterm@0.29.0:c19b7c6f923b580a",
+      "name": "crossterm",
+      "version": "0.29.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/crossterm@0.29.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossterm-rs/crossterm"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:crossterm_winapi@0.9.1:c19b7c6f923b580a",
+      "name": "crossterm_winapi",
+      "version": "0.9.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/crossterm_winapi@0.9.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossterm-rs/crossterm-winapi"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:crunchy@0.2.4:c19b7c6f923b580a",
       "name": "crunchy",
       "version": "0.2.4",
@@ -6101,6 +6317,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:darling@0.24.1:c19b7c6f923b580a",
+      "name": "darling",
+      "version": "0.24.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/darling@0.24.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:darling_core@0.23.0:c19b7c6f923b580a",
       "name": "darling_core",
       "version": "0.23.0",
@@ -6137,6 +6389,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:darling_core@0.24.1:c19b7c6f923b580a",
+      "name": "darling_core",
+      "version": "0.24.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/darling_core@0.24.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:darling_macro@0.23.0:c19b7c6f923b580a",
       "name": "darling_macro",
       "version": "0.23.0",
@@ -6146,6 +6434,42 @@
         }
       ],
       "purl": "pkg:cargo/darling_macro@0.23.0",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:darling_macro@0.24.1:c19b7c6f923b580a",
+      "name": "darling_macro",
+      "version": "0.24.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/darling_macro@0.24.1",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -13733,6 +14057,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:indoc@2.0.7:c19b7c6f923b580a",
+      "name": "indoc",
+      "version": "2.0.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/indoc@2.0.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/indoc"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:inotify@0.10.2:c19b7c6f923b580a",
       "name": "inotify",
       "version": "0.10.2",
@@ -13836,6 +14196,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:instability@0.3.14:c19b7c6f923b580a",
+      "name": "instability",
+      "version": "0.3.14",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/instability@0.3.14",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/instability"
         }
       ]
     },
@@ -14556,6 +14952,42 @@
         {
           "type": "vcs",
           "url": "https://github.com/callum-oakley/json5-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:kasuari@0.4.12:c19b7c6f923b580a",
+      "name": "kasuari",
+      "version": "0.4.12",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/kasuari@0.4.12",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/kasuari"
         }
       ]
     },
@@ -15389,6 +15821,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:line-clipping@0.3.8:c19b7c6f923b580a",
+      "name": "line-clipping",
+      "version": "0.3.8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/line-clipping@0.3.8",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/line-clipping"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:linebender_resource_handle@0.1.1:c19b7c6f923b580a",
       "name": "linebender_resource_handle",
       "version": "0.1.1",
@@ -15744,6 +16212,42 @@
         {
           "type": "vcs",
           "url": "https://gitlab.com/kornelski/loop9.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:lru@0.18.5:c19b7c6f923b580a",
+      "name": "lru",
+      "version": "0.18.5",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/lru@0.18.5",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jeromefroe/lru-rs.git"
         }
       ]
     },
@@ -19565,6 +20069,114 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:palette@0.7.7:c19b7c6f923b580a",
+      "name": "palette",
+      "version": "0.7.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/palette@0.7.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Ogeon/palette"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:palette_derive@0.7.7:c19b7c6f923b580a",
+      "name": "palette_derive",
+      "version": "0.7.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/palette_derive@0.7.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Ogeon/palette"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:palette_math@0.7.7:c19b7c6f923b580a",
+      "name": "palette_math",
+      "version": "0.7.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/palette_math@0.7.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Ogeon/palette"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:pango@0.18.3:c19b7c6f923b580a",
       "name": "pango",
       "version": "0.18.3",
@@ -22476,6 +23088,150 @@
         {
           "type": "vcs",
           "url": "https://github.com/jeffparsons/rangemap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ratatui@0.30.2:c19b7c6f923b580a",
+      "name": "ratatui",
+      "version": "0.30.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ratatui@0.30.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/ratatui"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ratatui-core@0.1.2:c19b7c6f923b580a",
+      "name": "ratatui-core",
+      "version": "0.1.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ratatui-core@0.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/ratatui"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ratatui-crossterm@0.1.2:c19b7c6f923b580a",
+      "name": "ratatui-crossterm",
+      "version": "0.1.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ratatui-crossterm@0.1.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/ratatui"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:ratatui-widgets@0.3.2:c19b7c6f923b580a",
+      "name": "ratatui-widgets",
+      "version": "0.3.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/ratatui-widgets@0.3.2",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ratatui/ratatui"
         }
       ]
     },
@@ -26081,6 +26837,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:signal-hook@0.3.18:c19b7c6f923b580a",
+      "name": "signal-hook",
+      "version": "0.3.18",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/signal-hook@0.3.18",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "Apache-2.0"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vorner/signal-hook"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:signal-hook@0.4.4:c19b7c6f923b580a",
       "name": "signal-hook",
       "version": "0.4.4",
@@ -26090,6 +26882,42 @@
         }
       ],
       "purl": "pkg:cargo/signal-hook@0.4.4",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vorner/signal-hook"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:signal-hook-mio@0.2.5:c19b7c6f923b580a",
+      "name": "signal-hook-mio",
+      "version": "0.2.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/signal-hook-mio@0.2.5",
       "properties": [
         {
           "name": "vibex:cargo-source",
@@ -31841,6 +32669,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:unicode-truncate@2.0.1:c19b7c6f923b580a",
+      "name": "unicode-truncate",
+      "version": "2.0.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/unicode-truncate@2.0.1",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "MIT"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Aetf/unicode-truncate"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:unicode-vo@0.1.0:c19b7c6f923b580a",
       "name": "unicode-vo",
       "version": "0.1.0",
@@ -32885,6 +33749,42 @@
     },
     {
       "type": "library",
+      "bom-ref": "cargo:vibex-client@0.1.0-rc.7:24cd157ed23fafe9",
+      "name": "vibex-client",
+      "version": "0.1.0-rc.7",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-client@0.1.0-rc.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:apps/tui"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "cargo:vibex-config-switch@0.1.0-rc.7:15ba9694989d1411",
       "name": "vibex-config-switch",
       "version": "0.1.0-rc.7",
@@ -33402,6 +34302,42 @@
         {
           "name": "vibex:cargo-source",
           "value": "path:crates/vibex-terminal-ui"
+        },
+        {
+          "name": "vibex:selected-license",
+          "value": "AGPL-3.0-or-later"
+        },
+        {
+          "name": "vibex:license-policy-status",
+          "value": "approved"
+        },
+        {
+          "name": "vibex:license-evidence",
+          "value": "cargo-manifest"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/vibex-ai/vibex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "cargo:vibex-tui@0.1.0-rc.7:97b7354da06442ef",
+      "name": "vibex-tui",
+      "version": "0.1.0-rc.7",
+      "licenses": [
+        {
+          "expression": "AGPL-3.0-or-later"
+        }
+      ],
+      "purl": "pkg:cargo/vibex-tui@0.1.0-rc.7",
+      "properties": [
+        {
+          "name": "vibex:cargo-source",
+          "value": "path:crates/vibex-tui"
         },
         {
           "name": "vibex:selected-license",
@@ -40838,6 +41774,12 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:approx@0.5.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:num-traits@0.2.19:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:arbitrary@1.4.2:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -41506,6 +42448,10 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:by_address@1.2.1:c19b7c6f923b580a",
+      "dependsOn": []
+    },
+    {
       "ref": "cargo:bytemuck@1.25.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:bytemuck_derive@1.11.0:c19b7c6f923b580a"
@@ -41573,6 +42519,12 @@
         "cargo:rustix@1.1.4:c19b7c6f923b580a",
         "cargo:slab@0.4.12:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:castaway@0.2.4:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:rustversion@1.0.22:c19b7c6f923b580a"
       ]
     },
     {
@@ -41757,6 +42709,17 @@
         "cargo:nix@0.27.1:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:winapi@0.3.9:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:compact_str@0.9.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:castaway@0.2.4:c19b7c6f923b580a",
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:itoa@1.0.18:c19b7c6f923b580a",
+        "cargo:rustversion@1.0.22:c19b7c6f923b580a",
+        "cargo:ryu@1.0.23:c19b7c6f923b580a",
+        "cargo:static_assertions@1.1.0:c19b7c6f923b580a"
       ]
     },
     {
@@ -41999,6 +42962,28 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:crossterm@0.29.0:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:crossterm_winapi@0.9.1:c19b7c6f923b580a",
+        "cargo:derive_more@2.1.1:c19b7c6f923b580a",
+        "cargo:document-features@0.2.12:c19b7c6f923b580a",
+        "cargo:futures-core@0.3.34:c19b7c6f923b580a",
+        "cargo:mio@1.2.1:c19b7c6f923b580a",
+        "cargo:parking_lot@0.12.5:c19b7c6f923b580a",
+        "cargo:rustix@1.1.4:c19b7c6f923b580a",
+        "cargo:signal-hook-mio@0.2.5:c19b7c6f923b580a",
+        "cargo:signal-hook@0.3.18:c19b7c6f923b580a",
+        "cargo:winapi@0.3.9:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:crossterm_winapi@0.9.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:winapi@0.3.9:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:crunchy@0.2.4:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -42055,6 +43040,13 @@
       ]
     },
     {
+      "ref": "cargo:darling@0.24.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:darling_core@0.24.1:c19b7c6f923b580a",
+        "cargo:darling_macro@0.24.1:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:darling_core@0.23.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:ident_case@1.0.1:c19b7c6f923b580a",
@@ -42065,11 +43057,29 @@
       ]
     },
     {
+      "ref": "cargo:darling_core@0.24.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:ident_case@1.0.1:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:strsim@0.11.1:c19b7c6f923b580a",
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:darling_macro@0.23.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:darling_core@0.23.0:c19b7c6f923b580a",
         "cargo:quote@1.0.46:c19b7c6f923b580a",
         "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:darling_macro@0.24.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:darling_core@0.24.1:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
       ]
     },
     {
@@ -43681,7 +44691,11 @@
     },
     {
       "ref": "cargo:hashbrown@0.17.1:c19b7c6f923b580a",
-      "dependsOn": []
+      "dependsOn": [
+        "cargo:allocator-api2@0.2.21:c19b7c6f923b580a",
+        "cargo:equivalent@1.0.2:c19b7c6f923b580a",
+        "cargo:foldhash@0.2.0:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:hashlink@0.10.0:c19b7c6f923b580a",
@@ -44045,6 +45059,12 @@
       ]
     },
     {
+      "ref": "cargo:indoc@2.0.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:rustversion@1.0.22:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:inotify-sys@0.1.8:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:libc@0.2.189:c19b7c6f923b580a"
@@ -44063,6 +45083,16 @@
       "dependsOn": [
         "cargo:block-padding@0.3.3:c19b7c6f923b580a",
         "cargo:generic-array@0.14.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:instability@0.3.14:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:darling@0.24.1:c19b7c6f923b580a",
+        "cargo:indoc@2.0.7:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@3.0.6:c19b7c6f923b580a"
       ]
     },
     {
@@ -44205,6 +45235,14 @@
       "dependsOn": [
         "cargo:serde@1.0.228:c19b7c6f923b580a",
         "cargo:ucd-trie@0.1.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:kasuari@0.4.12:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:hashbrown@0.16.1:c19b7c6f923b580a",
+        "cargo:portable-atomic@1.13.1:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a"
       ]
     },
     {
@@ -44362,6 +45400,12 @@
       ]
     },
     {
+      "ref": "cargo:line-clipping@0.3.8:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:linebender_resource_handle@0.1.1:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -44414,6 +45458,12 @@
     {
       "ref": "cargo:lru-slab@0.1.2:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:lru@0.18.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:hashbrown@0.17.1:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:lsp-types@0.97.0:c19b7c6f923b580a",
@@ -45266,6 +46316,30 @@
       ]
     },
     {
+      "ref": "cargo:palette@0.7.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:approx@0.5.1:c19b7c6f923b580a",
+        "cargo:libm@0.2.16:c19b7c6f923b580a",
+        "cargo:palette_derive@0.7.7:c19b7c6f923b580a",
+        "cargo:palette_math@0.7.7:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:palette_derive@0.7.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:by_address@1.2.1:c19b7c6f923b580a",
+        "cargo:proc-macro2@1.0.106:c19b7c6f923b580a",
+        "cargo:quote@1.0.46:c19b7c6f923b580a",
+        "cargo:syn@2.0.118:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:palette_math@0.7.7:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libm@0.2.16:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:pango-sys@0.18.0:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:glib-sys@0.18.1:c19b7c6f923b580a",
@@ -45838,6 +46912,60 @@
     {
       "ref": "cargo:rangemap@1.7.1:c19b7c6f923b580a",
       "dependsOn": []
+    },
+    {
+      "ref": "cargo:ratatui-core@0.1.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:compact_str@0.9.1:c19b7c6f923b580a",
+        "cargo:hashbrown@0.17.1:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:kasuari@0.4.12:c19b7c6f923b580a",
+        "cargo:lru@0.18.5:c19b7c6f923b580a",
+        "cargo:palette@0.7.7:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:strum@0.28.0:c19b7c6f923b580a",
+        "cargo:thiserror@2.0.18:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:unicode-truncate@2.0.1:c19b7c6f923b580a",
+        "cargo:unicode-width@0.2.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ratatui-crossterm@0.1.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:cfg-if@1.0.4:c19b7c6f923b580a",
+        "cargo:crossterm@0.29.0:c19b7c6f923b580a",
+        "cargo:instability@0.3.14:c19b7c6f923b580a",
+        "cargo:ratatui-core@0.1.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ratatui-widgets@0.3.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:bitflags@2.13.0:c19b7c6f923b580a",
+        "cargo:hashbrown@0.17.1:c19b7c6f923b580a",
+        "cargo:indoc@2.0.7:c19b7c6f923b580a",
+        "cargo:instability@0.3.14:c19b7c6f923b580a",
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:line-clipping@0.3.8:c19b7c6f923b580a",
+        "cargo:ratatui-core@0.1.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:strum@0.28.0:c19b7c6f923b580a",
+        "cargo:time@0.3.55:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:unicode-width@0.2.2:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:ratatui@0.30.2:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:instability@0.3.14:c19b7c6f923b580a",
+        "cargo:ratatui-core@0.1.2:c19b7c6f923b580a",
+        "cargo:ratatui-crossterm@0.1.2:c19b7c6f923b580a",
+        "cargo:ratatui-widgets@0.3.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a"
+      ]
     },
     {
       "ref": "cargo:rav1e@0.8.1:c19b7c6f923b580a",
@@ -46694,10 +47822,25 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:signal-hook-mio@0.2.5:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:mio@1.2.1:c19b7c6f923b580a",
+        "cargo:signal-hook@0.3.18:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a",
       "dependsOn": [
         "cargo:errno@0.3.14:c19b7c6f923b580a",
         "cargo:libc@0.2.189:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:signal-hook@0.3.18:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:libc@0.2.189:c19b7c6f923b580a",
+        "cargo:signal-hook-registry@1.4.8:c19b7c6f923b580a"
       ]
     },
     {
@@ -47823,6 +48966,14 @@
       "dependsOn": []
     },
     {
+      "ref": "cargo:unicode-truncate@2.0.1:c19b7c6f923b580a",
+      "dependsOn": [
+        "cargo:itertools@0.14.0:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:unicode-width@0.2.2:c19b7c6f923b580a"
+      ]
+    },
+    {
       "ref": "cargo:unicode-vo@0.1.0:c19b7c6f923b580a",
       "dependsOn": []
     },
@@ -48099,6 +49250,23 @@
       ]
     },
     {
+      "ref": "cargo:vibex-client@0.1.0-rc.7:24cd157ed23fafe9",
+      "dependsOn": [
+        "cargo:anyhow@1.0.102:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:vibex-backend@0.1.0-rc.7:14559522eff35735",
+        "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
+        "cargo:vibex-db@0.1.0-rc.7:b0d5d96e1f6cacc2",
+        "cargo:vibex-desktop-runtime@0.1.0-rc.7:7b92bf06aa544433",
+        "cargo:vibex-remote-client@0.1.0-rc.7:fbf177affd133cad",
+        "cargo:vibex-remote@0.1.0-rc.7:b2402acf3d0333d8",
+        "cargo:vibex-tui@0.1.0-rc.7:97b7354da06442ef",
+        "cargo:vibex-ui@0.1.0-rc.7:5b03b27578a01810"
+      ]
+    },
+    {
       "ref": "cargo:vibex-config-switch@0.1.0-rc.7:15ba9694989d1411",
       "dependsOn": [
         "cargo:dirs@6.0.0:c19b7c6f923b580a",
@@ -48253,6 +49421,7 @@
         "cargo:vibex-app-update@0.1.0-rc.7:f60e76a96d343114",
         "cargo:vibex-backend@0.1.0-rc.7:14559522eff35735",
         "cargo:vibex-browser@0.1.0-rc.7:df2965b12b4b9031",
+        "cargo:vibex-client@0.1.0-rc.7:24cd157ed23fafe9",
         "cargo:vibex-config-switch@0.1.0-rc.7:15ba9694989d1411",
         "cargo:vibex-content@0.1.0-rc.7:f936269d77d1b44a",
         "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
@@ -48261,6 +49430,7 @@
         "cargo:vibex-markdown@0.1.0-rc.7:d874bdc43e124bf4",
         "cargo:vibex-remote-client@0.1.0-rc.7:fbf177affd133cad",
         "cargo:vibex-terminal@0.1.0-rc.7:73363de7836b4dd0",
+        "cargo:vibex-tui@0.1.0-rc.7:97b7354da06442ef",
         "cargo:vibex-ui@0.1.0-rc.7:5b03b27578a01810",
         "font:vibex-desktop-ibm-plex-sans:550b0b7d6dee90b4",
         "font:vibex-desktop-lilex:8e69f85c04197d91",
@@ -48424,6 +49594,28 @@
         "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
         "cargo:vibex-terminal-ui@0.1.0-rc.7:81e25774d4aead5f",
         "cargo:xpty@0.3.6:c19b7c6f923b580a"
+      ]
+    },
+    {
+      "ref": "cargo:vibex-tui@0.1.0-rc.7:97b7354da06442ef",
+      "dependsOn": [
+        "cargo:crossterm@0.29.0:c19b7c6f923b580a",
+        "cargo:qrcode@0.14.1:c19b7c6f923b580a",
+        "cargo:ratatui@0.30.2:c19b7c6f923b580a",
+        "cargo:serde@1.0.228:c19b7c6f923b580a",
+        "cargo:serde_json@1.0.150:c19b7c6f923b580a",
+        "cargo:sys-locale@0.3.2:c19b7c6f923b580a",
+        "cargo:tokio@1.52.3:c19b7c6f923b580a",
+        "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:unicode-bidi@0.3.18:c19b7c6f923b580a",
+        "cargo:unicode-segmentation@1.13.3:c19b7c6f923b580a",
+        "cargo:unicode-width@0.2.2:c19b7c6f923b580a",
+        "cargo:vibex-backend@0.1.0-rc.7:14559522eff35735",
+        "cargo:vibex-core@0.1.0-rc.7:a1f32ad3e304847a",
+        "cargo:vibex-desktop-model@0.1.0-rc.7:3eccb8226f5ee757",
+        "cargo:vibex-markdown@0.1.0-rc.7:d874bdc43e124bf4",
+        "cargo:vibex-terminal-ui@0.1.0-rc.7:81e25774d4aead5f",
+        "cargo:vibex-ui@0.1.0-rc.7:5b03b27578a01810"
       ]
     },
     {

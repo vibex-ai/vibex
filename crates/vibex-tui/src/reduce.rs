@@ -1,0 +1,2083 @@
+//! `App::perform`: the pure intent → effect reducer.
+//!
+//! Nothing here touches the terminal, the network, or the filesystem. Every
+//! asynchronous consequence is expressed as an [`Effect`] value, which is the
+//! property that lets the whole interaction model be tested by driving intents
+//! and asserting on state.
+
+use vibex_backend::{BackendOperation, MutationRequest};
+use vibex_core::{
+    AgentSessionState, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue,
+    ElicitationResolution, ElicitationResolutionAction, ForkAgentSessionRequest,
+    PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    SteerAgentMessageRequest, WorkspaceMode,
+};
+
+use crate::action::Intent;
+use crate::app::{
+    App, Availability, Effect, Focus, ManagementRow, Overlay, Page, PromptField, RecoveryAction,
+    SettingRow, Toast,
+};
+use crate::composer::{CompletionMenu, CompletionTrigger};
+use crate::keymap::Scope;
+use crate::theme::GlyphMode;
+use crate::view::block_detail_text;
+
+/// What an intent produced, for tests and for the event loop.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    pub effects: Vec<Effect>,
+    /// Set when the intent changed something the renderer must repaint.
+    pub dirty: bool,
+}
+
+impl Outcome {
+    fn effects(effects: Vec<Effect>) -> Self {
+        Self {
+            effects,
+            dirty: true,
+        }
+    }
+
+    fn quiet() -> Self {
+        Self::default()
+    }
+}
+
+/// The first response option matching `response`, falling back to the first
+/// option the request actually advertised.
+fn response_for(
+    options: &[vibex_core::PermissionResponseOption],
+    response: PermissionResponseKind,
+) -> Option<PermissionResponseKind> {
+    options
+        .iter()
+        .find(|option| option.response == response)
+        .or_else(|| options.first())
+        .map(|option| option.response)
+}
+
+impl App {
+    /// Apply one intent.
+    pub fn perform(&mut self, intent: Intent) -> Outcome {
+        // An overlay swallows most intents; the overlay's own intents and the
+        // global escape hatches still apply.
+        if self.overlay.is_some() {
+            return self.perform_overlay(intent);
+        }
+        if self.filtering {
+            return self.perform_filter(intent);
+        }
+
+        if let Some(reason) = self.unavailable_reason(intent) {
+            self.toast(Toast::warning(reason));
+            return Outcome::quiet();
+        }
+
+        match intent {
+            // ---- global -------------------------------------------------
+            Intent::OpenCommandPalette => {
+                self.overlay = Some(Overlay::Palette {
+                    query: String::new(),
+                    selected: 0,
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::ToggleHelp => {
+                self.overlay = Some(Overlay::Help {
+                    scroll: 0,
+                    query: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::OpenSettings => {
+                self.select_global(vibex_ui::shell::GlobalDestination::Settings);
+                Outcome::effects(vec![])
+            }
+            Intent::RequestQuit => self.confirm_quit(),
+            Intent::Back => self.go_back(),
+            Intent::FocusNext => {
+                self.focus = self.focus.next();
+                if self.focus == Focus::Composer {
+                    self.page = Page::Agent;
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::FocusPrevious => {
+                self.focus = self.focus.previous();
+                Outcome::effects(vec![])
+            }
+            Intent::Refresh => self.refresh_current_page(),
+            Intent::ContextualCancel => self.contextual_cancel(),
+            Intent::GotoSessions => {
+                self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
+                Outcome::effects(vec![Effect::ListSessions {
+                    include_archived: self.show_archived,
+                }])
+            }
+            Intent::GotoManagement => {
+                self.select_global(vibex_ui::shell::GlobalDestination::Management);
+                Outcome::effects(vec![])
+            }
+            Intent::GotoUsage => {
+                self.page = Page::Usage;
+                self.navigation.level = vibex_ui::shell::NavigationLevel::Global;
+                Outcome::effects(vec![Effect::LoadUsage])
+            }
+            Intent::ToggleSidebar => {
+                self.toggle_sidebar_collapsed();
+                Outcome::effects(vec![])
+            }
+            Intent::ReloadKeymap => {
+                match crate::keymap::Keymap::user_path() {
+                    Some(path) => {
+                        self.keymap = crate::keymap::Keymap::load(&path);
+                        if self.keymap.warnings.is_empty() {
+                            let message = crate::locale::Strings::with_locale(self.settings.locale)
+                                .settings_keymap_reloaded()
+                                .to_string();
+                            self.toast(Toast::success(message));
+                        } else {
+                            let message = crate::locale::Strings::with_locale(self.settings.locale)
+                                .settings_keymap_error()
+                                .to_string();
+                            self.toast(Toast::warning(format!(
+                                "{message}: {}",
+                                self.keymap.warnings.join("; ")
+                            )));
+                        }
+                    }
+                    None => self.toast(Toast::warning("no home directory for tui-keys.toml")),
+                }
+                Outcome::effects(vec![])
+            }
+
+            // ---- selection motion ----------------------------------------
+            Intent::SelectPrevious => self.move_selection(-1),
+            Intent::SelectNext => self.move_selection(1),
+            Intent::ScrollPageUp => {
+                self.scroll_by(-1, true);
+                Outcome::effects(vec![])
+            }
+            Intent::ScrollPageDown => {
+                self.scroll_by(1, true);
+                Outcome::effects(vec![])
+            }
+            Intent::ScrollHalfPageUp => {
+                self.scroll_by(-1, false);
+                Outcome::effects(vec![])
+            }
+            Intent::ScrollHalfPageDown => {
+                self.scroll_by(1, false);
+                Outcome::effects(vec![])
+            }
+            Intent::ScrollToTop => {
+                self.scroll.follow = false;
+                self.scroll.offset = 0;
+                Outcome::effects(vec![])
+            }
+            Intent::ScrollToBottom => {
+                self.scroll.follow = true;
+                Outcome::effects(vec![])
+            }
+            Intent::ShowDetails => {
+                self.focus = Focus::Details;
+                Outcome::effects(vec![])
+            }
+            Intent::BeginFilter => {
+                self.filtering = true;
+                self.filter.clear();
+                Outcome::effects(vec![])
+            }
+            Intent::ClearFilter => {
+                self.filter.clear();
+                self.filtering = false;
+                Outcome::effects(vec![])
+            }
+
+            // ---- sessions -------------------------------------------------
+            Intent::OpenSelectedSession => {
+                let rows = self.sidebar_rows();
+                let index = self.selection_for(Scope::Sessions);
+                let Some(row) = rows.get(index) else {
+                    return Outcome::quiet();
+                };
+                let Some(session_id) = row.session_id.clone() else {
+                    // A project header toggles instead of opening.
+                    self.toggle_sidebar_collapsed_for(&row.project_id);
+                    return Outcome::effects(vec![]);
+                };
+                self.open_session(session_id.clone());
+                Outcome::effects(vec![Effect::OpenSession { session_id }])
+            }
+            Intent::EnterSession => {
+                let outcome = self.perform(Intent::OpenSelectedSession);
+                if !outcome.effects.is_empty() {
+                    self.select_session_destination(vibex_ui::shell::SessionDestination::Agent);
+                }
+                outcome
+            }
+            Intent::NewSession => self.begin_new_session(),
+            Intent::BeginRenameSession => self.begin_rename_session(),
+            Intent::ForkSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                let message = format!(
+                    "{} — {}",
+                    self.strings.session_fork(),
+                    self.strings.confirm()
+                );
+                self.toast(Toast::info(message));
+                Outcome::effects(vec![Effect::ForkSession { session_id }])
+            }
+            Intent::ArchiveSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                self.overlay = Some(Overlay::Confirm {
+                    title: self.strings.session_archive().to_string(),
+                    body: self.strings.session_confirm_archive().to_string(),
+                    confirm: Intent::ArchiveSession,
+                });
+                self.set_selection(Scope::Overlay, 0);
+                let _ = session_id;
+                Outcome::effects(vec![])
+            }
+            Intent::DeleteSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                self.overlay = Some(Overlay::Confirm {
+                    title: self.strings.session_delete().to_string(),
+                    body: self.strings.session_confirm_delete().to_string(),
+                    confirm: Intent::DeleteSession,
+                });
+                self.set_selection(Scope::Overlay, 0);
+                let _ = session_id;
+                Outcome::effects(vec![])
+            }
+            Intent::ToggleShowArchived => {
+                self.show_archived = !self.show_archived;
+                Outcome::effects(vec![Effect::ListSessions {
+                    include_archived: self.show_archived,
+                }])
+            }
+            Intent::SwitchWorkspace => {
+                self.page = Page::Sessions;
+                self.toast(Toast::info(self.strings.workspace_pick().to_string()));
+                Outcome::effects(vec![Effect::ListWorkspaces])
+            }
+            Intent::OpenWorkspaceBrowser => {
+                self.toast(Toast::info(self.strings.workspace_browse().to_string()));
+                Outcome::effects(vec![Effect::BrowseDirectories { path: None }])
+            }
+            Intent::WorkspaceBrowseUp => {
+                let parent = self
+                    .workspace_browse
+                    .as_ref()
+                    .and_then(|listing| listing.parent.clone());
+                let Some(parent) = parent else {
+                    self.toast(Toast::warning(self.strings.workspace_empty().to_string()));
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::BrowseDirectories { path: Some(parent) }])
+            }
+            Intent::WorkspaceBrowseSelect => {
+                let Some(listing) = self.workspace_browse.as_ref() else {
+                    return Outcome::quiet();
+                };
+                let index = self.selection_for(Scope::Sessions);
+                let Some(entry) = listing.entries.get(index) else {
+                    return Outcome::quiet();
+                };
+                let path = entry.path.clone();
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.session_new().to_string(),
+                    field: PromptField::NewSessionTitle,
+                    value: String::new(),
+                });
+                self.workspace_path = Some(path);
+                Outcome::effects(vec![])
+            }
+
+            // ---- agent transcript ----------------------------------------
+            Intent::FocusComposer => {
+                self.page = Page::Agent;
+                self.focus = Focus::Composer;
+                Outcome::effects(vec![])
+            }
+            Intent::ContinueTurn => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                if !self.session_can_continue() {
+                    self.toast(Toast::warning(
+                        self.strings.toast_action_unavailable().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                Outcome::effects(vec![Effect::ContinueTurn { session_id }])
+            }
+            Intent::ToggleBlockExpanded => {
+                let index = self.selection_for(Scope::Agent);
+                if !self.transcript.toggle_block(index) {
+                    self.toast(Toast::info(
+                        self.strings.toast_action_unavailable().to_string(),
+                    ));
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::ToggleAllBlocksExpanded => {
+                let expand = !self.transcript.all_expanded();
+                self.transcript.toggle_all(expand);
+                Outcome::effects(vec![])
+            }
+            Intent::ToggleReasoningExpanded => {
+                // Reasoning blocks are the collapsible ones the desktop folds
+                // by default; toggling them all is the whole-body equivalent.
+                for index in 0..self.transcript.len() {
+                    let is_reasoning = self.transcript.block(index).is_some_and(|block| {
+                        block.kind == vibex_desktop_model::TimelineRowKind::Reasoning
+                    });
+                    if is_reasoning {
+                        self.transcript.toggle_block(index);
+                    }
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::CopyBlockBody => {
+                let index = self.selection_for(Scope::Agent);
+                match self.transcript.block_text(index) {
+                    Some(text) => {
+                        let message = self.strings.copied().to_string();
+                        self.toast(Toast::success(message));
+                        Outcome::effects(vec![Effect::Clipboard { text }])
+                    }
+                    None => Outcome::quiet(),
+                }
+            }
+            Intent::CopyBlockMetadata => {
+                let index = self.selection_for(Scope::Agent);
+                match self.transcript.block_metadata(index) {
+                    Some(text) => {
+                        let message = self.strings.copied().to_string();
+                        self.toast(Toast::success(message));
+                        Outcome::effects(vec![Effect::Clipboard { text }])
+                    }
+                    None => Outcome::quiet(),
+                }
+            }
+            Intent::OpenBlockDetails => {
+                let index = self.selection_for(Scope::Agent);
+                match block_detail_text(&mut self.transcript, index) {
+                    Some((title, body)) => {
+                        self.overlay = Some(Overlay::TextView {
+                            title,
+                            body,
+                            scroll: 0,
+                        });
+                        Outcome::effects(vec![])
+                    }
+                    None => Outcome::quiet(),
+                }
+            }
+            Intent::PreviousPanel => {
+                self.cycle_session_destination(false);
+                Outcome::effects(vec![])
+            }
+            Intent::NextPanel => {
+                self.cycle_session_destination(true);
+                Outcome::effects(vec![])
+            }
+            Intent::OpenChanges => {
+                self.select_session_destination(vibex_ui::shell::SessionDestination::Changes);
+                self.load_changes()
+            }
+            Intent::OpenFiles => {
+                self.select_session_destination(vibex_ui::shell::SessionDestination::Files);
+                self.load_files()
+            }
+            Intent::SwitchAgentRuntime => self.open_runtime_picker(),
+            Intent::ProbeAgentRuntime => match self.active_session() {
+                Some(session) => {
+                    let request = vibex_core::AgentRuntimeOptionProbeRequest {
+                        agent_id: session.agent_id.clone(),
+                    };
+                    Outcome::effects(vec![Effect::ProbeAgentRuntime { request }])
+                }
+                None => Outcome::quiet(),
+            },
+
+            // ---- composer -------------------------------------------------
+            Intent::SubmitComposer => self.submit_composer(),
+            Intent::InsertNewline => {
+                self.composer.insert_char('\n');
+                Outcome::effects(vec![])
+            }
+            Intent::ToggleMultiline => {
+                self.composer.insert_char('\n');
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerHistoryPrevious => {
+                let current = self.composer.text().to_string();
+                if let Some(entry) = self.history.previous(&current) {
+                    self.composer.set_text(entry);
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerHistoryNext => {
+                if let Some(entry) = self.history.next() {
+                    self.composer.set_text(entry);
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::EditComposerExternally => {
+                let body = self.composer.text().to_string();
+                Outcome::effects(vec![Effect::EditExternally {
+                    title: self.strings.composer_placeholder().to_string(),
+                    body,
+                }])
+            }
+            Intent::BackgroundRunningCommand => {
+                self.toast(Toast::info(
+                    self.strings.toast_action_unavailable().to_string(),
+                ));
+                Outcome::quiet()
+            }
+            Intent::SteerRunningTurn => self.steer_composer(),
+            Intent::CompletionNext => {
+                self.move_completion(1);
+                Outcome::effects(vec![])
+            }
+            Intent::CompletionPrevious => {
+                self.move_completion(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::CompletionAccept => self.accept_completion(),
+            Intent::CompletionCancel => {
+                self.completion = None;
+                Outcome::effects(vec![])
+            }
+            Intent::DeleteWordBefore => {
+                self.composer.delete_word_before();
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerLineStart => {
+                self.composer.move_line_start();
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerLineEnd => {
+                self.composer.move_line_end();
+                Outcome::effects(vec![])
+            }
+
+            // ---- approval and elicitation ---------------------------------
+            Intent::ApprovalApprove | Intent::ApprovalDeny | Intent::ApprovalAlways => {
+                self.open_approval();
+                self.perform_overlay(intent)
+            }
+            Intent::ElicitationSubmit => {
+                self.open_elicitation();
+                Outcome::effects(vec![])
+            }
+            Intent::ApprovalFocusNext => {
+                self.open_approval();
+                self.perform_overlay(intent)
+            }
+            Intent::ElicitationFieldNext => {
+                self.open_elicitation();
+                self.perform_overlay(intent)
+            }
+            Intent::ElicitationFieldPrevious => {
+                self.open_elicitation();
+                self.perform_overlay(intent)
+            }
+            Intent::OverlayToggleValue => {
+                self.open_elicitation();
+                Outcome::effects(vec![])
+            }
+            Intent::CloseOverlay
+            | Intent::ConfirmOverlay
+            | Intent::PaletteRun
+            | Intent::OverlayNextField
+            | Intent::OverlayPreviousField => Outcome::quiet(),
+
+            // ---- management ------------------------------------------------
+            Intent::OpenManagementSection => {
+                let index = self.selection_for(Scope::Management);
+                let Some(row) = ManagementRow::ALL.get(index) else {
+                    return Outcome::quiet();
+                };
+                self.navigate_to(row.page());
+                self.refresh_current_page()
+            }
+            Intent::ReloadManagement => self.refresh_current_page(),
+            Intent::ToggleSelectedEntry => self.toggle_selected_entry(),
+            Intent::EditSelectedEntry => self.begin_edit_entry(),
+            Intent::InstallOrUpdateAgent => self.install_selected_agent(false),
+            Intent::UninstallAgent => self.install_selected_agent(true),
+            Intent::AgentAuthMenu => self.list_agent_auth(),
+            Intent::AgentAuthRefresh => self.list_agent_auth(),
+            Intent::AgentLogout => self.logout_selected_agent(),
+            Intent::ActivateProviderProfile => self.activate_provider_profile(),
+            Intent::EditProviderProfile => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.management_providers().to_string(),
+                    field: PromptField::ProviderEndpoint,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::EditProviderProjection => {
+                self.toast(Toast::info(
+                    self.strings.management_form_essentials().to_string(),
+                ));
+                Outcome::quiet()
+            }
+            Intent::EditProviderSecret => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.management_providers().to_string(),
+                    field: PromptField::ProviderSecret,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::TestProviderProfile => self.test_provider_profile(),
+            Intent::FetchProviderModels => self.fetch_provider_models(),
+            Intent::ProviderHealth => Outcome::effects(vec![Effect::ListHealth]),
+            Intent::CreatePairingCode => {
+                let availability = self.availability(BackendOperation::DevicePairing);
+                match availability {
+                    Availability::Available => Outcome::effects(vec![Effect::CreatePairingOffer]),
+                    Availability::RequiresPermission => {
+                        self.toast(Toast::warning(
+                            self.strings.permission_required_for().to_string(),
+                        ));
+                        Outcome::quiet()
+                    }
+                    _ => {
+                        self.toast(Toast::warning(
+                            self.strings.toast_action_unavailable().to_string(),
+                        ));
+                        Outcome::quiet()
+                    }
+                }
+            }
+            Intent::RevokeSelectedDevice => self.begin_revoke_device(),
+            Intent::OpenDeviceAudit => Outcome::effects(vec![Effect::ListAudit]),
+
+            // ---- files / changes -------------------------------------------
+            Intent::OpenSelectedFile => {
+                let index = self.selection_for(Scope::Files);
+                match self.file_rows.get(index).cloned() {
+                    Some(entry) if entry.kind == vibex_core::FileEntryKind::File => {
+                        let workspace_id = self.active_workspace_id();
+                        match workspace_id {
+                            Some(workspace_id) => Outcome::effects(vec![Effect::ReadFile {
+                                workspace_id,
+                                path: entry.path,
+                            }]),
+                            None => Outcome::quiet(),
+                        }
+                    }
+                    _ => Outcome::quiet(),
+                }
+            }
+            Intent::EditSelectedFile => {
+                let index = self.selection_for(Scope::Files);
+                match self.file_rows.get(index).cloned() {
+                    Some(entry) if entry.kind == vibex_core::FileEntryKind::File => {
+                        Outcome::effects(vec![Effect::EditExternally {
+                            title: entry.name.clone(),
+                            body: entry.path.clone(),
+                        }])
+                    }
+                    _ => Outcome::quiet(),
+                }
+            }
+            Intent::ToggleFileTreeExpanded => Outcome::effects(vec![]),
+            Intent::FileSearch => {
+                self.filtering = true;
+                Outcome::effects(vec![])
+            }
+            Intent::ShowDiff => {
+                let index = self.selection_for(Scope::Changes);
+                let (Some(status), Some(workspace_id)) =
+                    (self.git_status.as_ref(), self.active_workspace_id())
+                else {
+                    return Outcome::quiet();
+                };
+                let Some(entry) = status.changes.get(index) else {
+                    return Outcome::quiet();
+                };
+                let path = entry.path.clone();
+                Outcome::effects(vec![Effect::LoadGitDiff { workspace_id, path }])
+            }
+            Intent::GitStageSelected => self.git_stage(true),
+            Intent::GitUnstageSelected => self.git_stage(false),
+            Intent::GitCommit => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.transcript_git().to_string(),
+                    field: PromptField::CommitMessage,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::GitRevert | Intent::GitHistory | Intent::GitBranches => {
+                self.toast(Toast::info(
+                    self.strings.toast_action_unavailable().to_string(),
+                ));
+                Outcome::quiet()
+            }
+            Intent::WorktreeMenu | Intent::WorktreeCreate | Intent::WorktreePreflight => {
+                self.toast(Toast::info(
+                    self.strings.toast_action_unavailable().to_string(),
+                ));
+                Outcome::quiet()
+            }
+
+            // ---- terminal ---------------------------------------------------
+            Intent::NewTerminal | Intent::CloseTerminal | Intent::TerminalToggleFollow => {
+                // The embedded terminal pane is an M4 feature; the terminal
+                // page explains that rather than pretending to work.
+                self.toast(Toast::info(
+                    self.strings.toast_action_unavailable().to_string(),
+                ));
+                Outcome::quiet()
+            }
+
+            // ---- usage -------------------------------------------------------
+            Intent::UsageSessionScope => {
+                self.usage_scope_session = !self.usage_scope_session;
+                Outcome::effects(vec![Effect::LoadUsage])
+            }
+
+            // ---- recovery ----------------------------------------------------
+            Intent::ActivateRecoveryAction => {
+                let index = self.selection_for(Scope::Recovery);
+                match RecoveryAction::ALL.get(index) {
+                    Some(RecoveryAction::Diagnostics) => self.perform(Intent::ExportDiagnostics),
+                    Some(RecoveryAction::BackupCreate) => self.perform(Intent::CreateBackup),
+                    Some(RecoveryAction::BackupInspect) => self.perform(Intent::InspectBackup),
+                    Some(RecoveryAction::BackupRestore) => self.perform(Intent::RestoreBackup),
+                    None => Outcome::quiet(),
+                }
+            }
+            Intent::ExportDiagnostics => self.guard(
+                BackendOperation::RecoveryDiagnosticsExport,
+                Effect::ExportDiagnostics,
+            ),
+            Intent::CreateBackup => {
+                self.guard(BackendOperation::RecoveryBackupCreate, Effect::CreateBackup)
+            }
+            Intent::InspectBackup => self.guard(
+                BackendOperation::RecoveryBackupInspect,
+                Effect::InspectBackup,
+            ),
+            Intent::RestoreBackup => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.recovery_backup_restore().to_string(),
+                    field: PromptField::RestoreBackupId,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
+            }
+
+            // ---- settings ----------------------------------------------------
+            Intent::ActivateSetting => self.activate_setting(),
+            Intent::SettingPrevious => self.step_setting(-1),
+            Intent::SettingNext => self.step_setting(1),
+        }
+    }
+
+    fn guard(&mut self, operation: BackendOperation, effect: Effect) -> Outcome {
+        match self.availability(operation) {
+            Availability::Available => Outcome::effects(vec![effect]),
+            Availability::RequiresPermission => {
+                self.toast(Toast::warning(
+                    self.strings.permission_required_for().to_string(),
+                ));
+                Outcome::quiet()
+            }
+            Availability::Offline => {
+                self.toast(Toast::warning(self.strings.toast_offline().to_string()));
+                Outcome::quiet()
+            }
+            Availability::Unsupported => {
+                self.toast(Toast::warning(
+                    self.strings.toast_action_unavailable().to_string(),
+                ));
+                Outcome::quiet()
+            }
+        }
+    }
+
+    // ---- overlay dispatch -----------------------------------------------
+
+    fn perform_overlay(&mut self, intent: Intent) -> Outcome {
+        // Global escape hatches still work with an overlay open.
+        match intent {
+            Intent::CloseOverlay | Intent::Back => {
+                self.overlay = None;
+                return Outcome::effects(vec![]);
+            }
+            Intent::RequestQuit => return self.confirm_quit(),
+            _ => {}
+        }
+        let Some(overlay) = self.overlay.clone() else {
+            return Outcome::quiet();
+        };
+        match overlay {
+            Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
+            Overlay::Help { scroll, query: _ } => match intent {
+                Intent::ScrollPageUp | Intent::SelectPrevious => {
+                    self.set_overlay_scroll(scroll.saturating_sub(10));
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollPageDown | Intent::SelectNext => {
+                    self.set_overlay_scroll(scroll + 10);
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollToTop => {
+                    self.set_overlay_scroll(0);
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollToBottom => {
+                    self.set_overlay_scroll(usize::MAX);
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::Confirm { confirm, .. } => match intent {
+                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                    self.overlay = None;
+                    let mut outcome = self.perform_confirm(confirm);
+                    outcome.dirty = true;
+                    outcome
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::Prompt {
+                field,
+                value,
+                title,
+            } => match intent {
+                Intent::ConfirmOverlay => {
+                    self.overlay = None;
+                    let mut outcome = self.submit_prompt(field, value, title);
+                    outcome.dirty = true;
+                    outcome
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::Approval { selected } => match intent {
+                Intent::ApprovalApprove
+                | Intent::ApprovalDeny
+                | Intent::ApprovalAlways
+                | Intent::ConfirmOverlay => {
+                    let kind = match intent {
+                        Intent::ApprovalDeny => PermissionResponseKind::Deny,
+                        Intent::ApprovalAlways => PermissionResponseKind::AlwaysAllowForSession,
+                        _ => PermissionResponseKind::Approve,
+                    };
+                    self.overlay = None;
+                    self.resolve_approval(kind, selected)
+                }
+                Intent::ApprovalFocusNext | Intent::OverlayNextField => {
+                    let count = self.approvals().len();
+                    if count == 0 {
+                        return Outcome::quiet();
+                    }
+                    self.overlay = Some(Overlay::Approval {
+                        selected: (selected + 1) % count,
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::Elicitation { field } => match intent {
+                Intent::ElicitationSubmit | Intent::ConfirmOverlay => {
+                    self.overlay = None;
+                    self.submit_elicitation(field)
+                }
+                Intent::ElicitationFieldNext | Intent::OverlayNextField => {
+                    let count = self.current_elicitation_fields();
+                    if count == 0 {
+                        return Outcome::quiet();
+                    }
+                    self.overlay = Some(Overlay::Elicitation {
+                        field: (field + 1) % count,
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::ElicitationFieldPrevious | Intent::OverlayPreviousField => {
+                    let count = self.current_elicitation_fields();
+                    if count == 0 {
+                        return Outcome::quiet();
+                    }
+                    self.overlay = Some(Overlay::Elicitation {
+                        field: field.saturating_sub(1),
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::PairingCode { .. } => Outcome::quiet(),
+            Overlay::RuntimePicker { selected } => match intent {
+                Intent::ConfirmOverlay | Intent::ApprovalApprove => {
+                    self.overlay = None;
+                    self.apply_runtime_selection(selected)
+                }
+                Intent::SelectNext => {
+                    let count = self.runtime_option_count();
+                    self.overlay = Some(Overlay::RuntimePicker {
+                        selected: (selected + 1) % count.max(1),
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::SelectPrevious => {
+                    self.overlay = Some(Overlay::RuntimePicker {
+                        selected: selected.saturating_sub(1),
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::BlockDetails { scroll, .. } => match intent {
+                Intent::ScrollPageDown | Intent::SelectNext => {
+                    self.set_overlay_scroll(scroll + 10);
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollPageUp | Intent::SelectPrevious => {
+                    self.set_overlay_scroll(scroll.saturating_sub(10));
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+            Overlay::TextView {
+                title,
+                body,
+                scroll,
+            } => match intent {
+                Intent::ScrollPageDown | Intent::SelectNext => {
+                    self.overlay = Some(Overlay::TextView {
+                        title,
+                        body,
+                        scroll: scroll + 10,
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollPageUp | Intent::SelectPrevious => {
+                    self.overlay = Some(Overlay::TextView {
+                        title,
+                        body,
+                        scroll: scroll.saturating_sub(10),
+                    });
+                    Outcome::effects(vec![])
+                }
+                Intent::ScrollToTop => {
+                    self.overlay = Some(Overlay::TextView {
+                        title,
+                        body,
+                        scroll: 0,
+                    });
+                    Outcome::effects(vec![])
+                }
+                _ => Outcome::quiet(),
+            },
+        }
+    }
+
+    fn perform_palette(&mut self, intent: Intent, query: String, selected: usize) -> Outcome {
+        match intent {
+            Intent::ConfirmOverlay | Intent::PaletteRun => {
+                let matches = crate::view::palette_matches(&query, self.strings);
+                let Some(entry) = matches.get(selected).copied() else {
+                    return Outcome::quiet();
+                };
+                self.overlay = None;
+                self.perform(entry.intent)
+            }
+            Intent::SelectNext => {
+                let count = crate::view::palette_matches(&query, self.strings).len();
+                self.overlay = Some(Overlay::Palette {
+                    query,
+                    selected: if count == 0 {
+                        0
+                    } else {
+                        (selected + 1) % count
+                    },
+                });
+                Outcome::effects(vec![])
+            }
+            Intent::SelectPrevious => {
+                self.overlay = Some(Overlay::Palette {
+                    query,
+                    selected: selected.saturating_sub(1),
+                });
+                Outcome::effects(vec![])
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn perform_filter(&mut self, intent: Intent) -> Outcome {
+        match intent {
+            Intent::Back | Intent::CloseOverlay | Intent::ContextualCancel => {
+                self.filtering = false;
+                self.filter.clear();
+                Outcome::effects(vec![Effect::ListSessions {
+                    include_archived: self.show_archived,
+                }])
+            }
+            Intent::ConfirmOverlay => {
+                self.filtering = false;
+                Outcome::effects(vec![])
+            }
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn perform_confirm(&mut self, confirm: Intent) -> Outcome {
+        match confirm {
+            Intent::DeleteSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::DeleteSession { session_id }])
+            }
+            Intent::ArchiveSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::ArchiveSession { session_id }])
+            }
+            Intent::RevokeSelectedDevice => {
+                let index = self.selection_for(Scope::Devices);
+                let Some(device) = self.management_data.devices.get(index) else {
+                    return Outcome::quiet();
+                };
+                let device_id = device.device_id.clone();
+                Outcome::effects(vec![Effect::RevokeDevice {
+                    device_id,
+                    reason: None,
+                }])
+            }
+            Intent::RequestQuit => {
+                self.should_quit = true;
+                Outcome::effects(vec![])
+            }
+            other => self.perform(other),
+        }
+    }
+
+    fn submit_prompt(&mut self, field: PromptField, value: String, title: String) -> Outcome {
+        let trimmed = value.trim().to_string();
+        match field {
+            PromptField::RenameSession => {
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                if trimmed.is_empty() {
+                    self.toast(Toast::warning(
+                        self.strings.session_title_label().to_string(),
+                    ));
+                    return Outcome::quiet();
+                }
+                Outcome::effects(vec![Effect::RenameSession {
+                    session_id,
+                    title: trimmed,
+                }])
+            }
+            PromptField::NewSessionTitle => {
+                let workspace_root = self
+                    .workspace_path
+                    .clone()
+                    .or_else(|| {
+                        self.active_session()
+                            .map(|session| session.workspace_root.clone())
+                    })
+                    .unwrap_or_default();
+                Outcome::effects(vec![Effect::CreateSession {
+                    workspace_root,
+                    title: (!trimmed.is_empty()).then_some(trimmed),
+                }])
+            }
+            PromptField::WorkspacePath => {
+                Outcome::effects(vec![Effect::OpenWorkspace { root_path: trimmed }])
+            }
+            PromptField::CommitMessage => {
+                let Some(workspace_id) = self.active_workspace_id() else {
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::GitCommit {
+                    workspace_id,
+                    message: trimmed,
+                }])
+            }
+            PromptField::ProviderSecret => {
+                let index = self.selection_for(Scope::Providers);
+                let Some(profile) = self.management_data.providers.get(index) else {
+                    return Outcome::quiet();
+                };
+                let profile_id = profile.id.clone();
+                // The drafted secret is dropped as soon as it is submitted.
+                Outcome::effects(vec![Effect::WriteProviderSecret {
+                    profile_id,
+                    secret: value,
+                }])
+            }
+            PromptField::ProviderEndpoint => {
+                let index = self.selection_for(Scope::Providers);
+                let Some(profile) = self.management_data.providers.get(index) else {
+                    return Outcome::quiet();
+                };
+                let profile_id = profile.id.clone();
+                Outcome::effects(vec![Effect::RenameProfile {
+                    profile_id,
+                    name: trimmed,
+                }])
+            }
+            PromptField::McpServerName
+            | PromptField::SkillName
+            | PromptField::PromptName
+            | PromptField::HookName => {
+                let _ = title;
+                Outcome::quiet()
+            }
+            PromptField::DeviceRevokeReason => {
+                let index = self.selection_for(Scope::Devices);
+                let Some(device) = self.management_data.devices.get(index) else {
+                    return Outcome::quiet();
+                };
+                let device_id = device.device_id.clone();
+                Outcome::effects(vec![Effect::RevokeDevice {
+                    device_id,
+                    reason: (!trimmed.is_empty()).then_some(trimmed),
+                }])
+            }
+            PromptField::RestoreBackupId => {
+                if trimmed.is_empty() {
+                    return Outcome::quiet();
+                }
+                self.guard(
+                    BackendOperation::RecoveryBackupRestore,
+                    Effect::RestoreBackup { backup_id: trimmed },
+                )
+            }
+        }
+    }
+
+    // ---- focused helpers --------------------------------------------------
+
+    fn confirm_quit(&mut self) -> Outcome {
+        self.overlay = Some(Overlay::Confirm {
+            title: self.strings.close().to_string(),
+            body: self.strings.help_hint().to_string(),
+            confirm: Intent::RequestQuit,
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn go_back(&mut self) -> Outcome {
+        if self.overlay.is_some() {
+            self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        if self.filtering {
+            self.filtering = false;
+            self.filter.clear();
+            return Outcome::effects(vec![]);
+        }
+        if self.focus == Focus::Composer {
+            self.focus = Focus::Main;
+            return Outcome::effects(vec![]);
+        }
+        if self.page.is_session_page() && self.page != Page::Agent {
+            self.select_session_destination(vibex_ui::shell::SessionDestination::Agent);
+            return Outcome::effects(vec![]);
+        }
+        if self.page != Page::Sessions {
+            self.select_global(vibex_ui::shell::GlobalDestination::Sessions);
+        }
+        Outcome::effects(vec![])
+    }
+
+    fn contextual_cancel(&mut self) -> Outcome {
+        if self.overlay.is_some() {
+            self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        if !self.composer.is_empty() {
+            self.composer.clear();
+            self.history.reset();
+            let message = self.strings.composer_draft_cleared().to_string();
+            self.toast(Toast::info(message));
+            return Outcome::effects(vec![]);
+        }
+        if self.is_turn_running() {
+            let Some(session_id) = self.selected_session_id().cloned() else {
+                return Outcome::quiet();
+            };
+            return Outcome::effects(vec![Effect::Interrupt { session_id }]);
+        }
+        self.confirm_quit()
+    }
+
+    fn is_turn_running(&self) -> bool {
+        self.active_session().is_some_and(|session| {
+            matches!(
+                session.state,
+                AgentSessionState::Running | AgentSessionState::NeedsInput
+            )
+        })
+    }
+
+    fn session_can_continue(&self) -> bool {
+        self.active_session().is_some_and(|session| {
+            !matches!(
+                session.state,
+                AgentSessionState::Running | AgentSessionState::Archived
+            )
+        })
+    }
+
+    fn move_selection(&mut self, delta: i64) -> Outcome {
+        let scope = if self.page == Page::Agent {
+            Scope::Agent
+        } else if self.overlay.is_some() {
+            Scope::Overlay
+        } else {
+            self.page.scope()
+        };
+        let count = self.page_row_count();
+        if count == 0 {
+            return Outcome::quiet();
+        }
+        let current = self.selection_for(scope) as i64;
+        let next = (current + delta).clamp(0, count as i64 - 1) as usize;
+        self.set_selection(scope, next);
+        if scope == Scope::Agent {
+            self.scroll.follow = false;
+            let offset = self.transcript.offset_of_block(next);
+            self.scroll.offset = offset;
+        }
+        Outcome::effects(vec![])
+    }
+
+    fn scroll_by(&mut self, direction: i64, page: bool) {
+        let step = if page {
+            usize::from(self.viewport.1).saturating_sub(4).max(1)
+        } else {
+            (usize::from(self.viewport.1) / 2).max(1)
+        };
+        let current = self.scroll.offset as i64;
+        self.scroll.follow = false;
+        self.scroll.offset = (current + direction * step as i64).max(0) as usize;
+    }
+
+    fn set_overlay_scroll(&mut self, value: usize) {
+        self.overlay = match self.overlay.clone() {
+            Some(Overlay::Help { query, .. }) => Some(Overlay::Help {
+                scroll: value,
+                query,
+            }),
+            Some(Overlay::BlockDetails { block, .. }) => Some(Overlay::BlockDetails {
+                block,
+                scroll: value,
+            }),
+            Some(Overlay::TextView { title, body, .. }) => Some(Overlay::TextView {
+                title,
+                body,
+                scroll: value,
+            }),
+            other => other,
+        };
+    }
+
+    fn cycle_session_destination(&mut self, forward: bool) {
+        use vibex_ui::shell::SessionDestination;
+        let order = [
+            SessionDestination::Agent,
+            SessionDestination::Files,
+            SessionDestination::Changes,
+            SessionDestination::Terminal,
+        ];
+        let current = order
+            .iter()
+            .position(|candidate| *candidate == self.navigation.session)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % order.len()
+        } else {
+            (current + order.len() - 1) % order.len()
+        };
+        self.select_session_destination(order[next]);
+    }
+
+    fn begin_new_session(&mut self) -> Outcome {
+        self.overlay = Some(Overlay::Prompt {
+            title: self.strings.session_new().to_string(),
+            field: PromptField::NewSessionTitle,
+            value: String::new(),
+        });
+        self.workspace_path = None;
+        Outcome::effects(vec![Effect::ListWorkspaces])
+    }
+
+    fn begin_rename_session(&mut self) -> Outcome {
+        let Some(session) = self.active_session() else {
+            return Outcome::quiet();
+        };
+        let title = session.title.clone();
+        self.overlay = Some(Overlay::Prompt {
+            title: self.strings.session_rename().to_string(),
+            field: PromptField::RenameSession,
+            value: title,
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn begin_revoke_device(&mut self) -> Outcome {
+        self.overlay = Some(Overlay::Confirm {
+            title: self.strings.devices_revoke().to_string(),
+            body: self.strings.devices_confirm_revoke().to_string(),
+            confirm: Intent::RevokeSelectedDevice,
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn open_approval(&mut self) {
+        if self.overlay.is_none() && !self.approvals().is_empty() {
+            self.overlay = Some(Overlay::Approval { selected: 0 });
+        }
+    }
+
+    fn open_elicitation(&mut self) {
+        if self.overlay.is_none() && !self.elicitations().is_empty() {
+            self.overlay = Some(Overlay::Elicitation { field: 0 });
+        }
+    }
+
+    fn resolve_approval(&mut self, requested: PermissionResponseKind, index: usize) -> Outcome {
+        let approvals = self.approvals();
+        let Some(approval) = approvals.get(index) else {
+            return Outcome::quiet();
+        };
+        let Some(response) = response_for(&approval.response_options, requested) else {
+            return Outcome::quiet();
+        };
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        let request_id = approval.request_id.clone();
+        let resolution = PermissionResolution {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            response,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: None,
+            resolved_at_ms: vibex_core::unix_timestamp_ms(),
+        };
+        // Optimistically grey the card out; a failure rolls it back with an
+        // error toast from the worker.
+        self.mark_pending(format!("permission:{}", request_id.as_str()));
+        Outcome::effects(vec![Effect::ResolvePermission {
+            session_id,
+            request_id,
+            resolution,
+        }])
+    }
+
+    fn current_elicitation_fields(&self) -> usize {
+        self.elicitations()
+            .first()
+            .map(|surface| surface.request.fields.len())
+            .unwrap_or(0)
+    }
+
+    fn submit_elicitation(&mut self, field: usize) -> Outcome {
+        let elicitations = self.elicitations();
+        let Some(surface) = elicitations.first() else {
+            return Outcome::quiet();
+        };
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        let request = surface.request.clone();
+        let draft = self.elicitation_draft.clone();
+        let mut answers = std::collections::BTreeMap::new();
+        for (index, definition) in request.fields.iter().enumerate() {
+            if let Some(answer) = draft.answer_for(&definition.id, index, definition, field) {
+                answers.insert(definition.id.clone(), answer);
+            }
+        }
+        let resolution = ElicitationResolution {
+            request_id: request.id.clone(),
+            session_id: session_id.clone(),
+            action: ElicitationResolutionAction::Accept,
+            answers,
+            responder_device_id: None,
+            resolved_at_ms: vibex_core::unix_timestamp_ms(),
+        };
+        if let Err(error) = request.validate_resolution(&resolution) {
+            self.toast(Toast::danger(error.message));
+            return Outcome::quiet();
+        }
+        self.mark_pending(format!("elicitation:{}", request.id.as_str()));
+        Outcome::effects(vec![Effect::ResolveElicitation {
+            session_id,
+            request_id: request.id.clone(),
+            resolution,
+        }])
+    }
+
+    fn mark_pending(&mut self, key: String) {
+        self.pending.insert(key, ());
+    }
+
+    fn submit_composer(&mut self) -> Outcome {
+        if self.composer.is_empty() {
+            self.toast(Toast::warning(self.strings.composer_empty().to_string()));
+            return Outcome::quiet();
+        }
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            self.toast(Toast::warning(self.strings.sessions_empty().to_string()));
+            return Outcome::quiet();
+        };
+        if !self.supports(BackendOperation::AgentSendMessage) {
+            self.toast(Toast::warning(
+                self.strings.toast_action_unavailable().to_string(),
+            ));
+            return Outcome::quiet();
+        }
+        let text = self.composer.take();
+        self.history.push(text.clone());
+        self.completion = None;
+        self.scroll.follow = true;
+        Outcome::effects(vec![Effect::SendMessage { session_id, text }])
+    }
+
+    fn steer_composer(&mut self) -> Outcome {
+        if self.composer.is_empty() {
+            self.toast(Toast::warning(self.strings.composer_empty().to_string()));
+            return Outcome::quiet();
+        }
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        let text = self.composer.take();
+        self.history.push(text.clone());
+        // Remote seats have no steering RPC, so the worker falls back to
+        // interrupt + resend and says so.
+        let fallback = self.seat != crate::view::SeatKind::Authority;
+        if fallback {
+            self.toast(Toast::info(
+                self.strings.composer_steer_unavailable().to_string(),
+            ));
+        }
+        Outcome::effects(vec![Effect::SteerMessage {
+            session_id,
+            text,
+            fallback_to_resend: fallback,
+        }])
+    }
+
+    fn move_completion(&mut self, delta: i64) {
+        let Some(menu) = self.completion.as_mut() else {
+            return;
+        };
+        let count = menu.items.len();
+        if count == 0 {
+            return;
+        }
+        let current = menu.selected as i64;
+        menu.selected = (current + delta).rem_euclid(count as i64) as usize;
+    }
+
+    fn accept_completion(&mut self) -> Outcome {
+        let Some(menu) = self.completion.clone() else {
+            return Outcome::quiet();
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            self.completion = None;
+            return Outcome::quiet();
+        };
+        let insertion = item.insert.clone();
+        self.composer.replace_trigger_word(menu.start, &insertion);
+        self.completion = None;
+        Outcome::effects(vec![])
+    }
+
+    /// Recompute the completion menu after an edit.
+    pub fn refresh_completion(&mut self) -> Option<(CompletionTrigger, String)> {
+        match self.composer.active_trigger() {
+            Some((trigger, start, query)) => {
+                let end = self.composer.cursor();
+                match self.completion.as_mut() {
+                    Some(menu) if menu.trigger == trigger && menu.start == start => {
+                        menu.end = end;
+                        let filtered = menu.filtered(&query);
+                        if let Some(first) = filtered.first() {
+                            menu.selected = menu.selected.min(menu.items.len() - 1);
+                            let _ = first;
+                        }
+                    }
+                    _ => {
+                        self.completion = Some(CompletionMenu {
+                            trigger,
+                            start,
+                            end,
+                            items: Vec::new(),
+                            selected: 0,
+                            loading: true,
+                        });
+                    }
+                }
+                Some((trigger, query))
+            }
+            None => {
+                self.completion = None;
+                None
+            }
+        }
+    }
+
+    fn open_runtime_picker(&mut self) -> Outcome {
+        if self.runtime_options.is_none() {
+            return Outcome::effects(vec![Effect::ListRuntimeOptions]);
+        }
+        self.overlay = Some(Overlay::RuntimePicker { selected: 0 });
+        Outcome::effects(vec![])
+    }
+
+    fn runtime_option_count(&self) -> usize {
+        self.runtime_options
+            .as_ref()
+            .map(|catalog| catalog.options.len())
+            .unwrap_or(0)
+    }
+
+    fn apply_runtime_selection(&mut self, index: usize) -> Outcome {
+        let Some(catalog) = self.runtime_options.as_ref() else {
+            return Outcome::quiet();
+        };
+        let Some(option) = catalog.options.get(index) else {
+            return Outcome::quiet();
+        };
+        let Some(session_id) = self.selected_session_id().cloned() else {
+            return Outcome::quiet();
+        };
+        Outcome::effects(vec![Effect::SwitchRuntime {
+            session_id,
+            selection: option.selection.clone(),
+        }])
+    }
+
+    fn refresh_current_page(&mut self) -> Outcome {
+        match self.page {
+            Page::Sessions => Outcome::effects(vec![Effect::ListSessions {
+                include_archived: self.show_archived,
+            }]),
+            Page::Agent => Outcome::effects(vec![Effect::RefreshTimeline]),
+            Page::Devices => Outcome::effects(vec![Effect::ListDevices]),
+            Page::Providers => Outcome::effects(vec![Effect::ListProfiles]),
+            Page::Agents => Outcome::effects(vec![Effect::ListAgents]),
+            Page::Mcp => Outcome::effects(vec![Effect::ListMcp]),
+            Page::Skills => Outcome::effects(vec![Effect::ListSkills]),
+            Page::Prompts => Outcome::effects(vec![Effect::ListPrompts]),
+            Page::Hooks => Outcome::effects(vec![Effect::ListHooks]),
+            Page::Usage => Outcome::effects(vec![Effect::LoadUsage]),
+            Page::Files => self.load_files(),
+            Page::Changes => self.load_changes(),
+            Page::Management | Page::Recovery | Page::Settings | Page::Help | Page::Terminal => {
+                Outcome::effects(vec![])
+            }
+        }
+    }
+
+    fn load_files(&mut self) -> Outcome {
+        match self.active_workspace_id() {
+            Some(workspace_id) => Outcome::effects(vec![Effect::LoadFileTree { workspace_id }]),
+            None => Outcome::quiet(),
+        }
+    }
+
+    fn load_changes(&mut self) -> Outcome {
+        match self.active_workspace_id() {
+            Some(workspace_id) => Outcome::effects(vec![Effect::LoadGitStatus { workspace_id }]),
+            None => Outcome::quiet(),
+        }
+    }
+
+    fn toggle_selected_entry(&mut self) -> Outcome {
+        let index = self.selection_for(self.page.scope());
+        match self.page {
+            Page::Mcp => match self.management_data.mcp.get(index) {
+                Some(server) => Outcome::effects(vec![Effect::ToggleMcp {
+                    server_id: server.id.clone(),
+                    enabled: server.status != vibex_core::McpServerStatus::Enabled,
+                }]),
+                None => Outcome::quiet(),
+            },
+            Page::Skills => match self.management_data.skills.get(index) {
+                Some(skill) => Outcome::effects(vec![Effect::ToggleSkill {
+                    skill_id: skill.id.clone(),
+                    enabled: skill.status != vibex_core::SkillStatus::Enabled,
+                }]),
+                None => Outcome::quiet(),
+            },
+            Page::Prompts => match self.management_data.prompts.get(index) {
+                Some(prompt) => Outcome::effects(vec![Effect::TogglePrompt {
+                    prompt_id: prompt.id.clone(),
+                    enabled: prompt.status != vibex_core::PromptStatus::Enabled,
+                }]),
+                None => Outcome::quiet(),
+            },
+            Page::Hooks => match self.management_data.hooks.get(index) {
+                Some(hook) => Outcome::effects(vec![Effect::ToggleHook {
+                    hook_id: hook.id.clone(),
+                    enabled: hook.status != vibex_core::HookStatus::Enabled,
+                }]),
+                None => Outcome::quiet(),
+            },
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn begin_edit_entry(&mut self) -> Outcome {
+        let field = match self.page {
+            Page::Mcp => PromptField::McpServerName,
+            Page::Skills => PromptField::SkillName,
+            Page::Prompts => PromptField::PromptName,
+            Page::Hooks => PromptField::HookName,
+            _ => return Outcome::quiet(),
+        };
+        self.overlay = Some(Overlay::Prompt {
+            title: self.strings.management_mcp().to_string(),
+            field,
+            value: String::new(),
+        });
+        Outcome::effects(vec![])
+    }
+
+    fn install_selected_agent(&mut self, uninstall: bool) -> Outcome {
+        let index = self.selection_for(Scope::Management);
+        let Some(agent) = self.management_data.agents.get(index) else {
+            return Outcome::quiet();
+        };
+        let agent_id = agent.id.clone();
+        if uninstall {
+            return self.guard(
+                BackendOperation::ManagementAgents,
+                Effect::UninstallAgent { agent_id },
+            );
+        }
+        self.guard(
+            BackendOperation::ManagementAgents,
+            Effect::InstallAgent { agent_id },
+        )
+    }
+
+    fn list_agent_auth(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Management);
+        let Some(agent) = self.management_data.agents.get(index) else {
+            return Outcome::quiet();
+        };
+        let agent_id = agent.id.clone();
+        self.guard(
+            BackendOperation::AgentAuthRead,
+            Effect::ListAgentAuth { agent_id },
+        )
+    }
+
+    fn logout_selected_agent(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Management);
+        let Some(agent) = self.management_data.agents.get(index) else {
+            return Outcome::quiet();
+        };
+        let agent_id = agent.id.clone();
+        self.guard(
+            BackendOperation::AgentAuthManage,
+            Effect::LogoutAgent { agent_id },
+        )
+    }
+
+    fn activate_provider_profile(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Providers);
+        let Some(profile) = self.management_data.providers.get(index) else {
+            return Outcome::quiet();
+        };
+        let profile_id = profile.id.clone();
+        self.guard(
+            BackendOperation::ManagementProfileSelect,
+            Effect::SelectProfile { profile_id },
+        )
+    }
+
+    fn test_provider_profile(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Providers);
+        let Some(profile) = self.management_data.providers.get(index) else {
+            return Outcome::quiet();
+        };
+        let profile_id = profile.id.clone();
+        self.guard(
+            BackendOperation::ManagementProviderProfileTest,
+            Effect::TestProviderProfile { profile_id },
+        )
+    }
+
+    fn fetch_provider_models(&mut self) -> Outcome {
+        let index = self.selection_for(Scope::Providers);
+        let Some(profile) = self.management_data.providers.get(index) else {
+            return Outcome::quiet();
+        };
+        let profile_id = profile.id.clone();
+        self.guard(
+            BackendOperation::ManagementProviderModelFetch,
+            Effect::FetchProviderModels { profile_id },
+        )
+    }
+
+    fn git_stage(&mut self, stage: bool) -> Outcome {
+        let index = self.selection_for(Scope::Changes);
+        let Some(workspace_id) = self.active_workspace_id() else {
+            return Outcome::quiet();
+        };
+        let Some(status) = self.git_status.as_ref() else {
+            return Outcome::quiet();
+        };
+        let Some(entry) = status.changes.get(index) else {
+            return Outcome::quiet();
+        };
+        let path = entry.path.clone();
+        let operation = if stage {
+            BackendOperation::GitStage
+        } else {
+            BackendOperation::GitUnstage
+        };
+        self.guard(
+            operation,
+            Effect::GitStage {
+                workspace_id,
+                path,
+                stage,
+            },
+        )
+    }
+
+    fn activate_setting(&mut self) -> Outcome {
+        let index = self.settings.selected;
+        match SettingRow::ALL.get(index) {
+            Some(SettingRow::Theme) => self.step_setting(1),
+            Some(SettingRow::Locale) => self.step_setting(1),
+            Some(SettingRow::Icons) => self.step_setting(1),
+            Some(SettingRow::Keys) => self.perform(Intent::ReloadKeymap),
+            _ => Outcome::quiet(),
+        }
+    }
+
+    fn step_setting(&mut self, delta: i64) -> Outcome {
+        let index = self.settings.selected;
+        match SettingRow::ALL.get(index) {
+            Some(SettingRow::Theme) => {
+                let themes =
+                    vibex_ui::theme_catalog::themes_for(self.settings.mode).collect::<Vec<_>>();
+                if themes.is_empty() {
+                    return Outcome::quiet();
+                }
+                let current = themes
+                    .iter()
+                    .position(|theme| theme.id == self.settings.theme_id)
+                    .unwrap_or(0) as i64;
+                let next = (current + delta).rem_euclid(themes.len() as i64) as usize;
+                self.settings.theme_id = themes[next].id.to_string();
+                self.theme = crate::theme::TuiTheme::from_definition(themes[next], self.capability);
+                self.transcript.configure(
+                    crate::view::layout_for(self.shell, self.viewport.0, self.viewport.1)
+                        .main_width,
+                    &self.theme.clone(),
+                );
+                Outcome::effects(vec![])
+            }
+            Some(SettingRow::Locale) => {
+                let locales = [
+                    crate::locale::Locale::En,
+                    crate::locale::Locale::ZhCn,
+                    crate::locale::Locale::ZhTw,
+                ];
+                let current = locales
+                    .iter()
+                    .position(|locale| *locale == self.settings.locale)
+                    .unwrap_or(0) as i64;
+                let next = (current + delta).rem_euclid(locales.len() as i64) as usize;
+                self.settings.locale = locales[next];
+                self.strings = crate::locale::Strings::with_locale(locales[next]);
+                Outcome::effects(vec![])
+            }
+            Some(SettingRow::Icons) => {
+                let ascii = self.settings.glyphs == GlyphMode::Ascii;
+                self.settings.glyphs = if ascii {
+                    GlyphMode::Unicode
+                } else {
+                    GlyphMode::Ascii
+                };
+                self.capability.glyphs = self.settings.glyphs;
+                self.theme = crate::theme::TuiTheme::resolve(
+                    Some(&self.settings.theme_id),
+                    self.settings.mode,
+                    self.capability,
+                );
+                Outcome::effects(vec![])
+            }
+            Some(SettingRow::Backend) | Some(SettingRow::Seat) | Some(SettingRow::Version) => {
+                Outcome::quiet()
+            }
+            Some(SettingRow::Keys) => self.perform(Intent::ReloadKeymap),
+            None => Outcome::quiet(),
+        }
+    }
+}
+
+/// Build the request payloads the worker needs for the agent mutations.
+///
+/// Kept here so the worker stays a thin transport layer and the payload shape
+/// lives next to the reducer that decided to send it.
+pub mod payloads {
+    use super::*;
+
+    pub fn create_session(
+        workspace_root: String,
+        title: Option<String>,
+        runtime: vibex_core::SessionRuntimeSelection,
+    ) -> MutationRequest<CreateAgentSessionRequest> {
+        MutationRequest::new(CreateAgentSessionRequest {
+            runtime,
+            workspace_root,
+            workspace_mode: WorkspaceMode::CurrentCheckout,
+            title,
+            safety: None,
+            session_id: None,
+            defer_runtime_materialization: false,
+        })
+    }
+
+    pub fn send_message(
+        session_id: vibex_core::VibexSessionId,
+        text: String,
+        desired_runtime: vibex_core::SessionRuntimeSelection,
+    ) -> MutationRequest<SendAgentMessageRequest> {
+        MutationRequest::new(SendAgentMessageRequest {
+            session_id,
+            message_idempotency_key: RequestId::new().as_str().to_string(),
+            desired_runtime,
+            text,
+            attachments: Vec::new(),
+            reasoning_effort: None,
+            correlation_id: None,
+            delivery: vibex_core::UserMessageDelivery::Prompt,
+        })
+    }
+
+    pub fn continue_turn(
+        session_id: vibex_core::VibexSessionId,
+    ) -> MutationRequest<ContinueAgentTurnRequest> {
+        MutationRequest::new(ContinueAgentTurnRequest {
+            session_id,
+            correlation_id: None,
+        })
+    }
+
+    pub fn rename_session(
+        session_id: vibex_core::VibexSessionId,
+        title: String,
+    ) -> MutationRequest<RenameAgentSessionRequest> {
+        MutationRequest::new(RenameAgentSessionRequest { session_id, title })
+    }
+
+    pub fn fork_session(
+        session_id: vibex_core::VibexSessionId,
+    ) -> MutationRequest<ForkAgentSessionRequest> {
+        MutationRequest::new(ForkAgentSessionRequest {
+            source_session_id: session_id,
+            through_sequence: i64::MAX,
+            expected_source_end_sequence: None,
+        })
+    }
+
+    pub fn steer_message(
+        session_id: vibex_core::VibexSessionId,
+        text: String,
+    ) -> MutationRequest<SteerAgentMessageRequest> {
+        MutationRequest::new(SteerAgentMessageRequest {
+            session_id,
+            text,
+            attachments: Vec::new(),
+            correlation_id: None,
+        })
+    }
+
+    pub fn resolve_permission(
+        session_id: vibex_core::VibexSessionId,
+        request_id: RequestId,
+        resolution: PermissionResolution,
+    ) -> MutationRequest<ResolvePermissionRequest> {
+        MutationRequest::new(ResolvePermissionRequest {
+            session_id,
+            request_id,
+            resolution,
+        })
+    }
+
+    pub fn resolve_elicitation(
+        session_id: vibex_core::VibexSessionId,
+        request_id: RequestId,
+        resolution: ElicitationResolution,
+    ) -> MutationRequest<ResolveElicitationRequest> {
+        MutationRequest::new(ResolveElicitationRequest {
+            session_id,
+            request_id,
+            resolution,
+        })
+    }
+
+    pub fn answer_string(value: impl Into<String>) -> ElicitationAnswerValue {
+        ElicitationAnswerValue::String(value.into())
+    }
+}
+
+/// A locally-held draft of an elicitation form.
+///
+/// The answers live here rather than in the shared controller because the
+/// controller models the *request*, not the in-progress edit; keeping the draft
+/// next to the reducer is what lets the whole form be tested without a
+/// terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElicitationDraft {
+    text: std::collections::BTreeMap<String, String>,
+    boolean: std::collections::BTreeMap<String, bool>,
+    multi: std::collections::BTreeMap<String, Vec<String>>,
+    active_text: String,
+}
+
+impl ElicitationDraft {
+    pub fn set_text(&mut self, field_id: impl Into<String>, value: impl Into<String>) {
+        self.text.insert(field_id.into(), value.into());
+    }
+
+    pub fn set_boolean(&mut self, field_id: impl Into<String>, value: bool) {
+        self.boolean.insert(field_id.into(), value);
+    }
+
+    pub fn toggle_multi(&mut self, field_id: impl Into<String>, value: impl Into<String>) {
+        let value = value.into();
+        let entry = self.multi.entry(field_id.into()).or_default();
+        if let Some(position) = entry.iter().position(|existing| *existing == value) {
+            entry.remove(position);
+        } else {
+            entry.push(value);
+        }
+    }
+
+    pub fn text(&self, field_id: &str) -> Option<&str> {
+        self.text.get(field_id).map(String::as_str)
+    }
+
+    pub fn boolean(&self, field_id: &str) -> Option<bool> {
+        self.boolean.get(field_id).copied()
+    }
+
+    pub fn multi(&self, field_id: &str) -> Vec<String> {
+        self.multi.get(field_id).cloned().unwrap_or_default()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.boolean.clear();
+        self.multi.clear();
+        self.active_text.clear();
+    }
+
+    /// Answer for one field, using the draft where the user typed something and
+    /// the field's default otherwise.
+    pub fn answer_for(
+        &self,
+        field_id: &str,
+        index: usize,
+        definition: &vibex_core::ElicitationField,
+        active: usize,
+    ) -> Option<ElicitationAnswerValue> {
+        use vibex_core::ElicitationFieldKind;
+        match &definition.kind {
+            ElicitationFieldKind::Text { default, .. } => {
+                let value = self
+                    .text(field_id)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // The field being edited reads from the live editor.
+                        (index == active)
+                            .then(|| self.active_text.clone())
+                            .filter(|value| !value.is_empty())
+                    })
+                    .or_else(|| default.clone())?;
+                Some(ElicitationAnswerValue::String(value))
+            }
+            ElicitationFieldKind::Number { default, .. } => {
+                let value = self
+                    .text(field_id)
+                    .map(str::to_string)
+                    .or_else(|| default.clone())?;
+                Some(ElicitationAnswerValue::Number(value))
+            }
+            ElicitationFieldKind::Integer { default, .. } => {
+                let value = self
+                    .text(field_id)
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .or(*default)?;
+                Some(ElicitationAnswerValue::Integer(value))
+            }
+            ElicitationFieldKind::Boolean { default } => {
+                let value = self.boolean(field_id).or(*default)?;
+                Some(ElicitationAnswerValue::Boolean(value))
+            }
+            ElicitationFieldKind::MultiSelect { .. } => {
+                let values = self.multi(field_id);
+                (!values.is_empty()).then_some(ElicitationAnswerValue::StringArray(values))
+            }
+            _ => None,
+        }
+    }
+
+    /// Bind the live text editor to `field_id`.
+    pub fn begin_text(&mut self, field_id: &str) {
+        self.active_text = self.text.get(field_id).cloned().unwrap_or_default();
+    }
+
+    pub fn active_text_mut(&mut self) -> &mut String {
+        &mut self.active_text
+    }
+
+    /// Flush the live editor back into the stored answer.
+    pub fn commit_text(&mut self, field_id: &str) {
+        let value = std::mem::take(&mut self.active_text);
+        self.text.insert(field_id.to_string(), value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_response_kind_resolves_to_an_advertised_option() {
+        let options = vec![vibex_core::PermissionResponseOption {
+            option_id: "o1".into(),
+            label: "Allow".into(),
+            response: PermissionResponseKind::Approve,
+        }];
+        // Deny is not advertised, so it falls back to the only real option
+        // rather than inventing one the provider would reject.
+        assert_eq!(
+            response_for(&options, PermissionResponseKind::Deny),
+            Some(PermissionResponseKind::Approve)
+        );
+        assert_eq!(response_for(&[], PermissionResponseKind::Approve), None);
+    }
+
+    #[test]
+    fn elicitation_draft_prefers_typed_values_over_defaults() {
+        let field = vibex_core::ElicitationField {
+            id: "name".into(),
+            title: "Name".into(),
+            description: None,
+            required: true,
+            kind: vibex_core::ElicitationFieldKind::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+                format: None,
+                default: Some("default".into()),
+                options: Vec::new(),
+            },
+        };
+        let mut draft = ElicitationDraft::default();
+        draft.set_text("name", "typed");
+        assert_eq!(
+            draft.answer_for("name", 0, &field, 0),
+            Some(ElicitationAnswerValue::String("typed".into()))
+        );
+        draft.clear();
+        assert_eq!(
+            draft.answer_for("name", 0, &field, 0),
+            Some(ElicitationAnswerValue::String("default".into()))
+        );
+    }
+
+    #[test]
+    fn elicitation_draft_reads_the_live_editor_for_the_active_field() {
+        let field = vibex_core::ElicitationField {
+            id: "q".into(),
+            title: "Q".into(),
+            description: None,
+            required: true,
+            kind: vibex_core::ElicitationFieldKind::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+                format: None,
+                default: None,
+                options: Vec::new(),
+            },
+        };
+        let mut draft = ElicitationDraft::default();
+        draft.begin_text("q");
+        draft.active_text_mut().push_str("hello");
+        assert_eq!(
+            draft.answer_for("q", 0, &field, 0),
+            Some(ElicitationAnswerValue::String("hello".into()))
+        );
+        // Not the active field, and nothing committed: no answer.
+        assert_eq!(draft.answer_for("q", 1, &field, 0), None);
+        draft.commit_text("q");
+        assert_eq!(
+            draft.answer_for("q", 1, &field, 0),
+            Some(ElicitationAnswerValue::String("hello".into()))
+        );
+    }
+
+    #[test]
+    fn multi_select_toggles_membership() {
+        let mut draft = ElicitationDraft::default();
+        draft.toggle_multi("f", "a");
+        draft.toggle_multi("f", "b");
+        assert_eq!(draft.multi("f"), vec!["a".to_string(), "b".to_string()]);
+        draft.toggle_multi("f", "a");
+        assert_eq!(draft.multi("f"), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn boolean_defaults_are_used_when_untouched() {
+        let field = vibex_core::ElicitationField {
+            id: "flag".into(),
+            title: "Flag".into(),
+            description: None,
+            required: false,
+            kind: vibex_core::ElicitationFieldKind::Boolean {
+                default: Some(true),
+            },
+        };
+        let mut draft = ElicitationDraft::default();
+        assert_eq!(
+            draft.answer_for("flag", 0, &field, 0),
+            Some(ElicitationAnswerValue::Boolean(true))
+        );
+        draft.set_boolean("flag", false);
+        assert_eq!(
+            draft.answer_for("flag", 0, &field, 0),
+            Some(ElicitationAnswerValue::Boolean(false))
+        );
+    }
+}

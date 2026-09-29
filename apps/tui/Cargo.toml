@@ -1,23 +1,30 @@
 [package]
-name = "vibex-server"
+name = "vibex-client"
 version = "0.1.0-rc.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Standalone character-grid client for a Vibex runtime"
 
 [dependencies]
-qrcode.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
-vibex-agent = { path = "../../crates/agent" }
-vibex-browser = { path = "../../crates/browser" }
+vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }
 vibex-remote = { path = "../../crates/remote" }
-vibex-client = { path = "../tui" }
+vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 vibex-tui = { path = "../../crates/vibex-tui" }
+vibex-ui = { path = "../../crates/vibex-ui", default-features = false }
+
+[lib]
+name = "vibex_client"
+path = "src/lib.rs"
 
 [[bin]]
-name = "vibex-server"
+name = "vibex"
 path = "src/main.rs"
