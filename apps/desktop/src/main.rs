@@ -82,7 +82,7 @@ fn run_tui(local: bool) {
         home: None,
         prefer_authority: local,
     };
-    if let Some(home) = vibex_client::seat::resolve_home(None).ok() {
+    if let Ok(home) = vibex_client::seat::resolve_home(None) {
         request.home = Some(home);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()

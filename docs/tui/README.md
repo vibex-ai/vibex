@@ -13,6 +13,18 @@ vibex-server tui           # run the client from the server binary
 vibex-desktop tui          # run the client from the desktop binary (Linux)
 ```
 
+## Packaging
+
+The standalone client ships inside the desktop packages as a second, non-main
+binary so a shell user never installs anything extra:
+
+| Platform | How the client is reached |
+| --- | --- |
+| Linux | `/usr/bin/vibex` from the `.deb` / AppImage |
+| macOS | `vibex` next to the `.app` bundle, symlinked onto `PATH` by the installer |
+| Windows | `vibex.exe` from the NSIS installer; the GUI binary uses the `windows` subsystem and cannot host a console |
+| Containers | `docker exec -it <container> vibex-server tui` |
+
 ## Seats
 
 A client attaches in one of two ways, decided once before the interface starts:

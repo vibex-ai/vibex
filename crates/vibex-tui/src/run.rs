@@ -722,6 +722,37 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },
+        AppMessage::Completions(result) => match result {
+            Ok(discovery) => {
+                if let Some(menu) = app.completion.as_mut() {
+                    // `/` shows the Agent's commands and Vibex Prompts in one
+                    // list; the menu keeps the provider's ordering, which is
+                    // already "most relevant first".
+                    let mut entries = discovery
+                        .response
+                        .entries
+                        .iter()
+                        .chain(discovery.quick_phrases.iter())
+                        .map(|entry| crate::composer::Completion {
+                            insert: entry.insertion_text.clone(),
+                            label: entry.label.clone(),
+                            detail: entry.description.clone().unwrap_or_default(),
+                            group: format!("{:?}", entry.source_kind),
+                        })
+                        .collect::<Vec<_>>();
+                    entries.dedup_by(|left, right| left.insert == right.insert);
+                    menu.items = entries;
+                    menu.loading = false;
+                    menu.selected = menu.selected.min(menu.items.len().saturating_sub(1));
+                }
+            }
+            Err(error) => {
+                if let Some(menu) = app.completion.as_mut() {
+                    menu.loading = false;
+                }
+                app.toast(Toast::warning(error.message));
+            }
+        },
         AppMessage::Hooks(result) => match result {
             Ok(hooks) => {
                 app.management_data.hooks = hooks;

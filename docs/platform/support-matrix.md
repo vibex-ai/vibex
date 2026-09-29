@@ -15,10 +15,17 @@ platform-specific checks.
 | Android | Native GPUI client using `gpui-pre-mobile` and NativeActivity | `pnpm build:mobile:android` | Each rebuilt APK needs source-bound device or emulator validation before a release claim. |
 | iOS | Native GPUI client using `gpui-pre-mobile` and UIKit | `pnpm build:mobile:ios` on macOS | Simulator/device, signing, and distribution validation remain separate release evidence. |
 | Relay server | Optional user-self-hosted encrypted transport | `pnpm smoke:relay:local` | Relay is transport only; deployment, TLS, NAT, and device proof are operator-owned. |
+| Terminal (TUI) | Character-grid client for an authority or remote runtime | `cargo test -p vibex-tui`, `vibex status` | Requires an interactive terminal; CJK and RTL rendering depend on the user's terminal font and width tables, which are not queryable. |
 
 Desktop is the only authoritative runtime. Mobile is a remote client through the
 typed backend facade and `AutoRemoteTransport`; it does not run local Agents,
 Git, PTY, or workspace filesystem services.
+
+The TUI is a client in the same sense as mobile: it consumes the
+`BackendFacade` domain traits and never reaches past the runtime. It is the only
+client that can also be the *authority seat* — when it holds the home lock it
+hosts the runtime in-process — so `cargo test -p vibex-tui` covers the seat
+decision as well as the interface.
 
 ## Capability Boundaries
 

@@ -120,6 +120,16 @@ function validate() {
     assert(JSON.stringify(debProbe) === JSON.stringify(appImageProbe),
       ".deb and AppImage probes differ");
 
+    // The character-grid client ships as a second, non-main binary. It has to
+    // reach PATH in the package, otherwise `vibex` is only available from a
+    // source checkout.
+    const debClient = join(debRoot, "usr/bin/vibex");
+    assert(existsSync(debClient), ".deb is missing the vibex terminal client");
+    const clientStatus = JSON.parse(run(debClient, ["status"]));
+    assert(typeof clientStatus.home === "string" && clientStatus.home.length > 0,
+      "the packaged vibex client does not report a home directory");
+    assert(clientStatus.version.length > 0, "the packaged vibex client reports no version");
+
     console.log(JSON.stringify({
       status: "passed",
       deb: fileIdentity(DEB),

@@ -23,6 +23,15 @@ icons = [
 path = "vibex-desktop"
 main = true
 
+# The character-grid client ships alongside the GUI so a shell user never has to
+# install anything extra. On macOS and Windows the GUI binary cannot host a
+# console (the Windows release entry uses the `windows` subsystem and the macOS
+# binary lives inside the `.app`), so this second, non-main binary is the one
+# that lands on PATH.
+[[binaries]]
+path = "vibex"
+main = false
+
 [deb]
 depends = [
   "libc6",

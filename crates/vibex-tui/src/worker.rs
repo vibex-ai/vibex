@@ -59,6 +59,7 @@ pub enum AppMessage {
     Skills(BackendResult<Vec<vibex_core::Skill>>),
     Prompts(BackendResult<Vec<vibex_core::Prompt>>),
     Hooks(BackendResult<Vec<vibex_core::Hook>>),
+    Completions(BackendResult<Box<vibex_core::AgentCommandDiscovery>>),
     Usage(BackendResult<Box<UsageReport>>),
     Recovery(BackendResult<String>),
     BackupList(BackendResult<Vec<vibex_core::BackupCreateOutcome>>),
@@ -823,10 +824,33 @@ impl Dispatch {
                     Err(error) => self.send(AppMessage::Recovery(Err(error))),
                 }
             }
-            Effect::DiscoverCompletions { .. } => {
-                // Completion discovery is driven by the composer's trigger and
-                // needs the session's workspace; the reducer asks for it only
-                // when a session is open, so a missing session is a no-op.
+            Effect::DiscoverCompletions { trigger, query } => {
+                // The authority owns the command catalogue: `/` merges the
+                // Agent's own commands with Vibex Prompts, `@` resolves
+                // workspace files, and `$` resolves Skills. None of that is
+                // local knowledge, so the composer asks rather than guessing.
+                let session = self.current_session().await;
+                let request = vibex_core::AgentCommandDiscoverRequest {
+                    agent_id: session.as_ref().map(|session| session.agent_id.clone()),
+                    provider_profile_id: None,
+                    session_id: session.as_ref().map(|session| session.id.clone()),
+                    workspace_id: session.as_ref().map(|session| session.workspace_id.clone()),
+                    trigger: Some(match trigger {
+                        crate::composer::CompletionTrigger::Slash => {
+                            vibex_core::AgentCommandTrigger::Slash
+                        }
+                        crate::composer::CompletionTrigger::At => {
+                            vibex_core::AgentCommandTrigger::Mention
+                        }
+                        crate::composer::CompletionTrigger::Dollar => {
+                            vibex_core::AgentCommandTrigger::Dollar
+                        }
+                    }),
+                    query: (!query.is_empty()).then_some(query),
+                    limit: Some(50),
+                };
+                let result = self.facade.agent().discover_agent_commands(request).await;
+                self.send(AppMessage::Completions(result.map(Box::new)));
             }
             Effect::CheckDrift => {}
             Effect::EditExternally { title, body } => {
@@ -922,6 +946,18 @@ impl Dispatch {
                 provider_options: None,
             },
         ))
+    }
+
+    /// The session the composer is composing into, used to scope discovery to
+    /// the right workspace and Agent.
+    async fn current_session(&self) -> Option<vibex_core::AgentSession> {
+        self.facade
+            .agent()
+            .list_sessions(false)
+            .await
+            .ok()?
+            .into_iter()
+            .next()
     }
 
     async fn current_session_token_usage(

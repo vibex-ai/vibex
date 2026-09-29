@@ -14,6 +14,7 @@ embeds the other product's assets.
 | Android mobile | Signed native GPUI APK + AAB | `pnpm package:mobile:android` locally; tagged workflow signs before upload | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, Gradle wrapper, Android API 35/NDK, release key | `pnpm check:mobile-native`, `apksigner`/`jarsigner` verification, APK/AAB checksum, device validation |
 | iOS mobile | Unsigned simulator app + XCFramework | `pnpm build:mobile:ios` on macOS | Rust source, Cargo lock, pinned gpui-pre/gpui-pre-mobile revisions, XcodeGen project | `pnpm check:mobile-native`, simulator/device validation and signing pipeline |
 | Relay | Transport container | `pnpm smoke:relay:local` plus deployment scripts | Rust source and Cargo lock | Health/API smoke, TLS/NAT/operator validation |
+| Terminal (TUI) | Ships inside the desktop packages as a second, non-main `vibex` binary | Same package commands as the desktop channel | Same as the desktop channel | The binary must be reachable on `PATH` after install on Linux and macOS, and the console subsystem must be verified on Windows. |
 
 ## Linux AppImage Packaging Rules
 
