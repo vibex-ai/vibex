@@ -29201,16 +29201,17 @@ impl VibexWorkbench {
 
     /// Opens find on whichever surface holds the keyboard.
     ///
-    /// The file editor binds the same chord for its own find, but a workbench
-    /// binding is registered after the component's and so outranks it: with a
-    /// file editor focused, the conversation's find opened over the file the
-    /// user was reading. Find follows focus — the editor answers for itself
-    /// here, and only a conversation that actually has the keyboard falls
-    /// through to the session search.
+    /// The file editor and the embedded browser bind the same chord for their
+    /// own find, but a workbench binding is registered after the component's
+    /// and so outranks it: with a file editor focused, the conversation's find
+    /// opened over the file the user was reading. Find follows focus — those
+    /// surfaces answer for themselves here, and only a conversation that
+    /// actually has the keyboard falls through to the session search.
     fn open_conversation_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let code_workbench = self.code_workbench.clone();
         if code_workbench.update(cx, |workbench, cx| {
             workbench.open_focused_editor_find(window, cx)
+                || workbench.open_focused_browser_find(window, cx)
         }) {
             return;
         }

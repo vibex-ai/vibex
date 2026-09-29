@@ -1829,6 +1829,44 @@ impl CodeWorkbench {
         true
     }
 
+    /// The browser panel that holds the keyboard, if this workbench draws it.
+    ///
+    /// Find follows focus for the browser too: the panel answers for itself
+    /// instead of letting the conversation's find open over the page. A panel
+    /// that is off screen — hidden or detached — answers for nobody, the same
+    /// rule [`Self::focused_editor`] applies.
+    pub(crate) fn focused_browser_surface(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<BrowserSurface>> {
+        if self.preview_detached || !self.preview_visible {
+            return None;
+        }
+        self.browser_surfaces
+            .iter()
+            .filter(|(browser_tab_id, _)| {
+                self.active_browser_surface_ids
+                    .contains(browser_tab_id.as_str())
+            })
+            .find(|(_, surface)| surface.read(cx).owns_keyboard(window, cx))
+            .map(|(_, surface)| surface.clone())
+    }
+
+    /// Opens the focused browser panel's own find bar. Returns whether one took
+    /// the request; `false` leaves the chord to the conversation behind it.
+    pub(crate) fn open_focused_browser_find(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(surface) = self.focused_browser_surface(window, cx) else {
+            return false;
+        };
+        surface.update(cx, |surface, cx| surface.open_find(window, cx));
+        true
+    }
+
     pub(crate) fn set_workspace_surface_visibility(
         &mut self,
         files_visible: bool,
@@ -2909,12 +2947,6 @@ impl CodeWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) {
-            return;
-        }
-        let Some(initial_dir) = self.local_workspace_root.clone() else {
-            return;
-        };
         let workbench = cx.weak_entity();
         let on_pick: DirectoryPickHandler = Arc::new(move |path, window, cx| {
             workbench
@@ -2923,6 +2955,77 @@ impl CodeWorkbench {
                 })
                 .unwrap_or(false)
         });
+        self.open_file_picker_dialog(
+            locale::text("Open file", "打开文件", "開啟檔案"),
+            on_pick,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens this workbench's file browser for a page's file chooser.
+    ///
+    /// A headless browser has no native dialog, so the page's `<input
+    /// type=file>` is answered from here: the confirmed path travels back to
+    /// the panel, which hands it to the runtime exactly as `browser_upload`
+    /// does. The listing starts at the project directory, which is where a page
+    /// being developed usually wants its files from.
+    fn open_browser_upload_picker(
+        &mut self,
+        browser_tab_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workbench = cx.weak_entity();
+        let on_pick: DirectoryPickHandler = Arc::new(move |path, _window, cx| {
+            workbench
+                .update(cx, |workbench, cx| {
+                    workbench.upload_browser_file(&browser_tab_id, path, cx)
+                })
+                .unwrap_or(false)
+        });
+        self.open_file_picker_dialog(
+            locale::text(
+                "Choose a file for the page",
+                "为页面选择文件",
+                "為頁面選擇檔案",
+            ),
+            on_pick,
+            window,
+            cx,
+        );
+    }
+
+    /// Hands one chosen file to the browser tab whose page asked for it.
+    fn upload_browser_file(
+        &mut self,
+        browser_tab_id: &str,
+        path: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(surface) = self.browser_surfaces.get(browser_tab_id).cloned() else {
+            return false;
+        };
+        surface.update(cx, |surface, cx| {
+            surface.upload_file(PathBuf::from(path), cx)
+        });
+        true
+    }
+
+    /// Opens the project's file browser over the window that asked for it.
+    fn open_file_picker_dialog(
+        &mut self,
+        title: &'static str,
+        on_pick: DirectoryPickHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(initial_dir) = self.local_workspace_root.clone() else {
+            return;
+        };
         let dialog_view = cx.new(|cx| {
             DirectoryPickerDialog::new_file_picker(
                 locale::current_locale_mode(),
@@ -2932,7 +3035,6 @@ impl CodeWorkbench {
                 cx,
             )
         });
-        let title = locale::text("Open file", "打开文件", "開啟檔案");
         let viewport = window.viewport_size();
         let dialog_width = (f32::from(viewport.width) - 48.0).clamp(420.0, 640.0);
         let dialog_height = (f32::from(viewport.height) - 48.0).clamp(1.0, 520.0);
@@ -4800,6 +4902,12 @@ impl CodeWorkbench {
                 if let BrowserSurfaceEvent::CaptureQualityChanged(quality) = event {
                     workbench.apply_browser_capture_quality(*quality, cx);
                 }
+                // A page's file chooser is a native dialog the headless browser
+                // does not have; the panel borrows this workbench's file
+                // browser to answer it.
+                if let BrowserSurfaceEvent::FileChooserPickRequested { tab_id } = event {
+                    workbench.open_browser_upload_picker(tab_id.as_str().to_string(), window, cx);
+                }
             },
         );
         self.browser_surface_subscriptions
@@ -5100,6 +5208,35 @@ impl CodeWorkbench {
             vibex_browser::BrowserServiceEvent::FileChooserOpened(tab_id) => {
                 self.update_browser_surface(&tab_id, cx, |surface, cx| {
                     surface.show_file_chooser(&tab_id, cx)
+                });
+            }
+            // Downloads are invisible in a headless browser: the panel shows
+            // the progress and the saved path, and a refused save is said out
+            // loud rather than looking like a click that did nothing.
+            vibex_browser::BrowserServiceEvent::Download(download) => {
+                if download.state == vibex_browser::BrowserDownloadState::Blocked {
+                    let message =
+                        locale::text("Download blocked: ", "下载已被阻止：", "下載已被阻止：");
+                    window.push_notification(
+                        hint_notification(
+                            NotificationType::Warning,
+                            format!(
+                                "{message}{} — {}",
+                                download.file_name,
+                                locale::text(
+                                    "turn on “Allow downloads” in Settings to let pages save files.",
+                                    "在设置中开启“允许下载”后，页面才能保存文件。",
+                                    "在設定中開啟「允許下載」後，頁面才能儲存檔案。",
+                                ),
+                            ),
+                            cx,
+                        ),
+                        cx,
+                    );
+                }
+                let tab_id = download.tab_id.clone();
+                self.update_browser_surface(&tab_id, cx, |surface, cx| {
+                    surface.show_download((*download).clone(), cx)
                 });
             }
             // The execution source flips under the panel — a human took over, or
@@ -20598,6 +20735,97 @@ mod tests {
             workbench.update(cx, |this, cx| this.open_focused_editor_find(window, cx))
         });
         assert!(!delegated, "an unfocused editor leaves the chord alone");
+    }
+
+    /// The browser panel answers the find chord the same way a file does.
+    ///
+    /// An embedded browser and a conversation share the screen, and the
+    /// conversation claims Ctrl+F. With the caret in the page, the chord has to
+    /// open the panel's own find bar — the conversation's find over a web page
+    /// searches the wrong thing.
+    #[gpui::test]
+    fn the_find_chord_reaches_the_focused_browser_panel(cx: &mut gpui::TestAppContext) {
+        let (workbench, cx) = fixture_workbench(cx);
+        restore_browser_layout(&workbench, cx, "browser_tab_find", Some("about:blank"));
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_browser_transport(
+                Some(std::sync::Arc::new(IdleBrowserTransport::default())),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let surface = workbench.read_with(cx, |workbench, _| {
+            workbench
+                .browser_surfaces
+                .values()
+                .next()
+                .cloned()
+                .expect("the restored tab has a surface")
+        });
+        let focus = surface.read_with(cx, |surface, cx| surface.focus_handle(cx));
+        cx.update(|window, cx| focus.focus(window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.open_focused_browser_find(window, cx)
+            })
+        });
+        assert!(delegated, "a focused page takes the find chord");
+        assert!(
+            surface.read_with(cx, |surface, _| surface.find_bar_open()),
+            "the panel's own find bar opens, not the conversation's"
+        );
+
+        // A panel the user collapsed keeps the focus handle until something
+        // else takes focus; the chord belongs to the conversation then.
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(false, cx);
+        });
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.open_focused_browser_find(window, cx)
+            })
+        });
+        assert!(
+            !delegated,
+            "a browser that is not on screen never answers the chord"
+        );
+
+        // A detached panel is drawn by its own window, so this column must not
+        // answer for it either.
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_visible(true, cx);
+            workbench.set_preview_detached(true, cx);
+        });
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.open_focused_browser_find(window, cx)
+            })
+        });
+        assert!(!delegated, "the detached host answers for its own panel");
+
+        // And neither does a visible panel that does not hold the keyboard.
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_preview_detached(false, cx);
+            workbench.set_preview_visible(true, cx);
+        });
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        let delegated = cx.update(|window, cx| {
+            workbench.update(cx, |workbench, cx| {
+                workbench.open_focused_browser_find(window, cx)
+            })
+        });
+        assert!(!delegated, "an unfocused page leaves the chord alone");
     }
 
     #[test]

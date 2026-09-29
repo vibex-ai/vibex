@@ -76,6 +76,12 @@ pub enum BrowserServiceEvent {
     DialogClosed(BrowserTabId),
     /// A page requested a file chooser.
     FileChooserOpened(BrowserTabId),
+    /// A download started, moved, finished or was refused.
+    ///
+    /// The panel renders these as a download popup: what is arriving, how far
+    /// along it is, where it landed — or that downloads are off, which is the
+    /// only answer a page gets then.
+    Download(Box<BrowserDownload>),
     /// A tab appeared because the page opened one — `target="_blank"` or
     /// `window.open` — exactly as it would in a real browser. The panel opens a
     /// preview tab for it.
@@ -582,6 +588,40 @@ pub(crate) struct DownloadsState {
     pub(crate) pending: HashMap<String, PendingDownload>,
 }
 
+/// One download the panel can show.
+///
+/// The guid is Chrome's, and is what identifies a download across its progress
+/// events: the suggested name is not unique, two saves of `report.pdf` are two
+/// downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserDownload {
+    /// Chrome's identifier for this download.
+    pub guid: String,
+    pub tab_id: BrowserTabId,
+    /// The sanitized name the runtime will write, not the page's suggestion.
+    pub file_name: String,
+    pub url: String,
+    pub received_bytes: u64,
+    /// Zero until Chrome reports a size; the panel shows a busy bar then.
+    pub total_bytes: u64,
+    pub state: BrowserDownloadState,
+    /// Where the finished file landed.
+    pub path: Option<PathBuf>,
+}
+
+/// Where one download stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserDownloadState {
+    /// Chrome is writing the file.
+    InProgress,
+    /// The file is in the runtime's download directory.
+    Completed,
+    /// Chrome gave up on the download.
+    Canceled,
+    /// Downloads are turned off, so the runtime refused to write anything.
+    Blocked,
+}
+
 /// One download Chrome has announced.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingDownload {
@@ -589,6 +629,8 @@ pub(crate) struct PendingDownload {
     pub(crate) session_id: String,
     pub(crate) file_name: String,
     pub(crate) url: String,
+    pub(crate) received_bytes: u64,
+    pub(crate) total_bytes: u64,
 }
 
 /// The runtime's download directory under its data home.
@@ -2468,6 +2510,10 @@ pub(crate) async fn cdp(
 /// runtime keeps control of the final name: it renames the file once the
 /// download completes. `allow` would let the page's own suggested name reach
 /// the disk, which is exactly the filename the policy exists to sanitize.
+///
+/// Events stay on while downloads are denied. They are how the runtime learns
+/// that a page tried to save something: without them the refusal was silent,
+/// and a click that produced no file and no message read as a broken panel.
 fn download_behavior(enabled: bool, dir: &Path) -> Value {
     if enabled {
         json!({
@@ -2476,7 +2522,7 @@ fn download_behavior(enabled: bool, dir: &Path) -> Value {
             "eventsEnabled": true,
         })
     } else {
-        json!({ "behavior": "deny", "eventsEnabled": false })
+        json!({ "behavior": "deny", "eventsEnabled": true })
     }
 }
 
@@ -3422,6 +3468,9 @@ async fn push_console(
 /// The name is decided here, not by the page: `sanitize_download_filename`
 /// keeps the write inside the runtime's download directory, and the guid Chrome
 /// actually writes under is only an implementation detail of the rename.
+///
+/// A refused download is announced too — the page gets no file either way, and
+/// the human is the only one who can turn the policy on.
 async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
     let Some(guid) = params.get("guid").and_then(Value::as_str) else {
         return;
@@ -3453,8 +3502,22 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
     let record = {
         let mut downloads = inner.downloads.lock().await;
         if !downloads.enabled {
-            // The behaviour was already denied at the browser; a page that
-            // started a download anyway is not written anywhere.
+            // The behaviour was already denied at the browser, so nothing is
+            // written. The panel is told anyway: a click that saves nothing
+            // and says nothing looks like the panel is broken.
+            drop(downloads);
+            let _ = inner
+                .events
+                .send(BrowserServiceEvent::Download(Box::new(BrowserDownload {
+                    guid: guid.to_string(),
+                    tab_id,
+                    file_name,
+                    url,
+                    received_bytes: 0,
+                    total_bytes: 0,
+                    state: BrowserDownloadState::Blocked,
+                    path: None,
+                })));
             return;
         }
         downloads.pending.insert(
@@ -3464,6 +3527,8 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
                 session_id: session_id.clone(),
                 file_name: file_name.clone(),
                 url: url.clone(),
+                received_bytes: 0,
+                total_bytes: 0,
             },
         );
         download_record(
@@ -3477,9 +3542,24 @@ async fn handle_download_will_begin(inner: &Arc<BrowserInner>, params: &Value) {
         )
     };
     inner.state.lock().await.push_ledger(record);
+    let _ = inner
+        .events
+        .send(BrowserServiceEvent::Download(Box::new(BrowserDownload {
+            guid: guid.to_string(),
+            tab_id,
+            file_name,
+            url,
+            received_bytes: 0,
+            total_bytes: 0,
+            state: BrowserDownloadState::InProgress,
+            path: None,
+        })));
 }
 
 /// Moves a finished download into place and records it.
+///
+/// Progress events are forwarded as they arrive; only the terminal ones write a
+/// ledger row or move the file.
 async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
     let Some(guid) = params.get("guid").and_then(Value::as_str) else {
         return;
@@ -3488,6 +3568,40 @@ async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
         .get("state")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let received_bytes = params
+        .get("receivedBytes")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0) as u64;
+    let total_bytes = params
+        .get("totalBytes")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0) as u64;
+    if state_name == "inProgress" {
+        let download = {
+            let mut downloads = inner.downloads.lock().await;
+            let Some(pending) = downloads.pending.get_mut(guid) else {
+                return;
+            };
+            pending.received_bytes = received_bytes;
+            pending.total_bytes = total_bytes;
+            BrowserDownload {
+                guid: guid.to_string(),
+                tab_id: pending.tab_id.clone(),
+                file_name: pending.file_name.clone(),
+                url: pending.url.clone(),
+                received_bytes,
+                total_bytes,
+                state: BrowserDownloadState::InProgress,
+                path: None,
+            }
+        };
+        let _ = inner
+            .events
+            .send(BrowserServiceEvent::Download(Box::new(download)));
+        return;
+    }
     if state_name != "completed" && state_name != "canceled" {
         return;
     }
@@ -3499,21 +3613,22 @@ async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
     let Some(pending) = pending else {
         return;
     };
-    let (summary, status) = if state_name == "completed" {
+    let (summary, status, state, path) = if state_name == "completed" {
         // The guid is what Chrome wrote; the reader gets the sanitized name.
-        let _ = tokio::fs::rename(
-            dir.join(guid),
-            unique_download_path(&dir, &pending.file_name),
-        )
-        .await;
+        let destination = unique_download_path(&dir, &pending.file_name);
+        let _ = tokio::fs::rename(dir.join(guid), &destination).await;
         (
             format!("saved a download as {}", pending.file_name),
             vibex_core::BrowserOperationStatus::Verified,
+            BrowserDownloadState::Completed,
+            Some(destination),
         )
     } else {
         (
             format!("a download of {} was canceled", pending.file_name),
             vibex_core::BrowserOperationStatus::Failed,
+            BrowserDownloadState::Canceled,
+            None,
         )
     };
     let record = download_record(
@@ -3524,6 +3639,22 @@ async fn handle_download_progress(inner: &Arc<BrowserInner>, params: &Value) {
         &pending.url,
     );
     inner.state.lock().await.push_ledger(record);
+    let _ = inner
+        .events
+        .send(BrowserServiceEvent::Download(Box::new(BrowserDownload {
+            guid: guid.to_string(),
+            tab_id: pending.tab_id,
+            file_name: pending.file_name,
+            url: pending.url,
+            received_bytes: if state == BrowserDownloadState::Completed {
+                total_bytes.max(pending.received_bytes)
+            } else {
+                pending.received_bytes
+            },
+            total_bytes: total_bytes.max(pending.total_bytes),
+            state,
+            path,
+        })));
 }
 
 /// Builds the ledger row a download produces.
@@ -3818,8 +3949,8 @@ mod tests {
         let dir = std::path::Path::new("/tmp/vibex-downloads");
         assert_eq!(
             download_behavior(false, dir),
-            json!({ "behavior": "deny", "eventsEnabled": false }),
-            "a page never chooses a write path"
+            json!({ "behavior": "deny", "eventsEnabled": true }),
+            "a page never chooses a write path, and a refused save is still announced"
         );
         assert_eq!(
             download_behavior(true, dir),

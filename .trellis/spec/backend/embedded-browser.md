@@ -110,7 +110,10 @@ agent acts on and what the user sees cannot diverge.
    page cannot drop a file where a later build step would pick it up — and the
    runtime renames Chrome's guid to `sanitize_download_filename`'s answer, so
    the page influences the name and nothing else. Two downloads of the same name
-   are two files (`unique_download_path`), never one overwritten file.
+   are two files (`unique_download_path`), never one overwritten file. Events
+   stay enabled while downloads are denied: a refused save is announced as
+   `BrowserDownloadState::Blocked` so the panel can prompt the reader, instead of
+   a click that silently produces nothing.
 
 10. **The browser service is polled inside the Tokio runtime, always.**
    `BrowserService` is a Tokio citizen: it spawns Chrome, opens async pipes,
@@ -427,12 +430,12 @@ page. Each one needs a panel-side answer:
 | Missing surface | What the panel does |
 | --- | --- |
 | JS dialogs (`alert`/`confirm`/`prompt`/`beforeunload`) | card from `DialogOpened`, answered through `handle_dialog` |
-| File chooser | card from `FileChooserOpened`; the Agent attaches files with `browser_upload`, the human cancels through `resolve_file_chooser` |
+| File chooser | card from `FileChooserOpened`; the human's "Choose file" opens the workbench's own file browser and the confirmed path goes through `resolve_file_chooser`, while the Agent attaches files with `browser_upload`; cancelling sends an empty list |
 | `<select>` popup | `probe_select_hint` on hover, then the panel's own list; `select_menu_at` / `choose_select_option` apply the choice and dispatch `input` + `change` |
-| Clipboard | Ctrl/Cmd+C reads the selection with `selection_text` and writes the system clipboard; Ctrl/Cmd+V types the system clipboard into the page with `Input.insertText`; Shift/Alt combinations stay with the page |
-| Downloads | denied by default; when allowed, `Browser.setDownloadBehavior` is `allowAndName` into the runtime's own directory and `Browser.downloadWillBegin` / `Browser.downloadProgress` rename the guid to the sanitized name. Both events are browser-level, so they are dispatched *before* the session-id early return in the event pump |
+| Clipboard | Ctrl/Cmd+C reads the selection with `selection_text` and writes the system clipboard; Ctrl/Cmd+X does the same before letting the page cut, so the text is not stranded in Chrome's clipboard; Ctrl/Cmd+V types the system clipboard into the page with `Input.insertText`; Shift/Alt combinations stay with the page |
+| Downloads | denied by default; when allowed, `Browser.setDownloadBehavior` is `allowAndName` into the runtime's own directory and `Browser.downloadWillBegin` / `Browser.downloadProgress` rename the guid to the sanitized name. Both events are browser-level, so they are dispatched *before* the session-id early return in the event pump. The panel renders `Download` events as a popup with a progress bar and the saved path, and a refused save (events stay on under `deny`) becomes a `Blocked` row plus a notification |
 | Permissions, HTTP auth | denied by Chrome itself (see Security rules) |
-| Find in page | no browser UI exists, so the panel owns Ctrl/Cmd+F. `find_in_page` walks text nodes and paints with the CSS Custom Highlight API, never by wrapping hits in `<mark>`: a foreign node inside a framework's tree makes its next render throw. The active hit is marked with one attribute because Chrome will not scroll to a bare range |
+| Find in page | no browser UI exists, so the panel owns Ctrl/Cmd+F. The chord is claimed before focus is consulted, so the host asks the focused surface first: `CodeWorkbench::open_focused_editor_find` / `open_focused_browser_find` answer for the file or page under the caret, and only a conversation that really has the keyboard opens the session search. `find_in_page` walks text nodes and paints with the CSS Custom Highlight API, never by wrapping hits in `<mark>`: a foreign node inside a framework's tree makes its next render throw. The active hit is marked with one attribute because Chrome will not scroll to a bare range |
 | Mouse cursor | a frame carries no cursor, so `cursor_at` reads `getComputedStyle(el).cursor` at the hovered point and the panel maps it onto a native shape (`cursor_style_for`). Throttled to one probe per round trip; a keyword the platform cannot express falls back to the arrow |
 | Frame quality | JPEG 80 by default; the panel's HD toggle restarts the screencast as lossless PNG (`BrowserCaptureQuality`). The choice is a preference, so the panels follow each other and it survives a restart |
 
@@ -451,6 +454,14 @@ Two input translations are easy to get wrong and are pinned by tests:
   a `mouseMoved` into a drag; without it a scrollbar drag, a text selection, a
   slider and an HTML5 drop all die at the first move. `BrowserInput::MouseMove`
   carries the mask, filled from `MouseMoveEvent::dragging()`.
+- **Space and Enter are keys *and* characters.** A `rawKeyDown` produces no
+  character at all — a space never reached a text field and Enter never broke a
+  line in a textarea — so `key_input` sends them as `keyDown` with the text
+  Chrome would have generated (`page_key_text`), and the panel claims the
+  keystroke so the platform's text path cannot insert it twice. Other printable
+  characters still travel the text path only. F5/Ctrl+R reload, Ctrl+L focuses
+  the address bar, and Ctrl/Cmd+C/X/V are the panel's (`browser_command`,
+  `clipboard_command`).
 
 ## Approvals
 
@@ -531,8 +542,14 @@ The same live test also covers the shell fallbacks, because each of them is only
 real against a browser: the page's own selection comes back through
 `selection_text`; a rendered `<select>` is found by point, its options read, a
 choice applied and read back; a 401 settles the tab instead of hanging it; and
-geolocation resolves to a denial. `browser_surface::tests` holds the pure parts —
-which keystrokes mean copy and paste, how close a click must be to a probed
-point, dialog cards belonging to their own tab. `management::tests` and
-`desktop-runtime` pin the per-Agent delivery copy, and `desktop-model` pins that
-an old UI-state file reads as "notice not accepted".
+geolocation resolves to a denial. Downloads are covered there too — an allowed
+one reports progress and the path it landed at, a refused one is announced as
+`Blocked` with nothing written — and a chosen file is handed to the page's
+`<input type=file>` through `resolve_file_chooser`. `browser_surface::tests`
+holds the pure parts — which keystrokes mean copy, cut and paste, which keys
+carry a character, the browser commands a page never sees, how close a click
+must be to a probed point, dialog cards and download rows belonging to their own
+tab. `code_workbench::tests` pins the find chord reaching the focused editor or
+browser panel and staying with the conversation when neither holds the keyboard.
+`management::tests` and `desktop-runtime` pin the per-Agent delivery copy, and
+`desktop-model` pins that an old UI-state file reads as "notice not accepted".

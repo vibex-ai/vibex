@@ -36,6 +36,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
+    progress::Progress,
     v_flex,
 };
 use image::Frame;
@@ -147,6 +148,9 @@ pub enum BrowserSurfaceEvent {
     /// The reader switched the encoder from the toolbar, so the choice should
     /// outlive this surface and reach the settings that own it.
     CaptureQualityChanged(BrowserCaptureQuality),
+    /// The reader asked to choose the file a page's file chooser is waiting
+    /// for. The host owns the file browser that answers it.
+    FileChooserPickRequested { tab_id: BrowserTabId },
 }
 
 /// A GPUI surface for one browser tab.
@@ -181,8 +185,6 @@ pub struct BrowserSurface {
     /// with it.
     orphans: Option<OrphanTextures>,
     frame_metadata: BrowserFrameMetadata,
-    frame_sequence: u64,
-    dropped_frames: u64,
     /// Panel-space bounds of the frame, used to convert pointer positions.
     frame_bounds: Option<Bounds<Pixels>>,
     /// Encoded pixel size of the current frame.
@@ -197,6 +199,13 @@ pub struct BrowserSurface {
     dialog: Option<BrowserDialogRequest>,
     prompt_input: String,
     file_chooser_pending: bool,
+    /// Downloads this tab has announced, newest last.
+    ///
+    /// The panel is the only place a headless download can be watched: Chrome
+    /// has no shelf of its own, so progress and the saved path are shown here.
+    downloads: Vec<vibex_browser::BrowserDownload>,
+    /// The timer that takes finished downloads off the screen.
+    downloads_hide_task: Option<Task<()>>,
     /// A `<select>` under the pointer, whose popup headless Chrome never paints.
     ///
     /// Probed on hover rather than on click: the panel forwards the click it
@@ -324,8 +333,6 @@ impl BrowserSurface {
             pending_drop: Vec::new(),
             orphans: None,
             frame_metadata: BrowserFrameMetadata::default(),
-            frame_sequence: 0,
-            dropped_frames: 0,
             frame_bounds: None,
             frame_pixel_size: (0.0, 0.0),
             last_applied_viewport: None,
@@ -336,6 +343,8 @@ impl BrowserSurface {
             recording: false,
             prompt_input: String::new(),
             file_chooser_pending: false,
+            downloads: Vec::new(),
+            downloads_hide_task: None,
             select_hint: None,
             select_menu: None,
             hover_cursor: gpui::CursorStyle::Arrow,
@@ -674,10 +683,12 @@ impl BrowserSurface {
         if let Some(previous) = self.frame_image.take() {
             self.pending_drop.push(previous);
         }
-        self.frame_sequence = 0;
-        self.dropped_frames = 0;
         self.dialog = None;
         self.file_chooser_pending = false;
+        // The next tab's downloads are its own; a card left over from the last
+        // one would report progress for a page that is gone.
+        self.downloads.clear();
+        self.downloads_hide_task = None;
         self.phase = if self.tab_id.is_some() {
             SurfacePhase::Connecting
         } else {
@@ -814,12 +825,11 @@ impl BrowserSurface {
                             async move { decode_frame(&bytes) }
                         })
                         .await;
-                    let dropped = stream.dropped_frames();
                     let Ok(decoded) = decoded else {
                         continue;
                     };
                     let alive = this.update(cx, |surface, cx| {
-                        surface.accept_frame(frame, decoded, dropped);
+                        surface.accept_frame(frame, decoded);
                         cx.notify();
                     });
                     if alive.is_err() {
@@ -849,7 +859,7 @@ impl BrowserSurface {
         }));
     }
 
-    fn accept_frame(&mut self, frame: BrowserFrame, image: DecodedFrame, dropped: u64) {
+    fn accept_frame(&mut self, frame: BrowserFrame, image: DecodedFrame) {
         // Park the outgoing texture: `Window::drop_image` needs a window, which
         // only `render` has.
         if let Some(previous) = self.frame_image.take() {
@@ -858,8 +868,6 @@ impl BrowserSurface {
         self.frame_image = Some(Arc::new(RenderImage::new(vec![Frame::new(image.image)])));
         self.frame_pixel_size = (image.width as f32, image.height as f32);
         self.frame_metadata = frame.metadata;
-        self.frame_sequence = frame.sequence;
-        self.dropped_frames = dropped;
         self.phase = SurfacePhase::Live;
         self.message = None;
     }
@@ -988,12 +996,28 @@ impl BrowserSurface {
             cx.stop_propagation();
             return;
         }
-        // Copy and paste belong to the panel: headless Chrome has its own
+        // The browser's own keys are answered here: a page never sees F5,
+        // Ctrl+R or Ctrl+L, and headless Chrome has nowhere to reload or focus.
+        if browser_command(&event.keystroke) {
+            match event.keystroke.key.as_str() {
+                "f5" | "r" | "R" => self.reload(cx),
+                "l" | "L" => self.focus_address_bar(window, cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // Copy, cut and paste belong to the panel: headless Chrome has its own
         // clipboard, so forwarding the shortcut would copy into a buffer the
         // human can never reach.
         match clipboard_command(&event.keystroke) {
             Some(ClipboardCommand::Copy) => {
                 self.copy_selection(cx);
+                cx.stop_propagation();
+                return;
+            }
+            Some(ClipboardCommand::Cut) => {
+                self.cut_selection(&event.keystroke, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1117,6 +1141,40 @@ impl BrowserSurface {
         .detach();
     }
 
+    /// Cuts the page's selection into the system clipboard.
+    ///
+    /// The page performs the cut — that is the only way its own edit history
+    /// stays consistent — but it writes Chrome's clipboard, which the human
+    /// cannot paste from. The selection is read into the system clipboard
+    /// first, so the text is not lost between the two.
+    fn cut_selection(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
+            return;
+        };
+        let keystroke = keystroke.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(text) = transport.selection_text(&tab_id).await
+                && !text.is_empty()
+            {
+                let _ = this.update(cx, |_surface, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                });
+            }
+            let _ = this.update(cx, |surface, cx| {
+                if let Some(input) = key_input(&keystroke, "rawKeyDown") {
+                    surface.dispatch(input, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Puts the caret in the address bar, the way Ctrl+L does in a browser.
+    fn focus_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.address_input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
     /// Sends the system clipboard's text to the page as typed input.
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
@@ -1186,10 +1244,25 @@ impl BrowserSurface {
     }
 
     /// Opens the find bar and puts the caret in it.
-    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = true;
         window.focus(&self.find_input.read(cx).focus_handle(cx), cx);
         cx.notify();
+    }
+
+    /// Whether this panel holds the keyboard — the page, or a field of its own.
+    ///
+    /// The session's find shortcut is claimed before focus is consulted, so the
+    /// panel has to be able to say that the chord belongs to it: with the caret
+    /// in the page or in one of the toolbar fields, Ctrl+F is the page's find.
+    pub(crate) fn owns_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.focus.is_focused(window)
+            || self
+                .address_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self.find_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     /// Closes the find bar and takes its highlights off the page.
@@ -1504,6 +1577,29 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Hands the page the file the reader chose for its file chooser.
+    pub(crate) fn upload_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.tab_id.clone() else {
+            return;
+        };
+        if !self.file_chooser_pending {
+            return;
+        }
+        self.file_chooser_pending = false;
+        let Some(local) = self.local_browser() else {
+            cx.notify();
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let _ = local
+                    .run(local.service().resolve_file_chooser(&tab_id, &[path]))
+                    .await;
+            })
+            .detach();
+        cx.notify();
+    }
+
     /// Gives the Agent its control back after a human took over.
     ///
     /// The page may have moved on while the human was driving, so the Agent is
@@ -1535,6 +1631,121 @@ impl BrowserSurface {
         }
         self.file_chooser_pending = true;
         cx.notify();
+    }
+
+    /// Reflects a download the runtime announced for this tab.
+    ///
+    /// The same guid updates one row as it moves, so progress does not grow the
+    /// list one event at a time; the most recent few stay visible.
+    pub fn show_download(
+        &mut self,
+        download: vibex_browser::BrowserDownload,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_id.as_ref() != Some(&download.tab_id) {
+            return;
+        }
+        const MAX_DOWNLOADS_SHOWN: usize = 4;
+        match self
+            .downloads
+            .iter_mut()
+            .find(|shown| shown.guid == download.guid)
+        {
+            Some(shown) => *shown = download,
+            None => self.downloads.push(download),
+        }
+        if self.downloads.len() > MAX_DOWNLOADS_SHOWN {
+            let excess = self.downloads.len() - MAX_DOWNLOADS_SHOWN;
+            self.downloads.drain(..excess);
+        }
+        self.schedule_downloads_hide(cx);
+        cx.notify();
+    }
+
+    /// Takes the download card off the screen once nothing is still arriving.
+    ///
+    /// Chrome's own bubble disappears the same way: a progress bar is worth
+    /// watching, and a list of files saved an hour ago is not worth owning a
+    /// corner of the page.
+    fn schedule_downloads_hide(&mut self, cx: &mut Context<Self>) {
+        const DOWNLOAD_NOTICE_LINGER: Duration = Duration::from_secs(12);
+        self.downloads_hide_task = None;
+        if self.downloads.is_empty()
+            || self
+                .downloads
+                .iter()
+                .any(|download| download.state == vibex_browser::BrowserDownloadState::InProgress)
+        {
+            return;
+        }
+        self.downloads_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DOWNLOAD_NOTICE_LINGER).await;
+            let _ = this.update(cx, |surface, cx| {
+                surface.downloads_hide_task = None;
+                // Only what has finished goes: a download that started while
+                // the timer ran is still worth its progress bar.
+                surface.downloads.retain(|download| {
+                    download.state == vibex_browser::BrowserDownloadState::InProgress
+                });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The download popup: what is arriving, and where it went.
+    fn render_downloads(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.downloads.is_empty() {
+            return None;
+        }
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(self.downloads.len());
+        for (index, download) in self.downloads.iter().enumerate() {
+            rows.push(render_download_row(index, download, cx));
+        }
+        Some(
+            v_flex()
+                .id("browser-downloads")
+                .absolute()
+                .right(px(12.0))
+                .bottom(px(12.0))
+                .w(px(320.0))
+                .gap_1()
+                .p_2()
+                .rounded_lg()
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(cx.theme().border)
+                .shadow_md()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(locale::text("Downloads", "下载", "下載")),
+                        )
+                        .child(
+                            Button::new("browser-downloads-dismiss")
+                                .icon(Icon::new(IconName::Close))
+                                .ghost()
+                                .xsmall()
+                                .tooltip(locale::text(
+                                    "Hide the download list",
+                                    "隐藏下载列表",
+                                    "隱藏下載列表",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.downloads.clear();
+                                    this.downloads_hide_task = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     fn render_frame(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1866,34 +2077,10 @@ impl BrowserSurface {
     }
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // The field follows the page until the reader takes it over, which is
-        // how every browser address bar behaves.
-        let page_url = self
-            .tab
-            .as_ref()
-            .map(|tab| tab.url.clone())
-            .unwrap_or_default();
-        let typed = self.address_input.read(cx).value().to_string();
-        let display_address = if typed.trim().is_empty() {
-            page_url
-        } else {
-            typed
-        };
-        let display_address = if display_address.chars().count() > 120 {
-            format!("{}…", display_address.chars().take(120).collect::<String>())
-        } else {
-            display_address
-        };
-        let status = self
-            .tab
-            .as_ref()
-            .map(|tab| tab.title.clone())
-            .unwrap_or_default();
         // Chrome's three buttons: back and forward follow the tab's own history,
         // reload is always available.
         let can_go_back = self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
         let can_go_forward = self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
-        let _ = display_address;
         h_flex()
             .id("browser-toolbar")
             .flex_none()
@@ -1974,35 +2161,6 @@ impl BrowserSurface {
                         this.set_capture_quality(next, cx);
                         cx.emit(BrowserSurfaceEvent::CaptureQualityChanged(next));
                     }))
-            })
-            .when(!status.is_empty(), |this| {
-                this.child(
-                    div()
-                        .max_w(px(200.0))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .truncate()
-                        .child(status),
-                )
-            })
-            // TEMPORARY DIAGNOSTIC: the sequence of the frame on screen, so a
-            // frozen picture can be told apart from a stalled stream without
-            // attaching a debugger. Remove once the report is settled.
-            .when(self.frame_sequence > 0, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("#{}", self.frame_sequence)),
-                )
-            })
-            .when(self.dropped_frames > 0, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("-{}", self.dropped_frames)),
-                )
             })
             .into_any_element()
     }
@@ -2107,6 +2265,12 @@ impl BrowserSurface {
     #[cfg(test)]
     pub(crate) fn render_recording_banner_for_test(&self) -> bool {
         self.recording
+    }
+
+    /// Whether the find bar is open, for tests.
+    #[cfg(test)]
+    pub(crate) fn find_bar_open(&self) -> bool {
+        self.find_open
     }
 
     /// Why an Alt+click could not be mapped, said where the human clicked.
@@ -2422,6 +2586,10 @@ impl BrowserSurface {
         if !self.file_chooser_pending {
             return None;
         }
+        // A paired runtime's browser has no local file picker this panel could
+        // feed, so only the cancel affordance is offered there.
+        let can_choose = self.local_browser().is_some();
+        let tab_id = self.tab_id.clone();
         Some(
             v_flex()
                 .id("browser-file-chooser")
@@ -2450,28 +2618,186 @@ impl BrowserSurface {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(locale::text(
-                                    "A headless browser has no native file dialog. An Agent can \
-                                     attach files with the browser_upload tool, or you can cancel \
-                                     this request.",
-                                    "无头浏览器没有原生文件对话框。Agent 可以使用 browser_upload 工具附加文件，或者你也可以取消该请求。",
-                                    "無頭瀏覽器沒有原生檔案對話框。Agent 可以使用 browser_upload 工具附加檔案，或者你也可以取消該請求。",
+                                    "A headless browser has no native file dialog. Choose the file \
+                                     to attach it to the page, or cancel the request.",
+                                    "无头浏览器没有原生文件对话框。选择文件后会附加到页面，也可以取消该请求。",
+                                    "無頭瀏覽器沒有原生檔案對話框。選擇檔案後會附加到頁面，也可以取消該請求。",
                                 )),
                         )
                         .child(
-                            h_flex().w_full().justify_end().child(
-                                Button::new("browser-file-chooser-dismiss")
-                                    .label(locale::text("Cancel request", "取消请求", "取消請求"))
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_file_chooser(cx);
-                                    })),
-                            ),
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("browser-file-chooser-dismiss")
+                                        .label(locale::text(
+                                            "Cancel request",
+                                            "取消请求",
+                                            "取消請求",
+                                        ))
+                                        .ghost()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_file_chooser(cx);
+                                        })),
+                                )
+                                .when(can_choose, |this| {
+                                    this.child(
+                                        Button::new("browser-file-chooser-pick")
+                                            .label(locale::text(
+                                                "Choose file",
+                                                "选择文件",
+                                                "選擇檔案",
+                                            ))
+                                            .small()
+                                            .on_click(cx.listener(
+                                                move |_, _, _, cx| {
+                                                    let Some(tab_id) = tab_id.clone() else {
+                                                        return;
+                                                    };
+                                                    cx.emit(
+                                                        BrowserSurfaceEvent::FileChooserPickRequested {
+                                                            tab_id,
+                                                        },
+                                                    );
+                                                },
+                                            )),
+                                    )
+                                }),
                         ),
                 )
                 .into_any_element(),
         )
     }
+}
+
+/// A byte count the way a download list reads it.
+///
+/// Chrome reports exact bytes, and the reader wants the size, not the count:
+/// `3.4 MB` is an answer, `3565158 B` is a puzzle.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// One row of the download popup.
+///
+/// The name is what the reader asked for; under it the row says where the
+/// download stands — a bar while Chrome writes, the saved path once it is
+/// done, or why nothing was written at all.
+fn render_download_row(
+    index: usize,
+    download: &vibex_browser::BrowserDownload,
+    cx: &App,
+) -> AnyElement {
+    use vibex_browser::BrowserDownloadState;
+    let (icon, tone) = match download.state {
+        BrowserDownloadState::InProgress => (IconName::File, cx.theme().muted_foreground),
+        BrowserDownloadState::Completed => (IconName::CircleCheck, cx.theme().success),
+        BrowserDownloadState::Canceled => (IconName::CircleX, cx.theme().muted_foreground),
+        BrowserDownloadState::Blocked => (IconName::TriangleAlert, cx.theme().warning),
+    };
+    let detail: AnyElement = match download.state {
+        BrowserDownloadState::InProgress => {
+            // Chrome reports the total only once it has one; until then the bar
+            // is busy rather than pretending the download is at zero.
+            let known_total = download.total_bytes > 0;
+            let percent = if known_total {
+                (download.received_bytes as f32 / download.total_bytes as f32 * 100.0)
+                    .clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let label = if known_total {
+                format!(
+                    "{} / {}",
+                    format_bytes(download.received_bytes),
+                    format_bytes(download.total_bytes)
+                )
+            } else {
+                format_bytes(download.received_bytes)
+            };
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    Progress::new(format!("browser-download-{index}"))
+                        .value(percent)
+                        .loading(!known_total)
+                        .small(),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .into_any_element()
+        }
+        BrowserDownloadState::Completed => {
+            let saved_to = locale::text("Saved to ", "已保存到 ", "已儲存至 ");
+            div()
+                .w_full()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .truncate()
+                .child(match download.path.as_ref() {
+                    Some(path) => format!("{saved_to}{}", path.display()),
+                    None => saved_to.to_string(),
+                })
+                .into_any_element()
+        }
+        BrowserDownloadState::Canceled => div()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(locale::text("Canceled", "已取消", "已取消"))
+            .into_any_element(),
+        BrowserDownloadState::Blocked => div()
+            .text_xs()
+            .text_color(cx.theme().warning)
+            .child(locale::text(
+                "Blocked. Turn on “Allow downloads” in Settings to save files.",
+                "已被阻止。在设置中开启“允许下载”后才能保存文件。",
+                "已被阻止。在設定中開啟「允許下載」後才能儲存檔案。",
+            ))
+            .into_any_element(),
+    };
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap_2()
+        .py_1()
+        .child(Icon::new(icon).size(px(14.0)).text_color(tone))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .truncate()
+                        .child(download.file_name.clone()),
+                )
+                .child(detail),
+        )
+        .into_any_element()
 }
 
 /// A decoded frame ready to upload to the GPU.
@@ -2568,7 +2894,8 @@ struct PageKey {
 /// Identifies a named editing or navigation key.
 ///
 /// Only keys whose *identity* the page needs are listed. Printable characters
-/// stay on the text path below, which is where their characters come from.
+/// stay on the text path below, which is where their characters come from —
+/// except Space and Enter, which are named keys that also carry a character.
 fn named_page_key(key: &str) -> Option<PageKey> {
     let (key_name, code, virtual_key_code) = match key {
         "enter" => ("Enter", "Enter", 13),
@@ -2758,6 +3085,7 @@ fn select_hint_matches(hint: &SelectHint, x: f64, y: f64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardCommand {
     Copy,
+    Cut,
     Paste,
 }
 
@@ -2776,8 +3104,26 @@ fn clipboard_command(keystroke: &Keystroke) -> Option<ClipboardCommand> {
     }
     match keystroke.key.as_str() {
         "c" | "C" => Some(ClipboardCommand::Copy),
+        "x" | "X" => Some(ClipboardCommand::Cut),
         "v" | "V" => Some(ClipboardCommand::Paste),
         _ => None,
+    }
+}
+
+/// Whether a keystroke is a browser command the page must never see.
+///
+/// A real browser keeps F5, Ctrl+R and Ctrl+L for itself, so a page that binds
+/// them never sees them either; forwarding them here would both do nothing and
+/// hide the browser's own behaviour.
+fn browser_command(keystroke: &Keystroke) -> bool {
+    if keystroke.modifiers.alt || keystroke.modifiers.function {
+        return false;
+    }
+    let command = keystroke.modifiers.control || keystroke.modifiers.platform;
+    match keystroke.key.as_str() {
+        "f5" => true,
+        "r" | "R" | "l" | "L" => command && !keystroke.modifiers.shift,
+        _ => false,
     }
 }
 
@@ -2826,22 +3172,57 @@ fn is_find_shortcut(keystroke: &Keystroke) -> bool {
     matches!(keystroke.key.as_str(), "f" | "F")
 }
 
+/// Maps one GPUI keystroke onto the CDP key event the page receives.
+///
+/// Named keys and shortcuts whose identity matters travel this path; plain
+/// printable characters do not, because their text arrives through
+/// `EntityInputHandler` and `Input.insertText`. Sending them here as well would
+/// insert every character twice, and would push the raw letters of a CJK
+/// composition into the page. This mirrors how the terminal forwards keys.
+///
+/// Space and Enter are the exception: they are named keys *and* characters. A
+/// `rawKeyDown` for either produces no character at all — a space never reached
+/// a text field, and Enter never broke a line in a textarea — so both travel as
+/// `keyDown` with the text Chrome would have generated.
 fn key_input(keystroke: &Keystroke, event_type: &str) -> Option<BrowserInput> {
     let identity = named_page_key(keystroke.key.as_str()).or_else(|| {
         let shortcut =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
         shortcut.then(|| character_page_key(keystroke)).flatten()
     })?;
+    let text = (event_type == "rawKeyDown")
+        .then(|| page_key_text(keystroke))
+        .flatten();
     Some(BrowserInput::Key {
-        event_type: event_type.to_string(),
+        event_type: if text.is_some() {
+            "keyDown".to_string()
+        } else {
+            event_type.to_string()
+        },
         key: identity.key,
         code: identity.code.to_string(),
-        // The character travels on the text path, so the key event must not
-        // carry it or the page would receive it twice.
-        text: None,
+        // A key event with no character keeps `text` empty: the character
+        // travels on the text path, and sending it here too would insert it
+        // twice.
+        text: text.map(str::to_string),
         modifiers: mouse_modifiers(keystroke.modifiers),
         windows_key_code: identity.virtual_key_code,
     })
+}
+
+/// The character a named key generates, or `None` when it generates none.
+///
+/// Control, Alt and Meta suppress the character — Ctrl+Enter is a shortcut, not
+/// a newline — and only the keys that produce one carry text.
+fn page_key_text(keystroke: &Keystroke) -> Option<&'static str> {
+    if keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform {
+        return None;
+    }
+    match keystroke.key.as_str() {
+        "space" => Some(" "),
+        "enter" => Some("\r"),
+        _ => None,
+    }
 }
 
 fn mouse_modifiers(modifiers: gpui::Modifiers) -> i32 {
@@ -3021,6 +3402,7 @@ impl Render for BrowserSurface {
         let select_menu = self.render_select_menu(cx);
         let dialog = self.render_dialog(cx);
         let file_chooser = self.render_file_chooser(cx);
+        let downloads = self.render_downloads(cx);
         v_flex()
             .id("browser-surface")
             .track_focus(&self.focus)
@@ -3056,6 +3438,7 @@ impl Render for BrowserSurface {
             .when_some(select_menu, |this, menu| this.child(menu))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(file_chooser, |this, chooser| this.child(chooser))
+            .when_some(downloads, |this, downloads| this.child(downloads))
             .on_key_down(cx.listener(Self::on_page_key_down))
             .on_key_up(cx.listener(Self::on_page_key_up))
     }
@@ -3243,11 +3626,20 @@ mod tests {
             clipboard_command(&keystroke("v", Some("v"), command)),
             Some(ClipboardCommand::Paste)
         );
+        // Cut is the panel's as well: the page performs the cut, but only after
+        // the selection has reached the system clipboard.
+        assert_eq!(
+            clipboard_command(&keystroke("x", Some("x"), ctrl)),
+            Some(ClipboardCommand::Cut)
+        );
         // Paste-as-plain-text and AltGr combinations belong to the page.
         assert_eq!(clipboard_command(&keystroke("v", None, ctrl_shift)), None);
         assert_eq!(clipboard_command(&keystroke("v", None, ctrl_alt)), None);
         assert_eq!(clipboard_command(&keystroke("c", Some("c"), none)), None);
-        assert_eq!(clipboard_command(&keystroke("x", Some("x"), ctrl)), None);
+        assert_eq!(
+            clipboard_command(&keystroke("x", Some("x"), ctrl_shift)),
+            None
+        );
     }
 
     #[test]
@@ -3316,6 +3708,73 @@ mod tests {
             );
             surface.dismiss_dialog(&attached, cx);
             assert!(surface.dialog.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn downloads_land_on_their_own_tab_and_update_one_row(cx: &mut gpui::TestAppContext) {
+        use vibex_browser::{BrowserDownload, BrowserDownloadState};
+        let (surface, mut cx) = test_surface(cx);
+        let attached = BrowserTabId::new();
+        let other = BrowserTabId::new();
+        let download = |tab_id: &BrowserTabId,
+                        guid: &str,
+                        received: u64,
+                        state: BrowserDownloadState| BrowserDownload {
+            guid: guid.to_string(),
+            tab_id: tab_id.clone(),
+            file_name: "report.pdf".to_string(),
+            url: "https://example.com/report.pdf".to_string(),
+            received_bytes: received,
+            total_bytes: 4096,
+            state,
+            path: None,
+        };
+
+        surface.update(&mut cx, |surface, cx| {
+            surface.tab_id = Some(attached.clone());
+            // Another tab's download must not appear over this page.
+            surface.show_download(
+                download(&other, "g1", 0, BrowserDownloadState::InProgress),
+                cx,
+            );
+            assert!(surface.downloads.is_empty());
+
+            surface.show_download(
+                download(&attached, "g1", 1024, BrowserDownloadState::InProgress),
+                cx,
+            );
+            assert_eq!(surface.downloads.len(), 1);
+            // The same guid is one download moving, not a new row per event.
+            surface.show_download(
+                download(&attached, "g1", 4096, BrowserDownloadState::Completed),
+                cx,
+            );
+            assert_eq!(surface.downloads.len(), 1);
+            assert_eq!(surface.downloads[0].state, BrowserDownloadState::Completed);
+            assert_eq!(surface.downloads[0].received_bytes, 4096);
+
+            // A second download is a second row, and the card holds only the
+            // most recent few.
+            for index in 0..6 {
+                surface.show_download(
+                    download(
+                        &attached,
+                        &format!("g{index}"),
+                        index,
+                        BrowserDownloadState::InProgress,
+                    ),
+                    cx,
+                );
+            }
+            assert!(surface.downloads.len() <= 4);
+            assert_eq!(
+                surface
+                    .downloads
+                    .last()
+                    .map(|download| download.guid.as_str()),
+                Some("g5")
+            );
         });
     }
 
@@ -3400,22 +3859,37 @@ mod tests {
         )
     }
 
+    fn key_text(input: &vibex_browser::BrowserInput) -> Option<String> {
+        let vibex_browser::BrowserInput::Key { text, .. } = input else {
+            panic!("not a key input: {input:?}");
+        };
+        text.clone()
+    }
+
     #[test]
     fn editing_keys_reach_the_page_with_their_virtual_key_codes() {
         let none = gpui::Modifiers::default();
+        // Enter carries the newline; a `rawKeyDown` would insert nothing at
+        // all, which is how a textarea lost every line break.
         let enter = key_input(&keystroke("enter", None, none), "rawKeyDown").unwrap();
         assert_eq!(
             key_fields(&enter),
             (
-                "rawKeyDown".to_string(),
+                "keyDown".to_string(),
                 "Enter".to_string(),
                 "Enter".to_string(),
                 0,
                 13
             )
         );
+        assert_eq!(key_text(&enter).as_deref(), Some("\r"));
         let backspace = key_input(&keystroke("backspace", None, none), "rawKeyDown").unwrap();
         assert_eq!(key_fields(&backspace).4, 8);
+        assert_eq!(
+            key_text(&backspace),
+            None,
+            "Backspace edits, it types nothing"
+        );
         let delete = key_input(&keystroke("delete", None, none), "keyUp").unwrap();
         assert_eq!(key_fields(&delete).0, "keyUp");
         let arrow = key_input(&keystroke("left", None, none), "rawKeyDown").unwrap();
@@ -3431,6 +3905,48 @@ mod tests {
         );
         let function = key_input(&keystroke("f5", None, none), "rawKeyDown").unwrap();
         assert_eq!(key_fields(&function).4, 116);
+    }
+
+    #[test]
+    fn space_and_enter_carry_the_character_they_generate() {
+        let none = gpui::Modifiers::default();
+        let space = key_input(&keystroke("space", Some(" "), none), "rawKeyDown").unwrap();
+        assert_eq!(
+            key_fields(&space),
+            (
+                "keyDown".to_string(),
+                " ".to_string(),
+                "Space".to_string(),
+                0,
+                32
+            )
+        );
+        assert_eq!(key_text(&space).as_deref(), Some(" "));
+
+        // Shift only changes which character a key produces, not whether there
+        // is one; the character of Shift+Space is still a space.
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let shifted = key_input(&keystroke("space", Some(" "), shift), "rawKeyDown").unwrap();
+        assert_eq!(key_text(&shifted).as_deref(), Some(" "));
+        assert_eq!(key_fields(&shifted).0, "keyDown");
+
+        // A modifier makes it a shortcut: the page is told which key was
+        // pressed, not that a character was typed.
+        let control = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let shortcut = key_input(&keystroke("space", None, control), "rawKeyDown").unwrap();
+        assert_eq!(key_fields(&shortcut).0, "rawKeyDown");
+        assert_eq!(key_text(&shortcut), None);
+
+        // A key-up never carries text: only the press types.
+        let released = key_input(&keystroke("space", Some(" "), none), "keyUp").unwrap();
+        assert_eq!(key_fields(&released).0, "keyUp");
+        assert_eq!(key_text(&released), None);
     }
 
     #[test]
@@ -3452,7 +3968,7 @@ mod tests {
             )
         );
         // Alt+arrow and Shift+Enter are named keys, so they travel with their
-        // modifiers rather than through the text path.
+        // modifiers; Shift+Enter still carries the line break it generates.
         let alt_left = gpui::Modifiers {
             alt: true,
             ..Default::default()
@@ -3465,6 +3981,7 @@ mod tests {
         };
         let newline = key_input(&keystroke("enter", None, shift), "rawKeyDown").unwrap();
         assert_eq!(key_fields(&newline).3, 8);
+        assert_eq!(key_text(&newline).as_deref(), Some("\r"));
         // A shifted printable is a character, not a shortcut: it stays on the
         // text path, but its identity is still the key it was typed on.
         assert!(key_input(&keystroke("1", Some("!"), shift), "rawKeyDown").is_none());
@@ -3478,12 +3995,46 @@ mod tests {
     #[test]
     fn printable_keys_stay_on_the_text_path() {
         let none = gpui::Modifiers::default();
-        // Typing "a" or a space must not produce a key event: the character is
+        // Typing "a" or ";" must not produce a key event: the character is
         // committed through the input handler, and sending it here as well
         // would insert it twice (and leak raw keys from a CJK composition).
+        // Space and Enter are the two that cannot take that path — their
+        // characters are only produced by a `keyDown` carrying text.
         assert!(key_input(&keystroke("a", Some("a"), none), "rawKeyDown").is_none());
         assert!(key_input(&keystroke(";", Some(";"), none), "rawKeyDown").is_none());
         assert!(key_input(&keystroke("中", Some("中"), none), "rawKeyDown").is_none());
+    }
+
+    #[test]
+    fn the_panel_answers_the_browser_commands_a_page_never_sees() {
+        let none = gpui::Modifiers::default();
+        let control = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(browser_command(&keystroke("f5", None, none)));
+        assert!(browser_command(&keystroke("r", Some("r"), control)));
+        assert!(browser_command(&keystroke("l", Some("l"), control)));
+        // A page's own F5 is not a thing: a real browser claims it either way.
+        assert!(!browser_command(&keystroke("r", None, shift)));
+        assert!(!browser_command(&keystroke("f", Some("f"), control)));
+        assert!(!browser_command(&keystroke("r", None, none)));
+
+        // Cut is the panel's too: the page performs it, but the selection has
+        // to reach the system clipboard first or the text is lost.
+        assert_eq!(
+            clipboard_command(&keystroke("x", Some("x"), control)),
+            Some(ClipboardCommand::Cut)
+        );
+        assert_eq!(
+            clipboard_command(&keystroke("c", Some("c"), control)),
+            Some(ClipboardCommand::Copy)
+        );
+        assert_eq!(clipboard_command(&keystroke("x", None, shift)), None);
     }
 
     #[test]

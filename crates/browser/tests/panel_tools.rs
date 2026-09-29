@@ -25,7 +25,8 @@ fn serve_page() -> u16 {
 <p id=third>needle three</p>\
 <a id=link href='/nowhere' style='position:fixed;bottom:0;left:0;width:200px;height:40px;display:block'>a link</a>\
 <a id=dl href='/download' download='re:port?.txt' \
-style='position:fixed;bottom:0;right:0;width:200px;height:40px;display:block'>save file</a>";
+style='position:fixed;bottom:0;right:0;width:200px;height:40px;display:block'>save file</a>\
+<input id=up type=file style='position:fixed;top:200px;left:300px;width:200px;height:40px'>";
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -312,4 +313,217 @@ fn tool_context(session_id: &vibex_core::BrowserSessionId) -> vibex_browser::Bro
         tier: vibex_core::BrowserToolTier::Fine,
         approved_origins: Vec::new(),
     }
+}
+
+/// Waits for the next download event, so the assertions below never race the
+/// browser's own progress reports.
+async fn next_download(
+    events: &mut tokio::sync::broadcast::Receiver<vibex_browser::BrowserServiceEvent>,
+    deadline: Instant,
+) -> Option<vibex_browser::BrowserDownload> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(vibex_browser::BrowserServiceEvent::Download(download))) => {
+                return Some((*download).clone());
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => return None,
+        }
+    }
+}
+
+/// Clicks the fixture page's download link.
+async fn click_download_link(
+    service: &BrowserService,
+    session_id: &vibex_core::BrowserSessionId,
+    tab: &vibex_core::BrowserTabId,
+) {
+    let clicked = service
+        .call_tool(
+            &tool_context(session_id),
+            "browser_click_by_name",
+            &serde_json::json!({
+                "tab_id": tab.as_str(),
+                "name": "save file",
+                "role": "link",
+            }),
+        )
+        .await;
+    assert!(
+        !clicked.is_error,
+        "the download link is clicked: {}",
+        clicked.text
+    );
+}
+
+/// A download the reader allowed reports its progress and where it landed.
+///
+/// The panel has no browser shelf to fall back on: without these events a
+/// download was a silent write to a directory the reader never saw.
+#[tokio::test]
+async fn an_allowed_download_reports_progress_and_its_saved_path() {
+    let Some((service, home, session_id, tab)) = service_with_page().await else {
+        return;
+    };
+    let _home = home;
+    service.set_downloads_enabled(true).await;
+    let mut events = service.subscribe();
+
+    click_download_link(&service, &session_id, &tab).await;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut started = None;
+    let mut completed = None;
+    while let Some(download) = next_download(&mut events, deadline).await {
+        match download.state {
+            vibex_browser::BrowserDownloadState::InProgress if started.is_none() => {
+                started = Some(download);
+            }
+            vibex_browser::BrowserDownloadState::Completed => {
+                completed = Some(download);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let started = started.expect("a download announces that it started");
+    assert_eq!(
+        started.file_name, "re_port_.txt",
+        "the runtime names the file"
+    );
+    assert_eq!(
+        started.tab_id, tab,
+        "the download belongs to the tab that started it"
+    );
+    let completed = completed.expect("a download announces that it finished");
+    let path = completed
+        .path
+        .as_ref()
+        .expect("a completed download names the file on disk");
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("re_port_.txt")
+    );
+    assert!(path.is_file(), "the announced path is the file that landed");
+    assert_eq!(
+        completed.total_bytes, 5,
+        "the size Chrome reported travels with the event"
+    );
+    assert_eq!(completed.received_bytes, 5);
+    service.shutdown().await;
+}
+
+/// The file a page's chooser is given is the file the page receives.
+///
+/// The panel's own "Choose file" button ends in this same call: a headless
+/// browser has no native dialog, so `DOM.setFileInputFiles` is the only way a
+/// human's answer ever reaches the `<input type=file>`.
+#[tokio::test]
+async fn a_chosen_file_reaches_the_pages_file_input() {
+    let Some((service, home, session_id, tab)) = service_with_page().await else {
+        return;
+    };
+    let chosen = home.path().join("chosen.txt");
+    std::fs::write(&chosen, b"picked by the reader").expect("the chosen file");
+    let mut events = service.subscribe();
+
+    // The page opens its chooser; the runtime intercepts it and the panel's
+    // card is what answers instead of a native dialog. The click travels as a
+    // real mouse event: a scripted `click()` has no user activation, and Chrome
+    // refuses to open a chooser without one.
+    for input in [
+        vibex_browser::BrowserInput::MouseDown {
+            x: 400.0,
+            y: 220.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+        vibex_browser::BrowserInput::MouseUp {
+            x: 400.0,
+            y: 220.0,
+            button: "left".to_string(),
+            click_count: 1,
+            modifiers: 0,
+        },
+    ] {
+        service
+            .dispatch_input(&tab, input)
+            .await
+            .expect("the click reaches the page");
+    }
+    service.resume_agent_operations(&session_id).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut announced = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Ok(vibex_browser::BrowserServiceEvent::FileChooserOpened(opened))) => {
+                assert_eq!(opened, tab);
+                announced = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(announced, "the page's file chooser reaches the panel");
+
+    service
+        .resolve_file_chooser(&tab, std::slice::from_ref(&chosen))
+        .await
+        .expect("the chosen path is applied to the page");
+    let files = service
+        .call_tool(
+            &tool_context(&session_id),
+            "browser_evaluate",
+            &serde_json::json!({
+                "tab_id": tab.as_str(),
+                "script": "document.getElementById('up').files.length",
+            }),
+        )
+        .await;
+    assert!(!files.is_error, "the page answers: {}", files.text);
+    assert!(
+        files.text.contains('1'),
+        "the page's input holds the chosen file: {}",
+        files.text
+    );
+    service.shutdown().await;
+}
+
+/// A refused download is announced instead of silently doing nothing.
+#[tokio::test]
+async fn a_refused_download_is_announced() {
+    let Some((service, home, session_id, tab)) = service_with_page().await else {
+        return;
+    };
+    let _home = home;
+    let downloads = service.downloads_dir().await;
+    assert!(!service.downloads_enabled().await);
+    let mut events = service.subscribe();
+
+    click_download_link(&service, &session_id, &tab).await;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let blocked = loop {
+        let Some(download) = next_download(&mut events, deadline).await else {
+            panic!("a refused download still reaches the panel");
+        };
+        if download.state == vibex_browser::BrowserDownloadState::Blocked {
+            break download;
+        }
+    };
+    assert_eq!(blocked.tab_id, tab);
+    assert_eq!(blocked.file_name, "re_port_.txt");
+    assert!(blocked.path.is_none(), "nothing was written for a refusal");
+    let written = std::fs::read_dir(&downloads)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(written, 0, "a denied download leaves no file behind");
+    service.shutdown().await;
 }

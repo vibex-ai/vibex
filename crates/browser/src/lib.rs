@@ -44,7 +44,7 @@ pub use mcp::{
     BrowserPermissionDecision, issue_session_token, verify_session_token,
 };
 pub use service::{
-    BrowserFavicon, BrowserFrameSubscription, BrowserInput, BrowserSelectMenu, BrowserSelectOption,
-    BrowserService, BrowserServiceConfig, BrowserServiceEvent, BrowserSessionKey,
-    BrowserToolContext, BrowserToolOutcome,
+    BrowserDownload, BrowserDownloadState, BrowserFavicon, BrowserFrameSubscription, BrowserInput,
+    BrowserSelectMenu, BrowserSelectOption, BrowserService, BrowserServiceConfig,
+    BrowserServiceEvent, BrowserSessionKey, BrowserToolContext, BrowserToolOutcome,
 };
