@@ -143,3 +143,16 @@ run("cargo", [
   "warnings"
 ]);
 run("cargo", ["test", "--workspace", "--locked"]);
+// The PTY layer drives the real binary through a real pseudo-terminal, which
+// needs the harness entry point. It is built only here, so a normal build does
+// not carry a second binary.
+run("cargo", [
+  "test",
+  "--package",
+  "vibex-tui",
+  "--features",
+  "pty-harness",
+  "--test",
+  "pty",
+  "--locked"
+]);

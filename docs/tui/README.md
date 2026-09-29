@@ -145,7 +145,17 @@ Every one of these has a defined behaviour rather than a broken screen:
 cargo test -p vibex-tui
 ```
 
-Three layers: pure state-machine tests over the reducer, render assertions
-against `TestBackend` at four terminal sizes, and contract tests that pin the
-dependency boundary, the key tables, the locale coverage and the absence of
-secret-shaped copy.
+Four layers:
+
+| Layer | Command | What it proves |
+| --- | --- | --- |
+| Reducer | `cargo test -p vibex-tui --lib` | the intent → effect mapping is a pure function |
+| Render | `cargo test -p vibex-tui --test render` | layout degrades at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
+| Contract | `cargo test -p vibex-tui --test contracts` | dependency boundary, key tables, locale coverage, no secret-shaped copy |
+| PTY | `cargo test -p vibex-tui --features pty-harness --test pty` | the real binary enters raw mode, paints a first frame, writes **zero bytes when idle**, restores the terminal on exit, and survives a resize storm |
+
+The PTY layer is the only one that can catch a failure outside the renderer.
+The idle test is the `idle_cost` contract from the design report: after startup
+settles, a client with nothing to do must not touch the terminal at all.
+
+`pnpm check:rust` runs all four.

@@ -144,5 +144,13 @@ is never a column count.
 | Reducer unit tests | the intent → effect mapping is a pure function; key sequences drive state |
 | `TestBackend` render tests | layout degrades correctly at 80×24 / 100×30 / 120×40 / 200×50, CJK wraps, colour-less mode still reads |
 | Contract tests | dependency boundary, key tables, locale coverage, no secret-shaped copy, docs exist per page |
+| PTY end-to-end | the real binary enters raw mode, paints a first frame, writes zero bytes when idle, restores the terminal on exit, survives a resize storm |
 
-`cargo test -p vibex-tui` runs all three.
+`cargo test -p vibex-tui` runs the first three. The PTY layer needs the harness
+entry point, so it runs as
+`cargo test -p vibex-tui --features pty-harness --test pty`; `pnpm check:rust`
+covers both.
+
+The idle assertion is load-bearing: it is the measured form of "no animation and
+no events means no frames". A startup notice legitimately repaints while it is
+visible, so the test settles first and only then measures.

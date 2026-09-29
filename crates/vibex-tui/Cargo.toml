@@ -31,8 +31,20 @@ vibex-markdown = { path = "../vibex-markdown", default-features = false }
 vibex-terminal-ui = { path = "../vibex-terminal-ui" }
 vibex-ui = { path = "../vibex-ui", default-features = false }
 
+[features]
+# Builds the harness binary the PTY tests drive. Off by default so a normal
+# build does not ship a second entry point.
+pty-harness = []
+
 [dev-dependencies]
+anyhow.workspace = true
 crossterm.workspace = true
+portable-pty.workspace = true
 ratatui.workspace = true
 tempfile = "3"
 vibex-git = { path = "../git" }
+
+[[bin]]
+name = "vibex-tui-harness"
+path = "src/bin/harness.rs"
+required-features = ["pty-harness"]

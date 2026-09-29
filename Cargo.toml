@@ -63,6 +63,8 @@ crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 unicode-bidi = "0.3"
+# The PTY harness drives the real binary through a real pseudo-terminal.
+portable-pty = "0.9"
 uuid = { version = "1", features = ["serde", "v4", "js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
