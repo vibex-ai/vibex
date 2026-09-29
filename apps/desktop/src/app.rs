@@ -28,8 +28,8 @@ use gpui::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
     Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowId, WindowOptions, canvas, div, fill, img, linear_color_stop, linear_gradient, point,
-    prelude::*, px, relative, rgb, size,
+    WindowId, WindowOptions, div, img, linear_color_stop, linear_gradient, point, prelude::*, px,
+    relative, rgb, size,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName, IndexPath,
@@ -48,9 +48,10 @@ use gpui_component::{
     h_flex,
     input::{
         Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
-        Escape as InputEscape, IndentInline as InputIndentInline, Input, InputEvent, InputState,
-        MoveDown as InputMoveDown, MoveLeft as InputMoveLeft, MoveRight as InputMoveRight,
-        MoveUp as InputMoveUp, Paste as InputPaste, Textarea, TextareaState,
+        Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
+        InlineTokenClickEvent, Input, InputEvent, InputState, MoveDown as InputMoveDown,
+        MoveLeft as InputMoveLeft, MoveRight as InputMoveRight, MoveUp as InputMoveUp,
+        Paste as InputPaste, Textarea, TextareaState,
     },
     kbd::Kbd,
     marker::{Marker, MarkerIcon},
@@ -118,7 +119,7 @@ use vibex_core::{
 use vibex_desktop_model::{
     AgentOrderEntry, AgentOrdering, AgentPlanProjection, AgentSortStrategy, AppearanceUiState,
     BrowserSearchEngine, BrowserStartPage, BrowserUiState, ComposerAttachment,
-    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerToken, ComposerTrigger,
+    ComposerQueueSendMode, ComposerSuggestionSelection, ComposerTrigger,
     DEFAULT_EDITOR_AUTOSAVE_DELAY_MS, DEFAULT_NETWORK_PROXY_BYPASS, DesktopBehaviorUiState,
     DesktopUiStateV1, DeveloperUiState, EditorAutosaveMode, GitSelectionKey, GitWorkbenchMode,
     LocaleMode, MAX_EDITOR_AUTOSAVE_DELAY_MS, MIN_EDITOR_AUTOSAVE_DELAY_MS, MessageSendKey,
@@ -137,7 +138,7 @@ use vibex_desktop_model::{
     TimelineFollowState, TimelineModel, TimelineProcessActivityGroup, TimelineRow, TimelineRowKind,
     UiStateStore, UnifiedDiffLineKind, WorkbenchRoute, WorkspaceContextProjection,
     WorkspaceLayoutState, WorkspaceStateScope, WorktreeLifecycleDisplayState,
-    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order, composer_tokens,
+    active_collaborations, clamp_editor_autosave_delay_ms, complete_string_order,
     composer_trigger_at, current_active_goal, current_agent_plan, custom_worktree_path_is_absolute,
     has_managed_child_agent_delegations, move_string_relative, move_strings_relative,
     ordered_agent_ids, parse_unified_diff, sidebar_project_custom_logo_file_is_valid,
@@ -1354,117 +1355,6 @@ fn reveal_composer_cursor_after_layout(input: Entity<TextareaState>, window: &mu
             });
         });
     });
-}
-
-/// How strongly a `/`, `@` or `$` token is tinted inside the composer.
-///
-/// The tint is the text colour itself, so the glyphs keep their exact colour
-/// and only the surface behind them changes. That is what lets one quad over
-/// the text read as a chip under it, and it keeps the contrast between the
-/// chip and the composer surface the same in every theme: the fill is derived
-/// from the ink, not from a surface token a theme may set equal to the
-/// composer's own background.
-const COMPOSER_TOKEN_CHIP_OPACITY: f32 = 0.14;
-/// Rounding of that tint, at the small end of the scale: a token belongs to
-/// the text line, not to the control family around it.
-const COMPOSER_TOKEN_CHIP_RADIUS: f32 = 4.0;
-
-/// Paint the highlight over every `/`, `@` or `$` token a composer shows.
-///
-/// Tokens are ranges inside one editable text rather than elements of their
-/// own: the caret has to move into a token and edit it like any other
-/// character, so the highlight cannot own the glyphs it marks. The textarea is
-/// the only thing that knows where a byte range landed, and it records that
-/// while it paints — which is why this runs from an element that follows the
-/// textarea in the child list and paints over it, rather than from one that
-/// paints under it and would read the previous frame's positions.
-fn paint_composer_token_chips(input: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
-    let chip = cx.theme().foreground.opacity(COMPOSER_TOKEN_CHIP_OPACITY);
-    let chips = {
-        let state = input.read(cx);
-        // The input's own frame, not the slot around it: a scrolled composer
-        // must not paint a chip into the space its text has scrolled out of.
-        composer_token_chip_bounds(state, state.input_bounds())
-    };
-    for bounds in chips {
-        window.paint_quad(fill(bounds, chip).corner_radii(px(COMPOSER_TOKEN_CHIP_RADIUS)));
-    }
-}
-
-/// The element that paints a composer's token highlight.
-///
-/// It must stay after the textarea in the child list: see
-/// [`paint_composer_token_chips`].
-fn composer_token_highlight(input: &Entity<TextareaState>) -> impl IntoElement {
-    let input = input.clone();
-    canvas(
-        |_, _, _| (),
-        move |_, _, window, cx| paint_composer_token_chips(&input, window, cx),
-    )
-    .absolute()
-    .inset_0()
-}
-
-/// The box each `/`, `@` or `$` token occupies, clipped to what is visible.
-fn composer_token_chip_bounds(state: &TextareaState, clip: Bounds<Pixels>) -> Vec<Bounds<Pixels>> {
-    let Some(line_height) = state.line_height() else {
-        return Vec::new();
-    };
-    let text = state.text().to_string();
-    composer_tokens(&text)
-        .iter()
-        .flat_map(|token| composer_token_line_bounds(state, &text, token, line_height))
-        .map(|bounds| bounds.intersect(&clip))
-        .filter(|bounds| bounds.size.width > px(0.0) && bounds.size.height > px(0.0))
-        .collect()
-}
-
-/// One box per visual line a token occupies.
-///
-/// `range_to_bounds` answers with a single box spanning a range's first and
-/// last glyph, which would cover everything between them once a long token
-/// wraps. The longest prefix that still fits on one line is measured first,
-/// then the rest of the token from where that prefix ended, so a wrapped
-/// mention is highlighted on each of its lines instead of boxed across them.
-fn composer_token_line_bounds(
-    state: &TextareaState,
-    text: &str,
-    token: &ComposerToken,
-    line_height: Pixels,
-) -> Vec<Bounds<Pixels>> {
-    let Some(token_bounds) = state.range_to_bounds(&token.byte_range) else {
-        // Scrolled out of view: nothing to paint, and no per-line work to do.
-        return Vec::new();
-    };
-    if token_bounds.size.height <= line_height + px(0.5) {
-        return vec![token_bounds];
-    }
-    let token_text = &text[token.byte_range.clone()];
-    let single_line = |start: usize, end: usize| {
-        state
-            .range_to_bounds(&(token.byte_range.start + start..token.byte_range.start + end))
-            .filter(|bounds| bounds.size.height <= line_height + px(0.5))
-    };
-    let mut boundaries: Vec<usize> = token_text.char_indices().map(|(index, _)| index).collect();
-    boundaries.push(token_text.len());
-    let mut bounds = Vec::new();
-    let mut first = 0;
-    while first + 1 < boundaries.len() {
-        let (mut low, mut high) = (first + 1, boundaries.len() - 1);
-        let mut last = first + 1;
-        while low <= high {
-            let middle = low + (high - low) / 2;
-            if single_line(boundaries[first], boundaries[middle]).is_some() {
-                last = middle;
-                low = middle + 1;
-            } else {
-                high = middle - 1;
-            }
-        }
-        bounds.extend(single_line(boundaries[first], boundaries[last]));
-        first = last;
-    }
-    bounds
 }
 
 fn composer_runtime_controls_are_compact(viewport_width: u32) -> bool {
@@ -20387,16 +20277,10 @@ impl VibexWorkbench {
         let Some(trigger) = composer_trigger_for_selection(&value, selection) else {
             return;
         };
-        let start_byte = character_offset_to_byte(&value, trigger.character_range.start);
-        let end_byte = character_offset_to_byte(&value, trigger.character_range.end);
-        let mut replacement = String::with_capacity(value.len() + entry.insertion_text.len());
-        replacement.push_str(&value[..start_byte]);
-        replacement.push_str(&entry.insertion_text);
-        replacement.push_str(&value[end_byte..]);
-        let cursor = start_byte + entry.insertion_text.len();
+        let range = character_offset_to_byte(&value, trigger.character_range.start)
+            ..character_offset_to_byte(&value, trigger.character_range.end);
         input.update(cx, |input, cx| {
-            input.replace_all(replacement, window, cx);
-            input.set_selected_range(cursor..cursor, cx);
+            replace_composer_trigger(input, &entry, range, window, cx);
             input.focus(window, cx);
         });
         match target {
@@ -23747,13 +23631,42 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(path) = attachment.path.clone() else {
+            return;
+        };
+        self.open_workspace_reference_in_tab(&path, window, cx);
+    }
+
+    /// Open the workspace file a composer token refers to.
+    ///
+    /// A mention chip answers a click the way the same path in an attachment
+    /// does: the workspace it belongs to comes forward and the file opens in a
+    /// tab. Tokens that name no file — a `/command`, a `$skill` — have nothing
+    /// to open and leave the click alone.
+    fn open_composer_token_reference(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = composer_token_reference_path(id) else {
+            return;
+        };
+        let path = path.to_string();
+        self.open_workspace_reference_in_tab(&path, window, cx);
+    }
+
+    fn open_workspace_reference_in_tab(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace_root) = self.composer_attachment_workspace_root() else {
             return;
         };
-        let Some(path) = agent_file_operation_preview_path(
-            attachment.path.as_deref().unwrap_or_default(),
-            Some(workspace_root.as_str()),
-        ) else {
+        let Some(path) = agent_file_operation_preview_path(path, Some(workspace_root.as_str()))
+        else {
             return;
         };
         if let Some(workspace) = self
@@ -42178,11 +42091,20 @@ impl VibexWorkbench {
                                                     .child(
                                                         Textarea::new(&self.new_session_input)
                                                             .appearance(false)
-                                                            .h_full(),
+                                                            .h_full()
+                                                            .on_token_click(cx.listener(
+                                                                |this,
+                                                                 event: &InlineTokenClickEvent,
+                                                                 window,
+                                                                 cx| {
+                                                                    this.open_composer_token_reference(
+                                                                        event.token().id(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
                                                     )
-                                                    .child(composer_token_highlight(
-                                                        &self.new_session_input,
-                                                    )),
                                             )
                                     )
                             .child(
@@ -52745,9 +52667,20 @@ impl VibexWorkbench {
                                                     .disabled(!enabled)
                                                     .when(self.composer_expanded, |this| {
                                                         this.h_full()
-                                                    }),
+                                                    })
+                                                    .on_token_click(cx.listener(
+                                                        |this,
+                                                         event: &InlineTokenClickEvent,
+                                                         window,
+                                                         cx| {
+                                                            this.open_composer_token_reference(
+                                                                event.token().id(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
                                             )
-                                            .child(composer_token_highlight(&composer_input)),
                                     )
                                     .child(
                                         v_flex()
@@ -57346,6 +57279,74 @@ fn character_offset_to_byte(text: &str, offset: usize) -> usize {
         .nth(offset)
         .map(|(index, _)| index)
         .unwrap_or(text.len())
+}
+
+/// The token id prefix a file mention carries, so a click can find the path
+/// again without holding on to the entry that produced it.
+///
+/// The rest of the id is the workspace-relative path the mention names.
+const COMPOSER_FILE_TOKEN_PREFIX: &str = "reference:file:";
+
+/// The atomic token an accepted suggestion inserts, or `None` when the entry
+/// inserts prose instead of a reference.
+///
+/// A picked `/command`, `@file` or `$skill` is a reference the Agent resolves,
+/// so it goes in as one editing unit: the caret steps over it, backspace
+/// deletes it whole, and the chip shows the entry's own name while the document
+/// keeps the exact text the Agent is sent. A quick phrase inserts a paragraph —
+/// prose, not a reference — and stays ordinary text. The entry has to be a
+/// single word after its trigger for the same reason: a mention that spans
+/// whitespace could not be one unit.
+fn composer_token_for_entry(entry: &AgentCommandEntry) -> Option<InlineToken> {
+    let text = entry.insertion_text.trim_end();
+    let mut characters = text.chars();
+    if !matches!(characters.next(), Some('/' | '@' | '$')) || characters.any(char::is_whitespace) {
+        return None;
+    }
+    Some(InlineToken::new(entry.id.clone(), text).with_label(entry.label.clone()))
+}
+
+/// The workspace path a composer token points at, when it points at a file.
+fn composer_token_reference_path(id: &str) -> Option<&str> {
+    id.strip_prefix(COMPOSER_FILE_TOKEN_PREFIX)
+}
+
+/// Write an accepted suggestion over the range its trigger occupies.
+///
+/// A reference goes in atomically, and the separator the entry carries lands
+/// after it as ordinary text: the token owns the mention alone, so the chip
+/// never swallows the space that follows it, while the document still reads
+/// exactly as it did before tokens existed. A plain-text insertion replaces the
+/// whole range in one edit so the caret and the undo history stay where the
+/// typing path leaves them.
+fn replace_composer_trigger(
+    input: &mut TextareaState,
+    entry: &AgentCommandEntry,
+    range: Range<usize>,
+    window: &mut Window,
+    cx: &mut Context<TextareaState>,
+) {
+    if let Some(token) = composer_token_for_entry(entry) {
+        let token_text = token.text().clone();
+        if input
+            .replace_range_with_token(range.clone(), token, window, cx)
+            .is_ok()
+        {
+            let separator = &entry.insertion_text[token_text.len()..];
+            if !separator.is_empty() {
+                input.replace(separator, window, cx);
+            }
+            return;
+        }
+    }
+    let value = input.value().to_string();
+    let mut replacement = String::with_capacity(value.len() + entry.insertion_text.len());
+    replacement.push_str(&value[..range.start]);
+    replacement.push_str(&entry.insertion_text);
+    replacement.push_str(&value[range.end..]);
+    input.replace_all(replacement, window, cx);
+    let cursor = range.start + entry.insertion_text.len();
+    input.set_selected_range(cursor..cursor, cx);
 }
 
 fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)> {
@@ -70914,44 +70915,236 @@ mod tests {
         }
     }
 
-    /// Lays a composer textarea out at a chosen size, so the boxes the token
-    /// highlight derives from a real layout can be measured.
-    struct ComposerTokenGeometryProbe {
+    /// A composer textarea in a window, so an accepted suggestion can be
+    /// written into a real editing state and read back.
+    struct ComposerTokenProbe {
         input: Entity<TextareaState>,
-        width: Pixels,
     }
 
-    impl Render for ComposerTokenGeometryProbe {
+    impl Render for ComposerTokenProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Narrow enough that the path a mention inserts cannot fit as text,
+            // so the test can tell the chip's box from the run it replaced.
             div()
-                .w(self.width)
+                .w(px(160.0))
                 .h(px(240.0))
                 .child(Textarea::new(&self.input).appearance(false).size_full())
         }
     }
 
-    /// The chips a composer would paint for `text`, next to the boxes the
-    /// tokens themselves occupy in the same layout.
-    fn composer_token_geometry(
-        window: &mut Window,
-        cx: &mut App,
-        input: &Entity<TextareaState>,
+    /// A composer window holding `text`, and its input.
+    fn composer_token_window<'a>(
         text: &str,
-    ) -> (Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>, Pixels) {
-        input.update(cx, |input, cx| input.set_value(text, window, cx));
-        // The input records its layout while it paints, so a frame has to be
-        // drawn before any byte range has a position.
-        let _ = window.draw(cx);
-        let _ = window.draw(cx);
-        let state = input.read(cx);
-        let laid_out = state.text().to_string();
-        let expected = composer_tokens(&laid_out)
-            .iter()
-            .filter_map(|token| state.range_to_bounds(&token.byte_range))
-            .collect();
-        let chips = composer_token_chip_bounds(state, state.input_bounds());
-        let line_height = state.line_height().expect("a drawn input has a line");
-        (chips, expected, line_height)
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<TextareaState>, &'a mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let input_slot: Rc<RefCell<Option<Entity<TextareaState>>>> = Rc::new(RefCell::new(None));
+        let input_slot_for_view = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+            *input_slot_for_view.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerTokenProbe {
+                input: input.clone(),
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("composer input should be created with the root view");
+        (input, cx)
+    }
+
+    /// A picked reference is one editing unit.
+    ///
+    /// The composer keeps the exact text the Agent is sent, the token spans the
+    /// mention alone — never the separator the entry carries — and one
+    /// backspace at its end deletes the whole thing instead of one character.
+    #[gpui::test]
+    fn an_accepted_reference_becomes_one_atomic_token(cx: &mut TestAppContext) {
+        let (input, cx) = composer_token_window("@app", cx);
+        let mention = "@apps/desktop/src/app.rs";
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        entry.id = format!("{COMPOSER_FILE_TOKEN_PREFIX}apps/desktop/src/app.rs");
+        entry.label = "@app.rs".into();
+        entry.insertion_text = format!("{mention} ");
+        entry.reference_path = Some("apps/desktop/src/app.rs".into());
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                replace_composer_trigger(input, &entry, 0..4, window, cx);
+            });
+        });
+
+        let (text, tokens) = input.read_with(cx, |input, _| {
+            (input.value().to_string(), input.tokens().to_vec())
+        });
+        assert_eq!(
+            text,
+            format!("{mention} "),
+            "the document keeps the text the Agent is sent"
+        );
+        assert_eq!(tokens.len(), 1, "the mention is one token");
+        assert_eq!(tokens[0].range(), 0..mention.len());
+        assert_eq!(
+            tokens[0].token().label().as_ref(),
+            "@app.rs",
+            "the chip shows the entry's own name, not the path it was typed as"
+        );
+        assert_eq!(
+            composer_token_reference_path(tokens[0].token().id()),
+            Some("apps/desktop/src/app.rs"),
+            "a click can find the file from the token alone"
+        );
+
+        // The kit lays a token out as the one chip it is, so the composer draws
+        // a short name where the document holds a path: the box stays on one
+        // line although the path could not.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (box_, line_height) = input.read_with(cx, |input, _| {
+            (
+                input.range_to_bounds(&(0..mention.len())),
+                input.line_height().expect("a drawn input has a line"),
+            )
+        });
+        let box_ = box_.expect("the mention should be laid out as a token");
+        assert!(
+            box_.size.height <= line_height + px(0.5),
+            "the chip is one line, not a wrapped path: {box_:?}"
+        );
+
+        // The proof that it is atomic: one backspace at the token's end takes
+        // the mention and leaves the separator behind.
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_selected_range(mention.len()..mention.len(), cx);
+                input.focus(window, cx);
+            });
+            window.dispatch_action(Box::new(InputBackspace), cx);
+        });
+        assert_eq!(
+            input.read_with(cx, |input, _| input.value().to_string()),
+            " ",
+            "one backspace deletes the whole mention"
+        );
+
+        // The same text without the token, for contrast: the chip is what keeps
+        // a path this long on one line.
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.set_value(mention, window, cx));
+            let _ = window.draw(cx);
+        });
+        let plain = input
+            .read_with(cx, |input, _| input.range_to_bounds(&(0..mention.len())))
+            .expect("the text should be laid out");
+        assert!(
+            plain.size.height > line_height + px(0.5),
+            "the same path as text wraps, so the one-line chip is the token's own box: {plain:?}"
+        );
+    }
+
+    /// Prose is not a reference, so a quick phrase stays ordinary text.
+    #[gpui::test]
+    fn a_quick_phrase_inserts_prose_without_a_token(cx: &mut TestAppContext) {
+        let (input, cx) = composer_token_window("/rev", cx);
+        let body = "review the working tree and summarize every risky change";
+        let mut entry = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            None,
+        );
+        entry.id = "phrase:review".into();
+        entry.label = body.into();
+        entry.insertion_text = body.into();
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                replace_composer_trigger(input, &entry, 0..4, window, cx);
+            });
+        });
+
+        input.read_with(cx, |input, _| {
+            assert_eq!(input.value().as_ref(), body);
+            assert!(
+                input.tokens().is_empty(),
+                "a phrase is prose, and prose is not one editing unit"
+            );
+            assert_eq!(
+                input.selected_range(),
+                body.len()..body.len(),
+                "the caret lands after the insertion"
+            );
+        });
+    }
+
+    /// Only an insertion that is a single triggered word is a reference.
+    #[test]
+    fn only_a_triggered_single_word_becomes_a_token() {
+        let mut command = command_entry(
+            AgentCommandSourceKind::Provider,
+            AgentCommandTrigger::Slash,
+            Some("review"),
+        );
+        command.insertion_text = "/review ".into();
+        assert_eq!(
+            composer_token_for_entry(&command).map(|token| token.text().to_string()),
+            Some("/review".to_string())
+        );
+
+        let mut mention = command_entry(
+            AgentCommandSourceKind::Reference,
+            AgentCommandTrigger::Mention,
+            None,
+        );
+        mention.insertion_text = "@src/main.rs ".into();
+        assert_eq!(
+            composer_token_for_entry(&mention).map(|token| token.text().to_string()),
+            Some("@src/main.rs".to_string())
+        );
+
+        let mut phrase = command_entry(
+            AgentCommandSourceKind::Prompt,
+            AgentCommandTrigger::Slash,
+            None,
+        );
+        phrase.insertion_text = "summarize the diff".into();
+        assert!(
+            composer_token_for_entry(&phrase).is_none(),
+            "a phrase would span whitespace and could not be one unit"
+        );
+
+        let mut prose = command_entry(
+            AgentCommandSourceKind::Provider,
+            AgentCommandTrigger::Slash,
+            Some("note"),
+        );
+        prose.insertion_text = "remember this".into();
+        assert!(
+            composer_token_for_entry(&prose).is_none(),
+            "an insertion that carries no trigger is text"
+        );
+    }
+
+    /// A token id names its own file, so a click needs nothing else to open it.
+    #[test]
+    fn a_file_token_id_names_the_path_it_opens() {
+        assert_eq!(
+            composer_token_reference_path("reference:file:apps/desktop/src/app.rs"),
+            Some("apps/desktop/src/app.rs")
+        );
+        assert_eq!(
+            composer_token_reference_path("provider:acp:runtime:help"),
+            None,
+            "a command token has nothing to open"
+        );
+        assert_eq!(composer_token_reference_path("skill:local:user:abc"), None);
     }
 
     /// Mirrors the active composer's height chain (workbench → composer root →
@@ -78415,99 +78608,6 @@ mod tests {
                 "the pasted-text cursor should be inside the laid-out viewport"
             );
         });
-    }
-
-    #[gpui::test]
-    fn composer_token_chips_cover_the_tokens_and_not_the_words(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let input_slot = Rc::new(RefCell::new(None));
-        let input_slot_for_view = input_slot.clone();
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
-            *input_slot_for_view.borrow_mut() = Some(input.clone());
-            let probe = cx.new(|_| ComposerTokenGeometryProbe {
-                input,
-                // Wide enough that the sample line cannot wrap, whatever font
-                // the test machine resolves, so one chip means one token.
-                width: px(640.0),
-            });
-            gpui_component::Root::new(probe, window, cx)
-        });
-        let input = input_slot
-            .borrow()
-            .clone()
-            .expect("composer input should be created with the root view");
-
-        let (chips, tokens, _) = cx.update(|window, cx| {
-            composer_token_geometry(window, cx, &input, "run /goal @.agents $gpui-tool now")
-        });
-        assert_eq!(
-            chips.len(),
-            3,
-            "one chip per token, and none over the plain words"
-        );
-        assert_eq!(
-            chips, tokens,
-            "a chip is exactly the box of the token it marks"
-        );
-        assert!(
-            chips
-                .windows(2)
-                .all(|pair| pair[0].right() < pair[1].left()),
-            "tokens are highlighted in reading order: {chips:?}"
-        );
-    }
-
-    #[gpui::test]
-    fn composer_token_chips_split_a_wrapped_token_by_line(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let input_slot = Rc::new(RefCell::new(None));
-        let input_slot_for_view = input_slot.clone();
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 12));
-            *input_slot_for_view.borrow_mut() = Some(input.clone());
-            let probe = cx.new(|_| ComposerTokenGeometryProbe {
-                input,
-                width: px(160.0),
-            });
-            gpui_component::Root::new(probe, window, cx)
-        });
-        let input = input_slot
-            .borrow()
-            .clone()
-            .expect("composer input should be created with the root view");
-
-        let mention = format!("@{}", "long/".repeat(12));
-        let (chips, tokens, line_height) = cx.update(|window, cx| {
-            composer_token_geometry(window, cx, &input, &format!("see {mention} please"))
-        });
-        assert_eq!(tokens.len(), 1, "the wrapped mention is still one token");
-        assert!(
-            tokens[0].size.height > line_height * 1.5,
-            "the token really does span several lines: {tokens:?}"
-        );
-        assert!(
-            chips.len() > 1,
-            "a wrapped token is highlighted on every line it occupies: {chips:?}"
-        );
-        assert!(
-            chips
-                .iter()
-                .all(|chip| chip.size.height <= line_height + px(0.5)),
-            "no chip may cover the text between the token's two ends: {chips:?}"
-        );
-        assert!(
-            chips.windows(2).all(|pair| pair[0].top() < pair[1].top()),
-            "the line boxes stack in reading order: {chips:?}"
-        );
-        assert_eq!(
-            (
-                chips.first().map(|chip| chip.left()),
-                chips.last().map(|chip| chip.bottom())
-            ),
-            (Some(tokens[0].left()), Some(tokens[0].bottom())),
-            "the split boxes start and end with the token itself"
-        );
     }
 
     #[test]

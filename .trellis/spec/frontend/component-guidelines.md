@@ -568,6 +568,35 @@ let popover = Popover::new(id).anchor(anchor).trigger(trigger).child(panel)
     .offset(px(RUNTIME_MENU_TRIGGER_GAP));
 ```
 
+### Composer References Are Atomic Tokens
+
+A reference the user picks from the suggestion menu — `/command`, `@file`,
+`$skill` — is inserted as an atomic inline token, not as text a painter later
+tints. `replace_composer_trigger` writes it with
+`TextareaState::replace_range_with_token`, so the input owns it: the caret steps
+over it, one backspace deletes it whole, and a click opens what it names.
+
+The token carries the entry's own id, which is what a click resolves:
+`composer_token_reference_path` strips the `reference:file:` prefix and the
+workbench opens that path in a tab. A command or a skill token names nothing
+openable and leaves the click to the input.
+
+Two constraints keep the document honest:
+
+- **The token text is the text the Agent is sent.** Never a label, never a
+  prettier spelling: the chip may show `@app.rs`, but the document holds
+  `@apps/desktop/src/app.rs`, so the trigger scan, the slash-command parser and
+  the submitted prompt keep reading one text.
+- **The separator stays outside the token.** The entry's `insertion_text` ends
+  with the space that ends the mention; only the word itself becomes the token,
+  or the chip would swallow the space and glue itself to the next word.
+
+Only a single triggered word becomes a token. A quick phrase inserts a paragraph
+of prose — not a reference and not one editing unit — so it stays ordinary text,
+as does anything typed by hand and never picked from the menu. Do not paint a
+tint behind typed `/`, `@` or `$` text to imitate a chip: two visuals for one
+idea is what the atomic token replaced.
+
 ## Timeline Cards
 
 Render Agent activity through provider-neutral cards:
