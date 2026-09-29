@@ -1921,26 +1921,6 @@ pub(crate) fn agent_brand_icon(
         .unwrap_or_else(|| themed_icon(Icon::new(IconName::Bot).size(size), current_color))
 }
 
-/// The Agent's mark as a single-color glyph.
-///
-/// [`agent_brand_icon`] keeps a logo's own colors — `img` for the polychrome
-/// ones — which cannot be tinted. A tab strip mark has to say "this Agent is
-/// driving" in green, so this paints the same path as an alpha mask instead and
-/// falls back to the robot when the Agent has no mark.
-pub(crate) fn agent_brand_glyph(identity: &str, size: Pixels, color: Hsla) -> AnyElement {
-    match agent_brand_asset(identity) {
-        Some(asset) => Icon::default()
-            .path(asset.path)
-            .size(size)
-            .text_color(color)
-            .into_any_element(),
-        None => Icon::new(IconName::Bot)
-            .size(size)
-            .text_color(color)
-            .into_any_element(),
-    }
-}
-
 pub(crate) fn agent_brand_logo(
     identity: &str,
     size: Pixels,

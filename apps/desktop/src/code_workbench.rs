@@ -89,7 +89,7 @@ use vibex_terminal::TerminalManager;
 use crate::actions::{GoToLineInEditor, SaveActiveFile};
 use crate::app::VibexWorkbench;
 use crate::assets::{
-    BUNDLED_SANS_FAMILY, agent_brand_glyph, file_tree_asset_icon, open_tool_brand_icon,
+    BUNDLED_SANS_FAMILY, agent_brand_icon, file_tree_asset_icon, open_tool_brand_icon,
 };
 use crate::browser_surface::{BrowserSurface, BrowserSurfaceEvent, OrphanTextures};
 use crate::directory_picker::{DirectoryPickHandler, DirectoryPickerDialog};
@@ -8556,18 +8556,15 @@ impl CodeWorkbench {
             }
             _ => (false, false, None),
         };
-        // The Agent's own mark, green while it is driving and muted while the
-        // tab is only its own; a client that cannot name the Agent falls back
-        // to the robot inside `agent_brand_glyph`.
+        // The Agent's own mark, in its own colors: a Claude tab shows Claude,
+        // a Codex tab shows Codex, and a client that cannot name the Agent
+        // falls back to the robot inside `agent_brand_icon`. Whether the Agent
+        // is driving is the pause control's business, not the logo's.
         let agent_mark = (agent_browser_tab || agent_driving).then(|| {
-            agent_brand_glyph(
+            agent_brand_icon(
                 agent_identity.as_deref().unwrap_or_default(),
                 px(11.0),
-                if agent_driving {
-                    cx.theme().success
-                } else {
-                    cx.theme().muted_foreground
-                },
+                None,
             )
         });
         let target_icon = preview_target_icon(&tab.target, browser_favicon, cx);
