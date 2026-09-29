@@ -185,6 +185,23 @@ strings! {
     transcript_command => { "Command", "命令", "命令" },
     transcript_file_change => { "File change", "文件变更", "檔案變更" },
     transcript_diff => { "Diff", "差异", "差異" },
+    git_revert_title => { "Discard changes", "放弃更改", "捨棄變更" },
+    git_revert_warning => {
+        "This discards the working-tree changes at this path. It cannot be undone.",
+        "这将丢弃该路径的工作区更改，且无法撤销。",
+        "這將捨棄該路徑的工作區變更，且無法復原。"
+    },
+    git_history_title => { "Recent commits", "最近提交", "最近提交" },
+    git_branches_title => { "Branches", "分支", "分支" },
+    worktree_title => { "Worktrees", "工作树", "工作樹" },
+    worktree_create_title => { "New worktree branch", "新建工作树分支", "新增工作樹分支" },
+    worktree_preflight_title => {
+        "Worktree preflight",
+        "工作树预检",
+        "工作樹預檢"
+    },
+    worktree_preflight_allowed => { "Allowed", "允许", "允許" },
+    worktree_preflight_blocked => { "Blocked", "已阻止", "已封鎖" },
     transcript_error => { "Error", "错误", "錯誤" },
     transcript_notice => { "Notice", "提示", "提示" },
     transcript_plan => { "Plan", "计划", "計畫" },

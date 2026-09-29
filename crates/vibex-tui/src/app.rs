@@ -166,6 +166,7 @@ pub enum PromptField {
     HookName,
     DeviceRevokeReason,
     RestoreBackupId,
+    WorktreeBranch,
 }
 
 /// A transient status message.
@@ -378,6 +379,9 @@ pub struct App {
     pub workspace_browse: Option<vibex_core::RemoteWorkspaceDirectoryListing>,
     pub file_rows: Vec<vibex_core::FileTreeEntry>,
     pub git_status: Option<vibex_core::GitStatusSummary>,
+    pub git_history: Vec<vibex_core::GitCommitSummary>,
+    pub git_branches: Vec<vibex_core::GitBranchSummary>,
+    pub worktrees: Option<Box<vibex_core::GitWorktreeLifecycleSnapshot>>,
     pub diff_text: Option<String>,
     pub text_view: Option<(String, String)>,
     /// The crossterm-reported terminal size, used by renderers that need to
@@ -460,6 +464,9 @@ impl App {
             workspace_browse: None,
             file_rows: Vec::new(),
             git_status: None,
+            git_history: Vec::new(),
+            git_branches: Vec::new(),
+            worktrees: None,
             diff_text: None,
             text_view: None,
             viewport: (120, 40),
@@ -807,6 +814,28 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
     }
 }
 
+/// A management entry edit, carried as data so the worker does not have to
+/// re-derive which page the user was on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagementEntryEdit {
+    Mcp {
+        server_id: vibex_core::McpServerId,
+        display_name: String,
+    },
+    Skill {
+        skill_id: vibex_core::SkillId,
+        display_name: String,
+    },
+    Prompt {
+        prompt_id: vibex_core::PromptId,
+        display_name: String,
+    },
+    Hook {
+        hook_id: vibex_core::HookId,
+        display_name: String,
+    },
+}
+
 /// Actions on the recovery page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryAction {
@@ -983,6 +1012,37 @@ pub enum Effect {
         workspace_id: vibex_core::WorkspaceId,
         message: String,
     },
+    /// Recent commits on the workspace's branch.
+    LoadGitHistory {
+        workspace_id: vibex_core::WorkspaceId,
+    },
+    /// Local and remote branches.
+    LoadGitBranches {
+        workspace_id: vibex_core::WorkspaceId,
+    },
+    /// Discard the changes at one path.
+    GitRevert {
+        workspace_id: vibex_core::WorkspaceId,
+        path: String,
+    },
+    /// Read the worktree lifecycle snapshot for a workspace.
+    LoadWorktrees {
+        workspace_id: vibex_core::WorkspaceId,
+    },
+    /// Run the destructive preflight a worktree action requires.
+    WorktreePreflight {
+        workspace_id: vibex_core::WorkspaceId,
+        path: String,
+    },
+    /// Create a worktree from a branch name.
+    WorktreeCreate {
+        workspace_id: vibex_core::WorkspaceId,
+        branch_name: String,
+    },
+    /// Edit one management entry by id.
+    UpdateEntry {
+        entry: ManagementEntryEdit,
+    },
     /// Read a file for the read-only viewer.
     ReadFile {
         workspace_id: vibex_core::WorkspaceId,
@@ -1066,6 +1126,13 @@ impl Effect {
             Effect::GitStage { .. } => "git_stage",
             Effect::GitCommit { .. } => "git_commit",
             Effect::ReadFile { .. } => "read_file",
+            Effect::LoadGitHistory { .. } => "git_history",
+            Effect::LoadGitBranches { .. } => "git_branches",
+            Effect::GitRevert { .. } => "git_revert",
+            Effect::LoadWorktrees { .. } => "worktrees",
+            Effect::WorktreePreflight { .. } => "worktree_preflight",
+            Effect::WorktreeCreate { .. } => "worktree_create",
+            Effect::UpdateEntry { .. } => "update_entry",
             Effect::ListHealth => "provider_health",
             Effect::RenameProfile { .. } => "rename_profile",
             Effect::EditExternally { .. } => "edit_external",

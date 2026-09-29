@@ -625,17 +625,57 @@ impl App {
                 });
                 Outcome::effects(vec![])
             }
-            Intent::GitRevert | Intent::GitHistory | Intent::GitBranches => {
-                self.toast(Toast::info(
-                    self.strings.toast_action_unavailable().to_string(),
-                ));
-                Outcome::quiet()
+            Intent::GitRevert => {
+                let index = self.selection_for(Scope::Changes);
+                let Some(status) = self.git_status.as_ref() else {
+                    return Outcome::quiet();
+                };
+                let Some(entry) = status.changes.get(index) else {
+                    return Outcome::quiet();
+                };
+                let path = entry.path.clone();
+                self.overlay = Some(Overlay::Confirm {
+                    title: self.strings.git_revert_title().to_string(),
+                    body: format!("{path}\n\n{}", self.strings.git_revert_warning()),
+                    confirm: Intent::GitRevert,
+                });
+                Outcome::effects(vec![])
             }
-            Intent::WorktreeMenu | Intent::WorktreeCreate | Intent::WorktreePreflight => {
-                self.toast(Toast::info(
-                    self.strings.toast_action_unavailable().to_string(),
-                ));
-                Outcome::quiet()
+            Intent::GitHistory => match self.active_workspace_id() {
+                Some(workspace_id) => {
+                    Outcome::effects(vec![Effect::LoadGitHistory { workspace_id }])
+                }
+                None => Outcome::quiet(),
+            },
+            Intent::GitBranches => match self.active_workspace_id() {
+                Some(workspace_id) => {
+                    Outcome::effects(vec![Effect::LoadGitBranches { workspace_id }])
+                }
+                None => Outcome::quiet(),
+            },
+            Intent::WorktreeMenu => match self.active_workspace_id() {
+                Some(workspace_id) => {
+                    Outcome::effects(vec![Effect::LoadWorktrees { workspace_id }])
+                }
+                None => Outcome::quiet(),
+            },
+            Intent::WorktreePreflight => {
+                let Some(workspace_id) = self.active_workspace_id() else {
+                    return Outcome::quiet();
+                };
+                let Some(path) = self.selected_worktree_path() else {
+                    self.toast(Toast::warning(self.strings.nothing_here().to_string()));
+                    return Outcome::quiet();
+                };
+                Outcome::effects(vec![Effect::WorktreePreflight { workspace_id, path }])
+            }
+            Intent::WorktreeCreate => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: self.strings.worktree_create_title().to_string(),
+                    field: PromptField::WorktreeBranch,
+                    value: String::new(),
+                });
+                Outcome::effects(vec![])
             }
 
             // ---- terminal ---------------------------------------------------
@@ -965,6 +1005,22 @@ impl App {
                     reason: None,
                 }])
             }
+            Intent::GitRevert => {
+                let index = self.selection_for(Scope::Changes);
+                let (Some(status), Some(workspace_id)) =
+                    (self.git_status.as_ref(), self.active_workspace_id())
+                else {
+                    return Outcome::quiet();
+                };
+                let Some(entry) = status.changes.get(index) else {
+                    return Outcome::quiet();
+                };
+                let path = entry.path.clone();
+                self.guard(
+                    BackendOperation::GitRevert,
+                    Effect::GitRevert { workspace_id, path },
+                )
+            }
             Intent::RequestQuit => {
                 self.should_quit = true;
                 Outcome::effects(vec![])
@@ -1044,8 +1100,57 @@ impl App {
             | PromptField::SkillName
             | PromptField::PromptName
             | PromptField::HookName => {
+                if trimmed.is_empty() {
+                    return Outcome::quiet();
+                }
+                let index = self.selection_for(Scope::Management);
+                let entry = match field {
+                    PromptField::McpServerName => {
+                        self.management_data.mcp.get(index).map(|server| {
+                            crate::app::ManagementEntryEdit::Mcp {
+                                server_id: server.id.clone(),
+                                display_name: trimmed,
+                            }
+                        })
+                    }
+                    PromptField::SkillName => self.management_data.skills.get(index).map(|skill| {
+                        crate::app::ManagementEntryEdit::Skill {
+                            skill_id: skill.id.clone(),
+                            display_name: trimmed,
+                        }
+                    }),
+                    PromptField::PromptName => {
+                        self.management_data.prompts.get(index).map(|prompt| {
+                            crate::app::ManagementEntryEdit::Prompt {
+                                prompt_id: prompt.id.clone(),
+                                display_name: trimmed,
+                            }
+                        })
+                    }
+                    _ => self.management_data.hooks.get(index).map(|hook| {
+                        crate::app::ManagementEntryEdit::Hook {
+                            hook_id: hook.id.clone(),
+                            display_name: trimmed,
+                        }
+                    }),
+                };
                 let _ = title;
-                Outcome::quiet()
+                match entry {
+                    Some(entry) => Outcome::effects(vec![Effect::UpdateEntry { entry }]),
+                    None => Outcome::quiet(),
+                }
+            }
+            PromptField::WorktreeBranch => {
+                if trimmed.is_empty() {
+                    return Outcome::quiet();
+                }
+                match self.active_workspace_id() {
+                    Some(workspace_id) => Outcome::effects(vec![Effect::WorktreeCreate {
+                        workspace_id,
+                        branch_name: trimmed,
+                    }]),
+                    None => Outcome::quiet(),
+                }
             }
             PromptField::DeviceRevokeReason => {
                 let index = self.selection_for(Scope::Devices);
@@ -1215,6 +1320,16 @@ impl App {
             (current + order.len() - 1) % order.len()
         };
         self.select_session_destination(order[next]);
+    }
+
+    /// Path of the highlighted managed worktree, when the page has one.
+    pub fn selected_worktree_path(&self) -> Option<String> {
+        let snapshot = self.worktrees.as_ref()?;
+        let index = self.selection_for(Scope::Changes);
+        snapshot
+            .managed_worktrees
+            .get(index)
+            .map(|worktree| worktree.worktree_path.clone())
     }
 
     fn begin_new_session(&mut self) -> Outcome {
@@ -2046,6 +2161,74 @@ mod tests {
             draft.answer_for("q", 1, &field, 0),
             Some(ElicitationAnswerValue::String("hello".into()))
         );
+    }
+
+    #[test]
+    fn entry_edits_carry_the_row_id_so_the_worker_does_not_guess() {
+        // The effect must name the entry it edits: re-deriving "the third row"
+        // in the worker would race a list refresh.
+        let edits = [
+            crate::app::ManagementEntryEdit::Mcp {
+                server_id: vibex_core::McpServerId::new(),
+                display_name: "a".into(),
+            },
+            crate::app::ManagementEntryEdit::Skill {
+                skill_id: vibex_core::SkillId::new(),
+                display_name: "b".into(),
+            },
+            crate::app::ManagementEntryEdit::Prompt {
+                prompt_id: vibex_core::PromptId::new(),
+                display_name: "c".into(),
+            },
+            crate::app::ManagementEntryEdit::Hook {
+                hook_id: vibex_core::HookId::new(),
+                display_name: "d".into(),
+            },
+        ];
+        for edit in edits {
+            let effect = Effect::UpdateEntry {
+                entry: edit.clone(),
+            };
+            assert_eq!(effect.key(), "update_entry");
+        }
+    }
+
+    #[test]
+    fn mutating_effects_are_distinguishable_by_key() {
+        // The pending map is keyed by this string, so two different mutations
+        // sharing a key would clear each other's spinner.
+        let workspace_id = vibex_core::WorkspaceId::new();
+        let keys = [
+            Effect::GitStage {
+                workspace_id: workspace_id.clone(),
+                path: "a".into(),
+                stage: true,
+            }
+            .key(),
+            Effect::GitCommit {
+                workspace_id: workspace_id.clone(),
+                message: "m".into(),
+            }
+            .key(),
+            Effect::GitRevert {
+                workspace_id: workspace_id.clone(),
+                path: "a".into(),
+            }
+            .key(),
+            Effect::WorktreeCreate {
+                workspace_id: workspace_id.clone(),
+                branch_name: "b".into(),
+            }
+            .key(),
+            Effect::WorktreePreflight {
+                workspace_id: workspace_id.clone(),
+                path: "a".into(),
+            }
+            .key(),
+            Effect::LoadGitHistory { workspace_id }.key(),
+        ];
+        let unique = keys.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
     }
 
     #[test]

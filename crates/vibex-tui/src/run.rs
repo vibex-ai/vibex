@@ -531,6 +531,10 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
                         let message = app.strings.approval_resolved().to_string();
                         app.toast(Toast::success(message));
                     }
+                    if key == "update_entry" || key == "git_revert" || key == "worktree_create" {
+                        let message = app.strings.management_saved().to_string();
+                        app.toast(Toast::success(message));
+                    }
                     if key == "provider_secret" {
                         let message = app.strings.management_saved().to_string();
                         app.toast(Toast::success(message));
@@ -586,6 +590,109 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
             Ok(status) => {
                 app.git_status = Some(status);
                 app.live = LiveState::Ready;
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
+        AppMessage::GitHistory(result) => match result {
+            Ok(history) => {
+                let body = history
+                    .commits
+                    .iter()
+                    .map(|commit| {
+                        format!(
+                            "{}  {}  {}",
+                            commit.short_hash, commit.author_name, commit.subject
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                app.git_history = history.commits;
+                app.overlay = Some(Overlay::TextView {
+                    title: app.strings.git_history_title().to_string(),
+                    body,
+                    scroll: 0,
+                });
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
+        AppMessage::GitBranches(result) => match result {
+            Ok(branches) => {
+                let body = branches
+                    .branches
+                    .iter()
+                    .map(|branch| {
+                        format!(
+                            "{} {}{}",
+                            if branch.current { "*" } else { " " },
+                            branch.name,
+                            branch
+                                .upstream
+                                .as_ref()
+                                .map(|upstream| format!(
+                                    "  {upstream} (+{}/-{})",
+                                    branch.ahead, branch.behind
+                                ))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                app.git_branches = branches.branches;
+                app.overlay = Some(Overlay::TextView {
+                    title: app.strings.git_branches_title().to_string(),
+                    body,
+                    scroll: 0,
+                });
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
+        AppMessage::Worktrees(result) => match result {
+            Ok(snapshot) => {
+                let body = if snapshot.managed_worktrees.is_empty() {
+                    app.strings.nothing_here().to_string()
+                } else {
+                    snapshot
+                        .managed_worktrees
+                        .iter()
+                        .map(|worktree| {
+                            format!(
+                                "{}  {}  {:?}",
+                                worktree.branch.clone().unwrap_or_else(|| "-".to_string()),
+                                worktree.worktree_path,
+                                worktree.status
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                app.worktrees = Some(snapshot);
+                app.overlay = Some(Overlay::TextView {
+                    title: app.strings.worktree_title().to_string(),
+                    body,
+                    scroll: 0,
+                });
+            }
+            Err(error) => app.toast(Toast::danger(error.message)),
+        },
+        AppMessage::WorktreePreflight(result) => match result {
+            Ok(preflight) => {
+                // The preflight verdict is shown before anything is touched.
+                let verdict = if preflight.allowed {
+                    app.strings.worktree_preflight_allowed()
+                } else {
+                    app.strings.worktree_preflight_blocked()
+                };
+                let risks = preflight
+                    .risks
+                    .iter()
+                    .map(|risk| format!("{risk:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                app.overlay = Some(Overlay::TextView {
+                    title: app.strings.worktree_preflight_title().to_string(),
+                    body: format!("{verdict}\n\n{risks}"),
+                    scroll: 0,
+                });
             }
             Err(error) => app.toast(Toast::danger(error.message)),
         },

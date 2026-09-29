@@ -46,6 +46,10 @@ pub enum AppMessage {
     FileContents(BackendResult<vibex_core::FileReadResponse>),
     GitStatus(BackendResult<vibex_core::GitStatusSummary>),
     GitDiff(BackendResult<vibex_core::GitDiffResponse>),
+    GitHistory(BackendResult<vibex_core::GitHistoryResponse>),
+    GitBranches(BackendResult<vibex_core::GitBranchListResponse>),
+    Worktrees(BackendResult<Box<vibex_core::GitWorktreeLifecycleSnapshot>>),
+    WorktreePreflight(BackendResult<vibex_core::GitWorktreeDestructivePreflight>),
     Devices(BackendResult<Vec<vibex_core::RemoteDeviceDetail>>),
     PairingOffer(BackendResult<Box<vibex_core::RemoteCreatePairingOfferResponse>>),
     Audit(BackendResult<Vec<vibex_core::RemoteAuditRecord>>),
@@ -459,6 +463,82 @@ impl Dispatch {
                 match result {
                     Ok(()) => self.ok("git_stage"),
                     Err(error) => self.failure("git_stage", error),
+                }
+            }
+            Effect::LoadGitHistory { workspace_id } => {
+                let request = vibex_core::GitHistoryRequest {
+                    workspace_id,
+                    limit: Some(200),
+                    before_commit: None,
+                    ref_name: None,
+                    author: None,
+                    query: None,
+                    authored_after_ms: None,
+                    authored_before_ms: None,
+                };
+                let result = self.facade.git().git_history(request).await;
+                self.send(AppMessage::GitHistory(result));
+            }
+            Effect::LoadGitBranches { workspace_id } => {
+                let result = self.facade.git().git_branch_list(workspace_id).await;
+                self.send(AppMessage::GitBranches(result));
+            }
+            Effect::GitRevert { workspace_id, path } => {
+                let request = MutationRequest::new(vibex_core::GitStageRequest {
+                    workspace_id,
+                    paths: vec![path],
+                });
+                match self.facade.git().git_revert(request).await {
+                    Ok(status) => {
+                        self.send(AppMessage::GitStatus(Ok(status)));
+                        self.ok("git_revert");
+                    }
+                    Err(error) => self.failure("git_revert", error),
+                }
+            }
+            Effect::LoadWorktrees { workspace_id } => {
+                let result = self.facade.git().git_worktree_snapshot(workspace_id).await;
+                self.send(AppMessage::Worktrees(result.map(Box::new)));
+            }
+            Effect::WorktreePreflight { workspace_id, path } => {
+                // Preflight is mandatory: it is what tells the user whether a
+                // destructive worktree action would lose work.
+                let request = vibex_core::GitWorktreeArchiveRequest {
+                    workspace_id,
+                    worktree_path: path,
+                    expected_head: None,
+                    preflight_revision: None,
+                };
+                let result = self
+                    .facade
+                    .git()
+                    .git_worktree_archive_preflight(request)
+                    .await;
+                self.send(AppMessage::WorktreePreflight(result));
+            }
+            Effect::WorktreeCreate {
+                workspace_id,
+                branch_name,
+            } => {
+                let request = MutationRequest::new(vibex_core::GitWorktreeCreateRequest {
+                    workspace_id,
+                    branch_name,
+                    base_ref: None,
+                    name: None,
+                    worktree_path: None,
+                    target_workspace_id: None,
+                    target_branch: None,
+                });
+                match self.facade.git().git_worktree_create(request).await {
+                    Ok(_) => self.ok("worktree_create"),
+                    Err(error) => self.failure("worktree_create", error),
+                }
+            }
+            Effect::UpdateEntry { entry } => {
+                let result = self.update_entry(entry).await;
+                match result {
+                    Ok(()) => self.ok("update_entry"),
+                    Err(error) => self.failure("update_entry", error),
                 }
             }
             Effect::GitCommit {
@@ -958,6 +1038,98 @@ impl Dispatch {
             .ok()?
             .into_iter()
             .next()
+    }
+
+    /// Apply a management entry rename through the domain-specific update call.
+    async fn update_entry(&self, entry: crate::app::ManagementEntryEdit) -> BackendResult<()> {
+        use crate::app::ManagementEntryEdit;
+        match entry {
+            ManagementEntryEdit::Mcp {
+                server_id,
+                display_name,
+            } => self
+                .facade
+                .management()
+                .update_mcp_server(MutationRequest::new(vibex_core::McpServerUpdateRequest {
+                    mcp_server_id: server_id,
+                    display_name: Some(display_name),
+                    transport_kind: None,
+                    status: None,
+                    scope_kind: None,
+                    project_id: None,
+                    workspace_id: None,
+                    command: None,
+                    args: None,
+                    env: None,
+                    url: None,
+                    headers: None,
+                    description: None,
+                    tags: None,
+                }))
+                .await
+                .map(|_| ()),
+            ManagementEntryEdit::Skill {
+                skill_id,
+                display_name,
+            } => self
+                .facade
+                .management()
+                .update_skill(MutationRequest::new(vibex_core::SkillUpdateRequest {
+                    skill_id,
+                    display_name: Some(display_name),
+                    source_kind: None,
+                    status: None,
+                    scope_kind: None,
+                    project_id: None,
+                    workspace_id: None,
+                    source_uri: None,
+                    description: None,
+                    tags: None,
+                    content_preview: None,
+                    body: None,
+                }))
+                .await
+                .map(|_| ()),
+            ManagementEntryEdit::Prompt {
+                prompt_id,
+                display_name,
+            } => self
+                .facade
+                .management()
+                .update_prompt(MutationRequest::new(vibex_core::PromptUpdateRequest {
+                    prompt_id,
+                    display_name: Some(display_name),
+                    kind: None,
+                    status: None,
+                    scope_kind: None,
+                    project_id: None,
+                    workspace_id: None,
+                    body: None,
+                    description: None,
+                    tags: None,
+                }))
+                .await
+                .map(|_| ()),
+            ManagementEntryEdit::Hook {
+                hook_id,
+                display_name,
+            } => self
+                .facade
+                .management()
+                .update_hook(MutationRequest::new(vibex_core::HookUpdateRequest {
+                    hook_id,
+                    display_name: Some(display_name),
+                    provider_kind: None,
+                    event_kind: None,
+                    status: None,
+                    install_state: None,
+                    command_preview: None,
+                    managed_marker: None,
+                    description: None,
+                }))
+                .await
+                .map(|_| ()),
+        }
     }
 
     async fn current_session_token_usage(
