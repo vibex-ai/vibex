@@ -67154,7 +67154,11 @@ impl Render for VibexWorkbench {
                             });
                             cx.new(|_| FpsHudDrag)
                         })
-                        .child(monitor.cached(StyleRefinement::default().flex())),
+                        // The HUD's size comes from its current expanded or
+                        // compact contents. A cached view has no intrinsic
+                        // measurement, so using one here would collapse this
+                        // flex item to zero and leave no drag hitbox.
+                        .child(monitor),
                 )
                 .into_any_element()
         });
@@ -82108,6 +82112,8 @@ mod tests {
         assert!(render.contains("fps_hud_offset_within_window("));
         assert!(render.contains(".left(px(offset.x))"));
         assert!(render.contains(".top(px(offset.y))"));
+        assert!(render.contains(".child(monitor)"));
+        assert!(!render.contains("monitor.cached"));
         assert!(render.contains(".on_drag(FpsHudDrag, move |_, _, window, cx|"));
         assert!(
             render.contains("this.drag_fps_hud(event.event.position, window.viewport_size(), cx)")
@@ -82296,6 +82302,106 @@ mod tests {
         // hitbox after the HUD moves.
         cx.simulate_click(drop, Modifiers::none());
         assert_eq!(toggles.get(), 2);
+    }
+
+    struct ActualFpsHudDragProbe {
+        offset: FpsHudOffset,
+        drag: Option<FpsHudDragState>,
+        monitor: Option<Entity<FpsMonitor>>,
+        moves: Rc<Cell<usize>>,
+    }
+
+    impl Render for ActualFpsHudDragProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let monitor = self
+                .monitor
+                .get_or_insert_with(|| cx.new(|cx| FpsMonitor::new(window, cx)))
+                .clone();
+            let drag_target = cx.weak_entity();
+            let viewport = window.viewport_size();
+            v_flex()
+                .relative()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .id("actual-fps-hud-drag-probe")
+                        .relative()
+                        .left(px(self.offset.x))
+                        .top(px(self.offset.y))
+                        .cursor_move()
+                        .on_drag(FpsHudDrag, move |_, _, window, cx| {
+                            let start_cursor = window.mouse_position();
+                            let _ = drag_target.update(cx, |this, cx| {
+                                this.drag = Some(FpsHudDragState {
+                                    start_cursor,
+                                    offset: fps_hud_offset_within_window(this.offset, viewport),
+                                });
+                                cx.notify();
+                            });
+                            cx.new(|_| FpsHudDrag)
+                        })
+                        .child(monitor),
+                )
+                .on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<FpsHudDrag>, window, cx| {
+                        let Some(drag) = this.drag else {
+                            return;
+                        };
+                        this.offset = dragged_fps_hud_offset(
+                            drag.offset,
+                            drag.start_cursor,
+                            event.event.position,
+                            window.viewport_size(),
+                        );
+                        this.moves.set(this.moves.get() + 1);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.drag = None;
+                        cx.notify();
+                    }),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn actual_fps_hud_can_be_dragged(cx: &mut TestAppContext) {
+        let moves = Rc::new(Cell::new(0));
+        let (probe, cx) = cx.add_window_view(|_, _| ActualFpsHudDragProbe {
+            offset: FpsHudOffset::default(),
+            drag: None,
+            monitor: None,
+            moves: moves.clone(),
+        });
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let middle = point(viewport.width / 2.0, viewport.height / 2.0);
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_down(middle, MouseButton::Left, Modifiers::none());
+        let armed = point(middle.x, middle.y + px(20.0));
+        cx.simulate_mouse_move(armed, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let drop = point(middle.x - px(40.0), middle.y + px(40.0));
+        cx.simulate_mouse_move(drop, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_up(drop, MouseButton::Left, Modifiers::none());
+
+        assert!(moves.get() > 0, "the real FPS monitor must start its drag");
+        assert_eq!(
+            cx.update(|_, cx| probe.read(cx).offset),
+            FpsHudOffset { x: -40.0, y: 40.0 }
+        );
     }
 
     #[test]
