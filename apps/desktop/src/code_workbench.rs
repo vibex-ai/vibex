@@ -17294,7 +17294,7 @@ fn read_local_preview_file(
             "the selected path is not a regular file",
         ));
     }
-    let path_string = path.to_string_lossy().into_owned();
+    let path_string = path.to_string_lossy().replace('\\', "/");
     let content_kind = content_preview_kind_for_path(&path_string);
     let mut preview_kind = match content_kind {
         ContentPreviewKind::Markdown => FilePreviewKind::Markdown,
@@ -19061,7 +19061,10 @@ mod tests {
         std::fs::write(file.path(), "one\r\ntwo\r\n").expect("write temporary external file");
         let response =
             read_local_preview_file(file.path(), WorkspaceId::new()).expect("read local preview");
-        assert_eq!(response.path, file.path().to_string_lossy());
+        assert_eq!(
+            response.path,
+            file.path().to_string_lossy().replace('\\', "/")
+        );
         assert_eq!(response.preview_kind, FilePreviewKind::Text);
         assert_eq!(response.content.as_deref(), Some("one\r\ntwo\r\n"));
         assert_eq!(response.line_ending, FileLineEnding::Crlf);
