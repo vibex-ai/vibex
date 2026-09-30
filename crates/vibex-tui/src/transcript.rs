@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use vibex_desktop_model::TimelineRowKind;
 
 use crate::locale::Strings;
@@ -870,6 +871,61 @@ impl Transcript {
         self.blocks.get(index).map(block_plain_text)
     }
 
+    /// The plain text of a range of display lines.
+    ///
+    /// Unlike [`Transcript::visible_lines`] this is not restricted to the
+    /// viewport: a selection can be dragged past the edge of the screen, and
+    /// the copy must contain what the reader dragged over rather than what
+    /// happened to be on screen when they let go.
+    pub fn plain_lines(
+        &mut self,
+        start: usize,
+        end: usize,
+        theme: &TuiTheme,
+        strings: Strings,
+    ) -> Vec<String> {
+        if end <= start || self.blocks.is_empty() {
+            return Vec::new();
+        }
+        self.ensure_layout();
+        let total = self.offsets.last().copied().unwrap_or(0);
+        let start = start.min(total);
+        let end = end.min(total);
+        if end <= start {
+            return Vec::new();
+        }
+        let mut lines = Vec::with_capacity(end - start);
+        let mut index = self
+            .offsets
+            .partition_point(|value| *value <= start)
+            .saturating_sub(1);
+        while index < self.blocks.len() && lines.len() < end - start {
+            self.measure(index, theme, strings);
+            let (block_start, block_end) = self.block_range(index);
+            if block_end <= start {
+                index += 1;
+                continue;
+            }
+            let skip = start.saturating_sub(block_start);
+            let take = block_end.min(end).saturating_sub(block_start.max(start));
+            if take > 0 {
+                let rendered = match self.rendered.get(&index) {
+                    Some(rendered) => rendered.clone(),
+                    None => {
+                        let rendered = self.render_block(index, theme, strings);
+                        self.store_rendered(index, rendered.clone());
+                        rendered
+                    }
+                };
+                for line in rendered.plain.iter().skip(skip).take(take) {
+                    lines.push(line.clone());
+                }
+            }
+            index += 1;
+        }
+        lines
+    }
+
     /// Metadata text for one block, for the `Shift+Y` copy action.
     pub fn block_metadata(&self, index: usize) -> Option<String> {
         let block = self.blocks.get(index)?;
@@ -935,8 +991,83 @@ impl Transcript {
     }
 }
 
-/// Invert every search match in one rendered line.
+/// Paint a column range of one rendered line with `style`.
 ///
+/// The line is rebuilt grapheme by grapheme so a wide character is never split
+/// across the boundary of the band: a cell in a terminal is two columns wide
+/// for CJK, and half a glyph is not a thing that can be drawn.
+pub fn paint_columns(line: Line<'static>, from: usize, to: usize, style: Style) -> Line<'static> {
+    if from >= to {
+        return line;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+    let mut column = 0usize;
+    for span in line.spans {
+        let mut pending: Option<(bool, String)> = None;
+        for grapheme in span.content.graphemes(true) {
+            let width = display_width(grapheme);
+            let covered = column < to && column + width > from;
+            column += width;
+            match pending.as_mut() {
+                Some((flag, text)) if *flag == covered => text.push_str(grapheme),
+                Some((flag, text)) => {
+                    // The style changes here, so the run so far is emitted and
+                    // a new one starts. Order is preserved exactly.
+                    spans.push(Span::styled(
+                        std::mem::take(text),
+                        if *flag { style } else { span.style },
+                    ));
+                    *flag = covered;
+                    text.push_str(grapheme);
+                }
+                None => pending = Some((covered, grapheme.to_string())),
+            }
+        }
+        if let Some((flag, text)) = pending {
+            spans.push(Span::styled(text, if flag { style } else { span.style }));
+        }
+    }
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// The column range of the word under `column`, or `None` over whitespace.
+///
+/// Word boundaries are whitespace, not punctuation: double-clicking `src/net.rs`
+/// selects the whole path, which is what a reader copying a file name wants.
+pub fn word_at(text: &str, column: u16) -> Option<(u16, u16)> {
+    let column = usize::from(column);
+    let mut cells: Vec<(usize, usize, &str)> = Vec::new();
+    let mut width_so_far = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = display_width(grapheme);
+        cells.push((width_so_far, width, grapheme));
+        width_so_far += width;
+    }
+    let position = cells
+        .iter()
+        .position(|(start, width, _)| column >= *start && column < start + width)?;
+    let is_word = |grapheme: &str| !grapheme.trim().is_empty();
+    if !is_word(cells[position].2) {
+        return None;
+    }
+    let mut first = position;
+    while first > 0 && is_word(cells[first - 1].2) {
+        first -= 1;
+    }
+    let mut last = position;
+    while last + 1 < cells.len() && is_word(cells[last + 1].2) {
+        last += 1;
+    }
+    let start = cells[first].0 as u16;
+    let end = (cells[last].0 + cells[last].1) as u16;
+    Some((start, end))
+}
+
+/// Invert every search match in one rendered line.///
 /// The spans are split at the match boundaries rather than rebuilt, so the
 /// glyphs, their widths and their order are exactly what the block renderer
 /// produced; only the style of the matched cells changes.
@@ -1667,6 +1798,68 @@ mod tests {
             .find(|span| span.content == "upload")
             .expect("the match survives as its own span");
         assert!(matched.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_column_paint_keeps_every_grapheme_and_only_changes_style() {
+        let line = Line::from(vec![
+            Span::styled("ab".to_string(), Style::default()),
+            Span::styled("中文cd".to_string(), Style::default()),
+        ]);
+        let highlight = Style::default().add_modifier(Modifier::REVERSED);
+        let text = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let painted_text = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        // Columns 2..4 are the two cells of the first wide glyph.
+        let painted = paint_columns(line.clone(), 2, 4, highlight);
+        assert_eq!(text(&painted), text(&line));
+        assert_eq!(painted_text(&painted), "中");
+        // Columns 2..6 cover both wide glyphs.
+        assert_eq!(
+            painted_text(&paint_columns(line.clone(), 2, 6, highlight)),
+            "中文"
+        );
+        // A boundary that falls inside a wide glyph paints the whole glyph,
+        // because half a cell is not something a terminal can draw.
+        assert_eq!(painted_text(&paint_columns(line, 2, 3, highlight)), "中");
+    }
+
+    #[test]
+    fn a_word_selection_covers_the_whole_path() {
+        let text = "read src/net/upload.rs now";
+        // The click lands inside `net`.
+        let (start, end) = word_at(text, 8).expect("a word under the pointer");
+        assert_eq!(
+            &text[usize::from(start)..usize::from(end)],
+            "src/net/upload.rs"
+        );
+        // Whitespace selects nothing.
+        assert!(word_at(text, 4).is_none());
+        // A column past the end of the line is not a word either.
+        assert!(word_at(text, 200).is_none());
+    }
+
+    #[test]
+    fn plain_lines_reach_past_the_viewport() {
+        let mut transcript = transcript_with(40, "a line of body text");
+        let palette = theme();
+        let lines = transcript.plain_lines(0, 40, &palette, strings());
+        assert!(!lines.is_empty());
+        assert!(
+            lines.len() >= 40,
+            "a range is not a viewport: {}",
+            lines.len()
+        );
     }
 
     #[test]

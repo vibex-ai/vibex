@@ -743,3 +743,41 @@ fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
         .expect("the question is visible inline");
     assert!(pinned_row >= 3, "the question must not be drawn twice");
 }
+
+#[test]
+fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
+    let mut app = transcript_app(120, 40);
+    // One frame publishes the band's rectangle, which a real drag needs.
+    let _ = render(&mut app, 120, 40);
+    assert!(
+        app.regions.scrollback.height > 0,
+        "the transcript band must be published for the mouse"
+    );
+    let expected = app
+        .transcript
+        .plain_lines(0, 1, &app.theme.clone(), Strings::for_locale(Locale::En))
+        .into_iter()
+        .next()
+        .expect("a first line");
+    let (prefix, _) = vibex_tui::text::take_width(&expected, 4);
+
+    app.begin_text_selection(0, 0);
+    app.extend_text_selection(0, 4);
+    assert!(app.finish_text_selection(), "the drag covered cells");
+    let copied = app.selected_text().expect("a non-empty selection");
+    assert_eq!(copied, prefix.trim_end());
+
+    // A selection over several lines joins them with newlines and drops the
+    // padding a terminal would otherwise put on the clipboard.
+    app.begin_text_selection(0, 0);
+    app.extend_text_selection(1, 6);
+    let copied = app.selected_text().expect("a multi-line selection");
+    assert!(copied.contains('\n'), "lines are not joined: {copied:?}");
+    for line in copied.lines() {
+        assert_eq!(line, line.trim_end(), "trailing padding was copied");
+    }
+
+    // `Esc` is what dismisses the highlight.
+    assert!(app.clear_text_selection());
+    assert!(app.selected_text().is_none());
+}

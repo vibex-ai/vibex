@@ -375,6 +375,15 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::CopyBlockBody => {
+                // A live selection is what the reader last pointed at, so `y`
+                // copies that rather than surprising them with the whole block.
+                if self.text_selection.is_some()
+                    && let Some(text) = self.selected_text()
+                {
+                    let message = self.strings.copied().to_string();
+                    self.toast(Toast::success(message));
+                    return Outcome::effects(vec![Effect::Clipboard { text }]);
+                }
                 let index = self.selection_for(Scope::Agent);
                 match self.transcript.block_text(index) {
                     Some(text) => {
@@ -1233,8 +1242,12 @@ impl App {
             self.overlay = None;
             return Outcome::effects(vec![]);
         }
-        // The search bar is the innermost surface on the agent page, so `Esc`
-        // closes it before it does anything else.
+        // A copied selection stays highlighted until the reader dismisses it,
+        // and `Esc` is that dismissal before it means anything else.
+        if self.clear_text_selection() {
+            return Outcome::effects(vec![]);
+        }
+        // The search bar is the next innermost surface on the agent page.
         if self.close_search() {
             return Outcome::effects(vec![]);
         }

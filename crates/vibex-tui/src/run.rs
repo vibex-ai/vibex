@@ -14,7 +14,8 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -120,7 +121,7 @@ fn event_loop(
                     dirty = true;
                 }
                 Event::Mouse(mouse) => {
-                    if handle_mouse(app, mouse.kind) {
+                    if handle_mouse(app, worker, mouse) {
                         dirty = true;
                     }
                 }
@@ -536,9 +537,11 @@ fn handle_composer_key(
     Ok(None)
 }
 
-fn handle_mouse(app: &mut App, kind: MouseEventKind) -> bool {
-    // The mouse is an enhancement only: every action has a keyboard path.
-    match kind {
+/// The mouse is an enhancement, never the only path: every gesture here has a
+/// keyboard equivalent, and the transcript stays readable if the terminal has no
+/// mouse reporting at all.
+fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
+    match mouse.kind {
         MouseEventKind::ScrollUp => {
             app.scroll.follow = false;
             app.scroll.offset = app.scroll.offset.saturating_sub(3);
@@ -548,8 +551,98 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) -> bool {
             app.scroll.offset = app.scroll.offset.saturating_add(3);
             true
         }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // The modal's close affordance is the one chrome control the mouse
+            // owns, and it only exists while a modal is open.
+            if let Some(close) = app.regions.modal_close
+                && rect_contains(close, mouse.column, mouse.row)
+            {
+                app.overlay = None;
+                app.regions.modal_close = None;
+                return true;
+            }
+            if app.overlay.is_some() {
+                return false;
+            }
+            if app.page != Page::Agent {
+                return false;
+            }
+            let Some((line, column)) = mouse_cell(app, mouse.column, mouse.row) else {
+                return false;
+            };
+            let now = Instant::now();
+            let double_click = app.last_click.is_some_and(|(at, last_line, last_column)| {
+                now.duration_since(at) < DOUBLE_CLICK && last_line == line && last_column == column
+            });
+            if double_click {
+                app.last_click = None;
+                return app.select_word_at(line, column);
+            }
+            app.last_click = Some((now, line, column));
+            app.clear_text_selection();
+            app.begin_text_selection(line, column);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some((line, column)) = mouse_cell_clamped(app, mouse.column, mouse.row) else {
+                return false;
+            };
+            app.extend_text_selection(line, column)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if !app.finish_text_selection() {
+                return true;
+            }
+            let Some(text) = app.selected_text() else {
+                return true;
+            };
+            let message = app.strings.copied().to_string();
+            app.toast(Toast::success(message));
+            worker.dispatch(crate::app::Effect::Clipboard { text });
+            true
+        }
         _ => false,
     }
+}
+
+/// How long two clicks count as one double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+/// The display cell under a pointer inside the transcript band.
+fn mouse_cell(app: &App, column: u16, row: u16) -> Option<(usize, u16)> {
+    let rect = app.regions.scrollback;
+    if !rect_contains(rect, column, row) {
+        return None;
+    }
+    let line = app.transcript.scroll_offset() + usize::from(row - rect.y);
+    Some((line, column - rect.x))
+}
+
+/// The display cell under a pointer, clamped into the band.
+///
+/// A drag that leaves the band scrolls the transcript one row per event and
+/// keeps extending the selection, so a phrase taller than the window can still
+/// be selected in one gesture.
+fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u16)> {
+    let rect = app.regions.scrollback;
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    if row < rect.y {
+        app.scroll.follow = false;
+        app.scroll.offset = app.scroll.offset.saturating_sub(1);
+    } else if row >= rect.bottom() {
+        app.scroll.follow = false;
+        app.scroll.offset = app.scroll.offset.saturating_add(1);
+    }
+    let row = row.clamp(rect.y, rect.bottom().saturating_sub(1));
+    let column = column.clamp(rect.x, rect.right().saturating_sub(1));
+    let line = app.transcript.scroll_offset() + usize::from(row - rect.y);
+    Some((line, column - rect.x))
 }
 
 fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {

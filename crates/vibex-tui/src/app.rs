@@ -409,6 +409,12 @@ pub struct App {
     pub session_cards: std::collections::BTreeSet<String>,
     /// The transcript search in progress, when the search bar is open.
     pub search: Option<crate::search::SearchState>,
+    /// The mouse selection over the transcript, while it is being made or after
+    /// it has been copied.
+    pub text_selection: Option<TextSelection>,
+    /// The last left click, so two clicks in the same cell can be told apart
+    /// from two clicks in different ones.
+    pub last_click: Option<(std::time::Instant, usize, u16)>,
     /// Messages held back until the running turn ends.
     pub queued_messages: Vec<String>,
     /// A transient message above the composer, dismissed on the next key.
@@ -455,10 +461,41 @@ pub struct Banner {
 /// recomputing the layout with a second copy of the maths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameRegions {
-    /// The transcript rectangle, excluding the gutter.
+    /// The rows that actually show transcript text: the band, less the pinned
+    /// header and the search bar.
     pub scrollback: ratatui::layout::Rect,
     /// The close affordance on the open modal's top border.
     pub modal_close: Option<ratatui::layout::Rect>,
+}
+
+/// A free-text selection over the transcript, in display coordinates.
+///
+/// `line` counts display lines from the top of the transcript, and `column`
+/// counts terminal cells from the left edge of the transcript band. Both are
+/// what the renderer already speaks in, so a selection never has to be
+/// translated back into block or byte coordinates to be painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: (usize, u16),
+    pub head: (usize, u16),
+    /// Whether the button is still held.
+    pub dragging: bool,
+}
+
+impl TextSelection {
+    /// The selection with the two ends in reading order.
+    pub fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Whether the selection covers any cell at all.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,6 +605,8 @@ impl App {
             draft_clear_armed: false,
             session_cards: std::collections::BTreeSet::new(),
             search: None,
+            text_selection: None,
+            last_click: None,
             queued_messages: Vec::new(),
             banner: None,
             turn_started: None,
@@ -951,6 +990,13 @@ impl App {
         self.page = page;
         self.filtering = false;
         self.focus = Focus::Main;
+        // The search bar and the selection belong to the transcript; leaving it
+        // must not leave a highlight behind on another page.
+        if page != Page::Agent {
+            self.close_search();
+            self.clear_text_selection();
+            self.last_click = None;
+        }
         if page.is_session_page() {
             self.navigation.level = vibex_ui::shell::NavigationLevel::Session;
         } else {
@@ -1073,6 +1119,104 @@ impl App {
         search.composing = false;
         self.reveal_current_match();
         true
+    }
+
+    // ---- transcript text selection -------------------------------------
+
+    /// Start a selection at one cell of the transcript band.
+    pub fn begin_text_selection(&mut self, line: usize, column: u16) {
+        self.text_selection = Some(TextSelection {
+            anchor: (line, column),
+            head: (line, column),
+            dragging: true,
+        });
+    }
+
+    /// Extend the selection in progress to one cell.
+    pub fn extend_text_selection(&mut self, line: usize, column: u16) -> bool {
+        let Some(selection) = self.text_selection.as_mut() else {
+            return false;
+        };
+        selection.head = (line, column);
+        true
+    }
+
+    /// Finish the selection in progress, reporting whether it covers anything.
+    pub fn finish_text_selection(&mut self) -> bool {
+        let Some(selection) = self.text_selection.as_mut() else {
+            return false;
+        };
+        selection.dragging = false;
+        !selection.is_empty()
+    }
+
+    /// Replace the selection with a whole word, for a double click.
+    pub fn select_word_at(&mut self, line: usize, column: u16) -> bool {
+        let theme = self.theme.clone();
+        let strings = self.strings;
+        let Some(text) = self
+            .transcript
+            .plain_lines(line, line + 1, &theme, strings)
+            .into_iter()
+            .next()
+        else {
+            return false;
+        };
+        let Some((start, end)) = crate::transcript::word_at(&text, column) else {
+            return false;
+        };
+        self.text_selection = Some(TextSelection {
+            anchor: (line, start),
+            head: (line, end),
+            dragging: false,
+        });
+        true
+    }
+
+    /// Forget the selection.
+    pub fn clear_text_selection(&mut self) -> bool {
+        self.text_selection.take().is_some()
+    }
+
+    /// The selected text, ready for the clipboard.
+    ///
+    /// The trailing whitespace of every line is dropped, because a terminal
+    /// pads with spaces and nobody wants them on the clipboard; interior
+    /// spacing is preserved exactly.
+    pub fn selected_text(&mut self) -> Option<String> {
+        let selection = self.text_selection?;
+        let (start, end) = selection.ordered();
+        if start == end {
+            return None;
+        }
+        let theme = self.theme.clone();
+        let strings = self.strings;
+        let lines = self
+            .transcript
+            .plain_lines(start.0, end.0 + 1, &theme, strings);
+        if lines.is_empty() {
+            return None;
+        }
+        let last = lines.len() - 1;
+        let mut output = Vec::with_capacity(lines.len());
+        for (index, line) in lines.into_iter().enumerate() {
+            let from = if index == 0 { usize::from(start.1) } else { 0 };
+            let to = if index == last {
+                usize::from(end.1)
+            } else {
+                usize::from(u16::MAX)
+            };
+            let (_, rest) = crate::text::take_width(&line, from);
+            let (prefix, _) = crate::text::take_width(rest, to.saturating_sub(from));
+            output.push(prefix.trim_end().to_string());
+        }
+        while output.last().is_some_and(|line| line.is_empty()) {
+            output.pop();
+        }
+        if output.is_empty() {
+            return None;
+        }
+        Some(output.join("\n"))
     }
 
     /// Recompute the shell kind for the current viewport.

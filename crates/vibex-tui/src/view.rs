@@ -553,7 +553,7 @@ fn render_scrollback(
         .search
         .as_ref()
         .and_then(|search| search.pattern.clone());
-    let lines = app.transcript.visible_lines_highlighted(
+    let mut lines = app.transcript.visible_lines_highlighted(
         scroll,
         height,
         theme,
@@ -561,6 +561,19 @@ fn render_scrollback(
         pattern.as_ref(),
         search_highlight_style(theme),
     );
+    // The selection is painted last so it wins over a search highlight on the
+    // same cells: the reader's most recent gesture is the one they mean.
+    if let Some(selection) = app.text_selection {
+        paint_selection(
+            &mut lines,
+            &selection,
+            app.transcript.scroll_offset(),
+            selection_style(theme),
+        );
+    }
+    // The mouse layer maps a pointer to a display line through this rect, so it
+    // is published once the header and the search bar have taken their rows.
+    app.regions.scrollback = content;
     if let Some(header) = header {
         // The pinned header sits on a raised surface so the transcript moving
         // underneath it reads as a separate layer rather than as more prose.
@@ -577,6 +590,44 @@ fn render_scrollback(
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
     if let Some(rows) = search_bar {
         render_search_bar(frame, rows, app, theme, strings);
+    }
+}
+
+/// The inverted band a mouse selection is painted with.
+fn selection_style(theme: &TuiTheme) -> Style {
+    Style::default()
+        .fg(theme.roles.background)
+        .bg(theme.roles.foreground)
+}
+
+/// Paint the selected column range of every visible display line.
+///
+/// `first_line` is the display line the first visible row shows, so a selection
+/// made in one frame still highlights correctly after the transcript scrolls.
+fn paint_selection(
+    lines: &mut [Line<'static>],
+    selection: &crate::app::TextSelection,
+    first_line: usize,
+    style: Style,
+) {
+    let (start, end) = selection.ordered();
+    for (offset, line) in lines.iter_mut().enumerate() {
+        let display_line = first_line + offset;
+        if display_line < start.0 || display_line > end.0 {
+            continue;
+        }
+        let from = if display_line == start.0 {
+            usize::from(start.1)
+        } else {
+            0
+        };
+        let to = if display_line == end.0 {
+            usize::from(end.1)
+        } else {
+            usize::MAX
+        };
+        let painted = crate::transcript::paint_columns(line.clone(), from, to, style);
+        *line = painted;
     }
 }
 
