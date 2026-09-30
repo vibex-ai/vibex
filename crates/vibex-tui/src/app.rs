@@ -399,6 +399,8 @@ pub struct App {
     pub last_click: Option<(std::time::Instant, usize, u16)>,
     /// Messages held back until the running turn ends.
     pub queued_messages: Vec<String>,
+    /// Which queued message the queue band's cursor is on.
+    pub queue_selection: Option<usize>,
     /// A transient message above the composer, dismissed on the next key.
     pub banner: Option<Banner>,
     /// When the running turn started, for the elapsed-time readout.
@@ -426,6 +428,16 @@ pub enum ComposerMode {
     Shell,
     /// Treat the draft as a search over sent messages.
     HistorySearch,
+}
+
+/// How far through its plan the session is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TodoProgress {
+    pub title: String,
+    pub done: usize,
+    pub total: usize,
+    /// The step the Agent is on, when one is running.
+    pub running: Option<String>,
 }
 
 /// A transient message above the composer.
@@ -594,6 +606,7 @@ impl App {
             text_selection: None,
             last_click: None,
             queued_messages: Vec::new(),
+            queue_selection: None,
             banner: None,
             turn_started: None,
             turn_tokens: None,
@@ -867,13 +880,51 @@ impl App {
         0
     }
 
+    /// The session's current plan, as the last plan-shaped block reported it.
+    ///
+    /// The runtime publishes a plan as a `TodoUpdate` (or `Plan`) timeline row
+    /// whose body is one `Status: title` line per step, so the progress bar is
+    /// derived from the transcript the reader can see rather than from a second
+    /// source of truth that could disagree with it.
+    pub fn todo_progress(&self) -> Option<TodoProgress> {
+        let block = self.transcript.blocks().iter().rev().find(|block| {
+            matches!(
+                block.kind,
+                vibex_desktop_model::TimelineRowKind::TodoUpdate
+                    | vibex_desktop_model::TimelineRowKind::Plan
+            )
+        })?;
+        let mut progress = TodoProgress {
+            title: block.title.clone(),
+            done: 0,
+            total: 0,
+            running: None,
+        };
+        for line in block.body.lines() {
+            let Some((status, title)) = line.split_once(": ") else {
+                continue;
+            };
+            progress.total += 1;
+            match status.trim() {
+                "Completed" => progress.done += 1,
+                "Running" => progress.running = Some(title.trim().to_string()),
+                _ => {}
+            }
+        }
+        (progress.total > 0).then_some(progress)
+    }
+
     /// Steps the session's plan has completed and total.
     pub fn todo_done_count(&self) -> usize {
-        0
+        self.todo_progress()
+            .map(|progress| progress.done)
+            .unwrap_or(0)
     }
 
     pub fn todo_total_count(&self) -> usize {
-        0
+        self.todo_progress()
+            .map(|progress| progress.total)
+            .unwrap_or(0)
     }
 
     /// What the Agent is doing right now, when the runtime reported it.
@@ -1136,6 +1187,127 @@ impl App {
         self.recent_commands.retain(|candidate| candidate != &id);
         self.recent_commands.insert(0, id);
         self.recent_commands.truncate(MAX_RECENT_COMMANDS);
+    }
+
+    // ---- the send queue --------------------------------------------------
+
+    /// Whether the open session has a turn running.
+    pub fn session_running(&self) -> bool {
+        self.active_session()
+            .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running)
+    }
+
+    /// Hold a message until the running turn ends.
+    pub fn enqueue_message(&mut self, text: String) {
+        self.queued_messages.push(text);
+        self.queue_selection = Some(self.queued_messages.len() - 1);
+    }
+
+    /// Move the queue cursor, entering the queue at its newest row.
+    pub fn move_queue_selection(&mut self, delta: isize) {
+        if self.queued_messages.is_empty() {
+            self.queue_selection = None;
+            return;
+        }
+        let last = self.queued_messages.len() - 1;
+        let current = self.queue_selection.unwrap_or(last) as isize;
+        self.queue_selection = Some((current + delta).clamp(0, last as isize) as usize);
+    }
+
+    /// Take the selected queued message back into the composer to edit it.
+    pub fn edit_queued_message(&mut self) -> bool {
+        let Some(index) = self
+            .queue_selection
+            .filter(|index| *index < self.queued_messages.len())
+        else {
+            return false;
+        };
+        let text = self.queued_messages.remove(index);
+        self.queue_selection = if self.queued_messages.is_empty() {
+            None
+        } else {
+            Some(index.min(self.queued_messages.len() - 1))
+        };
+        // A draft already in the composer is not thrown away: it goes to the
+        // front of the queue, which is where the reader would look for it.
+        let draft = self.composer.text().to_string();
+        if !draft.trim().is_empty() {
+            self.queued_messages.insert(index, draft);
+        }
+        self.composer.set_text(text);
+        self.focus = Focus::Composer;
+        self.composer_mode = ComposerMode::Normal;
+        true
+    }
+
+    /// Drop the selected queued message.
+    pub fn delete_queued_message(&mut self) -> bool {
+        let Some(index) = self
+            .queue_selection
+            .filter(|index| *index < self.queued_messages.len())
+        else {
+            return false;
+        };
+        self.queued_messages.remove(index);
+        self.queue_selection = if self.queued_messages.is_empty() {
+            None
+        } else {
+            Some(index.min(self.queued_messages.len() - 1))
+        };
+        true
+    }
+
+    /// Swap the selected queued message with its neighbour.
+    pub fn move_queued_message(&mut self, delta: isize) -> bool {
+        let Some(index) = self
+            .queue_selection
+            .filter(|index| *index < self.queued_messages.len())
+        else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= self.queued_messages.len() as isize {
+            return false;
+        }
+        self.queued_messages.swap(index, target as usize);
+        self.queue_selection = Some(target as usize);
+        true
+    }
+
+    /// Take the selected queued message out, to be sent immediately.
+    pub fn take_queued_message(&mut self) -> Option<String> {
+        let index = self
+            .queue_selection
+            .filter(|index| *index < self.queued_messages.len())?;
+        let text = self.queued_messages.remove(index);
+        self.queue_selection = if self.queued_messages.is_empty() {
+            None
+        } else {
+            Some(index.min(self.queued_messages.len() - 1))
+        };
+        Some(text)
+    }
+
+    /// Send the next held message once the turn has ended.
+    ///
+    /// Called after every worker message rather than on a special "turn ended"
+    /// event: the client has no such event, and a queue that only drains on one
+    /// signal would stall the moment that signal changed shape.
+    pub fn drain_queue(&mut self) -> Option<String> {
+        if self.queued_messages.is_empty() || self.session_running() {
+            return None;
+        }
+        if !self.live.is_live() {
+            return None;
+        }
+        let text = self.queued_messages.remove(0);
+        self.queue_selection = if self.queued_messages.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.history.push(text.clone());
+        Some(text)
     }
 
     // ---- composer history search ----------------------------------------

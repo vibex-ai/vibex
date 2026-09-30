@@ -921,6 +921,114 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
 }
 
 #[test]
+fn the_queue_band_shows_the_cursor_and_its_keys() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.enqueue_message("first held message".to_string());
+    app.enqueue_message("second held message".to_string());
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("second held message"), "{screen}");
+    assert!(
+        screen.contains("Alt+E edit"),
+        "the key hints are missing:\n{screen}"
+    );
+    assert!(screen.contains('▸'), "the cursor is not drawn:\n{screen}");
+}
+
+#[test]
+fn queue_editing_moves_a_message_back_into_the_draft() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.enqueue_message("first".to_string());
+    app.enqueue_message("second".to_string());
+    app.queue_selection = Some(1);
+    assert!(app.edit_queued_message());
+    assert_eq!(app.composer.text(), "second");
+    assert_eq!(app.queued_messages, vec!["first".to_string()]);
+    // The draft that was there is not lost: it joins the queue.
+    app.composer.set_text("a new draft");
+    app.queue_selection = Some(0);
+    assert!(app.edit_queued_message());
+    assert_eq!(app.queued_messages, vec!["a new draft".to_string()]);
+}
+
+#[test]
+fn queue_reordering_and_dropping_keep_the_cursor_sane() {
+    let mut app = app(120, 40);
+    for message in ["one", "two", "three"] {
+        app.enqueue_message(message.to_string());
+    }
+    app.queue_selection = Some(1);
+    assert!(app.move_queued_message(-1));
+    assert_eq!(app.queued_messages, vec!["two", "one", "three"]);
+    assert_eq!(app.queue_selection, Some(0));
+    // At the top, raising again is a no-op rather than a wrap.
+    assert!(!app.move_queued_message(-1));
+    assert!(app.delete_queued_message());
+    assert_eq!(app.queued_messages, vec!["one", "three"]);
+    assert_eq!(app.queue_selection, Some(0));
+}
+
+#[test]
+fn a_held_message_is_sent_once_the_turn_ends() {
+    let mut app = app(120, 40);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let session = seeded_session("session_queue0001", "queued work");
+    app.agent
+        .apply_sessions(Ok(vec![session.clone()]))
+        .expect("sessions apply");
+    app.agent.state.active_session.resolve(session.clone());
+    // Idle: the queue drains immediately.
+    app.enqueue_message("held".to_string());
+    assert_eq!(app.drain_queue().as_deref(), Some("held"));
+    assert!(app.queued_messages.is_empty());
+
+    // Running: nothing drains until the state changes.
+    let mut running = session;
+    running.state = vibex_core::AgentSessionState::Running;
+    app.agent.state.active_session.resolve(running.clone());
+    app.enqueue_message("waits".to_string());
+    assert!(app.drain_queue().is_none());
+    running.state = vibex_core::AgentSessionState::Idle;
+    app.agent.state.active_session.resolve(running);
+    assert_eq!(app.drain_queue().as_deref(), Some("waits"));
+}
+
+#[test]
+fn the_plan_band_reports_progress_from_the_timeline() {
+    use vibex_desktop_model::TimelineRowKind;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript
+        .set_blocks(vec![vibex_tui::transcript::Block {
+            id: "todo-1".to_string(),
+            kind: TimelineRowKind::TodoUpdate,
+            title: "Ship the plan band".to_string(),
+            body: "Completed: read the design\nRunning: write the band\nPending: add a test"
+                .to_string(),
+            turn_id: Some("turn-1".to_string()),
+            sequence: 1,
+            expanded: false,
+            collapsible: true,
+            streaming: false,
+            failed: false,
+            pending_permission: false,
+            file_path: None,
+            runtime_attribution: None,
+            conclusion: false,
+            group: vibex_tui::transcript::GroupRole::Solo,
+        }]);
+    assert_eq!(app.todo_done_count(), 1);
+    assert_eq!(app.todo_total_count(), 3);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("1/3"),
+        "the progress bar is missing:\n{screen}"
+    );
+    assert!(screen.contains("write the band"), "{screen}");
+}
+
+#[test]
 fn the_shortcuts_cheatsheet_groups_bindings_by_category() {
     use vibex_tui::keymap::Category;
     let app = app(120, 40);

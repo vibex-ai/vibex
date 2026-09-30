@@ -107,6 +107,13 @@ intents! {
     SwitchAgentRuntime => { scope: Agent, id: "runtime_switch", label: "Runtime", help: "Choose the Agent runtime and model for this session." },
     ProbeAgentRuntime => { scope: Agent, id: "runtime_probe", label: "Probe", help: "Ask the runtime to re-discover available Agents." },
     BeginTranscriptSearch => { scope: Agent, id: "transcript_search", label: "Find", help: "Search the transcript with a regular expression." },
+    QueueSelectPrevious => { scope: Agent, id: "queue_previous", label: "Queue up", help: "Move the queue cursor to the message above." },
+    QueueSelectNext => { scope: Agent, id: "queue_next", label: "Queue down", help: "Move the queue cursor to the message below." },
+    QueueEditSelected => { scope: Agent, id: "queue_edit", label: "Queue edit", help: "Pull the queued message back into the composer." },
+    QueueDeleteSelected => { scope: Agent, id: "queue_delete", label: "Queue drop", help: "Remove the queued message." },
+    QueueMoveUp => { scope: Agent, id: "queue_move_up", label: "Queue raise", help: "Send the queued message one turn earlier." },
+    QueueMoveDown => { scope: Agent, id: "queue_move_down", label: "Queue lower", help: "Send the queued message one turn later." },
+    QueueSendNow => { scope: Agent, id: "queue_send_now", label: "Send now", help: "Interrupt the turn and send the queued message immediately." },
     SearchNext => { scope: Agent, id: "search_next", label: "Next match", help: "Jump to the next match, wrapping at the end." },
     SearchPrevious => { scope: Agent, id: "search_previous", label: "Prev match", help: "Jump to the previous match, wrapping at the start." },
 
@@ -301,6 +308,12 @@ impl Intent {
                 | Intent::BeginTranscriptSearch
                 | Intent::SearchNext
                 | Intent::SearchPrevious
+                | Intent::QueueSelectPrevious
+                | Intent::QueueSelectNext
+                | Intent::QueueEditSelected
+                | Intent::QueueDeleteSelected
+                | Intent::QueueMoveUp
+                | Intent::QueueMoveDown
                 | Intent::CopyBlockBody
                 | Intent::CopyBlockMetadata
                 | Intent::OpenBlockDetails

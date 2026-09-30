@@ -582,7 +582,7 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         } else {
             0
         },
-        todo: 0,
+        todo: u16::from(app.todo_total_count() > 0),
         queue: if queued > 0 { (queued + 1).min(5) } else { 0 },
         turn_status,
         banner: u16::from(app.banner.is_some()),
@@ -633,22 +633,40 @@ fn render_todo_band(
     theme: &TuiTheme,
     _strings: Strings,
 ) {
-    let done = app.todo_done_count();
-    let total = app.todo_total_count();
+    let Some(progress) = app.todo_progress() else {
+        return;
+    };
     let bar_width = usize::from(area.width).saturating_sub(16).clamp(4, 40);
-    let filled = (done * bar_width).checked_div(total).unwrap_or(0);
-    let text = format!(
-        "{}{} {done}/{total}",
-        "█".repeat(filled),
-        "░".repeat(bar_width.saturating_sub(filled))
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(theme.roles.accent_user),
-        ))),
-        area,
-    );
+    let filled = (progress.done * bar_width)
+        .checked_div(progress.total)
+        .unwrap_or(0);
+    let mut spans = vec![Span::styled(
+        format!(
+            "{}{} {}/{}",
+            "█".repeat(filled),
+            "░".repeat(bar_width.saturating_sub(filled)),
+            progress.done,
+            progress.total
+        ),
+        Style::default().fg(theme.roles.accent_user),
+    )];
+    // The running step is what the reader wants from this band; the bar alone
+    // says how much is left without saying what is happening.
+    let label = progress
+        .running
+        .clone()
+        .unwrap_or_else(|| progress.title.clone());
+    if !label.is_empty() {
+        let used = bar_width + 8;
+        spans.push(Span::styled(
+            format!(
+                "  {}",
+                truncate_to_width(&label, usize::from(area.width).saturating_sub(used), "…")
+            ),
+            Style::default().fg(theme.roles.gray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The transcript band: full width, no frame.
@@ -1371,7 +1389,7 @@ fn render_queue_band(
     theme: &TuiTheme,
     strings: Strings,
 ) {
-    let mut lines = vec![Line::from(Span::styled(
+    let mut header = vec![Span::styled(
         format!(
             "{} {} {}",
             crate::glyphs::diamond_dotted(app.glyph_tier()),
@@ -1379,19 +1397,52 @@ fn render_queue_band(
             strings.composer_queue()
         ),
         Style::default().fg(theme.roles.gray_dim),
-    ))];
-    for message in app
+    )];
+    // The keys are only worth listing while the queue has something to act on,
+    // and only while the cursor is in it.
+    if app.queue_selection.is_some() {
+        header.push(Span::styled(
+            format!("  {}", strings.queue_hint()),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    let mut lines = vec![Line::from(header)];
+    let visible = usize::from(area.height).saturating_sub(1);
+    // Scroll the window so the cursor stays visible: a queue can be longer than
+    // the three rows the band allows.
+    let selected = app.queue_selection.unwrap_or(0);
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    for (index, message) in app
         .queued_messages
         .iter()
-        .take(usize::from(area.height).saturating_sub(1))
+        .enumerate()
+        .skip(offset)
+        .take(visible)
     {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                truncate_to_width(message, usize::from(area.width).saturating_sub(4), "…")
+        let active = app.queue_selection == Some(index);
+        let prefix = if active { "▸ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(theme.roles.accent_user),
             ),
-            Style::default().fg(theme.roles.gray),
-        )));
+            Span::styled(
+                format!("#{} ", index + 1),
+                Style::default().fg(theme.roles.gray_dim),
+            ),
+            Span::styled(
+                truncate_to_width(
+                    message.lines().next().unwrap_or_default(),
+                    usize::from(area.width).saturating_sub(6),
+                    "…",
+                ),
+                if active {
+                    theme.selected()
+                } else {
+                    Style::default().fg(theme.roles.gray)
+                },
+            ),
+        ]));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }

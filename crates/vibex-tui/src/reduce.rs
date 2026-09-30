@@ -455,6 +455,52 @@ impl App {
                 }
                 None => Outcome::quiet(),
             },
+            Intent::QueueSelectPrevious => {
+                self.move_queue_selection(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::QueueSelectNext => {
+                self.move_queue_selection(1);
+                Outcome::effects(vec![])
+            }
+            Intent::QueueEditSelected => {
+                if self.edit_queued_message() {
+                    self.toast(Toast::info(self.strings.queue_editing().to_string()));
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::QueueDeleteSelected => {
+                self.delete_queued_message();
+                Outcome::effects(vec![])
+            }
+            Intent::QueueMoveUp => {
+                self.move_queued_message(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::QueueMoveDown => {
+                self.move_queued_message(1);
+                Outcome::effects(vec![])
+            }
+            Intent::QueueSendNow => {
+                let Some(text) = self.take_queued_message() else {
+                    return Outcome::quiet();
+                };
+                let Some(session_id) = self.selected_session_id().cloned() else {
+                    return Outcome::quiet();
+                };
+                // Sending now means the running turn is interrupted first: the
+                // alternative is a message that claims to be immediate and is
+                // not.
+                let mut effects = Vec::new();
+                if self.session_running() {
+                    effects.push(Effect::Interrupt {
+                        session_id: session_id.clone(),
+                    });
+                }
+                self.history.push(text.clone());
+                effects.push(Effect::SendMessage { session_id, text });
+                Outcome::effects(effects)
+            }
             Intent::BeginTranscriptSearch => {
                 self.page = Page::Agent;
                 if !self.begin_search() {
@@ -1634,8 +1680,15 @@ impl App {
             return Outcome::quiet();
         }
         let text = self.composer.take_expanded();
-        self.history.push(text.clone());
         self.completion = None;
+        // A message written while a turn is running is held rather than sent:
+        // the runtime would have to interleave it with work already in flight.
+        if self.session_running() {
+            self.enqueue_message(text);
+            self.toast(Toast::info(self.strings.queue_held().to_string()));
+            return Outcome::effects(vec![]);
+        }
+        self.history.push(text.clone());
         self.scroll.follow = true;
         Outcome::effects(vec![Effect::SendMessage { session_id, text }])
     }

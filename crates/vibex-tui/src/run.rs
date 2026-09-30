@@ -171,6 +171,17 @@ fn event_loop(
             }
         }
 
+        // ---- the send queue ----------------------------------------------
+        // A turn that has ended releases the next held message. Checked here,
+        // after worker results have been applied, because that is the only
+        // moment the session's state can have changed.
+        if let Some(text) = app.drain_queue()
+            && let Some(session_id) = app.selected_session_id().cloned()
+        {
+            worker.dispatch(crate::app::Effect::SendMessage { session_id, text });
+            dirty = true;
+        }
+
         // ---- tick ---------------------------------------------------------
         let period = if app.transcript_animating() {
             ANIMATION_TICK

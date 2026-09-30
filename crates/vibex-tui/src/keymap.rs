@@ -687,6 +687,46 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::BeginTranscriptSearch,
         "Find",
     ),
+    // The queue's own keys. `Alt` keeps them out of the way of the transcript,
+    // and every one of them no-ops when nothing is queued.
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Up, KeyModifiers::ALT),
+        Intent::QueueSelectPrevious,
+        "Queue up",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Down, KeyModifiers::ALT),
+        Intent::QueueSelectNext,
+        "Queue down",
+    ),
+    alias(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        Intent::QueueEditSelected,
+    ),
+    alias(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('x'), KeyModifiers::ALT),
+        Intent::QueueDeleteSelected,
+    ),
+    alias(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('k'), KeyModifiers::ALT),
+        Intent::QueueMoveUp,
+    ),
+    alias(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('j'), KeyModifiers::ALT),
+        Intent::QueueMoveDown,
+    ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Enter, KeyModifiers::ALT),
+        Intent::QueueSendNow,
+        "Send now",
+    ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('n')),

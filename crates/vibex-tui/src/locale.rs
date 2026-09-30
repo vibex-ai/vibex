@@ -371,6 +371,21 @@ strings! {
     details_context => { "Context", "上下文", "上下文" },
     background_tasks => { "background", "后台任务", "背景工作" },
     queued_messages => { "queued", "已排队", "已排隊" },
+    queue_held => {
+        "Held until the running turn ends",
+        "将在当前轮次结束后发送",
+        "將在目前輪次結束後傳送"
+    },
+    queue_editing => {
+        "Queued message moved back into the draft",
+        "已把排队消息放回输入框",
+        "已把排隊訊息放回輸入框"
+    },
+    queue_hint => {
+        "Alt+↑↓ pick · Alt+E edit · Alt+X drop · Alt+J/K reorder · Alt+Enter send now",
+        "Alt+↑↓ 选择 · Alt+E 编辑 · Alt+X 删除 · Alt+J/K 调序 · Alt+Enter 立即发送",
+        "Alt+↑↓ 選擇 · Alt+E 編輯 · Alt+X 刪除 · Alt+J/K 調序 · Alt+Enter 立即傳送"
+    },
     mode_shell => { "shell", "shell", "shell" },
     mode_remember => { "remember", "记住", "記住" },
     mode_plan => { "plan", "计划", "計畫" },
