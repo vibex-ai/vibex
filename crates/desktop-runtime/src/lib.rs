@@ -7,6 +7,7 @@ mod auth_catalog;
 mod browser;
 mod catalog;
 pub mod composer;
+mod computer;
 mod events;
 mod fixture;
 mod home_lock;
@@ -76,6 +77,7 @@ use acp_terminal::DesktopAcpTerminalHost;
 
 pub use agent_auth_context::AgentAuthContextService;
 pub use browser::BrowserRuntime;
+pub use computer::{ComputerRuntime, HelperSpawnPolicy};
 
 pub use agent_install::{AgentInstallService, AgentNodeRuntimeOptions, AgentUvRuntimeOptions};
 pub use auth_catalog::AgentAuthCatalogService;
@@ -231,6 +233,10 @@ pub struct DesktopRuntimeConfig {
     /// Executable used for the session-scoped delegation MCP sidecar. `None`
     /// keeps isolated/test runtimes from exposing a subprocess entry point.
     pub delegation_sidecar_command: Option<PathBuf>,
+    /// Whether the computer-use feature may start at all. Defaults to **off**:
+    /// an Agent driving the user's real desktop is opt-in, and a deployment
+    /// that never asked for it must not get it by upgrading.
+    pub computer_use_enabled: bool,
 }
 
 impl DesktopRuntimeConfig {
@@ -376,6 +382,10 @@ impl DesktopRuntimeConfig {
             workspace_browse_roots,
             delegation_sidecar_command: std::env::var_os("VIBEX_DELEGATION_SIDECAR_COMMAND")
                 .map(PathBuf::from),
+            // Off unless the deployment asks for it. This is the one feature in
+            // the product that can act on a user's real desktop with their real
+            // accounts, so it is opt-in in every mode, including headless.
+            computer_use_enabled: environment_bool("VIBEX_COMPUTER_USE").unwrap_or(false),
         })
     }
 
@@ -404,6 +414,7 @@ impl DesktopRuntimeConfig {
             remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
+            computer_use_enabled: false,
         })
     }
 
@@ -441,6 +452,7 @@ impl DesktopRuntimeConfig {
             remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
+            computer_use_enabled: false,
         }
     }
 
@@ -467,6 +479,7 @@ impl DesktopRuntimeConfig {
             remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
+            computer_use_enabled: false,
         }
     }
 
@@ -494,6 +507,7 @@ impl DesktopRuntimeConfig {
             remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
+            computer_use_enabled: false,
         }
     }
 
@@ -518,6 +532,7 @@ impl DesktopRuntimeConfig {
             remote_gateway: Self::desktop_gateway(),
             workspace_browse_roots,
             delegation_sidecar_command: None,
+            computer_use_enabled: false,
         }
     }
 
@@ -2117,6 +2132,10 @@ pub struct DesktopRuntime {
     config: DesktopRuntimeConfig,
     app_update: AppUpdateService,
     agent: AgentHandle,
+    /// Computer-use service, its engine helper and its loopback MCP endpoint.
+    /// The helper owns the OS grants, so this runtime is the only thing that
+    /// may start it.
+    computer: Arc<ComputerRuntime>,
     /// Embedded-browser service plus its loopback MCP endpoint. The browser
     /// process, the CDP connection and the audit ledger all belong to the
     /// runtime; clients only subscribe.
@@ -2147,6 +2166,12 @@ pub struct DesktopRuntime {
 /// The profile lives under the runtime's data directory, never inside the
 /// user's workspace: a browser profile is runtime state, not a project
 /// artifact, and writing it into the workspace would show up in `git status`.
+/// Where the computer-use helper keeps its single-owner lock and where the CLI
+/// writes screenshots. Runtime state, never inside a workspace.
+fn computer_home_dir(config: &DesktopRuntimeConfig) -> PathBuf {
+    config.home_dir.join("computer-use")
+}
+
 fn browser_home_dir(config: &DesktopRuntimeConfig) -> PathBuf {
     config.home_dir.clone()
 }
@@ -2524,6 +2549,14 @@ impl DesktopRuntime {
         // tool installation happen after the struct is built, so a failure in
         // either degrades the browser only and never blocks startup.
         let browser = BrowserRuntime::new(browser_home_dir(&config), agent.clone());
+        // Computer use is assembled the same way and degrades the same way: a
+        // missing engine, a missing desktop session or a refused platform
+        // leaves the rest of the runtime untouched.
+        let computer = ComputerRuntime::new(
+            computer_home_dir(&config),
+            agent.clone(),
+            config.computer_use_enabled,
+        );
         let runtime = Arc::new(Self {
             config,
             app_update,
@@ -2568,6 +2601,7 @@ impl DesktopRuntime {
             timeline_display_settings,
             polling: DesktopPollingPolicy::default(),
             browser: browser.clone(),
+            computer: computer.clone(),
             events,
             tasks: Mutex::new(Vec::new()),
             home_lock: Mutex::new(home_lock),
@@ -2618,6 +2652,40 @@ impl DesktopRuntime {
                 runtime.browser.service().clone(),
             ));
         runtime.browser.service().start_background_tasks().await;
+        // The computer endpoint is started after the browser one so that a
+        // failure in either degrades only that feature. `headless` is passed
+        // through because where the OS attaches its grants depends on it.
+        startup_stage_async("computer_use_start", async {
+            let command = runtime.config.delegation_sidecar_command.clone();
+            let headless = matches!(runtime.config.mode, DesktopRuntimeMode::Headless);
+            if let Err(error) = runtime.computer.start(command, headless).await {
+                tracing::warn!(
+                    target: "vibex_computer",
+                    error_code = %error.code,
+                    "computer use could not be started; desktop tools will not reach Agents"
+                );
+                return Ok(());
+            }
+            if runtime.computer.service().endpoint_url().is_some() {
+                runtime.computer.start_audit_consumer().await;
+                runtime.computer.start_disconnect_guard().await;
+                if let Some(command) = runtime.config.delegation_sidecar_command.clone() {
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move {
+                        if let Err(error) = runtime.computer.install_tool_config(command).await {
+                            tracing::warn!(
+                                target: "vibex_computer",
+                                error_code = %error.code,
+                                "the computer MCP tool could not be installed; desktop tools will \
+                                 not reach Agents"
+                            );
+                        }
+                    });
+                }
+            }
+            Ok(())
+        })
+        .await?;
         if let Some(task) = delegation_broker_task {
             runtime
                 .tasks
@@ -3320,6 +3388,12 @@ impl DesktopRuntime {
         self.agent.clone()
     }
 
+    /// The computer-use runtime: the engine helper, its loopback MCP endpoint
+    /// and the redacted audit ledger.
+    pub fn computer(&self) -> Arc<ComputerRuntime> {
+        Arc::clone(&self.computer)
+    }
+
     /// The embedded-browser runtime: the service, its loopback MCP endpoint and
     /// the tool-delivery matrix.
     pub fn browser(&self) -> Arc<BrowserRuntime> {
@@ -3568,6 +3642,10 @@ impl DesktopRuntime {
         // that must not outlive the runtime, and both are cheap to stop
         // explicitly. `kill_on_drop` is a net, not the plan.
         self.browser.shutdown().await;
+        // Computer use goes down next to the browser: both own a process tree
+        // and a privileged channel, and the helper must release held input
+        // before the runtime exits.
+        self.computer.shutdown().await;
         if let Err(error) = self.agent.runtime_lifecycle.stop().await {
             record_shutdown_error(&mut first_error, error);
         }

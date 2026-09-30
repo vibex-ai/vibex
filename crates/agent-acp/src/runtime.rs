@@ -12825,6 +12825,14 @@ impl AcpRuntimeClient {
             .compatibility_registry
             .for_agent(&agent_id)
             .map(|descriptor| descriptor.transcript_strategy);
+        // Session-scoped environment a built-in capability needs in the Agent's
+        // own shell (the computer-use CLI is the only one today). A profile
+        // overlay naming the same key wins: it is a deliberate user choice.
+        for (key, value) in &runtime_resources.env {
+            if !env_overlays.iter().any(|(existing, _)| existing == key) {
+                command.env(key, value);
+            }
+        }
         for (key, value) in env_overlays {
             command.env(key, value);
         }
@@ -19506,7 +19514,7 @@ fn content_block_image_mime(content: Option<&Value>) -> Option<Option<String>> {
             item.get("mimeType")
                 .or_else(|| item.get("mime_type"))
                 .and_then(Value::as_str)
-                .map(|mime_type| bounded_session_content(mime_type))
+                .map(bounded_session_content)
         })
     })
 }
@@ -23030,6 +23038,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
             disabled_tools: Vec::new(),
         };
         let invalid = ProviderRuntimeResources {
+            env: Vec::new(),
             mcp_servers: vec![ProviderRuntimeMcpServer {
                 id: "broken".to_string(),
                 display_name: "Broken".to_string(),
@@ -23053,6 +23062,7 @@ printf '%s %s\n' "$$" "$descendant" > "$VIBEX_TEST_PID_FILE"
         assert_eq!(err.code, "acp_mcp_stdio_command_missing");
 
         let resources = ProviderRuntimeResources {
+            env: Vec::new(),
             mcp_servers: vec![ProviderRuntimeMcpServer {
                 id: "web".to_string(),
                 display_name: "Web MCP".to_string(),
@@ -26973,6 +26983,7 @@ for line in sys.stdin:
 
     fn fixture_mcp_resources() -> ProviderRuntimeResources {
         ProviderRuntimeResources {
+            env: Vec::new(),
             mcp_servers: vec![
                 ProviderRuntimeMcpServer {
                     id: "filesystem".to_string(),

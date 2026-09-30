@@ -9,6 +9,7 @@ use gpui::{
 use gpui_component::{Root, TitleBar};
 use vibex_agent::run_delegation_mcp_stdio;
 use vibex_browser::stdio::run_browser_mcp_stdio;
+use vibex_computer::cli::run as run_computer_cli;
 use vibex_desktop::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, MIN_HEIGHT, MIN_WIDTH, app, assets,
     code_workbench::{CodeWorkbenchFixture, CodeWorkbenchFixtureKind},
@@ -115,6 +116,51 @@ fn run_tui(local: bool) {
     }
 }
 
+/// Runs the computer-use helper until its parent goes away.
+///
+/// The helper is the only process that talks to the desktop driver. It
+/// authenticates before it does anything, owns a single-owner lock file,
+/// releases held input when its parent dies, and exits after thirty
+/// unauthenticated seconds.
+fn run_computer_helper() -> Result<(), String> {
+    let configuration = vibex_computer::helper::helper_config_from_environment()
+        .map_err(|error| error.to_string())?;
+    let mut engine = vibex_computer::CuaDriverCli::new(
+        configuration
+            .driver
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(vibex_computer::DRIVER_COMMAND)),
+    );
+    if let Some(enable) = std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable())
+    {
+        engine = engine.with_env(
+            vibex_core::ComputerPlatform::wayland_opt_in_variable(),
+            enable.to_string_lossy().to_string(),
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start the helper runtime: {error}"))?;
+    runtime.block_on(async move {
+        // The helper's protocol is newline-delimited JSON over its own
+        // standard streams, so the parent's death is visible as EOF.
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let stdout = tokio::io::stdout();
+        vibex_computer::run_helper_with_engine(
+            std::sync::Arc::new(engine),
+            configuration.token,
+            configuration.owner,
+            configuration.parent_pid,
+            stdin,
+            stdout,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+}
+
 fn main() {
     configure_allocator();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
@@ -134,6 +180,44 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    if arguments.len() == 1 && arguments[0] == "--computer-mcp" {
+        if let Err(error) = vibex_computer::stdio::run_computer_mcp_stdio() {
+            eprintln!("Computer MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The engine helper is spawned by the runtime, never by an Agent CLI: the
+    // process that starts it is the process the operating system attaches its
+    // screen and accessibility grants to.
+    if arguments.len() == 1 && arguments[0] == "--computer-helper" {
+        if let Err(error) = run_computer_helper() {
+            eprintln!("Computer-use helper failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The CLI path exists for Agents that receive no built-in MCP server at
+    // all. It speaks to the same runtime endpoint, so policy, approval and the
+    // audit ledger are the same code either way.
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "computer")
+    {
+        match run_computer_cli(&arguments[1..]) {
+            Ok(output) => {
+                println!("{output}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                if let Some(hint) = &error.recovery_hint {
+                    eprintln!("{hint}");
+                }
+                std::process::exit(2);
+            }
+        }
     }
     // The character-grid client runs before any GPUI setup: on Linux the
     // packaged binary is already on PATH, so `vibex-desktop tui` is the

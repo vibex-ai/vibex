@@ -7,6 +7,7 @@ pub mod assets;
 pub mod browser_surface;
 pub mod browser_transport;
 pub mod code_workbench;
+pub mod computer_surface;
 pub mod directory_picker;
 pub mod gpui_ext;
 pub mod hint_layer;
@@ -67,6 +68,7 @@ pub struct FirstFrameProbe {
     pub code_workbench_contract: testing::CodeWorkbenchContractProbe,
     pub management_contract: testing::ManagementContractProbe,
     pub embedded_browser_contract: testing::EmbeddedBrowserContractProbe,
+    pub computer_use_contract: testing::ComputerUseContractProbe,
 }
 
 pub fn first_frame_probe() -> FirstFrameProbe {
@@ -96,6 +98,7 @@ pub fn first_frame_probe() -> FirstFrameProbe {
         code_workbench_contract: testing::code_workbench_contract_probe(),
         management_contract: testing::management_contract_probe(),
         embedded_browser_contract: testing::embedded_browser_contract_probe(),
+        computer_use_contract: testing::computer_use_contract_probe(),
     }
 }
 

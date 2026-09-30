@@ -16,6 +16,7 @@ members = [
   "crates/diagnostics",
   "crates/desktop-model",
   "crates/browser",
+  "crates/computer",
   "crates/desktop-runtime",
   "crates/db",
   "crates/fs",
@@ -56,7 +57,9 @@ sysinfo = "0.37"
 # filesystem layer already resolves, so the graph gains no new package.
 regex = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+# `io-std` is what the computer-use helper needs to speak its newline-delimited
+# protocol over the process's own standard streams.
+tokio = { version = "1", features = ["io-std", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 # Terminal UI stack. `ratatui` drives the character grid; `crossterm` owns the
 # terminal backend, raw mode and the event stream. Both are optional-free for

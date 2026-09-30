@@ -116,6 +116,7 @@ vibex_id!(TimelineItemId, "timeline");
 vibex_id!(TerminalId, "terminal");
 vibex_id!(BrowserSessionId, "browser_session");
 vibex_id!(BrowserTabId, "browser_tab");
+vibex_id!(ComputerSessionId, "computer_session");
 vibex_id!(EventId, "event");
 vibex_id!(ChannelId, "channel");
 vibex_id!(RelayRoomId, "relayroom");

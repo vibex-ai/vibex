@@ -25,6 +25,7 @@ const OPEN_ID: &str = "vibex-tray-open";
 const NEW_SESSION_ID: &str = "vibex-tray-new-session";
 const CONFIG_CENTER_ID: &str = "vibex-tray-config-center";
 const SETTINGS_ID: &str = "vibex-tray-settings";
+const COMPUTER_USE_ID: &str = "vibex-tray-computer-use";
 const QUIT_ID: &str = "vibex-tray-quit";
 
 struct TrayMenuItems {
@@ -32,6 +33,7 @@ struct TrayMenuItems {
     new_session: MenuItem,
     config_center: MenuItem,
     settings: MenuItem,
+    computer_use: MenuItem,
     quit: MenuItem,
 }
 
@@ -66,6 +68,9 @@ impl SystemTray {
                 None,
             ),
             settings: MenuItem::with_id(SETTINGS_ID, strings.settings, true, None),
+            // The panel lives one click away from anywhere: it is the only
+            // place a reader can watch a desktop Agent and stop it.
+            computer_use: MenuItem::with_id(COMPUTER_USE_ID, "Computer use", true, None),
             quit: MenuItem::with_id(QUIT_ID, strings.tray_quit_vibex, true, None),
         };
         let separator = PredefinedMenuItem::separator();
@@ -74,6 +79,7 @@ impl SystemTray {
             &items.new_session,
             &items.config_center,
             &items.settings,
+            &items.computer_use,
             &separator,
             &items.quit,
         ])
@@ -232,6 +238,9 @@ impl SystemTray {
                 workbench.update(cx, |workbench, cx| {
                     workbench.open_settings_from_tray(window, cx)
                 });
+            }),
+            COMPUTER_USE_ID => self.with_visible_window(cx, |workbench, _, cx| {
+                workbench.update(cx, |workbench, cx| workbench.open_computer_panel(cx));
             }),
             QUIT_ID => {
                 self.quitting = true;

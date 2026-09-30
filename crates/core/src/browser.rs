@@ -35,8 +35,11 @@ pub const AGENT_DELEGATION_MCP_SERVER_ID: &str = "vibex-agent-delegation";
 /// The check has to be a set, not a single id, or a second built-in server is
 /// silently treated as a user server and dropped on every profile without the
 /// flag.
-pub const BUILTIN_MCP_SERVER_IDS: &[&str] =
-    &[AGENT_DELEGATION_MCP_SERVER_ID, BROWSER_MCP_SERVER_ID];
+pub const BUILTIN_MCP_SERVER_IDS: &[&str] = &[
+    AGENT_DELEGATION_MCP_SERVER_ID,
+    BROWSER_MCP_SERVER_ID,
+    crate::computer::COMPUTER_MCP_SERVER_ID,
+];
 
 /// True when an MCP server id belongs to the runtime itself.
 pub fn is_builtin_mcp_server_id(id: &str) -> bool {
@@ -1006,6 +1009,9 @@ mod tests {
     fn builtin_mcp_server_ids_are_recognized_as_a_set() {
         assert!(is_builtin_mcp_server_id(AGENT_DELEGATION_MCP_SERVER_ID));
         assert!(is_builtin_mcp_server_id(BROWSER_MCP_SERVER_ID));
+        assert!(is_builtin_mcp_server_id(
+            crate::computer::COMPUTER_MCP_SERVER_ID
+        ));
         assert!(!is_builtin_mcp_server_id("user-configured-server"));
         assert!(!is_builtin_mcp_server_id(""));
     }

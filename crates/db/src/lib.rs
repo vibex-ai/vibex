@@ -75,7 +75,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 60;
+pub const CURRENT_SCHEMA_VERSION: i64 = 61;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -1905,6 +1905,8 @@ pub struct RemotePairingCodeRepository;
 pub struct RemoteAuditRepository;
 pub struct BrowserAuditRepository;
 pub struct BrowserOriginGrantRepository;
+pub struct ComputerAuditRepository;
+pub struct ComputerAppGrantRepository;
 
 /// One entry in the embedded browser's redacted operation ledger.
 ///
@@ -1936,6 +1938,42 @@ pub struct BrowserAuditRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserOriginGrant {
     pub origin: String,
+    pub granted_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// One entry in the computer-use redacted action ledger.
+///
+/// The record carries no typed text, clipboard contents, accessibility tree
+/// bodies, window titles or screenshots by construction; callers must redact
+/// before they insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerAuditRecord {
+    pub id: String,
+    pub session_id: String,
+    pub workspace_id: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub kind: String,
+    /// Already redacted by the caller; never raw typed text or window content.
+    pub summary: String,
+    pub target: Option<String>,
+    pub risk: String,
+    pub delivery_mode: Option<String>,
+    pub verification: String,
+    pub status: String,
+    pub execution_source: String,
+    pub at_ms: i64,
+}
+
+/// One remembered computer-use application grant.
+///
+/// The runtime resolves an application to a canonical identity before it lands
+/// here, so a grant is never keyed by a model-supplied string and a renamed
+/// application or a new executable path is a separate grant. `expires_at_ms` is
+/// nullable so a future TTL needs no further migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerAppGrant {
+    pub app_identity: String,
     pub granted_at_ms: i64,
     pub expires_at_ms: Option<i64>,
 }
@@ -11041,6 +11079,182 @@ impl BrowserOriginGrantRepository {
     }
 }
 
+impl ComputerAuditRepository {
+    pub fn insert(conn: &Connection, record: &ComputerAuditRecord) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO computer_audit_records (
+                id, session_id, workspace_id, agent_session_id, kind, summary,
+                target, risk, delivery_mode, verification, status,
+                execution_source, at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                record.id.as_str(),
+                record.session_id.as_str(),
+                record.workspace_id.as_deref(),
+                record.agent_session_id.as_deref(),
+                record.kind.as_str(),
+                record.summary.as_str(),
+                record.target.as_deref(),
+                record.risk.as_str(),
+                record.delivery_mode.as_deref(),
+                record.verification.as_str(),
+                record.status.as_str(),
+                record.execution_source.as_str(),
+                record.at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "computer_audit_insert_failed",
+            "failed to insert computer audit record",
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_for_session(
+        conn: &Connection,
+        session_id: &str,
+        limit: i64,
+    ) -> VibexResult<Vec<ComputerAuditRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, session_id, workspace_id, agent_session_id, kind, summary,
+                    target, risk, delivery_mode, verification, status,
+                    execution_source, at_ms
+                FROM computer_audit_records
+                WHERE session_id = ?1
+                ORDER BY at_ms DESC, id DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(storage_err(
+                "computer_audit_list_failed",
+                "failed to list computer audit records",
+            ))?;
+        let rows = stmt
+            .query_map(params![session_id, limit], map_computer_audit_record)
+            .map_err(storage_err(
+                "computer_audit_list_failed",
+                "failed to list computer audit records",
+            ))?;
+        collect_rows(
+            rows,
+            "computer_audit_decode_failed",
+            "failed to decode computer audit record",
+        )
+    }
+
+    pub fn list_for_workspace(
+        conn: &Connection,
+        workspace_id: &str,
+        limit: i64,
+    ) -> VibexResult<Vec<ComputerAuditRecord>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, session_id, workspace_id, agent_session_id, kind, summary,
+                    target, risk, delivery_mode, verification, status,
+                    execution_source, at_ms
+                FROM computer_audit_records
+                WHERE workspace_id = ?1
+                ORDER BY at_ms DESC, id DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(storage_err(
+                "computer_audit_list_failed",
+                "failed to list computer audit records",
+            ))?;
+        let rows = stmt
+            .query_map(params![workspace_id, limit], map_computer_audit_record)
+            .map_err(storage_err(
+                "computer_audit_list_failed",
+                "failed to list computer audit records",
+            ))?;
+        collect_rows(
+            rows,
+            "computer_audit_decode_failed",
+            "failed to decode computer audit record",
+        )
+    }
+}
+
+impl ComputerAppGrantRepository {
+    pub fn upsert(conn: &Connection, grant: &ComputerAppGrant) -> VibexResult<()> {
+        conn.execute(
+            "
+            INSERT INTO computer_app_grants (app_identity, granted_at_ms, expires_at_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(app_identity) DO UPDATE SET
+                granted_at_ms = excluded.granted_at_ms,
+                expires_at_ms = excluded.expires_at_ms
+            ",
+            params![
+                grant.app_identity.as_str(),
+                grant.granted_at_ms,
+                grant.expires_at_ms
+            ],
+        )
+        .map_err(storage_err(
+            "computer_app_grant_upsert_failed",
+            "failed to upsert computer app grant",
+        ))?;
+        Ok(())
+    }
+
+    /// Identities whose grant has not expired. A NULL expiry never expires.
+    pub fn live_identities(conn: &Connection) -> VibexResult<Vec<String>> {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT app_identity
+                FROM computer_app_grants
+                WHERE expires_at_ms IS NULL OR expires_at_ms > ?1
+                ORDER BY app_identity ASC
+                ",
+            )
+            .map_err(storage_err(
+                "computer_app_grant_list_failed",
+                "failed to list computer app grants",
+            ))?;
+        let rows = stmt
+            .query_map(params![unix_timestamp_ms()], |row| row.get::<_, String>(0))
+            .map_err(storage_err(
+                "computer_app_grant_list_failed",
+                "failed to list computer app grants",
+            ))?;
+        collect_rows(
+            rows,
+            "computer_app_grant_decode_failed",
+            "failed to decode computer app grant",
+        )
+    }
+
+    pub fn revoke(conn: &Connection, app_identity: &str) -> VibexResult<()> {
+        conn.execute(
+            "DELETE FROM computer_app_grants WHERE app_identity = ?1",
+            params![app_identity],
+        )
+        .map_err(storage_err(
+            "computer_app_grant_revoke_failed",
+            "failed to revoke computer app grant",
+        ))?;
+        Ok(())
+    }
+
+    pub fn revoke_all(conn: &Connection) -> VibexResult<()> {
+        conn.execute("DELETE FROM computer_app_grants", [])
+            .map_err(storage_err(
+                "computer_app_grant_revoke_failed",
+                "failed to revoke computer app grants",
+            ))?;
+        Ok(())
+    }
+}
+
 /// The runtime's own published name.
 ///
 /// One row per database, so the store is a get-or-default read and an upsert
@@ -11215,6 +11429,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     apply_drop_duplicate_timeline_index(conn, &mut applied)?;
     apply_browser_origin_grants(conn, &mut applied)?;
     apply_prompt_usage_table(conn, &mut applied)?;
+    apply_computer_use(conn, &mut applied)?;
 
     // Seed compatibility Profiles before the v37 backfill while no caller
     // transaction is active. Repository reads may run inside a transaction and
@@ -11440,6 +11655,69 @@ fn apply_browser_origin_grants(
     tx.commit().map_err(storage_err(
         "migration_commit_failed",
         "failed to commit the browser origin grant migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
+    Ok(())
+}
+
+/// Adds the computer-use redacted action ledger and its session-scoped
+/// application allowlist.
+///
+/// The computer-use layer drives applications the runtime did not author, so a
+/// remembered grant and a redacted record of what was done both have to be
+/// durable here instead of in a shared permission policy store.
+fn apply_computer_use(conn: &mut Connection, applied: &mut Vec<String>) -> VibexResult<()> {
+    const VERSION: i64 = 61;
+    const NAME: &str = "computer_use";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        -- The redacted computer-use action ledger. Typed text, clipboard contents,
+        -- accessibility tree bodies, window titles and screenshots are deliberately
+        -- NOT stored here.
+        CREATE TABLE IF NOT EXISTS computer_audit_records (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            workspace_id TEXT NULL,
+            agent_session_id TEXT NULL,
+            kind TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            target TEXT NULL,
+            risk TEXT NOT NULL,
+            delivery_mode TEXT NULL,
+            verification TEXT NOT NULL,
+            status TEXT NOT NULL,
+            execution_source TEXT NOT NULL,
+            at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_computer_audit_records_session
+            ON computer_audit_records(session_id, at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_computer_audit_records_workspace
+            ON computer_audit_records(workspace_id, at_ms DESC);
+
+        -- Session-scoped application grants. The key is the canonical identity the
+        -- runtime resolved (app id + display name + bundle id + executable path,
+        -- lowercased), never a model-supplied string.
+        CREATE TABLE IF NOT EXISTS computer_app_grants (
+            app_identity TEXT PRIMARY KEY,
+            granted_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER NULL
+        );
+        ",
+    )
+    .map_err(storage_err(
+        "migration_apply_failed",
+        "failed to create the computer-use tables",
+    ))?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the computer-use migration",
     ))?;
     applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
@@ -13853,6 +14131,24 @@ fn map_browser_origin_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Browser
     })
 }
 
+fn map_computer_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerAuditRecord> {
+    Ok(ComputerAuditRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        agent_session_id: row.get(3)?,
+        kind: row.get(4)?,
+        summary: row.get(5)?,
+        target: row.get(6)?,
+        risk: row.get(7)?,
+        delivery_mode: row.get(8)?,
+        verification: row.get(9)?,
+        status: row.get(10)?,
+        execution_source: row.get(11)?,
+        at_ms: row.get(12)?,
+    })
+}
+
 fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
         id: parse_id_sql(row.get(0)?, VibexSessionId::parse)?,
@@ -14931,7 +15227,8 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
-                "60:prompt_usage"
+                "60:prompt_usage",
+                "61:computer_use"
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -15076,6 +15373,7 @@ mod tests {
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
                 "60:prompt_usage",
+                "61:computer_use",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -15200,7 +15498,8 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
-                "60:prompt_usage"
+                "60:prompt_usage",
+                "61:computer_use"
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -15363,7 +15662,8 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
-                "60:prompt_usage"
+                "60:prompt_usage",
+                "61:computer_use"
             ]
         );
         assert_eq!(
@@ -16783,7 +17083,8 @@ mod tests {
                 "57:browser_audit",
                 "58:drop_duplicate_timeline_index",
                 "59:browser_origin_grants",
-                "60:prompt_usage"
+                "60:prompt_usage",
+                "61:computer_use"
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -19706,11 +20007,12 @@ mod tests {
                 .any(|entry| entry == "59:browser_origin_grants")
         );
         assert!(first.iter().any(|entry| entry == "60:prompt_usage"));
+        assert!(first.iter().any(|entry| entry == "61:computer_use"));
         // A second run must be a no-op: the tables already exist and the
         // migration row is already recorded.
         let second = apply_migrations(&mut conn).unwrap();
         assert!(second.is_empty(), "second run applied {second:?}");
-        assert_eq!(current_schema_version(&conn).unwrap(), 60);
+        assert_eq!(current_schema_version(&conn).unwrap(), 61);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             CURRENT_SCHEMA_VERSION
@@ -19926,6 +20228,203 @@ mod tests {
 
         drop(conn);
         cleanup_db(temp);
+    }
+
+    #[test]
+    fn computer_audit_list_for_session_round_trips_and_isolates_sessions() {
+        let temp = temp_db_path("computer-audit-list");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        for (index, at_ms) in [1_000_i64, 2_000, 3_000].into_iter().enumerate() {
+            ComputerAuditRepository::insert(
+                &conn,
+                &sample_computer_audit_record(index, "session-a", at_ms),
+            )
+            .unwrap();
+        }
+        ComputerAuditRepository::insert(
+            &conn,
+            &sample_computer_audit_record(9, "session-b", 4_000),
+        )
+        .unwrap();
+
+        let listed = ComputerAuditRepository::list_for_session(&conn, "session-a", 10).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].at_ms, 3_000);
+        assert_eq!(listed[1].at_ms, 2_000);
+        assert_eq!(
+            listed[2],
+            sample_computer_audit_record(0, "session-a", 1_000)
+        );
+
+        let limited = ComputerAuditRepository::list_for_session(&conn, "session-a", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].at_ms, 3_000);
+        assert_eq!(limited[1].at_ms, 2_000);
+
+        let other = ComputerAuditRepository::list_for_session(&conn, "session-b", 10).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].session_id, "session-b");
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn computer_audit_list_for_workspace_is_most_recent_first_and_limited() {
+        let temp = temp_db_path("computer-audit-workspace");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        for (index, at_ms) in [1_000_i64, 2_000, 3_000].into_iter().enumerate() {
+            ComputerAuditRepository::insert(
+                &conn,
+                &sample_computer_audit_record(index, "session-a", at_ms),
+            )
+            .unwrap();
+        }
+        let mut other_workspace = sample_computer_audit_record(9, "session-a", 4_000);
+        other_workspace.workspace_id = Some("workspace-2".to_string());
+        ComputerAuditRepository::insert(&conn, &other_workspace).unwrap();
+
+        let listed = ComputerAuditRepository::list_for_workspace(&conn, "workspace-1", 10).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].at_ms, 3_000);
+        assert_eq!(listed[1].at_ms, 2_000);
+        assert_eq!(listed[2].at_ms, 1_000);
+        assert!(
+            listed
+                .iter()
+                .all(|record| record.workspace_id.as_deref() == Some("workspace-1"))
+        );
+
+        let limited = ComputerAuditRepository::list_for_workspace(&conn, "workspace-1", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].at_ms, 3_000);
+        assert_eq!(limited[1].at_ms, 2_000);
+
+        let other = ComputerAuditRepository::list_for_workspace(&conn, "workspace-2", 10).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].at_ms, 4_000);
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn computer_audit_round_trips_missing_optional_columns_as_none() {
+        let temp = temp_db_path("computer-audit-none");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let mut record = sample_computer_audit_record(0, "session-none", 42);
+        record.workspace_id = None;
+        record.agent_session_id = None;
+        record.target = None;
+        record.delivery_mode = None;
+        ComputerAuditRepository::insert(&conn, &record).unwrap();
+
+        let listed = ComputerAuditRepository::list_for_session(&conn, "session-none", 10).unwrap();
+        assert_eq!(listed, vec![record]);
+        assert!(listed[0].workspace_id.is_none());
+        assert!(listed[0].agent_session_id.is_none());
+        assert!(listed[0].target.is_none());
+        assert!(listed[0].delivery_mode.is_none());
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn computer_app_grants_are_upserted_and_revoked() {
+        let temp = temp_db_path("computer-app-grants");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let editor_identity =
+            "com.example.editor|Editor|com.example.editor|/Applications/Editor.app";
+        let fresh_identity = "com.example.fresh|Fresh|com.example.fresh|/Applications/Fresh.app";
+        let stale_identity = "com.example.stale|Stale|com.example.stale|/Applications/Stale.app";
+
+        // A NULL expiry never expires.
+        let editor = ComputerAppGrant {
+            app_identity: editor_identity.to_string(),
+            granted_at_ms: 1_000,
+            expires_at_ms: None,
+        };
+        ComputerAppGrantRepository::upsert(&conn, &editor).unwrap();
+        let fresh = ComputerAppGrant {
+            app_identity: fresh_identity.to_string(),
+            granted_at_ms: 1_000,
+            expires_at_ms: Some(unix_timestamp_ms() + 60_000),
+        };
+        ComputerAppGrantRepository::upsert(&conn, &fresh).unwrap();
+        let stale = ComputerAppGrant {
+            app_identity: stale_identity.to_string(),
+            granted_at_ms: 1_000,
+            expires_at_ms: Some(unix_timestamp_ms() - 1_000),
+        };
+        ComputerAppGrantRepository::upsert(&conn, &stale).unwrap();
+
+        assert_eq!(
+            ComputerAppGrantRepository::live_identities(&conn).unwrap(),
+            vec![editor_identity.to_string(), fresh_identity.to_string()]
+        );
+
+        // A second upsert of the same identity is an update, not a duplicate
+        // row, and the renewed expiry keeps it live.
+        let renewed = ComputerAppGrant {
+            app_identity: editor_identity.to_string(),
+            granted_at_ms: unix_timestamp_ms(),
+            expires_at_ms: Some(unix_timestamp_ms() + 60_000),
+        };
+        ComputerAppGrantRepository::upsert(&conn, &renewed).unwrap();
+        assert_eq!(
+            ComputerAppGrantRepository::live_identities(&conn).unwrap(),
+            vec![editor_identity.to_string(), fresh_identity.to_string()]
+        );
+
+        ComputerAppGrantRepository::revoke(&conn, stale_identity).unwrap();
+        assert!(
+            !ComputerAppGrantRepository::live_identities(&conn)
+                .unwrap()
+                .contains(&stale_identity.to_string())
+        );
+        // Revoking an identity that was never granted is a no-op.
+        ComputerAppGrantRepository::revoke(&conn, "com.example.unknown|Unknown||").unwrap();
+
+        ComputerAppGrantRepository::revoke_all(&conn).unwrap();
+        assert!(
+            ComputerAppGrantRepository::live_identities(&conn)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(conn);
+        cleanup_db(temp);
+    }
+
+    fn sample_computer_audit_record(
+        index: usize,
+        session_id: &str,
+        at_ms: i64,
+    ) -> ComputerAuditRecord {
+        ComputerAuditRecord {
+            id: format!("computer-audit-{index}"),
+            session_id: session_id.to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            agent_session_id: Some("agent-session-1".to_string()),
+            kind: "click".to_string(),
+            summary: "redacted click".to_string(),
+            target: Some("save-button".to_string()),
+            risk: "low".to_string(),
+            delivery_mode: Some("foreground".to_string()),
+            verification: "screenshot_changed".to_string(),
+            status: "ok".to_string(),
+            execution_source: "agent".to_string(),
+            at_ms,
+        }
     }
 
     fn sample_browser_audit_record(

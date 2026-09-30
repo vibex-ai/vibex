@@ -745,7 +745,13 @@ fn skills_export_plans(
         )]);
     };
 
-    if resources.skills.is_empty() {
+    // An Agent that can receive no built-in MCP server still has to learn the
+    // runtime's computer command line, and this Skill is the only channel that
+    // carries it. It is bound to the Agent, so it is written into whatever
+    // Skills folder `native_skill_root` resolved for that Agent rather than
+    // into a path named here.
+    let carries_computer_use = crate::computer_skill::agent_needs_the_computer_use_skill(agent_id);
+    if resources.skills.is_empty() && !carries_computer_use {
         diagnostics.push(metadata(
             "provider_native_export_no_skills",
             format!("no enabled Skills are assigned to {agent_id}"),
@@ -762,6 +768,34 @@ fn skills_export_plans(
             roots.market_skill_store.as_deref(),
             diagnostics,
         )?);
+    }
+    if carries_computer_use {
+        // A user Skill that already writes the same command name owns the
+        // folder: overwriting instructions the user authored under
+        // `computer-use` would be a worse failure than not shipping the
+        // built-in, so the user's Skill wins and the preview says so.
+        let shadowed = resources.skills.iter().any(|skill| {
+            crate::skills::command_token_from_skill_name(&skill.display_name)
+                == crate::computer_skill::COMPUTER_USE_SKILL_SLUG
+        });
+        if shadowed {
+            diagnostics.push(metadata(
+                "provider_native_export_computer_use_skill_shadowed",
+                format!(
+                    "a Skill assigned to {agent_id} already writes the '{}' command name, so the built-in computer-use Skill was not written",
+                    crate::computer_skill::COMPUTER_USE_SKILL_SLUG
+                ),
+            ));
+        } else {
+            files.extend(skill_export_plans(
+                export_id,
+                request.source,
+                &crate::computer_skill::computer_use_skill(),
+                &skill_root,
+                roots.market_skill_store.as_deref(),
+                diagnostics,
+            )?);
+        }
     }
     Ok(files)
 }
@@ -2540,5 +2574,188 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.key == "provider_native_export_rollback_skipped")
         );
+    }
+
+    #[test]
+    fn an_agent_without_mcp_delivery_receives_the_computer_use_skill() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("pi-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("pi"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::AgentDefault,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            // The Agent has no user Skills at all: the built-in is the whole
+            // export, which is the delivery path working as intended.
+            NativeExportResources::default(),
+        )
+        .unwrap();
+
+        assert_eq!(preview.files.len(), 1);
+        let target = PathBuf::from(&preview.files[0].target_path);
+        assert_eq!(
+            target,
+            home.join("skills")
+                .join(crate::computer_skill::COMPUTER_USE_SKILL_SLUG)
+                .join(SKILL_MANIFEST_NAME)
+        );
+        assert_eq!(
+            preview.files[0].operation_kind,
+            ProviderNativeExportOperationKind::CreateFile
+        );
+        assert!(
+            !preview
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_no_skills"),
+            "the built-in Skill means the export is not empty"
+        );
+
+        let apply = apply_preview(preview);
+        assert_eq!(apply.status, ProviderNativeExportApplyStatus::Applied);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            crate::computer_skill::computer_use_skill_document()
+        );
+    }
+
+    #[test]
+    fn the_computer_use_skill_follows_the_derived_skill_root_not_a_fixed_path() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("pi-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("pi"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::AgentDefault,
+            ),
+            // No explicit Skills folder: the export has to fall back to the
+            // same derivation the import scanner uses.
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: None,
+                ..Default::default()
+            },
+            NativeExportResources::default(),
+        )
+        .unwrap();
+
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(
+            PathBuf::from(&preview.files[0].target_path),
+            home.join(SKILLS_DIR_NAME)
+                .join(crate::computer_skill::COMPUTER_USE_SKILL_SLUG)
+                .join(SKILL_MANIFEST_NAME)
+        );
+    }
+
+    #[test]
+    fn the_combined_export_carries_the_computer_use_skill_too() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("pi-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("pi"),
+            export_request(
+                ProviderNativeExportMode::Combined,
+                ProviderNativeExportSource::AgentDefault,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources::default(),
+        )
+        .unwrap();
+
+        assert!(preview.files.iter().any(|file| {
+            Path::new(&file.target_path)
+                == home
+                    .join("skills")
+                    .join(crate::computer_skill::COMPUTER_USE_SKILL_SLUG)
+                    .join(SKILL_MANIFEST_NAME)
+        }));
+    }
+
+    #[test]
+    fn an_agent_with_mcp_delivery_does_not_receive_the_computer_use_skill() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("claude"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::Claude,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources::default(),
+        )
+        .unwrap();
+
+        assert!(preview.files.is_empty());
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.key == "provider_native_export_no_skills")
+        );
+    }
+
+    #[test]
+    fn a_user_skill_under_the_same_command_name_is_not_overwritten() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("pi-home");
+        let preview = preview_native_export_with_roots(
+            &agent_profile("pi"),
+            export_request(
+                ProviderNativeExportMode::Skills,
+                ProviderNativeExportSource::AgentDefault,
+            ),
+            NativeExportRoots {
+                agent_home: Some(home.clone()),
+                skill_root: Some(home.join("skills")),
+                ..Default::default()
+            },
+            NativeExportResources {
+                mcp_servers: Vec::new(),
+                skills: vec![manual_skill(
+                    "Computer Use",
+                    "The user's own instructions.",
+                    None,
+                )],
+            },
+        )
+        .unwrap();
+
+        let targets: Vec<PathBuf> = preview
+            .files
+            .iter()
+            .map(|file| PathBuf::from(&file.target_path))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                home.join("skills")
+                    .join(crate::computer_skill::COMPUTER_USE_SKILL_SLUG)
+                    .join(SKILL_MANIFEST_NAME)
+            ],
+            "only the user's Skill may claim the folder"
+        );
+        assert!(preview.diagnostics.iter().any(
+            |diagnostic| diagnostic.key == "provider_native_export_computer_use_skill_shadowed"
+        ));
+        let after = &preview.files[0].redacted_after;
+        assert!(after.contains("The user's own instructions."));
+        assert!(!after.contains("What this path cannot do"));
     }
 }

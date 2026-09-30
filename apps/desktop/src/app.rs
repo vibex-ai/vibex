@@ -6695,6 +6695,13 @@ pub struct VibexWorkbench {
     focus_handle: FocusHandle,
     config: Option<DesktopRuntimeConfig>,
     runtime: Option<Arc<DesktopRuntime>>,
+    /// The computer-use runtime, kept so the panel can be opened from anywhere
+    /// without going back through the backend facade: it is a local-only
+    /// authority, exactly like the runtime's terminal manager.
+    computer_runtime: Option<Arc<vibex_desktop_runtime::ComputerRuntime>>,
+    /// The Tokio handle the computer service lives on; the panel polls it from
+    /// GPUI's executor, which has no reactor of its own.
+    computer_tokio: Option<tokio::runtime::Handle>,
     backend: Option<BackendFacade>,
     shared_workflow: Option<AgentFileGitController>,
     shared_terminal: Option<TerminalWorkflowController>,
@@ -7779,6 +7786,8 @@ impl VibexWorkbench {
             focus_handle,
             config,
             runtime: None,
+            computer_runtime: None,
+            computer_tokio: None,
             backend: None,
             shared_workflow: None,
             shared_terminal: None,
@@ -8208,6 +8217,37 @@ impl VibexWorkbench {
 
     pub(crate) fn open_settings_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(window, cx);
+    }
+
+    /// Opens the computer-use panel in its own window.
+    ///
+    /// Its own window rather than a tab on purpose: the panel is what a reader
+    /// keeps an eye on *while* working somewhere else, and the emergency stop
+    /// has to be reachable without hunting for a tab.
+    pub(crate) fn open_computer_panel(&mut self, cx: &mut Context<Self>) {
+        let (Some(runtime), Some(tokio)) =
+            (self.computer_runtime.clone(), self.computer_tokio.clone())
+        else {
+            return;
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(560.0), px(720.0)),
+                cx,
+            ))),
+            titlebar: Some(TitleBar::title_bar_options()),
+            window_min_size: Some(size(px(420.0), px(520.0))),
+            ..Default::default()
+        };
+        let opened = cx.open_window(options, move |window, cx| {
+            let surface =
+                cx.new(|cx| crate::computer_surface::ComputerSurface::new(runtime, tokio, cx));
+            cx.new(|cx| gpui_component::Root::new(surface, window, cx))
+        });
+        if let Err(error) = opened {
+            eprintln!("failed to open the computer-use panel: {error}");
+        }
     }
 
     fn begin_runtime_start(&mut self, cx: &mut Context<Self>) {
@@ -9970,6 +10010,12 @@ impl VibexWorkbench {
                 )),
                 cx,
             );
+            // The computer panel renders the desktop of this machine. It is a
+            // local-only authority: a paired client cannot see these frames
+            // yet, which the panel says out loud rather than showing an empty
+            // stage.
+            self.computer_runtime = Some(runtime.computer());
+            self.computer_tokio = Some(gpui_tokio::Tokio::handle(cx));
             // The browser panel renders frames the runtime encodes; the local
             // authority serves them from the in-process service. The panel
             // polls that service from GPUI's executor, so the transport needs
@@ -67653,7 +67699,24 @@ fn release_runtime_config() -> vibex_core::VibexResult<DesktopRuntimeConfig> {
         ReleaseChannel::Preview => DesktopRuntimeConfig::preview_default(),
     }?;
     config.delegation_sidecar_command = std::env::current_exe().ok();
+    // The desktop application is the process that owns the user's desktop
+    // session, so it is the only process that may spawn the engine helper on
+    // macOS. The feature still starts only when the user turns it on; this
+    // makes the desktop build the one that *can*.
+    config.computer_use_enabled = vibex_computer_use_requested();
     Ok(config)
+}
+
+/// Whether the user turned computer use on.
+///
+/// The desktop app is the only client that can start the engine, but starting
+/// it is still a user decision: an Agent driving the real desktop with real
+/// accounts is exactly the capability that must never be enabled by an upgrade.
+fn vibex_computer_use_requested() -> bool {
+    matches!(
+        std::env::var("VIBEX_COMPUTER_USE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 fn release_application_id() -> vibex_core::VibexResult<&'static str> {

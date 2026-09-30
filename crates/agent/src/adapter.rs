@@ -40,11 +40,19 @@ pub struct ProviderSessionHandle {
 pub struct ProviderRuntimeResources {
     pub mcp_servers: Vec<ProviderRuntimeMcpServer>,
     pub skills: Vec<ProviderRuntimeSkill>,
+    /// Environment the Agent process itself needs for this session.
+    ///
+    /// The MCP descriptors carry their own environment, but an Agent whose
+    /// only delivery path is a shell command has no descriptor to read: it
+    /// needs the endpoint and its session token in *its* environment, so the
+    /// command it runs can reach the runtime. These travel with the launch,
+    /// never into a file.
+    pub env: Vec<(String, String)>,
 }
 
 impl ProviderRuntimeResources {
     pub fn is_empty(&self) -> bool {
-        self.mcp_servers.is_empty() && self.skills.is_empty()
+        self.mcp_servers.is_empty() && self.skills.is_empty() && self.env.is_empty()
     }
 }
 

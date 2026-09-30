@@ -88,6 +88,7 @@ pub struct AgentManager {
     usage_telemetry: OnceLock<mpsc::UnboundedSender<AgentUsageTelemetryEvent>>,
     delegation_tool: OnceLock<AgentDelegationToolConfig>,
     browser_mcp_tool: OnceLock<BrowserMcpToolConfig>,
+    computer_mcp_tool: OnceLock<ComputerMcpToolConfig>,
     delegation_lifecycle_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     elicitation_resolution_locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// One read connection shared by the paged timeline reads.
@@ -134,6 +135,65 @@ pub struct BrowserMcpToolConfig {
     pub command: PathBuf,
     pub endpoint: String,
     pub capability_token: String,
+}
+
+/// Per-desktop-process launch metadata for the built-in computer-use MCP
+/// server.
+///
+/// Like the browser tool this is runtime-only and never persisted with user MCP
+/// configuration. `endpoint` is the runtime's own loopback MCP endpoint and
+/// `command` is the Vibex binary in `--computer-mcp` sidecar mode, used only as
+/// the fallback for Agents that cannot speak HTTP MCP.
+#[derive(Debug, Clone)]
+pub struct ComputerMcpToolConfig {
+    pub command: PathBuf,
+    pub endpoint: String,
+    pub capability_token: String,
+}
+
+/// Builds the computer-use MCP descriptors for one Agent session.
+///
+/// The HTTP descriptor is offered first and the stdio sidecar second; the ACP
+/// wire filter keeps the first entry whose transport the Agent supports and
+/// drops the later duplicate. Both carry the token the runtime's computer MCP
+/// endpoint verifies ([`vibex_core::computer_mcp_session_token`]).
+fn computer_mcp_descriptors(
+    tool: &ComputerMcpToolConfig,
+    session_id: &VibexSessionId,
+) -> Vec<ProviderRuntimeMcpServer> {
+    let session_token =
+        vibex_core::computer_mcp_session_token(&tool.capability_token, session_id.as_str());
+    vec![
+        ProviderRuntimeMcpServer {
+            id: vibex_core::COMPUTER_MCP_SERVER_ID.to_string(),
+            display_name: "Computer use".to_string(),
+            transport: ProviderRuntimeMcpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some(tool.endpoint.clone()),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!("Bearer {session_token}"),
+            )],
+        },
+        ProviderRuntimeMcpServer {
+            id: vibex_core::COMPUTER_MCP_SERVER_ID.to_string(),
+            display_name: "Computer use (sidecar)".to_string(),
+            transport: ProviderRuntimeMcpTransport::Stdio,
+            command: Some(tool.command.to_string_lossy().to_string()),
+            args: vec!["--computer-mcp".to_string()],
+            env: vec![
+                (
+                    "VIBEX_COMPUTER_MCP_ENDPOINT".to_string(),
+                    tool.endpoint.clone(),
+                ),
+                ("VIBEX_COMPUTER_MCP_TOKEN".to_string(), session_token),
+            ],
+            url: None,
+            headers: Vec::new(),
+        },
+    ]
 }
 
 /// Builds the browser MCP descriptors for one Agent session.
@@ -365,6 +425,7 @@ impl AgentManager {
             usage_telemetry: OnceLock::new(),
             delegation_tool: OnceLock::new(),
             browser_mcp_tool: OnceLock::new(),
+            computer_mcp_tool: OnceLock::new(),
             delegation_lifecycle_locks: StdMutex::new(HashMap::new()),
             elicitation_resolution_locks: StdMutex::new(HashMap::new()),
             timeline_reader: StdMutex::new(None),
@@ -553,6 +614,34 @@ impl AgentManager {
         self.browser_mcp_tool.get()
     }
 
+    /// Installs the built-in computer-use MCP launch configuration.
+    ///
+    /// Validated exactly like the browser tool: a loopback `http://` endpoint
+    /// and a capability token that cannot be spoofed or truncated on the wire.
+    pub fn install_computer_mcp_tool(&self, config: ComputerMcpToolConfig) -> VibexResult<()> {
+        if config.command.as_os_str().is_empty()
+            || !config.endpoint.starts_with("http://")
+            || config.capability_token.len() < 24
+            || config.capability_token.chars().any(char::is_whitespace)
+        {
+            return Err(VibexError::validation(
+                "computer_mcp_tool_config_invalid",
+                "computer MCP tool launch configuration is invalid",
+            ));
+        }
+        self.computer_mcp_tool.set(config).map_err(|_| {
+            VibexError::conflict(
+                "computer_mcp_tool_already_installed",
+                "the computer MCP tool is already installed",
+            )
+        })
+    }
+
+    /// The installed computer-use MCP launch configuration, if any.
+    pub fn computer_mcp_tool(&self) -> Option<&ComputerMcpToolConfig> {
+        self.computer_mcp_tool.get()
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.db_path
     }
@@ -620,6 +709,38 @@ impl AgentManager {
             resources
                 .mcp_servers
                 .extend(browser_mcp_descriptors(tool, session_id));
+        }
+        // Computer use is a second built-in server, not a second copy of the
+        // browser one: an Agent that cannot use it simply never lists the
+        // tools, and the runtime withholds nothing from the browser path.
+        if provider_kind == ProviderKind::Acp
+            && let Some(tool) = self.computer_mcp_tool.get()
+        {
+            resources
+                .mcp_servers
+                .extend(computer_mcp_descriptors(tool, session_id));
+            // The CLI path runs inside the Agent's own shell, so the same
+            // capability has to be in the process environment. It is minted
+            // per session with the same derivation the endpoint verifies, and
+            // it is never written to a file.
+            if vibex_core::AGENTS_WITHOUT_MCP_DELIVERY.contains(&agent_id.as_str()) {
+                resources.env.push((
+                    "VIBEX_COMPUTER_MCP_ENDPOINT".to_string(),
+                    tool.endpoint.clone(),
+                ));
+                resources.env.push((
+                    "VIBEX_COMPUTER_MCP_TOKEN".to_string(),
+                    vibex_core::computer_mcp_session_token(
+                        &tool.capability_token,
+                        session_id.as_str(),
+                    ),
+                ));
+                if let Some(home) = self.db_path.parent() {
+                    resources
+                        .env
+                        .push(("VIBEX_HOME".to_string(), home.to_string_lossy().to_string()));
+                }
+            }
         }
         Ok(resources)
     }
@@ -3399,6 +3520,7 @@ impl AgentManager {
             .collect();
 
         Ok(ProviderRuntimeResources {
+            env: Vec::new(),
             mcp_servers,
             skills,
         })
@@ -8738,6 +8860,66 @@ mod tests {
     }
 
     #[test]
+    fn the_computer_cli_environment_reaches_only_the_agents_that_need_it() {
+        let db_path = temp_db_path("computer-cli-env");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let secret = "cap_computer_cli_test_secret_value".to_string();
+        manager
+            .install_computer_mcp_tool(ComputerMcpToolConfig {
+                command: PathBuf::from("/tmp/vibex-desktop"),
+                endpoint: "http://127.0.0.1:43212/mcp".to_string(),
+                capability_token: secret.clone(),
+            })
+            .unwrap();
+        let session_id = VibexSessionId::new();
+
+        // An Agent that receives no built-in MCP server gets the capability in
+        // its own environment, because a shell command is its only path.
+        let pi = AgentId::parse("pi").unwrap();
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &pi, ProviderKind::Acp)
+            .unwrap();
+        let endpoint = resources
+            .env
+            .iter()
+            .find(|(key, _)| key == "VIBEX_COMPUTER_MCP_ENDPOINT")
+            .map(|(_, value)| value.clone())
+            .expect("the CLI path needs the endpoint");
+        assert_eq!(endpoint, "http://127.0.0.1:43212/mcp");
+        let token = resources
+            .env
+            .iter()
+            .find(|(key, _)| key == "VIBEX_COMPUTER_MCP_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("the CLI path needs a session token");
+        // The environment carries the *session* token, not the runtime secret.
+        assert_ne!(token, secret);
+        assert_eq!(
+            vibex_core::verify_computer_mcp_session_token(&secret, &token).as_deref(),
+            Some(session_id.as_str())
+        );
+        assert!(resources.env.iter().any(|(key, _)| key == "VIBEX_HOME"));
+        // The MCP server is still advertised for an Agent that can use it; the
+        // environment is additional, not a replacement.
+        assert!(
+            resources
+                .mcp_servers
+                .iter()
+                .any(|server| server.id == vibex_core::COMPUTER_MCP_SERVER_ID)
+        );
+
+        // An Agent with a working MCP delivery path does not get a second,
+        // weaker way in.
+        let claude = AgentId::parse("claude").unwrap();
+        let resources = manager
+            .runtime_resources_for_session(&session_id, &claude, ProviderKind::Acp)
+            .unwrap();
+        assert!(resources.env.is_empty());
+
+        cleanup_db(&db_path);
+    }
+
+    #[test]
     fn delegation_sidecar_resource_is_scoped_to_its_parent_session() {
         let db_path = temp_db_path("delegation-sidecar-resource");
         let manager = AgentManager::new(&db_path).unwrap();
@@ -9313,6 +9495,48 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn the_computer_descriptors_carry_a_token_the_endpoint_accepts() {
+        let secret = "cap_computer_test_secret";
+        let tool = ComputerMcpToolConfig {
+            command: PathBuf::from("/usr/bin/vibex"),
+            endpoint: "http://127.0.0.1:43211/mcp".to_string(),
+            capability_token: secret.to_string(),
+        };
+        let session_id = VibexSessionId::new();
+        let descriptors = computer_mcp_descriptors(&tool, &session_id);
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, vibex_core::COMPUTER_MCP_SERVER_ID);
+        assert_eq!(descriptors[0].transport, ProviderRuntimeMcpTransport::Http);
+        assert_eq!(descriptors[1].transport, ProviderRuntimeMcpTransport::Stdio);
+        let http_token = descriptors[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| value.trim_start_matches("Bearer ").to_string())
+            .unwrap();
+        assert_eq!(
+            vibex_core::verify_computer_mcp_session_token(secret, &http_token).as_deref(),
+            Some(session_id.as_str())
+        );
+        let stdio_token = descriptors[1]
+            .env
+            .iter()
+            .find(|(name, _)| name == "VIBEX_COMPUTER_MCP_TOKEN")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(http_token, stdio_token);
+        // A token for one session must not verify for another.
+        let other = computer_mcp_descriptors(&tool, &VibexSessionId::new());
+        let other_token = other[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| value.trim_start_matches("Bearer ").to_string())
+            .unwrap();
+        assert_ne!(http_token, other_token);
     }
 
     #[test]

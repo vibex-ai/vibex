@@ -34,6 +34,7 @@ vibex-app-update = { path = "../app-update" }
 vibex-agent = { path = "../agent" }
 vibex-agent-acp = { path = "../agent-acp" }
 vibex-browser = { path = "../browser" }
+vibex-computer = { path = "../computer" }
 vibex-config-switch = { path = "../config-switch" }
 vibex-core = { path = "../core" }
 vibex-db = { path = "../db" }
@@ -53,3 +54,6 @@ tempfile = "3"
 [[bin]]
 name = "vibex-home-lock-probe"
 path = "src/bin/vibex-home-lock-probe.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

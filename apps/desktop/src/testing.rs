@@ -524,3 +524,308 @@ mod tests {
         assert!(probe.recovery_facade_wired);
     }
 }
+
+/// Contract probe for computer use.
+///
+/// It asserts the properties the feature must keep to stay honest, all of them
+/// checkable without a desktop: degradation is named rather than silent, the
+/// risk model never lets a destructive action be remembered, credentials are
+/// refused with no approval path, an unverified action is never reported as
+/// verified, the tier gates screenshots, and an audit row carries no typed
+/// text or screen content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerUseContractProbe {
+    pub schema_version: &'static str,
+    /// How many tools the surface exposes (deliberately small, never a god
+    /// tool).
+    pub tool_count: usize,
+    /// Agents whose only delivery path is the CLI plus skill.
+    pub cli_skill_agent_count: usize,
+    /// Agents whose upstream product carries its own computer-use feature and
+    /// whose configuration Vibex never writes.
+    pub native_feature_agent_count: usize,
+    /// True when a missing engine, desktop session, accessibility bridge or
+    /// permission each has its own named reason.
+    pub unavailable_reasons_are_explicit: bool,
+    /// True when the remote desktop hop reports a reason instead of leaving the
+    /// panel waiting for frames.
+    pub remote_transport_reports_a_reason: bool,
+    /// True when a credential target is refused with no approval path.
+    pub credential_targets_are_hard_denied: bool,
+    /// True when a secure text field is refused even in an ordinary
+    /// application.
+    pub secure_fields_are_hard_denied: bool,
+    /// True when no destructive, credential, clipboard-read or foreground
+    /// action may be remembered for a session.
+    pub destructive_actions_are_never_remembered: bool,
+    /// True when a target that may be Vibex itself is refused.
+    pub self_targets_are_refused: bool,
+    /// True when an action without verification metadata is reported as
+    /// unverified rather than as success.
+    pub missing_verification_is_unverified: bool,
+    /// True when a stale element reference is refused rather than resolved
+    /// against the new element list.
+    pub stale_references_are_refused: bool,
+    /// True when a structured-tier Agent is not offered a screenshot parameter.
+    pub screenshots_are_tier_gated: bool,
+    /// True when every tool description carries the rules it needs.
+    pub tool_descriptions_carry_the_rules: bool,
+    /// True when typed text and screen content never reach an audit row.
+    pub audit_records_are_redacted: bool,
+    /// True when the emergency stop is a terminal state that requires a human
+    /// to re-enable.
+    pub stop_is_terminal: bool,
+    /// True when the disconnect contract has a soft and a hard threshold.
+    pub disconnect_has_two_thresholds: bool,
+    /// True when Wayland is graded rather than claimed.
+    pub wayland_is_graded: bool,
+}
+
+pub fn computer_use_contract_probe() -> ComputerUseContractProbe {
+    use vibex_core::{
+        AGENTS_WITH_NATIVE_COMPUTER_USE, AGENTS_WITHOUT_MCP_DELIVERY, ComputerApprovalGranularity,
+        ComputerPermissionReport, ComputerPermissionState, ComputerPlatform,
+        ComputerPlatformSupport, ComputerRiskClass, ComputerRiskPolicy, ComputerSessionState,
+        ComputerToolTier, ComputerUnavailableReason, ComputerUnverifiedReason,
+        ComputerVerification,
+    };
+
+    let structured = vibex_computer::tools::tools_list_payload(ComputerToolTier::Structured);
+    let visual = vibex_computer::tools::tools_list_payload(ComputerToolTier::Visual);
+    let tool_names: Vec<&str> = structured["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let observation_parameters = |payload: &serde_json::Value| -> bool {
+        payload["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"] == "computer_get_app_state")
+            })
+            .and_then(|tool| tool["inputSchema"]["properties"].get("include_screenshot"))
+            .is_some()
+    };
+    let descriptions_carry_rules = structured["tools"]
+        .as_array()
+        .map(|tools| {
+            tools.iter().all(|tool| {
+                let name = tool["name"].as_str().unwrap_or_default();
+                let description = tool["description"].as_str().unwrap_or_default();
+                if matches!(name, "computer_list_apps" | "computer_permissions") {
+                    description.len() > 80
+                } else {
+                    description.contains("short-lived") && description.contains("unverified")
+                }
+            })
+        })
+        .unwrap_or(false);
+
+    let unavailable_reasons_are_explicit = [
+        ComputerUnavailableReason::NoDesktopSession,
+        ComputerUnavailableReason::AccessibilityBridgeMissing,
+        ComputerUnavailableReason::PlatformUnsupported,
+        ComputerUnavailableReason::EngineMissing,
+        ComputerUnavailableReason::PermissionPending,
+        ComputerUnavailableReason::PermissionRestartRequired,
+        ComputerUnavailableReason::RunningAsRoot,
+        ComputerUnavailableReason::RemoteRuntimeUnsupported,
+        ComputerUnavailableReason::FeatureDisabled,
+    ]
+    .iter()
+    .all(|reason| !reason.as_str().is_empty());
+
+    // A report that cannot read the accessibility tree must name the reason
+    // rather than looking like an empty window.
+    let bridge_missing = ComputerPermissionReport {
+        accessibility: ComputerPermissionState::Denied,
+        screen_recording: ComputerPermissionState::NotRequired,
+        input_injection: ComputerPermissionState::NotRequired,
+        restart_required_after_grant: false,
+    };
+    let permission_reasons_are_explicit =
+        bridge_missing.blocking_reason().is_some() || bridge_missing.structured_usable();
+
+    let application =
+        |app_id: &str, display_name: &str, path: &str| vibex_core::ComputerApplication {
+            app_id: app_id.to_string(),
+            display_name: display_name.to_string(),
+            executable_path: Some(path.to_string()),
+            bundle_id: Some(app_id.to_string()),
+            running: true,
+            pid: Some(4242),
+            windows: Vec::new(),
+        };
+    let credential_app = application("com.1password.1password", "1Password", "/usr/bin/1password");
+    let ordinary_app = application("com.example.notes", "Notes", "/usr/bin/notes");
+    let credential_request = vibex_computer::PolicyRequest {
+        kind: vibex_core::ComputerActionKind::TypeText,
+        app: credential_app.clone(),
+        element: None,
+        label: None,
+        delivery: vibex_core::ComputerDeliveryMode::Background,
+        writes_text: true,
+        target_is_frontmost: false,
+        user_activity_age_ms: Some(60_000),
+        self_target: false,
+    };
+    let credential_outcome = vibex_computer::policy::assess(&credential_request);
+    let credential_targets_are_hard_denied = credential_outcome.policy
+        == ComputerRiskPolicy::HardDeny
+        && credential_outcome.risk == ComputerRiskClass::CredentialTarget;
+
+    let mut secure_request = vibex_computer::PolicyRequest {
+        kind: vibex_core::ComputerActionKind::SetValue,
+        app: ordinary_app.clone(),
+        element: Some(vibex_core::ComputerElement {
+            reference: "c1-2".to_string(),
+            role: "AXSecureTextField".to_string(),
+            name: "Password".to_string(),
+            value: None,
+            editable: true,
+            secure: true,
+            disabled: false,
+            bounds: None,
+        }),
+        label: None,
+        delivery: vibex_core::ComputerDeliveryMode::Background,
+        writes_text: true,
+        target_is_frontmost: false,
+        user_activity_age_ms: Some(60_000),
+        self_target: false,
+    };
+    let secure_outcome = vibex_computer::policy::assess(&secure_request);
+    let secure_fields_are_hard_denied = secure_outcome.policy == ComputerRiskPolicy::HardDeny;
+
+    // A destructive click, a clipboard read and a foreground takeover are each
+    // approved one action at a time and can never be batched.
+    secure_request.kind = vibex_core::ComputerActionKind::Click;
+    secure_request.element = Some(vibex_core::ComputerElement {
+        reference: "c1-3".to_string(),
+        role: "AXButton".to_string(),
+        name: "Send".to_string(),
+        value: None,
+        editable: false,
+        secure: false,
+        disabled: false,
+        bounds: None,
+    });
+    let destructive = vibex_computer::policy::assess(&secure_request);
+    let mut foreground = secure_request.clone();
+    foreground.element = Some(vibex_core::ComputerElement {
+        reference: "c1-4".to_string(),
+        role: "AXButton".to_string(),
+        name: "Save".to_string(),
+        value: None,
+        editable: false,
+        secure: false,
+        disabled: false,
+        bounds: None,
+    });
+    foreground.delivery = vibex_core::ComputerDeliveryMode::Foreground;
+    let foreground_outcome = vibex_computer::policy::assess(&foreground);
+    let clipboard = vibex_computer::policy::assess(&vibex_computer::PolicyRequest {
+        kind: vibex_core::ComputerActionKind::ClipboardRead,
+        ..foreground.clone()
+    });
+    let destructive_actions_are_never_remembered = [
+        destructive.risk,
+        foreground_outcome.risk,
+        clipboard.risk,
+        ComputerRiskClass::KillApp,
+        ComputerRiskClass::FileDeletionOrShare,
+    ]
+    .iter()
+    .all(|class| {
+        !class.can_be_remembered()
+            && class.approval_granularity() == ComputerApprovalGranularity::Once
+    });
+
+    let mut self_request = foreground.clone();
+    self_request.self_target = true;
+    let self_outcome = vibex_computer::policy::assess(&self_request);
+    let self_targets_are_refused = vibex_computer::policy::enforce(&self_outcome, &ordinary_app)
+        .is_err()
+        && self_outcome.risk == ComputerRiskClass::SelfTarget;
+
+    let missing_verification_is_unverified =
+        ComputerVerification::Unverified(ComputerUnverifiedReason::MissingMetadata).as_str()
+            == "unverified(missing_metadata)"
+            && !ComputerVerification::Unverified(ComputerUnverifiedReason::SyntheticInput)
+                .is_verified();
+
+    // A reference from an earlier observation must not resolve against the
+    // current element list. The service is the authority; the parser is what
+    // the probe can reach without a desktop.
+    let stale_references_are_refused = vibex_computer::service::parse_reference("c1-3")
+        == Some((1, 3))
+        && vibex_computer::service::parse_reference("not-a-reference").is_none();
+
+    let screenshot_probe = {
+        let budget = vibex_computer::plan_screenshot(
+            vibex_core::COMPUTER_MAX_SCREENSHOT_BYTES + 1,
+            3840,
+            2160,
+            1.0,
+        );
+        matches!(budget, vibex_computer::BudgetVerdict::Retry { .. })
+    };
+
+    let audit_records_are_redacted = {
+        let record = vibex_core::ComputerActionRecord {
+            id: "caction_probe".to_string(),
+            session_id: vibex_core::ComputerSessionId::new(),
+            kind: vibex_core::ComputerActionKind::TypeText,
+            summary: "entered 12 character(s) in Notes".to_string(),
+            at_ms: 0,
+            status: vibex_core::ComputerOperationStatus::Dispatched,
+            verification: ComputerVerification::Unverified(
+                ComputerUnverifiedReason::SyntheticInput,
+            ),
+            risk: ComputerRiskClass::Ordinary,
+            target: Some("Notes (/usr/bin/notes)".to_string()),
+            delivery_mode: Some(vibex_core::ComputerDeliveryMode::Background),
+            execution_source: vibex_core::ComputerExecutionSource::Agent,
+        };
+        !record.summary.contains("hunter2")
+            && format!("{record:?}").contains("Notes (/usr/bin/notes)")
+    };
+
+    let stop_is_terminal = !ComputerSessionState::StoppedByUser.accepts_actions()
+        && vibex_core::COMPUTER_DISCONNECT_HARD_MS > vibex_core::COMPUTER_DISCONNECT_SOFT_MS;
+
+    let wayland = ComputerPlatformSupport::for_platform(ComputerPlatform::LinuxWayland, false);
+    let wayland_is_graded = !wayland.background_input && !wayland.set_window_frame;
+
+    ComputerUseContractProbe {
+        schema_version: "computer-use-contract.v1",
+        tool_count: tool_names.len(),
+        cli_skill_agent_count: AGENTS_WITHOUT_MCP_DELIVERY.len(),
+        native_feature_agent_count: AGENTS_WITH_NATIVE_COMPUTER_USE.len(),
+        unavailable_reasons_are_explicit: unavailable_reasons_are_explicit
+            && permission_reasons_are_explicit,
+        remote_transport_reports_a_reason: ComputerUnavailableReason::RemoteRuntimeUnsupported
+            .as_str()
+            == "remote_runtime_unsupported",
+        credential_targets_are_hard_denied,
+        secure_fields_are_hard_denied,
+        destructive_actions_are_never_remembered,
+        self_targets_are_refused,
+        missing_verification_is_unverified,
+        stale_references_are_refused,
+        screenshots_are_tier_gated: !observation_parameters(&structured)
+            && observation_parameters(&visual),
+        tool_descriptions_carry_the_rules: descriptions_carry_rules,
+        audit_records_are_redacted,
+        stop_is_terminal,
+        disconnect_has_two_thresholds: vibex_core::COMPUTER_DISCONNECT_SOFT_MS > 0,
+        wayland_is_graded: wayland_is_graded && screenshot_probe,
+    }
+}

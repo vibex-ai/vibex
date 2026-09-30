@@ -10449,6 +10449,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibex-computer"
+version = "0.1.0-rc.7"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "command-group",
+ "futures-util",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "vibex-core",
+]
+
+[[package]]
 name = "vibex-config-switch"
 version = "0.1.0-rc.7"
 dependencies = [
@@ -10553,6 +10574,7 @@ dependencies = [
  "vibex-backend",
  "vibex-browser",
  "vibex-client",
+ "vibex-computer",
  "vibex-config-switch",
  "vibex-content",
  "vibex-core",
@@ -10593,6 +10615,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "libc",
  "mdns-sd",
  "reqwest",
  "rusqlite",
@@ -10614,6 +10637,7 @@ dependencies = [
  "vibex-app-update",
  "vibex-backup",
  "vibex-browser",
+ "vibex-computer",
  "vibex-config-switch",
  "vibex-core",
  "vibex-db",

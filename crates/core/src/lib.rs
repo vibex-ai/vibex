@@ -11,6 +11,7 @@ pub mod agent_provider_runtime;
 pub mod automation_graph;
 pub mod browser;
 pub mod canonical_json;
+pub mod computer;
 pub mod delegation;
 pub mod diagnostics;
 pub mod elicitation;
@@ -80,9 +81,9 @@ pub use agent_config::{
     AgentRefreshSnapshotRequest, AgentRefreshSnapshotResponse, AgentRuntimeKind,
     AgentRuntimeOptionProbeRequest, AgentRuntimeOptionProbeResult, AgentRuntimeStatus,
     AgentSnapshotEntry, AgentSourceKind, AgentUpdateConfigRequest, CustomAgentCreateRequest,
-    CustomAgentDeleteRequest, acp_registry_agent_id, agent_id_for_provider_kind,
-    builtin_agent_definitions, custom_agent_definition, is_user_visible_agent,
-    supports_native_provider_import,
+    CustomAgentDeleteRequest, USER_VISIBLE_AGENT_IDS, acp_registry_agent_id,
+    agent_id_for_provider_kind, builtin_agent_definitions, custom_agent_definition,
+    is_user_visible_agent, supports_native_provider_import,
 };
 pub use agent_provider_runtime::*;
 pub use automation_graph::{
@@ -122,6 +123,29 @@ pub use browser::{
 };
 
 pub use canonical_json::canonical_json_vec;
+pub use computer::{
+    AGENTS_WITH_NATIVE_COMPUTER_USE, AGENTS_WITHOUT_MCP_DELIVERY, COMPUTER_APPROVAL_TTL_MS,
+    COMPUTER_CONCURRENT_ACTIVITY_MS, COMPUTER_CREDENTIAL_APP_DENYLIST,
+    COMPUTER_DESTRUCTIVE_ACTION_WORDS, COMPUTER_DISCONNECT_HARD_MS, COMPUTER_DISCONNECT_SOFT_MS,
+    COMPUTER_HELPER_TOKEN_PREFIX, COMPUTER_LOOP_HISTORY_ITEMS, COMPUTER_MAX_QUEUED_INPUTS,
+    COMPUTER_MAX_SCREENSHOT_BYTES, COMPUTER_MAX_SESSION_LEDGER_ITEMS, COMPUTER_MCP_SERVER_ID,
+    COMPUTER_MCP_TOKEN_PREFIX, COMPUTER_OBSERVE_DEFAULT_MAX_ELEMENTS,
+    COMPUTER_OBSERVE_MAX_MAX_ELEMENTS, COMPUTER_OBSERVE_MIN_MAX_ELEMENTS,
+    COMPUTER_SCREENSHOT_FILE_TTL_MS, COMPUTER_SCREENSHOT_MIN_SCALE, COMPUTER_SCREENSHOT_SCALE_STEP,
+    COMPUTER_SCREENSHOT_START_EDGE, COMPUTER_SECURE_TEXT_FIELD_ROLE,
+    COMPUTER_UNTRUSTED_CONTENT_BEGIN, COMPUTER_UNTRUSTED_CONTENT_END,
+    COMPUTER_UNTRUSTED_CONTENT_NOTICE, ComputerActionKind, ComputerActionRecord,
+    ComputerApplication, ComputerApprovalGranularity, ComputerAvailability, ComputerDeliveryMode,
+    ComputerElement, ComputerExecutionSource, ComputerFrame, ComputerObservation,
+    ComputerOperationStatus, ComputerPermissionReport, ComputerPermissionState, ComputerPlatform,
+    ComputerPlatformSupport, ComputerRect, ComputerRiskClass, ComputerRiskPolicy,
+    ComputerScreenshot, ComputerSession, ComputerSessionSnapshot, ComputerSessionState,
+    ComputerToolDelivery, ComputerToolTier, ComputerUnavailableReason, ComputerUnverifiedReason,
+    ComputerUseDelivery, ComputerVerification, ComputerWindow, computer_helper_token,
+    computer_helper_token_matches, computer_mcp_session_token, fence_untrusted_screen_content,
+    is_credential_application, is_destructive_action_label, is_secure_field_role,
+    verify_computer_helper_token, verify_computer_mcp_session_token,
+};
 pub use delegation::{
     AgentDelegation, AgentDelegationStatus, CancelAgentDelegationRequest,
     CreateAgentDelegationRequest, GetAgentDelegationRequest,
@@ -186,12 +210,13 @@ pub use ids::{
     AgentDelegationId, AgentModelProviderBindingId, AgentProviderProjectionDescriptorId,
     AgentRuntimeProbeId, AgentRuntimeProfileId, AutomationEdgeId, AutomationGraphId,
     AutomationNodeId, AutomationRunId, AutomationRunStepId, BrowserSessionId, BrowserTabId,
-    ChannelId, CorrelationId, DeviceId, EventId, HookId, McpServerId, MessageSubmissionId,
-    ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId, ProviderProfileId,
-    RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId, RequestId,
-    RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId, RuntimeStreamId,
-    RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId, ScheduledTaskRunId, SkillId,
-    TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId, WorkspaceId,
+    ChannelId, ComputerSessionId, CorrelationId, DeviceId, EventId, HookId, McpServerId,
+    MessageSubmissionId, ModelProviderProfileId, NativeStateHomeId, ProjectId, PromptId,
+    ProviderProfileId, RelayConnectionId, RelayFrameId, RelayPeerId, RelayRoomId, RelaySessionId,
+    RequestId, RuntimeBindingId, RuntimeClientId, RuntimeLeaseId, RuntimeProcessId,
+    RuntimeStreamId, RuntimeSwitchId, RuntimeSwitchOperationId, ScheduledTaskId,
+    ScheduledTaskRunId, SkillId, TerminalId, TimelineItemId, UsageExecutionId, VibexSessionId,
+    WorkspaceId,
 };
 pub use local_history::{
     LocalHistoryImportRecord, LocalHistoryImportResult, LocalHistoryImportStatus, LocalHistoryKey,

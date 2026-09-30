@@ -76,6 +76,7 @@ use vibex_db::{
     open_database,
 };
 
+pub mod computer_skill;
 mod market;
 pub mod mcp_delivery;
 mod native_export;

@@ -394,31 +394,37 @@ pub struct AgentCatalogListResponse {
     pub agents: Vec<AgentDefinition>,
 }
 
-/// Returns whether an Agent is currently part of Vibex's user-facing catalog.
+/// Agents that are part of Vibex's user-facing catalog.
 ///
-/// The ACP catalog intentionally contains more integrations than the product
-/// is ready to expose. Keep this presentation policy separate from the runtime
+/// The ACP catalog intentionally contains more integrations than the product is
+/// ready to expose. Keep this presentation policy separate from the runtime
 /// catalog so hidden integrations remain available for development and probes.
+///
+/// The list is a value, not only a predicate, because a capability matrix has
+/// to enumerate the Agents a reader can actually meet — including the ones that
+/// follow the generic dialect and therefore appear in no deviation table.
+pub const USER_VISIBLE_AGENT_IDS: &[&str] = &[
+    "antigravity",
+    "claude",
+    "cline",
+    "codebuddy-code",
+    "codex",
+    "cursor",
+    "gemini",
+    "copilot",
+    "devin",
+    "grok",
+    "hermes",
+    "kimi",
+    "opencode",
+    "pi",
+    "zcode",
+    "deepseek-harness",
+];
+
+/// Returns whether an Agent is currently part of Vibex's user-facing catalog.
 pub fn is_user_visible_agent(agent_id: &AgentId) -> bool {
-    matches!(
-        agent_id.as_str(),
-        "antigravity"
-            | "claude"
-            | "cline"
-            | "codebuddy-code"
-            | "codex"
-            | "cursor"
-            | "gemini"
-            | "copilot"
-            | "devin"
-            | "grok"
-            | "hermes"
-            | "kimi"
-            | "opencode"
-            | "pi"
-            | "zcode"
-            | "deepseek-harness"
-    )
+    USER_VISIBLE_AGENT_IDS.contains(&agent_id.as_str())
 }
 
 /// Returns whether Vibex can import a Provider configuration for this Agent.
