@@ -145,6 +145,19 @@ the bar. And a drag selects text across lines, copying it over OSC 52 on
 release — the same escape sequence the rest of the client uses, so it works over
 SSH and inside tmux.
 
+**One owner per row.** The banner row above the composer has four kinds of
+claimant — a warning about the connection, a reminder about the composer's mode,
+a tip, a transient note — and they are ordered. A tip never displaces a warning,
+and a banner whose condition has gone withdraws itself on the next frame rather
+than waiting to be dismissed. Clicking it dismisses it early.
+
+**The mouse is a second path, never the only one.** Every click has a key
+equivalent, and the frame publishes the rectangles that make the click possible:
+the transcript, a list's rows, the queue, the composer, the turn rail's ticks,
+the shortcut band's hints, the banner and a modal's close control. A click on a
+hint runs the intent its key would have run; a click on a turn tick scrolls to
+that turn; a click in the composer puts the cursor on the cell that was clicked.
+
 **Glyphs have fallbacks.** Terminals disagree about more than colour: the
 conservative Windows console does no font fallback, so a glyph outside its
 raster font is tofu. Every chrome glyph declares an ASCII fallback and the width
@@ -174,6 +187,16 @@ working one.
 
 The bottom border is an info line rather than a rule: a terminal has no room for
 chrome that only carries status, and a divider that also informs is free.
+
+A paste of four or more lines (or one over 10 KB) collapses into a chip —
+`[Pasted: 42 lines]` — instead of burying the draft. The chip is one object:
+the cursor steps over it, one `Backspace` removes it, and pasting the same bytes
+again expands it in place rather than adding a second copy. What is sent is the
+original bytes, not the label.
+
+Typing `? ` turns the composer into a filter over the messages you have sent;
+`↑↓` walks the matches and `Enter` recalls one into the draft. `Up` on an empty
+draft still steps through history one entry at a time.
 
 Editing is readline-shaped, because that is the muscle memory a terminal user
 already has:
@@ -306,8 +329,8 @@ paired device.
 ### Settings
 
 Theme and its dark/light mode (20 shipped themes), language (`en`, `zh-CN`,
-`zh-TW`), icon set, the default workspace for new sessions, and the key-binding
-file. The page is one surface with four modes rather than four screens:
+`zh-TW`), icon set, the bottom status line, the default workspace for new
+sessions, and the key-binding file. The page is one surface with four modes rather than four screens:
 
 | Mode | Entered by | What it does |
 | --- | --- | --- |
@@ -320,6 +343,14 @@ A reset asks first and then restores the shipped default. `F9` reloads
 `~/.vibex/tui-keys.toml`; the interface reports which lines it could not use
 instead of failing to start.
 
+### Status line
+
+Optional, on by default, and switched off from Settings on a short terminal: a
+denser second row under the composer carrying the branch and change count, the
+plan's progress, the context budget and how many messages are queued. The top
+band answers "where am I and is it alive"; this one answers "what am I working
+on".
+
 ### First run
 
 With an empty session list the landing surface is a short ordered guide:
@@ -331,9 +362,27 @@ useful again.
 
 ### Help
 
-`?` opens contextual help for whatever has focus. It is generated from the same
-binding tables that dispatch the keys, so a hint cannot describe a key that does
+`?` opens the shortcuts cheatsheet: every binding, grouped by category (Global,
+Transcript, Composer, Modals, Workbench, Management, Panels). `/` filters it,
+`←`/`→` or `Enter` folds the category the cursor is on, and the highlighted
+binding explains itself on the line below. It is generated from the same binding
+tables that dispatch the keys, so a hint cannot describe a key that does
 nothing.
+
+### Command palette
+
+`Ctrl+P` opens a fuzzy-scored list, grouped the same way as the cheatsheet.
+Commands you have run are lifted into a `Recent` section on the next open, and
+they break ties among equally good matches, so the palette converges on the way
+you actually work.
+
+### Queue
+
+A message written while a turn is running is held rather than interleaved with
+work already in flight. The queue band shows what is waiting, and `Alt+↑↓`
+picks a row, `Alt+E` pulls it back into the draft, `Alt+X` drops it, `Alt+J/K`
+reorders it and `Alt+Enter` interrupts the turn and sends it now. The queue
+drains itself when the turn ends.
 
 ## Environment
 
