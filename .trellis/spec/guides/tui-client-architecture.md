@@ -149,6 +149,20 @@ Rules that make this work:
 * The gutter is taken from the transcript's right edge and only when the
   transcript is at least `MIN_TRANSCRIPT_FOR_GUTTER` wide; below that the two
   columns go back to the prose.
+* **The frame publishes what the mouse needs, nothing more.** `FrameRegions`
+  carries the transcript rect, a `ListRegion` (rect, scope, row count, first
+  line), the composer's text rows, the queue band, the turn rail's ticks, the
+  shortcut band's hints with their intents, the banner and a modal's close
+  control. Every one of them is written by the renderer that drew it, because
+  only that code knows where the band landed; `run.rs` does nothing but
+  hit-test. A click on a hint runs the intent its key would run, so the mouse
+  cannot grow a second, divergent command set.
+* **The banner row has one owner.** `BannerPriority` orders the claimants
+  (transient < tip < mode < warning); `App::set_banner` refuses to displace a
+  higher-priority message, and `refresh_banner` re-derives the row from the
+  current conditions once per loop so a message that is no longer true
+  withdraws itself. A producer that only assigned the field would let the last
+  writer win and the row flicker between unrelated messages.
 * **Surfaces inside a band reserve rows rather than overlay.** The pinned prompt
   header (`MAX_STICKY_ROWS` + a gap) and the transcript search bar (a rule plus
   the bar) are subtracted from the transcript band before the viewport is
@@ -190,6 +204,11 @@ Rules that follow:
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
+* **A band that reports progress derives it from the transcript.**
+  `App::todo_progress` reads the last plan-shaped block's `Status: title` lines,
+  so the progress bar cannot disagree with the rows the reader can scroll to.
+  A counter with no runtime source (background tasks) stays at zero rather than
+  guessing.
 * **The pinned prompt header is chrome, not content.** Only a user message
   pins; an expanded one does not (it is already fully visible inline). It
   shrinks one row per row scrolled past down to `min(full_height,
@@ -253,6 +272,16 @@ is never a column count.
   so they stay testable without a terminal. A modifier chord is never text:
   every printable-key arm excludes `Ctrl` and `Alt`, so a binding such as
   `Alt+B` reaches the table instead of typing a `b`.
+* **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
+  `PASTE_CHIP_BYTES` decide; the buffer's text holds the label and the original
+  bytes ride in a `PasteChip`. A chip is atomic — the cursor steps over it, one
+  `Backspace` removes it, and any edit that reaches into one dissolves it into
+  literal text so no range can point at the wrong bytes. `take_expanded` puts
+  the bytes back on the way out; `text()` shows only the label.
+* **A draft's mode is derived from its text, not tracked beside it.**
+  `sync_composer_mode` reads the first character (`? ` = history search), so an
+  undo, a recalled history entry or a paste cannot leave the prefix describing a
+  mode the draft is not in.
 * **The composer keeps an undo history and one kill buffer.**
   `ComposerBuffer` snapshots after each mutation (`MAX_UNDO`), coalescing
   consecutive typing into one step and breaking the batch on any cursor move —
