@@ -2098,6 +2098,14 @@ struct ToolCallSnapshot {
     output_summary: Option<String>,
     raw_input: Option<Value>,
     raw_output_state: Option<ToolCallOutputState>,
+    /// Accumulated `_meta.terminal_output.data` text.
+    ///
+    /// An adapter that streams a command sends each chunk exactly once instead
+    /// of resending the whole output, so the host has to hold the running text:
+    /// `raw_output_delta` derives an append by comparing against the previous
+    /// full text, and handing it one chunk at a time would report every chunk
+    /// after the first as a replacement snapshot and drop what came before it.
+    terminal_output: String,
     content: Option<Value>,
     locations: Vec<vibex_core::AgentEventLocation>,
     meta: BTreeMap<String, String>,
@@ -4722,17 +4730,32 @@ impl AcpSessionAttachment {
             snapshot.raw_input = Some(raw_input.clone());
             snapshot.input_summary = truncate_optional_summary(raw_input.to_string());
         }
+        // An adapter that streams a terminal-backed command delivers each chunk
+        // once, under the spec's reserved `_meta`, and settles with the
+        // un-streamed tail plus `_meta.terminal_exit`. Accumulate the chunks so
+        // the delta below sees a growing text rather than a lone fragment.
+        let streamed_terminal = streamed_terminal_output(update);
+        if let Some(fragment) = streamed_terminal
+            && !fragment.is_empty()
+        {
+            snapshot.terminal_output.push_str(fragment);
+        }
         let raw_output_text = update
             .get("rawOutput")
             .map(|value| match value {
                 Value::String(value) => value.clone(),
                 _ => value.to_string(),
             })
-            .and_then(safe_tool_raw_output);
+            .and_then(safe_tool_raw_output)
+            .or_else(|| {
+                (!snapshot.terminal_output.is_empty())
+                    .then(|| snapshot.terminal_output.clone())
+                    .and_then(safe_tool_raw_output)
+            });
         let raw_output = raw_output_text
             .as_deref()
             .and_then(|next| raw_output_delta(&mut snapshot.raw_output_state, next));
-        if update.get("rawOutput").is_some() {
+        if update.get("rawOutput").is_some() || streamed_terminal.is_some() {
             snapshot.output_summary = raw_output_text
                 .as_deref()
                 .and_then(truncate_optional_summary);
@@ -4746,8 +4769,17 @@ impl AcpSessionAttachment {
         if let Some(locations) = update.get("locations") {
             snapshot.locations = crate::parse_event_locations(Some(locations));
         }
-        if let Some(meta) = update.get("meta") {
+        // `meta` is the adapter-extension spelling the catalog reads; `_meta`
+        // is the spec's reserved one. Accept both so neither an extension nor a
+        // conforming adapter loses its bounded metadata.
+        if let Some(meta) = update.get("_meta").or_else(|| update.get("meta")) {
             snapshot.meta = crate::parse_event_meta(Some(meta));
+        }
+        // The streaming settlement reports the exit status beside the tail.
+        if let Some(exit_code) = streamed_terminal_exit_code(update) {
+            snapshot
+                .meta
+                .insert("exit_code".to_string(), exit_code.to_string());
         }
         let status_raw =
             update
@@ -19355,6 +19387,28 @@ fn safe_tool_raw_output(value: String) -> Option<String> {
     Some(value)
 }
 
+/// One chunk of terminal output an adapter streams under the reserved `_meta`.
+///
+/// The chunk is a fragment, not the whole output so far: the adapter sends each
+/// byte exactly once and settles with whatever it did not stream. Callers must
+/// therefore append, never replace.
+fn streamed_terminal_output(update: &Value) -> Option<&str> {
+    update
+        .get("_meta")
+        .and_then(|meta| meta.get("terminal_output"))
+        .and_then(|terminal| terminal.get("data"))
+        .and_then(Value::as_str)
+}
+
+/// The exit status an adapter reports beside the settled terminal tail.
+fn streamed_terminal_exit_code(update: &Value) -> Option<i64> {
+    update
+        .get("_meta")
+        .and_then(|meta| meta.get("terminal_exit"))
+        .and_then(|exit| exit.get("exit_code"))
+        .and_then(Value::as_i64)
+}
+
 fn raw_output_delta(
     previous: &mut Option<ToolCallOutputState>,
     next: &str,
@@ -21436,6 +21490,7 @@ mod tests {
                 byte_len: 2,
                 digest: Sha256::digest(b"ok").into(),
             }),
+            terminal_output: String::new(),
             content: None,
             locations: Vec::new(),
             meta: BTreeMap::from([("exitCode".to_string(), "0".to_string())]),
@@ -21505,6 +21560,80 @@ mod tests {
         );
     }
 
+    /// DeepSeek Harness streams a terminal-backed command as
+    /// `_meta.terminal_output` fragments and settles with the un-streamed tail
+    /// beside `_meta.terminal_exit`.
+    ///
+    /// The chunks are fragments, not a growing total, so the host has to
+    /// accumulate them before deriving a delta. This pins both the wire shape
+    /// and that rule, because getting the rule wrong loses output silently: a
+    /// bare fragment is not a prefix of the previous one, so `raw_output_delta`
+    /// reports it as a replacement and everything streamed before it is gone.
+    #[test]
+    fn streamed_terminal_output_is_read_as_fragments_under_the_reserved_meta() {
+        let first = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "in_progress",
+            "_meta": { "terminal_output": { "terminal_id": "call-1", "data": "line one\n" } }
+        });
+        let second = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "in_progress",
+            "_meta": { "terminal_output": { "terminal_id": "call-1", "data": "line two\n" } }
+        });
+        let settled = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "completed",
+            "_meta": {
+                "terminal_output": { "terminal_id": "call-1", "data": "tail" },
+                "terminal_exit": { "terminal_id": "call-1", "exit_code": 0, "signal": null }
+            }
+        });
+
+        assert_eq!(streamed_terminal_output(&first), Some("line one\n"));
+        assert_eq!(streamed_terminal_output(&second), Some("line two\n"));
+        assert_eq!(streamed_terminal_output(&settled), Some("tail"));
+        assert_eq!(streamed_terminal_exit_code(&first), None);
+        assert_eq!(streamed_terminal_exit_code(&settled), Some(0));
+        // A non-zero status is reported, not normalised away.
+        assert_eq!(
+            streamed_terminal_exit_code(&json!({
+                "_meta": { "terminal_exit": { "exit_code": 1, "signal": null } }
+            })),
+            Some(1)
+        );
+        // An Agent that does not stream keeps the plain tool-call shape.
+        assert_eq!(
+            streamed_terminal_output(&json!({ "toolCallId": "call-1", "status": "completed" })),
+            None
+        );
+
+        let mut accumulated = None;
+        assert_eq!(
+            raw_output_delta(&mut accumulated, "line one\n").map(|output| output.mode),
+            Some(AgentEventRawOutputMode::Snapshot)
+        );
+        assert_eq!(
+            raw_output_delta(&mut accumulated, "line one\nline two\n").map(|output| output.mode),
+            Some(AgentEventRawOutputMode::Append),
+            "accumulating first turns the second fragment into an append"
+        );
+
+        let mut fragment_by_fragment = None;
+        assert_eq!(
+            raw_output_delta(&mut fragment_by_fragment, "line one\n").map(|output| output.mode),
+            Some(AgentEventRawOutputMode::Snapshot)
+        );
+        assert_eq!(
+            raw_output_delta(&mut fragment_by_fragment, "line two\n").map(|output| output.mode),
+            Some(AgentEventRawOutputMode::Snapshot),
+            "feeding fragments straight through would replace instead of append"
+        );
+    }
+
     #[test]
     fn initialize_params_keep_phase_one_capabilities() {
         assert_eq!(
@@ -21526,6 +21655,9 @@ mod tests {
                         "terminal_output": false,
                         "terminal-auth": false,
                         "mcpServers": false
+                    },
+                    "_meta": {
+                        "terminal_output": false
                     }
                 },
                 "clientInfo": {

@@ -778,15 +778,23 @@ pub(crate) fn build_initialize_params(
                 "mcpServers": mcp_servers
             }),
         );
+        // Both spellings are advertised on purpose, and they are not
+        // interchangeable. `meta` is the adapter-extension key Vibex already
+        // shipped; `_meta` is the spec's reserved key, and the Agents that
+        // stream terminal output read the capability from there — DeepSeek
+        // Harness gates `_meta.terminal_output` on
+        // `clientCapabilities._meta.terminal_output === true` and stays silent
+        // without it. Advertising only the extension spelling therefore left
+        // the feature permanently off rather than merely degraded.
+        let mut reserved_meta = serde_json::Map::new();
+        reserved_meta.insert("terminal_output".to_string(), json!(terminal_tools));
         if parameterized_model_picker {
             // Cursor reads the spec's reserved `_meta` (not the plain `meta`
             // extension above) to decide whether each model parameter becomes
             // its own config option instead of a frozen variant id.
-            capabilities.insert(
-                "_meta".to_string(),
-                json!({ "parameterizedModelPicker": true }),
-            );
+            reserved_meta.insert("parameterizedModelPicker".to_string(), json!(true));
         }
+        capabilities.insert("_meta".to_string(), Value::Object(reserved_meta));
     }
     params
 }
@@ -986,7 +994,8 @@ mod tests {
                         "terminal_output": false,
                         "terminal-auth": true,
                         "mcpServers": true
-                    }
+                    },
+                    "_meta": { "terminal_output": false }
                 },
                 "clientInfo": {
                     "name": "vibex",
@@ -998,19 +1007,28 @@ mod tests {
 
     /// Cursor reads the spec's reserved `_meta`, so the capability must not be
     /// folded into the plain `meta` extension key above.
+    ///
+    /// `terminal_output` shares that reserved key because the Agents that
+    /// stream terminal output read it from there, and it is reported even when
+    /// terminal tools are off, so that an Agent cannot mistake silence for a
+    /// client that never looked.
     #[test]
     fn parameterized_model_picker_is_advertised_through_the_reserved_meta_key() {
         let capabilities =
             &build_initialize_params(true, true, false, false, false, true)["clientCapabilities"];
         assert_eq!(
             capabilities["_meta"],
-            json!({ "parameterizedModelPicker": true })
+            json!({ "terminal_output": false, "parameterizedModelPicker": true })
         );
         assert_eq!(capabilities["meta"]["mcpServers"], json!(false));
 
         let without =
             &build_initialize_params(true, true, false, false, false, false)["clientCapabilities"];
-        assert!(without.get("_meta").is_none());
+        assert_eq!(
+            without["_meta"],
+            json!({ "terminal_output": false }),
+            "the reserved key stays reserved for terminal_output alone"
+        );
     }
 
     #[test]
