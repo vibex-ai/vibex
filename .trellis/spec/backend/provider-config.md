@@ -4092,6 +4092,26 @@ ResolvedAgentProviderProjection {
   token counts. Nothing on the wire names the reason, so a `stopReason`-shaped
   decoder for them would never fire. The same applies to `NO_RESPONSE_TEXT`,
   `NO_FINISH_REASON`, `MALFORMED_FUNCTION_CALL` and `UNEXPECTED_TOOL_CALL`.
+- Do not write a `subagentId` decoder for Copilot CLI. Its changelog says ACP
+  clients "receive subagent IDs", but there is no ACP-level field: the string
+  appears nowhere in the adapter's ACP region, and the official ACP schema has
+  no such member. The identity reaches a client only through the raw-event
+  passthrough `github.com/copilot/sessionEvent`, as that event's `agentId` or
+  its deprecated `data.parentToolCallId`, and neither the notification's params
+  shape nor a way to subscribe to it could be found — six plausible subscribe
+  methods all answered `-32601`. Treat the capability as unavailable to a plain
+  ACP client until that passthrough is documented.
+- Streamed terminal output has two channels with opposite semantics, and a host
+  that treats them alike corrupts the transcript. `_meta.terminal_output.data`
+  is a delta: append it, never compare it against the previous text. The
+  non-streaming fallback `content[0].content.text` is a full replacement
+  rewritten on every frame, so it must replace. At settlement `rawOutput` still
+  carries the whole output even when `terminal_output` carries only the tail,
+  and a truncated stream makes that tail the entire text again — which is why
+  `merge_tool_call_update` prefers `rawOutput` for the delta and treats the
+  accumulated chunks as a fallback. Feeding the chunks through the
+  prefix-comparison delta as if each were a growing total would report every
+  chunk after the first as a replacement and drop what came before it.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
