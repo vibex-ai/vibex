@@ -2915,10 +2915,54 @@ fn render_help(
     strings: Strings,
 ) {
     let inner = page_frame(frame, area, theme, strings.help_title(), true);
+    // The filter is a line of the page, like every other list, so what is being
+    // typed is visible next to what it matched.
+    let list_area = if app.filtering || !app.filter.is_empty() {
+        let filter_area = Rect { height: 1, ..inner };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("/ ", Style::default().fg(theme.roles.accent_user)),
+                Span::styled(
+                    app.filter.clone(),
+                    Style::default().fg(theme.roles.foreground),
+                ),
+                Span::styled(
+                    if app.filtering { "▏" } else { "" },
+                    Style::default().fg(theme.roles.accent_user),
+                ),
+            ])),
+            filter_area,
+        );
+        Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
     let scopes = app.documented_scopes();
-    let bindings = app.keymap.advertised(&scopes);
+    let needle = app.filter.trim().to_lowercase();
+    // Help is generated from the binding tables, so filtering it is filtering
+    // the same data that dispatches the keys.
+    let bindings = app
+        .keymap
+        .advertised(&scopes)
+        .into_iter()
+        .filter(|binding| {
+            needle.is_empty()
+                || binding.chord.display().to_lowercase().contains(&needle)
+                || binding
+                    .label
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
+                || binding.intent.id().contains(&needle)
+                || binding.intent.help().to_lowercase().contains(&needle)
+        })
+        .collect::<Vec<_>>();
     if bindings.is_empty() {
-        empty_state(frame, inner, theme, strings.help_no_keys());
+        empty_state(frame, list_area, theme, strings.help_no_keys());
         return;
     }
     let items = bindings
@@ -2930,7 +2974,7 @@ fn render_help(
             ]))
         })
         .collect::<Vec<_>>();
-    frame.render_widget(List::new(items), inner);
+    frame.render_widget(List::new(items), list_area);
 }
 
 /// The key hint bar.

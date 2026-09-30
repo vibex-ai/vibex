@@ -127,6 +127,24 @@ scrollbar because a lone tick is noise.
 their colour and drop in weight, and the composer's rail goes from the accent to
 dim grey. That makes "where will my keystrokes go" answerable at a glance.
 
+**One chrome, many modals.** Every popup — the command palette, the runtime
+picker, an approval card, a diff view, a confirmation — is drawn through one
+chrome: the same border, the same title on the top rule, the same `[✗]` in the
+same corner, the same inner padding, and a footer whose key hints are
+bottom-aligned and centered. A modal declares how important it is (a palette, a
+picker, a card, a document) and the geometry follows; on a compact terminal the
+margins are given back to the content. Nothing draws its own box, so nothing
+drifts.
+
+**The transcript is a reading surface, not a buffer.** Three things follow from
+that. A user prompt that has scrolled off the top stays pinned above the
+viewport, shrinking toward its truncated height and pushed off by the next
+prompt rather than overlapping it. A search (`/`) is a smart-case regular
+expression whose matches are inverted in place, with the counter on the right of
+the bar. And a drag selects text across lines, copying it over OSC 52 on
+release — the same escape sequence the rest of the client uses, so it works over
+SSH and inside tmux.
+
 **Glyphs have fallbacks.** Terminals disagree about more than colour: the
 conservative Windows console does no font fallback, so a glyph outside its
 raster font is tofu. Every chrome glyph declares an ASCII fallback and the width
@@ -199,6 +217,11 @@ opens, `n` creates, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and
 the authority's own directory browser, so a remote client chooses a path that
 exists where the Agent runs.
 
+`e` opens a detail card under the selected row — id, workspace, state, agent,
+model when it is known, the timestamps, and the message and turn counts for the
+open session. `c` closes every open card and `y` copies the selected session's
+details.
+
 ### Agent
 
 The transcript is a block list with a streaming tail. `e` folds the selected
@@ -207,6 +230,16 @@ and `Ctrl+Y` its metadata. `Enter` opens a block's details. The composer takes
 `/` commands, `@` files and `$` skills, `Enter` sends, `Shift+Enter` breaks the
 line, `Ctrl+O` hands the draft to `$EDITOR`, and `Ctrl+S` steers a running turn.
 `Ctrl+C` clears the draft, then interrupts, then offers to quit.
+
+`/` on the transcript opens a search: a regular expression, case-insensitive
+until it contains an uppercase letter, highlighted in place. `Enter` keeps the
+matches and `n` / `p` step through them, wrapping at the ends. Invalid patterns
+say so rather than silently matching nothing.
+
+A drag with the mouse selects text over as many lines as it covers, scrolling at
+the edges, and copies on release. A double click takes the whole word, so
+`src/net/upload.rs` arrives in one piece. `Esc` dismisses the highlight; `y`
+copies the selection again if the clipboard was clobbered.
 
 Pending approvals appear as a card: `a` allows, `d` denies, `Ctrl+A` allows for
 the rest of the session, and a digit answers with that specific advertised
@@ -254,9 +287,29 @@ paired device.
 
 ### Settings
 
-Theme (20 shipped themes), language (`en`, `zh-CN`, `zh-TW`), icon set, and the
-key-binding file. `F9` reloads `~/.vibex/tui-keys.toml`; the interface reports
-which lines it could not use instead of failing to start.
+Theme and its dark/light mode (20 shipped themes), language (`en`, `zh-CN`,
+`zh-TW`), icon set, the default workspace for new sessions, and the key-binding
+file. The page is one surface with four modes rather than four screens:
+
+| Mode | Entered by | What it does |
+| --- | --- | --- |
+| Browse | default | `↑↓` moves, `Enter` opens the row, `Space` toggles, `d` resets |
+| Filter | `/` | Typing narrows the rows; `Enter` keeps the query, `Esc` clears it |
+| Picking | `Enter` on a choice | `↑↓` previews the value live, `Enter` keeps it, `Esc` puts the old one back |
+| Editing | `Enter` on a text row | Type the value; `Enter` saves, `Esc` discards |
+
+A reset asks first and then restores the shipped default. `F9` reloads
+`~/.vibex/tui-keys.toml`; the interface reports which lines it could not use
+instead of failing to start.
+
+### First run
+
+With an empty session list the landing surface is a short ordered guide:
+connect to the runtime, choose where the Agent works, start a session, write the
+first message. Each step's state is derived from what the client already knows,
+so nothing is persisted and nothing has to be dismissed — the guide retires by
+itself once all four are done, and comes back into an empty home where it is
+useful again.
 
 ### Help
 
@@ -316,6 +369,8 @@ cargo run -p vibex-tui --example preview -- 150 44
 cargo run -p vibex-tui --example preview -- 100 30 --light
 cargo run -p vibex-tui --example preview -- 150 44 --ansi    # real SGR codes
 cargo run -p vibex-tui --example preview -- 150 44 --no-color
+cargo run -p vibex-tui --example preview -- 120 34 --settings
+cargo run -p vibex-tui --example preview -- 120 34 --welcome
 ```
 
 ## Testing

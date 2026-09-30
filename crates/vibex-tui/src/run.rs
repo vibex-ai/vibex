@@ -238,13 +238,18 @@ fn handle_key(
 ) -> BackendResult<bool> {
     // The transcript search bar is a text field, so it takes printable keys
     // before the binding table sees them — the same rule the list filter uses.
-    if app.search_composing() {
+    // Control chords still fall through, so `Ctrl+Q`, `Ctrl+P` and `Ctrl+C`
+    // keep working while a field has focus.
+    if app.search_composing() && !key.modifiers.contains(KeyModifiers::CONTROL) {
         handle_search_key(app, key);
         return Ok(false);
     }
     // The settings surface has four modes. The two typing modes take printable
     // keys before the table, and the chooser takes the arrows.
-    if app.page == Page::Settings && !app.settings.view.is_browse() {
+    if app.page == Page::Settings
+        && !app.settings.view.is_browse()
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
         handle_settings_mode_key(app, key);
         return Ok(false);
     }

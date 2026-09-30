@@ -149,6 +149,13 @@ Rules that make this work:
 * The gutter is taken from the transcript's right edge and only when the
   transcript is at least `MIN_TRANSCRIPT_FOR_GUTTER` wide; below that the two
   columns go back to the prose.
+* **Surfaces inside a band reserve rows rather than overlay.** The pinned prompt
+  header (`MAX_STICKY_ROWS` + a gap) and the transcript search bar (a rule plus
+  the bar) are subtracted from the transcript band before the viewport is
+  positioned, and the renderer publishes what is left as
+  `FrameRegions::scrollback`. That rect is the only coordinate space the mouse
+  layer knows: a pointer maps to a display line through it, so chrome can never
+  be mistaken for content.
 
 ## 5. Visual language
 
@@ -183,6 +190,12 @@ Rules that follow:
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
+* **The pinned prompt header is chrome, not content.** Only a user message
+  pins; an expanded one does not (it is already fully visible inline). It
+  shrinks one row per row scrolled past down to `min(full_height,
+  MAX_STICKY_ROWS)`, and the next prompt pushes it off from the bottom rather
+  than overlapping it, so the transcript below is never hidden. It is decided
+  against a conservatively small viewport so two frames cannot disagree.
 
 ### Surfaces that must not regress
 
@@ -226,6 +239,32 @@ is never a column count.
   owns clear-draft / interrupt / quit-confirm.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
+* **Every popup renders through `crate::modal`.** One chrome — border, title on
+  the top rule, `[✗]`, inner padding, bottom-aligned centered footer hints — and
+  one sizing preset per weight class (`palette`, `prompt`, `picker`, `large`,
+  `document`, `card`). A surface picks a preset and supplies content; a popup
+  that draws its own box is the drift this prevents. `ModalSizing::compact`
+  returns the margins on a small terminal, and a terminal too small for the
+  minimum clears to the title rather than drawing a broken box.
+* **A text-entry state consumes keys before the binding table.** The composer,
+  the list filter, the transcript search bar and the settings filter/editor are
+  text fields: printable keys edit them, and only `Esc`/`Enter`/arrows are
+  commands. Their state lives on `App` and the transitions are reducer methods,
+  so they stay testable without a terminal.
+* **A sub-mode owns `Esc` before the screen does.** Closing a selection
+  highlight, a search bar, a settings chooser or filter happens in `go_back`
+  before page navigation, in that order of innermost first. `Esc` means "undo
+  the thing I am in the middle of" and only then "go back".
+* **Search is a smart-case regular expression** (`crate::search`): lowercase
+  folds case, any uppercase letter makes it exact, an invalid pattern matches
+  nothing and says `bad pattern`, zero-width matches are skipped. Matches are
+  highlighted by splitting the *rendered* line, so markdown that renders away
+  cannot shift a match.
+* **A mouse text selection copies through OSC 52** — the same route as every
+  other copy, so no clipboard crate enters the dependency graph. A selection is
+  `(display line, column)` in the published transcript rect, extracted through
+  `Transcript::plain_lines` (not the viewport) so a drag can exceed the screen,
+  and painted by grapheme so a wide glyph is never split.
 
 ## 8. Security
 

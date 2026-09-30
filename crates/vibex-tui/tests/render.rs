@@ -264,6 +264,25 @@ fn the_help_page_renders_keys_from_the_binding_table() {
 }
 
 #[test]
+fn the_help_page_filter_narrows_the_binding_table() {
+    let mut app = app(120, 40);
+    app.perform(vibex_tui::action::Intent::ToggleHelp);
+    app.perform(vibex_tui::action::Intent::BeginFilter);
+    for character in "palette".chars() {
+        app.filter.push(character);
+    }
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Ctrl+P"),
+        "the filter dropped the matching key:\n{screen}"
+    );
+    assert!(
+        !screen.contains("F6"),
+        "the filter kept a binding that does not match:\n{screen}"
+    );
+}
+
+#[test]
 fn the_command_palette_shows_matches_and_a_query_line() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::OpenCommandPalette);
