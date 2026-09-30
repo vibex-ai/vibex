@@ -31,6 +31,14 @@ use crate::theme::{Rail, TuiTheme};
 
 /// How many collapsed lines a long block shows before folding.
 pub const COLLAPSED_BODY_LINES: usize = 4;
+/// The most rows a pinned prompt header may occupy.
+///
+/// A user prompt can be a paragraph; pinning all of it would leave no room for
+/// the reply it is the header *of*. Four rows is enough to recognise the
+/// question and short enough to keep the transcript the main event.
+pub const MAX_STICKY_ROWS: usize = 4;
+/// The blank row kept between a pinned header and the transcript below it.
+pub const STICKY_GAP_ROWS: usize = 1;
 /// How many rendered blocks stay resident. Blocks outside the window keep their
 /// measured height but drop their styled lines.
 pub const RENDER_CACHE_BLOCKS: usize = 192;
@@ -120,7 +128,7 @@ pub struct ChangeSet {
     pub any: bool,
 }
 
-/// Viewport scroll state.
+/// The viewport scroll state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollState {
     /// Offset in display lines from the top of the transcript.
@@ -138,6 +146,21 @@ impl Default for ScrollState {
             follow: true,
             selected: None,
         }
+    }
+}
+
+/// A user prompt pinned above the transcript viewport.
+#[derive(Debug, Clone)]
+pub struct StickyHeader {
+    /// The block the header was drawn from, so a click can jump to it.
+    pub block: usize,
+    pub lines: Vec<Line<'static>>,
+}
+
+impl StickyHeader {
+    /// Rows the header occupies, gap included.
+    pub fn reserved_rows(&self) -> usize {
+        self.lines.len() + STICKY_GAP_ROWS
     }
 }
 
@@ -689,6 +712,117 @@ impl Transcript {
                 .collect(),
             None => lines,
         }
+    }
+
+    /// The user prompt pinned above the viewport, when one applies.
+    ///
+    /// Only the reader's own messages pin. An Agent message is not a landmark:
+    /// it is the thing being read, and pinning it would cover the content the
+    /// header is supposed to head. The header draws the real prompt block,
+    /// truncated to its pinned height, and it is pushed off by the next prompt
+    /// rather than overlapped, so the transcript below is never hidden.
+    ///
+    /// `viewport` is the height the transcript *would* have without a header;
+    /// the caller passes a conservatively small value so the decision cannot
+    /// oscillate between two frames.
+    pub fn sticky_header(
+        &mut self,
+        scroll: ScrollState,
+        viewport: usize,
+        theme: &TuiTheme,
+        strings: Strings,
+    ) -> Option<StickyHeader> {
+        if viewport < 3 || self.blocks.is_empty() {
+            return None;
+        }
+        if scroll.follow {
+            self.measure_tail(viewport, theme, strings);
+        }
+        self.ensure_layout();
+        let total = self.offsets.last().copied().unwrap_or(0);
+        let offset = if scroll.follow {
+            total.saturating_sub(viewport)
+        } else {
+            scroll.offset.min(total.saturating_sub(1))
+        };
+        if offset == 0 {
+            return None;
+        }
+        // The last prompt the reader has scrolled past.
+        let mut candidate = None;
+        for index in 0..self.blocks.len() {
+            let start = self.offsets.get(index).copied().unwrap_or(0);
+            if start >= offset {
+                break;
+            }
+            if self.blocks[index].kind == TimelineRowKind::UserMessage && self.is_sticky(index) {
+                candidate = Some(index);
+            }
+        }
+        let index = candidate?;
+        let full_height = self.measure(index, theme, strings) as usize;
+        self.ensure_layout();
+        let start = self.offsets.get(index).copied().unwrap_or(0);
+        // The header shrinks one row per row scrolled past, but never below the
+        // height it would have inline-truncated to, so the question stays
+        // readable however far the reader has scrolled.
+        let scroll_past = offset.saturating_sub(start);
+        let floor = full_height.clamp(1, MAX_STICKY_ROWS);
+        let mut height = full_height
+            .saturating_sub(scroll_past)
+            .max(floor)
+            .min(viewport.saturating_sub(1));
+        if height == 0 {
+            return None;
+        }
+        let mut clip_top = 0usize;
+        // The next prompt pushes this one off, from the bottom up.
+        for next in index + 1..self.blocks.len() {
+            let next_start = self.offsets.get(next).copied().unwrap_or(0);
+            if next_start <= offset {
+                continue;
+            }
+            if self.blocks[next].kind != TimelineRowKind::UserMessage || !self.is_sticky(next) {
+                continue;
+            }
+            let naive = next_start - offset;
+            if naive <= height + STICKY_GAP_ROWS {
+                let visible = naive.saturating_sub(1);
+                if visible == 0 {
+                    return None;
+                }
+                // The pushed header reveals its bottom rows, clipped from the
+                // truncated header rather than from the whole prompt.
+                let pushed_height = full_height.min(height);
+                clip_top = pushed_height.saturating_sub(visible);
+                height = visible;
+            }
+            break;
+        }
+        let rendered = self.rendered.get(&index)?.clone();
+        let end = (clip_top + height).min(rendered.lines.len());
+        let lines = rendered
+            .lines
+            .get(clip_top.min(end)..end)
+            .unwrap_or_default()
+            .to_vec();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(StickyHeader {
+            block: index,
+            lines,
+        })
+    }
+
+    /// Whether a prompt still pins when it has scrolled away.
+    ///
+    /// A block the reader deliberately expanded shows all of itself inline, so
+    /// pinning a truncated copy of it would be a second, worse copy.
+    fn is_sticky(&self, index: usize) -> bool {
+        self.blocks
+            .get(index)
+            .is_some_and(|block| !(block.collapsible && block.expanded))
     }
 
     /// Measure blocks backwards from the end until `height` lines are covered.
@@ -1426,6 +1560,113 @@ mod tests {
                 .collect(),
         );
         transcript
+    }
+
+    #[test]
+    fn a_scrolled_past_prompt_pins_above_the_viewport() {
+        let mut transcript = Transcript::new();
+        transcript.configure(40, &theme());
+        let mut blocks = Vec::new();
+        for index in 0..6 {
+            blocks.push(block(
+                &format!("prompt-{index}"),
+                TimelineRowKind::UserMessage,
+                "a question the reader asked",
+            ));
+            blocks.push(block(
+                &format!("reply-{index}"),
+                TimelineRowKind::AgentMessage,
+                "an answer that is long enough to push the question off screen",
+            ));
+        }
+        transcript.set_blocks(blocks);
+        let palette = theme();
+        let strings = strings();
+        // Following the tail of a long transcript still pins the current prompt.
+        let header = transcript
+            .sticky_header(ScrollState::default(), 12, &palette, strings)
+            .expect("the last prompt has scrolled away");
+        assert!(
+            header.lines.len() <= MAX_STICKY_ROWS,
+            "a pinned header must stay short: {}",
+            header.lines.len()
+        );
+        // The header draws the reader's own message, not an Agent reply.
+        assert_eq!(
+            transcript.blocks()[header.block].kind,
+            TimelineRowKind::UserMessage
+        );
+
+        // At the very top nothing is pinned: the prompt is already visible.
+        let top = transcript.sticky_header(
+            ScrollState {
+                offset: 0,
+                follow: false,
+                selected: None,
+            },
+            12,
+            &palette,
+            strings,
+        );
+        assert!(top.is_none());
+    }
+
+    #[test]
+    fn an_expanded_prompt_does_not_pin() {
+        let mut transcript = Transcript::new();
+        transcript.configure(40, &theme());
+        transcript.set_blocks(vec![
+            block("prompt", TimelineRowKind::UserMessage, "a question"),
+            block("reply", TimelineRowKind::AgentMessage, "an answer"),
+        ]);
+        transcript.toggle_block(0);
+        let palette = theme();
+        let header = transcript.sticky_header(
+            ScrollState {
+                offset: 3,
+                follow: false,
+                selected: None,
+            },
+            10,
+            &palette,
+            strings(),
+        );
+        assert!(
+            header.is_none(),
+            "an expanded prompt is already fully visible"
+        );
+    }
+
+    #[test]
+    fn a_search_highlight_splits_a_line_without_changing_its_text() {
+        let pattern = crate::search::SearchPattern::compile("upload").expect("compiles");
+        let line = Line::from(vec![
+            Span::styled("fix the ".to_string(), Style::default()),
+            Span::styled(
+                "upload".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" path".to_string(), Style::default()),
+        ]);
+        let text = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let before = text(&line);
+        let highlighted = highlight_line(
+            line,
+            &pattern,
+            Style::default().add_modifier(Modifier::REVERSED),
+        );
+        assert_eq!(text(&highlighted), before);
+        let matched = highlighted
+            .spans
+            .iter()
+            .find(|span| span.content == "upload")
+            .expect("the match survives as its own span");
+        assert!(matched.style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

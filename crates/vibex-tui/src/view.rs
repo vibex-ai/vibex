@@ -526,6 +526,29 @@ fn render_scrollback(
     let selected = app.selection_for(Scope::Agent);
     let mut scroll = app.scroll;
     scroll.selected = Some(selected);
+    // A pinned prompt header takes its rows off the top before the transcript
+    // is positioned. The header decision is made against a conservatively
+    // small viewport so it cannot oscillate between two frames.
+    let header = app.transcript.sticky_header(
+        scroll,
+        height.saturating_sub(
+            crate::transcript::MAX_STICKY_ROWS + crate::transcript::STICKY_GAP_ROWS,
+        ),
+        theme,
+        strings,
+    );
+    let (content, height) = match &header {
+        Some(header) => {
+            let reserved = header.reserved_rows().min(usize::from(content.height));
+            let content = Rect {
+                y: content.y + reserved as u16,
+                height: content.height.saturating_sub(reserved as u16),
+                ..content
+            };
+            (content, usize::from(content.height))
+        }
+        None => (content, height),
+    };
     let pattern = app
         .search
         .as_ref()
@@ -538,6 +561,19 @@ fn render_scrollback(
         pattern.as_ref(),
         search_highlight_style(theme),
     );
+    if let Some(header) = header {
+        // The pinned header sits on a raised surface so the transcript moving
+        // underneath it reads as a separate layer rather than as more prose.
+        let header_area = Rect {
+            height: header.lines.len() as u16,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(header.lines.clone()))
+                .style(Style::default().bg(theme.roles.surface_raised)),
+            header_area,
+        );
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
     if let Some(rows) = search_bar {
         render_search_bar(frame, rows, app, theme, strings);

@@ -699,3 +699,47 @@ fn a_match_is_a_regular_expression() {
     let screen = text(&render(&mut app, 120, 40));
     assert!(screen.contains("1/2"), "{screen}");
 }
+
+#[test]
+fn a_scrolled_transcript_pins_the_prompt_it_belongs_to() {
+    let mut app = app(120, 40);
+    let mut blocks = vec![seeded_block(
+        "prompt-0",
+        vibex_desktop_model::TimelineRowKind::UserMessage,
+        "PINNED QUESTION about the upload path",
+    )];
+    for index in 0..12 {
+        blocks.push(seeded_block(
+            &format!("reply-{index}"),
+            vibex_desktop_model::TimelineRowKind::AgentMessage,
+            "an answer long enough to occupy a row or two of the transcript",
+        ));
+    }
+    app.transcript.set_blocks(blocks);
+    app.navigate_to(Page::Agent);
+    // Scroll past the question without expanding it.
+    app.scroll.follow = false;
+    app.scroll.offset = 8;
+    let lines = render(&mut app, 120, 40);
+    let screen = text(&lines);
+    let pinned_row = lines
+        .iter()
+        .position(|line| line.contains("PINNED QUESTION"))
+        .unwrap_or_else(|| panic!("the prompt is not pinned:\n{screen}"));
+    // The pinned header is the first row of the transcript band, above the
+    // content that scrolled it away.
+    assert!(
+        pinned_row <= 4,
+        "the pinned header is not at the top of the band: row {pinned_row}\n{screen}"
+    );
+
+    // Scrolled to the very top, the question is inline and nothing is pinned a
+    // second time.
+    app.scroll.offset = 0;
+    let lines = render(&mut app, 120, 40);
+    let pinned_row = lines
+        .iter()
+        .position(|line| line.contains("PINNED QUESTION"))
+        .expect("the question is visible inline");
+    assert!(pinned_row >= 3, "the question must not be drawn twice");
+}
