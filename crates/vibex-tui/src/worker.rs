@@ -955,6 +955,7 @@ impl Dispatch {
             .fetch_timeline(vibex_core::FetchTimelineRequest {
                 session_id: session_id.clone(),
                 after_sequence: None,
+                before_sequence: None,
                 limit: vibex_ui::AGENT_TIMELINE_PAGE_LIMIT,
             })
             .await?;

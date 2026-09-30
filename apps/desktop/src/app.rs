@@ -1590,6 +1590,7 @@ async fn fetch_authoritative_timeline(
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session_id.clone(),
                 after_sequence: Some(after_sequence),
+                before_sequence: None,
                 limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
             })
             .await?;
@@ -1620,6 +1621,7 @@ async fn fetch_authoritative_timeline_via_backend(
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session_id.clone(),
                 after_sequence: Some(after_sequence),
+                before_sequence: None,
                 limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
             })
             .await
@@ -12408,6 +12410,7 @@ impl VibexWorkbench {
                 .fetch_timeline(FetchTimelineRequest {
                     session_id: request_session_id,
                     after_sequence: None,
+                    before_sequence: None,
                     limit: 500,
                 })
                 .await
@@ -17207,6 +17210,7 @@ impl VibexWorkbench {
                     .fetch_timeline(FetchTimelineRequest {
                         session_id: request_session_id.clone(),
                         after_sequence: Some(after_sequence),
+                        before_sequence: None,
                         limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
                     })
                     .await?;
@@ -17804,6 +17808,7 @@ impl VibexWorkbench {
                     .fetch_timeline(FetchTimelineRequest {
                         session_id: session_id.clone(),
                         after_sequence,
+                        before_sequence: None,
                         limit: 500,
                     })
                     .await

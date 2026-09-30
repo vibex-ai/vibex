@@ -30232,6 +30232,7 @@ for line in sys.stdin:
             .fetch_timeline(FetchTimelineRequest {
                 session_id: fixture.session.id.clone(),
                 after_sequence: Some(0),
+                before_sequence: None,
                 limit: 200,
             })
             .await
@@ -30917,6 +30918,7 @@ for line in sys.stdin:
             .fetch_timeline(FetchTimelineRequest {
                 session_id: fixture.session.id.clone(),
                 after_sequence: Some(0),
+                before_sequence: None,
                 limit: 200,
             })
             .await
@@ -36900,6 +36902,7 @@ for line in sys.stdin:
                 .fetch_timeline(FetchTimelineRequest {
                     session_id: session.id.clone(),
                     after_sequence: Some(0),
+                    before_sequence: None,
                     limit: 200,
                 })
                 .await

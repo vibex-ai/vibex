@@ -837,6 +837,7 @@ mod tests {
                     .or_else(|| first_result.outcomes[0].session_id.clone())
                     .unwrap_or_else(|| runs[0].session_id.clone().unwrap()),
                 after_sequence: Some(0),
+                before_sequence: None,
                 limit: 100,
             })
             .await

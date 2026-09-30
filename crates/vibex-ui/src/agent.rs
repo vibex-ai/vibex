@@ -1363,6 +1363,7 @@ async fn load_timeline_after(
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session_id.clone(),
                 after_sequence: Some(after_sequence),
+                before_sequence: None,
                 limit: AGENT_TIMELINE_PAGE_LIMIT,
             })
             .await?;

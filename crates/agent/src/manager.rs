@@ -7216,6 +7216,7 @@ mod tests {
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session.id.clone(),
                 after_sequence: None,
+                before_sequence: None,
                 limit: 100,
             })
             .await

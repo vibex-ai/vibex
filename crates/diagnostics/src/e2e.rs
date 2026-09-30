@@ -851,6 +851,7 @@ async fn remote_agent_protocol(root: &Path) -> VibexResult<E2eRegressionCheck> {
             request: FetchTimelineRequest {
                 session_id: session.id,
                 after_sequence: Some(0),
+                before_sequence: None,
                 limit: 100,
             },
         }),

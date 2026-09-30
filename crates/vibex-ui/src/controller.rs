@@ -66,6 +66,7 @@ impl SessionController {
             .fetch_timeline(FetchTimelineRequest {
                 session_id,
                 after_sequence: None,
+                before_sequence: None,
                 limit: timeline_limit.max(1),
             })
             .await

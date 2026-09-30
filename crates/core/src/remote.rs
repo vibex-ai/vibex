@@ -4891,6 +4891,7 @@ mod tests {
             request: FetchTimelineRequest {
                 session_id,
                 after_sequence: Some(3),
+                before_sequence: None,
                 limit: 20,
             },
         });
