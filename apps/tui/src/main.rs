@@ -114,20 +114,32 @@ fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
         .build()
         .map_err(|error| Failure::Message(format!("could not start the runtime: {error}")))?;
 
-    let seat = runtime
-        .block_on(Seat::resolve(request))
-        .map_err(Failure::from)?;
-
+    // `status` answers "what would happen", so it probes instead of attaching.
+    // Attaching first would make it fail for exactly the situations it exists
+    // to explain.
     if command == Command::Status {
-        let kind = match seat.kind {
-            SeatKind::Authority => "authority",
-            SeatKind::Remote => "remote",
-        };
-        println!("home={}", seat.home.display());
-        println!("seat={kind}");
+        let home = vibex_client::seat::resolve_home(request.home.clone()).map_err(Failure::from)?;
+        let probe = vibex_client::seat::probe(&home);
+        println!("home={}", probe.home.display());
+        println!("flavour={}", probe.flavour.label());
+        println!(
+            "seat={}",
+            match probe.seat {
+                SeatKind::Authority => "authority",
+                SeatKind::Remote => "remote",
+            }
+        );
+        if let Some(endpoint) = &probe.endpoint {
+            println!("endpoint={endpoint}");
+        }
+        println!("detail={}", probe.detail);
         println!("version={VERSION}");
         return Ok(ExitCode::SUCCESS);
     }
+
+    let seat = runtime
+        .block_on(Seat::resolve(request))
+        .map_err(Failure::from)?;
 
     let mut options = TuiOptions {
         seat: seat.kind,
@@ -167,8 +179,14 @@ fn usage() -> String {
          \n\
          USAGE:\n\
          \x20   vibex [tui] [--home <dir>] [--local|--remote] [--theme <id>]\n\
+         \n\
+         HOMES:\n\
+         \x20   A home ending in desktop-preview / desktop-rc / desktop-stable is\n\
+         \x20   that desktop channel; anything else is a server home. The flavour is\n\
+         \x20   taken from the path, because the runtime refuses to start a channel\n\
+         \x20   in a home that does not match it.\n\
          \x20   vibex connect <vibex://… | pairing-code>\n\
-         \x20   vibex status [--home <dir>]\n\
+         \x20   vibex status [--home <dir>]        report the seat without attaching\n\
          \n\
          SEATS:\n\
          \x20   authority  this process starts and owns the runtime for the home\n\
@@ -207,6 +225,19 @@ mod tests {
             Err(Failure::Usage(text)) => assert_eq!(text, format!("vibex {VERSION}")),
             other => panic!("expected version output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_reports_without_attaching() {
+        // `status` must succeed where the real run would fail, because
+        // explaining that failure is its whole purpose.
+        let code = run(vec![
+            "status".to_string(),
+            "--home".to_string(),
+            "/tmp/vibex-status-probe/desktop-preview".to_string(),
+        ])
+        .expect("status does not need a seat");
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     #[test]

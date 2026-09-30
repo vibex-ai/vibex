@@ -101,6 +101,33 @@ pub const DESKTOP_DIRECT_LOOPBACK: &str = "http://127.0.0.1:1428";
 /// The loopback address a headless server listens on by default.
 pub const SERVER_LOOPBACK: &str = "http://127.0.0.1:8765";
 
+/// Where a runtime that owns a given home answers local clients.
+///
+/// The two flavours listen in different places: the desktop app's Direct
+/// listener defaults to 1428, while a headless server defaults to 8765 and moves
+/// with `VIBEX_BIND_ADDR`. Dialling the wrong one produces a connection error
+/// that looks like "the runtime is not accepting clients", which is the exact
+/// confusion the seat messages exist to avoid.
+pub fn loopback_endpoint(flavour: HomeFlavour) -> String {
+    match flavour {
+        HomeFlavour::Preview | HomeFlavour::ReleaseCandidate | HomeFlavour::Stable => {
+            DESKTOP_DIRECT_LOOPBACK.to_string()
+        }
+        HomeFlavour::Server => std::env::var("VIBEX_BIND_ADDR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.contains("://") {
+                    value
+                } else {
+                    format!("http://{value}")
+                }
+            })
+            .unwrap_or_else(|| SERVER_LOOPBACK.to_string()),
+    }
+}
+
 impl Seat {
     /// Resolve the seat and construct the facade.
     pub async fn resolve(request: SeatRequest) -> Result<Self, SeatError> {
@@ -275,7 +302,14 @@ impl Seat {
             .map_err(|error| SeatError::Environment {
                 detail: format!("could not read the runtime identity: {error}"),
             })?;
-        let pinned = vibex_remote::pinned_tls_certificate_base64(&identity).ok();
+        // Only a listener that actually terminates TLS can be pinned. Under the
+        // loopback development policy the runtime serves plain HTTP, and asking
+        // for a pinned route there is rejected by the client's own validation.
+        let endpoint = loopback_endpoint(HomeFlavour::of(&home));
+        let pinned = endpoint
+            .starts_with("https://")
+            .then(|| vibex_remote::pinned_tls_certificate_base64(&identity).ok())
+            .flatten();
 
         // The runtime is running, so the database is shared. WAL mode plus the
         // runtime's own 15 s busy timeout make a short-lived read safe, and this
@@ -299,7 +333,7 @@ impl Seat {
             detail: format!("could not mint a local pairing code: {error}"),
         })?;
 
-        let base_url = SERVER_LOOPBACK.to_string();
+        let base_url = endpoint;
         let bundle = claim_pairing_code_with_identity(
             base_url.clone(),
             response.pairing_code.clone(),
@@ -323,21 +357,26 @@ impl Seat {
         pinned: Option<String>,
         home: &Path,
     ) -> Result<Self, SeatError> {
-        let mut remote = RemoteClientConfig::new(
-            bundle.credential.server_url.clone(),
-            bundle.credential.auth.clone(),
-        )
-        .with_device_identity(bundle.identity.clone());
+        let url = bundle.credential.server_url.clone();
+        // The scheme decides the security model, not the availability of a
+        // certificate: a runtime in the `loopback_http` policy serves plain
+        // HTTP and has no use for a pin, while pinning a plain-HTTP URL is
+        // rejected outright by `RemoteClientConfig::validate`.
+        let is_tls = url.starts_with("https://") || url.starts_with("wss://");
+        let pin = if is_tls { pinned } else { None };
+        let mut remote = RemoteClientConfig::new(url, bundle.credential.auth.clone())
+            .with_device_identity(bundle.identity.clone());
         remote.expected_server_id = Some(bundle.server_id.clone());
+        // The identity public key is pinned over the wire when the route is
+        // encrypted. Over plain loopback HTTP the same key still comes from the
+        // local identity file, so the comparison is meaningful there too.
         remote.expected_server_identity_public_key =
             bundle.credential.server_identity_public_key.clone();
-        remote.pinned_tls_certificate_der = pinned.clone();
+        remote.pinned_tls_certificate_der = pin.clone();
         remote.client_id = "vibex-tui".to_string();
         remote.client_type = RemoteClientType::Native;
-        // Pinned TLS is chosen whenever the runtime advertised a certificate;
-        // plain HTTP is only the explicit loopback bootstrap fallback.
-        remote.allow_insecure_local_dev = pinned.is_none();
-        Self::from_remote_config(remote, pinned, None, home)
+        remote.allow_insecure_local_dev = !is_tls;
+        Self::from_remote_config(remote, pin, None, home)
     }
 
     fn from_remote_config(
@@ -380,29 +419,189 @@ impl Seat {
     }
 }
 
+/// Which runtime flavour a home belongs to.
+///
+/// The leaf of the path is authoritative. The desktop channels each own a
+/// dedicated home (`desktop-preview`, `desktop-rc`, `desktop-stable`) and the
+/// runtime refuses to start if the flavour and the leaf disagree, so deriving
+/// the flavour from the path is the only way `--home` can work at all. A home
+/// that is not a channel home is a server home, which has no isolation rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeFlavour {
+    Preview,
+    ReleaseCandidate,
+    Stable,
+    Server,
+}
+
+impl HomeFlavour {
+    /// The directory leaf each flavour requires, or `None` for a server home.
+    pub const fn leaf(self) -> Option<&'static str> {
+        match self {
+            HomeFlavour::Preview => Some("desktop-preview"),
+            HomeFlavour::ReleaseCandidate => Some("desktop-rc"),
+            HomeFlavour::Stable => Some("desktop-stable"),
+            HomeFlavour::Server => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            HomeFlavour::Preview => "preview",
+            HomeFlavour::ReleaseCandidate => "rc",
+            HomeFlavour::Stable => "stable",
+            HomeFlavour::Server => "server",
+        }
+    }
+
+    /// Classify a home by its last path component.
+    pub fn of(home: &Path) -> Self {
+        match home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+        {
+            "desktop-preview" => Self::Preview,
+            "desktop-rc" => Self::ReleaseCandidate,
+            "desktop-stable" => Self::Stable,
+            _ => Self::Server,
+        }
+    }
+}
+
 /// The desktop runtime config for a given home.
 ///
-/// The channel follows `VIBEX_CHANNEL` the same way the desktop binary does, so
-/// `vibex tui` attaches to the home the user is actually running.
+/// The flavour is derived from the home itself, and each channel is built
+/// through its own constructor so the runtime's isolation check passes. A home
+/// that is not a channel home gets the server flavour, which is what makes
+/// `--home /tmp/scratch` a working throwaway runtime.
 pub fn home_config(home: &Path) -> Result<DesktopRuntimeConfig, SeatError> {
-    let channel = std::env::var("VIBEX_CHANNEL").unwrap_or_default();
-    let mut config = match channel.trim().to_ascii_lowercase().as_str() {
-        "stable" => DesktopRuntimeConfig::stable_default(),
-        "rc" | "release-candidate" => DesktopRuntimeConfig::release_candidate_default(),
-        _ => DesktopRuntimeConfig::preview_default(),
+    let mut config = match HomeFlavour::of(home) {
+        // `isolated_*(base)` derives `<base>/<leaf>`, so the parent is the base.
+        HomeFlavour::Preview => {
+            DesktopRuntimeConfig::isolated_preview(home.parent().unwrap_or(home))
+        }
+        HomeFlavour::ReleaseCandidate => {
+            DesktopRuntimeConfig::isolated_release_candidate(home.parent().unwrap_or(home))
+        }
+        HomeFlavour::Stable => {
+            DesktopRuntimeConfig::isolated_release_stable(home.parent().unwrap_or(home))
+        }
+        HomeFlavour::Server => {
+            let mut config =
+                DesktopRuntimeConfig::headless_from_environment().map_err(|error| {
+                    SeatError::Environment {
+                        detail: format!("could not resolve the runtime configuration: {error}"),
+                    }
+                })?;
+            config.home_dir = home.to_path_buf();
+            config.database_path = home.join("vibex.db");
+            config
+        }
+    };
+    // The derived home must be the one that was asked for; silently running
+    // against a different directory is worse than refusing.
+    if config.home_dir != home {
+        return Err(SeatError::Environment {
+            detail: format!(
+                "the {} runtime home is {} but {} was requested",
+                HomeFlavour::of(home).label(),
+                config.home_dir.display(),
+                home.display()
+            ),
+        });
     }
-    .map_err(|error| SeatError::Environment {
-        detail: format!("could not resolve the runtime configuration: {error}"),
-    })?;
-    config.home_dir = home.to_path_buf();
-    config.database_path = home.join("vibex.db");
     // The TUI may run a delegated agent, so point the sidecar at this binary,
     // exactly as `vibex-server` does.
     config.delegation_sidecar_command = std::env::current_exe().ok();
     Ok(config)
 }
 
+/// A diagnosis of what `vibex` would do with this home, without doing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatProbe {
+    pub home: PathBuf,
+    pub flavour: HomeFlavour,
+    pub seat: SeatKind,
+    /// Why the seat was chosen, in the user's terms.
+    pub detail: String,
+    /// The address a remote seat would use, when there is one.
+    pub endpoint: Option<String>,
+}
+
+/// Report which seat this home would produce, without starting anything.
+///
+/// `status` exists to answer "why is this not working", so it must succeed
+/// precisely when the real run would fail.
+pub fn probe(home: &Path) -> SeatProbe {
+    let flavour = HomeFlavour::of(home);
+    let application_id = application_id(flavour);
+    match DesktopHomeLock::acquire(home, application_id) {
+        Ok(lock) => {
+            drop(lock);
+            SeatProbe {
+                home: home.to_path_buf(),
+                flavour,
+                seat: SeatKind::Authority,
+                detail: "no runtime owns this home; `vibex` would start one".to_string(),
+                endpoint: None,
+            }
+        }
+        Err(error) if error.code == "desktop_runtime_home_locked" => {
+            let credential = credential_path(home);
+            let (detail, endpoint) = if credential.exists() {
+                (
+                    "a runtime owns this home; `vibex` would attach with the saved credential"
+                        .to_string(),
+                    Some(read_saved_url(&credential).unwrap_or_else(|| loopback_endpoint(flavour))),
+                )
+            } else {
+                (
+                    "a runtime owns this home and no local credential exists yet; `vibex` would mint one over loopback, which needs the runtime to accept local clients"
+                        .to_string(),
+                    Some(loopback_endpoint(flavour)),
+                )
+            };
+            SeatProbe {
+                home: home.to_path_buf(),
+                flavour,
+                seat: SeatKind::Remote,
+                detail,
+                endpoint,
+            }
+        }
+        Err(error) => SeatProbe {
+            home: home.to_path_buf(),
+            flavour,
+            seat: SeatKind::Remote,
+            detail: format!("the home lock could not be probed: {error}"),
+            endpoint: None,
+        },
+    }
+}
+
+fn application_id(flavour: HomeFlavour) -> &'static str {
+    match flavour {
+        HomeFlavour::Preview => "dev.vibex.desktop.preview",
+        HomeFlavour::ReleaseCandidate => "dev.vibex.desktop.rc",
+        HomeFlavour::Stable => "dev.vibex.desktop",
+        HomeFlavour::Server => "dev.vibex.server",
+    }
+}
+
+fn read_saved_url(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let stored: StoredCredential = serde_json::from_str(&raw).ok()?;
+    Some(stored.server_url)
+}
+
 /// Resolve the Vibex home directory the same way the other binaries do.
+///
+/// An explicit path is used **verbatim**: `--home` is the escape hatch for
+/// pointing at a scratch or server home, so appending a channel leaf to it
+/// would defeat the purpose. The environment path is also verbatim, for the
+/// same reason `VIBEX_HOME` is honoured by every other binary. Only the
+/// fallback derives a channel home under `~/.vibex`.
 pub fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf, SeatError> {
     if let Some(home) = explicit {
         return Ok(home);
@@ -520,6 +719,72 @@ mod tests {
     }
 
     #[test]
+    fn the_flavour_comes_from_the_home_leaf() {
+        // The runtime refuses to start when the flavour and the leaf disagree,
+        // so the leaf has to win over any environment setting.
+        assert_eq!(
+            HomeFlavour::of(Path::new("/h/.vibex/desktop-preview")),
+            HomeFlavour::Preview
+        );
+        assert_eq!(
+            HomeFlavour::of(Path::new("/h/.vibex/desktop-rc")),
+            HomeFlavour::ReleaseCandidate
+        );
+        assert_eq!(
+            HomeFlavour::of(Path::new("/h/.vibex/desktop-stable")),
+            HomeFlavour::Stable
+        );
+        assert_eq!(
+            HomeFlavour::of(Path::new("/tmp/scratch")),
+            HomeFlavour::Server
+        );
+    }
+
+    #[test]
+    fn every_channel_home_config_is_accepted_by_the_runtime() {
+        // This is the check `--home` used to fail: `preview_default()` returns
+        // the environment home, and overwriting `home_dir` afterwards trips the
+        // isolation rule.
+        for home in [
+            "/tmp/vibex-probe/desktop-preview",
+            "/tmp/vibex-probe/desktop-rc",
+            "/tmp/vibex-probe/desktop-stable",
+        ] {
+            let config = home_config(Path::new(home)).expect("the config resolves");
+            assert_eq!(config.home_dir, Path::new(home));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{home} was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_non_channel_home_gets_a_server_config() {
+        let config = home_config(Path::new("/tmp/vibex-scratch")).expect("the config resolves");
+        assert_eq!(config.home_dir, Path::new("/tmp/vibex-scratch"));
+        assert_eq!(
+            config.database_path,
+            Path::new("/tmp/vibex-scratch/vibex.db")
+        );
+        config.validate().expect("a server home validates");
+    }
+
+    #[test]
+    fn a_probe_never_starts_a_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("desktop-preview");
+        let probe = probe(&home);
+        assert_eq!(probe.seat, SeatKind::Authority);
+        assert_eq!(probe.flavour, HomeFlavour::Preview);
+        assert!(probe.detail.contains("would start one"), "{}", probe.detail);
+        // Probing must not leave a lock behind: the real run has to be able to
+        // take it.
+        let lock = DesktopHomeLock::acquire(&home, application_id(HomeFlavour::Preview))
+            .expect("the probe released the lock");
+        drop(lock);
+    }
+
+    #[test]
     fn credential_path_lives_under_local_clients() {
         let path = credential_path(Path::new("/data/vibex"));
         assert!(path.ends_with("local-clients/tui-credential.json"));
@@ -550,5 +815,50 @@ mod tests {
         // A LAN or public default here would silently expose the runtime.
         assert!(SERVER_LOOPBACK.contains("127.0.0.1"));
         assert!(DESKTOP_DIRECT_LOOPBACK.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_plain_http_route_is_never_pinned() {
+        // `RemoteClientConfig::validate` rejects a pin on a plain-HTTP URL, and
+        // a runtime in the loopback policy serves exactly that.
+        let mut remote = RemoteClientConfig::new("http://127.0.0.1:8791", auth_proof());
+        remote.allow_insecure_local_dev = false;
+        remote.pinned_tls_certificate_der = None;
+        assert!(
+            remote.validate().is_err(),
+            "plain loopback HTTP must need an explicit opt-in"
+        );
+        remote.allow_insecure_local_dev = true;
+        assert!(
+            remote.validate().is_ok(),
+            "the loopback development exception must be usable"
+        );
+    }
+
+    fn auth_proof() -> vibex_core::RemoteAuthProof {
+        vibex_core::RemoteAuthProof {
+            device_id: vibex_core::DeviceId::new(),
+            auth_token: "test-token".to_string(),
+        }
+    }
+
+    #[test]
+    fn each_flavour_dials_its_own_listener() {
+        // The desktop Direct listener and the headless server listen on
+        // different ports; dialling the wrong one reads as "not accepting
+        // local clients".
+        assert_eq!(
+            loopback_endpoint(HomeFlavour::Preview),
+            DESKTOP_DIRECT_LOOPBACK
+        );
+        assert_eq!(
+            loopback_endpoint(HomeFlavour::ReleaseCandidate),
+            DESKTOP_DIRECT_LOOPBACK
+        );
+        assert_eq!(
+            loopback_endpoint(HomeFlavour::Stable),
+            DESKTOP_DIRECT_LOOPBACK
+        );
+        assert_eq!(loopback_endpoint(HomeFlavour::Server), SERVER_LOOPBACK);
     }
 }
