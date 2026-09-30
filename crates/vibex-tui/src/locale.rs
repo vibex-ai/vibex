@@ -330,11 +330,6 @@ strings! {
         "在 ? 後輸入以搜尋已傳送訊息；Enter 取回"
     },
     composer_draft_cleared => { "Draft cleared", "草稿已清空", "草稿已清空" },
-    composer_press_again => {
-        "Press Esc again to clear the draft",
-        "再按一次 Esc 清空草稿",
-        "再按一次 Esc 清空草稿"
-    },
     composer_attachments => { "Attachments", "附件", "附件" },
     composer_attach_hint => {
         "Type a path to attach it",
@@ -490,6 +485,10 @@ strings! {
     runtime_model => { "Model", "模型", "模型" },
     runtime_agent => { "Agent", "Agent", "Agent" },
     runtime_probe => { "Probe runtimes", "探测运行时", "探測執行階段" },
+    // The switch affordance, shown beside the runtime it moves.
+    runtime_switch_hint => { "Ctrl+G change", "Ctrl+G 切换", "Ctrl+G 切換" },
+    runtime_current => { "Current", "当前", "目前" },
+    runtime_unavailable => { "Unavailable", "不可用", "無法使用" },
 
     // ---- workspace ------------------------------------------------------
     workspace_pick => { "Choose a workspace", "选择工作区", "選擇工作區" },

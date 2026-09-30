@@ -2532,16 +2532,55 @@ fn render_composer_info(
     let mut left = vec![Span::raw(" ")];
     // Model identity, when the session has one.
     if let Some(session) = app.active_session() {
-        left.push(Span::styled(
-            session.agent_id.to_string(),
-            flag(theme).add_modifier(Modifier::BOLD),
-        ));
-        if let Some(catalog) = app.runtime_options.as_ref()
-            && let Some(option) = catalog.options.first()
-        {
-            left.push(sep(theme));
-            left.push(Span::styled(option.model_label.clone(), flag(theme)));
+        // The Agent and model the draft will actually be sent through. The
+        // catalogue's first entry is *not* that: a session keeps its own
+        // runtime until the reader switches it, so naming the default here
+        // would misreport every session that is not on it.
+        let current = app.current_runtime_option_index().and_then(|index| {
+            app.runtime_options
+                .as_ref()
+                .and_then(|catalog| catalog.options.get(index))
+        });
+        match current {
+            Some(option) => {
+                left.push(Span::styled(
+                    option.agent_label.clone(),
+                    flag(theme).add_modifier(Modifier::BOLD),
+                ));
+                left.push(sep(theme));
+                left.push(Span::styled(
+                    format!("{}/{}", option.auth_source_label, option.model_label),
+                    flag(theme),
+                ));
+            }
+            // No catalogue entry to read labels from: the session's own
+            // selection still names the Agent and the model, so say what is
+            // known rather than guessing at the rest.
+            None => {
+                left.push(Span::styled(
+                    app.session_runtime_selection()
+                        .map(|selection| selection.agent_id.to_string())
+                        .unwrap_or_else(|| session.agent_id.to_string()),
+                    flag(theme).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(model) = app
+                    .session_runtime_selection()
+                    .and_then(|selection| selection.model.model_id())
+                {
+                    left.push(sep(theme));
+                    left.push(Span::styled(model.to_string(), flag(theme)));
+                }
+            }
         }
+        // The switch has to be legible from where the reader is looking: the
+        // line already names the runtime, so it also names the key that moves it.
+        // A backend that cannot honour the key explains itself with a toast
+        // rather than silently dropping the entry point.
+        left.push(sep(theme));
+        left.push(Span::styled(
+            strings.runtime_switch_hint().to_string(),
+            flag(theme),
+        ));
     } else {
         // No session yet: name the page, which is the only true context there is.
         let page = match app.page {
@@ -4541,6 +4580,10 @@ fn render_overlay(
             let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
                 return;
             };
+            // One row per Agent, authentication source and model the runtime
+            // publishes. The row the session is on is marked rather than
+            // merely listed first: "which Agent am I talking to" is the
+            // question this overlay exists to answer.
             let items = options
                 .iter()
                 .enumerate()
@@ -4550,17 +4593,41 @@ fn render_overlay(
                     } else {
                         theme.base()
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{:<20}", truncate_to_width(&option.agent_label, 20, "…")),
-                            style,
+                    let current = app.runtime_option_is_current(option);
+                    let mut spans = vec![Span::styled(
+                        if current { "● " } else { "  " }.to_string(),
+                        Style::default().fg(theme.roles.accent_user),
+                    )];
+                    spans.push(Span::styled(
+                        format!("{:<18}", truncate_to_width(&option.agent_label, 18, "…")),
+                        if current {
+                            style.add_modifier(Modifier::BOLD)
+                        } else {
+                            style
+                        },
+                    ));
+                    spans.push(Span::styled(
+                        truncate_to_width(
+                            &format!("{}/{}", option.auth_source_label, option.model_label),
+                            34,
+                            "…",
                         ),
-                        Span::styled(
-                            truncate_to_width(&option.model_label, 30, "…"),
-                            theme.muted(),
-                        ),
-                        Span::styled(format!("  {:?}", option.availability), theme.muted()),
-                    ]))
+                        theme.muted(),
+                    ));
+                    if current {
+                        spans.push(Span::styled(
+                            format!("  {}", strings.runtime_current()),
+                            Style::default().fg(theme.roles.accent_user),
+                        ));
+                    } else if option.availability
+                        != vibex_core::RuntimeOptionAvailability::Available
+                    {
+                        spans.push(Span::styled(
+                            format!("  {}", strings.runtime_unavailable()),
+                            Style::default().fg(theme.roles.gray_dim),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
                 })
                 .collect::<Vec<_>>();
             let mut state = ratatui::widgets::ListState::default();

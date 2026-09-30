@@ -180,6 +180,62 @@ fn escape_never_cancels_a_running_turn() {
 }
 
 #[test]
+fn the_session_view_keeps_the_global_escape_hatches() {
+    // The composer owns the keyboard inside a session, and a composer-scope
+    // binding wins over the global one. Two chords must never be taken by it,
+    // because they are the ways *out*: the command palette and quitting. A
+    // reader who could type but not leave reported both as dead keys.
+    let keymap = vibex_tui::keymap::Keymap::built_in();
+    use vibex_tui::keymap::Scope;
+    let scopes = [Scope::Composer, Scope::Agent, Scope::Global];
+    assert_eq!(
+        keymap.resolve(&scopes, vibex_tui::keymap::Chord::ctrl('p')),
+        Some(vibex_tui::action::Intent::OpenCommandPalette),
+        "Ctrl+P no longer opens the command palette inside a session"
+    );
+    assert_eq!(
+        keymap.resolve(&scopes, vibex_tui::keymap::Chord::ctrl('q')),
+        Some(vibex_tui::action::Intent::RequestQuit),
+        "Ctrl+Q no longer asks to quit inside a session"
+    );
+    assert_eq!(
+        keymap.resolve(
+            &scopes,
+            vibex_tui::keymap::Chord::plain(crossterm::event::KeyCode::Esc)
+        ),
+        Some(vibex_tui::action::Intent::Back),
+        "Esc no longer walks back out of a session"
+    );
+    // The runtime switcher is the Agent and model entry point, so it has to be
+    // reachable from the composer too.
+    assert_eq!(
+        keymap.resolve(&scopes, vibex_tui::keymap::Chord::ctrl('g')),
+        Some(vibex_tui::action::Intent::SwitchAgentRuntime)
+    );
+    // Completion navigation lives on the Alt layer for exactly that reason.
+    assert_eq!(
+        keymap.resolve(
+            &scopes,
+            vibex_tui::keymap::Chord::new(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::ALT
+            )
+        ),
+        Some(vibex_tui::action::Intent::CompletionPrevious)
+    );
+    assert_eq!(
+        keymap.resolve(
+            &scopes,
+            vibex_tui::keymap::Chord::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::ALT
+            )
+        ),
+        Some(vibex_tui::action::Intent::CompletionNext)
+    );
+}
+
+#[test]
 fn the_user_key_file_uses_the_documented_path() {
     // The path is part of the product contract in `settings_keys_hint`.
     let strings = vibex_tui::Strings::for_locale(vibex_tui::Locale::En);

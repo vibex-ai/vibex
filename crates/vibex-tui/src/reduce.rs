@@ -279,7 +279,16 @@ impl App {
                     }
                 };
                 self.open_session(session_id.clone());
-                Outcome::effects(vec![Effect::OpenSession { session_id, ticket }])
+                // The composer's info line names the Agent and model the
+                // session is on, and the switcher needs the same catalogue, so
+                // it is fetched on the way in rather than only when the picker
+                // is opened. It is a read; a failure leaves the line naming the
+                // Agent alone.
+                let mut effects = vec![Effect::OpenSession { session_id, ticket }];
+                if self.runtime_options.is_none() && self.runtime_catalog_available() {
+                    effects.push(Effect::ListRuntimeOptions);
+                }
+                Outcome::effects(effects)
             }
             Intent::EnterSession => {
                 let outcome = self.perform(Intent::OpenSelectedSession);
@@ -1027,23 +1036,36 @@ impl App {
     }
 
     fn guard(&mut self, operation: BackendOperation, effect: Effect) -> Outcome {
+        match self.unavailable_outcome(operation) {
+            Some(outcome) => outcome,
+            None => Outcome::effects(vec![effect]),
+        }
+    }
+
+    /// The toast an operation earns when the backend cannot run it.
+    ///
+    /// `None` means "go ahead". Callers that have work to do before building an
+    /// effect — opening a picker, reading a catalogue — ask this first, so an
+    /// unavailable action explains itself instead of opening a surface that
+    /// cannot do anything.
+    fn unavailable_outcome(&mut self, operation: BackendOperation) -> Option<Outcome> {
         match self.availability(operation) {
-            Availability::Available => Outcome::effects(vec![effect]),
+            Availability::Available => None,
             Availability::RequiresPermission => {
                 self.toast(Toast::warning(
                     self.strings.permission_required_for().to_string(),
                 ));
-                Outcome::quiet()
+                Some(Outcome::quiet())
             }
             Availability::Offline => {
                 self.toast(Toast::warning(self.strings.toast_offline().to_string()));
-                Outcome::quiet()
+                Some(Outcome::quiet())
             }
             Availability::Unsupported => {
                 self.toast(Toast::warning(
                     self.strings.toast_action_unavailable().to_string(),
                 ));
-                Outcome::quiet()
+                Some(Outcome::quiet())
             }
         }
     }
@@ -1559,7 +1581,11 @@ impl App {
             self.filter.clear();
             return Outcome::effects(vec![]);
         }
-        if self.focus == Focus::Composer {
+        // The composer is where the keyboard lands when a session is opened, so
+        // it must not be a room with no door: `Esc` from a session returns to
+        // the session list rather than only moving focus off the draft. `Tab`
+        // is what walks the panes, and the draft is left where it was.
+        if self.focus == Focus::Composer && !self.page.is_session_page() {
             self.focus = Focus::Main;
             return Outcome::effects(vec![]);
         }
@@ -1951,12 +1977,36 @@ impl App {
         }
     }
 
+    /// Whether the runtime catalogue can be read at all.
+    fn runtime_catalog_available(&self) -> bool {
+        self.availability(BackendOperation::AgentSwitchRuntime)
+            .is_available()
+    }
+
     fn open_runtime_picker(&mut self) -> Outcome {
+        // A backend that cannot move a session between runtimes gets an
+        // explanation rather than an overlay whose Enter does nothing.
+        if let Some(outcome) = self.unavailable_outcome(BackendOperation::AgentSwitchRuntime) {
+            return outcome;
+        }
         if self.runtime_options.is_none() {
+            // Opening the picker is what asked for the catalogue; the message
+            // that carries it is what opens the overlay.
+            self.runtime_picker_pending = true;
             return Outcome::effects(vec![Effect::ListRuntimeOptions]);
         }
-        self.overlay = Some(Overlay::RuntimePicker { selected: 0 });
+        self.show_runtime_picker();
         Outcome::effects(vec![])
+    }
+
+    /// Open the picker on the choice the session is already on.
+    ///
+    /// It answers "what am I on" before it asks "what do you want", and a
+    /// session with no matching entry (a catalogue that moved under it) opens
+    /// on the first row rather than on nothing.
+    pub fn show_runtime_picker(&mut self) {
+        let selected = self.current_runtime_option_index().unwrap_or(0);
+        self.overlay = Some(Overlay::RuntimePicker { selected });
     }
 
     fn runtime_option_count(&self) -> usize {
@@ -1973,13 +2023,21 @@ impl App {
         let Some(option) = catalog.options.get(index) else {
             return Outcome::quiet();
         };
+        if option.availability != vibex_core::RuntimeOptionAvailability::Available {
+            let message = self.strings.runtime_unavailable().to_string();
+            self.toast(Toast::warning(message));
+            return Outcome::quiet();
+        }
         let Some(session_id) = self.selected_session_id().cloned() else {
             return Outcome::quiet();
         };
-        Outcome::effects(vec![Effect::SwitchRuntime {
-            session_id,
-            selection: option.selection.clone(),
-        }])
+        self.guard(
+            BackendOperation::AgentSwitchRuntime,
+            Effect::SwitchRuntime {
+                session_id,
+                selection: option.selection.clone(),
+            },
+        )
     }
 
     fn refresh_current_page(&mut self) -> Outcome {
@@ -2317,10 +2375,14 @@ pub mod payloads {
         MutationRequest::new(SendAgentMessageRequest {
             session_id,
             message_idempotency_key: RequestId::new().as_str().to_string(),
+            // The submission is refused when the message's reasoning effort
+            // disagrees with the selection it travels with, so the selection is
+            // the single source for both: a message must never be the reason a
+            // session's runtime configuration changes.
+            reasoning_effort: desired_runtime.reasoning_effort.clone(),
             desired_runtime,
             text,
             attachments,
-            reasoning_effort: None,
             correlation_id: None,
             delivery: vibex_core::UserMessageDelivery::Prompt,
         })
@@ -2579,6 +2641,32 @@ mod tests {
     }
 
     #[test]
+    fn a_sent_message_carries_its_selection_and_nothing_else() {
+        // The submission is refused unless the message's reasoning effort agrees
+        // with the selection it travels with, and the selection is what decides
+        // which Agent the turn runs on. So the payload must not disagree with
+        // the session's own selection, and it must not carry a setting the
+        // session never chose.
+        let mut selection = vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse("codex").expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            "gpt-5",
+        );
+        selection.reasoning_effort = Some("high".to_string());
+        let request = super::payloads::send_message(
+            VibexSessionId::new(),
+            "hello".to_string(),
+            Vec::new(),
+            selection.clone(),
+        );
+        assert_eq!(request.payload.desired_runtime, selection);
+        assert_eq!(
+            request.payload.reasoning_effort, selection.reasoning_effort,
+            "the message disagrees with the runtime selection it carries"
+        );
+    }
+
+    #[test]
     fn entering_a_session_from_the_list_takes_the_keyboard_into_the_composer() {
         let mut app = capable_app();
         app.agent
@@ -2597,6 +2685,177 @@ mod tests {
             app.focus,
             crate::app::Focus::Composer,
             "the navigation reset the focus out of the composer"
+        );
+        // The composer's info line names the Agent and model, which needs the
+        // catalogue: it is read on the way in, not only when the picker opens.
+        assert!(
+            outcome
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ListRuntimeOptions)),
+            "entering the session did not read the runtime catalogue: {outcome:?}"
+        );
+        assert!(
+            !app.runtime_picker_pending,
+            "a catalogue read for the info line must not open the picker"
+        );
+    }
+
+    #[test]
+    fn the_switcher_reads_the_catalogue_then_opens_on_the_current_choice() {
+        let mut app = capable_app();
+        app.live = crate::app::LiveState::Ready;
+        app.navigate_to(Page::Agent);
+        assert!(app.runtime_options.is_none());
+
+        // Nothing is loaded yet, so opening the switcher asks for the catalogue
+        // and waits: a modal with no rows would be a dead end.
+        let requested = app.perform(Intent::SwitchAgentRuntime);
+        assert_eq!(app.overlay, None);
+        assert!(app.runtime_picker_pending);
+        assert!(matches!(
+            requested.effects.as_slice(),
+            [Effect::ListRuntimeOptions]
+        ));
+
+        // When it lands, the picker opens on the session's own entry.
+        app.runtime_options = Some(runtime_catalog());
+        let desired = app.runtime_options.as_ref().unwrap().options[1]
+            .selection
+            .clone();
+        app.agent
+            .state
+            .runtime_selection
+            .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+                desired: desired.clone(),
+                effective: desired,
+                status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                session_revision: 2,
+                selection_revision: 3,
+                current_binding_id: None,
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            });
+        app.show_runtime_picker();
+        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 1 }));
+    }
+
+    #[test]
+    fn escape_from_a_session_returns_to_the_list_with_the_draft_kept() {
+        // The composer is where the keyboard lands when a session opens, so
+        // `Esc` has to be able to leave the page from it: a reader who could
+        // not get back to the session list was stuck in the session.
+        let mut app = capable_app();
+        app.navigate_to(Page::Agent);
+        app.focus = crate::app::Focus::Composer;
+        app.composer.set_text("an unsent draft");
+
+        let outcome = app.perform(Intent::Back);
+        assert!(outcome.effects.is_empty());
+        assert_eq!(app.page, Page::Sessions);
+        assert_eq!(
+            app.composer.text(),
+            "an unsent draft",
+            "leaving the session threw the draft away"
+        );
+    }
+
+    /// A runtime catalogue with two Agents, the second one unavailable.
+    fn runtime_catalog() -> vibex_core::SessionRuntimeOptionCatalog {
+        let option = |agent: &str, model: &str, availability| vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection::provider(
+                vibex_core::AgentId::parse(agent).expect("agent id"),
+                vibex_core::ProviderProfileId::new(),
+                model,
+            ),
+            agent_label: agent.to_string(),
+            auth_source_label: "bal".to_string(),
+            model_label: model.to_string(),
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+            availability,
+        };
+        vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![
+                option(
+                    "claude",
+                    "claude-sonnet",
+                    vibex_core::RuntimeOptionAvailability::Available,
+                ),
+                option(
+                    "codex",
+                    "gpt-5",
+                    vibex_core::RuntimeOptionAvailability::RequiresConfiguration,
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_runtime_picker_opens_on_the_choice_the_session_is_on() {
+        let mut app = capable_app();
+        // A switch is a mutation, so the reducer only offers the picker while
+        // the connection is up — which is the state an open session is in.
+        app.live = crate::app::LiveState::Ready;
+        let session_id = VibexSessionId::new();
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.runtime_options = Some(runtime_catalog());
+        // The session is on the *second* entry, which is also unavailable: the
+        // picker must still start there and say so rather than silently
+        // offering to switch.
+        app.agent
+            .state
+            .runtime_selection
+            .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+                desired: app.runtime_options.as_ref().unwrap().options[1]
+                    .selection
+                    .clone(),
+                effective: app.runtime_options.as_ref().unwrap().options[1]
+                    .selection
+                    .clone(),
+                status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                session_revision: 4,
+                selection_revision: 7,
+                current_binding_id: None,
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            });
+
+        let outcome = app.perform(Intent::SwitchAgentRuntime);
+        assert!(
+            outcome.effects.is_empty(),
+            "the catalogue was already loaded"
+        );
+        assert_eq!(app.overlay, Some(Overlay::RuntimePicker { selected: 1 }));
+        assert!(app.runtime_option_is_current(&app.runtime_options.as_ref().unwrap().options[1]));
+
+        // Choosing the unavailable entry refuses instead of issuing a switch
+        // the runtime would reject.
+        let refused = app.perform(Intent::ConfirmOverlay);
+        assert!(refused.effects.is_empty());
+
+        // Choosing the available one asks for exactly that selection.
+        app.overlay = Some(Overlay::RuntimePicker { selected: 0 });
+        let switched = app.perform(Intent::ConfirmOverlay);
+        let [
+            Effect::SwitchRuntime {
+                session_id: target,
+                selection,
+            },
+        ] = switched.effects.as_slice()
+        else {
+            panic!("expected one runtime switch, got {switched:?}");
+        };
+        assert_eq!(target, &session_id);
+        assert_eq!(
+            selection,
+            &app.runtime_options.as_ref().unwrap().options[0].selection
         );
     }
 

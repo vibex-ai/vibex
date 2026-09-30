@@ -850,17 +850,21 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::SteerRunningTurn,
         "Steer running turn",
     ),
+    // The completion drawer is walked with the arrow keys while it is open;
+    // these two are the explicit chords, and they deliberately stay off
+    // `Ctrl+N`/`Ctrl+P` so the global command palette keeps working while the
+    // composer owns the keyboard.
     binding(
         Scope::Composer,
-        Chord::ctrl('n'),
-        Intent::CompletionNext,
-        "Next completion",
+        Chord::new(KeyCode::Up, KeyModifiers::ALT),
+        Intent::CompletionPrevious,
+        "Previous completion",
     ),
     binding(
         Scope::Composer,
-        Chord::ctrl('p'),
-        Intent::CompletionPrevious,
-        "Previous completion",
+        Chord::new(KeyCode::Down, KeyModifiers::ALT),
+        Intent::CompletionNext,
+        "Next completion",
     ),
     binding(
         Scope::Composer,

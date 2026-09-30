@@ -828,11 +828,11 @@ fn handle_composer_key(
             app.composer.extend_right();
             return Ok(Some(false));
         }
-        KeyCode::Up if shift => {
+        KeyCode::Up if shift && !alt => {
             app.composer.extend_up();
             return Ok(Some(false));
         }
-        KeyCode::Down if shift => {
+        KeyCode::Down if shift && !alt => {
             app.composer.extend_down();
             return Ok(Some(false));
         }
@@ -852,7 +852,7 @@ fn handle_composer_key(
             app.composer.move_right();
             return Ok(Some(false));
         }
-        KeyCode::Up if !ctrl => {
+        KeyCode::Up if !ctrl && !alt => {
             // The completion menu owns the arrow keys while it is open.
             if app.completion.is_some() {
                 let outcome = app.perform(Intent::CompletionPrevious);
@@ -863,7 +863,7 @@ fn handle_composer_key(
             }
             return Ok(Some(false));
         }
-        KeyCode::Down if !ctrl => {
+        KeyCode::Down if !ctrl && !alt => {
             if app.completion.is_some() {
                 let outcome = app.perform(Intent::CompletionNext);
                 dispatch_all(worker, &outcome);
@@ -896,24 +896,17 @@ fn handle_composer_key(
                 app.completion = None;
                 return Ok(Some(false));
             }
-            // A selection is dropped first, and the press is declined: the
-            // reader who highlighted a phrase and pressed Escape wanted the
-            // highlight gone, not the whole draft cleared.
+            // A selection is dropped first: the reader who highlighted a phrase
+            // and pressed Escape wanted the highlight gone, not to leave the
+            // session.
             if app.composer.clear_selection() {
                 return Ok(Some(false));
             }
-            // A double Escape clears the draft; the first press only warns.
-            if app.draft_clear_armed {
-                app.composer.clear();
-                app.history.reset();
-                app.draft_clear_armed = false;
-                let message = app.strings.composer_draft_cleared().to_string();
-                app.toast(Toast::info(message));
-            } else {
-                app.draft_clear_armed = true;
-                let message = app.strings.composer_press_again().to_string();
-                app.toast(Toast::info(message));
-            }
+            // Otherwise `Esc` walks back out of the session, exactly as the
+            // binding table advertises it. The draft is kept, so stepping out to
+            // the session list costs nothing; `Ctrl+C` is what clears it.
+            let outcome = app.perform(Intent::Back);
+            dispatch_all(worker, &outcome);
             return Ok(Some(false));
         }
         KeyCode::Tab => {
@@ -1237,14 +1230,26 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
             }
         }
         AppMessage::RuntimeOptions(result) => {
+            // The catalogue is read both on the way into a session (for the
+            // composer's info line) and by the picker itself; only the second
+            // one opens an overlay, which is what the pending flag records.
+            let picker_waiting = app.runtime_picker_pending;
+            app.runtime_picker_pending = false;
             match result {
                 Ok(catalog) => {
                     app.runtime_options = Some(catalog);
-                    if app.overlay.is_none() {
-                        app.overlay = Some(Overlay::RuntimePicker { selected: 0 });
+                    if picker_waiting && app.overlay.is_none() {
+                        app.show_runtime_picker();
                     }
                 }
-                Err(error) => app.toast(Toast::danger(error.message)),
+                // A prefetch that fails is not news: the info line falls back
+                // to the Agent the session records. A failure the reader asked
+                // for — they opened the picker — is.
+                Err(error) => {
+                    if picker_waiting {
+                        app.toast(Toast::danger(error.message));
+                    }
+                }
             };
         }
         AppMessage::SessionCreated(result) => match result {
@@ -1274,6 +1279,14 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
                     if key == "provider_secret" {
                         let message = app.strings.management_saved().to_string();
                         app.toast(Toast::success(message));
+                    }
+                    if key == "switch_runtime" {
+                        // The switch is durable and asynchronous: the runtime
+                        // reports `Switching…` until the new Agent is up, so the
+                        // acknowledgement says that rather than claiming the
+                        // session has already moved.
+                        let message = app.strings.runtime_switching().to_string();
+                        app.toast(Toast::info(message));
                     }
                     if key == "revoke_device" || key == "delete_session" {
                         let outcome = app.perform(crate::action::Intent::Refresh);

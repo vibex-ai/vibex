@@ -146,6 +146,170 @@ pub fn wrap_text_at(text: &str, width: usize, source_offset: usize) -> Vec<Wrapp
     wrap_text_inner(text, width, source_offset)
 }
 
+/// Wrap `text` to `width` columns, keeping every line a verbatim slice of it.
+///
+/// [`wrap_text`] produces *rendered* lines: a run of whitespace collapses to a
+/// single space and a break at a space is re-joined with a space of the
+/// wrapper's own. That is what prose wants, but it breaks the byte mapping —
+/// `line.text` is no longer the slice at `line.source_start`, so an offset taken
+/// from the source (a caret, a selection end, a chip boundary) can point into
+/// the middle of a multi-byte character once it is used to slice the line.
+///
+/// This variant keeps the mapping exact instead:
+///
+/// ```text
+/// line.text == source[line.source_start ..][..line.text.len()]
+/// ```
+///
+/// with ASCII control characters (a tab, a carriage return) drawn as a space —
+/// one byte for one byte, so the offsets survive and a tab cannot move the
+/// terminal's caret the way its own tab stops would. Whitespace between two
+/// words stays in the text (at the end of the line the break was decided on),
+/// which means a line is never wider than `width` by more than trailing
+/// whitespace the reader cannot see.
+///
+/// A line's [`LineJoiner`] is therefore informational — it records whether a
+/// whitespace run ended the line — and a caller that re-joins these lines must
+/// concatenate them rather than insert the space
+/// [`LineJoiner::inserts_space`] describes.
+///
+/// Use this whenever the caller holds source offsets into `text`; use
+/// [`wrap_text`] when the lines are only going to be painted.
+pub fn wrap_source_text(text: &str, width: usize) -> Vec<WrappedLine> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut paragraph_offset = 0usize;
+    for paragraph in text.split('\n') {
+        wrap_source_paragraph(text, paragraph, paragraph_offset, width, &mut lines);
+        paragraph_offset += paragraph.len() + 1;
+    }
+    if lines.is_empty() {
+        lines.push(WrappedLine {
+            text: String::new(),
+            width: 0,
+            joiner: LineJoiner::End,
+            source_start: 0,
+        });
+    }
+    if let Some(last) = lines.last_mut()
+        && last.joiner == LineJoiner::Newline
+    {
+        last.joiner = LineJoiner::End;
+    }
+    lines
+}
+
+/// Draw ASCII control characters as spaces, preserving byte length.
+fn sanitize_source(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// One source-exact line: the span `[start, end)` of `source`, drawn.
+fn source_line(source: &str, start: usize, end: usize, joiner: LineJoiner) -> WrappedLine {
+    let text = sanitize_source(source.get(start..end).unwrap_or_default());
+    WrappedLine {
+        width: display_width(&text),
+        text,
+        joiner,
+        source_start: start,
+    }
+}
+
+fn wrap_source_paragraph(
+    source: &str,
+    paragraph: &str,
+    paragraph_offset: usize,
+    width: usize,
+    lines: &mut Vec<WrappedLine>,
+) {
+    if paragraph.is_empty() {
+        lines.push(WrappedLine {
+            text: String::new(),
+            width: 0,
+            joiner: LineJoiner::Newline,
+            source_start: paragraph_offset,
+        });
+        return;
+    }
+    let tokens = tokenize(paragraph);
+    if tokens.is_empty() {
+        // A paragraph of nothing but whitespace is still a row: a caller that
+        // puts a caret on it must find one here rather than a missing line.
+        lines.push(source_line(
+            source,
+            paragraph_offset,
+            paragraph_offset + paragraph.len(),
+            LineJoiner::Newline,
+        ));
+        return;
+    }
+
+    let mut line_start = paragraph_offset;
+    let mut line_end = paragraph_offset;
+    let mut current_width = 0usize;
+    let mut started = false;
+
+    for token in tokens {
+        let pieces = if token.width > width {
+            hard_split(&token, width)
+        } else {
+            vec![token]
+        };
+        for piece in pieces {
+            let piece_start = paragraph_offset + piece.offset;
+            let piece_end = piece_start + piece.text.len();
+            // The whitespace the tokenizer consumed between what is already on
+            // the line and this piece.
+            let mut gap_width = if piece.after_space && line_end < piece_start {
+                display_width(&sanitize_source(&source[line_end..piece_start]))
+            } else {
+                0
+            };
+            if started && current_width + gap_width + piece.width > width {
+                // Break before the piece. The whitespace the break ran into
+                // stays at the end of the line it was read on: it is invisible
+                // there, and keeping it means the next line starts at the
+                // token, which is what makes the offsets line up.
+                let end = if gap_width > 0 { piece_start } else { line_end };
+                lines.push(source_line(
+                    source,
+                    line_start,
+                    end,
+                    if gap_width > 0 {
+                        LineJoiner::Space
+                    } else {
+                        LineJoiner::None
+                    },
+                ));
+                line_start = piece_start;
+                current_width = 0;
+                // It stayed on the line that was just emitted.
+                gap_width = 0;
+            }
+            started = true;
+            current_width += gap_width + piece.width;
+            line_end = piece_end;
+        }
+    }
+
+    if started {
+        lines.push(source_line(
+            source,
+            line_start,
+            line_end,
+            LineJoiner::Newline,
+        ));
+    }
+}
+
 fn wrap_text_inner(text: &str, width: usize, source_offset: usize) -> Vec<WrappedLine> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -262,9 +426,16 @@ fn hard_split(token: &Token, width: usize) -> Vec<Token> {
     let mut offset = token.offset;
     while !rest.is_empty() {
         let (prefix, suffix) = take_width(rest, width);
-        if prefix.is_empty() {
-            break;
-        }
+        // A grapheme wider than the whole line — an ideograph in a one-column
+        // grid — overflows that line rather than disappearing from it.
+        let (prefix, suffix) = if prefix.is_empty() {
+            match rest.graphemes(true).next() {
+                Some(grapheme) => (grapheme.to_string(), &rest[grapheme.len()..]),
+                None => break,
+            }
+        } else {
+            (prefix, suffix)
+        };
         pieces.push(Token {
             width: UnicodeWidthStr::width(prefix.as_str()),
             offset,
@@ -502,6 +673,100 @@ mod tests {
                 assert_eq!(display_width(&line.text), line.width);
             }
         }
+    }
+
+    #[test]
+    fn source_lines_map_back_onto_the_text_they_came_from() {
+        // Every offset a caller can hold — a caret between two characters, the
+        // end of a selection — must stay sliceable after wrapping.
+        let cases = [
+            "ab  中文 cd",
+            "中文 中文 中文 中文",
+            "a\tb\tc  d",
+            "two  spaces   everywhere  here",
+            "one\ntwo\n\nfour",
+            "   leading and trailing   ",
+            "supercalifragilisticexpialidocious 中文",
+        ];
+        for text in cases {
+            for width in 1..24 {
+                let lines = wrap_source_text(text, width);
+                assert!(!lines.is_empty(), "{text:?} at {width} produced no lines");
+                let mut previous_end = 0usize;
+                for line in &lines {
+                    let Some(span) =
+                        text.get(line.source_start..line.source_start + line.text.len())
+                    else {
+                        panic!(
+                            "{text:?} at {width}: {:?} at {} is not a source span",
+                            line.text, line.source_start
+                        )
+                    };
+                    // The line is that span, drawn: a tab is a space of the
+                    // same byte length, every other byte is the source's own.
+                    for (left, right) in span.chars().zip(line.text.chars()) {
+                        if left == '\t' || left == '\r' {
+                            assert_eq!(right, ' ');
+                        } else {
+                            assert_eq!(left, right);
+                        }
+                    }
+                    assert_eq!(display_width(&line.text), line.width);
+                    // The rows cover the source in order and never overlap, so
+                    // a caret maps to exactly one row.
+                    assert!(
+                        line.source_start >= previous_end,
+                        "{text:?} at {width}: row {} overlaps the one before it",
+                        line.source_start
+                    );
+                    // A gap between rows can only be whitespace: nothing a
+                    // reader typed may vanish at a wrap.
+                    assert!(
+                        text[previous_end..line.source_start].trim().is_empty(),
+                        "{text:?} at {width}: {:?} was dropped",
+                        &text[previous_end..line.source_start]
+                    );
+                    previous_end = line.source_start + line.text.len();
+                }
+                assert!(
+                    text[previous_end..].chars().all(char::is_whitespace),
+                    "{text:?} at {width}: {:?} was dropped",
+                    &text[previous_end..]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_caret_on_a_collapsed_space_run_is_a_valid_offset() {
+        // The composer wraps its draft with source offsets; a run of spaces
+        // before an ideograph used to shift every later offset by one byte and
+        // land the caret inside the character.
+        let text = "ab  中文";
+        let lines = wrap_source_text(text, 10);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(line.source_start, 0);
+        assert_eq!(line.text, "ab  中文");
+        // The caret sits between `中` and `文`, the offset the draft reports.
+        let offset = 7;
+        assert!(line.text.is_char_boundary(offset));
+        assert_eq!(&line.text[..offset], "ab  中");
+        assert_eq!(display_width(&line.text[..offset]), 6);
+        // The rendered wrapping the transcript uses is *not* offset-safe: the
+        // same caret is not a boundary in it at all, which is what used to
+        // abort the composer.
+        let rendered = wrap_text(text, 10);
+        assert_eq!(rendered[0].text, "ab 中文");
+        assert!(!rendered[0].text.is_char_boundary(offset));
+    }
+
+    #[test]
+    fn a_whitespace_only_line_is_still_a_line() {
+        let lines = wrap_source_text("a\n   \nb", 8);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].text, "   ");
+        assert_eq!(lines[1].source_start, 2);
     }
 
     #[test]

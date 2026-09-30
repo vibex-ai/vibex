@@ -1211,22 +1211,29 @@ impl ComposerBuffer {
     /// renderer needs it to place the terminal's own cursor on the draft. A
     /// cursor exactly on a wrap boundary belongs to the start of the next row,
     /// which is where the next character will appear.
+    ///
+    /// The rows come from [`crate::text::wrap_source_text`], whose lines are
+    /// verbatim slices of the draft, so the cursor's byte offset can be used on
+    /// the row's text directly. [`floor_boundary`] is the belt to that braces:
+    /// a mismatch has to degrade the caret's column, never abort the process.
     pub fn cursor_cell(&self, width: usize) -> (u16, u16) {
         let width = width.max(1);
         let mut row = 0usize;
         for line in 0..self.line_count() {
             let (start, end) = self.line_range(line);
-            let wrapped = crate::text::wrap_text(&self.text[start..end], width);
+            let wrapped = crate::text::wrap_source_text(&self.text[start..end], width);
             let segments = wrapped.len().max(1);
             if self.cursor >= start && self.cursor <= end {
                 for (index, segment) in wrapped.iter().enumerate() {
                     let segment_start = start + segment.source_start;
                     let segment_end = segment_start + segment.text.len();
                     if self.cursor < segment_end || index + 1 == wrapped.len() {
-                        let offset = self
-                            .cursor
-                            .saturating_sub(segment_start)
-                            .min(segment.text.len());
+                        let offset = floor_boundary(
+                            &segment.text,
+                            self.cursor
+                                .saturating_sub(segment_start)
+                                .min(segment.text.len()),
+                        );
                         let column = display_width(&segment.text[..offset]);
                         return ((row + index) as u16, column as u16);
                     }
@@ -1249,7 +1256,7 @@ impl ComposerBuffer {
         let mut remaining = usize::from(row);
         for line in 0..self.line_count() {
             let (start, end) = self.line_range(line);
-            let wrapped = crate::text::wrap_text(&self.text[start..end], width);
+            let wrapped = crate::text::wrap_source_text(&self.text[start..end], width);
             let segments = wrapped.len().max(1);
             if remaining < segments {
                 let offset = wrapped
@@ -1459,6 +1466,11 @@ impl ComposerBuffer {
     }
 
     /// The visual rows of the buffer, wrapped to `width`, with their origin.
+    ///
+    /// The rows are wrapped with [`crate::text::wrap_source_text`] rather than
+    /// [`crate::text::wrap_text`]: everything painted onto a row — the caret,
+    /// the selection, a chip's label — is addressed by a byte offset in the
+    /// draft, so a row's text has to be the slice of the draft it came from.
     pub fn display_rows(&mut self, width: usize) -> Vec<DisplayRow> {
         self.last_display_width = width.max(1);
         let (cursor_line, _) = self.cursor_line_column();
@@ -1466,7 +1478,7 @@ impl ComposerBuffer {
         for line in 0..self.line_count() {
             let (start, end) = self.line_range(line);
             let text = &self.text[start..end];
-            let wrapped = crate::text::wrap_text(text, width.max(1));
+            let wrapped = crate::text::wrap_source_text(text, width.max(1));
             for segment in wrapped {
                 out.push(DisplayRow {
                     text: segment.text,
@@ -1538,6 +1550,21 @@ fn byte_offset_for_column(line: &str, column: usize) -> usize {
     }
     let (prefix, _) = take_width(line, column);
     prefix.len()
+}
+
+/// The largest character boundary at or below `offset`.
+///
+/// A caret is placed by slicing text at an offset derived from the draft, and
+/// slicing at a non-boundary panics. The wrapping already guarantees the
+/// offsets line up, so this only ever has to hold when something else is wrong;
+/// moving the caret back one character is a bad frame, aborting is a lost
+/// session.
+fn floor_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 /// Sent-message history with a cursor into it.
@@ -1825,12 +1852,58 @@ mod tests {
         let lines = draft.display_lines(10);
         assert!(lines.len() >= 3);
         for (text, _) in &lines {
-            assert!(display_width(text) <= 10, "{text:?}");
+            // A row may carry the whitespace its break was decided on, which is
+            // invisible; what has to fit is the text the reader sees.
+            assert!(display_width(text.trim_end()) <= 10, "{text:?}");
         }
         // The cursor starts at the end of the last logical line.
         assert!(lines.last().unwrap().1);
         draft.move_to_start();
         assert!(draft.display_lines(10).first().unwrap().1);
+    }
+
+    #[test]
+    fn a_caret_after_a_collapsed_space_run_does_not_panic() {
+        // Regression: the composer wrapped with `wrap_text`, whose lines are
+        // rendered text rather than source slices. A run of spaces before an
+        // ideograph shifted every later offset, so placing the caret sliced the
+        // row inside a multi-byte character and aborted the client.
+        let mut draft = buffer("ab  中文");
+        draft.move_to_end();
+        // `ab  |中文`: the caret the draft reports sits between the two
+        // ideographs, seven bytes in.
+        draft.move_left();
+        assert_eq!(draft.cursor(), 7);
+        // Both the caret the renderer places and the click that maps back onto
+        // it have to survive the offset. A frame lays the rows out first, which
+        // is what records the width a click is mapped against.
+        for width in 1..24 {
+            draft.display_rows(width);
+            let (row, column) = draft.cursor_cell(width);
+            let mut clicked = draft.clone();
+            clicked.move_cursor_to_cell(row, column);
+            assert_eq!(clicked.cursor(), draft.cursor(), "width {width}");
+        }
+        draft.display_rows(10);
+        assert_eq!(draft.cursor_cell(10).1, 6);
+    }
+
+    #[test]
+    fn wrapped_draft_rows_are_the_slices_they_claim_to_be() {
+        let mut draft = buffer("颜色太少了，你可以按  markdown 语法来选取强调色");
+        for width in 1..30 {
+            let rows = draft.display_rows(width);
+            assert!(!rows.is_empty());
+            for row in &rows {
+                let source = &draft.text()[row.source_start..];
+                assert!(
+                    source.starts_with(&row.text),
+                    "row {:?} is not the draft at {}",
+                    row.text,
+                    row.source_start
+                );
+            }
+        }
     }
 
     #[test]

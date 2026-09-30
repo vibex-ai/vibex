@@ -248,6 +248,128 @@ fn the_prompt_border_carries_the_context_line() {
 }
 
 #[test]
+fn a_cjk_draft_with_a_collapsed_space_run_renders() {
+    // Regression for the reported abort. The renderer places the terminal's
+    // caret from an offset in the draft; the composer used to wrap with
+    // `wrap_text`, whose rows are rendered text, so a run of spaces before an
+    // ideograph shifted every later offset until the slice landed inside a
+    // character and the process aborted mid-frame.
+    let mut app = app(80, 24);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text("ab  中文");
+    // The caret lands between the two ideographs, the offset in the report.
+    app.composer.move_to_end();
+    app.composer.move_left();
+    assert_eq!(app.composer.cursor(), 7);
+    // A wide glyph leaves its trailing cell blank and a wrapping may collapse
+    // the run of spaces, so the painted row is not the draft byte for byte; the
+    // ASCII run and both ideographs are what prove the row was drawn whole —
+    // and that the caret could be placed on it.
+    let screen = text(&render(&mut app, 80, 24));
+    assert!(screen.contains("ab"), "{screen}");
+    assert!(screen.contains('中'), "{screen}");
+    assert!(screen.contains('文'), "{screen}");
+
+    // The same draft on a narrow terminal wraps, and the caret still has to be
+    // placeable.
+    app.composer.set_text(
+        "颜色太少了，你可以按  markdown 语法来选取不同的强调色，你可以看下 grok-build 的相关实现",
+    );
+    app.composer.move_to_end();
+    for _ in 0..6 {
+        app.composer.move_left();
+    }
+    app.resize(40, 24);
+    let screen = text(&render(&mut app, 40, 24));
+    assert!(screen.contains('颜'), "{screen}");
+    assert!(screen.contains("markdown"), "{screen}");
+}
+
+#[test]
+fn the_prompt_names_the_runtime_the_session_is_on() {
+    // The Agent and model switcher has to be visible from the composer: the
+    // line names the session's own runtime — not the first catalogue entry —
+    // and the key that moves it.
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.live = vibex_tui::app::LiveState::Ready;
+    let option = |agent: &str, model: &str| vibex_core::SessionRuntimeOption {
+        selection: vibex_core::SessionRuntimeSelection::provider(
+            vibex_core::AgentId::parse(agent).expect("agent id"),
+            vibex_core::ProviderProfileId::new(),
+            model,
+        ),
+        agent_label: agent.to_string(),
+        auth_source_label: "bal".to_string(),
+        model_label: model.to_string(),
+        reasoning_efforts: Vec::new(),
+        modes: Vec::new(),
+        features: Vec::new(),
+        availability: vibex_core::RuntimeOptionAvailability::Available,
+    };
+    app.runtime_options = Some(vibex_core::SessionRuntimeOptionCatalog {
+        revision: 1,
+        agents: Vec::new(),
+        auth_sources: Vec::new(),
+        options: vec![option("claude", "claude-sonnet"), option("codex", "gpt-5")],
+    });
+    app.agent
+        .state
+        .active_session
+        .resolve(vibex_core::AgentSession {
+            id: vibex_core::VibexSessionId::new(),
+            title: "a session".to_string(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-render-workspace".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse("codex").expect("agent id"),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        });
+    // The session is on the second entry, so the second one is what the line
+    // has to name.
+    let desired = app.runtime_options.as_ref().unwrap().options[1]
+        .selection
+        .clone();
+    app.agent
+        .state
+        .runtime_selection
+        .resolve(vibex_core::AgentSessionRuntimeSelectionState {
+            desired: desired.clone(),
+            effective: desired,
+            status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+            session_revision: 1,
+            selection_revision: 1,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        });
+
+    let lines = render(&mut app, 120, 40);
+    let screen = text(&lines);
+    assert!(
+        lines.iter().any(|line| line.contains("bal/gpt-5")),
+        "the prompt does not name the provider and model:\n{screen}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("Ctrl+G")),
+        "the prompt does not advertise the runtime switch:\n{screen}"
+    );
+    assert!(
+        !screen.contains("bal/claude-sonnet"),
+        "the prompt named a catalogue entry the session is not on:\n{screen}"
+    );
+}
+
+#[test]
 fn the_settings_page_lists_theme_language_and_keys() {
     let mut app = app(120, 40);
     app.perform(vibex_tui::action::Intent::OpenSettings);

@@ -290,7 +290,7 @@ impl Dispatch {
                 text,
                 attachments,
             } => {
-                let runtime = match self.current_runtime_selection().await {
+                let runtime = match self.session_runtime_selection(&session_id).await {
                     Ok(selection) => selection,
                     Err(error) => {
                         self.failure("send_message", error);
@@ -363,7 +363,7 @@ impl Dispatch {
                     self.failure("steer_message", error);
                     return;
                 }
-                let runtime = match self.current_runtime_selection().await {
+                let runtime = match self.session_runtime_selection(&session_id).await {
                     Ok(selection) => selection,
                     Err(error) => {
                         self.failure("steer_message", error);
@@ -403,12 +403,27 @@ impl Dispatch {
                 session_id,
                 selection,
             } => {
+                // The switch is a compare-and-set: the durable revisions are
+                // read first, because a stale expectation is refused rather
+                // than silently applied to whatever the session has become.
+                let state = match self
+                    .facade
+                    .agent()
+                    .runtime_selection(session_id.clone())
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.failure("switch_runtime", error);
+                        return;
+                    }
+                };
                 let request =
                     MutationRequest::new(vibex_core::SetDesiredAgentSessionRuntimeRequest {
                         session_id,
                         idempotency_key: vibex_core::RequestId::new().as_str().to_string(),
-                        expected_revision: 0,
-                        expected_selection_revision: 0,
+                        expected_revision: state.session_revision,
+                        expected_selection_revision: state.selection_revision,
                         desired: selection,
                         interaction: vibex_core::RuntimeSelectionInteraction::Seamless,
                     });
@@ -1012,10 +1027,28 @@ impl Dispatch {
                 "the backend returned an invalid Agent timeline page",
             ));
         }
+        // Best effort, and only where the backend can describe it: the
+        // authoritative timeline still renders when a provider or a remote
+        // device cannot expose runtime-selection details, and the composer then
+        // simply has no Agent and model to name.
+        let include_runtime = self
+            .facade
+            .capabilities()
+            .agent
+            .supports(vibex_backend::BackendOperation::AgentSwitchRuntime);
+        let runtime_selection = if include_runtime {
+            self.facade
+                .agent()
+                .runtime_selection(session_id.clone())
+                .await
+                .ok()
+        } else {
+            None
+        };
         Ok(vibex_ui::AgentSessionSnapshot {
             session,
             timeline: timeline.items,
-            runtime_selection: None,
+            runtime_selection,
             timeline_has_older: timeline.has_older,
         })
     }
@@ -1034,6 +1067,49 @@ impl Dispatch {
                 BackendError::failed(
                     "agent_runtime_unavailable",
                     "no Agent runtime is available for a new session",
+                )
+            })
+    }
+
+    /// The runtime selection an *existing* session is already using.
+    ///
+    /// The selection carried by a message is authoritative, so sending the
+    /// client's preferred catalogue entry would move the session onto another
+    /// Agent as a side effect of typing into it. Read the session's own desired
+    /// selection instead; only a session that predates runtime-selection state
+    /// falls back to the catalogue, and then only to an option belonging to the
+    /// Agent the session already records.
+    async fn session_runtime_selection(
+        &self,
+        session_id: &VibexSessionId,
+    ) -> BackendResult<vibex_core::SessionRuntimeSelection> {
+        if let Ok(state) = self
+            .facade
+            .agent()
+            .runtime_selection(session_id.clone())
+            .await
+        {
+            return Ok(state.desired);
+        }
+        let session = self.facade.agent().open_session(session_id.clone()).await?;
+        let catalog = self.facade.agent().list_runtime_options().await?;
+        // Only an option belonging to the Agent the session already records may
+        // stand in: the point of the fallback is to send through the session's
+        // own Agent, never to move it onto another one.
+        let agent_id = session.agent_id;
+        let for_agent =
+            |option: &&vibex_core::SessionRuntimeOption| option.selection.agent_id == agent_id;
+        catalog
+            .options
+            .iter()
+            .filter(|option| for_agent(option))
+            .find(|option| option.availability == vibex_core::RuntimeOptionAvailability::Available)
+            .or_else(|| catalog.options.iter().find(|option| for_agent(option)))
+            .map(|option| option.selection.clone())
+            .ok_or_else(|| {
+                BackendError::failed(
+                    "agent_runtime_unavailable",
+                    "the session's Agent has no runtime option to send through",
                 )
             })
     }

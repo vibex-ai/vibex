@@ -90,6 +90,21 @@ Rules:
 * `BackendEvent::Lagged` forces an authoritative refetch — the client never
   advances a cursor across a gap and never auto-resends a prompt after a
   reconnect.
+* **A message carries the session's own runtime selection.** A send's
+  `desired_runtime` is authoritative, so filling it with the client's preferred
+  catalogue entry moves the session onto another Agent as a side effect of
+  typing into it — the next desktop attach then finds its Agent changed, and the
+  abandoned runtime refuses to be resumed. The worker reads the session's durable
+  selection (`AgentBackend::runtime_selection`) and only falls back to the
+  catalogue — filtered to the Agent the session already records — for a session
+  that predates runtime-selection state. The same state rides in the session
+  snapshot, so the client can name the Agent and model a message will actually
+  go to instead of guessing from `options.first()`.
+* **A runtime switch is a compare-and-set, never a blind write.**
+  `SetDesiredAgentSessionRuntimeRequest` carries the expected session and
+  selection revisions; the durable state is read first and a stale expectation is
+  refused. Sending zero revisions is a request that only succeeds on a session
+  that has never moved.
 
 ### Console ownership
 
@@ -284,6 +299,19 @@ hard-wraps by cell and never collapses runs of spaces, and a table is a closed
 box (`┌┬┐ ├┼┤ └┴┘`) whose columns are padded by display width, so a double-width
 cell cannot push the next `│` out of line.
 
+**The composer wraps its draft so byte offsets survive.** `wrap_text` produces
+*rendered* lines: a run of whitespace collapses to one space and a broken token
+is re-joined with a space of the wrapper's own, so a line is no longer the slice
+at its `source_start`. Everything painted onto a composer row — the caret, the
+selection, a chip's label — is addressed by a byte offset in the draft, and a
+collapsed run shifted those offsets until they landed inside a multi-byte
+character and the slice panicked. The composer therefore wraps with
+`wrap_source_text`, which keeps every line a verbatim slice of the draft (an
+ASCII control character is drawn as a space, one byte for one byte, so a tab
+cannot move the caret either), and `floor_boundary` backs an offset down to a
+character boundary so any future mismatch costs a column instead of the process.
+A grapheme wider than the whole line overflows it rather than disappearing.
+
 Colour degrades `truecolor → ansi256 → 16 → none`, resolved from
 `NO_COLOR` > `VIBEX_TUI_COLOR` > detection > truecolor. Colour is never the sole
 carrier of meaning. Icon and border glyphs degrade to ASCII when the locale is
@@ -301,6 +329,24 @@ is never a column count.
   shift-only binding is unreachable. Use a modifier or a function key.
 * `Esc` only walks back one level; it never cancels a running turn. `Ctrl+C`
   owns clear-draft / interrupt / quit-confirm.
+* **The composer is not a room without a door.** `Esc` in the composer returns
+  to the session list in a single press — `go_back` skips its focus hop on a
+  session page — and leaves the draft where it was, so stepping out costs
+  nothing and stepping back in resumes typing. A selection highlight and an open
+  completion drawer are dismissed first; clearing the draft is `Ctrl+C`, never a
+  second `Esc`.
+* **A chord a text field does not use stays global.** The composer scope wins
+  over `Scope::Global`, so binding a completion key to `Ctrl+P` silently killed
+  the command palette inside every session. Completion navigation lives on
+  `Alt+↑`/`Alt+↓` (and the arrow keys while the drawer is open), and `Ctrl+P`,
+  `Ctrl+Q`, `Ctrl+G` and `Esc` resolve to their global intents with the composer
+  focused.
+* **The runtime switcher is visible where the reader is.** The composer's info
+  line names the session's Agent and its `provider/model` plus the key that moves
+  them (`Ctrl+G`); the picker opens with the cursor on the session's current
+  choice and marks it, refuses an option the catalogue says is unavailable, and
+  submits a compare-and-set switch. A backend that cannot switch runtimes gets a
+  toast instead of an overlay whose Enter does nothing.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
 * **Every popup renders through `crate::modal`.** One chrome — border, title on

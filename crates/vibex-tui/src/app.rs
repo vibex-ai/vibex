@@ -433,6 +433,10 @@ pub struct App {
 
     /// Runtime catalog, kept for the runtime picker.
     pub runtime_options: Option<vibex_core::SessionRuntimeOptionCatalog>,
+    /// Whether the pending catalogue read was asked for by the picker, so the
+    /// overlay opens when it lands. A catalogue fetched for the composer's
+    /// info line must not pop a modal over the session.
+    pub runtime_picker_pending: bool,
     /// The workspace chosen in the workspace browser, consumed by the
     /// new-session prompt.
     pub workspace_path: Option<String>,
@@ -440,8 +444,6 @@ pub struct App {
     pub elicitation_draft: crate::reduce::ElicitationDraft,
     /// Whether the usage page shows this session or the aggregate.
     pub usage_scope_session: bool,
-    /// Set by the first `Esc` in the composer; the second clears the draft.
-    pub draft_clear_armed: bool,
     /// Session ids whose detail card is open in the session list.
     ///
     /// Keyed by id rather than row index so a refresh, a rename or a filter
@@ -815,10 +817,10 @@ impl App {
             viewport: (120, 40),
             regions: FrameRegions::default(),
             runtime_options: None,
+            runtime_picker_pending: false,
             workspace_path: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
             usage_scope_session: true,
-            draft_clear_armed: false,
             session_cards: std::collections::BTreeSet::new(),
             search: None,
             hover: None,
@@ -910,6 +912,44 @@ impl App {
 
     pub fn active_session(&self) -> Option<&AgentSession> {
         self.agent.state.active_session.value.as_ref()
+    }
+
+    /// The runtime selection the open session is on: its Agent, the account or
+    /// provider profile that authenticates it, and the model.
+    ///
+    /// This is the session's own durable *desired* selection, not the client's
+    /// preferred catalogue entry, which is why the composer can name the Agent
+    /// and model a message will actually go to.
+    pub fn session_runtime_selection(&self) -> Option<&vibex_core::SessionRuntimeSelection> {
+        self.agent
+            .state
+            .runtime_selection
+            .value
+            .as_ref()
+            .map(|state| &state.desired)
+    }
+
+    /// Whether a catalogue entry is the one the open session is on.
+    ///
+    /// Matching is by Agent, authentication source and model rather than by
+    /// whole-selection equality: the catalogue's choice carries the feature
+    /// values it was published with, and a session that has since been tuned
+    /// is still on that choice.
+    pub fn runtime_option_is_current(&self, option: &vibex_core::SessionRuntimeOption) -> bool {
+        self.session_runtime_selection().is_some_and(|selection| {
+            option.selection.agent_id == selection.agent_id
+                && option.selection.auth_source == selection.auth_source
+                && option.selection.model == selection.model
+        })
+    }
+
+    /// The index of the open session's runtime choice in the loaded catalogue.
+    pub fn current_runtime_option_index(&self) -> Option<usize> {
+        let catalog = self.runtime_options.as_ref()?;
+        catalog
+            .options
+            .iter()
+            .position(|option| self.runtime_option_is_current(option))
     }
 
     /// Workspace the session pages read from.
