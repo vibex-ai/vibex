@@ -175,6 +175,24 @@ working one.
 The bottom border is an info line rather than a rule: a terminal has no room for
 chrome that only carries status, and a divider that also informs is free.
 
+Editing is readline-shaped, because that is the muscle memory a terminal user
+already has:
+
+| Keys | Effect |
+| --- | --- |
+| `Ctrl+Z` / `Alt+Z` | undo / redo, one step per word typed, paste or kill |
+| `Ctrl+K` / `Ctrl+U` | kill to the end / start of the line |
+| `Ctrl+W`, `Alt+Backspace` | kill the word before the cursor |
+| `Alt+D` | kill the word after the cursor |
+| `Ctrl+Y` | yank the last killed text back |
+| `Alt+B` / `Alt+F`, `Ctrl+←` / `Ctrl+→` | move by word |
+| `↑` / `↓` | recall sent messages |
+
+There is one kill buffer rather than a ring: a ring is a second thing to learn
+for a case that a terminal rarely reaches. Undo coalesces consecutive typing
+into one step and breaks the batch on a cursor move, so undo removes what was
+just typed rather than moving text out from under a cursor placed on purpose.
+
 ### Status bar
 
 Identity on the left, context in the centre, appearance on the right. Splitting

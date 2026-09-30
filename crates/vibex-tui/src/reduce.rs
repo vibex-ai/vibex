@@ -524,6 +524,53 @@ impl App {
                 self.composer.delete_word_before();
                 Outcome::effects(vec![])
             }
+            Intent::DeleteWordAfter => {
+                self.composer.delete_word_after();
+                Outcome::effects(vec![])
+            }
+            Intent::DeleteWordBackward => {
+                self.composer.delete_word_backward();
+                Outcome::effects(vec![])
+            }
+            Intent::KillToLineEnd => {
+                self.composer.kill_to_line_end();
+                Outcome::effects(vec![])
+            }
+            Intent::KillToLineStart => {
+                self.composer.kill_to_line_start();
+                Outcome::effects(vec![])
+            }
+            Intent::YankKill => {
+                if !self.composer.yank() {
+                    let message = self.strings.composer_nothing_to_yank();
+                    self.toast(Toast::info(message));
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerUndo => {
+                if !self.composer.undo() {
+                    let message = self.strings.composer_nothing_to_undo();
+                    self.toast(Toast::info(message));
+                }
+                self.refresh_completion();
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerRedo => {
+                if !self.composer.redo() {
+                    let message = self.strings.composer_nothing_to_redo();
+                    self.toast(Toast::info(message));
+                }
+                self.refresh_completion();
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerWordLeft => {
+                self.composer.move_word_left();
+                Outcome::effects(vec![])
+            }
+            Intent::ComposerWordRight => {
+                self.composer.move_word_right();
+                Outcome::effects(vec![])
+            }
             Intent::ComposerLineStart => {
                 self.composer.move_line_start();
                 Outcome::effects(vec![])

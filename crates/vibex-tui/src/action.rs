@@ -124,6 +124,15 @@ intents! {
     CompletionAccept => { scope: Composer, id: "completion_accept", label: "Accept", help: "Insert the highlighted completion." },
     CompletionCancel => { scope: Composer, id: "completion_cancel", label: "Dismiss", help: "Close the completion menu." },
     DeleteWordBefore => { scope: Composer, id: "composer_delete_word", label: "Delete word", help: "Delete the word before the cursor." },
+    DeleteWordAfter => { scope: Composer, id: "composer_delete_word_after", label: "Kill word", help: "Delete the word after the cursor into the kill buffer." },
+    DeleteWordBackward => { scope: Composer, id: "composer_delete_word_backward", label: "Kill word back", help: "Delete the word before the cursor into the kill buffer." },
+    KillToLineEnd => { scope: Composer, id: "composer_kill_to_end", label: "Kill to end", help: "Cut from the cursor to the end of the line." },
+    KillToLineStart => { scope: Composer, id: "composer_kill_to_start", label: "Kill to start", help: "Cut from the start of the line to the cursor." },
+    YankKill => { scope: Composer, id: "composer_yank", label: "Yank", help: "Put the last cut text back at the cursor." },
+    ComposerUndo => { scope: Composer, id: "composer_undo", label: "Undo", help: "Undo the last edit to the draft." },
+    ComposerRedo => { scope: Composer, id: "composer_redo", label: "Redo", help: "Redo an undone edit." },
+    ComposerWordLeft => { scope: Composer, id: "composer_word_left", label: "Word left", help: "Move the cursor to the start of the previous word." },
+    ComposerWordRight => { scope: Composer, id: "composer_word_right", label: "Word right", help: "Move the cursor past the end of the next word." },
     ComposerLineStart => { scope: Composer, id: "composer_line_start", label: "Line start", help: "Move the cursor to the start of the line." },
     ComposerLineEnd => { scope: Composer, id: "composer_line_end", label: "Line end", help: "Move the cursor to the end of the line." },
 
@@ -312,6 +321,15 @@ impl Intent {
                 | Intent::CompletionAccept
                 | Intent::CompletionCancel
                 | Intent::DeleteWordBefore
+                | Intent::DeleteWordAfter
+                | Intent::DeleteWordBackward
+                | Intent::KillToLineEnd
+                | Intent::KillToLineStart
+                | Intent::YankKill
+                | Intent::ComposerUndo
+                | Intent::ComposerRedo
+                | Intent::ComposerWordLeft
+                | Intent::ComposerWordRight
                 | Intent::ComposerLineStart
                 | Intent::ComposerLineEnd
                 | Intent::BeginFilter

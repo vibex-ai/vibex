@@ -233,6 +233,21 @@ strings! {
         "傳送訊息…（/ 命令 · @ 檔案 · $ 技能）"
     },
     composer_send => { "Send", "发送", "傳送" },
+    composer_nothing_to_undo => {
+        "Nothing left to undo in the draft",
+        "草稿没有可撤销的修改",
+        "草稿沒有可復原的修改"
+    },
+    composer_nothing_to_redo => {
+        "Nothing to redo in the draft",
+        "草稿没有可重做的修改",
+        "草稿沒有可重做的修改"
+    },
+    composer_nothing_to_yank => {
+        "Nothing has been cut from the draft yet",
+        "草稿中还没有剪切过内容",
+        "草稿中還沒有剪下過內容"
+    },
     composer_queue => { "Queue", "排队", "排隊" },
     composer_interrupt => { "Interrupt", "打断", "中斷" },
     composer_continue => { "Continue", "继续", "繼續" },

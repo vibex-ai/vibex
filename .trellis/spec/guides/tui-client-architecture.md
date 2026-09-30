@@ -250,7 +250,16 @@ is never a column count.
   the list filter, the transcript search bar and the settings filter/editor are
   text fields: printable keys edit them, and only `Esc`/`Enter`/arrows are
   commands. Their state lives on `App` and the transitions are reducer methods,
-  so they stay testable without a terminal.
+  so they stay testable without a terminal. A modifier chord is never text:
+  every printable-key arm excludes `Ctrl` and `Alt`, so a binding such as
+  `Alt+B` reaches the table instead of typing a `b`.
+* **The composer keeps an undo history and one kill buffer.**
+  `ComposerBuffer` snapshots after each mutation (`MAX_UNDO`), coalescing
+  consecutive typing into one step and breaking the batch on any cursor move —
+  undo must remove what was just typed, never move text out from under a cursor
+  the reader placed deliberately. Word motions use the `Small` class rule
+  (alphanumerics and `_`, punctuation, whitespace), while `Ctrl+W` stays
+  whitespace-delimited because that is what a shell does.
 * **A sub-mode owns `Esc` before the screen does.** Closing a selection
   highlight, a search bar, a settings chooser or filter happens in `go_back`
   before page navigation, in that order of innermost first. `Esc` means "undo

@@ -102,14 +102,77 @@ impl CompletionMenu {
     }
 }
 
+/// How many undo snapshots the buffer keeps.
+///
+/// A draft is a paragraph or two, not a document; a hundred steps is far more
+/// history than anyone reaches for, and the snapshots are two small fields
+/// each.
+pub const MAX_UNDO: usize = 100;
+
+/// What the last mutation was, so consecutive typing collapses into one step.
+///
+/// Undo that walks back one character at a time is worse than no undo: the
+/// reader wants the sentence they just typed gone, not letters. Batches break
+/// where the text changes kind — a space ends a word — which is the boundary a
+/// person would draw too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    InsertWord,
+    InsertSpace,
+    /// A paste, a kill, a yank or a programmatic replace: always its own step.
+    Block,
+    Delete,
+}
+
+impl EditKind {
+    /// Whether a repeat of this kind continues the previous step.
+    const fn coalesces(self) -> bool {
+        matches!(
+            self,
+            EditKind::InsertWord | EditKind::InsertSpace | EditKind::Delete
+        )
+    }
+}
+
+/// One point the buffer can be returned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    text: String,
+    cursor: usize,
+}
+
 /// A multi-line editable buffer with a grapheme-aligned cursor.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerBuffer {
     text: String,
     /// Cursor position as a byte offset, always on a grapheme boundary.
     cursor: usize,
     /// Desired column, preserved while moving vertically through short lines.
     preferred_column: Option<usize>,
+    /// Undo history, oldest first, with `history_index` pointing at the live
+    /// state.
+    history: Vec<Snapshot>,
+    history_index: usize,
+    last_edit: Option<EditKind>,
+    /// The last killed text, put back by `Ctrl+Y`.
+    kill_buffer: String,
+}
+
+impl Default for ComposerBuffer {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+            preferred_column: None,
+            history: vec![Snapshot {
+                text: String::new(),
+                cursor: 0,
+            }],
+            history_index: 0,
+            last_edit: None,
+            kill_buffer: String::new(),
+        }
+    }
 }
 
 impl ComposerBuffer {
@@ -117,9 +180,16 @@ impl ComposerBuffer {
         let text = text.into();
         let cursor = text.len();
         Self {
+            history: vec![Snapshot {
+                text: text.clone(),
+                cursor,
+            }],
             text,
             cursor,
             preferred_column: None,
+            history_index: 0,
+            last_edit: None,
+            kill_buffer: String::new(),
         }
     }
 
@@ -139,16 +209,92 @@ impl ComposerBuffer {
         self.text.len()
     }
 
+    /// The last killed text, for tests and for a footer that wants to say so.
+    pub fn kill_buffer(&self) -> &str {
+        &self.kill_buffer
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history_index > 0
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history_index + 1 < self.history.len()
+    }
+
+    /// Record the state after a mutation.
+    ///
+    /// Called *after* the text changes: a coalescing repeat replaces the live
+    /// snapshot, anything else becomes a new step and drops the redo tail.
+    fn record(&mut self, kind: EditKind) {
+        let snapshot = Snapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        };
+        let coalesce = self.last_edit == Some(kind) && kind.coalesces();
+        if coalesce && self.history_index < self.history.len() {
+            self.history[self.history_index] = snapshot;
+        } else {
+            self.history.truncate(self.history_index + 1);
+            self.history.push(snapshot);
+            self.history_index = self.history.len() - 1;
+            while self.history.len() > MAX_UNDO {
+                self.history.remove(0);
+                self.history_index = self.history_index.saturating_sub(1);
+            }
+        }
+        self.last_edit = Some(kind);
+    }
+
+    /// Break the typing batch, so the next edit starts a new undo step.
+    ///
+    /// Every cursor move calls this: undoing across a jump would move the text
+    /// out from under a cursor the reader deliberately placed.
+    fn break_batch(&mut self) {
+        self.last_edit = None;
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if !self.can_undo() {
+            return false;
+        }
+        self.history_index -= 1;
+        self.restore();
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if !self.can_redo() {
+            return false;
+        }
+        self.history_index += 1;
+        self.restore();
+        true
+    }
+
+    fn restore(&mut self) {
+        let snapshot = self.history[self.history_index].clone();
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor.min(self.text.len());
+        self.preferred_column = None;
+        self.break_batch();
+    }
+
     pub fn clear(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.record(EditKind::Block);
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
+        self.record(EditKind::Block);
     }
 
     /// Take the text out, leaving an empty buffer.
@@ -156,6 +302,7 @@ impl ComposerBuffer {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
         self.preferred_column = None;
+        self.record(EditKind::Block);
         text
     }
 
@@ -163,12 +310,19 @@ impl ComposerBuffer {
         self.text.insert(self.cursor, character);
         self.cursor += character.len_utf8();
         self.preferred_column = None;
+        let kind = if character.is_whitespace() {
+            EditKind::InsertSpace
+        } else {
+            EditKind::InsertWord
+        };
+        self.record(kind);
     }
 
     pub fn insert_str(&mut self, value: &str) {
         self.text.insert_str(self.cursor, value);
         self.cursor += value.len();
         self.preferred_column = None;
+        self.record(EditKind::Block);
     }
 
     /// Delete the grapheme before the cursor.
@@ -180,6 +334,7 @@ impl ComposerBuffer {
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
         self.preferred_column = None;
+        self.record(EditKind::Delete);
         true
     }
 
@@ -191,40 +346,201 @@ impl ComposerBuffer {
         let end = self.next_grapheme_boundary();
         self.text.replace_range(self.cursor..end, "");
         self.preferred_column = None;
+        self.record(EditKind::Delete);
         true
     }
 
     /// Delete the word before the cursor, the way a shell's `Ctrl+W` does.
+    ///
+    /// Whitespace-delimited, not class-delimited: `Ctrl+W` in a shell removes
+    /// `src/net.rs` in one press, and a composer that stopped at the dot would
+    /// be behaving like an editor instead.
     pub fn delete_word_before(&mut self) -> bool {
-        if self.cursor == 0 {
+        let start = self.whitespace_word_start();
+        if start == self.cursor {
             return false;
         }
-        let mut start = self.cursor;
-        // Skip trailing whitespace, then the word.
-        while start > 0 {
-            let previous = self.prev_boundary_from(start);
-            let grapheme = &self.text[previous..start];
-            if grapheme.chars().all(char::is_whitespace) {
-                start = previous;
-            } else {
+        self.kill_buffer = self.text[start..self.cursor].to_string();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Delete the word after the cursor, for `Alt+D`.
+    pub fn delete_word_after(&mut self) -> bool {
+        let end = self.word_end(self.cursor);
+        if end == self.cursor {
+            return false;
+        }
+        self.kill_buffer = self.text[self.cursor..end].to_string();
+        self.text.replace_range(self.cursor..end, "");
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Delete from the cursor back to the start of the word, for
+    /// `Alt+Backspace`.
+    pub fn delete_word_backward(&mut self) -> bool {
+        let start = self.word_start(self.cursor);
+        if start == self.cursor {
+            return false;
+        }
+        self.kill_buffer = self.text[start..self.cursor].to_string();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Kill from the cursor to the end of the line, for `Ctrl+K`.
+    pub fn kill_to_line_end(&mut self) -> bool {
+        let (_, line_end) = self.cursor_line();
+        // At the end of a line the newline itself is the next thing to go, so
+        // repeated `Ctrl+K` joins lines the way a reader expects.
+        let end = if self.cursor == line_end {
+            self.next_grapheme_boundary()
+        } else {
+            line_end
+        };
+        if end <= self.cursor {
+            return false;
+        }
+        self.kill_buffer = self.text[self.cursor..end].to_string();
+        self.text.replace_range(self.cursor..end, "");
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Kill from the start of the line to the cursor, for `Ctrl+U`.
+    pub fn kill_to_line_start(&mut self) -> bool {
+        let (line_start, _) = self.cursor_line();
+        if line_start == self.cursor {
+            return false;
+        }
+        self.kill_buffer = self.text[line_start..self.cursor].to_string();
+        self.text.replace_range(line_start..self.cursor, "");
+        self.cursor = line_start;
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Put the last killed text back at the cursor, for `Ctrl+Y`.
+    pub fn yank(&mut self) -> bool {
+        if self.kill_buffer.is_empty() {
+            return false;
+        }
+        let text = self.kill_buffer.clone();
+        self.text.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Move to the start of the previous word, for `Alt+B`.
+    pub fn move_word_left(&mut self) {
+        self.cursor = self.word_start(self.cursor);
+        self.preferred_column = None;
+        self.break_batch();
+    }
+
+    /// Move past the end of the next word, for `Alt+F`.
+    pub fn move_word_right(&mut self) {
+        self.cursor = self.word_end(self.cursor);
+        self.preferred_column = None;
+        self.break_batch();
+    }
+
+    /// The byte range of the line the cursor is on, without its newline.
+    fn cursor_line(&self) -> (usize, usize) {
+        let (line, _) = self.cursor_line_column();
+        self.line_range(line)
+    }
+
+    /// The start of the word before `index`, skipping whitespace.
+    fn word_start(&self, index: usize) -> usize {
+        let mut index = self.skip_whitespace_back(index);
+        if index == 0 {
+            return 0;
+        }
+        let previous = self.prev_boundary_from(index);
+        let class = word_class(&self.text[previous..index]);
+        while index > 0 {
+            let previous = self.prev_boundary_from(index);
+            if word_class(&self.text[previous..index]) != class {
                 break;
             }
+            index = previous;
         }
+        index
+    }
+
+    /// The end of the word at or after `index`, skipping leading whitespace.
+    fn word_end(&self, index: usize) -> usize {
+        let mut index = self.skip_whitespace_forward(index);
+        if index >= self.text.len() {
+            return self.text.len();
+        }
+        let next = self.next_boundary_from(index);
+        let class = word_class(&self.text[index..next]);
+        while index < self.text.len() {
+            let next = self.next_boundary_from(index);
+            if word_class(&self.text[index..next]) != class {
+                break;
+            }
+            index = next;
+        }
+        index
+    }
+
+    /// The start of the whitespace-delimited word before the cursor.
+    fn whitespace_word_start(&self) -> usize {
+        let mut start = self.cursor;
+        start = self.skip_whitespace_back(start);
         while start > 0 {
             let previous = self.prev_boundary_from(start);
-            let grapheme = &self.text[previous..start];
-            if grapheme.chars().all(char::is_whitespace) {
+            if self.text[previous..start].chars().all(char::is_whitespace) {
                 break;
             }
             start = previous;
         }
-        if start == self.cursor {
-            return false;
+        start
+    }
+
+    fn skip_whitespace_back(&self, mut index: usize) -> usize {
+        while index > 0 {
+            let previous = self.prev_boundary_from(index);
+            if !self.text[previous..index].chars().all(char::is_whitespace) {
+                break;
+            }
+            index = previous;
         }
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
-        self.preferred_column = None;
-        true
+        index
+    }
+
+    fn skip_whitespace_forward(&self, mut index: usize) -> usize {
+        while index < self.text.len() {
+            let next = self.next_boundary_from(index);
+            if !self.text[index..next].chars().all(char::is_whitespace) {
+                break;
+            }
+            index = next;
+        }
+        index
+    }
+
+    fn next_boundary_from(&self, index: usize) -> usize {
+        self.text[index..]
+            .grapheme_indices(true)
+            .next()
+            .map(|(_, grapheme)| index + grapheme.len())
+            .unwrap_or(self.text.len())
     }
 
     fn previous_grapheme_boundary(&self) -> usize {
@@ -248,11 +564,13 @@ impl ComposerBuffer {
     }
 
     pub fn move_left(&mut self) {
+        self.break_batch();
         self.cursor = self.previous_grapheme_boundary();
         self.preferred_column = None;
     }
 
     pub fn move_right(&mut self) {
+        self.break_batch();
         self.cursor = self.next_grapheme_boundary();
         self.preferred_column = None;
     }
@@ -286,6 +604,7 @@ impl ComposerBuffer {
     }
 
     pub fn move_up(&mut self) {
+        self.break_batch();
         let (line, column) = self.cursor_line_column();
         if line == 0 {
             return;
@@ -297,6 +616,7 @@ impl ComposerBuffer {
     }
 
     pub fn move_down(&mut self) {
+        self.break_batch();
         let (line, column) = self.cursor_line_column();
         if line + 1 >= self.line_count() {
             return;
@@ -308,23 +628,27 @@ impl ComposerBuffer {
     }
 
     pub fn move_line_start(&mut self) {
+        self.break_batch();
         let (line, _) = self.cursor_line_column();
         self.cursor = self.line_range(line).0;
         self.preferred_column = None;
     }
 
     pub fn move_line_end(&mut self) {
+        self.break_batch();
         let (line, _) = self.cursor_line_column();
         self.cursor = self.line_range(line).1;
         self.preferred_column = None;
     }
 
     pub fn move_to_start(&mut self) {
+        self.break_batch();
         self.cursor = 0;
         self.preferred_column = None;
     }
 
     pub fn move_to_end(&mut self) {
+        self.break_batch();
         self.cursor = self.text.len();
         self.preferred_column = None;
     }
@@ -531,6 +855,29 @@ impl ComposerHistory {
     }
 }
 
+/// Which class a grapheme belongs to, for word motions.
+///
+/// `Small` word style: a run of alphanumerics and underscores, a run of
+/// punctuation, or a run of whitespace. `src/net.rs` is therefore five stops —
+/// `src`, `/`, `net`, `.`, `rs` — which is what makes `Alt+F` usable for
+/// editing a path without reaching for the arrow keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Punctuation,
+    Space,
+}
+
+fn word_class(grapheme: &str) -> WordClass {
+    let mut characters = grapheme.chars();
+    match characters.next() {
+        None => WordClass::Space,
+        Some(character) if character.is_whitespace() => WordClass::Space,
+        Some(character) if character.is_alphanumeric() || character == '_' => WordClass::Word,
+        Some(_) => WordClass::Punctuation,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +1063,125 @@ mod tests {
         assert!(buffer.is_empty());
         buffer.insert_str("x");
         assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn typing_coalesces_into_one_undo_step_per_word() {
+        let mut buffer = ComposerBuffer::default();
+        for character in "fix the".chars() {
+            buffer.insert_char(character);
+        }
+        assert!(buffer.undo());
+        // One step back lands before the last word, not before its last letter.
+        assert_eq!(buffer.text(), "fix ");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "fix");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.undo(), "the empty draft is the floor");
+    }
+
+    #[test]
+    fn a_cursor_move_ends_the_typing_batch() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("abc");
+        buffer.insert_char('d');
+        buffer.insert_char('e');
+        buffer.move_left();
+        buffer.insert_char('f');
+        assert!(buffer.undo());
+        // Only the character typed after the move is undone: the cursor was
+        // placed deliberately, and undo must not move the text out from under
+        // it.
+        assert_eq!(buffer.text(), "abcde");
+    }
+
+    #[test]
+    fn redo_replays_what_undo_took_back() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("first");
+        buffer.insert_str(" second");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "first");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "first second");
+        assert!(!buffer.redo());
+        // A fresh edit drops the redo tail rather than replaying onto it.
+        buffer.undo();
+        buffer.insert_char('!');
+        assert!(!buffer.can_redo());
+    }
+
+    #[test]
+    fn a_cleared_draft_can_be_undone() {
+        let mut buffer = ComposerBuffer::from_text("a paragraph worth keeping");
+        buffer.clear();
+        assert_eq!(buffer.text(), "");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a paragraph worth keeping");
+    }
+
+    #[test]
+    fn kill_and_yank_round_trip() {
+        let mut buffer = ComposerBuffer::from_text("keep this tail");
+        buffer.move_to_start();
+        for _ in 0..5 {
+            buffer.move_right();
+        }
+        assert!(buffer.kill_to_line_end());
+        assert_eq!(buffer.text(), "keep ");
+        assert_eq!(buffer.kill_buffer(), "this tail");
+        buffer.move_to_end();
+        assert!(buffer.yank());
+        assert_eq!(buffer.text(), "keep this tail");
+
+        // The line-start kill is the mirror image, and the draft can be brought
+        // back from it.
+        buffer.move_to_end();
+        assert!(buffer.kill_to_line_start());
+        assert_eq!(buffer.text(), "");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "keep this tail");
+    }
+
+    #[test]
+    fn word_motions_stop_at_class_boundaries() {
+        let mut buffer = ComposerBuffer::from_text("read src/net.rs now");
+        buffer.move_to_start();
+        buffer.move_word_right();
+        // The cursor lands at the end of `read`, before the space.
+        assert_eq!(buffer.cursor(), 4);
+        buffer.move_word_right();
+        assert_eq!(&buffer.text()[..buffer.cursor()], "read src");
+        buffer.move_word_right();
+        assert_eq!(&buffer.text()[..buffer.cursor()], "read src/");
+        buffer.move_word_right();
+        assert_eq!(&buffer.text()[..buffer.cursor()], "read src/net");
+        // Backwards from the end retraces the same stops.
+        buffer.move_to_end();
+        buffer.move_word_left();
+        assert_eq!(&buffer.text()[buffer.cursor()..], "now");
+        buffer.move_word_left();
+        assert_eq!(&buffer.text()[buffer.cursor()..], "rs now");
+    }
+
+    #[test]
+    fn forward_and_backward_word_kills_agree_with_the_motions() {
+        let mut buffer = ComposerBuffer::from_text("read src/net.rs now");
+        buffer.move_to_start();
+        buffer.move_word_right();
+        buffer.move_word_right();
+        // Sitting between `src` and `/`, a forward kill takes the separator.
+        assert!(buffer.delete_word_after());
+        assert_eq!(buffer.text(), "read srcnet.rs now");
+        assert_eq!(buffer.kill_buffer(), "/");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "read src/net.rs now");
+
+        // From the end, a backward kill takes the trailing word.
+        buffer.move_to_end();
+        assert!(buffer.delete_word_backward());
+        assert_eq!(buffer.text(), "read src/net.rs ");
+        assert_eq!(buffer.kill_buffer(), "now");
     }
 }

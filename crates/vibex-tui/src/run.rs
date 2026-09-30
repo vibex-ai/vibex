@@ -519,16 +519,22 @@ fn handle_composer_key(
 ) -> BackendResult<Option<bool>> {
     use crate::action::Intent;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Char(character) if !ctrl => {
+        // `Alt` chords belong to the binding table: word motions, redo and the
+        // kill commands are bindings, not text. Inserting the letter instead
+        // would make `Alt+B` type a `b`.
+        KeyCode::Char(character) if !ctrl && !alt => {
             app.composer.insert_char(character);
             if let Some((trigger, query)) = app.refresh_completion() {
                 worker.dispatch(crate::app::Effect::DiscoverCompletions { trigger, query });
             }
             return Ok(Some(false));
         }
-        KeyCode::Backspace => {
+        // `Alt`/`Ctrl` + Backspace is a word kill and belongs to the binding
+        // table; a bare Backspace is one grapheme.
+        KeyCode::Backspace if !ctrl && !alt => {
             app.composer.backspace();
             app.refresh_completion();
             return Ok(Some(false));
