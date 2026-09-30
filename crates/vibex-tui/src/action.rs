@@ -206,6 +206,7 @@ intents! {
     ActivateSetting => { scope: Settings, id: "setting_activate", label: "Change", help: "Change the highlighted setting." },
     SettingPrevious => { scope: Settings, id: "setting_previous", label: "Previous value", help: "Step the setting backwards." },
     SettingNext => { scope: Settings, id: "setting_next", label: "Next value", help: "Step the setting forwards." },
+    ResetSetting => { scope: Settings, id: "setting_reset", label: "Reset", help: "Reset the highlighted setting to its default after a confirmation." },
 
     // ---- filters (shared) ------------------------------------------------
     BeginFilter => { scope: Global, id: "filter_begin", label: "Filter", help: "Type to filter the current list." },
@@ -318,6 +319,7 @@ impl Intent {
                 | Intent::ActivateSetting
                 | Intent::SettingPrevious
                 | Intent::SettingNext
+                | Intent::ResetSetting
         )
     }
 }

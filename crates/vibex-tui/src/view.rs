@@ -21,7 +21,7 @@ use vibex_ui::shell::ShellKind;
 use crate::action::Intent;
 use crate::app::{
     App, Availability, BannerTone, ComposerMode, ManagementRow, Overlay, Page, RecoveryAction,
-    SettingRow, ToastTone,
+    ToastTone,
 };
 use crate::keymap::Scope;
 use crate::layout::{Bands, MIN_RAIL_TURNS};
@@ -2495,69 +2495,302 @@ fn render_settings(
     strings: Strings,
 ) {
     let inner = page_frame(frame, area, theme, strings.nav_settings(), true);
-    let rows = [
-        (
-            SettingRow::Theme,
-            strings.settings_theme().to_string(),
-            app.settings.theme_id.clone(),
-        ),
-        (
-            SettingRow::Locale,
-            strings.settings_language().to_string(),
-            app.settings.locale.tag().to_string(),
-        ),
-        (
-            SettingRow::Icons,
-            strings.settings_icons().to_string(),
-            format!("{:?}", app.settings.glyphs),
-        ),
-        (
-            SettingRow::Backend,
-            strings.settings_backend().to_string(),
-            app.capabilities.schema_version.clone(),
-        ),
-        (
-            SettingRow::Seat,
-            strings.settings_connection().to_string(),
-            app.seat.label(strings).to_string(),
-        ),
-        (
-            SettingRow::Keys,
-            strings.settings_keys().to_string(),
-            format!("{}", app.keymap.bindings().len()),
-        ),
-        (
-            SettingRow::Version,
-            strings.settings_version().to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        ),
-    ];
-    let selected = app.settings.selected;
-    let items = rows
-        .iter()
-        .enumerate()
-        .map(|(index, (_, label, value))| {
-            let style = if index == selected {
-                theme.selected()
+    // Row 0 is the search bar (always present, so the filter is discoverable
+    // before it is used), row 1 a rule, the rest the grouped list, and the last
+    // row explains whichever mode is active.
+    if inner.height < 3 {
+        empty_state(frame, inner, theme, strings.settings_no_matches());
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_settings_filter(frame, rows[0], app, theme, strings);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(rows[1].width)),
+            Style::default().fg(theme.roles.gray_dim),
+        ))),
+        rows[1],
+    );
+    render_settings_rows(frame, rows[2], app, theme, strings);
+    render_settings_footer(frame, rows[3], app, theme, strings);
+}
+
+/// The settings filter bar.
+fn render_settings_filter(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let focused = matches!(app.settings.view, crate::app::SettingsMode::Filter);
+    let label = strings.settings_filter_label();
+    let caret = if focused { "▏" } else { "" };
+    let mut spans = vec![
+        Span::styled(
+            label,
+            Style::default().fg(if focused {
+                theme.roles.accent_user
             } else {
-                theme.base()
-            };
-            let mut spans = vec![
-                Span::styled(format!("{label:<16}"), style),
-                Span::styled(value.clone(), theme.accent()),
-            ];
-            if index == selected {
-                spans.push(Span::styled(
-                    format!("   ({})", strings.settings_keys_hint()),
-                    theme.muted(),
-                ));
+                theme.roles.gray
+            }),
+        ),
+        Span::styled(
+            app.settings.filter.clone(),
+            Style::default().fg(theme.roles.foreground),
+        ),
+        Span::styled(caret.to_string(), theme.accent()),
+    ];
+    if app.settings.filter.is_empty() && !focused {
+        spans.push(Span::styled(
+            strings.filter(),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The grouped, filtered setting rows.
+fn render_settings_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let visible = app.visible_settings();
+    if visible.is_empty() {
+        empty_state(frame, area, theme, strings.settings_no_matches());
+        return;
+    }
+    let selected_index = app
+        .selection_for(Scope::Settings)
+        .min(visible.len().saturating_sub(1));
+    let selected_row = visible[selected_index];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut section = None;
+    for (index, row) in visible.iter().enumerate() {
+        let definition = crate::settings::definition(*row);
+        if section != Some(definition.section) {
+            if section.is_some() {
+                lines.push(Line::from(""));
             }
-            ListItem::new(Line::from(spans))
-        })
+            section = Some(definition.section);
+            let label = definition.section.label(strings);
+            let used = display_width(label) + 2;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {label} "),
+                    Style::default()
+                        .fg(theme.roles.gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "─".repeat(usize::from(area.width).saturating_sub(used)),
+                    Style::default().fg(theme.roles.gray_dim),
+                ),
+            ]));
+        }
+        let selected = index == selected_index;
+        let label_style = if selected {
+            Style::default()
+                .fg(theme.roles.foreground)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.roles.foreground)
+        };
+        let value = if app.settings.view.row() == Some(*row) {
+            match &app.settings.view {
+                crate::app::SettingsMode::Editing { buffer, .. } => format!("{buffer}▏"),
+                _ => app.setting_value(*row),
+            }
+        } else {
+            app.setting_value(*row)
+        };
+        let chevron = match crate::settings::definition(*row).kind {
+            crate::settings::SettingKind::Choice | crate::settings::SettingKind::Text => "›",
+            _ => " ",
+        };
+        let used = 2 + display_width(app.setting_label(*row));
+        let marker = if selected { "▸" } else { " " };
+        // The value sits in a stable column so the eye can run down it. A label
+        // too long for that column keeps a single space instead of being
+        // truncated.
+        let value_column = (usize::from(area.width) / 2).clamp(20, 48);
+        let mut spans = vec![
+            Span::styled(format!("{marker} "), theme.accent()),
+            Span::styled(app.setting_label(*row).to_string(), label_style),
+        ];
+        if used + 2 <= value_column {
+            spans.push(Span::styled(
+                " ".repeat(value_column - used),
+                Style::default(),
+            ));
+        } else {
+            spans.push(Span::styled(" ", Style::default()));
+        }
+        spans.push(Span::styled(
+            value,
+            Style::default().fg(if selected {
+                theme.roles.accent_user
+            } else {
+                theme.roles.gray
+            }),
+        ));
+        spans.push(Span::styled(
+            format!(" {chevron}"),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    // The chooser replaces the list: it is the row's value being decided, and
+    // showing both would be two cursors on one screen.
+    if let crate::app::SettingsMode::Picking { row, selected, .. } = &app.settings.view {
+        let choices = app.setting_choices(*row);
+        let mut chooser = vec![Line::from(vec![
+            Span::styled("▸ ", theme.accent()),
+            Span::styled(
+                app.setting_label(*row).to_string(),
+                Style::default()
+                    .fg(theme.roles.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        for (index, choice) in choices.iter().enumerate() {
+            let active = index == *selected;
+            chooser.push(Line::from(vec![
+                Span::styled(
+                    if active { "  ▸ " } else { "    " },
+                    Style::default().fg(theme.roles.accent_user),
+                ),
+                Span::styled(
+                    choice.label.clone(),
+                    if active {
+                        theme.selected()
+                    } else {
+                        Style::default().fg(theme.roles.foreground)
+                    },
+                ),
+                Span::styled(
+                    if choice.current { "  ●" } else { "" },
+                    Style::default().fg(theme.roles.accent_success),
+                ),
+            ]));
+        }
+        chooser.push(Line::from(""));
+        chooser.push(Line::from(Span::styled(
+            strings.settings_pick_hint().to_string(),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+        frame.render_widget(Paragraph::new(Text::from(chooser)), area);
+        return;
+    }
+
+    // Keep the highlighted row on screen without a scroll offset of its own:
+    // a settings list is short, and the selected row is the anchor.
+    let height = usize::from(area.height);
+    let offset = if lines.len() > height {
+        let selected_line = lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.starts_with('▸'))
+            })
+            .unwrap_or(0);
+        selected_line.saturating_sub(height.saturating_sub(2))
+    } else {
+        0
+    };
+    let visible_lines = lines
+        .into_iter()
+        .skip(offset)
+        .take(height)
         .collect::<Vec<_>>();
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(selected.min(rows.len() - 1)));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    // The description of the highlighted row is the last thing shown, because
+    // it explains the choice rather than the list.
+    let mut text_lines = visible_lines;
+    if matches!(app.settings.view, crate::app::SettingsMode::Browse)
+        && text_lines.len() + 2 <= height
+        && !app.setting_description(selected_row).is_empty()
+    {
+        text_lines.push(Line::from(""));
+        text_lines.push(Line::from(Span::styled(
+            format!("  {}", app.setting_description(selected_row)),
+            Style::default()
+                .fg(theme.roles.gray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(text_lines)), area);
+}
+
+/// The one-line footer that names the keys of the active mode.
+fn render_settings_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let hints: Vec<(&str, &str)> = match &app.settings.view {
+        crate::app::SettingsMode::Browse => vec![
+            ("↑↓", strings.hint_nav()),
+            ("Enter", strings.hint_edit()),
+            ("Space", strings.hint_toggle()),
+            ("/", strings.filter()),
+            ("d", strings.hint_reset()),
+            ("Esc", strings.close()),
+        ],
+        crate::app::SettingsMode::Filter => vec![
+            ("type", strings.filter()),
+            ("Enter", strings.hint_commit()),
+            ("Esc", strings.hint_clear()),
+        ],
+        crate::app::SettingsMode::Picking { .. } => vec![
+            ("↑↓", strings.hint_nav()),
+            ("Enter", strings.hint_select()),
+            ("Esc", strings.hint_revert()),
+        ],
+        crate::app::SettingsMode::Editing { .. } => vec![
+            ("type", strings.hint_edit()),
+            ("Enter", strings.hint_commit()),
+            ("Esc", strings.cancel()),
+        ],
+    };
+    let rule = Span::styled(
+        format!(" {} ", crate::glyphs::accent_bar(app.glyph_tier())),
+        Style::default().fg(theme.roles.accent_user),
+    );
+    let mut spans = vec![rule];
+    for (index, (key, label)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  │  ",
+                Style::default().fg(theme.roles.gray_dim),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("{key} "),
+            Style::default()
+                .fg(theme.roles.gray_bright)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_help(

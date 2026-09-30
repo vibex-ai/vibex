@@ -17,11 +17,10 @@ use vibex_core::{
 use crate::action::Intent;
 use crate::app::{
     App, Availability, Effect, Focus, ManagementRow, Overlay, Page, PromptField, RecoveryAction,
-    SettingRow, Toast,
+    Toast,
 };
 use crate::composer::{CompletionMenu, CompletionTrigger};
 use crate::keymap::Scope;
-use crate::theme::GlyphMode;
 use crate::view::block_detail_text;
 
 /// What an intent produced, for tests and for the event loop.
@@ -186,11 +185,21 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::BeginFilter => {
+                if self.page == Page::Settings {
+                    // The settings filter is the surface's own mode, not the
+                    // list filter the other pages share.
+                    self.begin_settings_filter();
+                    return Outcome::effects(vec![]);
+                }
                 self.filtering = true;
                 self.filter.clear();
                 Outcome::effects(vec![])
             }
             Intent::ClearFilter => {
+                if self.page == Page::Settings {
+                    self.leave_settings_filter(true);
+                    return Outcome::effects(vec![]);
+                }
                 self.filter.clear();
                 self.filtering = false;
                 Outcome::effects(vec![])
@@ -780,6 +789,7 @@ impl App {
             Intent::ActivateSetting => self.activate_setting(),
             Intent::SettingPrevious => self.step_setting(-1),
             Intent::SettingNext => self.step_setting(1),
+            Intent::ResetSetting => self.begin_reset_setting(),
         }
     }
 
@@ -1033,6 +1043,17 @@ impl App {
 
     fn perform_confirm(&mut self, confirm: Intent) -> Outcome {
         match confirm {
+            Intent::ResetSetting => {
+                let Some(row) = self.selected_setting() else {
+                    return Outcome::quiet();
+                };
+                let label = self.setting_label(row);
+                if self.reset_setting(row) {
+                    let message = format!("{}: {}", label, self.strings.settings_reset_done());
+                    self.toast(Toast::success(message));
+                }
+                Outcome::effects(vec![])
+            }
             Intent::DeleteSession => {
                 let Some(session_id) = self.selected_session_id().cloned() else {
                     return Outcome::quiet();
@@ -1251,6 +1272,15 @@ impl App {
         if self.close_search() {
             return Outcome::effects(vec![]);
         }
+        // A settings sub-mode is undone before the page is left: `Esc` in the
+        // chooser puts the old value back rather than closing the screen.
+        if self.page == Page::Settings && !self.settings.view.is_browse() {
+            if self.cancel_setting_pick() || self.cancel_setting_edit() {
+                return Outcome::effects(vec![]);
+            }
+            self.leave_settings_filter(true);
+            return Outcome::effects(vec![]);
+        }
         if self.filtering {
             self.filtering = false;
             self.filter.clear();
@@ -1317,6 +1347,10 @@ impl App {
         } else {
             self.page.scope()
         };
+        if self.page == Page::Settings {
+            self.move_setting_selection(delta);
+            return Outcome::effects(vec![]);
+        }
         let count = self.page_row_count();
         if count == 0 {
             return Outcome::quiet();
@@ -1844,76 +1878,80 @@ impl App {
         )
     }
 
+    /// `Enter` on the settings page: what it does depends on the row's kind.
     fn activate_setting(&mut self) -> Outcome {
-        let index = self.settings.selected;
-        match SettingRow::ALL.get(index) {
-            Some(SettingRow::Theme) => self.step_setting(1),
-            Some(SettingRow::Locale) => self.step_setting(1),
-            Some(SettingRow::Icons) => self.step_setting(1),
-            Some(SettingRow::Keys) => self.perform(Intent::ReloadKeymap),
-            _ => Outcome::quiet(),
+        let Some(row) = self.selected_setting() else {
+            return Outcome::quiet();
+        };
+        match crate::settings::definition(row).kind {
+            crate::settings::SettingKind::Choice => {
+                self.begin_setting_pick(row);
+                Outcome::effects(vec![])
+            }
+            crate::settings::SettingKind::Toggle => {
+                self.step_setting(1);
+                Outcome::effects(vec![])
+            }
+            crate::settings::SettingKind::Text => {
+                self.begin_setting_edit(row);
+                Outcome::effects(vec![])
+            }
+            crate::settings::SettingKind::Action => self.perform(Intent::ReloadKeymap),
+            crate::settings::SettingKind::ReadOnly => Outcome::quiet(),
         }
     }
 
+    /// Step a row's value without opening its chooser.
+    ///
+    /// A toggle flips; a choice cycles through its values, applying each one.
+    /// The chooser is the deliberate path, this is the quick one.
     fn step_setting(&mut self, delta: i64) -> Outcome {
-        let index = self.settings.selected;
-        match SettingRow::ALL.get(index) {
-            Some(SettingRow::Theme) => {
-                let themes =
-                    vibex_ui::theme_catalog::themes_for(self.settings.mode).collect::<Vec<_>>();
-                if themes.is_empty() {
+        let Some(row) = self.selected_setting() else {
+            return Outcome::quiet();
+        };
+        match crate::settings::definition(row).kind {
+            crate::settings::SettingKind::Choice | crate::settings::SettingKind::Toggle => {
+                let choices = self.setting_choices(row);
+                if choices.is_empty() {
                     return Outcome::quiet();
                 }
-                let current = themes
+                let current = choices
                     .iter()
-                    .position(|theme| theme.id == self.settings.theme_id)
+                    .position(|choice| choice.current)
                     .unwrap_or(0) as i64;
-                let next = (current + delta).rem_euclid(themes.len() as i64) as usize;
-                self.settings.theme_id = themes[next].id.to_string();
-                self.theme = crate::theme::TuiTheme::from_definition(themes[next], self.capability);
-                self.transcript.configure(
-                    crate::view::layout_for(self.shell, self.viewport.0, self.viewport.1)
-                        .main_width,
-                    &self.theme.clone(),
-                );
+                let next = (current + delta).rem_euclid(choices.len() as i64) as usize;
+                let value = choices[next].value.clone();
+                self.apply_setting_value(row, &value);
                 Outcome::effects(vec![])
             }
-            Some(SettingRow::Locale) => {
-                let locales = [
-                    crate::locale::Locale::En,
-                    crate::locale::Locale::ZhCn,
-                    crate::locale::Locale::ZhTw,
-                ];
-                let current = locales
-                    .iter()
-                    .position(|locale| *locale == self.settings.locale)
-                    .unwrap_or(0) as i64;
-                let next = (current + delta).rem_euclid(locales.len() as i64) as usize;
-                self.settings.locale = locales[next];
-                self.strings = crate::locale::Strings::with_locale(locales[next]);
-                Outcome::effects(vec![])
-            }
-            Some(SettingRow::Icons) => {
-                let ascii = self.settings.glyphs == GlyphMode::Ascii;
-                self.settings.glyphs = if ascii {
-                    GlyphMode::Unicode
-                } else {
-                    GlyphMode::Ascii
-                };
-                self.capability.glyphs = self.settings.glyphs;
-                self.theme = crate::theme::TuiTheme::resolve(
-                    Some(&self.settings.theme_id),
-                    self.settings.mode,
-                    self.capability,
-                );
-                Outcome::effects(vec![])
-            }
-            Some(SettingRow::Backend) | Some(SettingRow::Seat) | Some(SettingRow::Version) => {
+            crate::settings::SettingKind::Action => self.perform(Intent::ReloadKeymap),
+            crate::settings::SettingKind::Text | crate::settings::SettingKind::ReadOnly => {
                 Outcome::quiet()
             }
-            Some(SettingRow::Keys) => self.perform(Intent::ReloadKeymap),
-            None => Outcome::quiet(),
         }
+    }
+
+    /// `d`: ask before resetting a row, and carry the row through the question.
+    fn begin_reset_setting(&mut self) -> Outcome {
+        let Some(row) = self.selected_setting() else {
+            return Outcome::quiet();
+        };
+        if matches!(
+            crate::settings::definition(row).kind,
+            crate::settings::SettingKind::ReadOnly | crate::settings::SettingKind::Action
+        ) {
+            return Outcome::quiet();
+        }
+        self.overlay = Some(Overlay::Confirm {
+            title: self.strings.settings_reset_title().to_string(),
+            body: format!(
+                "{}: {}",
+                self.setting_label(row),
+                self.strings.settings_reset_confirm()
+            ),
+            confirm: Intent::ResetSetting,
+        });
+        Outcome::effects(vec![])
     }
 }
 

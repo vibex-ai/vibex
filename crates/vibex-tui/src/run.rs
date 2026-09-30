@@ -242,6 +242,12 @@ fn handle_key(
         handle_search_key(app, key);
         return Ok(false);
     }
+    // The settings surface has four modes. The two typing modes take printable
+    // keys before the table, and the chooser takes the arrows.
+    if app.page == Page::Settings && !app.settings.view.is_browse() {
+        handle_settings_mode_key(app, key);
+        return Ok(false);
+    }
     // While a filter or a prompt is being typed, printable characters are text.
     if app.filtering {
         match key.code {
@@ -381,6 +387,78 @@ fn handle_key(
     let outcome = app.perform(intent);
     dispatch_all(worker, &outcome);
     Ok(app.should_quit)
+}
+
+/// Settings sub-mode keys.
+///
+/// `Esc` is deliberately routed through the reducer's `Back` intent rather than
+/// handled here: "put the old value back" and "clear the filter" are state
+/// transitions, not text editing.
+fn handle_settings_mode_key(app: &mut App, key: KeyEvent) {
+    use crate::app::SettingsMode;
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match app.settings.view.clone() {
+        SettingsMode::Filter => match key.code {
+            KeyCode::Char(character) if !control => app.push_settings_filter(character),
+            KeyCode::Char('u') if control => {
+                app.settings.filter.clear();
+                app.set_selection(crate::keymap::Scope::Settings, 0);
+            }
+            KeyCode::Backspace => app.pop_settings_filter(),
+            KeyCode::Delete => {
+                app.settings.filter.clear();
+                app.set_selection(crate::keymap::Scope::Settings, 0);
+            }
+            KeyCode::Enter => app.leave_settings_filter(false),
+            KeyCode::Esc => app.leave_settings_filter(true),
+            KeyCode::Down => app.move_setting_selection(1),
+            KeyCode::Up => app.move_setting_selection(-1),
+            _ => {}
+        },
+        SettingsMode::Picking { .. } => match key.code {
+            KeyCode::Down | KeyCode::Char('j') => app.step_setting_pick(1),
+            KeyCode::Up | KeyCode::Char('k') => app.step_setting_pick(-1),
+            KeyCode::Enter => {
+                app.commit_setting_pick();
+            }
+            KeyCode::Esc => {
+                app.cancel_setting_pick();
+            }
+            KeyCode::Char('d') => {
+                if let Some(row) = app.settings.view.row() {
+                    app.cancel_setting_pick();
+                    app.reset_setting(row);
+                }
+            }
+            _ => {}
+        },
+        SettingsMode::Editing { ref buffer, .. } => match key.code {
+            KeyCode::Char(character) if !control => {
+                let mut buffer = buffer.clone();
+                buffer.push(character);
+                app.settings.view = SettingsMode::Editing {
+                    row: app.settings.view.row().expect("editing has a row"),
+                    buffer,
+                };
+            }
+            KeyCode::Backspace => {
+                let mut buffer = buffer.clone();
+                buffer.pop();
+                app.settings.view = SettingsMode::Editing {
+                    row: app.settings.view.row().expect("editing has a row"),
+                    buffer,
+                };
+            }
+            KeyCode::Enter => {
+                app.commit_setting_edit();
+            }
+            KeyCode::Esc => {
+                app.cancel_setting_edit();
+            }
+            _ => {}
+        },
+        SettingsMode::Browse => {}
+    }
 }
 
 /// Transcript search editing keys.

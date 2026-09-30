@@ -480,6 +480,78 @@ strings! {
     settings_remote_seat => { "Remote seat", "远程座", "遠端座" },
     settings_capabilities => { "Capabilities", "能力", "能力" },
     settings_version => { "Version", "版本", "版本" },
+    settings_section_appearance => { "Appearance", "外观", "外觀" },
+    settings_section_language => { "Language", "语言", "語言" },
+    settings_section_interface => { "Interface", "界面", "介面" },
+    settings_mode => { "Theme mode", "主题模式", "主題模式" },
+    settings_mode_dark => { "Dark", "深色", "深色" },
+    settings_mode_light => { "Light", "浅色", "淺色" },
+    settings_mode_hint => {
+        "Light or dark treatment of the same palette.",
+        "同一套配色在深色或浅色下的呈现。",
+        "同一套配色在深色或淺色下的呈現。"
+    },
+    settings_theme_hint => {
+        "Twenty shipped palettes; the preview applies as you move.",
+        "内置 20 套配色；移动光标即预览。",
+        "內建 20 套配色；移動游標即預覽。"
+    },
+    settings_icons_hint => {
+        "Unicode chrome, or ASCII for a terminal without font fallback.",
+        "Unicode 界面符号；无字体回退的终端可用 ASCII。",
+        "Unicode 介面符號；無字型回退的終端可用 ASCII。"
+    },
+    settings_language_hint => {
+        "Product copy for the interface; the runtime is unaffected.",
+        "界面文案语言；不影响运行时。",
+        "介面文案語言；不影響執行階段。"
+    },
+    settings_workspace_hint => {
+        "Where a new session starts; empty uses the open session's workspace.",
+        "新会话的起始目录；留空则使用当前会话的工作区。",
+        "新工作階段的起始目錄；留空則使用目前工作階段的工作區。"
+    },
+    settings_backend_hint => {
+        "The runtime's capability schema this client is talking to.",
+        "当前客户端连接的运行时能力版本。",
+        "目前客戶端連線的執行階段能力版本。"
+    },
+    settings_seat_hint => {
+        "Whether this process owns the runtime or reaches it over a link.",
+        "本进程拥有运行时，还是通过网络连接。",
+        "本行程擁有執行階段，還是透過網路連線。"
+    },
+    settings_version_hint => {
+        "The client build; the runtime reports its own version separately.",
+        "客户端版本；运行时版本单独上报。",
+        "客戶端版本；執行階段版本單獨回報。"
+    },
+    settings_keys_reload => { "F9 reloads", "F9 重新加载", "F9 重新載入" },
+    settings_icons_unicode => { "Unicode", "Unicode", "Unicode" },
+    settings_icons_ascii => { "ASCII", "ASCII", "ASCII" },
+    settings_filter_label => { " filter: ", " 过滤: ", " 過濾: " },
+    settings_no_matches => {
+        "No settings match",
+        "没有匹配的设置",
+        "沒有符合的設定"
+    },
+    settings_pick_hint => {
+        "Moves preview the value; Esc puts the old one back",
+        "移动即预览；Esc 还原",
+        "移動即預覽；Esc 還原"
+    },
+    settings_edit_hint => {
+        "Enter saves, Esc discards",
+        "Enter 保存，Esc 放弃",
+        "Enter 儲存，Esc 捨棄"
+    },
+    settings_reset_confirm => {
+        "Reset this setting to its default?",
+        "将此设置重置为默认值？",
+        "將此設定重設為預設值？"
+    },
+    settings_reset_title => { "Reset setting", "重置设置", "重設設定" },
+    settings_reset_done => { "reset", "已重置", "已重設" },
 
     // ---- help -----------------------------------------------------------
     help_title => { "Help", "帮助", "說明" },

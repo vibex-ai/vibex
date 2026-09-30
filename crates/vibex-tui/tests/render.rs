@@ -781,3 +781,122 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     assert!(app.clear_text_selection());
     assert!(app.selected_text().is_none());
 }
+
+fn settings_app(width: u16, height: u16) -> App {
+    let mut app = app(width, height);
+    app.perform(vibex_tui::action::Intent::OpenSettings);
+    app
+}
+
+fn select_setting(app: &mut App, row: vibex_tui::settings::SettingRow) {
+    let index = app
+        .visible_settings()
+        .iter()
+        .position(|candidate| *candidate == row)
+        .expect("the row is visible");
+    app.set_selection(Scope::Settings, index);
+}
+
+#[test]
+fn the_settings_filter_narrows_the_list_to_matching_rows() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    app.perform(vibex_tui::action::Intent::BeginFilter);
+    for character in "workspace".chars() {
+        app.push_settings_filter(character);
+    }
+    assert_eq!(app.visible_settings(), vec![SettingRow::Workspace]);
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("filter:"), "no filter bar:\n{screen}");
+    assert!(screen.contains("Workspace"), "{screen}");
+
+    // `Esc` clears the query and leaves the mode.
+    app.perform(vibex_tui::action::Intent::Back);
+    assert!(app.visible_settings().len() > 1);
+}
+
+#[test]
+fn the_settings_chooser_previews_and_escape_puts_the_value_back() {
+    use vibex_tui::app::SettingsMode;
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    select_setting(&mut app, SettingRow::Theme);
+    let original = app.settings.theme_id.clone();
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    assert!(
+        matches!(app.settings.view, SettingsMode::Picking { .. }),
+        "Enter on a choice row opens the chooser"
+    );
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("Esc"),
+        "the chooser has no footer:\n{screen}"
+    );
+    assert!(
+        screen.contains("Vibex Dark") && screen.contains("Catppuccin Mocha"),
+        "the chooser does not list its values:\n{screen}"
+    );
+
+    app.step_setting_pick(1);
+    assert_ne!(
+        app.settings.theme_id, original,
+        "moving in the chooser must preview the value"
+    );
+
+    app.perform(vibex_tui::action::Intent::Back);
+    assert_eq!(
+        app.settings.theme_id, original,
+        "Esc must put the previewed value back"
+    );
+    assert!(app.settings.view.is_browse());
+}
+
+#[test]
+fn the_settings_editor_commits_a_workspace_path() {
+    use vibex_tui::app::SettingsMode;
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    select_setting(&mut app, SettingRow::Workspace);
+    app.perform(vibex_tui::action::Intent::ActivateSetting);
+    let SettingsMode::Editing { row, .. } = app.settings.view else {
+        panic!("Enter on a text row opens the editor");
+    };
+    assert_eq!(row, SettingRow::Workspace);
+    app.settings.view = SettingsMode::Editing {
+        row,
+        buffer: "/tmp/vibex-settings-workspace".to_string(),
+    };
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("/tmp/vibex-settings-workspace"),
+        "the buffer is not visible while editing:\n{screen}"
+    );
+    app.commit_setting_edit();
+    assert_eq!(
+        app.workspace_path.as_deref(),
+        Some("/tmp/vibex-settings-workspace")
+    );
+}
+
+#[test]
+fn resetting_a_setting_asks_first_and_then_restores_the_default() {
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    select_setting(&mut app, SettingRow::Theme);
+    let themes = vibex_ui::theme_catalog::themes_for(app.settings.mode).collect::<Vec<_>>();
+    let other = themes
+        .iter()
+        .find(|theme| theme.id != "vibex-dark")
+        .expect("more than one theme ships");
+    app.apply_setting_value(SettingRow::Theme, other.id);
+    assert_eq!(app.settings.theme_id, other.id);
+
+    app.perform(vibex_tui::action::Intent::ResetSetting);
+    assert!(
+        app.overlay.is_some(),
+        "a reset is destructive enough to ask first"
+    );
+    app.perform(vibex_tui::action::Intent::ConfirmOverlay);
+    assert_eq!(app.settings.theme_id, "vibex-dark");
+    assert!(app.overlay.is_none());
+}

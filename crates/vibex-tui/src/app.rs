@@ -25,7 +25,7 @@ use crate::action::Intent;
 use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory};
 use crate::keymap::{Keymap, Scope};
 use crate::locale::{Locale, Strings};
-use crate::theme::{ColorCapability, GlyphMode, TuiTheme};
+use crate::theme::{ColorCapability, TuiTheme};
 use crate::transcript::{Block, ScrollState, Transcript};
 use crate::view::SeatKind;
 
@@ -274,39 +274,11 @@ impl ManagementRow {
     }
 }
 
-/// A row on the settings page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingRow {
-    Theme,
-    Locale,
-    Icons,
-    Backend,
-    Seat,
-    Keys,
-    Version,
-}
-
-impl SettingRow {
-    pub const ALL: [SettingRow; 7] = [
-        SettingRow::Theme,
-        SettingRow::Locale,
-        SettingRow::Icons,
-        SettingRow::Backend,
-        SettingRow::Seat,
-        SettingRow::Keys,
-        SettingRow::Version,
-    ];
-}
-
-/// Everything the settings page renders from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingsState {
-    pub theme_id: String,
-    pub mode: vibex_ui::GpuiThemeMode,
-    pub locale: Locale,
-    pub glyphs: GlyphMode,
-    pub selected: usize,
-}
+/// A row on the settings page, and the state of its mode machine.
+///
+/// The definitions live in [`crate::settings`]; they are re-exported here
+/// because that is where every other page's navigation types live.
+pub use crate::settings::{SettingKind, SettingRow, SettingsMode, SettingsState};
 
 /// The data each management page holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -576,6 +548,8 @@ impl App {
                 locale: options.locale,
                 glyphs: capability.glyphs,
                 selected: 0,
+                view: SettingsMode::Browse,
+                filter: String::new(),
             },
             management_data: ManagementData::default(),
             selection: BTreeMap::new(),
@@ -736,7 +710,7 @@ impl App {
             Page::Prompts => self.management_data.prompts.len(),
             Page::Hooks => self.management_data.hooks.len(),
             Page::Recovery => RecoveryAction::ALL.len(),
-            Page::Settings => SettingRow::ALL.len(),
+            Page::Settings => self.visible_settings().len(),
             Page::Agent => self.transcript.len(),
             Page::Changes => self.file_rows.len(),
             Page::Files => self.file_rows.len(),
@@ -1690,9 +1664,22 @@ mod tests {
 
     #[test]
     fn settings_rows_cover_the_page() {
-        assert!(SettingRow::ALL.contains(&SettingRow::Theme));
-        assert!(SettingRow::ALL.contains(&SettingRow::Keys));
-        assert_eq!(SettingRow::ALL.len(), 7);
+        let rows = crate::settings::SETTINGS
+            .iter()
+            .map(|definition| definition.row)
+            .collect::<Vec<_>>();
+        assert!(rows.contains(&SettingRow::Theme));
+        assert!(rows.contains(&SettingRow::Keys));
+        assert!(rows.contains(&SettingRow::Workspace));
+        // Every section has at least one row, or its header would be empty.
+        for section in crate::settings::SettingsSection::ALL {
+            assert!(
+                crate::settings::SETTINGS
+                    .iter()
+                    .any(|definition| definition.section == section),
+                "{section:?} has no setting"
+            );
+        }
     }
 
     #[test]

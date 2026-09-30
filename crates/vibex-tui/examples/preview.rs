@@ -9,6 +9,7 @@
 //! cargo run -p vibex-tui --example preview -- 140 44
 //! cargo run -p vibex-tui --example preview -- 100 30 --light
 //! cargo run -p vibex-tui --example preview -- 140 44 --no-color
+//! cargo run -p vibex-tui --example preview -- 120 34 --settings
 //! ```
 //!
 //! `--ansi` emits real SGR codes instead of plain text, which is the only way
@@ -32,6 +33,7 @@ fn main() {
     let mut light = false;
     let mut ansi = false;
     let mut welcome = false;
+    let mut settings = false;
     let mut numbers = Vec::new();
     for argument in &arguments {
         match argument.as_str() {
@@ -40,6 +42,7 @@ fn main() {
             "--ascii" => mode = ColorMode::Ansi16,
             "--ansi" => ansi = true,
             "--welcome" => welcome = true,
+            "--settings" => settings = true,
             other => {
                 if let Ok(value) = other.parse::<u16>() {
                     numbers.push(value);
@@ -80,6 +83,10 @@ fn main() {
     if welcome {
         // The empty-state surface, which is what a new session shows.
         app.navigate_to(vibex_tui::app::Page::Sessions);
+    }
+    if settings {
+        app.perform(vibex_tui::action::Intent::OpenSettings);
+        app.set_selection(vibex_tui::keymap::Scope::Settings, 1);
     }
     let blocks = sample_session();
     if !welcome {

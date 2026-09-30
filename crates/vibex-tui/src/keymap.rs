@@ -1135,6 +1135,23 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Settings,
+        Chord::plain(KeyCode::Char('/')),
+        Intent::BeginFilter,
+        "Filter",
+    ),
+    alias(
+        Scope::Settings,
+        Chord::plain(KeyCode::Char(' ')),
+        Intent::ActivateSetting,
+    ),
+    binding(
+        Scope::Settings,
+        Chord::plain(KeyCode::Char('d')),
+        Intent::ResetSetting,
+        "Reset",
+    ),
+    binding(
+        Scope::Settings,
         Chord::plain(KeyCode::F(9)),
         Intent::ReloadKeymap,
         "Reload key bindings",
