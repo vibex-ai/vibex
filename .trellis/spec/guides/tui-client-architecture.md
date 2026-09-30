@@ -226,8 +226,20 @@ Rules that follow:
 
 * A block is `rail | pad(2) | content | pad(1)`, and the rail covers the block's
   status and attribution rows too, so the block reads as one object.
-* A run of three or more collapsed work items folds into its first member
-  (`MIN_GROUP_RUN`). An expanded or failed item breaks the run.
+* **The transcript is dense by default, and a row has to earn its height.**
+  A work item or a notice is *one* row: its action and the single detail that
+  identifies it (`is_dense_row`), with its body behind the fold and in the block
+  detail overlay. Messages keep no "You"/"Agent" header — the rail colour says
+  who is speaking and the reader's own words carry a `❯` on their first line.
+  A kind label is never printed when the title already says it. Two dense rows
+  are separated by nothing; everything else keeps the gap that makes it an
+  object. Plan updates and approval resolutions are not drawn at all: the todo
+  band and the dock own the plan, and the request row already shows the outcome.
+  Every density decision is mirrored in `estimate_height`, because a renderer
+  and an estimator that disagree about shape make scrolling jump.
+* A run of three or more collapsed rows *of the same kind* folds into its first
+  member (`MIN_GROUP_RUN`), which reports `+N` before its summary so truncation
+  cannot hide the count. An expanded or failed row breaks the run.
 * The current block is marked with a pointer in the rail plus a lifted header.
   Never a full-width reversed row: it is the heaviest emphasis a terminal has.
 * Focus is expressed as a fade toward the canvas (`TuiTheme::fade`), not as a
@@ -238,11 +250,12 @@ Rules that follow:
   glyph's fallback and the width invariant it must keep. The prompt arrow is
   always two columns and every spinner frame always one, so a degradation never
   shifts the layout.
-* **A band that reports progress derives it from the transcript.**
-  `App::todo_progress` reads the last plan-shaped block's `Status: title` lines,
-  so the progress bar cannot disagree with the rows the reader can scroll to.
-  A counter with no runtime source (background tasks) stays at zero rather than
-  guessing.
+* **A band that reports progress derives it from the projection, not from what
+  is drawn.** `App::todo_progress` reads the last plan-shaped *timeline row*'s
+  `Status: title` lines. Reading the transcript instead would tie a progress bar
+  to whether the transcript happens to draw that row — and it deliberately does
+  not draw a plan update. A counter with no runtime source (background tasks)
+  stays at zero rather than guessing.
 * **The pinned prompt header is chrome, not content.** Only a user message
   pins; an expanded one does not (it is already fully visible inline). It
   shrinks one row per row scrolled past down to `min(full_height,
@@ -273,23 +286,27 @@ Measured contract: with no input and no events the loop produces **zero frames**
 Folding happens *before* wrapping, so a collapsed block never pays for the lines
 it will not show.
 
-**Markdown carries a colour hierarchy, not one text colour.** Body prose is
-`gray_bright`, one step below `foreground`; headings and emphasis take
-`foreground` (and bold, plus an underline on the top two heading levels);
-literals use the theme's literal role (`command`, amber in the default theme) on
-the code background; link labels use the `link` role, derived from the
-catalogue's chart series because `accent` resolves to the foreground in several
-themes. Chrome — headers, markers, rules, the target printed beside a link —
-stays in the grey steps. A single-colour theme still has to spread what it has
-across the roles that carry meaning, and a test asserts the four roles stay four
-distinct colours.
+**Markdown is coloured by syntax role, and the role decides the colour.** Body
+prose is `gray_bright`, one step below `foreground`. A heading level takes its
+own hue from the theme's chart ladder — three chromatic steps for levels 1–3,
+then the greys, because a document that nests deeper than three levels is
+outlining — which is what makes an outline legible at a glance and survives a
+terminal whose CJK face has no bold cut. Literals take the syntax palette's code
+colour with no background of their own; links their own accent; and everything
+that is punctuation rather than content — bullets, ordered markers, task boxes,
+quote bars, thematic breaks, table borders — one muted step. Emphasis is weight
+and slant only: colour keeps meaning "this is a different kind of thing".
+`MarkdownPalette` is resolved once per theme, alongside the syntax palette the
+catalogue ships as JSON, so no render (and no streaming delta) pays for a parse.
+A single-colour theme still has to spread what it has across the roles that
+carry meaning, and a test asserts the ladder and the roles stay distinct in
+every shipped theme.
 
 **Markdown is interpreted, never echoed, and its styling survives wrapping.**
-The renderer never prints the syntax it parsed: headings carry emphasis (the top
-two levels are underlined as well, so the hierarchy survives a terminal whose
-CJK font has no bold face) instead of `#` markers, inline code is a background
-run instead of backticks, and links print their destination only when the label
-does not already say it. Wrapping is style-preserving: `wrap_text` decides where
+The renderer never prints the syntax it parsed: headings carry their level's
+colour and weight instead of `#` markers, inline code is a coloured run instead
+of backticks, and links print their destination only when the label does not
+already say it. Wrapping is style-preserving: `wrap_text` decides where
 lines break, and each visual line is matched back onto the styled runs
 character-by-character (a break consumes the space it broke on, so offsets are
 not reliable) — re-applying only the first span's style to a wrapped line erases
@@ -298,6 +315,29 @@ fenced code, diffs, table rows and rules — takes a preformatted path that
 hard-wraps by cell and never collapses runs of spaces, and a table is a closed
 box (`┌┬┐ ├┼┤ └┴┘`) whose columns are padded by display width, so a double-width
 cell cannot push the next `│` out of line.
+
+**A streamed answer is rendered once, and never from its first character
+again.** Re-parsing the whole document on every delta is quadratic in the length
+of the answer, which is felt exactly when the answer is worth reading.
+`StreamingMarkdown` keeps a *frozen prefix* — source bytes that text arriving
+later cannot reinterpret — and re-renders only what follows it. A freeze point
+is a blank line that ends a top-level block: a paragraph, a heading, a closed
+fence. Nothing inside a list, a quote, a table, an indented line or an unclosed
+fence qualifies, because the text after it can still change how those lines
+read. The rows are appended to one buffer and the stale tail is truncated, so a
+delta costs the size of the unfrozen tail rather than a copy of the answer. The
+transcript keeps one renderer per streaming block and drops it when the answer
+finishes, which is what makes the last frame of a stream and a reload of the
+same session the same render — a test asserts the streamed rows equal a whole
+render at every chunk boundary. There is no caret glyph in the streamed text:
+the rail pulses while the block is live, so nothing shifts and nothing flickers.
+
+**A streamed block is re-rendered at push time, and laid out at frame time.**
+The delta arrives on the worker's message, the renderer advances then, and the
+transcript invalidates only that block's height and rows; the frame composes
+whatever is current. Deltas are drained in batches and frames are capped at one
+per `FRAME_INTERVAL`, so a burst of tokens costs one repaint rather than one per
+token, and an unchanged frame writes nothing.
 
 **The composer wraps its draft so byte offsets survive.** `wrap_text` produces
 *rendered* lines: a run of whitespace collapses to one space and a broken token

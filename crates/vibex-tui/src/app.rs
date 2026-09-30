@@ -1533,20 +1533,23 @@ impl App {
     /// derived from the transcript the reader can see rather than from a second
     /// source of truth that could disagree with it.
     pub fn todo_progress(&self) -> Option<TodoProgress> {
-        let block = self.transcript.blocks().iter().rev().find(|block| {
+        // The projection, not the transcript: a plan update is bookkeeping the
+        // transcript deliberately does not draw, and a progress band that
+        // disappeared with the row it summarises would be worse than no band.
+        let row = self.projection.rows.iter().rev().find(|row| {
             matches!(
-                block.kind,
+                row.kind,
                 vibex_desktop_model::TimelineRowKind::TodoUpdate
                     | vibex_desktop_model::TimelineRowKind::Plan
             )
         })?;
         let mut progress = TodoProgress {
-            title: block.title.clone(),
+            title: row.title.clone(),
             done: 0,
             total: 0,
             running: None,
         };
-        for line in block.body.lines() {
+        for line in row.body.lines() {
             let Some((status, title)) = line.split_once(": ") else {
                 continue;
             };

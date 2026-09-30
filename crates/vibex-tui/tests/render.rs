@@ -1096,26 +1096,39 @@ fn select_setting(app: &mut App, row: vibex_tui::settings::SettingRow) {
     app.set_selection(Scope::Settings, index);
 }
 
-/// A plan block, which is the shape the runtime publishes a plan in.
-fn plan_block() -> vibex_tui::transcript::Block {
-    vibex_tui::transcript::Block {
-        id: "todo-dock".to_string(),
-        kind: vibex_desktop_model::TimelineRowKind::TodoUpdate,
-        title: "Ship the dock".to_string(),
-        body: "Completed: read the design\nRunning: write the band\nPending: add a test"
-            .to_string(),
-        turn_id: Some("turn-1".to_string()),
-        sequence: 1,
-        expanded: false,
-        collapsible: true,
-        streaming: false,
-        failed: false,
-        pending_permission: false,
-        file_path: None,
-        runtime_attribution: None,
-        conclusion: false,
-        group: vibex_tui::transcript::GroupRole::Solo,
-    }
+/// Seed a plan update the way the runtime delivers one.
+///
+/// The transcript deliberately draws no row for it, so a test that wants to see
+/// the plan has to put it where the projection reads it.
+fn seed_plan(app: &mut App, session_id: &vibex_core::VibexSessionId) {
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.timeline.replace_authoritative(
+        session_id.clone(),
+        vec![seeded_item(
+            session_id,
+            1,
+            vibex_core::TimelineItemKind::TodoUpdate,
+            vibex_core::TimelinePayload::TodoUpdate(vibex_core::TodoUpdatePayload {
+                title: "Ship the dock".into(),
+                items: vec![
+                    vibex_core::PlanStepPayload {
+                        title: "read the design".into(),
+                        status: vibex_core::PlanStepStatus::Completed,
+                    },
+                    vibex_core::PlanStepPayload {
+                        title: "write the band".into(),
+                        status: vibex_core::PlanStepStatus::Running,
+                    },
+                    vibex_core::PlanStepPayload {
+                        title: "add a test".into(),
+                        status: vibex_core::PlanStepStatus::Pending,
+                    },
+                ],
+                raw_extension: None,
+            }),
+        )],
+    );
+    app.sync_transcript();
 }
 
 #[test]
@@ -1123,7 +1136,7 @@ fn the_dock_lists_the_plan_and_the_held_queue() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
-    app.transcript.set_blocks(vec![plan_block()]);
+    seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("fix the flake".to_string());
     app.perform(Intent::ToggleDock);
     let screen = text(&render(&mut app, 120, 40));
@@ -1152,7 +1165,7 @@ fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
-    app.transcript.set_blocks(vec![plan_block()]);
+    seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("fix the flake".to_string());
     app.perform(Intent::ToggleDock);
     let rows = app.dock_rows();
@@ -1201,7 +1214,7 @@ fn hiding_finished_dock_work_leaves_the_running_step() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
-    app.transcript.set_blocks(vec![plan_block()]);
+    seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.perform(Intent::ToggleDock);
     let before = text(&render(&mut app, 120, 40));
     assert!(before.contains("1/3"), "{before}");
@@ -1445,7 +1458,7 @@ fn the_session_list_does_not_wear_the_agent_pages_chrome() {
     use vibex_tui::action::Intent;
     let mut app = app(120, 40);
     app.agent.apply_sessions(Ok(session_pair())).expect("apply");
-    app.transcript.set_blocks(vec![plan_block()]);
+    seed_plan(&mut app, &vibex_core::VibexSessionId::new());
     app.enqueue_message("held while listing".to_string());
     app.perform(Intent::GotoSessions);
     let listing = text(&render(&mut app, 120, 40));
@@ -1965,28 +1978,32 @@ fn a_held_message_is_sent_once_the_turn_ends() {
 
 #[test]
 fn the_plan_band_reports_progress_from_the_timeline() {
+    // The band reads the projection: a plan update does not earn a transcript
+    // row, and the progress must not disappear with it.
     use vibex_desktop_model::TimelineRowKind;
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);
-    app.transcript
-        .set_blocks(vec![vibex_tui::transcript::Block {
-            id: "todo-1".to_string(),
-            kind: TimelineRowKind::TodoUpdate,
-            title: "Ship the plan band".to_string(),
-            body: "Completed: read the design\nRunning: write the band\nPending: add a test"
-                .to_string(),
-            turn_id: Some("turn-1".to_string()),
-            sequence: 1,
-            expanded: false,
-            collapsible: true,
-            streaming: false,
-            failed: false,
-            pending_permission: false,
-            file_path: None,
-            runtime_attribution: None,
-            conclusion: false,
-            group: vibex_tui::transcript::GroupRole::Solo,
-        }]);
+    app.projection.rows = vec![vibex_desktop_model::TimelineRow {
+        id: "todo-1".to_string(),
+        kind: TimelineRowKind::TodoUpdate,
+        item_ids: Vec::new(),
+        turn_id: Some("turn-1".to_string()),
+        turn_item_count: 0,
+        turn_failed: false,
+        turn_pending_permission: false,
+        conclusion: false,
+        first_sequence: 1,
+        last_sequence: 1,
+        title: "Ship the plan band".to_string(),
+        body: "Completed: read the design\nRunning: write the band\nPending: add a test"
+            .to_string(),
+        streaming: false,
+        collapsible: false,
+        pending_permission: false,
+        failed: false,
+        runtime_attribution: None,
+        file_path: None,
+    }];
     assert_eq!(app.todo_done_count(), 1);
     assert_eq!(app.todo_total_count(), 3);
     let screen = text(&render(&mut app, 120, 40));
@@ -2450,6 +2467,57 @@ fn a_tool_heavy_turn_stays_a_short_run_of_rows() {
         app.transcript.total_height() <= 14,
         "the turn costs {} rows",
         app.transcript.total_height()
+    );
+}
+
+#[test]
+fn the_plan_band_reports_a_plan_the_transcript_does_not_draw() {
+    // A plan update is bookkeeping: it has no transcript row, and the band that
+    // summarises it has to read the projection instead — otherwise silencing
+    // the row would silence the progress with it.
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(110, 40);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    app.agent.state.timeline.replace_authoritative(
+        session_id.clone(),
+        vec![seeded_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::TodoUpdate,
+            vibex_core::TimelinePayload::TodoUpdate(vibex_core::TodoUpdatePayload {
+                title: "fix the flaky test".into(),
+                items: vec![
+                    vibex_core::PlanStepPayload {
+                        title: "read the runner tests".into(),
+                        status: vibex_core::PlanStepStatus::Completed,
+                    },
+                    vibex_core::PlanStepPayload {
+                        title: "use the fake clock".into(),
+                        status: vibex_core::PlanStepStatus::Running,
+                    },
+                ],
+                raw_extension: None,
+            }),
+        )],
+    );
+    app.sync_transcript();
+
+    assert!(
+        app.transcript.blocks().is_empty(),
+        "a plan update earned a transcript row: {:?}",
+        app.transcript
+            .blocks()
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(app.todo_total_count(), 2);
+    assert_eq!(app.todo_done_count(), 1);
+    let screen = text(&render(&mut app, 110, 40));
+    assert!(
+        screen.contains("fix the flaky test") || screen.contains("1/2"),
+        "the plan band lost the plan:\n{screen}"
     );
 }
 

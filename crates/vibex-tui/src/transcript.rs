@@ -351,6 +351,15 @@ impl Transcript {
             .saturating_sub(next_blocks.len() + change.removed);
         change.any = change.replaced > 0 || change.appended > 0 || change.removed > 0;
 
+        // A live renderer belongs to a block that is still in the transcript;
+        // one whose block has gone would otherwise sit in the map forever.
+        let present = self
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.live.retain(|id, _| present.contains(id.as_str()));
+
         self.blocks = next_blocks;
         self.heights = next_heights;
         self.keys = next_keys;
@@ -621,9 +630,10 @@ impl Transcript {
         ) && !block.body.is_empty();
         let header = usize::from(!headerless);
         let body_lines = if block.body.is_empty() || (dense && !open && !block.streaming) {
-            // A dense row's body is behind the fold.
+            // A dense row's body is behind the fold; a streaming one is being
+            // written, so its whole body is drawn.
             0
-        } else if open {
+        } else if open || block.streaming {
             // Count newlines plus a wrap allowance per line.
             let explicit = block.body.matches('\n').count() + 1;
             let wrap_allowance = block.body.len() / available.max(1);
@@ -1733,10 +1743,13 @@ pub fn render_block_in_run_with_body(
         // stands for.
         parts.push((format!("  +{hidden}"), theme.dimmed(theme.roles.gray_dim)));
     }
-    if dense && !open && !block.streaming && !matches!(block.kind, TimelineRowKind::SystemNotice) {
-        if let Some(summary) = dense_summary(block) {
-            parts.push((format!("  {summary}"), theme.dimmed(theme.roles.gray_dim)));
-        }
+    if dense
+        && !open
+        && !block.streaming
+        && !matches!(block.kind, TimelineRowKind::SystemNotice)
+        && let Some(summary) = dense_summary(block)
+    {
+        parts.push((format!("  {summary}"), theme.dimmed(theme.roles.gray_dim)));
     }
     if block.collapsible && !block.expanded && !dense {
         parts.push((
