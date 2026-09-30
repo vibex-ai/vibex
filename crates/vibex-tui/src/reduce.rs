@@ -264,6 +264,33 @@ impl App {
                     include_archived: self.show_archived,
                 }])
             }
+            Intent::ToggleSessionCard => {
+                let Some(session_id) = self.selected_session_row_id() else {
+                    return Outcome::quiet();
+                };
+                self.toggle_session_card(session_id.as_str());
+                Outcome::effects(vec![])
+            }
+            Intent::CollapseSessionCards => {
+                let open = self.close_session_cards();
+                if open == 0 {
+                    let message = self.strings.session_cards_none();
+                    self.toast(Toast::info(message));
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::CopySessionRow => {
+                let Some(session_id) = self.selected_session_row_id() else {
+                    return Outcome::quiet();
+                };
+                let Some(session) = self.session_by_id(&session_id) else {
+                    return Outcome::quiet();
+                };
+                let text = crate::view::session_card_text(self, session);
+                let message = self.strings.copied();
+                self.toast(Toast::success(message));
+                Outcome::effects(vec![Effect::Clipboard { text }])
+            }
             Intent::SwitchWorkspace => {
                 self.page = Page::Sessions;
                 self.toast(Toast::info(self.strings.workspace_pick().to_string()));

@@ -402,6 +402,11 @@ pub struct App {
     pub usage_scope_session: bool,
     /// Set by the first `Esc` in the composer; the second clears the draft.
     pub draft_clear_armed: bool,
+    /// Session ids whose detail card is open in the session list.
+    ///
+    /// Keyed by id rather than row index so a refresh, a rename or a filter
+    /// cannot move a card onto a different session.
+    pub session_cards: std::collections::BTreeSet<String>,
     /// Messages held back until the running turn ends.
     pub queued_messages: Vec<String>,
     /// A transient message above the composer, dismissed on the next key.
@@ -559,6 +564,7 @@ impl App {
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
             usage_scope_session: true,
             draft_clear_armed: false,
+            session_cards: std::collections::BTreeSet::new(),
             queued_messages: Vec::new(),
             banner: None,
             turn_started: None,
@@ -748,6 +754,62 @@ impl App {
                 .collapsed_ids
                 .insert(project_id.to_string());
         }
+    }
+
+    /// Whether a session's detail card is open in the session list.
+    pub fn session_card_expanded(&self, session_id: &str) -> bool {
+        self.session_cards.contains(session_id)
+    }
+
+    /// Open or close one session's detail card.
+    pub fn toggle_session_card(&mut self, session_id: &str) {
+        if !self.session_cards.remove(session_id) {
+            self.session_cards.insert(session_id.to_string());
+        }
+    }
+
+    /// Close one session's detail card, reporting whether it was open.
+    pub fn close_session_card(&mut self, session_id: &str) -> bool {
+        self.session_cards.remove(session_id)
+    }
+
+    /// Close every open session detail card, reporting how many were open.
+    pub fn close_session_cards(&mut self) -> usize {
+        let open = self.session_cards.len();
+        self.session_cards.clear();
+        open
+    }
+
+    /// The session the session-list selection points at, when it points at one.
+    pub fn selected_session_row_id(&self) -> Option<VibexSessionId> {
+        let rows = self.sidebar_rows();
+        let index = self.selection_for(Scope::Sessions);
+        rows.get(index)?.session_id.clone()
+    }
+
+    /// The session the session-list selection points at, when it points at one.
+    pub fn selected_session_row(&self) -> Option<&AgentSession> {
+        let session_id = self.selected_session_row_id()?;
+        self.agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|session| session.id == session_id)
+    }
+
+    /// The full record for one session id, when the list has loaded it.
+    pub fn session_by_id(&self, session_id: &VibexSessionId) -> Option<&AgentSession> {
+        self.agent
+            .state
+            .sessions
+            .value
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|session| &session.id == session_id)
     }
 
     /// Whether the terminal is narrow enough that chrome must give way.

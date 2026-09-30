@@ -554,6 +554,7 @@ fn render_session_view(
         return;
     }
     let selected = app.selection_for(Scope::Sessions);
+    let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
     let items = rows
         .iter()
         .enumerate()
@@ -586,7 +587,7 @@ fn render_session_view(
                 .map(|state| format!("  {}", session_state_label(state, strings)))
                 .unwrap_or_default();
             let name_width = usize::from(list_area.width).saturating_sub(24 + state.len());
-            ListItem::new(Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::styled(
                     format!(
                         "{indent}{marker} {:<width$}",
@@ -596,7 +597,16 @@ fn render_session_view(
                     style,
                 ),
                 Span::styled(state, Style::default().fg(theme.roles.gray_dim)),
-            ]))
+            ])];
+            // An expanded session shows its detail card under its row, inside
+            // the same list item so the selection band covers the whole card.
+            if let Some(session_id) = row.session_id.as_ref()
+                && app.session_card_expanded(session_id.as_str())
+                && let Some(session) = sessions.iter().find(|session| &session.id == session_id)
+            {
+                lines.extend(session_card_lines(app, session, strings, theme, list_area));
+            }
+            ListItem::new(Text::from(lines))
         })
         .collect::<Vec<_>>();
     let mut state = ratatui::widgets::ListState::default();
@@ -616,7 +626,106 @@ fn session_state_label(state: vibex_core::AgentSessionState, strings: Strings) -
     }
 }
 
-/// The Files and Changes views.
+/// The fields of one session's detail card, in the order they are shown.
+///
+/// Only what the runtime actually publishes appears. A field the client cannot
+/// answer is omitted rather than shown as a dash, because a card that says
+/// "Model —" tells the reader nothing and costs a row.
+fn session_card_fields(
+    app: &App,
+    session: &vibex_core::AgentSession,
+    strings: Strings,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        (strings.session_card_id(), session.id.as_str().to_string()),
+        (strings.session_workspace(), session.workspace_root.clone()),
+        (
+            strings.session_state(),
+            session_state_label(session.state, strings).to_string(),
+        ),
+        (strings.session_card_agent(), session.agent_id.to_string()),
+    ];
+    // The model is only known for the session whose runtime selection has been
+    // loaded, which is the open one.
+    if app.selected_session_id() == Some(&session.id)
+        && let Some(selection) = app.agent.state.runtime_selection.value.as_ref()
+        && let Some(model) = selection.effective.model.model_id()
+    {
+        fields.push((strings.session_card_model(), model.to_string()));
+    }
+    fields.push((
+        strings.session_card_created(),
+        crate::text::format_utc_timestamp(session.created_at_ms),
+    ));
+    fields.push((
+        strings.session_card_updated(),
+        crate::text::format_utc_timestamp(session.updated_at_ms),
+    ));
+    if session.last_message_at_ms > 0 {
+        fields.push((
+            strings.session_card_last_message(),
+            crate::text::format_utc_timestamp(session.last_message_at_ms),
+        ));
+    }
+    if app.selected_session_id() == Some(&session.id) {
+        let messages = app.transcript.len();
+        if messages > 0 {
+            fields.push((strings.session_card_messages(), messages.to_string()));
+            fields.push((
+                strings.session_card_turns(),
+                app.transcript.turn_count().to_string(),
+            ));
+        }
+    }
+    fields
+}
+
+/// The rendered lines of one session's detail card.
+fn session_card_lines(
+    app: &App,
+    session: &vibex_core::AgentSession,
+    strings: Strings,
+    theme: &TuiTheme,
+    area: Rect,
+) -> Vec<Line<'static>> {
+    let indent = usize::from(area.width).min(120) / 12 + 4;
+    let label_width = 12usize;
+    let value_width = usize::from(area.width)
+        .saturating_sub(indent + label_width + 2)
+        .max(8);
+    let label_style = Style::default().fg(theme.roles.gray_dim);
+    let value_style = Style::default().fg(theme.roles.gray);
+    let bar_style = Style::default().fg(theme.roles.accent_user);
+    session_card_fields(app, session, strings)
+        .into_iter()
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(" ".repeat(indent.saturating_sub(2)), Style::default()),
+                Span::styled(
+                    crate::glyphs::accent_bar(app.glyph_tier()).to_string(),
+                    bar_style,
+                ),
+                Span::styled(" ", Style::default()),
+                Span::styled(format!("{label:<label_width$}"), label_style),
+                Span::styled(
+                    truncate_to_width(&compact_path(&value, value_width), value_width, "…"),
+                    value_style,
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// The copyable text of one session's detail card.
+pub fn session_card_text(app: &App, session: &vibex_core::AgentSession) -> String {
+    let strings = Strings::for_locale(app.settings.locale);
+    session_card_fields(app, session, strings)
+        .into_iter()
+        .map(|(label, value)| format!("{label:<12} {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render_file_view(
     frame: &mut Frame<'_>,
     area: Rect,

@@ -409,6 +409,74 @@ pub fn contains_rtl(text: &str) -> bool {
     })
 }
 
+/// Format a Unix millisecond timestamp as a UTC civil date and time.
+///
+/// The client shows absolute times in exactly one place — a session's detail
+/// card — and the runtime stores epoch milliseconds. A calendar library would
+/// be a dependency for one label, so the civil-date conversion is done here:
+/// days since the epoch are shifted to the 0000-03-01 era, where the leap-year
+/// rule is a single division, and the month/day are recovered from the
+/// 400-year cycle.
+///
+/// The result is `YYYY-MM-DD HH:MM` in UTC. It is deliberately not localised:
+/// a terminal has no reliable timezone database, and an hour that silently
+/// disagrees with the reader's clock is worse than one labelled UTC.
+pub fn format_utc_timestamp(epoch_ms: i64) -> String {
+    let seconds = epoch_ms.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+/// Days since 1970-01-01 → (year, month, day), proleptic Gregorian.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01 so February (the leap-month special case)
+    // is the last month of the year.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// A coarse "how long ago" label for a timestamp in milliseconds.
+///
+/// Buckets match the ones the rest of the interface speaks in: minutes, hours,
+/// days, then months. `now_ms` is passed in rather than read from the clock so
+/// the function stays pure and testable.
+pub fn format_age(epoch_ms: i64, now_ms: i64) -> String {
+    let delta = now_ms.saturating_sub(epoch_ms).max(0);
+    let minutes = delta / 60_000;
+    if minutes < 1 {
+        return "just now".to_string();
+    }
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 30 {
+        return format!("{days}d");
+    }
+    format!("{}mo", days / 30)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +601,28 @@ mod tests {
             .map(|line| line.text.clone())
             .collect::<String>();
         assert_eq!(joined.replace(' ', ""), text.replace(' ', ""));
+    }
+
+    #[test]
+    fn utc_timestamps_land_on_the_right_civil_date() {
+        // 2025-09-30T13:12:00Z
+        assert_eq!(format_utc_timestamp(1_759_237_920_000), "2025-09-30 13:12");
+        // The epoch itself, and a leap day.
+        assert_eq!(format_utc_timestamp(0), "1970-01-01 00:00");
+        assert_eq!(format_utc_timestamp(1_709_164_800_000), "2024-02-29 00:00");
+        // A timestamp before the epoch must not wrap into a negative year.
+        assert_eq!(format_utc_timestamp(-1), "1969-12-31 23:59");
+    }
+
+    #[test]
+    fn ages_bucket_into_the_units_a_reader_thinks_in() {
+        let now = 1_000_000_000_000i64;
+        assert_eq!(format_age(now, now), "just now");
+        assert_eq!(format_age(now - 5 * 60_000, now), "5m");
+        assert_eq!(format_age(now - 3 * 3_600_000, now), "3h");
+        assert_eq!(format_age(now - 2 * 86_400_000, now), "2d");
+        assert_eq!(format_age(now - 61 * 86_400_000, now), "2mo");
+        // A clock that runs backwards must not produce a negative age.
+        assert_eq!(format_age(now + 60_000, now), "just now");
     }
 }

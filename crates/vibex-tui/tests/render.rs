@@ -505,3 +505,60 @@ fn the_locked_runtime_message_gives_three_ways_out() {
     assert!(message.contains("Remote Access"));
     assert!(message.contains("vibex connect"));
 }
+
+fn seeded_session(id: &str, title: &str) -> vibex_core::AgentSession {
+    vibex_core::AgentSession {
+        id: vibex_core::VibexSessionId::parse(id).expect("valid session id"),
+        title: title.to_string(),
+        project_id: vibex_core::ProjectId::new(),
+        workspace_id: vibex_core::WorkspaceId::new(),
+        workspace_root: "/tmp/vibex-card-workspace".to_string(),
+        workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+        agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+        state: vibex_core::AgentSessionState::Idle,
+        safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+        created_at_ms: 1_759_237_920_000,
+        updated_at_ms: 1_759_251_200_000,
+        last_message_at_ms: 1_759_251_200_000,
+        archived_at_ms: None,
+        deleted_at_ms: None,
+    }
+}
+
+#[test]
+fn a_session_detail_card_opens_and_closes_on_the_row() {
+    let mut app = app(120, 40);
+    app.agent
+        .apply_sessions(Ok(vec![seeded_session(
+            "session_card0001",
+            "fix the flaky test",
+        )]))
+        .expect("sessions apply");
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    // Row 0 is the workspace group; row 1 is the session.
+    app.set_selection(Scope::Sessions, 1);
+    let collapsed = text(&render(&mut app, 120, 40));
+    assert!(collapsed.contains("fix the flaky test"), "{collapsed}");
+    assert!(
+        !collapsed.contains("session_card0001"),
+        "the id belongs to the card, not the row:\n{collapsed}"
+    );
+
+    app.perform(vibex_tui::action::Intent::ToggleSessionCard);
+    let expanded = text(&render(&mut app, 120, 40));
+    for needle in [
+        "session_card0001",
+        "/tmp/vibex-card-workspace",
+        "2025-09-30",
+        "claude",
+    ] {
+        assert!(
+            expanded.contains(needle),
+            "the card lost {needle}:\n{expanded}"
+        );
+    }
+
+    app.perform(vibex_tui::action::Intent::CollapseSessionCards);
+    let closed = text(&render(&mut app, 120, 40));
+    assert!(!closed.contains("session_card0001"), "{closed}");
+}

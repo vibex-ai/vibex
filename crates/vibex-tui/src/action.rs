@@ -83,6 +83,9 @@ intents! {
     ArchiveSession => { scope: Sessions, id: "session_archive", label: "Archive", help: "Archive the selected session." },
     DeleteSession => { scope: Sessions, id: "session_delete", label: "Delete", help: "Permanently delete the selected session." },
     ToggleShowArchived => { scope: Sessions, id: "session_show_archived", label: "Archived", help: "Include archived sessions in the list." },
+    ToggleSessionCard => { scope: Sessions, id: "session_card_toggle", label: "Details", help: "Open or close the selected session's detail card." },
+    CollapseSessionCards => { scope: Sessions, id: "session_card_collapse", label: "Close cards", help: "Close every open session detail card." },
+    CopySessionRow => { scope: Sessions, id: "session_copy", label: "Copy", help: "Copy the selected session's details to the clipboard." },
     SwitchWorkspace => { scope: Sessions, id: "workspace_switch", label: "Workspace", help: "Change the workspace used for new sessions." },
     OpenWorkspaceBrowser => { scope: Sessions, id: "workspace_browse", label: "Browse", help: "List directories on the authority host." },
     WorkspaceBrowseUp => { scope: Sessions, id: "workspace_up", label: "Parent", help: "Go to the parent directory." },
@@ -279,6 +282,9 @@ impl Intent {
                 | Intent::ToggleBlockExpanded
                 | Intent::ToggleAllBlocksExpanded
                 | Intent::ToggleReasoningExpanded
+                | Intent::ToggleSessionCard
+                | Intent::CollapseSessionCards
+                | Intent::CopySessionRow
                 | Intent::CopyBlockBody
                 | Intent::CopyBlockMetadata
                 | Intent::OpenBlockDetails

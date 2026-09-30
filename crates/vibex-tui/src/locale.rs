@@ -155,6 +155,22 @@ strings! {
         "临时会话（不使用项目）",
         "臨時工作階段（不使用專案）"
     },
+    // Detail-card field labels. Kept to one word each so the label column can
+    // stay narrow enough for the value beside it.
+    session_card_id => { "ID", "ID", "ID" },
+    session_card_agent => { "Agent", "Agent", "Agent" },
+    session_card_model => { "Model", "模型", "模型" },
+    session_card_created => { "Created", "创建于", "建立於" },
+    session_card_updated => { "Updated", "更新于", "更新於" },
+    session_card_last_message => { "Last turn", "最近一轮", "最近一輪" },
+    session_card_messages => { "Messages", "消息数", "訊息數" },
+    session_card_turns => { "Turns", "轮次", "輪次" },
+    session_card_tools => { "Tools", "工具", "工具" },
+    session_cards_none => {
+        "No session detail cards are open",
+        "没有打开会话详情卡片",
+        "沒有開啟工作階段詳情卡片"
+    },
 
     // ---- composer -------------------------------------------------------
     composer_placeholder => {

@@ -491,6 +491,24 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     ),
     binding(
         Scope::Sessions,
+        Chord::plain(KeyCode::Char('e')),
+        Intent::ToggleSessionCard,
+        "Details",
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('c')),
+        Intent::CollapseSessionCards,
+        "Close cards",
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('y')),
+        Intent::CopySessionRow,
+        "Copy",
+    ),
+    binding(
+        Scope::Sessions,
         Chord::ctrl('a'),
         Intent::ToggleShowArchived,
         "Show archived",
