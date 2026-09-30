@@ -23,6 +23,8 @@ use vibex_ui::{AgentWorkflowController, ManagementWorkflowController};
 
 use crate::action::Intent;
 use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory};
+use serde::{Deserialize, Serialize};
+
 use crate::keymap::{Chord, Keymap, Scope};
 use crate::locale::{Locale, Strings};
 use crate::theme::{ColorCapability, TuiTheme};
@@ -317,6 +319,41 @@ pub struct ManagementData {
     pub usage_session: Option<vibex_core::AgentTokenUsage>,
 }
 
+/// The reader's own arrangement of the session list.
+///
+/// The projection already knows how to hoist pinned rows and honour a manual
+/// order; what it has never had is anything that writes those fields. They are
+/// the client's preference, so they live beside the key file rather than in the
+/// runtime's state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarArrangement {
+    pub sidebar: vibex_desktop_model::SidebarState,
+    pub grouped: bool,
+}
+
+impl Default for SidebarArrangement {
+    fn default() -> Self {
+        Self {
+            sidebar: vibex_desktop_model::SidebarState::default(),
+            grouped: true,
+        }
+    }
+}
+
+impl SidebarArrangement {
+    /// Read what a previous run wrote, or an empty arrangement.
+    fn load(path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+}
+
 /// What the transcript and sidebar are projected from.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionState {
@@ -411,6 +448,11 @@ pub struct App {
     /// Whether the button went down inside the composer, so a drag belongs to
     /// the draft instead of the transcript.
     pub draft_selecting: bool,
+    /// Whether the session list groups sessions under their workspace, or shows
+    /// them as one flat run. Persisted with the rest of the arrangement.
+    pub sidebar_grouped: bool,
+    /// Where the arrangement is written; `None` keeps it in memory only.
+    pub sidebar_path: Option<std::path::PathBuf>,
     /// The last left click, so two clicks in the same cell can be told apart
     /// from two clicks in different ones.
     pub last_click: Option<(std::time::Instant, usize, u16)>,
@@ -633,6 +675,7 @@ impl App {
             Some(path) => Keymap::load(&path),
             None => Keymap::built_in(),
         };
+        let arrangement = SidebarArrangement::load(options.sidebar_path.as_deref());
         let mut navigation = CompactNavigation::default();
         navigation.select_global(GlobalDestination::Sessions);
         Self {
@@ -647,7 +690,13 @@ impl App {
             navigation,
             agent,
             management,
-            projection: ProjectionState::default(),
+            projection: ProjectionState {
+                sidebar: arrangement.sidebar,
+                rows: Vec::new(),
+                sidebar_collapsed: false,
+            },
+            sidebar_grouped: arrangement.grouped,
+            sidebar_path: options.sidebar_path,
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
             composer: ComposerBuffer::default(),
@@ -788,12 +837,153 @@ impl App {
             .map(|session| session.workspace_id.clone())
     }
 
-    /// Sidebar rows for the current filter.
+    /// Sidebar rows for the current filter, with the reader's grouping applied.
     pub fn sidebar_rows(&self) -> Vec<vibex_desktop_model::AgentSidebarRow> {
-        self.agent
+        let mut rows = self
+            .agent
             .state
             .view(&self.projection.sidebar, &self.filter, self.shell)
+            .sessions;
+        if !self.sidebar_grouped {
+            // Flat mode keeps the order the projection computed -- pinned
+            // first, then the manual order -- and only drops the headings.
+            rows.retain(|row| row.kind != vibex_desktop_model::AgentSidebarRowKind::Project);
+        }
+        rows
+    }
+
+    /// The row the session cursor is on.
+    pub fn selected_sidebar_row(&self) -> Option<vibex_desktop_model::AgentSidebarRow> {
+        let rows = self.sidebar_rows();
+        rows.get(self.selection_for(Scope::Sessions)).cloned()
+    }
+
+    /// Where the manual arrangement is written.
+    ///
+    /// It sits beside the key file under the same home, so a reader who wants
+    /// to reset the interface has one directory to clear.
+    pub fn sidebar_arrangement_path() -> Option<std::path::PathBuf> {
+        if let Ok(explicit) = std::env::var("VIBEX_TUI_SIDEBAR")
+            && !explicit.trim().is_empty()
+        {
+            return Some(std::path::PathBuf::from(explicit));
+        }
+        let home = std::env::var("VIBEX_HOME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| std::path::PathBuf::from(value).join(".vibex"))
+            })?;
+        Some(home.join("tui-sidebar.json"))
+    }
+
+    /// Persist the arrangement. A failure is silent: losing a pin is not worth
+    /// interrupting the reader, and the next change tries again.
+    pub fn save_sidebar_arrangement(&self) {
+        let Some(path) = self.sidebar_path.clone() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        let arrangement = SidebarArrangement {
+            sidebar: self.projection.sidebar.clone(),
+            grouped: self.sidebar_grouped,
+        };
+        if let Ok(body) = serde_json::to_string_pretty(&arrangement) {
+            let _ = std::fs::write(path, body);
+        }
+    }
+
+    /// Fold the loaded session ids into the arrangement, keeping the reader's
+    /// choices and appending anything new.
+    ///
+    /// New ids are appended in the order they are already shown, not in the
+    /// order the runtime listed them: seeding the manual order is a way of
+    /// remembering the current list, so it must not quietly reshuffle it the
+    /// first time a session appears.
+    pub fn reconcile_sidebar_arrangement(&mut self) {
+        let ids = self
+            .agent
+            .state
+            .view(&self.projection.sidebar, "", self.shell)
             .sessions
+            .into_iter()
+            .filter_map(|row| row.session_id.map(|id| id.to_string()))
+            .collect::<Vec<_>>();
+        self.projection.sidebar.reconcile(ids);
+    }
+
+    /// Keep the selected session pinned above the rest, or let it go.
+    pub fn toggle_session_pin(&mut self) -> bool {
+        let Some(row) = self.selected_sidebar_row() else {
+            return false;
+        };
+        let Some(session_id) = row.session_id.as_ref().map(ToString::to_string) else {
+            return false;
+        };
+        if !self.projection.sidebar.pinned_ids.remove(&session_id) {
+            self.projection.sidebar.pinned_ids.insert(session_id);
+        }
+        self.save_sidebar_arrangement();
+        true
+    }
+
+    /// Move the selected session one place through the manual order.
+    ///
+    /// The cursor follows the row, so a second press moves the same session
+    /// again rather than the one that took its place.
+    pub fn move_session_row(&mut self, delta: isize) -> Option<bool> {
+        // A manual order is only meaningful once every loaded session has a
+        // place in it, and a session created in this run may not have one yet.
+        self.reconcile_sidebar_arrangement();
+        let rows = self.sidebar_rows();
+        let index = self.selection_for(Scope::Sessions);
+        let row = rows.get(index)?;
+        let moving_id = row.session_id.as_ref()?.to_string();
+        let moving_pinned = row.pinned;
+        let mut cursor = index as isize + delta;
+        let mut target = None;
+        while cursor >= 0 && (cursor as usize) < rows.len() {
+            let candidate = &rows[cursor as usize];
+            if let Some(id) = candidate.session_id.as_ref() {
+                target = Some((cursor as usize, id.to_string(), candidate.pinned));
+                break;
+            }
+            cursor += delta;
+        }
+        let (target_index, target_id, target_pinned) = target?;
+        // Pinned rows sort above the rest whatever the manual order says, so a
+        // move across that line would look like nothing happened. Saying so is
+        // better than silently disagreeing with the reader.
+        if moving_pinned != target_pinned {
+            return Some(false);
+        }
+        if !self
+            .projection
+            .sidebar
+            .move_row_relative(&moving_id, &target_id, delta > 0)
+        {
+            // Already against the end of the order: nothing to say about it.
+            return None;
+        }
+        self.set_selection(Scope::Sessions, target_index);
+        self.save_sidebar_arrangement();
+        Some(true)
+    }
+
+    /// Show the list grouped by workspace, or as one flat run.
+    pub fn toggle_sidebar_grouping(&mut self) -> bool {
+        self.sidebar_grouped = !self.sidebar_grouped;
+        self.save_sidebar_arrangement();
+        self.sidebar_grouped
     }
 
     /// The approval cards currently waiting.
@@ -1880,16 +2070,30 @@ pub struct AppOptions {
     pub theme_id: Option<String>,
     pub mode: vibex_ui::GpuiThemeMode,
     pub locale: Locale,
+    /// Where the reader's session-list arrangement is kept.
+    ///
+    /// The composition root decides this, the way it decides the seat: a test
+    /// harness must not write into the developer's home, and a client with no
+    /// writable home simply keeps the arrangement in memory for the run.
+    pub sidebar_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppOptions {
     fn default() -> Self {
+        Self::with_default_paths()
+    }
+}
+
+impl AppOptions {
+    /// The default options, with the arrangement stored beside the key file.
+    fn with_default_paths() -> Self {
         Self {
             seat: SeatKind::Remote,
             capability: ColorCapability::detect(),
             theme_id: None,
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
+            sidebar_path: App::sidebar_arrangement_path(),
         }
     }
 }
@@ -2245,6 +2449,89 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arrangement_app(path: &std::path::Path) -> App {
+        App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            AppOptions {
+                sidebar_path: Some(path.to_path_buf()),
+                ..AppOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_sidebar_arrangement_round_trips_through_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-sidebar.json");
+        let mut app = arrangement_app(&path);
+        app.projection
+            .sidebar
+            .pinned_ids
+            .insert("session_pinned01".to_string());
+        app.projection.sidebar.row_order = vec![
+            "session_pinned01".to_string(),
+            "session_other001".to_string(),
+        ];
+        app.projection
+            .sidebar
+            .collapsed_ids
+            .insert("project_collapsed".to_string());
+        app.sidebar_grouped = false;
+        app.save_sidebar_arrangement();
+
+        let reloaded = arrangement_app(&path);
+        assert!(
+            reloaded
+                .projection
+                .sidebar
+                .pinned_ids
+                .contains("session_pinned01")
+        );
+        assert_eq!(
+            reloaded.projection.sidebar.row_order,
+            vec![
+                "session_pinned01".to_string(),
+                "session_other001".to_string()
+            ]
+        );
+        assert!(
+            reloaded
+                .projection
+                .sidebar
+                .collapsed_ids
+                .contains("project_collapsed")
+        );
+        assert!(
+            !reloaded.sidebar_grouped,
+            "grouping did not survive the save"
+        );
+    }
+
+    #[test]
+    fn an_app_without_an_arrangement_path_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            vibex_backend::DisconnectedBackend::facade(),
+            AppOptions {
+                sidebar_path: None,
+                ..AppOptions::default()
+            },
+        );
+        app.projection
+            .sidebar
+            .pinned_ids
+            .insert("session_pinned01".to_string());
+        app.save_sidebar_arrangement();
+        // Nothing anywhere: the app was told it has no place to keep it.
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "an app without a path still wrote something"
+        );
+    }
 
     #[test]
     fn scopes_put_the_overlay_first() {

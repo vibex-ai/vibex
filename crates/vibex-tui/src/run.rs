@@ -1153,6 +1153,10 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));
             }
+            // Fold the loaded ids into the reader's arrangement: their pins and
+            // manual order survive a refresh, and new sessions are appended
+            // rather than dropped from the order.
+            app.reconcile_sidebar_arrangement();
             app.live = LiveState::Ready;
         }
         AppMessage::SessionOpened(result) => match result {

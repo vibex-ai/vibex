@@ -104,6 +104,7 @@ pub fn run(facade: BackendFacade, options: TuiOptions) -> BackendResult<ExitReas
             theme_id: options.theme_id,
             mode: options.mode,
             locale: options.locale,
+            sidebar_path: App::sidebar_arrangement_path(),
         },
     );
     let result = run::run_loop(&mut app, &worker, &mut messages);

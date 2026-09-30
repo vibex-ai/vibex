@@ -998,6 +998,11 @@ fn render_session_view(
                 vibex_desktop_model::AgentSidebarRowKind::Project => {
                     crate::glyphs::disclosure(!row.collapsed, app.glyph_tier())
                 }
+                // A pinned session keeps its place above the rest, and the list
+                // says so where the disclosure would otherwise be blank.
+                vibex_desktop_model::AgentSidebarRowKind::Session if row.pinned => {
+                    crate::glyphs::pin_marker(app.glyph_tier())
+                }
                 vibex_desktop_model::AgentSidebarRowKind::Session => " ",
             };
             let indent = " ".repeat(usize::from(row.depth) * 2);

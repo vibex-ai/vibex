@@ -72,6 +72,8 @@ fn main() {
                 vibex_ui::GpuiThemeMode::Dark
             },
             locale: Locale::En,
+            // A preview must not leave state behind.
+            sidebar_path: None,
         },
     );
     app.resize(width, height);

@@ -301,6 +301,29 @@ impl App {
                 self.toast(Toast::success(message));
                 Outcome::effects(vec![Effect::Clipboard { text }])
             }
+            Intent::PinSession => {
+                if self.toggle_session_pin() {
+                    let message = match self.selected_sidebar_row() {
+                        Some(row) if row.pinned => self.strings.sidebar_pinned(),
+                        _ => self.strings.sidebar_unpinned(),
+                    };
+                    self.toast(Toast::success(message));
+                }
+                Outcome::effects(vec![])
+            }
+            // Up the screen is a smaller row index.
+            Intent::MoveSessionUp => self.move_session(-1),
+            Intent::MoveSessionDown => self.move_session(1),
+            Intent::ToggleSidebarGrouping => {
+                let grouped = self.toggle_sidebar_grouping();
+                let message = if grouped {
+                    self.strings.sidebar_grouped()
+                } else {
+                    self.strings.sidebar_flat()
+                };
+                self.toast(Toast::info(message));
+                Outcome::effects(vec![])
+            }
             Intent::SwitchWorkspace => {
                 self.page = Page::Sessions;
                 self.toast(Toast::info(self.strings.workspace_pick().to_string()));
@@ -2039,6 +2062,20 @@ impl App {
             }
             crate::settings::SettingKind::Action => self.open_setting_action(row),
             crate::settings::SettingKind::ReadOnly => Outcome::quiet(),
+        }
+    }
+
+    /// Move the selected session through the list, one place per press.
+    ///
+    /// `delta` is in row-index space, so `-1` is up the screen.
+    fn move_session(&mut self, delta: isize) -> Outcome {
+        match self.move_session_row(delta) {
+            Some(true) => Outcome::effects(vec![]),
+            Some(false) => {
+                self.toast(Toast::warning(self.strings.sidebar_pinned_first()));
+                Outcome::quiet()
+            }
+            None => Outcome::quiet(),
         }
     }
 

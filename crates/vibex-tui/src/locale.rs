@@ -166,6 +166,15 @@ strings! {
     session_card_messages => { "Messages", "消息数", "訊息數" },
     session_card_turns => { "Turns", "轮次", "輪次" },
     session_card_tools => { "Tools", "工具", "工具" },
+    sidebar_pinned => { "Pinned to the top", "已置顶", "已置頂" },
+    sidebar_unpinned => { "Pin removed", "已取消置顶", "已取消置頂" },
+    sidebar_pinned_first => {
+        "Pinned sessions always come first — unpin one to move past it",
+        "置顶会话始终在最前 — 先取消置顶才能越过",
+        "置頂工作階段一律在最前 — 先取消置頂才能越過"
+    },
+    sidebar_grouped => { "Grouped by workspace", "按工作区分组", "依工作區分組" },
+    sidebar_flat => { "One flat list", "平铺列表", "平鋪清單" },
     session_cards_none => {
         "No session detail cards are open",
         "没有打开会话详情卡片",

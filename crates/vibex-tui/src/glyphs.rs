@@ -120,6 +120,14 @@ pub fn disclosure(open: bool, tier: GlyphTier) -> &'static str {
     }
 }
 
+/// The marker beside a row the reader has pinned. One column.
+pub fn pin_marker(tier: GlyphTier) -> &'static str {
+    match tier {
+        GlyphTier::Full => "●",
+        GlyphTier::Legacy => "*",
+    }
+}
+
 /// Chevrons for jumping a turn at a time. One column.
 pub fn chevron(up: bool, tier: GlyphTier) -> &'static str {
     match (up, tier) {

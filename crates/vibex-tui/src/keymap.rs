@@ -584,6 +584,30 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::EnterSession,
         "Open workspace",
     ),
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('p')),
+        Intent::PinSession,
+        "Pin",
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::new(KeyCode::Up, KeyModifiers::ALT),
+        Intent::MoveSessionUp,
+        "Move up",
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::new(KeyCode::Down, KeyModifiers::ALT),
+        Intent::MoveSessionDown,
+        "Move down",
+    ),
+    binding(
+        Scope::Sessions,
+        Chord::plain(KeyCode::Char('g')),
+        Intent::ToggleSidebarGrouping,
+        "Grouping",
+    ),
     // ---- agent (transcript) ---------------------------------------------
     binding(
         Scope::Agent,

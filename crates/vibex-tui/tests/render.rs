@@ -26,6 +26,9 @@ fn app(columns: u16, rows: u16) -> App {
             theme_id: Some("vibex-dark".to_string()),
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
+            // No arrangement file: a test must never write into the runner's
+            // home directory, and each test wants a clean list.
+            sidebar_path: None,
         },
     );
     app.resize(columns, rows);
@@ -478,6 +481,7 @@ fn color_less_mode_still_renders_every_label() {
             theme_id: None,
             mode: vibex_ui::GpuiThemeMode::Dark,
             locale: Locale::En,
+            sidebar_path: None,
         },
     );
     app.resize(100, 30);
@@ -584,6 +588,97 @@ fn a_session_detail_card_opens_and_closes_on_the_row() {
     app.perform(vibex_tui::action::Intent::CollapseSessionCards);
     let closed = text(&render(&mut app, 120, 40));
     assert!(!closed.contains("session_card0001"), "{closed}");
+}
+
+/// Two sessions in the same workspace, so they share one group heading.
+fn session_pair() -> Vec<vibex_core::AgentSession> {
+    let base = seeded_session("session_sidebar_alpha", "alpha session");
+    let mut first = base.clone();
+    first.last_message_at_ms = 1_759_251_100_000;
+    let mut second = base;
+    second.id = vibex_core::VibexSessionId::parse("session_sidebar_beta").expect("valid id");
+    second.title = "beta session".to_string();
+    second.last_message_at_ms = 1_759_251_200_000;
+    vec![first, second]
+}
+
+#[test]
+fn pinning_a_session_hoists_it_above_the_rest() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    app.perform(Intent::GotoSessions);
+    // Row 0 is the workspace heading, rows 1 and 2 are the sessions; the newer
+    // one sorts first.
+    let before = text(&render(&mut app, 120, 40));
+    let alpha = before.find("alpha session").expect("alpha on screen");
+    let beta = before.find("beta session").expect("beta on screen");
+    assert!(beta < alpha, "the newer session should lead:\n{before}");
+
+    app.set_selection(Scope::Sessions, 2);
+    app.perform(Intent::PinSession);
+    let after = text(&render(&mut app, 120, 40));
+    let alpha = after.find("alpha session").expect("alpha on screen");
+    let beta = after.find("beta session").expect("beta on screen");
+    assert!(alpha < beta, "the pinned session did not move up:\n{after}");
+}
+
+#[test]
+fn a_pinned_session_cannot_be_passed_by_a_manual_move() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    app.perform(Intent::GotoSessions);
+    // Row 2 is the older session; pinning it hoists it above the newer one.
+    app.set_selection(Scope::Sessions, 2);
+    app.perform(Intent::PinSession);
+    app.set_selection(Scope::Sessions, 2);
+    // The unpinned session cannot be moved above the pinned one: the projection
+    // always sorts pins first, so the move would be a lie.
+    app.perform(Intent::MoveSessionUp);
+    let screen = text(&render(&mut app, 120, 40));
+    let alpha = screen.find("alpha session").expect("alpha on screen");
+    let beta = screen.find("beta session").expect("beta on screen");
+    assert!(alpha < beta, "the pinned order was disturbed:\n{screen}");
+    assert!(
+        screen.contains("Pinned sessions always come first"),
+        "the refusal was silent:\n{screen}"
+    );
+}
+
+#[test]
+fn a_manual_move_reorders_two_unpinned_sessions() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    app.perform(Intent::GotoSessions);
+    // Row 2 is the older session; moving it up swaps the two.
+    app.set_selection(Scope::Sessions, 2);
+    app.perform(Intent::MoveSessionUp);
+    let screen = text(&render(&mut app, 120, 40));
+    let alpha = screen.find("alpha session").expect("alpha on screen");
+    let beta = screen.find("beta session").expect("beta on screen");
+    assert!(alpha < beta, "the move did not take:\n{screen}");
+    // The cursor followed the row that moved.
+    assert_eq!(app.selection_for(Scope::Sessions), 1);
+}
+
+#[test]
+fn grouping_can_be_folded_away_without_losing_the_sessions() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    app.perform(Intent::GotoSessions);
+    let grouped = text(&render(&mut app, 120, 40));
+    assert!(grouped.contains("vibex-card-workspace"), "{grouped}");
+    app.perform(Intent::ToggleSidebarGrouping);
+    let flat = text(&render(&mut app, 120, 40));
+    assert!(
+        !flat.contains("vibex-card-workspace"),
+        "the heading survived the toggle:\n{flat}"
+    );
+    assert!(flat.contains("alpha session"), "{flat}");
+    assert!(flat.contains("beta session"), "{flat}");
 }
 
 fn seeded_block(
