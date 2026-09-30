@@ -1610,7 +1610,7 @@ impl App {
             ));
             return Outcome::quiet();
         }
-        let text = self.composer.take();
+        let text = self.composer.take_expanded();
         self.history.push(text.clone());
         self.completion = None;
         self.scroll.follow = true;
@@ -1625,7 +1625,7 @@ impl App {
         let Some(session_id) = self.selected_session_id().cloned() else {
             return Outcome::quiet();
         };
-        let text = self.composer.take();
+        let text = self.composer.take_expanded();
         self.history.push(text.clone());
         // Remote seats have no steering RPC, so the worker falls back to
         // interrupt + resend and says so.

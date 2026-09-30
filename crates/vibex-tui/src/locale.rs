@@ -264,6 +264,16 @@ strings! {
     },
     composer_empty => { "Message is empty", "消息为空", "訊息為空" },
     composer_history => { "History", "历史", "歷史" },
+    composer_history_empty => {
+        "No sent message matches that",
+        "没有匹配的已发送消息",
+        "沒有符合的已傳送訊息"
+    },
+    composer_history_hint => {
+        "Type after ? to search sent messages; Enter recalls the match",
+        "在 ? 后输入以搜索已发送消息；Enter 取回",
+        "在 ? 後輸入以搜尋已傳送訊息；Enter 取回"
+    },
     composer_draft_cleared => { "Draft cleared", "草稿已清空", "草稿已清空" },
     composer_press_again => {
         "Press Esc again to clear the draft",

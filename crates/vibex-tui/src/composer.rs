@@ -139,7 +139,31 @@ impl EditKind {
 struct Snapshot {
     text: String,
     cursor: usize,
+    chips: Vec<PasteChip>,
 }
+
+/// A pasted block collapsed into a label until the message is sent.
+///
+/// The buffer's text holds the label (`[Pasted: 42 lines]`), so everything
+/// that measures, wraps or moves the cursor keeps working unchanged; the
+/// original bytes ride alongside and are substituted back in
+/// [`ComposerBuffer::expanded_text`] on the way out. A chip is atomic: the
+/// cursor steps over it and one `Backspace` removes all of it, because a
+/// hundred-line paste must not be a hundred keys to undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteChip {
+    /// Byte range of the label inside the buffer text.
+    start: usize,
+    end: usize,
+    label: String,
+    content: String,
+}
+
+/// The line count at which a paste collapses into a chip.
+pub const PASTE_CHIP_LINES: usize = 4;
+/// The byte size at which a paste collapses into a chip however few lines it
+/// has. A single-line minified log is still not something to put in a prompt.
+pub const PASTE_CHIP_BYTES: usize = 10_000;
 
 /// A multi-line editable buffer with a grapheme-aligned cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +180,8 @@ pub struct ComposerBuffer {
     last_edit: Option<EditKind>,
     /// The last killed text, put back by `Ctrl+Y`.
     kill_buffer: String,
+    /// Collapsed pastes, in buffer order.
+    chips: Vec<PasteChip>,
 }
 
 impl Default for ComposerBuffer {
@@ -167,10 +193,12 @@ impl Default for ComposerBuffer {
             history: vec![Snapshot {
                 text: String::new(),
                 cursor: 0,
+                chips: Vec::new(),
             }],
             history_index: 0,
             last_edit: None,
             kill_buffer: String::new(),
+            chips: Vec::new(),
         }
     }
 }
@@ -183,6 +211,7 @@ impl ComposerBuffer {
             history: vec![Snapshot {
                 text: text.clone(),
                 cursor,
+                chips: Vec::new(),
             }],
             text,
             cursor,
@@ -190,6 +219,7 @@ impl ComposerBuffer {
             history_index: 0,
             last_edit: None,
             kill_buffer: String::new(),
+            chips: Vec::new(),
         }
     }
 
@@ -230,6 +260,7 @@ impl ComposerBuffer {
         let snapshot = Snapshot {
             text: self.text.clone(),
             cursor: self.cursor,
+            chips: self.chips.clone(),
         };
         let coalesce = self.last_edit == Some(kind) && kind.coalesces();
         if coalesce && self.history_index < self.history.len() {
@@ -275,9 +306,140 @@ impl ComposerBuffer {
     fn restore(&mut self) {
         let snapshot = self.history[self.history_index].clone();
         self.text = snapshot.text;
+        self.chips = snapshot.chips;
         self.cursor = snapshot.cursor.min(self.text.len());
         self.preferred_column = None;
         self.break_batch();
+    }
+
+    /// A paste, collapsed to a chip when it is big enough to bury the draft.
+    ///
+    /// Returns whether it became a chip. Small pastes are inserted literally:
+    /// a chip for two lines is more chrome than content.
+    pub fn insert_paste(&mut self, value: &str) -> bool {
+        let value = normalize_line_breaks(value);
+        // Re-pasting the content of a chip the cursor is on expands it instead
+        // of adding a second copy of the same thing.
+        if let Some(index) = self.chip_covering(self.cursor).or_else(|| {
+            self.chips
+                .iter()
+                .position(|chip| chip.end == self.cursor || chip.start == self.cursor)
+        }) && self.chips[index].content == value
+        {
+            // The paste is already here, collapsed: show it rather than
+            // inserting a second copy of the same bytes.
+            self.expand_chip(index);
+            return false;
+        }
+        let lines = value.lines().count().max(1);
+        if lines < PASTE_CHIP_LINES && value.len() <= PASTE_CHIP_BYTES {
+            self.insert_str(&value);
+            return false;
+        }
+        let label = paste_label(&value, lines);
+        let start = self.cursor;
+        self.text.insert_str(start, &label);
+        let end = start + label.len();
+        self.cursor = end;
+        self.preferred_column = None;
+        self.chips.push(PasteChip {
+            start,
+            end,
+            label,
+            content: value,
+        });
+        self.chips.sort_by_key(|chip| chip.start);
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// Replace one chip's label with its content, in place.
+    fn expand_chip(&mut self, index: usize) -> bool {
+        let Some(chip) = self.chips.get(index).cloned() else {
+            return false;
+        };
+        self.text.replace_range(chip.start..chip.end, &chip.content);
+        self.chips.remove(index);
+        self.cursor = chip.start + chip.content.len();
+        let delta = chip.content.len() as isize - (chip.end - chip.start) as isize;
+        self.shift_chips(chip.end, delta);
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
+    }
+
+    /// The text to send: every chip replaced by what was actually pasted.
+    pub fn expanded_text(&self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        let mut cursor = 0usize;
+        for chip in &self.chips {
+            if chip.start < cursor || chip.end > self.text.len() {
+                continue;
+            }
+            out.push_str(&self.text[cursor..chip.start]);
+            out.push_str(&chip.content);
+            cursor = chip.end;
+        }
+        out.push_str(&self.text[cursor..]);
+        out
+    }
+
+    /// Take the expanded text out, leaving an empty buffer.
+    pub fn take_expanded(&mut self) -> String {
+        let text = self.expanded_text();
+        self.text.clear();
+        self.cursor = 0;
+        self.preferred_column = None;
+        self.chips.clear();
+        self.record(EditKind::Block);
+        text
+    }
+
+    /// How many pastes are currently collapsed.
+    pub fn chip_count(&self) -> usize {
+        self.chips.len()
+    }
+
+    fn chip_covering(&self, index: usize) -> Option<usize> {
+        self.chips
+            .iter()
+            .position(|chip| index >= chip.start && index < chip.end)
+    }
+
+    /// Drop any chip the edit range touched, and move the rest with the text.
+    ///
+    /// A chip is only valid while its label is exactly where it was put; an
+    /// edit that reaches into one dissolves it into literal text rather than
+    /// leaving a range pointing at the wrong bytes.
+    fn reshape_chips(&mut self, from: usize, to: usize) {
+        self.chips
+            .retain(|chip| chip.end <= from || chip.start >= to);
+    }
+
+    fn shift_chips(&mut self, at: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        for chip in &mut self.chips {
+            if chip.start >= at {
+                chip.start = chip.start.saturating_add_signed(delta);
+                chip.end = chip.end.saturating_add_signed(delta);
+            }
+        }
+    }
+
+    /// Remove a whole chip, label and all.
+    fn delete_chip_at(&mut self, index: usize) -> bool {
+        let Some(chip) = self.chips.get(index).cloned() else {
+            return false;
+        };
+        self.text.replace_range(chip.start..chip.end, "");
+        self.chips.remove(index);
+        self.shift_chips(chip.end, -((chip.end - chip.start) as isize));
+        self.cursor = chip.start;
+        self.preferred_column = None;
+        self.record(EditKind::Block);
+        true
     }
 
     pub fn clear(&mut self) {
@@ -287,6 +449,7 @@ impl ComposerBuffer {
         self.text.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.chips.clear();
         self.record(EditKind::Block);
     }
 
@@ -294,6 +457,7 @@ impl ComposerBuffer {
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
+        self.chips.clear();
         self.record(EditKind::Block);
     }
 
@@ -302,14 +466,18 @@ impl ComposerBuffer {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
         self.preferred_column = None;
+        self.chips.clear();
         self.record(EditKind::Block);
         text
     }
 
     pub fn insert_char(&mut self, character: char) {
-        self.text.insert(self.cursor, character);
+        let at = self.cursor;
+        self.text.insert(at, character);
         self.cursor += character.len_utf8();
         self.preferred_column = None;
+        self.reshape_chips(at, at);
+        self.shift_chips(at, character.len_utf8() as isize);
         let kind = if character.is_whitespace() {
             EditKind::InsertSpace
         } else {
@@ -319,9 +487,12 @@ impl ComposerBuffer {
     }
 
     pub fn insert_str(&mut self, value: &str) {
-        self.text.insert_str(self.cursor, value);
+        let at = self.cursor;
+        self.text.insert_str(at, value);
         self.cursor += value.len();
         self.preferred_column = None;
+        self.reshape_chips(at, at);
+        self.shift_chips(at, value.len() as isize);
         self.record(EditKind::Block);
     }
 
@@ -330,10 +501,17 @@ impl ComposerBuffer {
         if self.cursor == 0 {
             return false;
         }
+        // A chip is one object: the whole paste goes with one press.
+        if let Some(index) = self.chips.iter().position(|chip| chip.end == self.cursor) {
+            return self.delete_chip_at(index);
+        }
         let start = self.previous_grapheme_boundary();
-        self.text.replace_range(start..self.cursor, "");
+        let end = self.cursor;
+        self.text.replace_range(start..end, "");
         self.cursor = start;
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Delete);
         true
     }
@@ -343,9 +521,15 @@ impl ComposerBuffer {
         if self.cursor >= self.text.len() {
             return false;
         }
+        if let Some(index) = self.chips.iter().position(|chip| chip.start == self.cursor) {
+            return self.delete_chip_at(index);
+        }
+        let start = self.cursor;
         let end = self.next_grapheme_boundary();
-        self.text.replace_range(self.cursor..end, "");
+        self.text.replace_range(start..end, "");
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Delete);
         true
     }
@@ -361,9 +545,12 @@ impl ComposerBuffer {
             return false;
         }
         self.kill_buffer = self.text[start..self.cursor].to_string();
-        self.text.replace_range(start..self.cursor, "");
+        let end = self.cursor;
+        self.text.replace_range(start..end, "");
         self.cursor = start;
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Block);
         true
     }
@@ -375,8 +562,11 @@ impl ComposerBuffer {
             return false;
         }
         self.kill_buffer = self.text[self.cursor..end].to_string();
-        self.text.replace_range(self.cursor..end, "");
+        let start = self.cursor;
+        self.text.replace_range(start..end, "");
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Block);
         true
     }
@@ -389,9 +579,12 @@ impl ComposerBuffer {
             return false;
         }
         self.kill_buffer = self.text[start..self.cursor].to_string();
-        self.text.replace_range(start..self.cursor, "");
+        let end = self.cursor;
+        self.text.replace_range(start..end, "");
         self.cursor = start;
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Block);
         true
     }
@@ -410,8 +603,11 @@ impl ComposerBuffer {
             return false;
         }
         self.kill_buffer = self.text[self.cursor..end].to_string();
-        self.text.replace_range(self.cursor..end, "");
+        let start = self.cursor;
+        self.text.replace_range(start..end, "");
         self.preferred_column = None;
+        self.reshape_chips(start, end);
+        self.shift_chips(start, -((end - start) as isize));
         self.record(EditKind::Block);
         true
     }
@@ -423,9 +619,12 @@ impl ComposerBuffer {
             return false;
         }
         self.kill_buffer = self.text[line_start..self.cursor].to_string();
-        self.text.replace_range(line_start..self.cursor, "");
+        let end = self.cursor;
+        self.text.replace_range(line_start..end, "");
         self.cursor = line_start;
         self.preferred_column = None;
+        self.reshape_chips(line_start, end);
+        self.shift_chips(line_start, -((end - line_start) as isize));
         self.record(EditKind::Block);
         true
     }
@@ -436,9 +635,11 @@ impl ComposerBuffer {
             return false;
         }
         let text = self.kill_buffer.clone();
-        self.text.insert_str(self.cursor, &text);
+        let at = self.cursor;
+        self.text.insert_str(at, &text);
         self.cursor += text.len();
         self.preferred_column = None;
+        self.shift_chips(at, text.len() as isize);
         self.record(EditKind::Block);
         true
     }
@@ -565,13 +766,20 @@ impl ComposerBuffer {
 
     pub fn move_left(&mut self) {
         self.break_batch();
-        self.cursor = self.previous_grapheme_boundary();
+        // A chip is one stop, not one per label character.
+        self.cursor = match self.chips.iter().find(|chip| chip.end == self.cursor) {
+            Some(chip) => chip.start,
+            None => self.previous_grapheme_boundary(),
+        };
         self.preferred_column = None;
     }
 
     pub fn move_right(&mut self) {
         self.break_batch();
-        self.cursor = self.next_grapheme_boundary();
+        self.cursor = match self.chips.iter().find(|chip| chip.start == self.cursor) {
+            Some(chip) => chip.end,
+            None => self.next_grapheme_boundary(),
+        };
         self.preferred_column = None;
     }
 
@@ -855,6 +1063,53 @@ impl ComposerHistory {
     }
 }
 
+/// Turn any line break a terminal might send into `\n`.
+///
+/// Bracketed paste delivers what the clipboard holds, and that can include
+/// bare carriage returns (old Mac line endings), `\r\n`, or the Unicode line
+/// and paragraph separators. Normalising once, here, means everything
+/// downstream can assume `\n`.
+pub fn normalize_line_breaks(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                out.push('\n');
+            }
+            '\u{2028}' | '\u{2029}' => out.push('\n'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The label a collapsed paste is shown as.
+fn paste_label(value: &str, lines: usize) -> String {
+    if lines == 1 && value.len() > PASTE_CHIP_BYTES {
+        return format!("[Pasted: {}]", compact_bytes(value.len()));
+    }
+    if lines == 1 {
+        "[Pasted: 1 line]".to_string()
+    } else {
+        format!("[Pasted: {lines} lines]")
+    }
+}
+
+/// Decimal byte count, the way a file manager reports one.
+fn compact_bytes(bytes: usize) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{} KB", bytes / 1_000)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Which class a grapheme belongs to, for word motions.
 ///
 /// `Small` word style: a run of alphanumerics and underscores, a run of
@@ -1053,6 +1308,113 @@ mod tests {
         assert_eq!(menu.filtered("HE").len(), 1);
         assert_eq!(menu.filtered("").len(), 2);
         assert_eq!(menu.filtered("zzz").len(), 0);
+    }
+
+    #[test]
+    fn a_long_paste_collapses_into_one_atomic_chip() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("here is the log: ");
+        let log = (0..42)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(buffer.insert_paste(&log), "42 lines is a chip");
+        assert_eq!(buffer.chip_count(), 1);
+        // The draft shows the label, not the log.
+        assert!(
+            buffer.text().ends_with("[Pasted: 42 lines]"),
+            "{}",
+            buffer.text()
+        );
+        // One Backspace removes the whole paste.
+        buffer.backspace();
+        assert_eq!(buffer.text(), "here is the log: ");
+        assert_eq!(buffer.chip_count(), 0);
+        // ...and undo brings it back, still collapsed.
+        assert!(buffer.undo());
+        assert_eq!(buffer.chip_count(), 1);
+    }
+
+    #[test]
+    fn a_short_paste_stays_literal() {
+        let mut buffer = ComposerBuffer::default();
+        assert!(!buffer.insert_paste("two\nlines"));
+        assert_eq!(buffer.chip_count(), 0);
+        assert_eq!(buffer.text(), "two\nlines");
+    }
+
+    #[test]
+    fn a_chip_is_expanded_on_the_way_out_and_not_before() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..10)
+            .map(|index| format!("row {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        buffer.insert_paste(&log);
+        assert!(!buffer.text().contains("row 3"));
+        let sent = buffer.expanded_text();
+        assert!(sent.contains("row 3"), "{sent}");
+        assert_eq!(sent, log);
+        // Sending clears the chip with the draft.
+        let taken = buffer.take_expanded();
+        assert_eq!(taken, log);
+        assert!(buffer.text().is_empty());
+        assert_eq!(buffer.chip_count(), 0);
+    }
+
+    #[test]
+    fn repasting_the_same_content_expands_the_chip_instead_of_duplicating_it() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..8)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        buffer.insert_paste(&log);
+        assert_eq!(buffer.chip_count(), 1);
+        buffer.move_to_end();
+        assert!(!buffer.insert_paste(&log), "the second paste expands");
+        assert_eq!(buffer.chip_count(), 0);
+        assert_eq!(buffer.text(), log);
+    }
+
+    #[test]
+    fn editing_a_chip_dissolves_it_rather_than_leaving_a_stale_range() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..6)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        buffer.insert_paste(&log);
+        assert_eq!(buffer.chip_count(), 1);
+        // Backspace twice: once removes the chip, the second edits the draft.
+        buffer.backspace();
+        assert_eq!(buffer.chip_count(), 0);
+        buffer.insert_str("plain");
+        assert_eq!(buffer.expanded_text(), "plain");
+    }
+
+    #[test]
+    fn the_cursor_steps_over_a_chip_whole() {
+        let mut buffer = ComposerBuffer::default();
+        let log = (0..5)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        buffer.insert_paste(&log);
+        let end = buffer.cursor();
+        buffer.move_left();
+        assert_eq!(buffer.cursor(), 0, "one step, not one per label character");
+        buffer.move_right();
+        assert_eq!(buffer.cursor(), end);
+    }
+
+    #[test]
+    fn line_breaks_are_normalised_before_a_chip_is_measured() {
+        assert_eq!(normalize_line_breaks("a\r\nb\rc\u{2028}d"), "a\nb\nc\nd");
+        let mut buffer = ComposerBuffer::default();
+        // Four CRLF lines are four lines, so this is a chip.
+        assert!(buffer.insert_paste("1\r\n2\r\n3\r\n4"));
+        assert_eq!(buffer.chip_count(), 1);
     }
 
     #[test]

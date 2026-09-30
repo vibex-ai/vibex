@@ -138,7 +138,9 @@ fn event_loop(
                         }
                         app.refresh_search_matches();
                     } else {
-                        app.composer.insert_str(&text);
+                        // A big paste collapses into a chip so the draft stays
+                        // readable; the bytes are put back when it is sent.
+                        app.composer.insert_paste(&text);
                         app.refresh_completion();
                     }
                     dirty = true;
@@ -521,6 +523,32 @@ fn handle_composer_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // The draft's first character decides its mode, so the mode is refreshed
+    // before the key is interpreted rather than tracked alongside the text.
+    app.sync_composer_mode();
+    // `? ` puts the composer in history search: the draft is the query and the
+    // drawer above it is the list.
+    if app.composer_mode == crate::app::ComposerMode::HistorySearch {
+        match key.code {
+            KeyCode::Up => {
+                app.move_history_selection(-1);
+                return Ok(Some(false));
+            }
+            KeyCode::Down => {
+                app.move_history_selection(1);
+                return Ok(Some(false));
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                app.accept_history_match();
+                return Ok(Some(false));
+            }
+            KeyCode::Esc => {
+                app.cancel_history_search();
+                return Ok(Some(false));
+            }
+            _ => {}
+        }
+    }
     match key.code {
         // `Alt` chords belong to the binding table: word motions, redo and the
         // kill commands are bindings, not text. Inserting the letter instead

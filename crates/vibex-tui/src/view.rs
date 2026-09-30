@@ -1788,7 +1788,9 @@ fn render_composer(
                 } else {
                     theme.base().add_modifier(Modifier::DIM)
                 };
-                Line::from(vec![gutter, Span::styled(text, style)])
+                let mut spans = vec![gutter];
+                spans.extend(composer_line_spans(&text, style, theme));
+                Line::from(spans)
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(Text::from(lines)), text_area);
@@ -1809,7 +1811,117 @@ fn render_composer(
 
     if let Some(menu) = app.completion.clone() {
         render_completion(frame, area, app, theme, &menu);
+    } else if app.composer_mode == ComposerMode::HistorySearch {
+        render_history_search(frame, area, app, theme, strings);
     }
+}
+
+/// The history search drawer, drawn above the composer like the completion
+/// drawer and with the same two-rule chrome.
+///
+/// It is the same shape on purpose: `? ` in the draft and `/`/`@` completions
+/// are all "a list attached to the prompt", and giving them different chrome
+/// would invent a distinction the reader does not have.
+fn render_history_search(
+    frame: &mut Frame<'_>,
+    anchor: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    const MAX_ROWS: usize = 8;
+    let matches = app.history_matches();
+    let rows = matches.len().clamp(1, MAX_ROWS);
+    let height = rows as u16 + 2;
+    if anchor.y < height || anchor.width < 8 {
+        return;
+    }
+    let area = Rect {
+        x: anchor.x,
+        y: anchor.y - height,
+        width: anchor.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let rule_style = Style::default().fg(theme.roles.gray_dim);
+    // Top rule, titled and with the match count right-aligned on it.
+    let title = format!(" {} ", strings.composer_history());
+    let count = format!(" {} ", matches.len());
+    let used = display_width(&title) + display_width(&count);
+    let mut top = vec![Span::styled(title, Style::default().fg(theme.roles.gray))];
+    if usize::from(area.width) > used + 2 {
+        top.push(Span::styled(
+            "─".repeat(usize::from(area.width) - used),
+            rule_style,
+        ));
+        top.push(Span::styled(count, Style::default().fg(theme.roles.gray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(top)), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(area.width)),
+            rule_style,
+        ))),
+        Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        },
+    );
+
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    if matches.is_empty() {
+        empty_state(frame, body, theme, strings.composer_history_empty());
+        return;
+    }
+    // The selection is kept in view by scrolling the window rather than by an
+    // offset of its own: the list is short and the cursor is the anchor.
+    let selected = app.history_selection.min(matches.len() - 1);
+    let offset = selected.saturating_sub(rows.saturating_sub(1));
+    let lines = matches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(rows)
+        .map(|(index, (_, text))| {
+            let active = index == selected;
+            let first_line = text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            let mut spans = vec![Span::styled(
+                if active { "❯ " } else { "  " },
+                Style::default().fg(theme.roles.accent_user),
+            )];
+            if active {
+                spans.push(Span::styled(
+                    truncate_to_width(
+                        first_line.trim(),
+                        usize::from(body.width).saturating_sub(2),
+                        "…",
+                    ),
+                    Style::default()
+                        .fg(theme.roles.foreground)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    truncate_to_width(
+                        first_line.trim(),
+                        usize::from(body.width).saturating_sub(2),
+                        "…",
+                    ),
+                    Style::default().fg(theme.roles.gray),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
 /// The composer's info line: context on the left, mode on the right.
@@ -2975,6 +3087,40 @@ fn render_help(
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), list_area);
+}
+
+/// Split one composer line into spans, lifting a collapsed paste out of it.
+///
+/// A chip is a single object visually as well as in the buffer: the brackets
+/// are dim and the label is coloured, so a draft with a log in it reads as
+/// "a log is attached" rather than "the draft begins with a strange sentence".
+fn composer_line_spans(text: &str, style: Style, theme: &TuiTheme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[Pasted:") {
+        let after = &rest[start..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), style));
+        }
+        let label = &after[..=end];
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(theme.roles.accent_attention)
+                .add_modifier(Modifier::BOLD),
+        ));
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), style));
+    }
+    spans
 }
 
 /// The key hint bar.

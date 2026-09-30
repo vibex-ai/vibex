@@ -921,6 +921,58 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
 }
 
 #[test]
+fn a_big_paste_shows_as_one_chip_in_the_composer() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    let log = (0..40)
+        .map(|index| format!("2025-09-30 INFO line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(app.composer.insert_paste(&log), "40 lines is a chip");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(
+        screen.contains("[Pasted: 40 lines]"),
+        "the chip is not drawn:\n{screen}"
+    );
+    assert!(
+        !screen.contains("INFO line 7"),
+        "the paste is not collapsed:\n{screen}"
+    );
+    // What is sent is the bytes, not the label.
+    assert!(app.composer.expanded_text().contains("INFO line 7"));
+}
+
+#[test]
+fn the_history_drawer_lists_and_recalls_sent_messages() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    for entry in [
+        "fix the flaky upload test",
+        "add a retry to the upload path",
+        "write the release notes",
+    ] {
+        app.history.push(entry);
+    }
+    app.composer.set_text("? upload");
+    app.sync_composer_mode();
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("History"), "no drawer:\n{screen}");
+    assert!(screen.contains("2"), "the count is missing:\n{screen}");
+    assert!(screen.contains("fix the flaky upload test"), "{screen}");
+    assert!(!screen.contains("write the release notes"), "{screen}");
+
+    // Newest first, so the more recent match is the drawer's first row.
+    let matches = app.history_matches();
+    assert_eq!(matches[0].1, "add a retry to the upload path");
+    app.move_history_selection(1);
+    assert!(app.accept_history_match());
+    assert_eq!(app.composer.text(), "fix the flaky upload test");
+    assert_eq!(app.composer_mode, vibex_tui::app::ComposerMode::Normal);
+}
+
+#[test]
 fn the_welcome_screen_orders_the_first_run_steps() {
     let mut app = app(120, 40);
     app.live = vibex_tui::app::LiveState::Ready;

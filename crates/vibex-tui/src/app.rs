@@ -381,6 +381,8 @@ pub struct App {
     pub session_cards: std::collections::BTreeSet<String>,
     /// The transcript search in progress, when the search bar is open.
     pub search: Option<crate::search::SearchState>,
+    /// Which sent message the composer's history drawer points at.
+    pub history_selection: usize,
     /// The mouse selection over the transcript, while it is being made or after
     /// it has been copied.
     pub text_selection: Option<TextSelection>,
@@ -579,6 +581,7 @@ impl App {
             draft_clear_armed: false,
             session_cards: std::collections::BTreeSet::new(),
             search: None,
+            history_selection: 0,
             text_selection: None,
             last_click: None,
             queued_messages: Vec::new(),
@@ -1095,6 +1098,134 @@ impl App {
         true
     }
 
+    // ---- composer history search ----------------------------------------
+
+    /// Derive the composer's mode from what the draft starts with.
+    ///
+    /// The mode is a property of the text rather than a separate flag, so it
+    /// survives an undo, a recalled history entry and a paste without any of
+    /// them having to remember to set it.
+    pub fn sync_composer_mode(&mut self) {
+        let text = self.composer.text();
+        let next = if text == "?" || text.starts_with("? ") {
+            ComposerMode::HistorySearch
+        } else {
+            ComposerMode::Normal
+        };
+        if next != self.composer_mode {
+            self.composer_mode = next;
+            self.history_selection = 0;
+        }
+    }
+
+    /// The query the history drawer is filtering by, when it is open.
+    pub fn history_query(&self) -> Option<String> {
+        if self.composer_mode != ComposerMode::HistorySearch {
+            return None;
+        }
+        Some(
+            self.composer
+                .text()
+                .strip_prefix("? ")
+                .or_else(|| self.composer.text().strip_prefix('?'))
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// Sent messages matching the history query, best first.
+    ///
+    /// Ranking is deliberately simple — prefix beats word-start beats
+    /// substring, then newest first — because the history is at most a few
+    /// hundred entries and a reader looking for a message they sent recognises
+    /// it by reading, not by score.
+    pub fn history_matches(&self) -> Vec<(usize, String)> {
+        let Some(query) = self.history_query() else {
+            return Vec::new();
+        };
+        let query = query.trim().to_lowercase();
+        let entries = self.history.entries();
+        if query.is_empty() {
+            return entries
+                .iter()
+                .enumerate()
+                .rev()
+                .take(MAX_HISTORY_MATCHES)
+                .map(|(index, text)| (index, text.clone()))
+                .collect();
+        }
+        let mut scored = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                let haystack = text.to_lowercase();
+                let score = if haystack.starts_with(&query) {
+                    0
+                } else if haystack
+                    .split_whitespace()
+                    .any(|word| word.starts_with(&query))
+                {
+                    1
+                } else if haystack.contains(&query) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((score, index, text.clone()))
+            })
+            .collect::<Vec<_>>();
+        // Newest first inside a rank, so the most recent match is on top.
+        scored.sort_by(|left, right| (left.0, right.1).cmp(&(right.0, left.1)));
+        scored
+            .into_iter()
+            .take(MAX_HISTORY_MATCHES)
+            .map(|(_, index, text)| (index, text))
+            .collect()
+    }
+
+    /// The history drawer's current row.
+    pub fn history_selected(&self) -> Option<(usize, String)> {
+        let matches = self.history_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let index = self.history_selection.min(matches.len() - 1);
+        Some(matches[index].clone())
+    }
+
+    /// Move the history drawer's selection.
+    pub fn move_history_selection(&mut self, delta: isize) {
+        let count = self.history_matches().len();
+        if count == 0 {
+            return;
+        }
+        let current = self.history_selection.min(count - 1) as isize;
+        self.history_selection = (current + delta).clamp(0, count as isize - 1) as usize;
+    }
+
+    /// Replace the draft with the selected history entry.
+    pub fn accept_history_match(&mut self) -> bool {
+        let Some((_, text)) = self.history_selected() else {
+            return false;
+        };
+        self.composer.set_text(text);
+        self.composer_mode = ComposerMode::Normal;
+        self.history_selection = 0;
+        self.refresh_completion();
+        true
+    }
+
+    /// Leave history search, dropping the query.
+    pub fn cancel_history_search(&mut self) -> bool {
+        if self.composer_mode != ComposerMode::HistorySearch {
+            return false;
+        }
+        self.composer.clear();
+        self.composer_mode = ComposerMode::Normal;
+        self.history_selection = 0;
+        true
+    }
+
     // ---- transcript text selection -------------------------------------
 
     /// Start a selection at one cell of the transcript band.
@@ -1210,6 +1341,9 @@ impl App {
         None
     }
 }
+
+/// How many history entries the composer's drawer will show.
+pub const MAX_HISTORY_MATCHES: usize = 100;
 
 /// Column thresholds for the three shell layouts, re-calibrated from the
 /// desktop's pixel breakpoints for a character grid.
