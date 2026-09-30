@@ -4837,7 +4837,7 @@ fn codex_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "codex-acp",
         "Codex (ACP)",
-        "Codex through the fixed @agentclientprotocol/codex-acp@1.8.0 Adapter managed by the Compatibility Registry.",
+        "Codex through the fixed @agentclientprotocol/codex-acp@2.0.1 Adapter managed by the Compatibility Registry.",
         "codex-acp",
         &[],
         &["local", "acp", "codex"],

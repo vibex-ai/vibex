@@ -1217,9 +1217,9 @@ fn legacy_runtime_identity(
             }
             ("codex", None) if looks_managed_adapter_command(command, args, "codex-acp") => (
                 "codex-acp",
-                Some("1.8.0".to_string()),
-                Some("0.152.1".to_string()),
-                BTreeMap::from([("@openai/codex".to_string(), "0.152.1".to_string())]),
+                Some("2.0.1".to_string()),
+                Some("0.159.2".to_string()),
+                BTreeMap::from([("@openai/codex".to_string(), "0.159.2".to_string())]),
                 AgentVersionSource::Managed,
             ),
             ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {

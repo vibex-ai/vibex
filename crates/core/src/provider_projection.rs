@@ -49,7 +49,7 @@ const CODEX_ADAPTER_VERSION: &str = "1.8.0";
 pub const CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=1.8.0";
 #[cfg(test)]
 const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-const CODEX_RUNTIME_VERSION: &str = "0.152.1";
+const CODEX_RUNTIME_VERSION: &str = "0.159.2";
 const OPENCODE_AGENT_ID: &str = "opencode";
 const OPENCODE_ADAPTER_ID: &str = "opencode-acp";
 const ZCODE_AGENT_ID: &str = "zcode";

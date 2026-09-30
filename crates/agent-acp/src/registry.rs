@@ -33,13 +33,19 @@ pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.71.0";
 pub const CODEX_AGENT_ID: &str = "codex";
 pub const CODEX_ADAPTER_ID: &str = "codex-acp";
 pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CODEX_ADAPTER_VERSION: &str = "1.8.0";
-pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-F/wgzhlPOmLN9H6iEUNeV4W0RC1aL9YG2tDBZT3QuiNM7vj2ku00BDb08oVkxO2+FOsmE71XHcMmVWA2rKx8ug==";
-pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=1.8.0";
+pub const CODEX_ADAPTER_VERSION: &str = "2.0.1";
+pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-P144H9s2hUVvVDDgnL1+8u7VJu1OIBxHlb81VCxIBQM/M2D0JAepMufEW7jTKK4AML0TOHL+G1t5RqEt/t1fFA==";
+/// The alias table is registered against the exact adapter identity, so this
+/// requirement moves with `CODEX_ADAPTER_VERSION` rather than describing a
+/// range: 2.0.1 is the only release whose config-option spellings were read
+/// back from the published bundle.
+pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=2.0.1";
 pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.152.0";
-pub const CODEX_RUNTIME_PIN: &str = "0.152.1";
-pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-dSwQzl6JgsFe8L9i8xUnwRz9Vy8gn4UvXFU9xq2IJ1eC7zsSttqQ2SGq49ZZIjEyZQ0LZjCs6Bvtxort2Iyebg==";
+/// What 2.0.1 declares it needs. It moved from `^0.152.0`, so the runtime pin
+/// below has to satisfy the new range rather than the old one.
+pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.159.1";
+pub const CODEX_RUNTIME_PIN: &str = "0.159.2";
+pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-SE13C3nZCYoVL569BdegoOl6vwjb7o2sXOo7ivwVzaVoY0cswwi0/6pIE0TyO/C0vIkQh3jslExitET7PBTfIg==";
 
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
@@ -1050,7 +1056,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             "true".to_string(),
         )],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: codex-acp@1.8.0 + @openai/codex@0.152.1",
+            "real bridge contract schema v2: codex-acp@2.0.1 + @openai/codex@0.159.2",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1427,8 +1433,18 @@ mod tests {
         );
         assert_eq!(codex.route_key().adapter_id.as_str(), CODEX_ADAPTER_ID);
         let runtime = &codex.distribution.runtime_dependencies[0];
-        assert_eq!(runtime.declared_requirement.to_string(), "^0.152.0");
-        assert_eq!(runtime.managed_pin, Version::parse("0.152.1").unwrap());
+        assert_eq!(
+            runtime.declared_requirement.to_string(),
+            CODEX_RUNTIME_DECLARED_REQUIREMENT
+        );
+        assert_eq!(
+            runtime.managed_pin,
+            Version::parse(CODEX_RUNTIME_PIN).unwrap()
+        );
+        assert!(
+            runtime.declared_requirement.matches(&runtime.managed_pin),
+            "the managed runtime pin must satisfy what the adapter declares"
+        );
         assert!(!runtime.override_declared_requirement);
         assert_eq!(
             registry
@@ -1537,7 +1553,9 @@ mod tests {
             .clone();
         assert_eq!(
             codex.expected_compatibility_identity().as_str(),
-            "adapter=codex-acp@1.8.0;runtime=@openai/codex@0.152.1"
+            format!(
+                "adapter={CODEX_ADAPTER_ID}@{CODEX_ADAPTER_VERSION};runtime={CODEX_RUNTIME_PACKAGE}@{CODEX_RUNTIME_PIN}"
+            )
         );
 
         let changed = AdapterCompatibilityIdentity::new(
@@ -1602,7 +1620,7 @@ mod tests {
         );
         assert!(
             codex
-                .config_option_aliases_for_runtime("1.8.0", exact.as_str())
+                .config_option_aliases_for_runtime(CODEX_ADAPTER_VERSION, exact.as_str())
                 .is_some()
         );
 
@@ -1613,7 +1631,10 @@ mod tests {
         );
         assert!(
             codex
-                .config_option_aliases_for_runtime("1.8.0", incomplete_identity.as_str())
+                .config_option_aliases_for_runtime(
+                    CODEX_ADAPTER_VERSION,
+                    incomplete_identity.as_str()
+                )
                 .is_none()
         );
 

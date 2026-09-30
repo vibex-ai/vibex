@@ -804,7 +804,7 @@ pub fn agent_provider_rollout_manifest() -> VibexResult<Vec<AgentProviderRollout
     let mut entries = Vec::with_capacity(acp_agent_catalog_entries().len() + 4);
     for (id, version) in [
         ("claude", "0.84.0"),
-        ("codex", "0.152.1"),
+        ("codex", "0.159.2"),
         ("opencode", OPENCODE_LAST_VERIFIED_VERSION),
         ("zcode", crate::provider_projection::ZCODE_ADAPTER_VERSION),
     ] {

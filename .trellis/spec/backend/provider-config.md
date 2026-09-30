@@ -4037,13 +4037,19 @@ ResolvedAgentProviderProjection {
     `>=0.71.0` because the alias contract resolves the same `model` values in
     both releases. The older release is still projected, so the floor stays
     where the contract was last verified.
+  - Codex, whose identity is composite. `codex-acp` moves to `2.0.1` and its
+    managed runtime to `@openai/codex` `0.159.2`, which is what 2.0.1 declares
+    (`^0.159.1`) rather than the `^0.152.0` its predecessor declared. The quirk,
+    the config-option aliases and the event enricher are keyed on the exact
+    identity `adapter=codex-acp@2.0.1;runtime=@openai/codex@0.159.2`, while
+    `CODEX_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT` stays `>=1.8.0`: a runtime
+    that has not upgraded keeps the typed projection but stops inheriting the
+    alias table, because that table is deliberately exact-identity only. Both
+    versions live in `crates/agent-acp/src/registry.rs` and the identity string
+    is derived from them rather than spelled out at a call site.
 - A pin stays behind its Agent's newest release when the release changes a
   contract Vibex has to implement, not when it only changes a version string.
   The held pins and their reasons:
-  - Codex — `codex-acp` 2.0.1 moves the compatibility identity to
-    `adapter=codex-acp@2.0.1;runtime=@openai/codex@^0.159.1`. Every quirk,
-    config alias and event enricher is registered against the exact `1.8.0`
-    identity, so all of them go stale until each is re-verified on 2.0.1.
   - Cline — 3.0.65 resolves an initial model through
     `resolveDefaultModelId(provider, CLINE_MODEL, catalogue)`: an id outside the
     selected provider's catalogue is no longer used verbatim but silently
