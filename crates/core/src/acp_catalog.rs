@@ -176,18 +176,27 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        "0.4.33",
-        "https://github.com/vibex-ai/deepseek-harness-acp",
+        // 0.4.35 keeps reading the settings overlay this Agent is projected
+        // through: the adapter loads `$DSH_HOME/settings.yaml` on every launch
+        // and refuses to start when it does not parse, and it does not consume
+        // or rename the file. The bundled runtime also still recognises every
+        // `api` spelling the projection writes (`openai-completions`,
+        // `openai-responses`, `anthropic-messages`). The release's moves to the
+        // Messages API and its shrunken default catalogue apply to the official
+        // `deepseek-official` route, which the projected route does not use.
+        "0.4.35",
+        "https://github.com/openma-ai/deepseek-harness-acp",
         &[
             "npx",
             "-y",
-            "@openma/deepseek-harness-acp@0.4.33",
+            "@openma/deepseek-harness-acp@0.4.35",
         ],
     )
     // 0.4.33 qualifies every ACP model option id as `route::model`; Vibex keeps
     // the bare id on the wire and reads the qualified spelling back as an alias
     // so 0.4.32 keeps working. The projection floor therefore stays on 0.4.32
-    // even though the pin moved to 0.4.33.
+    // even though the pin moved past it; that qualification is byte-identical in
+    // 0.4.35, so the floor still describes a release the alias covers.
     .with_compatible_version("0.4.32"),
     AcpAgentCatalogEntry::new(
         "devin",
@@ -488,11 +497,11 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
             .unwrap();
-        assert_eq!(deepseek.version, "0.4.33");
+        assert_eq!(deepseek.version, "0.4.35");
         assert_eq!(deepseek.compatible_version, Some("0.4.32"));
         assert_eq!(
             deepseek.command,
-            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.33"]
+            &["npx", "-y", "@openma/deepseek-harness-acp@0.4.35"]
         );
         assert!(!entries.iter().any(|entry| entry.id == "corust-agent"));
     }
@@ -501,7 +510,7 @@ mod tests {
     fn verified_versions_skip_agents_vibex_does_not_pin() {
         assert_eq!(
             acp_agent_verified_version("deepseek-harness"),
-            Some("0.4.33")
+            Some("0.4.35")
         );
         assert_eq!(acp_agent_verified_version("gemini"), Some("0.62.0"));
         assert_eq!(acp_agent_verified_version("devin"), None);

@@ -6298,7 +6298,7 @@ mod tests {
 
         let pinned = pin_entry_to_target(&agent, entry.clone(), ManagedInstallTarget::Verified)
             .expect("the catalog pins this Agent");
-        assert_eq!(pinned.version, "0.4.33");
+        assert_eq!(pinned.version, "0.4.35");
         assert_eq!(
             pinned
                 .distribution
@@ -6306,7 +6306,7 @@ mod tests {
                 .as_ref()
                 .expect("npm distribution survives")
                 .package,
-            "@openma/deepseek-harness-acp@0.4.33"
+            "@openma/deepseek-harness-acp@0.4.35"
         );
         assert_eq!(
             parse_exact_npm_spec(
@@ -6314,7 +6314,7 @@ mod tests {
                 &pinned.version
             )
             .unwrap(),
-            ("@openma/deepseek-harness-acp", "0.4.33")
+            ("@openma/deepseek-harness-acp", "0.4.35")
         );
 
         let unchanged = pin_entry_to_target(&agent, entry, ManagedInstallTarget::Latest).unwrap();

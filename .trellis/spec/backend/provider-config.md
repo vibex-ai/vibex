@@ -4081,11 +4081,18 @@ ResolvedAgentProviderProjection {
     the floor would promise a credential and model surface that does not work.
     The managed install resolves the successor's npm channel directly, because
     the ACP Registry entry named `kimi` still points at the archived line.
-  - DeepSeek Harness — 0.4.35 moves the bundled runtime to `0.1.7-rc.2`, turns
-    `settings.yaml` into a one-shot import that is renamed on read, drops the
-    Chat Completions `protocol` option in favour of the Messages base URL, and
-    shrinks the default model catalogue. The settings overlay must be rewritten
-    before the pin moves.
+  - DeepSeek Harness did move, after the suspicion against it was tested rather
+    than reasoned about. Reading the bundles suggested 0.4.35 turned
+    `settings.yaml` into a one-shot import that is renamed on read, which would
+    have made the overlay dead after the first launch. Running the published
+    adapter says otherwise: a syntactically invalid `settings.yaml` makes it
+    refuse to start with a `YAMLParseError`, so it is read on every launch, and
+    after a full `initialize` the file is neither renamed nor accompanied by a
+    `profiles/` tree. The vendored runtime still contains every `api` spelling
+    the projection writes. What did move — Messages-only, a smaller default
+    catalogue — applies to the official `deepseek-official` route, which a
+    projected route does not use. The floor stays on `0.4.32` because the
+    `route::model` read-back qualification it covers is byte-identical in 0.4.35.
   - Cursor — Cursor publishes no CLI release notes for September, and its own
     installer and Homebrew cask resolve to `2026.09.28-64d2043`, a version
     string whose real shape carries a commit suffix this catalog does not
@@ -4173,6 +4180,16 @@ ResolvedAgentProviderProjection {
   fail silently — the Agent would start and simply not use the configured
   Provider. Install 0.4.35, project a Provider, and observe whether the route is
   honoured before touching the pin.
+- Settle a question about a config file by running the Agent, not by reading its
+  bundle: a parse error is a probe that costs one command. Corrupting
+  `settings.yaml` and starting the published adapter produced an immediate
+  `YAMLParseError` refusal, which proves the file is read every launch, while
+  inspecting the same file after a full `initialize` showed it was neither
+  renamed nor consumed. Both facts contradicted a careful reading of the
+  shipped JavaScript. The adapter also documents its real projection surface in
+  `--help` — `--provider`/`DSH_PROVIDER`, `--model`/`DSH_MODEL`,
+  `--models`/`DSH_ACP_MODELS`, `--permission-mode`, `--reasoning-effort` — which
+  is a faster route to a contract than any amount of bundle archaeology.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
