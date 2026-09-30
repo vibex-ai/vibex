@@ -128,6 +128,7 @@ outer padding (1 row top/bottom, 2 columns each side)
   [gap] [queue]        only when messages are held
   [gap] turn status    while running, waiting, or reporting a live session
   [gap] [banner]       transient messages
+  [gap] [dock]         the running-work panel, while it is open
   prompt gap           1 row
   prompt               borders + one blank row + the draft
   shortcut band        1 row, always last
@@ -143,7 +144,10 @@ Rules that make this work:
   inside the content rather than around it.
 * **Optional bands collapse to zero height**, never to a smaller size, and the
   frame skips their renderers entirely. `SHORT_TERMINAL_ROWS` drops the banner,
-  tasks and todo bands before it touches the transcript or the composer.
+  tasks, todo and dock bands before it touches the transcript or the composer.
+* **A band that duplicates another yields to it.** While the dock is open it
+  lists the plan and the held queue, so `band_request` gives those two bands
+  zero height rather than printing the same rows twice on one screen.
 * **`layout::compute` is pure data.** The composition is asserted at every
   terminal size without rendering anything.
 * The gutter is taken from the transcript's right edge and only when the
@@ -151,9 +155,11 @@ Rules that make this work:
   columns go back to the prose.
 * **The frame publishes what the mouse needs, nothing more.** `FrameRegions`
   carries the transcript rect, a `ListRegion` (rect, scope, row count, first
-  line), the composer's text rows, the queue band, the turn rail's ticks, the
-  shortcut band's hints with their intents, the banner and a modal's close
-  control. Every one of them is written by the renderer that drew it, because
+  line), the composer's text rows, the queue band, the dock, the turn rail's
+  ticks, the shortcut band's hints with their intents, the banner and a modal's
+  close control. A band that can disappear without a repaint clearing the field
+  (the dock) is reset to `None` by its renderer's caller, so a closed panel
+  cannot keep a stale hit rect. Every one of them is written by the renderer that drew it, because
   only that code knows where the band landed; `run.rs` does nothing but
   hit-test. A click on a hint runs the intent its key would run, so the mouse
   cannot grow a second, divergent command set.
@@ -274,10 +280,38 @@ is never a column count.
   `Alt+B` reaches the table instead of typing a `b`.
 * **A paste over the threshold collapses into a chip.** `PASTE_CHIP_LINES` /
   `PASTE_CHIP_BYTES` decide; the buffer's text holds the label and the original
-  bytes ride in a `PasteChip`. A chip is atomic — the cursor steps over it, one
+  bytes ride in a `Chip`. A chip is atomic — the cursor steps over it, one
   `Backspace` removes it, and any edit that reaches into one dissolves it into
   literal text so no range can point at the wrong bytes. `take_expanded` puts
-  the bytes back on the way out; `text()` shows only the label.
+  the bytes back on the way out; `text()` shows only the label. Image chips are
+  the same object with a different payload: `[Image #N]` is a display label only,
+  `expanded_text` drops it, and `take_with_attachments` returns text and pictures
+  together because the message is one value. Labels are numbered monotonically
+  per draft and never recycled, `IMAGE_CAP` bounds a prompt, and clipboard bytes
+  travel as a shared `Arc` so the undo snapshots do not copy the pixels.
+* **Clipboard reading is the worker's job, never the reducer's.** `Effect::
+  ReadClipboardImage` runs on `spawn_blocking`, shells out to the desktop's
+  clipboard tool with a deadline and a kill, and answers with an `AppMessage`.
+  The client still *writes* the clipboard only over OSC 52; reading is an
+  enhancement that degrades to "name a file instead" when no tool exists.
+* **A selection in the draft is byte offsets plus a sticky anchor.** `Shift`
+  motions extend it, `Alt+A`/`Alt+C` select and copy it, a mouse press-drag
+  selects it, and every mutation consumes it first, so typing replaces it.
+  `ComposerBuffer::selection` widens to whole chips: a half-selected chip label
+  would otherwise let a cut leave a marker that no longer parses.
+* **The key editor refuses a chord another action owns.** Dispatch takes the
+  first match in table order, so a duplicate would disable the loser silently.
+  The editor names the owner instead, `d` restores a row from `DEFAULT_BINDINGS`
+  (rebuilding so collapsed aliases come back) and `s` writes the same grammar
+  `Keymap::load` parses. The file remains hand-editable: it is one
+  `action_id = "Chord"` line per override.
+* **Client-owned arrangement is persisted client-side, keyed by id.** The
+  sidebar's pins, manual order and folded groups live in `SidebarState` and are
+  written to `~/.vibex/tui-sidebar.json`; the path is an `AppOptions` field so a
+  test or a preview can run without touching a home directory. Order is
+  reconciled against the *visible* rows, and pinned rows always sort first, so a
+  manual move across that boundary is refused with a message instead of
+  appearing to do nothing.
 * **A draft's mode is derived from its text, not tracked beside it.**
   `sync_composer_mode` reads the first character (`? ` = history search), so an
   undo, a recalled history entry or a paste cannot leave the prefix describing a

@@ -77,9 +77,9 @@ Navigation that would otherwise be a permanent column is a full-screen view
 (Sessions, Files, Changes) or an overlay, which is also the only way a session
 row can show a title, workspace, state and age without truncating all four.
 
-Optional bands (background tasks, queued messages, banners) collapse to zero
-height rather than to a smaller size, and a short terminal drops them before it
-touches the transcript or the composer.
+Optional bands (background tasks, queued messages, banners, the dock) collapse
+to zero height rather than to a smaller size, and a short terminal drops them
+before it touches the transcript or the composer.
 
 ## Visual language
 
@@ -194,6 +194,22 @@ the cursor steps over it, one `Backspace` removes it, and pasting the same bytes
 again expands it in place rather than adding a second copy. What is sent is the
 original bytes, not the label.
 
+`Alt+I` attaches an image: the client asks the desktop clipboard for one
+(`wl-paste`, `xclip` or `pngpaste`, each with a deadline) and falls back to
+asking for a path when there is none. Pasting a path that names an existing
+image file attaches it too, rather than typing the path into the prompt. The
+image becomes a second kind of chip, `[Image #1]`, numbered monotonically for
+the draft and capped at ten per prompt; the label is stripped from the message
+text and the picture travels as an attachment — by path when the runtime can
+read it, as a data URL when it came from the clipboard. The info line under the
+draft reports how many are attached.
+
+A draft can also be selected. `Shift` plus the motion keys extends the
+selection, `Alt+A` takes the whole draft and `Alt+C` copies the selected part;
+the mouse works the same way — press, drag, release copies — and typing over a
+selection replaces it. A selection that touches a collapsed chip selects the
+whole chip, so a cut can never leave half a `[Pasted: …]` marker behind.
+
 Typing `? ` turns the composer into a filter over the messages you have sent;
 `↑↓` walks the matches and `Enter` recalls one into the draft. `Up` on an empty
 draft still steps through history one entry at a time.
@@ -252,9 +268,17 @@ band from the least important end.
 
 ### Sessions
 
-The sidebar groups sessions by workspace and project. `/` filters, `Enter`
-opens, `n` creates, `r` renames, `f` forks, `a` archives, `Ctrl+X` deletes, and
-`Ctrl+A` includes archived sessions. Session creation picks a workspace through
+The sidebar groups sessions by workspace and project — `g` folds the headings
+away for one flat run. `/` filters, `Enter` opens, `n` creates, `r` renames, `f`
+forks, `a` archives, `Ctrl+X` deletes, and `Ctrl+A` includes archived sessions.
+`p` pins the selected session above the rest, and `Alt+↑`/`Alt+↓` move it
+through a manual order. Pinned rows always sort first, so a move across that
+line is refused with a message rather than silently doing nothing.
+
+The arrangement — pins, order, folded groups and headings — is the reader's
+preference rather than the runtime's state, so it is written to
+`~/.vibex/tui-sidebar.json` beside the key file. A client with nowhere to write
+keeps it in memory for the run. Session creation picks a workspace through
 the authority's own directory browser, so a remote client chooses a path that
 exists where the Agent runs.
 
@@ -339,9 +363,17 @@ sessions, and the key-binding file. The page is one surface with four modes rath
 | Picking | `Enter` on a choice | `↑↓` previews the value live, `Enter` keeps it, `Esc` puts the old one back |
 | Editing | `Enter` on a text row | Type the value; `Enter` saves, `Esc` discards |
 
-A reset asks first and then restores the shipped default. `F9` reloads
-`~/.vibex/tui-keys.toml`; the interface reports which lines it could not use
-instead of failing to start.
+A reset asks first and then restores the shipped default.
+
+`Enter` on the Key bindings row opens the editor: every binding, grouped by
+scope, with the same `/` filter. `Enter` on a row captures the next chord,
+`d` puts that row back on its shipped chord and `s` writes
+`~/.vibex/tui-keys.toml` (also reloaded by `F9`). A chord another action already
+owns is refused and the owner is named — dispatch takes the first match in the
+table, so accepting it would silently disable the other action. Rows moved off
+their default carry a marker, and the title shows whether there are unsaved
+changes. The interface reports which lines of the file it could not use instead
+of failing to start.
 
 ### Status line
 
@@ -382,7 +414,34 @@ A message written while a turn is running is held rather than interleaved with
 work already in flight. The queue band shows what is waiting, and `Alt+↑↓`
 picks a row, `Alt+E` pulls it back into the draft, `Alt+X` drops it, `Alt+J/K`
 reorders it and `Alt+Enter` interrupts the turn and sends it now. The queue
-drains itself when the turn ends.
+drains itself when the turn ends, and a held message carries its images with it
+— "send this later" sends what was composed.
+
+### Dock
+
+`Alt+D` opens a panel directly above the composer that answers "is anything
+still running?" without leaving the draft:
+
+```text
+◈ Running   Alt+J/K move · Alt+G open · Alt+H hide done · Alt+D close
+  ▾ Agents 1
+    ⠹ reviewer   reviewing the parser change
+  ▾ Plan 1/3
+    ✓ read the design
+    ⠹ write the band
+  ▾ Held 1
+    #1 fix the flake
+```
+
+Sections are `Agents` (delegated children, one row each), `Plan` (the current
+plan's steps) and `Held` (the queue). The list is derived from the transcript
+the reader can already see, so it cannot disagree with the page behind it: a
+plan step comes from the structured plan item when the runtime publishes one and
+from the plan block when it does not. `j`/`k` or `↑`/`↓` move, `Alt+G` jumps to
+the row's block — or takes a held message back into the draft — `Alt+H` hides
+finished work, and `Enter` on a heading folds a section. While the dock is open
+it replaces the plan and queue bands rather than saying the same thing twice,
+and `Esc` closes it.
 
 ## Environment
 
