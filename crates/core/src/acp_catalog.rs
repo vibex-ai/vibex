@@ -176,13 +176,17 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "deepseek-harness",
         "DeepSeek Harness",
         "DeepSeek Harness coding agent connected through the deepseek-harness-acp bridge.",
-        // 0.4.35 keeps reading the settings overlay this Agent is projected
-        // through: the adapter loads `$DSH_HOME/settings.yaml` on every launch
-        // and refuses to start when it does not parse, and it does not consume
-        // or rename the file. The bundled runtime also still recognises every
-        // `api` spelling the projection writes (`openai-completions`,
-        // `openai-responses`, `anthropic-messages`). The release's moves to the
-        // Messages API and its shrunken default catalogue apply to the official
+        // 0.4.35 keeps reading `$DSH_HOME/settings.yaml` for its standalone
+        // default model, but its bundled runtime moved from `0.1.5` to
+        // `0.1.7`, which dropped `dsh-settings-file` and no longer derives llm
+        // routes from that file. Vibex therefore registers the projected route
+        // through the `$DSH_HOME/cordis.patch.yml` home patch the bridge
+        // composes on every launch, and keeps writing `settings.yaml` beside it
+        // so 0.4.32/0.4.33 (runtime `0.1.5`) project the same route. The
+        // bundled runtime still recognises every `api` spelling the projection
+        // writes (`openai-completions`, `openai-responses`,
+        // `anthropic-messages`). The release's moves to the Messages API and
+        // its shrunken default catalogue apply to the official
         // `deepseek-official` route, which the projected route does not use.
         "0.4.35",
         "https://github.com/openma-ai/deepseek-harness-acp",

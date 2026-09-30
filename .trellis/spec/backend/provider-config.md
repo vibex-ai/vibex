@@ -332,10 +332,12 @@ environment key and the final ACP authentication decision.
 ### 2. Contracts
 
 - Declare Chat Completions, Responses, and Anthropic Messages as user-selectable model interfaces for DeepSeek Harness.
-- Materialize the selected Profile as a private `$DSH_HOME/settings.yaml` containing one `llm-pi-ai.providers` route and the matching `agent-default-model` selection. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` alone.
+- Materialize the selected Profile as two private files under `$DSH_HOME`: `settings.yaml` with one `llm-pi-ai.providers` route and the matching `agent-default-model` selection, and `cordis.patch.yml` with the same route as the `llm-pi-ai` home patch. Do not reduce the projection to `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY` alone.
+- Register the route in both files because the bundled runtime moved from `0.1.5` to `0.1.7` between adapter `0.4.33` and `0.4.35`. `0.1.5` read this Agent's `settings.yaml` through its bundled `dsh-settings-file` plugin, which `0.1.7` removed; `0.1.7` derives llm routes from the cordis entry list, which the adapter composes on every launch from its bundle patches plus the optional `$DSH_HOME/cordis.patch.yml` home patch. A route that lives only in `settings.yaml` is then never registered, the adapter's model discovery skips it, and the `effort` ACP control disappears because the route cannot be resolved — the new session then fails as `runtime_switch_configuration_unavailable` with cause `reasoning_effort_unavailable`. The home patch is composed by both runtime versions, so writing it beside `settings.yaml` keeps `0.4.32`/`0.4.33` and `0.4.35` projecting one route.
+- Keep `settings.yaml` even though `0.1.7` no longer reads its routes: the adapter reads it for its standalone `agent-default-model` fallback and for `permission.defaultPreset`, and it refuses to start when the file does not parse.
 - Map Vibex wire protocols to Harness API ids exactly: `openai_chat_completions` -> `openai-completions`, `openai_responses` -> `openai-responses`, and `anthropic_messages` -> `anthropic-messages`.
 - Keep the selected credential in a Profile-scoped environment reference named by `apiKeyEnv`; never write its value into `settings.yaml`.
-- Name that environment reference `DEEPSEEK_API_KEY`, and project the route-derived name beside it. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`. A second, prompt-time gate derives its name from the projected route instead — `<ROUTE_ID>_API_KEY`, upper-cased with every run of non-alphanumeric characters collapsed to a single `_` — and never consults the route's `apiKeyEnv`: `deepseek-harness-acp` 0.4.33 began recording the resolved route id on the session record when a Model switch happens, so the first prompt after a switch asks for `ACP_API_KEY` while the launch gate still asks for `DEEPSEEK_API_KEY`. Project both names, each carrying the selected credential's Secret; either name alone leaves one of the two gates failing with `provider_authentication_required`. Derive the route-derived name from the same route id the settings overlay writes, so the two cannot drift.
+- Name that environment reference `DEEPSEEK_API_KEY`, and project the route-derived name beside it. The Harness gates `session/new`, `session/load`, and `session/resume` on its launch-level credential lookup, which resolves the default DeepSeek route by exactly that name; a Vibex-scoped alias such as `VIBEX_DEEPSEEK_HARNESS_API_KEY` satisfies `apiKeyEnv` but fails the gate with `Authentication required`. A second, prompt-time gate derives its name from the projected route instead — `<ROUTE_ID>_API_KEY`, upper-cased with every run of non-alphanumeric characters collapsed to a single `_` — and never consults the route's `apiKeyEnv`: `deepseek-harness-acp` 0.4.33 began recording the resolved route id on the session record when a Model switch happens, so the first prompt after a switch asks for `ACP_API_KEY` while the launch gate still asks for `DEEPSEEK_API_KEY`. Project both names, each carrying the selected credential's Secret; either name alone leaves one of the two gates failing with `provider_authentication_required`. Derive the route-derived name from the same route id both overlays write, so the two cannot drift.
 - Project the selected model's declared display name, context/output limits, and image modality. Use the Harness defaults of 262,144 context tokens and 32,768 output tokens when those limits are undeclared.
 - A Vibex route id is never a pi-ai catalog provider, so the projected `contextWindow` / `maxTokens` are the only limits the Harness knows for that Model: they are what it carries as the run's model metadata and reports back as the session's context window. The same model on an Agent account resolves the Harness's own catalog entry instead (a 1,000,000-token DeepSeek model reports 1.0m there and 262.1k on a Vibex route that declares nothing). Declaring the real limits is what makes a BYOK route report the same window as the account route. See "Declared Model Context And Output Limits".
 - Write the model `input` modality only when the Model declares it: `image_input: true` -> `[text, image]`, `image_input: false` -> `[text]`. An undeclared modality omits `input` entirely, because the Harness resolves an absent entry from its own pi-ai catalog first. Projecting an explicit `[text]` for an undeclared Model makes the Harness replace every prompt image with `[image omitted because this model accepts text only; ...]` before the request leaves the process, so the Agent never receives the image and no error surfaces.
@@ -345,7 +347,7 @@ environment key and the final ACP authentication decision.
 - Accept only the Agent's thinking-level vocabulary — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — with a non-empty wire spelling for every level except `off`, and at least one level beyond `off`. The Harness rejects the whole settings file for anything else (unknown key, valueless level other than `off`, an offer of nothing to think with), so the Provider editor and the projection both refuse it while the Model is still nameable instead of leaving a session that cannot start.
 - Saving a Model whose declared capabilities or wire protocol changed drops that Model's cached `provider_model_runtime_option_snapshots` row. A successful per-Model probe is reused by model id, and the cache key carries no part of the declaration, so without the drop the run options keep advertising the previous vocabulary and an edited declaration looks ignored. An edit that cannot change a probe answer (display name, notes, unrelated fields) keeps the evidence.
 - Pin the route-level `compat: { supportsDeveloperRole: false }` on every route whose `api` is `openai-completions` or `openai-responses`. pi-ai sends a reasoning Model's system prompt in the `developer` role unless the endpoint's compatibility report says the endpoint takes it, and it resolves that report by detecting the provider id and the endpoint — neither of which recognizes a Vibex route, so the OpenAI default `true` stays in force. A gateway that only speaks OpenAI's older vocabulary then rejects the whole turn (`400`, unknown variant `developer`) while the same Model on an Agent account keeps working, and the rejection reaches the run options as a bare JSON-RPC failure. The pin and `reasoningEfforts` travel together: the role only changes once the Model reasons. Never write the pin for an `anthropic-messages` route — Anthropic Messages offers no such switch, and the Harness refuses a route-level switch no Model on the route can apply rather than ignoring it, which fails the entire settings file.
-- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as the settings overlay writes it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route. The bare id is the only form both Adapter versions accept, so the catalog pin moves to `0.4.33` while the compatibility floor stays `0.4.32`: raising the floor with the pin would make an installed `0.4.32` runtime conservative and hide the provider editor for a release the projection still supports.
+- Keep the projected ACP model id bare, and accept the Harness's `route::model` spelling only as a read-back alias. `deepseek-harness-acp` 0.4.33 qualifies every model option id once more than one provider route is registered, and the Harness always mounts its own `deepseek-official` route beside the projected `llm-pi-ai` one, so the qualifier is always present on a Vibex session; 0.4.32 answers that same spelling with `-32602 unknown model`. The bare id is therefore the only form both Adapter versions accept on the wire, while the qualified spelling exists so a model id the Harness reports resolves back to its product Model. Without the alias the reported id no longer equals the requested one and the switch fails as `acp_session_config_response_mismatch` before the session converges. Derive the route id exactly as both overlays write it — `vendor_hint`, else the Profile id — never by re-spelling the Profile display name, which is not the route. The bare id is the only form both Adapter versions accept, so the catalog pin moved to `0.4.33` — and later `0.4.35` — while the compatibility floor stays `0.4.32`: raising the floor with the pin would make an installed `0.4.32` runtime conservative and hide the provider editor for a release the projection still supports.
 - Roll back installs the Adapter version Vibex pins in its own catalog for that
   Agent, and is the only install target allowed to move an installation
   backwards. The pin is Vibex's compatibility statement, so a user asking for
@@ -372,14 +374,15 @@ environment key and the final ACP authentication decision.
 
 - Core descriptor tests assert all three protocols are advertised in stable order.
 - Projection tests parse `settings.yaml` for every protocol and assert route/default-model identity, model capabilities, and absence of Secret material.
+- Projection tests parse the `cordis.patch.yml` home patch and assert it is a one-row `llm-pi-ai` list whose `config.providers` route matches the `settings.yaml` route — same route id, `api`, `apiKeyEnv`, `baseURL`, and per-Model `reasoningEfforts` — across every protocol, and that the plan carries both files with `settings.yaml` first.
 - Projection tests assert an undeclared modality writes no model `input`, a declared `false` writes `[text]`, a declared `true` writes `[text, image]`, and every route carries `defaultInput: [text, image]`.
 - Projection tests assert an undeclared or `true` reasoning capability writes the `off`/`high`/`max` map with identity wire spellings and no undeclared level, while `reasoning: false` writes `reasoningEfforts: false`.
 - Projection tests assert a declared table is written verbatim — including a wire spelling that differs from its level — replaces the fallback instead of extending it, differs between two Models of one route, and that an undeclarable table (unknown level, valueless non-`off` level, nothing beyond `off`) fails with the Model named rather than reaching `settings.yaml`. A declared table beside `reasoning: false` still projects `false`.
 - Provider editor tests assert a declaration survives profile save normalization, catalogue merge, and an authoritative catalogue refresh for a Model the catalogue still advertises.
 - Projection tests assert the developer-role pin is present with value `false` exactly on the Chat Completions and Responses routes and absent — with no `compat` key at all — on the Anthropic Messages route, and that a reasoning route Model keeps its projected `reasoningEfforts` alongside the pin.
 - Projection tests assert the DeepSeek Harness read-back alias is `{projected route id}::{model id}` — the same route id the settings overlay writes — and that no other Agent projection declares one. Runtime tests assert the alias resolves to its product Model while the projected wire form stays bare, and that an alias another Model already owns is rejected as `acp_model_id_projection_ambiguous`.
-- Runtime tests assert the DeepSeek Harness descriptor pins `0.4.33` while accepting `>=0.4.32`: a `0.4.32` identity resolves to the typed projection with its credential and model controls, a `0.4.33` identity resolves the same way, and `0.4.31` is conservative with `agent_projection_version_mismatch`.
-- The typed projector matrix asserts the private `settings.yaml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
+- Runtime tests assert the DeepSeek Harness descriptor pins `0.4.35` while accepting `>=0.4.32`: a `0.4.32` identity resolves to the typed projection with its credential and model controls, a `0.4.33` identity resolves the same way as a semver-range match, and `0.4.31` is conservative with `agent_projection_version_mismatch`.
+- The typed projector matrix asserts the private `settings.yaml` and `cordis.patch.yml`, `DSH_HOME`, and Vibex-scoped credential environment boundary.
 
 ## Scenario: Declared Model Context And Output Limits
 
@@ -4026,9 +4029,11 @@ ResolvedAgentProviderProjection {
   `agent_projection_version_mismatch`. Two kinds of Agent sit above their floor:
   - Agents whose newer release changed a wire detail, where Vibex answers the
     older spelling with a read-back shim. DeepSeek Harness is the reference: the
-    pin is `0.4.33` while the floor stays `0.4.32`, because `0.4.33` qualifies
-    every ACP model option id as `route::model` and Vibex answers that spelling
-    with a read-back alias rather than dropping `0.4.32`.
+    pin is `0.4.35` while the floor stays `0.4.32`: `0.4.33` introduced the
+    `route::model` qualification, which Vibex answers with a read-back alias,
+    and `0.4.35` moved the bundled Harness runtime to `0.1.7`, whose route
+    registration Vibex answers by projecting the cordis home patch beside
+    `settings.yaml` rather than dropping an installed `0.4.32`.
   - Agents whose pin moved forward on a review that found no change to the
     projection contract: CodeBuddy `2.160.0` over `>=2.109.0`, Copilot `1.0.89`
     over `>=1.0.78`, Gemini `0.62.0` over `>=0.47.0`, Grok `1.0.44` over
@@ -4081,18 +4086,23 @@ ResolvedAgentProviderProjection {
     the floor would promise a credential and model surface that does not work.
     The managed install resolves the successor's npm channel directly, because
     the ACP Registry entry named `kimi` still points at the archived line.
-  - DeepSeek Harness did move, after the suspicion against it was tested rather
-    than reasoned about. Reading the bundles suggested 0.4.35 turned
-    `settings.yaml` into a one-shot import that is renamed on read, which would
-    have made the overlay dead after the first launch. Running the published
-    adapter says otherwise: a syntactically invalid `settings.yaml` makes it
-    refuse to start with a `YAMLParseError`, so it is read on every launch, and
-    after a full `initialize` the file is neither renamed nor accompanied by a
-    `profiles/` tree. The vendored runtime still contains every `api` spelling
-    the projection writes. What did move — Messages-only, a smaller default
-    catalogue — applies to the official `deepseek-official` route, which a
-    projected route does not use. The floor stays on `0.4.32` because the
-    `route::model` read-back qualification it covers is byte-identical in 0.4.35.
+  - DeepSeek Harness did move, and the move was in the bundled runtime rather
+    than the adapter's own reader. Reading the bundles suggested 0.4.35 turned
+    `settings.yaml` into a one-shot import renamed on read; running the
+    published adapter disproved that — an invalid `settings.yaml` still makes it
+    refuse to start with a `YAMLParseError`, and a full `initialize` neither
+    renames the file nor writes a `profiles/` tree. But the runtime moved from
+    `0.1.5` to `0.1.7`, which removed `@deepseek-ai/dsh-settings-file`: the
+    `acp` route a Vibex projection writes into `settings.yaml` is no longer
+    registered, so the adapter's `effortCatalog` cannot resolve
+    `acp::<model>`, drops the `effort` ACP control, and a remembered
+    `reasoningEffort: max` then resolves as `reasoning_effort_unavailable`. The
+    adapter composes `$DSH_HOME/cordis.patch.yml` into its cordis entry list in
+    both runtime versions, so the projection writes the route there as well.
+    What also moved — Messages-only, a smaller default catalogue — applies to
+    the official `deepseek-official` route, which a projected route does not
+    use. The floor stays on `0.4.32` because the `route::model` read-back
+    qualification it covers is byte-identical in 0.4.35.
   - Cursor — Cursor publishes no CLI release notes for September, and its own
     installer and Homebrew cask resolve to `2026.09.28-64d2043`, a version
     string whose real shape carries a commit suffix this catalog does not
@@ -4171,24 +4181,29 @@ ResolvedAgentProviderProjection {
   the wire shape is already handled and only the destination is missing.
 - DeepSeek Harness holds its model selection in `$DSH_HOME/acp-standalone-model.json`
   (`{"provider":"acp","model":"...","reasoningEffort":"..."}`), and reads
-  settings.yaml only as a fallback for the model plus `permission.defaultPreset`.
-  Do not move this Agent's pin until one thing is settled by experiment rather
-  than by reading bundles: which layer consumes the projected `llm-pi-ai`
-  provider route in 0.4.35. The adapter's own legacy reader takes just those two
-  keys, while the bundled harness composes its tree from bundle patches plus a
-  home layer whose profile directory the standalone path does not name anywhere
-  this repository can see. The overlay projects a provider route with
-  `apiKeyEnv`, so a settings.yaml write that the harness stopped reading would
-  fail silently — the Agent would start and simply not use the configured
-  Provider. Install 0.4.35, project a Provider, and observe whether the route is
-  honoured before touching the pin.
+  `settings.yaml` only as a fallback for the model plus `permission.defaultPreset`.
+  The `llm-pi-ai` provider route is consumed by the cordis entry list, which the
+  adapter composes from its bundle patches plus the optional
+  `$DSH_HOME/cordis.patch.yml` home patch; `settings.yaml` supplied that route
+  only through `0.1.5`'s `dsh-settings-file`, which `0.1.7` removed. Settle the
+  layer by running the Agent, not by reading bundles: with the route only in
+  `settings.yaml`, 0.4.35 discovery logs
+  `resolveModelInfo(acp::<model>) failed: no adapter registered for provider
+  "acp"` and drops the `effort` option, while adding the same route as a
+  `cordis.patch.yml` home patch restores `acp` and `off`/`high`/`max` in both
+  0.4.33 and 0.4.35. The Adapter's `--help` also names
+  `--provider`/`DSH_PROVIDER`, `--model`/`DSH_MODEL`, `--models`/`DSH_ACP_MODELS`,
+  `--permission-mode`, and `--reasoning-effort`.
 - Settle a question about a config file by running the Agent, not by reading its
   bundle: a parse error is a probe that costs one command. Corrupting
   `settings.yaml` and starting the published adapter produced an immediate
   `YAMLParseError` refusal, which proves the file is read every launch, while
   inspecting the same file after a full `initialize` showed it was neither
   renamed nor consumed. Both facts contradicted a careful reading of the
-  shipped JavaScript. The adapter also documents its real projection surface in
+  shipped JavaScript. Reading is not consuming, though: 0.1.7 still parses the
+  file for the standalone default and permission preset while deriving llm
+  routes from the cordis home patch, so a `YAMLParseError` probe cannot prove
+  that the route inside it is used. The adapter also documents its real projection surface in
   `--help` — `--provider`/`DSH_PROVIDER`, `--model`/`DSH_MODEL`,
   `--models`/`DSH_ACP_MODELS`, `--permission-mode`, `--reasoning-effort` — which
   is a faster route to a contract than any amount of bundle archaeology.

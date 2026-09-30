@@ -1305,6 +1305,25 @@ fn project_provider_control(
                 secret: false,
             });
             overlays.push(overlay);
+            if *strategy == ConfigOverlayStrategy::DeepseekHarnessSettingsYaml {
+                // 0.1.7 of the bundled runtime stopped reading this Agent's
+                // `settings.yaml` for llm routes, so the same route is also
+                // written as the `$DSH_HOME/cordis.patch.yml` home patch the ACP
+                // bridge composes on every launch. Both files describe one
+                // route: 0.1.5 reads either and 0.1.7 reads the home patch.
+                overlays.push(ManagedProjectionOverlay {
+                    relative_path: "cordis.patch.yml".to_string(),
+                    format: "yaml".to_string(),
+                    content: deepseek_harness_cordis_patch(
+                        provider,
+                        binding,
+                        endpoint,
+                        model,
+                        require_secret_env_key(descriptor_secret_env_key(descriptor))?,
+                    )?,
+                    contains_secret_reference: false,
+                });
+            }
             if *strategy == ConfigOverlayStrategy::KimiToml {
                 overlays.push(kimi_auth_compatibility_overlay(require_secret_env_key(
                     descriptor_secret_env_key(descriptor),
@@ -3643,13 +3662,17 @@ fn deepseek_harness_model_entry(
     Ok(serde_json::Value::Object(model_entry))
 }
 
-fn deepseek_harness_overlay(
+/// The `llm-pi-ai` route entry the Harness projections register.
+///
+/// Returns the projected route id beside the entry, because `settings.yaml`
+/// needs the id for both its providers map and its `agent-default-model` pin.
+fn deepseek_harness_route(
     provider: &ModelProviderProfile,
     binding: &AgentModelProviderBinding,
     endpoint: Option<&ModelProviderEndpoint>,
     model: Option<&AgentConfiguredModelBinding>,
     secret_env_key: &str,
-) -> VibexResult<String> {
+) -> VibexResult<(String, serde_json::Value)> {
     let model_id = projection_model_id(model).unwrap_or("vibex-model");
     let provider_id = deepseek_harness_route_id(provider);
     let api = deepseek_harness_api(model);
@@ -3711,6 +3734,26 @@ fn deepseek_harness_overlay(
         serde_json::Value::Array(model_entries),
     );
 
+    Ok((provider_id, serde_json::Value::Object(route)))
+}
+
+/// The Harness `settings.yaml` overlay.
+///
+/// The ACP bridge reads this file for its standalone `agent-default-model`
+/// pin, and 0.1.5 of the bundled runtime additionally derives its llm routes
+/// from the `llm-pi-ai` section here. 0.1.7 dropped that second use, so the
+/// route is also mirrored into the `cordis.patch.yml` home patch the bridge
+/// always composes; see [`deepseek_harness_cordis_patch`].
+fn deepseek_harness_overlay(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let model_id = projection_model_id(model).unwrap_or("vibex-model");
+    let (provider_id, route) =
+        deepseek_harness_route(provider, binding, endpoint, model, secret_env_key)?;
     serialized_yaml(serde_json::json!({
         "llm-pi-ai": {
             "providers": {provider_id.clone(): route},
@@ -3720,6 +3763,35 @@ fn deepseek_harness_overlay(
             "model": model_id,
         },
     }))
+}
+
+/// The Harness `$DSH_HOME/cordis.patch.yml` home patch that registers the route.
+///
+/// The ACP bridge composes this patch into its cordis entry list on every
+/// launch, and that held across the 0.1.5 -> 0.1.7 runtime move. 0.1.5 also
+/// read the `llm-pi-ai` section of `settings.yaml` through its bundled
+/// `dsh-settings-file` plugin, but 0.1.7 removed that package and now derives
+/// routes from the composed entries alone: a route that lives only in
+/// `settings.yaml` is never registered, the bridge's model discovery skips it,
+/// and the `effort` ACP control disappears because the route cannot be
+/// resolved. Writing both files keeps 0.1.5 and 0.1.7 projecting the same route.
+fn deepseek_harness_cordis_patch(
+    provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
+    endpoint: Option<&ModelProviderEndpoint>,
+    model: Option<&AgentConfiguredModelBinding>,
+    secret_env_key: &str,
+) -> VibexResult<String> {
+    let (provider_id, route) =
+        deepseek_harness_route(provider, binding, endpoint, model, secret_env_key)?;
+    serialized_yaml(serde_json::json!([
+        {
+            "id": "llm-pi-ai",
+            "config": {
+                "providers": {provider_id: route},
+            },
+        }
+    ]))
 }
 
 fn deepseek_harness_api(model: Option<&AgentConfiguredModelBinding>) -> &'static str {
@@ -4738,6 +4810,80 @@ mod tests {
         assert_eq!(
             plan.secret_env[0].secret_reference,
             plan.secret_env[1].secret_reference
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_home_patch_registers_the_route_settings_can_no_longer_carry() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::DeepseekHarnessSettingsYaml);
+
+        for (protocol, expected_api) in [
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+                "openai-completions",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_OPENAI_RESPONSES,
+                "openai-responses",
+            ),
+            (
+                vibex_core::WIRE_PROTOCOL_ANTHROPIC_MESSAGES,
+                "anthropic-messages",
+            ),
+        ] {
+            let mut model = binding.configured_models[0].clone();
+            model.wire_protocol_id = protocol.to_string();
+            let patch = deepseek_harness_cordis_patch(
+                &provider,
+                &binding,
+                provider.endpoints.first(),
+                Some(&model),
+                "DEEPSEEK_API_KEY",
+            )
+            .unwrap();
+            let rows: serde_yaml::Value = serde_yaml::from_str(&patch).unwrap();
+            let rows = rows.as_sequence().expect("a home patch is a row list");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"].as_str(), Some("llm-pi-ai"));
+            let route = &rows[0]["config"]["providers"]["fake"];
+            assert_eq!(route["api"].as_str(), Some(expected_api));
+            assert_eq!(route["apiKeyEnv"].as_str(), Some("DEEPSEEK_API_KEY"));
+            assert_eq!(
+                route["baseURL"].as_str(),
+                Some("https://user:pass@example.invalid/v1?token=never-preview")
+            );
+            assert_eq!(route["models"][0]["id"].as_str(), Some("model-a"));
+            assert_eq!(
+                route["models"][0]["reasoningEfforts"]["max"].as_str(),
+                Some("max")
+            );
+            assert!(!patch.contains("secret-value"));
+        }
+
+        // The plan carries both files, with `settings.yaml` first so the
+        // bridge's standalone default pin is unchanged.
+        let descriptors = vibex_core::catalog_projection_descriptors().unwrap();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.route.agent_id.as_str() == "deepseek-harness")
+            .expect("the DeepSeek Harness owns a projection descriptor");
+        let (provider, runtime, binding) = typed_projection_fixture(descriptor);
+        let plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &binding,
+            descriptor,
+            "typed-matrix",
+        )
+        .unwrap();
+        assert_eq!(plan.overlay_files.len(), 2);
+        assert_eq!(plan.overlay_files[0].relative_path, "settings.yaml");
+        assert_eq!(plan.overlay_files[1].relative_path, "cordis.patch.yml");
+        let patch: serde_yaml::Value =
+            serde_yaml::from_str(&plan.overlay_files[1].content).unwrap();
+        assert_eq!(
+            patch[0]["config"]["providers"]["matrix-provider"]["baseURL"].as_str(),
+            Some("https://provider.example.invalid/v1/")
         );
     }
 
@@ -6194,7 +6340,7 @@ mod tests {
             assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
             assert_eq!(
                 plan.overlay_files.len(),
-                if expected.agent_id == "kimi" {
+                if expected.agent_id == "kimi" || expected.agent_id == "deepseek-harness" {
                     2
                 } else if expected.overlay_path.is_some() {
                     1
@@ -6202,6 +6348,25 @@ mod tests {
                     0
                 }
             );
+            if expected.agent_id == "deepseek-harness" {
+                // The route must reach the runtime through the cordis home
+                // patch as well, because 0.1.7 no longer reads `settings.yaml`
+                // for llm routes.
+                let patch = &plan.overlay_files[1];
+                assert_eq!(patch.relative_path, "cordis.patch.yml");
+                assert_eq!(patch.format, "yaml");
+                assert!(!patch.contains_secret_reference);
+                let rows: serde_yaml::Value = serde_yaml::from_str(&patch.content).unwrap();
+                let rows = rows
+                    .as_sequence()
+                    .expect("a cordis home patch is a row list");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["id"].as_str(), Some("llm-pi-ai"));
+                assert_eq!(
+                    rows[0]["config"]["providers"]["matrix-provider"]["baseURL"].as_str(),
+                    Some("https://provider.example.invalid/v1/")
+                );
+            }
             if let Some((path, format)) = expected.overlay_path.zip(expected.overlay_format) {
                 let overlay = &plan.overlay_files[0];
                 assert_eq!(overlay.relative_path, path, "{}", expected.agent_id);
