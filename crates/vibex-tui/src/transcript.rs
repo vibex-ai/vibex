@@ -60,6 +60,21 @@ fn eligible_for_group(block: &Block) -> bool {
     is_work_item(block.kind) && block.collapsible && !block.expanded && !block.failed
 }
 
+/// Whether `incoming` starts with older blocks than the transcript holds.
+///
+/// True when the transcript's current head survives somewhere after index 0,
+/// which is what a prepend looks like after the diff. An empty transcript is
+/// not a prepend, and neither is a reload whose head moved to the front.
+fn prepends_existing_blocks(existing: &[Block], incoming: &[Block]) -> bool {
+    let Some(head) = existing.first() else {
+        return false;
+    };
+    incoming
+        .iter()
+        .position(|block| block.id == head.id)
+        .is_some_and(|index| index > 0)
+}
+
 /// One transcript block, projected from the authoritative `TimelineRow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -245,6 +260,14 @@ impl Transcript {
         self.blocks.get(index)
     }
 
+    /// Index of the block with this id, if it is still in the transcript.
+    ///
+    /// Used to keep the reader's place across a prepend: the block is
+    /// remembered before the reload and its new first line is looked up after.
+    pub fn index_of_block(&self, id: &str) -> Option<usize> {
+        self.blocks.iter().position(|block| block.id == id)
+    }
+
     /// Total display height, measured plus estimated.
     pub fn total_height(&mut self) -> usize {
         self.ensure_layout();
@@ -257,10 +280,20 @@ impl Transcript {
     /// wholesale reload all collapse into the same diff.
     pub fn set_blocks(&mut self, blocks: Vec<Block>) -> ChangeSet {
         let mut change = ChangeSet::default();
-        // Trim from the front when the authority's budget is exceeded.
+        // Trim when the authority's budget is exceeded. A prepend is the one
+        // case where the incoming list starts with history the reader just
+        // asked for, so dropping from the front would delete exactly what the
+        // fetch was for; an append or a wholesale reload keeps the newest
+        // blocks instead, which is the behaviour that predates the cursor.
         let blocks = if blocks.len() > MAX_BLOCKS {
             change.removed += blocks.len() - MAX_BLOCKS;
-            blocks[blocks.len() - MAX_BLOCKS..].to_vec()
+            if prepends_existing_blocks(&self.blocks, &blocks) {
+                let mut trimmed = blocks;
+                trimmed.truncate(MAX_BLOCKS);
+                trimmed
+            } else {
+                blocks[blocks.len() - MAX_BLOCKS..].to_vec()
+            }
         } else {
             blocks
         };
@@ -1940,6 +1973,38 @@ mod tests {
         assert!(!change.any);
         let change = transcript.set_blocks(snapshot);
         assert!(!change.any);
+    }
+
+    #[test]
+    fn a_prepend_at_the_budget_keeps_the_blocks_that_were_fetched() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let window = (0..MAX_BLOCKS)
+            .map(|index| block(&format!("b{index}"), TimelineRowKind::AgentMessage, "body"))
+            .collect::<Vec<_>>();
+        assert_eq!(transcript.set_blocks(window).appended, MAX_BLOCKS);
+
+        // One older block arrives and pushes the transcript over budget. The
+        // trim must come off the newest end: the older block is exactly what
+        // the reader just asked for.
+        let mut prepended = vec![block("older", TimelineRowKind::AgentMessage, "body")];
+        prepended.extend(transcript.blocks().to_vec());
+        let change = transcript.set_blocks(prepended);
+        assert_eq!(change.removed, 1);
+        assert_eq!(transcript.len(), MAX_BLOCKS);
+        assert_eq!(transcript.block(0).unwrap().id, "older");
+        assert_eq!(
+            transcript.block(MAX_BLOCKS - 1).unwrap().id,
+            format!("b{}", MAX_BLOCKS - 2)
+        );
+
+        // An append over budget keeps the historic behaviour: newest wins.
+        let mut appended = transcript.blocks().to_vec();
+        appended.push(block("newest", TimelineRowKind::AgentMessage, "body"));
+        transcript.set_blocks(appended);
+        assert_eq!(transcript.len(), MAX_BLOCKS);
+        assert_eq!(transcript.block(0).unwrap().id, "b0");
+        assert_eq!(transcript.block(MAX_BLOCKS - 1).unwrap().id, "newest");
     }
 
     #[test]

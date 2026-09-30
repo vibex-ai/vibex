@@ -4306,6 +4306,7 @@ async fn dispatch_agent_request(
                     .fetch_timeline(FetchTimelineRequest {
                         session_id: session.id.clone(),
                         after_sequence: None,
+                        before_sequence: None,
                         limit: timeline_limit,
                     })
                     .await?;
@@ -4332,6 +4333,7 @@ async fn dispatch_agent_request(
                 .fetch_timeline(FetchTimelineRequest {
                     session_id: session.id.clone(),
                     after_sequence: None,
+                    before_sequence: None,
                     limit: normalize_timeline_limit(request.timeline_limit),
                 })
                 .await?;
@@ -7103,6 +7105,7 @@ async fn catch_up_agent_timeline(
             .fetch_timeline(FetchTimelineRequest {
                 session_id: cursor.session_id.clone(),
                 after_sequence: Some(cursor.after_sequence),
+                before_sequence: None,
                 limit,
             })
             .await?;

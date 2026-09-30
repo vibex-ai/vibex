@@ -8681,6 +8681,132 @@ impl TimelineRepository {
         })
     }
 
+    /// Fetches the page that ends just below `before_sequence`, oldest first.
+    ///
+    /// This is the mirror image of [`Self::fetch_after`]: the cursor travels
+    /// towards older history, so `limit + 1` rows are read to probe whether
+    /// anything sits below the window and the extra row is dropped. The
+    /// primary key `(session_id, sequence)` makes the descending range scan
+    /// index-backed.
+    ///
+    /// `None` falls back to the same newest window as
+    /// `fetch_after(None, ..)`: "before everything" is the tail of history.
+    pub fn fetch_before(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        before_sequence: Option<i64>,
+        limit: u32,
+    ) -> VibexResult<TimelinePage> {
+        let limit = limit.clamp(1, 500) as i64;
+        let overfetch = limit + 1;
+        let mut items = if let Some(before_sequence) = before_sequence {
+            let mut stmt = conn
+                .prepare_cached(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence < ?2
+                    ORDER BY sequence DESC
+                    LIMIT ?3
+                    ",
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to prepare timeline fetch",
+                ))?;
+            let rows = stmt
+                .query_map(
+                    params![session_id.as_str(), before_sequence, overfetch],
+                    map_timeline_item,
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to query timeline items",
+                ))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(storage_err(
+                    "timeline_decode_failed",
+                    "failed to decode timeline row",
+                ))?);
+            }
+            out.reverse();
+            out
+        } else {
+            let mut stmt = conn
+                .prepare_cached(
+                    "
+                    SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                        correlation_id, provider_correlation_id, payload_json, redaction_state,
+                        execution_attribution_json
+                    FROM agent_timeline_items
+                    WHERE session_id = ?1
+                    ORDER BY sequence DESC
+                    LIMIT ?2
+                    ",
+                )
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to prepare timeline fetch",
+                ))?;
+            let rows = stmt
+                .query_map(params![session_id.as_str(), overfetch], map_timeline_item)
+                .map_err(storage_err(
+                    "timeline_fetch_failed",
+                    "failed to query timeline items",
+                ))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(storage_err(
+                    "timeline_decode_failed",
+                    "failed to decode timeline row",
+                ))?);
+            }
+            out.reverse();
+            out
+        };
+
+        // The overfetch row is the oldest one, so dropping it keeps the window
+        // as close to the cursor as the limit allows. What it proves is that
+        // something older exists below the returned page.
+        let has_older = items.len() as i64 > limit;
+        if has_older {
+            items.remove(0);
+        }
+
+        let start_sequence = items.first().map(|item| item.sequence);
+        let end_sequence = items.last().map(|item| item.sequence);
+        let has_newer = if let Some(end_sequence) = end_sequence {
+            conn.query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1 FROM agent_timeline_items
+                    WHERE session_id = ?1 AND sequence > ?2
+                )
+                ",
+                params![session_id.as_str(), end_sequence],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_err(
+                "timeline_newer_probe_failed",
+                "failed to inspect newer timeline items",
+            ))?
+        } else {
+            false
+        };
+
+        Ok(TimelinePage {
+            session_id: session_id.clone(),
+            items,
+            start_sequence,
+            end_sequence,
+            has_older,
+            has_newer,
+        })
+    }
+
     pub fn fetch_range(
         conn: &Connection,
         session_id: &VibexSessionId,
@@ -18949,6 +19075,114 @@ mod tests {
             TimelinePayload::AgentMessage(message)
                 if message.text == "complete final answer" && message.is_final
         ));
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn timeline_backward_pagination_walks_history_to_the_start() {
+        let temp = temp_db_path("timeline-backward");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-backward-test",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Backwards".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        for index in 1..=25 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("message-{index}"),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+
+        // `None` means "before everything", which is the newest window: the
+        // backward cursor must agree with the forward one there.
+        let first = TimelineRepository::fetch_before(&conn, &session.id, None, 10).unwrap();
+        let forward_tail = TimelineRepository::fetch_after(&conn, &session.id, None, 10).unwrap();
+        assert_eq!(first.items, forward_tail.items);
+        assert_eq!(first.start_sequence, Some(16));
+        assert_eq!(first.end_sequence, Some(25));
+        assert!(first.has_older);
+        assert!(!first.has_newer);
+
+        let mut collected: Vec<i64> = Vec::new();
+        let mut page = first;
+        loop {
+            collected.extend(page.items.iter().map(|item| item.sequence));
+            let Some(cursor) = page.start_sequence else {
+                break;
+            };
+            if !page.has_older {
+                break;
+            }
+            let next =
+                TimelineRepository::fetch_before(&conn, &session.id, Some(cursor), 10).unwrap();
+            // The page sits strictly below the cursor, with no gap and no
+            // overlap: it ends at the sequence immediately before it.
+            assert!(
+                next.items.iter().all(|item| item.sequence < cursor),
+                "the page leaked the cursor sequence"
+            );
+            assert_eq!(next.end_sequence, Some(cursor - 1));
+            page = next;
+        }
+
+        assert_eq!(
+            collected,
+            (16..=25).chain(6..=15).chain(1..=5).collect::<Vec<i64>>()
+        );
+
+        // A page below the oldest item is empty, not an error.
+        let exhausted = TimelineRepository::fetch_before(&conn, &session.id, Some(1), 10).unwrap();
+        assert!(exhausted.items.is_empty());
+        assert_eq!(exhausted.start_sequence, None);
+        assert_eq!(exhausted.end_sequence, None);
+        assert!(!exhausted.has_older);
+        assert!(!exhausted.has_newer);
+
+        // The limit is clamped like the forward fetch, so a zero limit still
+        // returns one item rather than an unusable empty page.
+        let clamped = TimelineRepository::fetch_before(&conn, &session.id, None, 0).unwrap();
+        assert_eq!(
+            clamped
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![25]
+        );
+        assert!(clamped.has_older);
 
         cleanup_db(temp);
     }

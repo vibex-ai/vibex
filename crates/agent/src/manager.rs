@@ -1765,7 +1765,12 @@ impl AgentManager {
     }
 
     pub async fn fetch_timeline(&self, request: FetchTimelineRequest) -> VibexResult<TimelinePage> {
-        self.fetch_timeline_page(&request.session_id, request.after_sequence, request.limit)
+        self.fetch_timeline_page(
+            &request.session_id,
+            request.after_sequence,
+            request.before_sequence,
+            request.limit,
+        )
     }
 
     /// Runs `f` against the shared streamed-append write connection.
@@ -1807,6 +1812,7 @@ impl AgentManager {
         &self,
         session_id: &VibexSessionId,
         after_sequence: Option<i64>,
+        before_sequence: Option<i64>,
         limit: u32,
     ) -> VibexResult<TimelinePage> {
         let mut reader = self
@@ -1819,7 +1825,19 @@ impl AgentManager {
         let conn = reader
             .as_ref()
             .expect("the timeline reader was opened just above");
-        match TimelineRepository::fetch_after(conn, session_id, after_sequence, limit) {
+        // The forward cursor wins when both are set: a caller that asks for a
+        // page after `a` and before `b` gets the forward window, which is what
+        // the pre-existing single-cursor contract promised.
+        let page = match (after_sequence, before_sequence) {
+            (Some(after_sequence), _) => {
+                TimelineRepository::fetch_after(conn, session_id, Some(after_sequence), limit)
+            }
+            (None, Some(before_sequence)) => {
+                TimelineRepository::fetch_before(conn, session_id, Some(before_sequence), limit)
+            }
+            (None, None) => TimelineRepository::fetch_after(conn, session_id, None, limit),
+        };
+        match page {
             Ok(page) => Ok(page),
             Err(error) => {
                 // A connection that cannot serve this read is not worth
@@ -7216,6 +7234,7 @@ mod tests {
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session.id.clone(),
                 after_sequence: None,
+                before_sequence: None,
                 limit: 100,
             })
             .await
@@ -8966,6 +8985,108 @@ mod tests {
         let stored = SessionRepository::get(&conn, &session.id).unwrap().unwrap();
         assert_eq!(stored.title, "Release plan");
         drop(conn);
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn timeline_fetch_serves_a_page_before_a_sequence_and_prefers_after() {
+        let db_path = temp_db_path("timeline-before-cursor");
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let workspace_root = temp_workspace_path("timeline-before-cursor");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "timeline before cursor",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("opencode").unwrap(),
+            AgentSessionState::Idle,
+        );
+        for index in 1..=12 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: format!("message-{index}"),
+                    attachments: Vec::new(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let before = manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id.clone(),
+                after_sequence: None,
+                before_sequence: Some(9),
+                limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            before
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
+        assert_eq!(before.start_sequence, Some(5));
+        assert_eq!(before.end_sequence, Some(8));
+        assert!(before.has_older);
+        assert!(before.has_newer);
+
+        // A request that sets both cursors keeps the pre-existing forward
+        // behaviour; the new cursor never silently rewrites it.
+        let forward_wins = manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id.clone(),
+                after_sequence: Some(2),
+                before_sequence: Some(9),
+                limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            forward_wins
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+
+        // Neither cursor keeps the newest window.
+        let newest = manager
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id.clone(),
+                after_sequence: None,
+                before_sequence: None,
+                limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            newest
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11, 12]
+        );
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);

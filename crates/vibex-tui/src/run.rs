@@ -940,6 +940,14 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
         MouseEventKind::ScrollUp => {
             app.scroll.follow = false;
             app.scroll.offset = app.scroll.offset.saturating_sub(3);
+            // The wheel is the other way to reach the top of the loaded
+            // window; the controller ignores the ask when there is nothing
+            // older or a page is already on its way.
+            if app.at_transcript_top()
+                && let Some(effect) = app.load_older_history()
+            {
+                worker.dispatch(effect);
+            }
             true
         }
         MouseEventKind::ScrollDown => {
@@ -1206,17 +1214,29 @@ fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
             app.reconcile_sidebar_arrangement();
             app.live = LiveState::Ready;
         }
-        AppMessage::SessionOpened(result) => match result {
-            Ok(snapshot) => {
-                app.sync_transcript();
-                app.open_session(snapshot.session.id.clone());
-                app.live = LiveState::Ready;
-                let _ = snapshot;
+        AppMessage::SessionOpened { ticket, result } => {
+            let failure = result.as_ref().err().map(|error| error.message.clone());
+            // The shared controller owns the projection: applying the snapshot
+            // is what populates `selected_session_id` and the timeline model,
+            // so live events stop being dropped as stale.
+            if app.agent.apply_session_snapshot(&ticket, result) {
+                match failure {
+                    Some(message) => app.toast(Toast::danger(message)),
+                    None => {
+                        app.sync_transcript();
+                        app.open_session(ticket.session_id.clone());
+                        app.live = LiveState::Ready;
+                    }
+                }
             }
-            Err(error) => {
-                app.toast(Toast::danger(error.message));
+        }
+        AppMessage::OlderTimeline { ticket, result } => {
+            match app.agent.apply_timeline_before(&ticket, result) {
+                Ok(true) => app.sync_transcript(),
+                Ok(false) => {}
+                Err(error) => app.toast(Toast::warning(error.message)),
             }
-        },
+        }
         AppMessage::TimelineRefreshed(result) => {
             if let Err(error) = result {
                 app.toast(Toast::danger(error.message));

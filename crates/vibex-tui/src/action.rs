@@ -114,6 +114,7 @@ intents! {
     ToggleDock => { scope: Agent, id: "dock_toggle", label: "Dock", help: "Show or hide the panel of running agents, the plan and held messages." },
     DockActivate => { scope: Agent, id: "dock_activate", label: "Dock open", help: "Open the highlighted dock row: jump to it, or fold its section." },
     DockHideDone => { scope: Agent, id: "dock_hide_done", label: "Hide done", help: "Hide finished agents and completed plan steps in the dock." },
+    LoadOlderHistory => { scope: Agent, id: "history_older", label: "Older history", help: "Fetch the page of history above the oldest loaded one." },
     QueueSelectPrevious => { scope: Agent, id: "queue_previous", label: "Queue up", help: "Move the queue cursor to the message above." },
     QueueSelectNext => { scope: Agent, id: "queue_next", label: "Queue down", help: "Move the queue cursor to the message below." },
     QueueEditSelected => { scope: Agent, id: "queue_edit", label: "Queue edit", help: "Pull the queued message back into the composer." },

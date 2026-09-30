@@ -242,6 +242,13 @@ pub struct AgentWorkflowState {
     pub latest_mutation: AsyncState<Vec<TimelineItem>>,
     pub connection: AgentConnectionState,
     pub last_runtime_event: Option<vibex_core::RuntimeSessionEvent>,
+    /// Whether the authoritative projection is known to have history below
+    /// its oldest item. Only an authoritative load or an applied older page
+    /// updates it, so it never guesses from a gap in the sequence numbers.
+    pub timeline_has_older: bool,
+    /// In-flight state of an older-page fetch, which is also the guard that
+    /// keeps a scrolled-to-the-top transcript from firing the request twice.
+    pub timeline_older_status: AsyncState<()>,
     pending_mutations: BTreeMap<String, AgentMutationKind>,
     pending_permission_resolutions: BTreeSet<String>,
     pending_elicitation_resolutions: BTreeSet<String>,
@@ -259,6 +266,9 @@ impl fmt::Debug for AgentWorkflowState {
             .field("has_active_session", &self.active_session.value.is_some())
             .field("timeline_status", &self.timeline_status.phase)
             .field("timeline_item_count", &self.timeline.items.len())
+            .field("timeline_has_older", &self.timeline_has_older)
+            .field("timeline_oldest_sequence", &self.timeline_oldest_sequence())
+            .field("timeline_older_phase", &self.timeline_older_status.phase)
             .field("runtime_options_phase", &self.runtime_options.phase)
             .field("runtime_selection_phase", &self.runtime_selection.phase)
             .field("latest_mutation_phase", &self.latest_mutation.phase)
@@ -292,6 +302,8 @@ impl Default for AgentWorkflowState {
             latest_mutation: AsyncState::default(),
             connection: AgentConnectionState::Online,
             last_runtime_event: None,
+            timeline_has_older: false,
+            timeline_older_status: AsyncState::default(),
             pending_mutations: BTreeMap::new(),
             pending_permission_resolutions: BTreeSet::new(),
             pending_elicitation_resolutions: BTreeSet::new(),
@@ -300,6 +312,14 @@ impl Default for AgentWorkflowState {
 }
 
 impl AgentWorkflowState {
+    /// Oldest sequence in the authoritative projection, if any.
+    ///
+    /// Derived rather than stored: every path that rewrites `timeline` would
+    /// otherwise have to remember to keep a second copy in step.
+    pub fn timeline_oldest_sequence(&self) -> Option<i64> {
+        self.timeline.items.first().map(|item| item.sequence)
+    }
+
     pub fn view(&self, sidebar: &SidebarState, query: &str, shell: ShellKind) -> AgentWorkflowView {
         AgentWorkflowView {
             generation: self.generation.0,
@@ -434,15 +454,33 @@ pub struct AgentSessionLoadTicket {
     pub after_sequence: i64,
 }
 
+/// Identifies one older-history fetch.
+///
+/// The cursor is fixed when the request starts, so a page that comes back
+/// after the reader kept scrolling is still validated against the window it
+/// was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTimelineBeforeTicket {
+    pub generation: WorkflowViewGeneration,
+    pub session_id: VibexSessionId,
+    /// Every item in the answered page must sit strictly below this sequence.
+    pub before_sequence: i64,
+}
+
 /// Authoritative projection of a previously loaded session. The stored
-/// timeline is a complete persisted prefix (paginated from sequence 0 with no
-/// gaps), so persisted items are immutable and a later refresh only needs the
-/// tail after the stored end sequence.
+/// timeline is a persisted prefix — complete when the client loaded the whole
+/// history, a bounded window when it hydrated only the newest page — so
+/// persisted items are immutable and a later refresh only needs the tail after
+/// the stored end sequence. `timeline_has_older` records whether the backend
+/// reported history below the stored window.
 #[derive(Clone)]
 struct CachedAgentSession {
     session: AgentSession,
     timeline: Vec<TimelineItem>,
     runtime_selection: Option<AgentSessionRuntimeSelectionState>,
+    /// Whether the backend reported history below this window when it was
+    /// stored. Restoring the cache restores that knowledge with it.
+    timeline_has_older: bool,
 }
 
 /// Most-recently-used-first LRU keyed by session id, bounded by session count
@@ -483,6 +521,12 @@ pub struct AgentSessionSnapshot {
     pub session: AgentSession,
     pub timeline: Vec<TimelineItem>,
     pub runtime_selection: Option<AgentSessionRuntimeSelectionState>,
+    /// Whether the backend reported history below `timeline`.
+    ///
+    /// A client that hydrates a bounded newest window sets this from the page
+    /// it fetched; the controller's own complete-prefix loader leaves it
+    /// `false` because nothing precedes sequence 0.
+    pub timeline_has_older: bool,
 }
 
 impl fmt::Debug for AgentSessionSnapshot {
@@ -492,6 +536,7 @@ impl fmt::Debug for AgentSessionSnapshot {
             .field("session_id", &self.session.id)
             .field("timeline_item_count", &self.timeline.len())
             .field("has_runtime_selection", &self.runtime_selection.is_some())
+            .field("timeline_has_older", &self.timeline_has_older)
             .finish()
     }
 }
@@ -628,6 +673,8 @@ impl AgentWorkflowController {
             self.state.timeline = TimelineModel::default();
             self.state.timeline_status.clear();
             self.state.runtime_selection.clear();
+            self.state.timeline_has_older = false;
+            self.state.timeline_older_status.clear();
         }
         if let Some(cached) = cached {
             // Restoring a cached complete prefix keeps the conversation
@@ -636,6 +683,7 @@ impl AgentWorkflowController {
             self.state
                 .timeline
                 .replace_authoritative(session_id.clone(), cached.timeline);
+            self.state.timeline_has_older = cached.timeline_has_older;
             if let Some(runtime_selection) = cached.runtime_selection {
                 self.state.runtime_selection.resolve(runtime_selection);
             }
@@ -701,6 +749,7 @@ impl AgentWorkflowController {
             session,
             timeline: self.state.timeline.items.clone(),
             runtime_selection: self.state.runtime_selection.value.clone(),
+            timeline_has_older: self.state.timeline_has_older,
         });
     }
 
@@ -721,7 +770,7 @@ impl AgentWorkflowController {
             // An empty cached prefix still resumes from 0 and refetches the
             // complete timeline, so the same paginated loader serves both the
             // cold and the incremental path.
-            let timeline =
+            let (timeline, timeline_has_older) =
                 load_timeline_after(backend.as_ref(), &ticket.session_id, ticket.after_sequence)
                     .await?;
             // Runtime metadata is a best-effort sibling query. The
@@ -739,8 +788,134 @@ impl AgentWorkflowController {
                 session,
                 timeline,
                 runtime_selection,
+                timeline_has_older,
             })
         })
+    }
+
+    /// Fetches one page of history below `ticket.before_sequence`.
+    ///
+    /// The sibling of [`Self::load_session`] for the older direction: the
+    /// window is bounded to a single page because the reader asked for one
+    /// screenful more, not for the rest of the archive.
+    pub fn load_timeline_before(
+        &self,
+        ticket: AgentTimelineBeforeTicket,
+    ) -> BackendFuture<'static, TimelinePage> {
+        let backend = self.backend.clone();
+        Box::pin(async move {
+            load_timeline_before(backend.as_ref(), &ticket.session_id, ticket.before_sequence).await
+        })
+    }
+
+    /// Starts an older-history fetch for the selected session.
+    ///
+    /// Fails when nothing is selected, when the projection is already known
+    /// to start at sequence 0, or when an older page is already in flight —
+    /// the last is what keeps a transcript parked at the top from firing a
+    /// request per keypress.
+    pub fn begin_timeline_before(&mut self) -> BackendResult<AgentTimelineBeforeTicket> {
+        self.require(BackendOperation::AgentFetchTimeline)?;
+        let Some(session_id) = self.state.selected_session_id.clone() else {
+            return Err(BackendError::conflict(
+                "agent_timeline_session_missing",
+                "no Agent session is selected",
+            ));
+        };
+        let Some(before_sequence) = self.state.timeline_oldest_sequence() else {
+            return Err(BackendError::conflict(
+                "agent_timeline_empty",
+                "the Agent timeline has no items to page before",
+            ));
+        };
+        if !self.state.timeline_has_older {
+            return Err(BackendError::conflict(
+                "agent_timeline_older_unavailable",
+                "the Agent timeline starts at the beginning of the history",
+            ));
+        }
+        if self.state.timeline_older_status.phase == AsyncPhase::Loading {
+            return Err(BackendError::conflict(
+                "agent_timeline_older_pending",
+                "an older Agent timeline page is already being fetched",
+            ));
+        }
+        self.state.timeline_older_status.begin();
+        Ok(AgentTimelineBeforeTicket {
+            generation: self.state.generation,
+            session_id,
+            before_sequence,
+        })
+    }
+
+    /// Prepends the page an older-history fetch produced.
+    ///
+    /// `Ok(true)` means the page was merged, `Ok(false)` that the ticket is
+    /// stale and the caller should drop the result, and `Err` that the page
+    /// was rejected — a backend that ignored the cursor and answered with a
+    /// newer page cannot serve older history at all, so the capability is
+    /// turned off rather than retried on every scroll.
+    pub fn apply_timeline_before(
+        &mut self,
+        ticket: &AgentTimelineBeforeTicket,
+        result: BackendResult<TimelinePage>,
+    ) -> BackendResult<bool> {
+        if self.state.generation != ticket.generation
+            || self.state.selected_session_id.as_ref() != Some(&ticket.session_id)
+        {
+            return Ok(false);
+        }
+        let page = match result {
+            Ok(page) => page,
+            Err(error) => {
+                self.state.timeline_older_status.reject(error.clone());
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            validate_timeline_before_page(&ticket.session_id, ticket.before_sequence, &page)
+        {
+            // The backend answered a cursor it did not understand. Retrying
+            // would return the same newest page forever, so the projection
+            // stops claiming to have older history.
+            self.state.timeline_has_older = false;
+            self.state.timeline_older_status.reject(error.clone());
+            return Err(error);
+        }
+        self.prepend_timeline_page(&ticket.session_id, page);
+        Ok(true)
+    }
+
+    /// Merges one older page into the head of the projection.
+    fn prepend_timeline_page(&mut self, session_id: &VibexSessionId, page: TimelinePage) {
+        let has_older = page.has_older;
+        let added_history = !page.items.is_empty();
+        let mut merged = page
+            .items
+            .into_iter()
+            .chain(self.state.timeline.items.iter().cloned())
+            .filter(|item| item.session_id == *session_id)
+            .collect::<Vec<_>>();
+        merged.sort_by_key(|item| item.sequence);
+        merged.dedup_by_key(|item| item.sequence);
+        // The budget is a hard cap and a prepend must never fail or panic to
+        // respect it. Overflow drops the NEWEST items and keeps the oldest
+        // `AGENT_TIMELINE_MAX_ITEMS`: the reader asked for older history and
+        // that is what must survive. The dropped tail is recoverable by the
+        // next authoritative load; older history is only reachable page by
+        // page, so losing it would lose it for good.
+        if merged.len() > AGENT_TIMELINE_MAX_ITEMS {
+            merged.truncate(AGENT_TIMELINE_MAX_ITEMS);
+        }
+        self.state
+            .timeline
+            .replace_authoritative(session_id.clone(), merged);
+        // An empty page is the end of the history whatever it claims: a page
+        // below the cursor that carries no items proves there is nothing down
+        // there, and trusting `has_older` instead would re-ask for the same
+        // cursor on every scroll gesture.
+        self.state.timeline_has_older = has_older && added_history;
+        self.state.timeline_older_status.resolve(());
     }
 
     pub fn apply_session_snapshot(
@@ -768,7 +943,9 @@ impl AgentWorkflowController {
                 if ticket.after_sequence > 0 {
                     // Merge the refreshed tail into the restored complete
                     // prefix; sequence normalization deduplicates items that
-                    // live events already applied while the refresh ran.
+                    // live events already applied while the refresh ran. The
+                    // restored window keeps the older-history knowledge it was
+                    // cached with: this page is above it, not below.
                     let merged = self
                         .state
                         .timeline
@@ -784,8 +961,10 @@ impl AgentWorkflowController {
                     self.state
                         .timeline
                         .replace_authoritative(ticket.session_id.clone(), snapshot.timeline);
+                    self.state.timeline_has_older = snapshot.timeline_has_older;
                 }
                 self.state.timeline_status.resolve(());
+                self.state.timeline_older_status.clear();
                 if let Some(runtime_selection) = snapshot.runtime_selection {
                     self.state.runtime_selection.resolve(runtime_selection);
                 } else if self.state.runtime_selection.phase == AsyncPhase::Loading {
@@ -799,6 +978,7 @@ impl AgentWorkflowController {
                         session,
                         timeline: self.state.timeline.items.clone(),
                         runtime_selection: self.state.runtime_selection.value.clone(),
+                        timeline_has_older: self.state.timeline_has_older,
                     });
                 }
             }
@@ -808,6 +988,10 @@ impl AgentWorkflowController {
                 if self.state.runtime_selection.phase == AsyncPhase::Loading {
                     self.state.runtime_selection.reject(error);
                 }
+                // The failed reload advanced the generation, so any older page
+                // still in flight is already dead; its status must not stay
+                // `Loading` and block the next request.
+                self.state.timeline_older_status.clear();
             }
         }
         true
@@ -1355,18 +1539,25 @@ async fn load_timeline_after(
     backend: &dyn AgentBackend,
     session_id: &VibexSessionId,
     after_sequence: i64,
-) -> BackendResult<Vec<TimelineItem>> {
+) -> BackendResult<(Vec<TimelineItem>, bool)> {
     let mut after_sequence = after_sequence.max(0);
     let mut by_sequence = BTreeMap::new();
+    let mut has_older = false;
     loop {
         let page = backend
             .fetch_timeline(FetchTimelineRequest {
                 session_id: session_id.clone(),
                 after_sequence: Some(after_sequence),
+                before_sequence: None,
                 limit: AGENT_TIMELINE_PAGE_LIMIT,
             })
             .await?;
         validate_timeline_page(session_id, after_sequence, &page)?;
+        // Only the first page can report history below the window; the later
+        // pages of this loop are above it by construction.
+        if by_sequence.is_empty() {
+            has_older = page.has_older;
+        }
         for item in page.items {
             if item.session_id == *session_id {
                 by_sequence.insert(item.sequence, item);
@@ -1379,7 +1570,7 @@ async fn load_timeline_after(
             ));
         }
         if !page.has_newer {
-            return Ok(by_sequence.into_values().collect());
+            return Ok((by_sequence.into_values().collect(), has_older));
         }
         let Some(next) = page.end_sequence.filter(|next| *next > after_sequence) else {
             return Err(BackendError::failed(
@@ -1389,6 +1580,27 @@ async fn load_timeline_after(
         };
         after_sequence = next;
     }
+}
+
+/// Fetches exactly one page below `before_sequence`.
+///
+/// Older history is loaded a screenful at a time as the reader scrolls up, so
+/// this deliberately does not loop: one gesture, one bounded request.
+async fn load_timeline_before(
+    backend: &dyn AgentBackend,
+    session_id: &VibexSessionId,
+    before_sequence: i64,
+) -> BackendResult<TimelinePage> {
+    let page = backend
+        .fetch_timeline(FetchTimelineRequest {
+            session_id: session_id.clone(),
+            after_sequence: None,
+            before_sequence: Some(before_sequence),
+            limit: AGENT_TIMELINE_PAGE_LIMIT,
+        })
+        .await?;
+    validate_timeline_before_page(session_id, before_sequence, &page)?;
+    Ok(page)
 }
 
 fn validate_timeline_page(
@@ -1410,6 +1622,37 @@ fn validate_timeline_page(
         return Err(BackendError::failed(
             "agent_timeline_page_invalid",
             "the Agent timeline page contains an invalid sequence or session",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a page fetched with the `before` cursor.
+///
+/// Serde ignores unknown fields, so a backend built before the cursor existed
+/// answers a `beforeSequence` request with the newest page instead of failing.
+/// That page looks perfectly well formed; the only thing wrong with it is that
+/// it is not below the cursor. Rejecting it here is what stops the client from
+/// prepending newer items and scrolling the reader to the wrong end.
+fn validate_timeline_before_page(
+    session_id: &VibexSessionId,
+    before_sequence: i64,
+    page: &TimelinePage,
+) -> BackendResult<()> {
+    if page.session_id != *session_id {
+        return Err(BackendError::failed(
+            "agent_timeline_session_mismatch",
+            "the Agent timeline page belongs to another session",
+        ));
+    }
+    if page
+        .items
+        .iter()
+        .any(|item| item.session_id != *session_id || item.sequence >= before_sequence)
+    {
+        return Err(BackendError::failed(
+            "agent_timeline_before_page_invalid",
+            "the Agent timeline backend ignored the before cursor and answered with a newer page",
         ));
     }
     Ok(())
@@ -1491,6 +1734,9 @@ mod tests {
         timeline: Arc<Mutex<Vec<TimelineItem>>>,
         permission_resolution: Arc<Mutex<Option<TimelineItem>>>,
         elicitation_resolution: Arc<Mutex<Option<TimelineItem>>>,
+        /// Models a backend built before the `before` cursor existed: it drops
+        /// the unknown field and answers with the newest page.
+        ignores_before_cursor: bool,
     }
 
     impl MockAgentBackend {
@@ -1500,7 +1746,13 @@ mod tests {
                 timeline: Arc::new(Mutex::new(timeline)),
                 permission_resolution: Arc::new(Mutex::new(None)),
                 elicitation_resolution: Arc::new(Mutex::new(None)),
+                ignores_before_cursor: false,
             }
+        }
+
+        fn ignoring_before_cursor(mut self) -> Self {
+            self.ignores_before_cursor = true;
+            self
         }
     }
 
@@ -1551,31 +1803,46 @@ mod tests {
 
         fn fetch_timeline(&self, request: FetchTimelineRequest) -> BackendFuture<'_, TimelinePage> {
             let timeline = self.timeline.clone();
+            let ignores_before_cursor = self.ignores_before_cursor;
             Box::pin(async move {
-                let after = request.after_sequence.unwrap_or_default();
                 let limit = request.limit as usize;
                 let items = timeline
                     .lock()
-                    .map_err(|_| BackendError::failed("mock", "mock poisoned"))?
+                    .map_err(|_| BackendError::failed("mock", "mock poisoned"))?;
+                if let Some(before) = request.before_sequence.filter(|_| !ignores_before_cursor) {
+                    // The newest `limit` items strictly below the cursor,
+                    // oldest first, mirroring the repository's own window.
+                    let below = items
+                        .iter()
+                        .filter(|item| item.sequence < before)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let start = below.len().saturating_sub(limit);
+                    let page = below[start..].to_vec();
+                    return Ok(TimelinePage {
+                        session_id: request.session_id,
+                        start_sequence: page.first().map(|item| item.sequence),
+                        end_sequence: page.last().map(|item| item.sequence),
+                        has_older: start > 0,
+                        has_newer: true,
+                        items: page,
+                    });
+                }
+                let after = request.after_sequence.unwrap_or_default();
+                let page = items
                     .iter()
                     .filter(|item| item.sequence > after)
                     .take(limit)
                     .cloned()
                     .collect::<Vec<_>>();
-                let end_sequence = items.last().map(|item| item.sequence);
-                let total_after = timeline
-                    .lock()
-                    .map_err(|_| BackendError::failed("mock", "mock poisoned"))?
-                    .iter()
-                    .filter(|item| item.sequence > after)
-                    .count();
+                let total_after = items.iter().filter(|item| item.sequence > after).count();
                 Ok(TimelinePage {
                     session_id: request.session_id,
-                    start_sequence: items.first().map(|item| item.sequence),
-                    end_sequence,
+                    start_sequence: page.first().map(|item| item.sequence),
+                    end_sequence: page.last().map(|item| item.sequence),
                     has_older: false,
-                    has_newer: total_after > items.len(),
-                    items,
+                    has_newer: total_after > page.len(),
+                    items: page,
                 })
             })
         }
@@ -1783,6 +2050,258 @@ mod tests {
         assert!(controller.apply_session_snapshot(&current, Ok(snapshot)));
         assert_eq!(controller.state.timeline.items.len(), 2);
         assert_eq!(controller.state.conversation_turns().len(), 1);
+    }
+
+    /// One user message per sequence, so a test can name a window by its
+    /// sequence numbers alone.
+    fn sequenced_items(
+        session_id: &VibexSessionId,
+        sequences: std::ops::RangeInclusive<i64>,
+    ) -> Vec<TimelineItem> {
+        sequences
+            .map(|sequence| {
+                timeline_item(
+                    session_id,
+                    sequence,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: format!("message-{sequence}"),
+                        attachments: Vec::new(),
+                        ..Default::default()
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn windowed_controller(
+        session: &AgentSession,
+        sequences: std::ops::RangeInclusive<i64>,
+        has_older: bool,
+    ) -> AgentWorkflowController {
+        let backend = Arc::new(MockAgentBackend::new(
+            session.clone(),
+            sequenced_items(&session.id, 1..=100),
+        ));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+        controller
+            .state
+            .timeline
+            .replace_authoritative(session.id.clone(), sequenced_items(&session.id, sequences));
+        controller.state.timeline_has_older = has_older;
+        controller
+    }
+
+    #[tokio::test]
+    async fn older_history_prepends_below_the_window_and_stops_at_the_start() {
+        let session = session();
+        let mut controller = windowed_controller(&session, 5..=8, true);
+        assert_eq!(controller.state.timeline_oldest_sequence(), Some(5));
+
+        let ticket = controller.begin_timeline_before().unwrap();
+        assert_eq!(ticket.before_sequence, 5);
+        assert_eq!(ticket.session_id, session.id);
+        assert_eq!(
+            controller.state.timeline_older_status.phase,
+            AsyncPhase::Loading
+        );
+
+        // A second request while the first is in flight is refused, which is
+        // what keeps a transcript parked at the top from firing per keypress.
+        let pending = controller.begin_timeline_before().unwrap_err();
+        assert_eq!(pending.code, "agent_timeline_older_pending");
+
+        let page = controller
+            .load_timeline_before(ticket.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(!page.has_older);
+        assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        assert!(!controller.state.timeline_has_older);
+        assert_eq!(
+            controller.state.timeline_older_status.phase,
+            AsyncPhase::Ready
+        );
+
+        // The projection is now known to start at sequence 1, so there is
+        // nothing left to ask for.
+        let exhausted = controller.begin_timeline_before().unwrap_err();
+        assert_eq!(exhausted.code, "agent_timeline_older_unavailable");
+    }
+
+    #[tokio::test]
+    async fn an_empty_older_page_ends_the_history_whatever_it_claims() {
+        let session = session();
+        let mut controller = windowed_controller(&session, 5..=8, true);
+        let ticket = controller.begin_timeline_before().unwrap();
+        // A page below the cursor with no items proves the history ends here,
+        // even if the backend still advertises more; believing it would make
+        // every scroll gesture ask for the same cursor again.
+        let page = TimelinePage {
+            session_id: session.id.clone(),
+            items: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: true,
+            has_newer: true,
+        };
+        assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
+        assert!(!controller.state.timeline_has_older);
+        assert_eq!(
+            controller.state.timeline_older_status.phase,
+            AsyncPhase::Ready
+        );
+        assert_eq!(
+            controller.begin_timeline_before().unwrap_err().code,
+            "agent_timeline_older_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_ignores_the_before_cursor_is_rejected_and_not_asked_again() {
+        let session = session();
+        let backend = Arc::new(
+            MockAgentBackend::new(session.clone(), sequenced_items(&session.id, 1..=8))
+                .ignoring_before_cursor(),
+        );
+        let mut controller = AgentWorkflowController::new(backend.clone(), capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+        controller
+            .state
+            .timeline
+            .replace_authoritative(session.id.clone(), sequenced_items(&session.id, 5..=8));
+        controller.state.timeline_has_older = true;
+
+        let ticket = controller.begin_timeline_before().unwrap();
+        assert_eq!(ticket.before_sequence, 5);
+        // What the stale backend actually answers: a perfectly valid newest
+        // page that simply is not below the cursor.
+        let stale_page = backend
+            .fetch_timeline(FetchTimelineRequest {
+                session_id: session.id.clone(),
+                after_sequence: None,
+                before_sequence: Some(5),
+                limit: AGENT_TIMELINE_PAGE_LIMIT,
+            })
+            .await
+            .unwrap();
+        assert!(stale_page.items.iter().any(|item| item.sequence >= 5));
+
+        let error = controller
+            .apply_timeline_before(&ticket, Ok(stale_page))
+            .unwrap_err();
+        assert_eq!(error.code, "agent_timeline_before_page_invalid");
+        // The page was not merged, and the projection stopped claiming to have
+        // older history instead of retrying the same losing request forever.
+        assert_eq!(
+            controller
+                .state
+                .timeline
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            (5..=8).collect::<Vec<_>>()
+        );
+        assert!(!controller.state.timeline_has_older);
+        assert_eq!(
+            controller.state.timeline_older_status.phase,
+            AsyncPhase::Failed
+        );
+        assert_eq!(
+            controller.begin_timeline_before().unwrap_err().code,
+            "agent_timeline_older_unavailable"
+        );
+
+        // The controller's own loader rejects the same answer before it ever
+        // reaches the projection.
+        controller.state.timeline_has_older = true;
+        let ticket = controller.begin_timeline_before().unwrap();
+        let error = controller.load_timeline_before(ticket).await.unwrap_err();
+        assert_eq!(error.code, "agent_timeline_before_page_invalid");
+    }
+
+    #[tokio::test]
+    async fn a_prepend_that_overflows_the_budget_keeps_the_oldest_items() {
+        let session = session();
+        let limit = AGENT_TIMELINE_MAX_ITEMS as i64;
+        let backend = Arc::new(MockAgentBackend::new(session.clone(), Vec::new()));
+        let mut controller = AgentWorkflowController::new(backend, capabilities());
+        controller.state.selected_session_id = Some(session.id.clone());
+        controller.state.active_session.resolve(session.clone());
+        // A full window: sequences 2..=20_001.
+        controller.state.timeline.replace_authoritative(
+            session.id.clone(),
+            sequenced_items(&session.id, 2..=limit + 1),
+        );
+        controller.state.timeline_has_older = true;
+        assert_eq!(
+            controller.state.timeline.items.len(),
+            AGENT_TIMELINE_MAX_ITEMS
+        );
+
+        let ticket = controller.begin_timeline_before().unwrap();
+        assert_eq!(ticket.before_sequence, 2);
+        let page = TimelinePage {
+            session_id: session.id.clone(),
+            items: sequenced_items(&session.id, 1..=1),
+            start_sequence: Some(1),
+            end_sequence: Some(1),
+            has_older: false,
+            has_newer: true,
+        };
+        assert!(controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
+
+        // The budget is a hard cap that a prepend must never trip. The oldest
+        // items survive and the newest tail is what gets dropped.
+        let sequences = controller
+            .state
+            .timeline
+            .items
+            .iter()
+            .map(|item| item.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences.len(), AGENT_TIMELINE_MAX_ITEMS);
+        assert_eq!(sequences.first(), Some(&1));
+        assert_eq!(sequences.last(), Some(&limit));
+    }
+
+    #[test]
+    fn a_stale_older_page_ticket_is_dropped_instead_of_applied() {
+        let session = session();
+        let mut controller = windowed_controller(&session, 5..=8, true);
+        let ticket = controller.begin_timeline_before().unwrap();
+        // Opening another session advances the generation; the page that
+        // arrives afterwards belongs to the previous window.
+        controller.begin_session_load(session.id.clone()).unwrap();
+        let page = TimelinePage {
+            session_id: session.id.clone(),
+            items: sequenced_items(&session.id, 1..=4),
+            start_sequence: Some(1),
+            end_sequence: Some(4),
+            has_older: false,
+            has_newer: true,
+        };
+        assert!(!controller.apply_timeline_before(&ticket, Ok(page)).unwrap());
     }
 
     #[test]
@@ -2176,6 +2695,7 @@ mod tests {
                     timeline_len
                 ],
                 runtime_selection: None,
+                timeline_has_older: false,
             });
             session.id
         }
@@ -2626,6 +3146,7 @@ mod tests {
             session: session.clone(),
             timeline: vec![item.clone()],
             runtime_selection: None,
+            timeline_has_older: false,
         };
         let mut state = AgentWorkflowState::default();
         state.sessions.resolve(vec![session.clone()]);

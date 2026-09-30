@@ -645,6 +645,14 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::ScrollToTop,
         "Top",
     ),
+    // `u` is free in this scope and reads as "up one page of history"; the
+    // scroll keys around it are all taken already.
+    binding(
+        Scope::Agent,
+        Chord::plain(KeyCode::Char('u')),
+        Intent::LoadOlderHistory,
+        "Older history",
+    ),
     binding(
         Scope::Agent,
         Chord::plain(KeyCode::Char('e')),

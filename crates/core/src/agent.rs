@@ -560,7 +560,16 @@ impl fmt::Debug for MessageSubmissionState {
 #[serde(rename_all = "camelCase")]
 pub struct FetchTimelineRequest {
     pub session_id: VibexSessionId,
+    /// Return the page that begins just after this sequence.
     pub after_sequence: Option<i64>,
+    /// Return the page ending just below this sequence, ordered oldest first.
+    /// Mutually exclusive with `after_sequence`, which wins when both are set.
+    ///
+    /// A backend that predates this cursor ignores the unknown field and
+    /// answers with the newest page, so a caller must check that every
+    /// returned item sits below `before_sequence` before using the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<i64>,
     pub limit: u32,
 }
 
@@ -895,5 +904,31 @@ mod tests {
         let encoded = serde_json::to_string(&completed).unwrap();
         assert!(!encoded.contains("private answer"));
         assert!(!format!("{completed:?}").contains("private answer"));
+    }
+
+    #[test]
+    fn fetch_timeline_before_cursor_is_optional_but_stable_once_used() {
+        let session_id = VibexSessionId::new();
+        let without = FetchTimelineRequest {
+            session_id: session_id.clone(),
+            after_sequence: None,
+            before_sequence: None,
+            limit: 50,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        // An absent cursor stays off the wire so older relays never see it.
+        assert!(json.get("beforeSequence").is_none());
+        // An old payload without the field still decodes.
+        let decoded: FetchTimelineRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, without);
+
+        let with = FetchTimelineRequest {
+            before_sequence: Some(42),
+            ..without
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["beforeSequence"], 42);
+        let decoded: FetchTimelineRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, with);
     }
 }

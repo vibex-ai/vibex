@@ -34,7 +34,15 @@ pub enum AppMessage {
     /// An image off the system clipboard: its media type and bytes, or `None`
     /// when there is none or the desktop offers no way to read one.
     ClipboardImage(Option<(String, Vec<u8>)>),
-    SessionOpened(BackendResult<Box<vibex_ui::AgentSessionSnapshot>>),
+    SessionOpened {
+        ticket: vibex_ui::AgentSessionLoadTicket,
+        result: BackendResult<vibex_ui::AgentSessionSnapshot>,
+    },
+    /// One page of history fetched with the `before` cursor.
+    OlderTimeline {
+        ticket: vibex_ui::AgentTimelineBeforeTicket,
+        result: BackendResult<vibex_core::TimelinePage>,
+    },
     TimelineRefreshed(BackendResult<i64>),
     RuntimeOptions(BackendResult<vibex_core::SessionRuntimeOptionCatalog>),
     SessionCreated(BackendResult<AgentSession>),
@@ -206,9 +214,19 @@ impl Dispatch {
                 let result = self.facade.agent().list_sessions(include_archived).await;
                 self.send(AppMessage::Sessions(result));
             }
-            Effect::OpenSession { session_id } => {
-                let result = self.load_session(session_id).await;
-                self.send(AppMessage::SessionOpened(result.map(Box::new)));
+            Effect::OpenSession { session_id, ticket } => {
+                let result = self.load_session(session_id, ticket.after_sequence).await;
+                self.send(AppMessage::SessionOpened { ticket, result });
+            }
+            Effect::LoadOlder { ticket } => {
+                let request = vibex_core::FetchTimelineRequest {
+                    session_id: ticket.session_id.clone(),
+                    after_sequence: None,
+                    before_sequence: Some(ticket.before_sequence),
+                    limit: vibex_ui::AGENT_TIMELINE_PAGE_LIMIT,
+                };
+                let result = self.facade.agent().fetch_timeline(request).await;
+                self.send(AppMessage::OlderTimeline { ticket, result });
             }
             Effect::RefreshTimeline => {
                 // The reducer re-issues an open for the current session; the
@@ -966,21 +984,39 @@ impl Dispatch {
     async fn load_session(
         &self,
         session_id: VibexSessionId,
+        after_sequence: i64,
     ) -> BackendResult<vibex_ui::AgentSessionSnapshot> {
         let session = self.facade.agent().open_session(session_id.clone()).await?;
+        // Hydration is a bounded window rather than the whole archive: the
+        // newest page on a cold open, the tail after a restored cached window
+        // otherwise. Older pages are fetched on demand as the reader scrolls
+        // up, which is what keeps a 100 000-item session usable.
         let timeline = self
             .facade
             .agent()
             .fetch_timeline(vibex_core::FetchTimelineRequest {
                 session_id: session_id.clone(),
-                after_sequence: None,
+                after_sequence: (after_sequence > 0).then_some(after_sequence),
+                before_sequence: None,
                 limit: vibex_ui::AGENT_TIMELINE_PAGE_LIMIT,
             })
             .await?;
+        if timeline.session_id != session_id
+            || timeline.items.iter().any(|item| {
+                item.session_id != session_id
+                    || (after_sequence > 0 && item.sequence <= after_sequence)
+            })
+        {
+            return Err(BackendError::failed(
+                "agent_timeline_page_invalid",
+                "the backend returned an invalid Agent timeline page",
+            ));
+        }
         Ok(vibex_ui::AgentSessionSnapshot {
             session,
             timeline: timeline.items,
             runtime_selection: None,
+            timeline_has_older: timeline.has_older,
         })
     }
 

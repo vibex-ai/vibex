@@ -705,6 +705,33 @@ fn seeded_block(
     }
 }
 
+/// One user message per sequence, so the projection has stable ids and the
+/// rendered text names the sequence it came from.
+fn seeded_items(
+    session_id: &vibex_core::VibexSessionId,
+    sequences: std::ops::RangeInclusive<i64>,
+) -> Vec<vibex_core::TimelineItem> {
+    sequences
+        .map(|sequence| vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: 1_759_237_920_000 + sequence,
+            source: vibex_core::TimelineSource::User,
+            kind: vibex_core::TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: format!("history message {sequence}"),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        })
+        .collect()
+}
+
 fn transcript_app(width: u16, height: u16) -> App {
     let mut app = app(width, height);
     app.transcript.set_blocks(vec![
@@ -1719,4 +1746,91 @@ fn the_first_run_guide_retires_once_every_step_is_done() {
         !screen.contains("Getting started"),
         "the guide must retire when it has nothing left to say:\n{screen}"
     );
+}
+
+#[test]
+fn a_prepended_history_page_keeps_the_readers_viewport_anchored() {
+    let session_id = vibex_core::VibexSessionId::new();
+    let mut app = app(100, 24);
+    app.navigate_to(Page::Agent);
+    app.agent.state.selected_session_id = Some(session_id.clone());
+    // The reader has hydrated the newest five items and scrolled to the top.
+    app.agent
+        .state
+        .timeline
+        .replace_authoritative(session_id.clone(), seeded_items(&session_id, 6..=10));
+    app.agent.state.timeline_has_older = true;
+    app.sync_transcript();
+    app.scroll.follow = false;
+    app.scroll.offset = 0;
+
+    let anchor = app
+        .transcript
+        .block(0)
+        .expect("the window has a first block")
+        .id
+        .clone();
+    let anchor_text = app
+        .transcript
+        .block(0)
+        .expect("the window has a first block")
+        .body
+        .clone();
+    let before = render(&mut app, 100, 24);
+    assert!(
+        text(&before).contains(&anchor_text),
+        "the oldest loaded item starts the viewport:\n{}",
+        text(&before)
+    );
+
+    // One page of older history arrives through the controller's real apply
+    // path. The ticket is built by hand because this app talks to the
+    // disconnected backend, which cannot issue one.
+    let ticket = vibex_ui::AgentTimelineBeforeTicket {
+        generation: app.agent.state.generation,
+        session_id: session_id.clone(),
+        before_sequence: 6,
+    };
+    let page = vibex_core::TimelinePage {
+        session_id: session_id.clone(),
+        items: seeded_items(&session_id, 1..=5),
+        start_sequence: Some(1),
+        end_sequence: Some(5),
+        has_older: false,
+        has_newer: true,
+    };
+    assert!(
+        app.agent
+            .apply_timeline_before(&ticket, Ok(page))
+            .expect("the page is valid")
+    );
+    app.sync_transcript();
+
+    // The prepend grew the content above the viewport, so the line offset had
+    // to move with it; an unanchored offset would have jumped back to the
+    // newly fetched first item.
+    assert!(
+        app.scroll.offset > 0,
+        "prepending history must shift the viewport down"
+    );
+    let anchored = app
+        .transcript
+        .block_at_line(app.scroll.offset)
+        .and_then(|index| app.transcript.block(index))
+        .map(|block| block.id.clone());
+    assert_eq!(anchored, Some(anchor));
+
+    let after = render(&mut app, 100, 24);
+    let screen = text(&after);
+    assert!(
+        screen.contains(&anchor_text),
+        "the block the reader was looking at must stay on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("history message 1"),
+        "the fetched page lands above the viewport, not in it:\n{screen}"
+    );
+    // The older page really is loaded: it is what the reader now scrolls into.
+    assert_eq!(app.agent.state.timeline_oldest_sequence(), Some(1));
+    assert!(!app.agent.state.timeline_has_older);
 }
