@@ -16,12 +16,19 @@ if (targetIndex >= 0 && (!target || target.startsWith("--"))) {
   process.exit(2);
 }
 
+// Both binaries the Packager configs declare must be built here: the desktop
+// GUI, and the standalone `vibex` character-grid client from `vibex-client`.
+// `vibex-desktop` only depends on `vibex-client` as a library, so building the
+// desktop package alone never produces `target/release/vibex` and cargo
+// packager fails to copy it into the package.
 const nativeBuildResult = spawnSync(
   process.env.CARGO || "cargo",
   [
     "build",
     "-p",
     "vibex-desktop",
+    "-p",
+    "vibex-client",
     "--release",
     "--locked",
     ...(target ? ["--target", target] : [])
