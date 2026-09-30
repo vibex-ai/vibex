@@ -1126,6 +1126,90 @@ fn a_pasted_image_path_attaches_instead_of_typing_the_path() {
 }
 
 #[test]
+fn markdown_styling_reaches_the_screen() {
+    use vibex_desktop_model::TimelineRowKind;
+    let mut app = transcript_app(120, 44);
+    let mut block = seeded_block(
+        "styled-body",
+        TimelineRowKind::AgentMessage,
+        "### 渲染标题\n\n正文里有 `inline_code` 片段，还有 **重点** 内容。",
+    );
+    block.expanded = true;
+    block.collapsible = true;
+    app.transcript.set_blocks(vec![block]);
+    let buffer = render_buffer(&mut app, 120, 44);
+    let rows = (0..44)
+        .map(|row| display_row(&buffer, row, 120))
+        .collect::<Vec<_>>();
+
+    // Markup is never printed: no `#` heading markers, no code backticks.
+    let screen = rows.join("\n");
+    assert!(
+        !screen.contains('#'),
+        "a heading marker is on screen:\n{screen}"
+    );
+    assert!(!screen.contains('`'), "backticks are on screen:\n{screen}");
+
+    // The heading is bold.
+    let heading_row = rows
+        .iter()
+        .position(|row| row.contains("渲染标题"))
+        .expect("the heading is on screen");
+    let bold = (0..120)
+        .filter_map(|column| buffer.cell((column, heading_row as u16)))
+        .any(|cell| {
+            cell.symbol() == "标"
+                && cell
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        });
+    assert!(bold, "the heading is not bold:\n{screen}");
+
+    // The inline code keeps the code background over its whole run, which is
+    // what the backticks used to stand for.
+    let code_row = rows
+        .iter()
+        .position(|row| row.contains("inline_code"))
+        .expect("the code span is on screen");
+    let code_background = vibex_tui::theme::TuiTheme::resolve(
+        Some("vibex-dark"),
+        vibex_ui::GpuiThemeMode::Dark,
+        vibex_tui::ColorCapability {
+            mode: vibex_tui::ColorMode::TrueColor,
+            glyphs: vibex_tui::GlyphMode::Unicode,
+        },
+    )
+    .roles
+    .code_background;
+    let coloured = (0..120)
+        .filter_map(|column| buffer.cell((column, code_row as u16)))
+        .filter(|cell| cell.style().bg == Some(code_background))
+        .count();
+    assert!(
+        coloured >= "inline_code".len(),
+        "only {coloured} cells carry the code background:\n{screen}"
+    );
+}
+
+/// A row's text with the filler cell after each wide glyph dropped, so a
+/// double-width string can be matched as it reads.
+fn display_row(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
+    let mut out = String::new();
+    let mut column = 0u16;
+    while column < width {
+        let Some(cell) = buffer.cell((column, row)) else {
+            break;
+        };
+        let symbol = cell.symbol();
+        out.push_str(symbol);
+        let advance = vibex_tui::text::display_width(symbol).max(1) as u16;
+        column += advance;
+    }
+    out
+}
+
+#[test]
 fn the_transcript_uses_the_whole_band_on_a_wide_terminal() {
     let mut app = transcript_app(200, 44);
     // One long paragraph, the shape an Agent's prose arrives in.

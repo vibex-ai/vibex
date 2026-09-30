@@ -23,6 +23,8 @@ use vibex_markdown::{
 };
 
 use crate::locale::Strings;
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::text::{display_width, take_width, wrap_text};
 use crate::theme::TuiTheme;
 
@@ -151,17 +153,13 @@ impl<'a> Builder<'a> {
         let body = logical.body();
         let available = self.width.saturating_sub(prefix_width).max(1);
         let wrapped = wrap_text(&body, available);
-        // Span styling survives wrapping by re-applying the logical line's own
-        // style to the wrapped segment; markdown emphasis is applied when the
-        // spans are built, so the wrapping above only splits plain text.
-        let primary_style = logical
-            .spans
-            .first()
-            .map(|span| span.style)
-            .unwrap_or_default();
         // The marker only decorates the first visual line; continuations line
         // up under the text so a long bullet stays readable.
         let hanging = " ".repeat(prefix_width);
+        // The wrapped text is matched back onto the styled runs one segment at
+        // a time, so emphasis, code and links keep their styling across a line
+        // break instead of collapsing to whichever span came first.
+        let mut cursor = RunCursor::new(&logical.spans);
         for (index, segment) in wrapped.iter().enumerate() {
             let mut spans = Vec::new();
             if index == 0 {
@@ -173,7 +171,7 @@ impl<'a> Builder<'a> {
                 spans.push(Span::raw(hanging.clone()));
             }
             let content = segment.text.clone();
-            spans.push(Span::styled(content.clone(), primary_style));
+            spans.extend(take_styled_segment(&mut cursor, &content));
             let mut line = Line::from(spans);
             if let Some(background) = logical.background {
                 line = line.style(background);
@@ -192,6 +190,38 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A line whose spacing is content: code, tables and rules are never
+    /// re-flowed, because collapsing their runs of spaces destroys the layout
+    /// they were written with.
+    fn push_preformatted(
+        &mut self,
+        indent: usize,
+        spans: Vec<Span<'static>>,
+        background: Option<Style>,
+    ) {
+        let available = self.width.saturating_sub(indent).max(1);
+        let body = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let mut cursor = RunCursor::new(&spans);
+        for range in hard_wrap_ranges(&body, available) {
+            let segment = &body[range];
+            let mut line_spans = Vec::new();
+            if indent > 0 {
+                line_spans.push(Span::raw(" ".repeat(indent)));
+            }
+            line_spans.extend(take_styled_segment(&mut cursor, segment));
+            let mut line = Line::from(line_spans);
+            if let Some(background) = background {
+                line = line.style(background);
+            }
+            let mut plain = " ".repeat(indent);
+            plain.push_str(segment);
+            self.lines.push((line, plain));
+        }
+    }
+
     fn blocks(&mut self, blocks: &[BlockNode], indent: usize) {
         for block in blocks {
             self.block(block, indent);
@@ -205,23 +235,23 @@ impl<'a> Builder<'a> {
                 self.blank();
             }
             Block::Heading { level, content, .. } => {
+                // Emphasis carries the heading, not the source's `#`s: the
+                // marker is markup, and printing it is noise the reader has to
+                // skip on every heading. A rule under the top two levels keeps
+                // the hierarchy visible in terminals whose CJK font has no bold
+                // face.
                 let style = match level {
-                    1 => self.theme.strong().add_modifier(Modifier::UNDERLINED),
+                    1 | 2 => self
+                        .theme
+                        .strong()
+                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
                     _ => self.theme.strong(),
                 };
                 let mut spans = self.inlines_styled(content, style);
                 if spans.is_empty() {
                     spans.push(Span::styled(String::new(), style));
                 }
-                let marker = if self.theme.glyphs() == crate::theme::GlyphMode::Unicode {
-                    vec![Span::styled(
-                        format!("{} ", "#".repeat(*level as usize)),
-                        self.theme.muted(),
-                    )]
-                } else {
-                    Vec::new()
-                };
-                self.logical_with(indent, marker, spans);
+                self.logical_with(indent, Vec::new(), spans);
                 self.blank();
             }
             Block::Quote(children) => {
@@ -512,7 +542,7 @@ impl<'a> Builder<'a> {
         };
         for line in lines {
             let spans = self.highlight.highlight(language, line, base, self.theme);
-            self.logical_code(indent + 2, spans, base);
+            self.push_preformatted(indent + 2, spans, Some(base));
         }
     }
 
@@ -528,10 +558,10 @@ impl<'a> Builder<'a> {
             } else {
                 self.theme.muted()
             };
-            self.logical_code(
+            self.push_preformatted(
                 indent + 2,
                 vec![Span::styled(line.to_string(), style)],
-                base,
+                Some(base),
             );
         }
     }
@@ -585,35 +615,32 @@ impl<'a> Builder<'a> {
         }
         let glyphs = self.theme.glyphs() == crate::theme::GlyphMode::Unicode;
         let (vertical, horizontal) = if glyphs { ("│", "─") } else { ("|", "-") };
-        let rule = |widths: &[usize]| {
-            let mut text = String::from(if glyphs { "├" } else { "+" });
+        // A table is a box: top, a rule under the header, and a closed bottom.
+        // Without the bottom rule it reads as content that got cut off.
+        let rule = |left: &str, middle: &str, right: &str, widths: &[usize]| {
+            let (left, middle, right) = if glyphs {
+                (left, middle, right)
+            } else {
+                ("+", "+", "+")
+            };
+            let mut text = String::from(left);
             for (index, width) in widths.iter().enumerate() {
                 text.push_str(&horizontal.repeat(width + 2));
                 text.push_str(if index + 1 == widths.len() {
-                    if glyphs { "┤" } else { "+" }
-                } else if glyphs {
-                    "┼"
+                    right
                 } else {
-                    "+"
+                    middle
                 });
             }
             text
         };
-        let mut header_rule = String::from(if glyphs { "┌" } else { "+" });
-        for (index, width) in widths.iter().enumerate() {
-            header_rule.push_str(&horizontal.repeat(width + 2));
-            header_rule.push_str(if index + 1 == widths.len() {
-                if glyphs { "┐" } else { "+" }
-            } else if glyphs {
-                "┬"
-            } else {
-                "+"
-            });
-        }
-        self.logical_with(
+        self.push_preformatted(
             indent,
-            Vec::new(),
-            vec![Span::styled(header_rule, self.theme.border_style())],
+            vec![Span::styled(
+                rule("┌", "┬", "┐", &widths),
+                self.theme.border_style(),
+            )],
+            None,
         );
         for (row_index, row) in cells.iter().enumerate() {
             let mut spans = vec![Span::styled(
@@ -622,42 +649,44 @@ impl<'a> Builder<'a> {
             )];
             for (index, width) in widths.iter().enumerate() {
                 let cell = row.get(index).map(String::as_str).unwrap_or_default();
-                let padded = match alignments.get(index) {
-                    Some(vibex_markdown::TableAlignment::Right) => {
-                        format!("{:>width$}", truncate(cell, *width), width = *width)
-                    }
-                    Some(vibex_markdown::TableAlignment::Center) => {
-                        let text = truncate(cell, *width);
-                        let padding = width.saturating_sub(display_width(&text));
-                        format!(
-                            "{}{}{}",
-                            " ".repeat(padding / 2),
-                            text,
-                            " ".repeat(padding - padding / 2)
-                        )
-                    }
-                    _ => format!("{:<width$}", truncate(cell, *width), width = *width),
-                };
+                // Padding is measured in cells: `{:<width$}` counts
+                // characters, which drags a CJK table's columns out of line.
+                let padded = pad_cell(cell, *width, alignments.get(index).copied());
                 let style = if row_index == 0 && header.is_some() {
                     self.theme.strong()
                 } else {
                     self.theme.base()
                 };
                 spans.push(Span::styled(padded, style));
-                spans.push(Span::styled(
-                    format!(" {vertical} "),
-                    self.theme.border_style(),
-                ));
+                // The closing edge carries no trailing space: a row must be
+                // exactly as wide as the rule that closes it.
+                let edge = if index + 1 == widths.len() {
+                    format!(" {vertical}")
+                } else {
+                    format!(" {vertical} ")
+                };
+                spans.push(Span::styled(edge, self.theme.border_style()));
             }
-            self.logical_with(indent, Vec::new(), spans);
+            self.push_preformatted(indent, spans, None);
             if row_index == 0 && header.is_some() {
-                self.logical_with(
+                self.push_preformatted(
                     indent,
-                    Vec::new(),
-                    vec![Span::styled(rule(&widths), self.theme.border_style())],
+                    vec![Span::styled(
+                        rule("├", "┼", "┤", &widths),
+                        self.theme.border_style(),
+                    )],
+                    None,
                 );
             }
         }
+        self.push_preformatted(
+            indent,
+            vec![Span::styled(
+                rule("└", "┴", "┘", &widths),
+                self.theme.border_style(),
+            )],
+            None,
+        );
     }
 
     fn inlines(&self, inlines: &[InlineNode]) -> Vec<Span<'static>> {
@@ -678,9 +707,11 @@ impl<'a> Builder<'a> {
                 out.push(Span::styled(text.clone(), style));
             }
             Inline::Code(text) => {
+                // No backticks: the background and colour are the marker. A
+                // reader should see code, not the syntax that marks it up.
                 out.push(Span::styled(
-                    format!("`{text}`"),
-                    style.patch(self.theme.code()).fg(self.theme.roles.accent),
+                    text.clone(),
+                    self.theme.code().fg(self.theme.roles.accent),
                 ));
             }
             Inline::Emphasis(children) => {
@@ -760,14 +791,6 @@ impl<'a> Builder<'a> {
     }
 
     /// A logical line that carries a background, so wrapping pads the tail.
-    fn logical_code(&mut self, indent: usize, spans: Vec<Span<'static>>, background: Style) {
-        let mut logical = Logical::new();
-        logical.indent = indent;
-        logical.spans = spans;
-        logical.background = Some(background);
-        self.push_logical(logical);
-    }
-
     fn logical_with(
         &mut self,
         indent: usize,
@@ -797,6 +820,130 @@ fn resource_label(resource: &vibex_markdown::ResolvedResource) -> String {
         .clone()
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| resource_target(resource))
+}
+
+/// Pad one table cell to `width` display columns.
+fn pad_cell(text: &str, width: usize, alignment: Option<vibex_markdown::TableAlignment>) -> String {
+    let text = truncate(text, width);
+    let padding = width.saturating_sub(display_width(&text));
+    match alignment {
+        Some(vibex_markdown::TableAlignment::Right) => {
+            format!("{}{text}", " ".repeat(padding))
+        }
+        Some(vibex_markdown::TableAlignment::Center) => format!(
+            "{}{text}{}",
+            " ".repeat(padding / 2),
+            " ".repeat(padding - padding / 2)
+        ),
+        _ => format!("{text}{}", " ".repeat(padding)),
+    }
+}
+
+/// A position inside a logical line's styled runs.
+struct RunCursor<'a> {
+    runs: &'a [Span<'static>],
+    run: usize,
+    offset: usize,
+}
+
+impl<'a> RunCursor<'a> {
+    fn new(runs: &'a [Span<'static>]) -> Self {
+        Self {
+            runs,
+            run: 0,
+            offset: 0,
+        }
+    }
+
+    /// The unstyled text left in the current run, skipping exhausted runs.
+    fn rest(&mut self) -> &'a str {
+        while let Some(span) = self.runs.get(self.run) {
+            if self.offset < span.content.len() {
+                return &span.content[self.offset..];
+            }
+            self.run += 1;
+            self.offset = 0;
+        }
+        ""
+    }
+
+    fn style(&self) -> Style {
+        self.runs
+            .get(self.run)
+            .map(|span| span.style)
+            .unwrap_or_default()
+    }
+
+    fn take(&mut self, bytes: usize) {
+        self.offset += bytes;
+    }
+}
+
+/// The styled runs of one wrapped segment.
+///
+/// `wrap_text` returns the text of each visual line rather than byte offsets,
+/// because a break consumes the space it broke on and an over-long token is cut
+/// in two. Walking the runs in step with each segment therefore matches on
+/// characters rather than offsets: the wrapper stays the single authority on
+/// where lines break, and every span keeps its colour and background across the
+/// break.
+fn take_styled_segment(cursor: &mut RunCursor<'_>, segment: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut remaining = segment;
+    while let Some(character) = remaining.chars().next() {
+        let rest = cursor.rest();
+        match rest.chars().next() {
+            Some(other) if other == character => {
+                push_styled(&mut spans, character, cursor.style());
+                cursor.take(character.len_utf8());
+                remaining = &remaining[character.len_utf8()..];
+            }
+            // The wrapper dropped or collapsed a space at this point.
+            Some(other) if other.is_whitespace() => cursor.take(other.len_utf8()),
+            // The wrapper re-joined two tokens with a space of its own.
+            None | Some(_) if character == ' ' => remaining = &remaining[1..],
+            // A mismatch the wrapper should not produce: take the segment's
+            // character rather than loop forever.
+            _ => {
+                push_styled(&mut spans, character, cursor.style());
+                remaining = &remaining[character.len_utf8()..];
+            }
+        }
+    }
+    spans
+}
+
+/// Append a character, merging it into the previous span when the style is the
+/// same so a paragraph does not become one span per grapheme.
+fn push_styled(spans: &mut Vec<Span<'static>>, character: char, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        let mut text = last.content.to_string();
+        text.push(character);
+        *last = Span::styled(text, style);
+        return;
+    }
+    spans.push(Span::styled(character.to_string(), style));
+}
+
+/// Split preformatted text into ranges of at most `width` display columns.
+fn hard_wrap_ranges(text: &str, width: usize) -> Vec<std::ops::Range<usize>> {
+    let width = width.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = display_width(grapheme);
+        if used > 0 && used + grapheme_width > width {
+            ranges.push(start..offset);
+            start = offset;
+            used = 0;
+        }
+        used += grapheme_width;
+    }
+    ranges.push(start..text.len());
+    ranges
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -1134,6 +1281,108 @@ mod tests {
         assert!(text.contains("Name"));
         assert!(text.contains("longer"));
         assert!(text.contains('│') || text.contains('|'));
+        // A table is a box: the header rule and the bottom rule are both there.
+        assert!(
+            text.contains('┌') && text.contains('├') && text.contains('└'),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_double_width_cells_stays_in_column() {
+        // Character-counted padding put every `│` after a CJK cell in a
+        // different column, which is what made a table look like spilled text.
+        let rendered = render(
+            "| 目录 | 内容 |\n| --- | --- |\n| `crates/` | 约 25 个库 |\n| `apps/` | 三个客户端 |",
+            60,
+        );
+        let widths = rendered
+            .plain
+            .iter()
+            .filter(|line| !line.is_empty())
+            .map(|line| display_width(line))
+            .collect::<Vec<_>>();
+        assert!(widths.len() >= 5, "{:?}", rendered.plain);
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "the table rows are not the same width: {widths:?}\n{}",
+            rendered.text()
+        );
+    }
+
+    #[test]
+    fn inline_code_and_headings_hide_their_markup() {
+        let rendered = render("## 项目概览\n\n用 `pnpm check:rust` 检查。", 40);
+        let text = rendered.text();
+        assert!(
+            !text.contains('#'),
+            "the heading marker is still printed: {text}"
+        );
+        assert!(
+            !text.contains('`'),
+            "the code backticks are still printed: {text}"
+        );
+        assert!(text.contains("项目概览"), "{text}");
+        assert!(text.contains("pnpm check:rust"), "{text}");
+        // The code span carries the code background rather than a pair of
+        // backticks, so it is still identifiable as code.
+        let code = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("pnpm check:rust"))
+            .expect("the code span is rendered");
+        assert_eq!(
+            code.style.bg,
+            Some(theme(ColorMode::TrueColor).roles.code_background)
+        );
+    }
+
+    #[test]
+    fn emphasis_and_code_survive_a_line_break() {
+        // The styled span is neither first nor last, and the paragraph wraps:
+        // re-applying only the first span's style to each visual line is what
+        // erased every markdown cue in a wrapped paragraph.
+        let rendered = render(
+            "aaaaaaaa bbbb **bold words here** cccc `code_span` dddd eeee ffff gggg",
+            24,
+        );
+        assert!(rendered.height() >= 2, "the paragraph did not wrap");
+        let by_style = |wanted: Style| {
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| {
+                    span.style.add_modifier == wanted.add_modifier && span.style.bg == wanted.bg
+                })
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let palette = theme(ColorMode::TrueColor);
+        let bold = by_style(palette.base().add_modifier(Modifier::BOLD));
+        assert!(bold.contains("bold"), "bold text lost its style: {bold:?}");
+        let code = by_style(palette.code().fg(palette.roles.accent));
+        assert!(
+            code.contains("code"),
+            "the code span lost its background: {code:?}"
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_their_alignment() {
+        // Runs of spaces inside a code line are content: collapsing them
+        // destroys an aligned comment block.
+        let rendered = render("```sh\npnpm dev   # start\npnpm check # gate\n```", 60);
+        let line = rendered
+            .plain
+            .iter()
+            .find(|line| line.contains("pnpm dev"))
+            .expect("the code line is rendered");
+        assert!(
+            line.contains("dev   #"),
+            "the alignment was collapsed: {line:?}"
+        );
     }
 
     #[test]
