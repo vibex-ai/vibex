@@ -481,18 +481,35 @@ impl Transcript {
     /// case this is free.
     pub fn configure(&mut self, width: usize, theme: &TuiTheme) {
         let width = width.max(8);
-        let theme_id = theme.id.to_string();
-        if self.width == width && self.theme_id == theme_id {
-            return;
+        if self.width != width {
+            self.width = width;
+            self.invalidate_all();
         }
-        self.width = width;
-        self.theme_id = theme_id;
+        self.set_theme(theme);
+    }
+
+    /// Drop every measurement and rendered row.
+    fn invalidate_all(&mut self) {
         self.heights
             .iter_mut()
             .for_each(|height| *height = UNMEASURED);
         self.rendered.clear();
         self.recency.clear();
         self.layout_valid = false;
+    }
+
+    /// Invalidate the cache when the look changed.
+    ///
+    /// The width is the renderer's business — it is the only code that knows
+    /// how wide the transcript band actually is — so a look change must be
+    /// tellable without pretending to know a width.
+    pub fn set_theme(&mut self, theme: &TuiTheme) {
+        let theme_id = theme.id.to_string();
+        if self.theme_id == theme_id {
+            return;
+        }
+        self.theme_id = theme_id;
+        self.invalidate_all();
     }
 
     /// Toggle one block's expansion.

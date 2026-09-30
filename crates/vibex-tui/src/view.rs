@@ -455,9 +455,22 @@ pub fn palette_matches(query: &str, strings: Strings) -> Vec<PaletteEntry> {
     entries
 }
 
-/// The transcript width available inside the agent page chrome.
-pub fn transcript_width(shell: ShellKind, columns: u16) -> usize {
-    layout_for(shell, columns, 40).main_width.saturating_sub(4)
+/// The transcript band's width at a terminal `columns` wide.
+///
+/// The agent view is one full-width stack, so this is the content area less
+/// the outer padding and the rail's gutter — not a sidebar-adjusted pane
+/// width. It mirrors [`crate::layout::compute`], and a test asserts the two
+/// agree at several sizes so the two cannot drift.
+pub fn transcript_width(_shell: ShellKind, columns: u16) -> usize {
+    let columns = usize::from(columns);
+    let hpad = usize::from(crate::layout::OUTER_HPAD.min(columns as u16 / 4));
+    let content = columns.saturating_sub(hpad * 2);
+    let gutter = if content >= usize::from(crate::layout::MIN_TRANSCRIPT_FOR_GUTTER) {
+        usize::from(crate::layout::GUTTER_WIDTH)
+    } else {
+        0
+    };
+    content.saturating_sub(gutter)
 }
 
 /// Detail text for one transcript block, used by the details overlay.
@@ -587,29 +600,38 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
             || app.turn_started.is_some(),
     );
     let queued = app.queued_messages.len() as u16;
+    // Everything from the turn line down belongs to the session view. On the
+    // session list the active session's plan and turn state are not what the
+    // reader is looking at, and printing them above the list is how a global
+    // page ends up wearing another page's chrome.
+    let session_view = app.page.is_session_page();
     crate::layout::BandRequest {
         // The tasks row appears only when background work exists, so an idle
         // session spends no rows on it.
-        tasks: if app.background_task_count() > 0 {
+        tasks: if session_view && app.background_task_count() > 0 {
             1
         } else {
             0
         },
         // The dock already lists the plan and the held queue, so its sections
         // replace those bands while it is open rather than saying it twice.
-        todo: if app.dock_open {
+        todo: if !session_view || app.dock_open {
             0
         } else {
             u16::from(app.todo_total_count() > 0)
         },
-        queue: if app.dock_open || queued == 0 {
+        queue: if !session_view || app.dock_open || queued == 0 {
             0
         } else {
             (queued + 1).min(5)
         },
-        turn_status,
+        turn_status: if session_view { turn_status } else { 0 },
         banner: u16::from(app.banner.is_some()),
-        dock: if app.dock_open { app.dock_height() } else { 0 },
+        dock: if session_view && app.dock_open {
+            app.dock_height()
+        } else {
+            0
+        },
         // The composer belongs to a session. On a page with no session context
         // there is nothing to send, so the band is not allocated and the
         // transcript gets its rows instead.
@@ -714,6 +736,10 @@ fn render_scrollback(
     // The mouse layer maps a pointer back to a display line through this rect,
     // so it is published before any early return.
     app.regions.scrollback = area;
+    // The transcript wraps to the band it is drawn in, and this is the only
+    // place that knows how wide that is. Configuring it from a pane layout
+    // instead is what left a wide terminal's right half empty.
+    app.transcript.configure(usize::from(area.width), theme);
     if app.transcript.is_empty() {
         render_welcome(frame, area, app, theme, strings);
         return;
@@ -989,6 +1015,22 @@ fn render_session_view(
     }
     let selected = app.selection_for(Scope::Sessions);
     let sessions = app.agent.state.sessions.value.clone().unwrap_or_default();
+    // One state column for the whole list. The widest label decides its edge,
+    // so every row's state starts at the same cell instead of wherever its
+    // title happened to end -- which, with double-width CJK titles padded by
+    // character count, is what made the column look attached to the wrong row.
+    let state_column = rows
+        .iter()
+        .filter_map(|row| row.state)
+        .map(|state| display_width(session_state_label(state, strings)))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(list_area.width) / 3);
+    let state_width = if state_column > 0 {
+        state_column + 1
+    } else {
+        0
+    };
     let items = rows
         .iter()
         .enumerate()
@@ -1026,22 +1068,37 @@ fn render_session_view(
                 vibex_desktop_model::AgentSidebarRowKind::Session => " ",
             };
             let indent = " ".repeat(usize::from(row.depth) * 2);
-            let state = row
-                .state
-                .map(|state| format!("  {}", session_state_label(state, strings)))
-                .unwrap_or_default();
-            let name_width = usize::from(list_area.width).saturating_sub(24 + state.len());
-            let mut lines = vec![Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{indent}{marker} {:<width$}",
-                        truncate_to_width(&row.label, name_width.max(8), "…"),
-                        width = name_width.max(8)
-                    ),
-                    style,
-                ),
-                Span::styled(state, Style::default().fg(theme.roles.gray_dim)),
-            ])];
+            // The marker plus its space, then the title, then the state column.
+            // Padding is counted in cells, not characters: a CJK title occupies
+            // two cells per character and a `{:<width$}` pad would push the
+            // state off the row.
+            let name_width = usize::from(list_area.width)
+                .saturating_sub(usize::from(row.depth) * 2 + 2 + state_width)
+                .max(8);
+            let label = truncate_to_width(&row.label, name_width, "…");
+            let padding = name_width.saturating_sub(display_width(&label));
+            let mut spans = vec![Span::styled(
+                format!("{indent}{marker} {label}{}", " ".repeat(padding)),
+                style,
+            )];
+            if let Some(state) = row.state {
+                let label = session_state_label(state, strings);
+                let padding = state_column.saturating_sub(display_width(label));
+                let state_style = if index == selected || hovered {
+                    // The state is part of the row, so it rides the band rather
+                    // than disappearing into a dim colour on top of it.
+                    style
+                } else if active {
+                    Style::default().fg(theme.roles.accent_user)
+                } else {
+                    Style::default().fg(theme.roles.gray_dim)
+                };
+                spans.push(Span::styled(
+                    format!("{}{label}", " ".repeat(padding)),
+                    state_style,
+                ));
+            }
+            let mut lines = vec![Line::from(spans)];
             // An expanded session shows its detail card under its row, inside
             // the same list item so the selection band covers the whole card.
             if let Some(session_id) = row.session_id.as_ref()
@@ -2234,8 +2291,10 @@ fn render_composer(
         .fg(prefix_color)
         .add_modifier(Modifier::BOLD);
 
-    // A click anywhere in the box puts the cursor there, empty or not.
+    // A click anywhere in the box puts the cursor there, empty or not; the
+    // border rows only take focus, since there is no cell to place a caret on.
     app.regions.composer = Some(text_area);
+    app.regions.composer_band = Some(area);
     if app.composer.text().is_empty() {
         // The placeholder explains the mode rather than the product: the mode is
         // the thing the reader cannot guess from an empty box.
@@ -2291,6 +2350,18 @@ fn render_composer(
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(Text::from(lines)), text_area);
+    }
+
+    // The caret is the terminal's own cursor, placed on the cell the next
+    // character will occupy. A composer that only highlights itself leaves the
+    // reader guessing where typing will land.
+    if focused {
+        let (row, column) = app.composer.cursor_cell(width);
+        let x = text_area.x + prompt_width as u16 + column;
+        let y = text_area.y + row;
+        if x < text_area.right() && y < text_area.bottom() {
+            frame.set_cursor_position((x, y));
+        }
     }
 
     // The info line is painted onto the bottom border. The rule continues
@@ -4979,5 +5050,28 @@ mod tests {
     fn transcript_width_leaves_room_for_the_frame() {
         let width = transcript_width(ShellKind::Wide, 160);
         assert!(width > 40 && width < 160);
+    }
+
+    #[test]
+    fn transcript_width_is_the_band_the_frame_actually_lays_out() {
+        // The helper and the composition must agree, or a block measures itself
+        // against a width other than the one it is drawn in.
+        for (columns, rows) in [(60u16, 24u16), (100, 30), (160, 40), (240, 50)] {
+            let bands = crate::layout::compute(
+                Rect::new(0, 0, columns, rows),
+                crate::layout::BandRequest {
+                    turn_status: 1,
+                    prompt: 4,
+                    prompt_gap: 1,
+                    shortcuts: 1,
+                    ..crate::layout::BandRequest::default()
+                },
+            );
+            assert_eq!(
+                transcript_width(ShellKind::Wide, columns),
+                usize::from(bands.scrollback.width),
+                "at {columns} columns the helper and the band disagree"
+            );
+        }
     }
 }

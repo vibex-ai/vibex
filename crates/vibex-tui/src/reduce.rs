@@ -284,7 +284,11 @@ impl App {
             Intent::EnterSession => {
                 let outcome = self.perform(Intent::OpenSelectedSession);
                 if !outcome.effects.is_empty() {
+                    // Landing on the session view is a request to work in it, so
+                    // the caret goes back into the composer: navigating set the
+                    // focus to the page itself.
                     self.select_session_destination(vibex_ui::shell::SessionDestination::Agent);
+                    self.focus = Focus::Composer;
                 }
                 outcome
             }
@@ -2552,6 +2556,48 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// A session the list can open, with every field the wire requires.
+    fn openable_session(id: &str) -> vibex_core::AgentSession {
+        vibex_core::AgentSession {
+            id: VibexSessionId::parse(id).expect("valid id"),
+            title: "a session".to_string(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id: vibex_core::WorkspaceId::new(),
+            workspace_root: "/tmp/vibex-reduce-workspace".to_string(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: vibex_core::AgentId::parse("claude").expect("valid agent id"),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1_759_237_920_000,
+            updated_at_ms: 1_759_251_200_000,
+            last_message_at_ms: 1_759_251_200_000,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn entering_a_session_from_the_list_takes_the_keyboard_into_the_composer() {
+        let mut app = capable_app();
+        app.agent
+            .apply_sessions(Ok(vec![openable_session("session_enter0001")]))
+            .expect("sessions apply");
+        app.navigate_to(Page::Sessions);
+        // Row 0 is the workspace heading; the session is one below it.
+        app.set_selection(crate::keymap::Scope::Sessions, 1);
+        let outcome = app.perform(Intent::EnterSession);
+        assert!(
+            !outcome.effects.is_empty(),
+            "entering the session issued no load: {outcome:?}"
+        );
+        assert_eq!(app.page, Page::Agent);
+        assert_eq!(
+            app.focus,
+            crate::app::Focus::Composer,
+            "the navigation reset the focus out of the composer"
+        );
     }
 
     #[test]

@@ -927,6 +927,29 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     assert!(app.selected_text().is_none());
 }
 
+/// The cell column a needle starts at on a rendered row, counted in terminal
+/// cells rather than bytes, so a double-width title cannot skew the reading.
+fn column_of(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Option<u16> {
+    let width = buffer.area.width;
+    let cells = (0..width)
+        .map(|column| {
+            buffer
+                .cell((column, row))
+                .map(|cell| cell.symbol().to_string())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    (0..width).find(|column| {
+        let mut text = String::new();
+        let mut cursor = *column;
+        while text.len() < needle.len() && cursor < width {
+            text.push_str(&cells[usize::from(cursor)]);
+            cursor += 1;
+        }
+        text.starts_with(needle)
+    })
+}
+
 /// The text of each held message, for the tests that only care about words.
 fn queued_texts(app: &App) -> Vec<String> {
     app.queued_messages
@@ -1099,6 +1122,173 @@ fn a_pasted_image_path_attaches_instead_of_typing_the_path() {
     assert_eq!(
         vibex_tui::app::App::image_path_from_paste("just some words"),
         None
+    );
+}
+
+#[test]
+fn the_transcript_uses_the_whole_band_on_a_wide_terminal() {
+    let mut app = transcript_app(200, 44);
+    // One long paragraph, the shape an Agent's prose arrives in.
+    let mut block = seeded_block(
+        "wide-body",
+        vibex_desktop_model::TimelineRowKind::AgentMessage,
+        "This paragraph is plain prose that should be wrapped to the width of the \
+         transcript band rather than to a sidebar-adjusted pane width, because on a \
+         wide terminal the difference is the entire right half of the screen and the \
+         reader has to scan a narrow column with nothing beside it.",
+    );
+    block.expanded = true;
+    block.collapsible = true;
+    app.transcript.set_blocks(vec![block]);
+    let buffer = render_buffer(&mut app, 200, 44);
+    let widest = (0..44)
+        .filter_map(|row| {
+            (0..200).rev().find(|column| {
+                buffer
+                    .cell((*column, row))
+                    .is_some_and(|cell| !cell.symbol().trim().is_empty())
+            })
+        })
+        .max()
+        .expect("the block is on screen");
+    // The band ends at the transcript's right edge; allow for the block's own
+    // right padding and the gutter, but not for a pane that is not there.
+    assert!(
+        widest > 170,
+        "the transcript stopped at column {widest} of 200 -- it is not using the band"
+    );
+}
+
+#[test]
+fn the_session_state_column_lines_up_on_every_row() {
+    let mut app = app(120, 40);
+    // One ASCII title and two double-width ones: character-counted padding put
+    // the state column in a different place on each of these.
+    let base = seeded_session("session_column0001", "short");
+    let mut cjk = base.clone();
+    cjk.id = vibex_core::VibexSessionId::parse("session_column0002").expect("valid id");
+    cjk.title = "帮我看看这个会话的状态列".to_string();
+    let mut long = base.clone();
+    long.id = vibex_core::VibexSessionId::parse("session_column0003").expect("valid id");
+    long.title = "一个特别特别特别特别特别特别长的中文会话标题".to_string();
+    app.agent
+        .apply_sessions(Ok(vec![base, cjk, long]))
+        .expect("sessions apply");
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    let buffer = render_buffer(&mut app, 120, 40);
+    let mut columns = Vec::new();
+    for row in 0..40 {
+        if let Some(column) = column_of(&buffer, row, "Idle") {
+            columns.push(column);
+        }
+    }
+    assert!(columns.len() >= 3, "not every session row was drawn");
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "the state column is ragged: {columns:?}"
+    );
+    // And the whole row stays inside the frame.
+    for row in 0..40 {
+        let last = (0..120).rev().find(|column| {
+            buffer
+                .cell((*column, row))
+                .is_some_and(|cell| !cell.symbol().trim().is_empty())
+        });
+        assert!(last.is_none_or(|column| column < 120));
+    }
+}
+
+#[test]
+fn the_session_list_does_not_wear_the_agent_pages_chrome() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.agent.apply_sessions(Ok(session_pair())).expect("apply");
+    app.transcript.set_blocks(vec![plan_block()]);
+    app.enqueue_message("held while listing".to_string());
+    app.perform(Intent::GotoSessions);
+    let listing = text(&render(&mut app, 120, 40));
+    for leaked in ["write the band", "held while listing", "Held"] {
+        assert!(
+            !listing.contains(leaked),
+            "the session list showed the agent page's {leaked}:\n{listing}"
+        );
+    }
+    // The session view still has them.
+    app.navigate_to(Page::Agent);
+    let agent_page = text(&render(&mut app, 120, 40));
+    assert!(agent_page.contains("write the band"), "{agent_page}");
+    assert!(agent_page.contains("held while listing"), "{agent_page}");
+}
+
+#[test]
+fn a_click_on_the_composer_takes_the_keyboard_and_the_caret() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Main;
+    app.composer.set_text("first line\nsecond line");
+    let _ = render(&mut app, 120, 40);
+    let region = app
+        .regions
+        .composer
+        .expect("the composer published its rows");
+    assert!(app.click_composer(region.x + 5, region.y));
+    assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+    assert_eq!(app.composer.cursor(), 5);
+
+    // The border has no cell to place a caret on, but it still takes focus: a
+    // box the reader can see and click must accept typing.
+    app.focus = vibex_tui::app::Focus::Main;
+    let band = app.regions.composer_band.expect("the band is published");
+    assert!(app.click_composer(band.x + 1, band.y + band.height - 1));
+    assert_eq!(app.focus, vibex_tui::app::Focus::Composer);
+}
+
+#[test]
+fn entering_a_session_focuses_the_composer() {
+    let mut app = app(120, 40);
+    app.agent
+        .apply_sessions(Ok(session_pair()))
+        .expect("sessions apply");
+    let session_id = app.agent.state.sessions.value.as_ref().unwrap()[0]
+        .id
+        .clone();
+    app.open_session(session_id);
+    assert_eq!(app.page, Page::Agent);
+    assert_eq!(
+        app.focus,
+        vibex_tui::app::Focus::Composer,
+        "opening a session left the keyboard outside the composer"
+    );
+}
+
+#[test]
+fn the_composer_places_the_terminal_cursor_on_the_draft() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text("ab");
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("frame draws");
+    let region = app.regions.composer.expect("composer rows");
+    let position = terminal.get_cursor_position().expect("the caret is placed");
+    assert_eq!(position.y, region.y);
+    // Two characters in, plus the prompt arrow's two columns.
+    assert_eq!(position.x, region.x + 2 + 2);
+
+    // The caret follows the draft, including onto a wrapped row.
+    for _ in 0..30 {
+        app.composer.insert_char('x');
+    }
+    terminal
+        .draw(|frame| vibex_tui::view::render(frame, &mut app))
+        .expect("frame draws");
+    let wrapped = terminal.get_cursor_position().expect("the caret moved");
+    assert!(
+        wrapped.y > region.y || wrapped.x > position.x,
+        "the caret did not follow the draft"
     );
 }
 

@@ -1205,6 +1205,39 @@ impl ComposerBuffer {
         self.preferred_column = None;
     }
 
+    /// Where the cursor sits in the wrapped display grid: `(row, column)`.
+    ///
+    /// This is the inverse of [`ComposerBuffer::move_cursor_to_cell`], and the
+    /// renderer needs it to place the terminal's own cursor on the draft. A
+    /// cursor exactly on a wrap boundary belongs to the start of the next row,
+    /// which is where the next character will appear.
+    pub fn cursor_cell(&self, width: usize) -> (u16, u16) {
+        let width = width.max(1);
+        let mut row = 0usize;
+        for line in 0..self.line_count() {
+            let (start, end) = self.line_range(line);
+            let wrapped = crate::text::wrap_text(&self.text[start..end], width);
+            let segments = wrapped.len().max(1);
+            if self.cursor >= start && self.cursor <= end {
+                for (index, segment) in wrapped.iter().enumerate() {
+                    let segment_start = start + segment.source_start;
+                    let segment_end = segment_start + segment.text.len();
+                    if self.cursor < segment_end || index + 1 == wrapped.len() {
+                        let offset = self
+                            .cursor
+                            .saturating_sub(segment_start)
+                            .min(segment.text.len());
+                        let column = display_width(&segment.text[..offset]);
+                        return ((row + index) as u16, column as u16);
+                    }
+                }
+                return ((row + segments - 1) as u16, 0);
+            }
+            row += segments;
+        }
+        (row as u16, 0)
+    }
+
     /// Put the cursor on a display cell, for a click in the composer.
     ///
     /// `row` counts wrapped display rows, which is what the renderer laid out;

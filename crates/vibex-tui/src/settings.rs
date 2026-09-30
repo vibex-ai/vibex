@@ -479,9 +479,9 @@ impl App {
             self.settings.mode,
             self.capability,
         );
-        let width =
-            crate::view::layout_for(self.shell, self.viewport.0, self.viewport.1).main_width;
-        self.transcript.configure(width, &self.theme.clone());
+        // Only the look changed; the width is still whatever the renderer last
+        // drew the transcript at.
+        self.transcript.set_theme(&self.theme.clone());
     }
 
     // ---- the mode machine ----------------------------------------------

@@ -627,6 +627,9 @@ pub struct FrameRegions {
     pub queue: Option<ratatui::layout::Rect>,
     /// The dock panel's rows, for click-to-select.
     pub dock: Option<ratatui::layout::Rect>,
+    /// The composer's whole band, borders included: a click anywhere in the box
+    /// takes the keyboard, and only the text rows can also take the caret.
+    pub composer_band: Option<ratatui::layout::Rect>,
     /// The banner row, which a click dismisses.
     pub banner: Option<ratatui::layout::Rect>,
     /// A row-per-index list the frame drew: its rect and the scope it selects
@@ -1668,7 +1671,39 @@ impl App {
     pub fn open_session(&mut self, session_id: VibexSessionId) {
         self.navigation.enter_session(session_id.as_str());
         self.navigate_to(Page::Agent);
+        // Opening a session is a request to work in it, so the keyboard lands
+        // in the composer without a trip through `Tab`.
+        self.focus = Focus::Composer;
         self.scroll = ScrollState::default();
+    }
+
+    /// Take the keyboard into the composer, placing the caret when the click
+    /// landed on a text row.
+    ///
+    /// A click on the box's border focuses it too: a box the reader can see and
+    /// click but not type in reads as broken.
+    pub fn click_composer(&mut self, column: u16, row: u16) -> bool {
+        let Some(text_area) = self.regions.composer else {
+            return false;
+        };
+        let in_text = column >= text_area.x
+            && column < text_area.right()
+            && row >= text_area.y
+            && row < text_area.bottom();
+        let in_band = self.regions.composer_band.is_some_and(|band| {
+            column >= band.x && column < band.right() && row >= band.y && row < band.bottom()
+        });
+        if !in_text && !in_band {
+            return false;
+        }
+        self.focus = Focus::Composer;
+        if in_text {
+            self.composer
+                .move_cursor_to_cell(row - text_area.y, column - text_area.x);
+            self.composer.begin_selection();
+            self.draft_selecting = true;
+        }
+        true
     }
 
     /// Rebuild the transcript from the shared controller's projection.
@@ -2453,9 +2488,12 @@ impl App {
     pub fn resize(&mut self, columns: u16, rows: u16) {
         self.viewport = (columns, rows);
         self.shell = shell_for_columns(columns);
-        let width = crate::view::layout_for(self.shell, columns, rows).main_width;
-        let theme = self.theme.clone();
-        self.transcript.configure(width, &theme);
+        // The renderer is the authority on the transcript's width and re-states
+        // it every frame; setting the same value here keeps pre-frame layout
+        // maths (a prepend's scroll anchor) honest instead of measuring against
+        // a zero width.
+        let width = crate::view::transcript_width(self.shell, columns);
+        self.transcript.configure(width, &self.theme.clone());
     }
 
     /// Locale-aware, capability-aware reason an action is unavailable.

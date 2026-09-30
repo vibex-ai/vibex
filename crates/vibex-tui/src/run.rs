@@ -1052,16 +1052,10 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 }
                 return true;
             }
-            // The composer places the cursor on the cell that was clicked and
-            // starts a selection there: a click leaves it empty, a drag fills
-            // it, and typing over it replaces it.
-            if let Some(region) = app.regions.composer
-                && rect_contains(region, mouse.column, mouse.row)
-            {
-                app.composer
-                    .move_cursor_to_cell(mouse.row - region.y, mouse.column - region.x);
-                app.composer.begin_selection();
-                app.draft_selecting = true;
+            // The composer takes the keyboard from a click anywhere in its box,
+            // and from a text row it also takes the caret: a click leaves the
+            // selection empty, a drag fills it, and typing over it replaces it.
+            if app.click_composer(mouse.column, mouse.row) {
                 return true;
             }
             if app.page != Page::Agent {
