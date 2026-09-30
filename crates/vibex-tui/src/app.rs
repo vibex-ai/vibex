@@ -659,6 +659,18 @@ impl App {
         }
     }
 
+    /// Whether the transcript has a running block worth animating.
+    ///
+    /// The interface repaints without input only while this is true.
+    pub fn transcript_animating(&self) -> bool {
+        self.transcript.is_animating()
+    }
+
+    /// Step the running-rail animation. Returns whether a repaint is due.
+    pub fn advance_transcript_animation(&mut self) -> bool {
+        self.transcript.advance_animation()
+    }
+
     pub fn tick(&mut self) {
         if let Some(toast) = self.toast.as_mut() {
             toast.ttl = toast.ttl.saturating_sub(1);
@@ -811,6 +823,7 @@ pub fn block_from_row(row: &TimelineRow) -> Block {
         file_path: row.file_path.clone(),
         runtime_attribution: row.runtime_attribution.clone(),
         conclusion: row.conclusion,
+        group: crate::transcript::GroupRole::Solo,
     }
 }
 

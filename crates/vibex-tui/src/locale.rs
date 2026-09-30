@@ -250,6 +250,13 @@ strings! {
 
     // ---- approvals ------------------------------------------------------
     approval_title => { "Approval required", "需要审批", "需要審批" },
+    approval_label => { "Approvals", "审批", "審批" },
+    details_state => { "State", "状态", "狀態" },
+    details_agent => { "Agent", "Agent", "Agent" },
+    details_model => { "Model", "模型", "模型" },
+    details_workspace => { "Workspace", "工作区", "工作區" },
+    details_branch => { "Branch", "分支", "分支" },
+    details_context => { "Context", "上下文", "上下文" },
     approval_risk => { "Risk", "风险", "風險" },
     approval_allow => { "Allow", "允许", "允許" },
     approval_deny => { "Deny", "拒绝", "拒絕" },

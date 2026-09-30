@@ -186,6 +186,97 @@ fn wrap_text_inner(text: &str, width: usize, source_offset: usize) -> Vec<Wrappe
     lines
 }
 
+/// One unbreakable unit of a paragraph.
+///
+/// Space-separated scripts produce word tokens; CJK produces one token per
+/// ideograph, because a Chinese paragraph has no spaces to break on and must
+/// still wrap at the column limit.
+struct Token {
+    text: String,
+    width: usize,
+    /// Byte offset of the token in the paragraph.
+    offset: usize,
+    /// Whether a space preceded it, which is what re-joining needs to know.
+    after_space: bool,
+}
+
+fn tokenize(paragraph: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_offset = 0usize;
+    let mut offset = 0usize;
+    let mut pending_space = false;
+
+    let flush = |current: &mut String,
+                 current_offset: usize,
+                 after_space: bool,
+                 tokens: &mut Vec<Token>| {
+        if current.is_empty() {
+            return;
+        }
+        let text = std::mem::take(current);
+        tokens.push(Token {
+            width: UnicodeWidthStr::width(text.as_str()),
+            text,
+            offset: current_offset,
+            after_space,
+        });
+    };
+
+    for grapheme in paragraph.graphemes(true) {
+        if is_space(grapheme) {
+            flush(&mut current, current_offset, pending_space, &mut tokens);
+            pending_space = true;
+            offset += grapheme.len();
+            continue;
+        }
+        if current.is_empty() {
+            current_offset = offset;
+        }
+        // A CJK ideograph is its own break opportunity, so it ends the token it
+        // was accumulating and stands alone.
+        if is_breakable_after(grapheme) {
+            flush(&mut current, current_offset, pending_space, &mut tokens);
+            let after_space = pending_space;
+            pending_space = false;
+            tokens.push(Token {
+                text: grapheme.to_string(),
+                width: UnicodeWidthStr::width(grapheme),
+                offset,
+                after_space,
+            });
+            offset += grapheme.len();
+            continue;
+        }
+        current.push_str(grapheme);
+        offset += grapheme.len();
+    }
+    flush(&mut current, current_offset, pending_space, &mut tokens);
+    tokens
+}
+
+/// Split a token that is wider than the whole line.
+fn hard_split(token: &Token, width: usize) -> Vec<Token> {
+    let mut pieces = Vec::new();
+    let mut rest = token.text.as_str();
+    let mut offset = token.offset;
+    while !rest.is_empty() {
+        let (prefix, suffix) = take_width(rest, width);
+        if prefix.is_empty() {
+            break;
+        }
+        pieces.push(Token {
+            width: UnicodeWidthStr::width(prefix.as_str()),
+            offset,
+            text: prefix,
+            after_space: pieces.is_empty() && token.after_space,
+        });
+        offset += rest.len() - suffix.len();
+        rest = suffix;
+    }
+    pieces
+}
+
 fn wrap_paragraph(
     paragraph: &str,
     width: usize,
@@ -203,97 +294,71 @@ fn wrap_paragraph(
         return;
     }
 
+    let tokens = tokenize(paragraph);
     let mut current = String::new();
     let mut current_width = 0usize;
-    let mut line_start_offset = paragraph_offset;
-    let mut pending_space = false;
-    let mut cursor_offset = paragraph_offset;
+    let mut line_start = 0usize;
+    let mut started = false;
 
-    let break_line = |lines: &mut Vec<WrappedLine>,
-                      current: &mut String,
-                      current_width: &mut usize,
-                      line_start_offset: &mut usize,
-                      cursor_offset: usize,
-                      joiner: LineJoiner| {
-        lines.push(WrappedLine {
-            text: std::mem::take(current),
-            width: *current_width,
-            joiner,
-            source_start: *line_start_offset,
-        });
-        *current_width = 0;
-        *line_start_offset = cursor_offset;
-    };
-
-    for grapheme in paragraph.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-
-        if is_space(grapheme) {
-            // Collapse runs of whitespace to a single break opportunity.
-            pending_space = !current.is_empty();
-            cursor_offset += grapheme.len();
-            continue;
-        }
-
-        let separator_width = usize::from(pending_space);
-        if current_width + separator_width + grapheme_width > width && !current.is_empty() {
-            let joiner = if pending_space {
-                LineJoiner::Space
-            } else {
-                LineJoiner::None
-            };
-            break_line(
-                lines,
-                &mut current,
-                &mut current_width,
-                &mut line_start_offset,
-                cursor_offset,
-                joiner,
-            );
-            pending_space = false;
-            line_start_offset = cursor_offset;
-        }
-
-        if pending_space && !current.is_empty() {
-            current.push(' ');
-            current_width += 1;
-        }
-        pending_space = false;
-
-        // A single grapheme wider than the whole line still has to go somewhere.
-        if grapheme_width > width && current.is_empty() {
-            current.push_str(grapheme);
-            current_width = grapheme_width;
+    for token in tokens {
+        // A token wider than the line has to be split; everything else moves to
+        // the next line whole, because breaking a word to save two columns
+        // reads as a rendering fault.
+        let pieces = if token.width > width {
+            hard_split(&token, width)
         } else {
-            current.push_str(grapheme);
-            current_width += grapheme_width;
-        }
-        cursor_offset += grapheme.len();
-
-        if is_breakable_after(grapheme) && current_width >= width {
-            break_line(
-                lines,
-                &mut current,
-                &mut current_width,
-                &mut line_start_offset,
-                cursor_offset,
-                LineJoiner::None,
-            );
+            vec![Token {
+                text: token.text,
+                width: token.width,
+                offset: token.offset,
+                after_space: token.after_space,
+            }]
+        };
+        for piece in pieces {
+            // Only a space that was in the source becomes a separator; a CJK
+            // token follows its predecessor with no gap, and adding one would
+            // invent punctuation the author did not write.
+            let mut space = piece.after_space && current_width > 0;
+            if started && current_width + usize::from(space) + piece.width > width {
+                lines.push(WrappedLine {
+                    text: std::mem::take(&mut current),
+                    width: current_width,
+                    joiner: if space {
+                        LineJoiner::Space
+                    } else {
+                        LineJoiner::None
+                    },
+                    source_start: line_start,
+                });
+                current_width = 0;
+                started = false;
+                // The break consumed the space.
+                space = false;
+            }
+            if !started {
+                line_start = paragraph_offset + piece.offset;
+                started = true;
+            }
+            if space {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(&piece.text);
+            current_width += piece.width;
         }
     }
 
-    if !current.is_empty() || lines.is_empty() {
+    if !current.is_empty() {
         lines.push(WrappedLine {
             text: current,
             width: current_width,
             joiner: LineJoiner::Newline,
-            source_start: line_start_offset,
+            source_start: line_start,
         });
-    } else if let Some(last) = lines.last_mut() {
-        // The paragraph ended on a break; mark the boundary as a real newline.
-        if last.joiner == LineJoiner::None || last.joiner == LineJoiner::Space {
-            last.joiner = LineJoiner::Newline;
-        }
+    } else if let Some(last) = lines.last_mut()
+        && matches!(last.joiner, LineJoiner::None | LineJoiner::Space)
+    {
+        last.joiner = LineJoiner::Newline;
     }
 }
 

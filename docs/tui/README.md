@@ -64,6 +64,71 @@ If the home is locked and the runtime is not accepting local clients, the client
 prints three ways out: enable *Settings → Remote Access → Direct*, quit the
 desktop app, or connect to another runtime with `vibex connect`.
 
+## Visual language
+
+Three ideas carry the interface.
+
+**The rail.** Every transcript block owns a one-column colour bar down its whole
+height. It gives each block a visible left edge, so a long tool output stays one
+object instead of dissolving into the previous one, and it lets a session be
+scanned by colour before a word is read:
+
+| Rail | Block |
+| --- | --- |
+| accent | your message |
+| foreground | the Agent's reply |
+| violet | reasoning |
+| blue | tool call, command, file change, search |
+| grey | system notice, todo, git |
+| amber | approval, question, retry |
+| red | error |
+| green | resolution |
+
+The rail is a *filled cell* rather than a drawn line: it is exactly one column
+wide in every font and needs no box-drawing glyph. Because a filled cell is
+carried entirely by colour, a terminal without colour falls back to a drawn
+`│`, which keeps the structure and lets the colour go.
+
+Work items — tool calls, commands, reasoning — also carry a `⏺` bullet, and a
+run of three or more collapsed ones folds into its first member with a
+`╶╶ N more` summary. A session produces work items in bursts, and showing all of
+them at full height buries the sentences they are evidence for.
+
+**Layered surfaces.** Backgrounds step away from the canvas, so a tool body or a
+raised row reads as a distinct plane rather than as more text on the same
+canvas. The grey scale has three steps — dim for punctuation and chrome, medium
+for muted body, bright for secondary labels — because one grey cannot do three
+jobs without everything competing.
+
+**Focus is a fade, not a switch.** Panes that do not have the keyboard keep
+their colour and drop in weight, and the composer's rail goes from the accent to
+dim grey. That makes "where will my keystrokes go" answerable at a glance.
+
+### Composer
+
+```text
+╭─ <session title> ─────────────────────────────╮
+│ ❯ the draft so far                             │
+╰─ <agent> · <model> · <running>     multiline ▏╯
+```
+
+The bottom border is an info line rather than a rule: a terminal has no room for
+chrome that only carries status, and a divider that also informs is free.
+
+### Status bar
+
+Identity on the left, context in the centre, appearance on the right. Splitting
+it into zones is what stops the bar from becoming one left-aligned sentence
+whose tail is the first thing a narrow terminal eats. The centre is the
+context-window readout — `8.5K / 1.0M`, with the colour moving through the
+usage thresholds — so the answer is available without reading the number.
+
+### Key bar
+
+Keys are drawn bold and bright, labels dim: the key is what the reader is
+looking for and the label only confirms it. The leading hints survive a narrow
+terminal, so shrinking the window degrades the bar from the least important end.
+
 ## Pages
 
 ### Sessions
@@ -181,6 +246,17 @@ Every one of these has a defined behaviour rather than a broken screen:
 | disconnected | a banner, mutations disabled, the last known state marked stale |
 | read-only device | actions are visible, disabled, and say which permission they need |
 | very long conversation | the transcript is capped and the oldest blocks are dropped |
+
+## Previewing
+
+A fixture session renders to stdout, which is how the layout is reviewed:
+
+```bash
+cargo run -p vibex-tui --example preview -- 150 44
+cargo run -p vibex-tui --example preview -- 100 30 --light
+cargo run -p vibex-tui --example preview -- 150 44 --ansi    # real SGR codes
+cargo run -p vibex-tui --example preview -- 150 44 --no-color
+```
 
 ## Testing
 

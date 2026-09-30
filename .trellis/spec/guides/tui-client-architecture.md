@@ -113,7 +113,36 @@ Rules:
 * the PTY layer asserts that a byte written while the interface owns the screen
   never reaches the terminal, which is the measured form of this rule.
 
-## 4. Rendering
+## 4. Visual language
+
+Structure is carried by three devices, in this order of importance:
+
+1. **The rail.** Every transcript block owns a one-column bar down its whole
+   height, coloured by block role (`ThemeRole::accent_*`, selected through
+   `TuiTheme::rail`). It is a filled cell, not a drawn glyph, and it is
+   *background*-coloured — a foreground-coloured space is invisible.
+2. **Layered surfaces.** `surface` / `surface_raised` / `surface_highlight` step
+   away from `background`, so a plane change is visible without a border.
+3. **A three-step grey scale.** `gray_dim` for punctuation and chrome, `gray`
+   for muted body, `gray_bright` for secondary labels. One grey cannot do three
+   jobs without everything competing.
+
+Rules that follow:
+
+* A block is `rail | pad(2) | content | pad(1)`, and the rail covers the block's
+  status and attribution rows too, so the block reads as one object.
+* A run of three or more collapsed work items folds into its first member
+  (`MIN_GROUP_RUN`). An expanded or failed item breaks the run.
+* The current block is marked with a pointer in the rail plus a lifted header.
+  Never a full-width reversed row: it is the heaviest emphasis a terminal has.
+* Focus is expressed as a fade toward the canvas (`TuiTheme::fade`), not as a
+  colour switch, so a blurred pane stays recognisable.
+* Colour is never the only carrier. When `has_color()` is false the rail becomes
+  a drawn glyph and bands disappear.
+* The only animation is the rail of a block that is working, and it runs only
+  while `Transcript::is_animating()` is true.
+
+## 5. Rendering
 
 The transcript is the performance-critical surface and follows four rules:
 
@@ -132,7 +161,7 @@ carrier of meaning. Icon and border glyphs degrade to ASCII when the locale is
 not UTF-8. All width arithmetic goes through `unicode-width`; `chars().count()`
 is never a column count.
 
-## 5. Interaction
+## 6. Interaction
 
 * One binding table per scope drives **dispatch, the key bar and `?` help**
   simultaneously. They cannot drift.
@@ -146,7 +175,7 @@ is never a column count.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
 
-## 6. Security
+## 7. Security
 
 | Rule | Requirement |
 | --- | --- |
@@ -159,7 +188,7 @@ is never a column count.
 | R7 | The client never opens the runtime database, except for the documented local bootstrap path. |
 | R8 | Non-loopback transport is HTTPS/WSS. Pinned TLS is preferred; plain HTTP only on loopback with an explicit opt-in. |
 
-## 7. Testing
+## 8. Testing
 
 | Layer | What it proves |
 | --- | --- |

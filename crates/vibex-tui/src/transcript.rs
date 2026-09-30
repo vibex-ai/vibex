@@ -20,14 +20,14 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use vibex_desktop_model::TimelineRowKind;
 
 use crate::locale::Strings;
 use crate::markdown::{render_markdown, render_plain};
 use crate::text::{display_width, truncate_to_width};
-use crate::theme::TuiTheme;
+use crate::theme::{Rail, TuiTheme};
 
 /// How many collapsed lines a long block shows before folding.
 pub const COLLAPSED_BODY_LINES: usize = 4;
@@ -39,6 +39,17 @@ pub const RENDER_CACHE_BLOCKS: usize = 192;
 pub const MAX_BLOCKS: usize = 20_000;
 
 const UNMEASURED: u32 = u32::MAX;
+
+/// The shortest run of collapsed work items worth folding.
+pub const MIN_GROUP_RUN: usize = 3;
+
+/// Whether a block can be folded into a dense run.
+///
+/// Only collapsed work items qualify: an expanded block is one the reader asked
+/// to see, and a message is never chrome.
+fn eligible_for_group(block: &Block) -> bool {
+    is_work_item(block.kind) && block.collapsible && !block.expanded && !block.failed
+}
 
 /// One transcript block, projected from the authoritative `TimelineRow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,8 @@ pub struct Block {
     pub file_path: Option<String>,
     pub runtime_attribution: Option<String>,
     pub conclusion: bool,
+    /// How this block participates in a dense run of work items.
+    pub group: GroupRole,
 }
 
 impl Block {
@@ -74,6 +87,7 @@ impl Block {
         self.pending_permission.hash(&mut hasher);
         self.collapsible.hash(&mut hasher);
         self.file_path.hash(&mut hasher);
+        self.group.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -113,6 +127,8 @@ pub struct ScrollState {
     pub offset: usize,
     /// Whether the view sticks to the bottom as new content arrives.
     pub follow: bool,
+    /// Block drawn as the current one, if any.
+    pub selected: Option<usize>,
 }
 
 impl Default for ScrollState {
@@ -120,6 +136,7 @@ impl Default for ScrollState {
         Self {
             offset: 0,
             follow: true,
+            selected: None,
         }
     }
 }
@@ -139,6 +156,10 @@ pub struct Transcript {
     recency: Vec<usize>,
     width: usize,
     theme_id: String,
+    /// Frame counter driving the running-rail animation.
+    animation_phase: u32,
+    /// The block drawn as current last frame, so a change invalidates it.
+    last_selected: Option<usize>,
     /// Counters that make the cache behaviour observable in tests and in the
     /// benchmark harness.
     pub stats: TranscriptStats,
@@ -175,6 +196,8 @@ impl Transcript {
             recency: Vec::new(),
             width: 0,
             theme_id: String::new(),
+            animation_phase: 0,
+            last_selected: None,
             stats: TranscriptStats::default(),
         }
     }
@@ -266,8 +289,71 @@ impl Transcript {
         self.keys = next_keys;
         self.rendered = reused_rendered;
         self.recency = reused_recency;
+        self.apply_grouping();
         self.layout_valid = false;
         change
+    }
+
+    /// Fold long runs of collapsed work items into their first member.
+    ///
+    /// A session produces work items in bursts — ten file reads, six greps —
+    /// and showing all of them at full height buries the sentences they are
+    /// evidence for. A run of three or more collapsed items keeps its first
+    /// member and reports the rest as a count, which is the density the reader
+    /// wants by default and one keypress away from the detail.
+    fn apply_grouping(&mut self) {
+        for block in &mut self.blocks {
+            block.group = GroupRole::Solo;
+        }
+        let mut index = 0usize;
+        while index < self.blocks.len() {
+            if !eligible_for_group(&self.blocks[index]) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < self.blocks.len() && eligible_for_group(&self.blocks[index]) {
+                index += 1;
+            }
+            let run = index - start;
+            // Two in a row still read as a pair; three is where a run starts to
+            // cost more rows than it earns.
+            if run < MIN_GROUP_RUN {
+                continue;
+            }
+            let hidden = run - 1;
+            self.blocks[start].group = GroupRole::Head { hidden };
+            for member in &mut self.blocks[start + 1..index] {
+                member.group = GroupRole::Member;
+            }
+        }
+    }
+
+    /// Whether any block is currently working.
+    pub fn is_animating(&self) -> bool {
+        self.blocks.iter().any(|block| block.streaming)
+    }
+
+    /// Advance the running-rail animation. Returns whether a repaint is due.
+    ///
+    /// Only a transcript with an active turn animates; an idle one keeps
+    /// returning `false`, which is what preserves the zero-frames-when-idle
+    /// contract.
+    pub fn advance_animation(&mut self) -> bool {
+        if !self.blocks.iter().any(|block| block.streaming) {
+            self.animation_phase = 0;
+            return false;
+        }
+        self.animation_phase = self.animation_phase.wrapping_add(1);
+        // The rail is the only animated chrome, and it lives inside the height
+        // cache, so the cached rows have to be dropped for the new phase.
+        for index in 0..self.blocks.len() {
+            if self.blocks[index].streaming {
+                self.rendered.remove(&index);
+                self.recency.retain(|value| *value != index);
+            }
+        }
+        true
     }
 
     /// Tell the transcript which width and theme it will render at.
@@ -362,8 +448,13 @@ impl Transcript {
         let Some(block) = self.blocks.get(index) else {
             return 1;
         };
+        // A folded member contributes nothing; the head reports it instead.
+        if matches!(block.group, GroupRole::Member) {
+            return 0;
+        }
         let available = self.width.max(8);
         let header = 1 + display_width(&block.title) / available;
+        let summary = usize::from(matches!(block.group, GroupRole::Head { hidden } if hidden > 0));
         let body_lines = if block.body.is_empty() {
             0
         } else if block.is_open() {
@@ -374,7 +465,7 @@ impl Transcript {
         } else {
             COLLAPSED_BODY_LINES.min(block.body.matches('\n').count() + 1)
         };
-        (header + body_lines).max(1)
+        (header + body_lines + summary + chrome::GAP).max(1)
     }
 
     /// Measure one block precisely and cache the height.
@@ -411,7 +502,31 @@ impl Transcript {
             return RenderedBlock::default();
         };
         self.stats.blocks_rendered += 1;
-        render_block(&block, theme, self.width, strings)
+        render_block_styled(
+            &block,
+            theme,
+            self.width,
+            strings,
+            self.animation_phase,
+            self.last_selected == Some(index),
+        )
+    }
+
+    /// Tell the transcript which block is current.
+    ///
+    /// Only the two affected blocks are invalidated, so moving the cursor costs
+    /// two re-renders rather than a repaint of the whole cache.
+    pub fn set_selected(&mut self, selected: Option<usize>) {
+        if self.last_selected == selected {
+            return;
+        }
+        if let Some(previous) = self.last_selected {
+            self.invalidate(previous);
+        }
+        if let Some(next) = selected {
+            self.invalidate(next);
+        }
+        self.last_selected = selected;
     }
 
     /// Index of the block containing display line `line`.
@@ -447,6 +562,7 @@ impl Transcript {
         if height == 0 || self.blocks.is_empty() {
             return Vec::new();
         }
+        self.set_selected(scroll.selected);
         if scroll.follow {
             // Following the tail means the tail must be measured first;
             // otherwise the window is positioned against estimates for blocks
@@ -655,49 +771,6 @@ pub fn kind_id(kind: TimelineRowKind) -> &'static str {
 }
 
 /// The icon and accent used for a block kind.
-fn kind_decoration(kind: TimelineRowKind, theme: &TuiTheme) -> (&'static str, Style) {
-    let unicode = theme.glyphs() == crate::theme::GlyphMode::Unicode;
-    match kind {
-        TimelineRowKind::UserMessage => {
-            if unicode {
-                ("›", theme.accent())
-            } else {
-                (">", theme.accent())
-            }
-        }
-        TimelineRowKind::AgentMessage => {
-            if unicode {
-                ("◆", theme.base())
-            } else {
-                ("*", theme.base())
-            }
-        }
-        TimelineRowKind::Reasoning => {
-            if unicode {
-                ("◇", theme.muted())
-            } else {
-                ("~", theme.muted())
-            }
-        }
-        TimelineRowKind::Plan => (if unicode { "☰" } else { "=" }, theme.accent()),
-        TimelineRowKind::ToolCall => (if unicode { "⚙" } else { "%" }, theme.muted()),
-        TimelineRowKind::Command => ("$", theme.muted()),
-        TimelineRowKind::FileOperation => (if unicode { "±" } else { "+" }, theme.muted()),
-        TimelineRowKind::WebSearch => (if unicode { "⌕" } else { "?" }, theme.muted()),
-        TimelineRowKind::TodoUpdate => (if unicode { "☑" } else { "v" }, theme.muted()),
-        TimelineRowKind::Collaboration => (if unicode { "⧉" } else { "&" }, theme.accent()),
-        TimelineRowKind::ImageGeneration => (if unicode { "▣" } else { "#" }, theme.muted()),
-        TimelineRowKind::GitNotice => (if unicode { "⑂" } else { "g" }, theme.muted()),
-        TimelineRowKind::SystemNotice => (if unicode { "•" } else { "-" }, theme.muted()),
-        TimelineRowKind::PermissionRequest => (if unicode { "⚠" } else { "!" }, theme.warning()),
-        TimelineRowKind::PermissionResolution => (if unicode { "✓" } else { "+" }, theme.muted()),
-        TimelineRowKind::ElicitationRequest => ("?", theme.warning()),
-        TimelineRowKind::ElicitationResolution => (if unicode { "✓" } else { "+" }, theme.muted()),
-        TimelineRowKind::Retry => (if unicode { "↻" } else { "r" }, theme.warning()),
-        TimelineRowKind::Error => (if unicode { "✗" } else { "x" }, theme.danger()),
-    }
-}
-
 /// Localised label for a block kind.
 pub fn kind_label(kind: TimelineRowKind, strings: Strings) -> &'static str {
     match kind {
@@ -739,47 +812,234 @@ fn is_markdown(kind: TimelineRowKind) -> bool {
 }
 
 /// Render one block into display lines.
+/// Chrome geometry for one transcript block.
+///
+/// The rail is the load-bearing part: a one-column colour bar down the whole
+/// block. It gives every block a visible left edge, so a long tool output stays
+/// one object instead of dissolving into the previous one, and it lets the eye
+/// scan a session by colour before reading a word.
+pub mod chrome {
+    /// Width of the rail column.
+    pub const RAIL: usize = 1;
+    /// Gap between the rail and the content.
+    pub const PAD_LEFT: usize = 2;
+    /// Gap between the content and the right edge.
+    pub const PAD_RIGHT: usize = 1;
+    /// Blank rows inserted between blocks.
+    pub const GAP: usize = 1;
+    /// Columns the chrome consumes in total.
+    pub const TOTAL: usize = RAIL + PAD_LEFT + PAD_RIGHT;
+
+    /// Content width available at a given total width.
+    pub const fn content_width(width: usize) -> usize {
+        width.saturating_sub(TOTAL)
+    }
+}
+
+/// The glyph marking the block the cursor is on.
+fn pointer_glyph(theme: &TuiTheme) -> &'static str {
+    if theme.glyphs() == crate::theme::GlyphMode::Unicode {
+        "▌"
+    } else {
+        ">"
+    }
+}
+
+/// The separator used between chrome items across the interface.
+pub fn chrome_separator() -> &'static str {
+    "│"
+}
+
+/// Which rail a block kind wears.
+fn kind_rail(kind: TimelineRowKind) -> Rail {
+    match kind {
+        TimelineRowKind::UserMessage => Rail::User,
+        TimelineRowKind::AgentMessage => Rail::Agent,
+        TimelineRowKind::Reasoning => Rail::Thinking,
+        TimelineRowKind::ToolCall
+        | TimelineRowKind::Command
+        | TimelineRowKind::FileOperation
+        | TimelineRowKind::WebSearch
+        | TimelineRowKind::ImageGeneration => Rail::Tool,
+        TimelineRowKind::Plan | TimelineRowKind::Collaboration => Rail::Agent,
+        TimelineRowKind::TodoUpdate | TimelineRowKind::GitNotice => Rail::System,
+        TimelineRowKind::SystemNotice => Rail::System,
+        TimelineRowKind::PermissionRequest
+        | TimelineRowKind::ElicitationRequest
+        | TimelineRowKind::Retry => Rail::Attention,
+        TimelineRowKind::PermissionResolution | TimelineRowKind::ElicitationResolution => {
+            Rail::Success
+        }
+        TimelineRowKind::Error => Rail::Error,
+    }
+}
+
+/// Whether a block kind is a dense, foldable work item.
+///
+/// These are the blocks that get bullets and participate in grouping: a session
+/// can contain dozens of them in a row, and rendering each one as a full block
+/// buries the conversation they belong to.
+pub fn is_work_item(kind: TimelineRowKind) -> bool {
+    matches!(
+        kind,
+        TimelineRowKind::ToolCall
+            | TimelineRowKind::Command
+            | TimelineRowKind::FileOperation
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Reasoning
+            | TimelineRowKind::TodoUpdate
+            | TimelineRowKind::ImageGeneration
+    )
+}
+
+/// The leading mark a work item carries on its first line.
+fn bullet(
+    kind: TimelineRowKind,
+    theme: &TuiTheme,
+    collapsed: bool,
+) -> Option<(&'static str, Style)> {
+    if !is_work_item(kind) {
+        return None;
+    }
+    let unicode = theme.glyphs() == crate::theme::GlyphMode::Unicode;
+    let glyph = if unicode { "⏺" } else { "*" };
+    // A collapsed item recedes: it is context for the conversation, not part of
+    // it, so it drops a grey step rather than keeping full contrast.
+    let color = if collapsed {
+        theme.roles.gray
+    } else {
+        theme.roles.gray_bright
+    };
+    Some((glyph, Style::default().fg(color)))
+}
+
+/// How a block participates in a dense run of work items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GroupRole {
+    /// Renders on its own.
+    #[default]
+    Solo,
+    /// Heads a collapsed run. `hidden` members follow it invisibly.
+    Head { hidden: usize },
+    /// Collapsed into the run above; contributes no rows.
+    Member,
+}
+
+/// Render one block into display lines.
+///
+/// Every row is prefixed with [`chrome::RAIL`] a column of the block's rail
+/// colour, then [`chrome::PAD_LEFT`] spaces. The rail is painted for the whole
+/// block, including its status and attribution rows, so the block reads as one
+/// object.
 pub fn render_block(
     block: &Block,
     theme: &TuiTheme,
     width: usize,
     strings: Strings,
 ) -> RenderedBlock {
+    render_block_at_phase(block, theme, width, strings, 0)
+}
+
+/// As [`render_block`], with an animation phase for the running rail.
+///
+/// `phase` advances while a turn is running; the rail of the block that is
+/// currently working breathes, which is the only animation in the interface and
+/// is what makes "the Agent is thinking" legible without a spinner that steals
+/// a whole row.
+pub fn render_block_at_phase(
+    block: &Block,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    phase: u32,
+) -> RenderedBlock {
+    render_block_styled(block, theme, width, strings, phase, false)
+}
+
+/// As [`render_block_at_phase`], with the current-block treatment.
+///
+/// The current block is marked rather than inverted: a full-width reversed row
+/// is the heaviest possible emphasis and makes the transcript look like a
+/// spreadsheet with a selected cell. A pointer in the rail plus a lifted header
+/// background says the same thing at a fraction of the volume.
+pub fn render_block_styled(
+    block: &Block,
+    theme: &TuiTheme,
+    width: usize,
+    strings: Strings,
+    phase: u32,
+    selected: bool,
+) -> RenderedBlock {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain: Vec<String> = Vec::new();
 
-    let (icon, accent) = kind_decoration(block.kind, theme);
+    if matches!(block.group, GroupRole::Member) {
+        // Folded into the run above; contributes nothing but is still counted
+        // by the head's summary line.
+        return RenderedBlock::default();
+    }
+
+    let rail = kind_rail(block.kind);
+    let mut rail_color = theme.rail(rail);
+    if block.streaming || rail == Rail::Running {
+        rail_color = pulse(theme, rail_color, phase);
+    }
+    let colored = rail_is_filled(theme);
+    let rail_style = if colored {
+        Style::default().bg(rail_color)
+    } else {
+        Style::default()
+            .fg(theme.roles.gray_dim)
+            .add_modifier(Modifier::DIM)
+    };
+    let rail_cell = if colored { " " } else { rail_glyph(theme) };
+
+    let content_width = chrome::content_width(width).max(8);
     let label = kind_label(block.kind, strings);
-    let mut parts: Vec<(String, Style)> = vec![
-        (format!("{icon} "), accent),
-        (format!("{label} "), accent.add_modifier(Modifier::BOLD)),
-        (block.title.clone(), theme.base()),
-    ];
+    let title_style = match block.kind {
+        TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
+        _ => theme.base(),
+    };
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    if let Some((glyph, style)) = bullet(block.kind, theme, !block.is_open()) {
+        parts.push((format!("{glyph} "), style));
+    }
+    parts.push((
+        format!("{label} "),
+        theme.dimmed(theme.roles.gray).add_modifier(Modifier::BOLD),
+    ));
+    parts.push((block.title.clone(), title_style));
     if block.streaming {
         parts.push((" ▍".to_string(), theme.accent()));
     }
     if block.collapsible && !block.expanded {
         parts.push((
             format!("  ({})", strings.transcript_collapsed_hint()),
-            theme.muted(),
+            theme.dimmed(theme.roles.gray_dim),
         ));
     }
-    let header = truncate_parts(parts, width);
+    let header = truncate_parts(parts, content_width);
     let header_plain = header
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    lines.push(Line::from(header));
+    let marker = if selected { pointer_glyph(theme) } else { " " };
+    let mut header_line = rail_line_marked(rail_style, header, marker, rail_cell);
+    if selected {
+        header_line = header_line.style(Style::default().bg(theme.roles.surface_highlight));
+    }
+    lines.push(header_line);
     plain.push(header_plain);
 
-    let body_width = width.saturating_sub(2).max(8);
+    // A lifted band behind a work body separates blocks that sit next to each
+    // other without spending a row on a separator.
+    let body_background = body_band(block, theme);
     let body = block.body.trim_end_matches('\n');
     if !body.is_empty() {
-        let indent = "  ";
         let mut rendered = if is_markdown(block.kind) {
-            render_markdown(body, theme, body_width, strings)
+            render_markdown(body, theme, content_width, strings)
         } else {
-            render_plain(body, theme, body_width)
+            render_plain(body, theme, content_width)
         };
         let style = body_style(block, theme);
         // Fold before wrapping: a collapsed block must not pay for the lines it
@@ -787,44 +1047,78 @@ pub fn render_block(
         if !block.is_open() && rendered.height() > COLLAPSED_BODY_LINES {
             rendered.lines.truncate(COLLAPSED_BODY_LINES);
             rendered.plain.truncate(COLLAPSED_BODY_LINES);
-            let omitted = 0;
-            let _ = omitted;
         }
         for (line, text) in rendered.lines.into_iter().zip(rendered.plain) {
-            let mut spans = vec![Span::raw(indent)];
             let mut styled = line;
             if !matches!(block.kind, TimelineRowKind::Error) {
                 styled = styled.style(style);
             }
-            spans.extend(styled.spans);
-            lines.push(Line::from(spans));
-            plain.push(format!("{indent}{text}"));
+            if let Some(background) = body_background {
+                styled = styled.style(background);
+            }
+            lines.push(rail_line_marked(
+                rail_style,
+                styled.spans,
+                rail_cell,
+                rail_cell,
+            ));
+            plain.push(text);
         }
     }
 
-    if block.failed {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(strings.failed().to_string(), theme.danger()),
-        ]));
-        plain.push(format!("  {}", strings.failed()));
+    let mut status = Vec::new();
+    // An Error block already says it failed; repeating the word on its own row
+    // adds a line without adding information.
+    if block.failed && block.kind != TimelineRowKind::Error {
+        status.push((strings.failed().to_string(), theme.danger()));
     }
     if block.pending_permission {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                strings.approval_waiting().to_string(),
-                theme.warning().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        plain.push(format!("  {}", strings.approval_waiting()));
+        status.push((
+            strings.approval_waiting().to_string(),
+            theme.warning().add_modifier(Modifier::BOLD),
+        ));
     }
     if let Some(runtime) = &block.runtime_attribution {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("[{runtime}]"), theme.muted()),
-        ]));
-        plain.push(format!("  [{runtime}]"));
+        status.push((format!("[{runtime}]"), theme.dimmed(theme.roles.gray_dim)));
+    }
+    for (text, style) in status {
+        lines.push(rail_line(
+            rail_style,
+            vec![Span::styled(text.clone(), style)],
+        ));
+        plain.push(text);
+    }
+
+    // The summary line of a collapsed run. It replaces the folded members, so
+    // it carries their rail rather than a generic grey.
+    if let GroupRole::Head { hidden } = block.group
+        && hidden > 0
+    {
+        let glyph = if theme.glyphs() == crate::theme::GlyphMode::Unicode {
+            "╶╶"
+        } else {
+            "--"
+        };
+        let text = format!("{glyph} {hidden} more");
+        lines.push(rail_line(
+            rail_style,
+            vec![Span::styled(
+                text.clone(),
+                theme.dimmed(theme.roles.gray_dim),
+            )],
+        ));
+        plain.push(text);
+    }
+
+    // Trailing gap so blocks are separated without a rule.
+    for _ in 0..chrome::GAP {
+        lines.push(rail_line_marked(
+            rail_style,
+            Vec::new(),
+            rail_cell,
+            rail_cell,
+        ));
+        plain.push(String::new());
     }
 
     RenderedBlock {
@@ -834,15 +1128,96 @@ pub fn render_block(
     }
 }
 
+/// Build one rendered row with the rail column.
+///
+/// The rail is a space with a *background* colour rather than a line glyph: a
+/// filled cell stays exactly one column wide in every font, renders identically
+/// in the ASCII fallback, and does not depend on a box-drawing glyph existing.
+fn rail_line(rail: Style, spans: Vec<Span<'static>>) -> Line<'static> {
+    rail_line_marked(rail, spans, " ", " ")
+}
+
+/// As [`rail_line`], with a marker glyph in the rail column.
+///
+/// The rail is exactly one column wide: the marker *replaces* the cell rather
+/// than sitting beside it, so marking a block never changes its width.
+fn rail_line_marked(
+    rail: Style,
+    spans: Vec<Span<'static>>,
+    marker: &str,
+    cell: &str,
+) -> Line<'static> {
+    let content = if marker == " " { cell } else { marker };
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    out.push(Span::styled(content.to_string(), rail));
+    out.push(Span::raw(" ".repeat(chrome::PAD_LEFT)));
+    out.extend(spans);
+    Line::from(out)
+}
+
+/// Whether the rail can be drawn as a filled cell, or needs a glyph.
+///
+/// A filled cell is the better rail: it is exactly one column wide in every
+/// font and needs no box-drawing glyph. But it is carried entirely by colour,
+/// so a terminal without colour would lose the block structure altogether. The
+/// glyph fallback keeps the structure and lets the colour go, which is the same
+/// trade every other surface makes.
+fn rail_is_filled(theme: &TuiTheme) -> bool {
+    theme.has_color()
+}
+
+/// The rail cell used when the rail cannot be a filled block.
+fn rail_glyph(theme: &TuiTheme) -> &'static str {
+    if theme.glyphs() == crate::theme::GlyphMode::Unicode {
+        "│"
+    } else {
+        "|"
+    }
+}
+
+/// Soften a rail colour for one frame of the running animation.
+fn pulse(theme: &TuiTheme, color: Color, phase: u32) -> Color {
+    // A slow triangle wave: fully lit, then two steps down. Fast enough to read
+    // as activity, slow enough not to flicker.
+    let step = (phase % 6) as f32;
+    let weight = if step < 3.0 {
+        1.0 - step * 0.22
+    } else {
+        0.34 + (step - 3.0) * 0.22
+    };
+    theme.fade(color, weight)
+}
+
+/// The background band a block body sits on, when it benefits from one.
+fn body_band(block: &Block, theme: &TuiTheme) -> Option<Style> {
+    if !block.is_open() {
+        return None;
+    }
+    match block.kind {
+        // Tool output is quoted material: a band says "this is the machine
+        // talking" and separates it from prose without a border.
+        TimelineRowKind::Command
+        | TimelineRowKind::ToolCall
+        | TimelineRowKind::FileOperation
+        | TimelineRowKind::WebSearch => Some(Style::default().bg(theme.roles.surface)),
+        TimelineRowKind::Error => Some(Style::default().bg(theme.roles.surface)),
+        _ => None,
+    }
+}
+
 fn body_style(block: &Block, theme: &TuiTheme) -> Style {
     match block.kind {
-        TimelineRowKind::Reasoning => theme.muted().add_modifier(Modifier::ITALIC),
+        TimelineRowKind::Reasoning => Style::default()
+            .fg(theme.roles.gray)
+            .add_modifier(Modifier::ITALIC),
         TimelineRowKind::Command | TimelineRowKind::ToolCall | TimelineRowKind::FileOperation => {
             theme.base()
         }
         TimelineRowKind::Error => theme.danger(),
-        TimelineRowKind::SystemNotice | TimelineRowKind::GitNotice => theme.muted(),
-        TimelineRowKind::UserMessage => theme.base().add_modifier(Modifier::BOLD),
+        TimelineRowKind::SystemNotice | TimelineRowKind::GitNotice => {
+            Style::default().fg(theme.roles.gray)
+        }
+        TimelineRowKind::UserMessage => theme.base(),
         _ => theme.base(),
     }
 }
@@ -885,6 +1260,7 @@ mod tests {
             file_path: None,
             runtime_attribution: None,
             conclusion: false,
+            group: GroupRole::Solo,
         }
     }
 
@@ -909,6 +1285,7 @@ mod tests {
             ScrollState {
                 offset: 0,
                 follow: false,
+                selected: None,
             },
             200,
             &palette,
@@ -926,6 +1303,7 @@ mod tests {
             ScrollState {
                 offset: 0,
                 follow: true,
+                selected: None,
             },
             200,
             &palette,
@@ -988,6 +1366,7 @@ mod tests {
             ScrollState {
                 offset: 0,
                 follow: true,
+                selected: None,
             },
             24,
             &palette,
@@ -1146,26 +1525,263 @@ mod tests {
     }
 
     #[test]
-    fn connection_blocks_render_without_a_body() {
+    fn a_bodyless_block_is_a_header_plus_its_gap() {
         let mut entry = block("a", TimelineRowKind::SystemNotice, "");
         entry.collapsible = false;
         let rendered = render_block(&entry, &theme(), 60, strings());
-        assert_eq!(rendered.height, 1);
+        assert_eq!(rendered.height, 1 + chrome::GAP);
     }
 
     #[test]
-    fn cjk_bodies_respect_the_render_width() {
+    fn every_rendered_row_carries_the_rail() {
+        // The rail is what makes a long block read as one object; a row without
+        // it would visually detach from its block.
+        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
+        entry.collapsible = false;
+        let rendered = render_block(&entry, &theme(), 60, strings());
+        assert!(rendered.height > 3);
+        for line in &rendered.lines {
+            let first = line.spans.first().expect("a rail span");
+            // The rail is a filled cell, so its colour lives in the background;
+            // a foreground-coloured space would be invisible.
+            assert!(first.style.bg.is_some(), "the rail cell is not filled");
+            assert_eq!(line.spans[1].content.as_ref(), " ".repeat(chrome::PAD_LEFT));
+        }
+    }
+
+    #[test]
+    fn each_block_kind_wears_its_own_rail_colour() {
+        // Scanning a session by colour only works if the mapping is stable and
+        // the roles are actually distinct.
         let palette = theme();
+        let rail_of = |kind| {
+            let mut entry = block("a", kind, "body");
+            entry.collapsible = false;
+            render_block(&entry, &palette, 60, strings()).lines[0].spans[0]
+                .style
+                .bg
+                .expect("rail colour")
+        };
+        // The rails a reader has to tell apart at a glance must not collide, or
+        // the colour carries no information.
+        let distinct = [
+            TimelineRowKind::UserMessage,
+            TimelineRowKind::AgentMessage,
+            TimelineRowKind::Reasoning,
+            TimelineRowKind::ToolCall,
+            TimelineRowKind::Error,
+        ]
+        .map(rail_of);
+        let unique = distinct
+            .iter()
+            .map(|color| format!("{color:?}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), distinct.len(), "{distinct:?}");
+    }
+
+    #[test]
+    fn a_colour_less_terminal_keeps_the_rail_as_a_glyph() {
+        // The rail is carried by colour, so without colour the block structure
+        // would vanish entirely. It falls back to a drawn line.
+        let plain = TuiTheme::resolve(
+            Some("vibex-dark"),
+            GpuiThemeMode::Dark,
+            ColorCapability {
+                mode: ColorMode::None,
+                glyphs: GlyphMode::Unicode,
+            },
+        );
+        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo");
+        entry.collapsible = false;
+        let rendered = render_block(&entry, &plain, 60, strings());
+        for line in &rendered.lines {
+            assert_eq!(line.spans[0].content.as_ref(), "│");
+            assert_eq!(line.spans[0].style.bg, None);
+        }
+        // The ASCII glyph mode uses a pipe.
+        let ascii = TuiTheme::resolve(
+            Some("vibex-dark"),
+            GpuiThemeMode::Dark,
+            ColorCapability {
+                mode: ColorMode::None,
+                glyphs: GlyphMode::Ascii,
+            },
+        );
+        let rendered = render_block(&entry, &ascii, 60, strings());
+        assert_eq!(rendered.lines[0].spans[0].content.as_ref(), "|");
+    }
+
+    #[test]
+    fn the_rail_runs_down_the_whole_block_not_just_its_header() {
+        // A rail that only covers the first row would not group anything.
+        let mut entry = block("a", TimelineRowKind::Command, "one\ntwo\nthree");
+        entry.collapsible = false;
+        let rendered = render_block(&entry, &theme(), 60, strings());
+        let rail = rendered.lines[0].spans[0].style.bg.expect("rail colour");
+        assert!(rendered.height > 4);
+        for (index, line) in rendered.lines.iter().enumerate() {
+            let cell = line.spans.first().expect("a rail cell");
+            assert_eq!(
+                cell.style.bg,
+                Some(rail),
+                "row {index} fell out of the block's rail"
+            );
+        }
+    }
+
+    #[test]
+    fn the_current_block_is_marked_without_inverting_its_text() {
+        let mut entry = block("a", TimelineRowKind::AgentMessage, "body");
+        entry.collapsible = false;
+        let plain = render_block(&entry, &theme(), 60, strings());
+        let marked = render_block_styled(&entry, &theme(), 60, strings(), 0, true);
+        // The marker replaces the blank rail cell on the header only.
+        assert_eq!(plain.lines[0].spans[0].content.as_ref(), " ");
+        assert_eq!(marked.lines[0].spans[0].content.as_ref(), "▌");
+        assert_eq!(marked.lines[1].spans[0].content.as_ref(), " ");
+        // The header is lifted rather than reversed: reverse video on a whole
+        // row is the heaviest emphasis a terminal has.
+        let header = marked.lines[0].style;
+        assert_eq!(header.bg, Some(theme().roles.surface_highlight));
+        assert!(!header.add_modifier.contains(Modifier::REVERSED));
+        // The rows under it are not lifted, so only the header reads as current.
+        assert_eq!(marked.lines[1].style.bg, None);
+        assert_eq!(plain.lines[0].style.bg, None);
+    }
+
+    #[test]
+    fn work_items_carry_a_bullet_and_messages_do_not() {
+        let palette = theme();
+        let with_bullet = |kind| {
+            let mut entry = block("a", kind, "body");
+            entry.collapsible = false;
+            render_block(&entry, &palette, 60, strings()).plain[0].clone()
+        };
+        assert!(with_bullet(TimelineRowKind::ToolCall).starts_with('⏺'));
+        assert!(with_bullet(TimelineRowKind::Reasoning).starts_with('⏺'));
+        assert!(!with_bullet(TimelineRowKind::AgentMessage).starts_with('⏺'));
+        assert!(!with_bullet(TimelineRowKind::UserMessage).starts_with('⏺'));
+    }
+
+    #[test]
+    fn a_run_of_collapsed_work_items_folds_into_its_first_member() {
         let mut transcript = Transcript::new();
-        transcript.configure(40, &palette);
+        transcript.configure(80, &theme());
+        transcript.set_blocks(
+            (0..6)
+                .map(|index| block(&format!("t{index}"), TimelineRowKind::ToolCall, "ran"))
+                .collect(),
+        );
+        assert!(matches!(
+            transcript.blocks()[0].group,
+            GroupRole::Head { hidden: 5 }
+        ));
+        for entry in &transcript.blocks()[1..] {
+            assert_eq!(entry.group, GroupRole::Member);
+        }
+        let rendered = transcript.visible_lines(ScrollState::default(), 60, &theme(), strings());
+        let text = rendered
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("5 more"), "{text}");
+    }
+
+    #[test]
+    fn an_expanded_or_failed_item_breaks_the_run() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        let mut expanded = block("t1", TimelineRowKind::ToolCall, "ran");
+        expanded.expanded = true;
+        let mut failed = block("t2", TimelineRowKind::ToolCall, "boom");
+        failed.failed = true;
+        transcript.set_blocks(vec![
+            block("t0", TimelineRowKind::ToolCall, "ran"),
+            expanded,
+            failed,
+            block("t3", TimelineRowKind::ToolCall, "ran"),
+            block("t4", TimelineRowKind::ToolCall, "ran"),
+        ]);
+        for entry in transcript.blocks() {
+            assert_eq!(
+                entry.group,
+                GroupRole::Solo,
+                "{} should not have been folded",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_run_is_left_alone() {
+        let mut transcript = Transcript::new();
+        transcript.configure(80, &theme());
+        transcript.set_blocks(vec![
+            block("t0", TimelineRowKind::ToolCall, "ran"),
+            block("t1", TimelineRowKind::ToolCall, "ran"),
+        ]);
+        for entry in transcript.blocks() {
+            assert_eq!(entry.group, GroupRole::Solo);
+        }
+    }
+
+    #[test]
+    fn grouping_keeps_the_transcript_shorter() {
+        let body = "output line\n".repeat(12);
+        let mut flat = Transcript::new();
+        flat.configure(80, &theme());
+        let mut entries = (0..8)
+            .map(|index| block(&format!("t{index}"), TimelineRowKind::ToolCall, &body))
+            .collect::<Vec<_>>();
+        for entry in &mut entries {
+            entry.expanded = true;
+        }
+        flat.set_blocks(entries);
+        let expanded_height = flat.total_height();
+
+        let mut folded = Transcript::new();
+        folded.configure(80, &theme());
+        folded.set_blocks(
+            (0..8)
+                .map(|index| block(&format!("t{index}"), TimelineRowKind::ToolCall, &body))
+                .collect(),
+        );
+        assert!(folded.total_height() * 3 < expanded_height);
+    }
+
+    #[test]
+    fn only_a_running_transcript_animates() {
+        // The idle contract is zero frames; an animation that ticks regardless
+        // would break it.
+        let mut transcript = transcript_with(3, "settled");
+        assert!(!transcript.advance_animation());
+
+        let mut running = transcript_with(2, "working");
+        let mut streaming = block("live", TimelineRowKind::AgentMessage, "…");
+        streaming.streaming = true;
+        let mut entries = running.blocks().to_vec();
+        entries.push(streaming);
+        running.set_blocks(entries);
+        assert!(running.advance_animation());
+    }
+
+    #[test]
+    fn the_width_change_keeps_the_chrome_inside_the_frame() {
+        let mut transcript = Transcript::new();
+        transcript.configure(40, &theme());
         transcript.set_blocks(vec![block(
-            "cjk",
+            "a",
             TimelineRowKind::AgentMessage,
             "这是一段中文正文，用于验证按列宽换行。",
         )]);
+        let palette = theme();
         let lines = transcript.visible_lines(ScrollState::default(), 100, &palette, strings());
         for line in &lines {
-            assert!(display_width(&line.to_string()) <= 40);
+            assert!(
+                display_width(&line.to_string()) <= 40,
+                "a row overflowed the chrome: {line:?}"
+            );
         }
     }
 }

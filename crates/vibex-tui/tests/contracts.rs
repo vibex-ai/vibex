@@ -259,8 +259,8 @@ fn effect_keys_are_stable_identifiers() {
 
 #[test]
 fn the_documentation_exists_for_every_page() {
-    // Mirrors the reference implementation's `registered_features_are_documented`
-    // test: a shipped page must have a user-facing document.
+    // A shipped page must have a user-facing document, so a feature cannot
+    // arrive without something that explains it.
     let root = workspace_root();
     let docs = root.join("docs").join("tui");
     assert!(

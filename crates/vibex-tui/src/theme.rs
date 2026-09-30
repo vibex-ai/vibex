@@ -178,6 +178,21 @@ pub fn rgb_to_ansi256(rgb: u32) -> u8 {
     }
 }
 
+/// Blend two packed sRGB colours. `t` is how far to move from `from` to `to`.
+///
+/// Used to derive the grey steps and to fade chrome toward the background when
+/// a pane loses focus. Fading rather than recolouring is what keeps a blurred
+/// pane recognisable: it stays the same hue, only quieter.
+pub fn mix_rgb(from: u32, to: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let channel = |shift: u32| -> u32 {
+        let a = ((from >> shift) & 0xff) as f32;
+        let b = ((to >> shift) & 0xff) as f32;
+        ((a + (b - a) * t).round() as u32) & 0xff
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 fn squared_distance(left: (i32, i32, i32), right: (i32, i32, i32)) -> i32 {
     let (dr, dg, db) = (left.0 - right.0, left.1 - right.1, left.2 - right.2);
     dr * dr + dg * dg + db * db
@@ -270,29 +285,105 @@ impl Default for ColorCapability {
 
 /// The semantic roles a terminal interface actually needs.
 ///
-/// The full 67-token catalogue exists for pixel rendering; a character grid
-/// collapses it to these roles. Anything not listed here is read on demand
-/// through [`TuiTheme::token`].
+/// The pixel catalogue has 67 entries because a window can afford that many
+/// distinctions. A character grid needs fewer *hues* but just as much
+/// *hierarchy*, and hierarchy is what a flat palette loses: with one muted grey
+/// and one accent, every secondary element competes with every other, and the
+/// eye has nowhere to rest.
+///
+/// The roles below are grouped the way the interface uses them:
+///
+/// * **surfaces** — layered backgrounds, so a composer or a raised row reads as
+///   a distinct plane rather than as text on the same canvas;
+/// * **rails** — the accent colour for each kind of transcript block, which is
+///   how a reader tells a tool call from a thought without reading the label;
+/// * **grey** — three steps, because "dim punctuation", "muted body" and
+///   "secondary label" are three different jobs;
+/// * **semantic** — a command is not an error is not a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeRole {
+    // ---- surfaces -------------------------------------------------------
     pub background: Color,
+    /// Slightly lifted from `background`; used for inline panels.
+    pub surface: Color,
+    /// Raised above `surface`; overlays and the composer sit here.
+    pub surface_raised: Color,
+    /// Selected or hovered row inside a list.
+    pub surface_highlight: Color,
+    /// Code and preformatted blocks.
+    pub code_background: Color,
+
+    // ---- text -----------------------------------------------------------
     pub foreground: Color,
-    pub muted_foreground: Color,
+    /// Body copy one step down from `foreground`.
+    pub text_secondary: Color,
+    /// Brightest grey: secondary labels that still need to be read.
+    pub gray_bright: Color,
+    /// The default grey: muted body, collapsed summaries.
+    pub gray: Color,
+    /// Dimmest: punctuation, separators, chrome.
+    pub gray_dim: Color,
+
+    // ---- structure ------------------------------------------------------
     pub border: Color,
+    pub border_focused: Color,
     pub focus: Color,
+
+    // ---- rails: one per transcript block kind ---------------------------
+    pub accent_user: Color,
+    pub accent_agent: Color,
+    pub accent_thinking: Color,
+    pub accent_tool: Color,
+    pub accent_system: Color,
+    pub accent_error: Color,
+    pub accent_success: Color,
+    /// The Agent is working: the running rail animates.
+    pub accent_running: Color,
+    /// Approval and elicitation surfaces.
+    pub accent_attention: Color,
+
+    // ---- semantic -------------------------------------------------------
     pub accent: Color,
     pub success: Color,
     pub warning: Color,
     pub danger: Color,
-    pub surface: Color,
-    pub surface_raised: Color,
-    pub code_background: Color,
+    pub command: Color,
+    pub path: Color,
+
+    // ---- diff -----------------------------------------------------------
+    pub diff_insert: Color,
+    pub diff_delete: Color,
 }
 
 impl ThemeRole {
     /// Highest-contrast colour pair available for text on `surface`.
     pub const fn contrast_foreground(self) -> Color {
         self.foreground
+    }
+}
+
+/// The transcript rail a block wears.
+///
+/// Named by intent rather than by colour so a theme change cannot make a
+/// thinking block look like an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rail {
+    User,
+    Agent,
+    Thinking,
+    Tool,
+    System,
+    Error,
+    Success,
+    Running,
+    Attention,
+}
+
+/// Extract the packed sRGB value of a resolved colour.
+pub fn color_rgb(color: Color) -> Option<u32> {
+    match color {
+        Color::Rgb(r, g, b) => Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)),
+        _ => None,
     }
 }
 
@@ -343,18 +434,60 @@ impl TuiTheme {
                 .unwrap_or(Color::Reset)
         };
         let roles = ThemeRole {
+            // Surfaces step away from the canvas so a plane change is visible
+            // without a border. The light themes step *toward* grey instead,
+            // which is why these are tokens rather than arithmetic.
             background: color(background_rgb),
+            surface: color(token("card", background_rgb)),
+            surface_raised: color(token("popover", background_rgb)),
+            surface_highlight: color(token("accent", token("secondary", background_rgb))),
+            code_background: color(token("muted", background_rgb)),
+
             foreground: color(foreground_rgb),
-            muted_foreground: color(token("muted-foreground", foreground_rgb)),
+            text_secondary: color(token("secondary-foreground", foreground_rgb)),
+            // Three greys derived from the one the catalogue ships: the bright
+            // step leans toward the foreground, the dim step away from it. A
+            // single muted token cannot carry three jobs.
+            gray_bright: color(mix_rgb(
+                token("muted-foreground", foreground_rgb),
+                foreground_rgb,
+                0.35,
+            )),
+            gray: color(token("muted-foreground", foreground_rgb)),
+            gray_dim: color(mix_rgb(
+                token("muted-foreground", foreground_rgb),
+                background_rgb,
+                0.45,
+            )),
+
             border: color(token("border", foreground_rgb)),
+            // A focused border has to be visible against the surface it wraps,
+            // so it uses the ring token rather than a brighter grey.
+            border_focused: color(token("ring", foreground_rgb)),
             focus: color(token("ring", foreground_rgb)),
+
+            // Rails. The catalogue has no per-role hues, so these are derived
+            // from the chart series, which exist precisely to give a fixed set
+            // of distinguishable colours inside one theme.
+            accent_user: color(token("primary", foreground_rgb)),
+            accent_agent: color(token("foreground", foreground_rgb)),
+            accent_thinking: color(token("chart-category-9", 0x8f7fd4)),
+            accent_tool: color(token("chart-category-2", 0x5aa6d8)),
+            accent_system: color(token("muted-foreground", foreground_rgb)),
+            accent_error: color(token("destructive", 0xd6453f)),
+            accent_success: color(token("chart-2", 0x2e9e5b)),
+            accent_running: color(token("chart-category-1", 0x5b8dee)),
+            accent_attention: color(token("warning", 0xd8a123)),
+
             accent: color(token("primary", foreground_rgb)),
             success: color(token("chart-2", 0x2e9e5b)),
             warning: color(token("warning", 0xd8a123)),
             danger: color(token("destructive", 0xd6453f)),
-            surface: color(token("card", background_rgb)),
-            surface_raised: color(token("popover", background_rgb)),
-            code_background: color(token("muted", background_rgb)),
+            command: color(token("chart-category-4", 0xd8a94a)),
+            path: color(token("chart-category-6", 0xd88a5a)),
+
+            diff_insert: color(token("right-rail-status-added", 0x3fae6a)),
+            diff_delete: color(token("destructive", 0xd6453f)),
         };
         Self {
             id: definition.id,
@@ -382,7 +515,7 @@ impl TuiTheme {
     }
 
     pub fn muted(&self) -> Style {
-        Style::default().fg(self.roles.muted_foreground)
+        Style::default().fg(self.roles.gray)
     }
 
     pub fn accent(&self) -> Style {
@@ -405,6 +538,50 @@ impl TuiTheme {
 
     pub fn success(&self) -> Style {
         Style::default().fg(self.roles.success)
+    }
+
+    /// The rail colour for a block kind. One place decides the mapping, so a
+    /// new block kind cannot silently inherit the wrong hue.
+    pub fn rail(&self, rail: Rail) -> Color {
+        match rail {
+            Rail::User => self.roles.accent_user,
+            Rail::Agent => self.roles.accent_agent,
+            Rail::Thinking => self.roles.accent_thinking,
+            Rail::Tool => self.roles.accent_tool,
+            Rail::System => self.roles.accent_system,
+            Rail::Error => self.roles.accent_error,
+            Rail::Success => self.roles.accent_success,
+            Rail::Running => self.roles.accent_running,
+            Rail::Attention => self.roles.accent_attention,
+        }
+    }
+
+    /// Fade a colour toward the canvas. `weight` is 1.0 for full strength and
+    /// 0.0 for invisible.
+    ///
+    /// Returns the plain resolved colour when the terminal cannot blend
+    /// (indexed palettes have no intermediate steps), so callers never have to
+    /// branch on the colour mode themselves.
+    pub fn fade(&self, color: Color, weight: f32) -> Color {
+        if weight >= 1.0 {
+            return color;
+        }
+        if !matches!(self.capability.mode, ColorMode::TrueColor) || !matches!(color, Color::Rgb(..))
+        {
+            return color;
+        }
+        let (Some(from), Some(background)) = (color_rgb(color), color_rgb(self.roles.background))
+        else {
+            return color;
+        };
+        self.capability
+            .color(mix_rgb(from, background, 1.0 - weight))
+            .unwrap_or(color)
+    }
+
+    /// The style for chrome that belongs to an unfocused pane.
+    pub fn dimmed(&self, color: Color) -> Style {
+        Style::default().fg(self.fade(color, 0.55))
     }
 
     pub fn border_style(&self) -> Style {

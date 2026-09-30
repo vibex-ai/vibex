@@ -1,7 +1,6 @@
 //! Rendering: layout maths, page shells, overlays and the pure view helpers.
 //!
-//! Two structural rules from the reference implementations are enforced here
-//! rather than trusted to discipline:
+//! Two structural rules are enforced here rather than trusted to discipline:
 //!
 //! * **Every page renders through [`page_frame`]**, which draws the bordered
 //!   title, the always-visible key bar and the summary line. A page cannot
@@ -13,7 +12,7 @@ use qrcode::QrCode;
 use qrcode::render::unicode::Dense1x2;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -70,6 +69,9 @@ impl SeatKind {
     }
 }
 
+/// The narrowest a main pane may be before the sidebar gives way.
+pub const MIN_MAIN_COLUMNS: usize = 44;
+
 /// Resolved pane widths for one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutPlan {
@@ -84,11 +86,14 @@ pub struct LayoutPlan {
 pub fn layout_for(shell: ShellKind, columns: u16, rows: u16) -> LayoutPlan {
     let columns = usize::from(columns);
     let rows = usize::from(rows);
+    // Panes sit edge to edge; the separators are their own borders, so no gap
+    // columns are reserved. Reserving them made the sidebar vanish at widths
+    // that still had room for it.
     match shell {
         ShellKind::Wide => {
             let sidebar = (columns / 5).clamp(24, 40);
             let details = (columns / 4).clamp(28, 56);
-            let main = columns.saturating_sub(sidebar + details + 4).max(24);
+            let main = columns.saturating_sub(sidebar + details).max(24);
             LayoutPlan {
                 sidebar_width: sidebar,
                 main_width: main,
@@ -99,7 +104,7 @@ pub fn layout_for(shell: ShellKind, columns: u16, rows: u16) -> LayoutPlan {
         }
         ShellKind::Medium => {
             let sidebar = 26usize.min(columns / 3);
-            let main = columns.saturating_sub(sidebar + 2).max(24);
+            let main = columns.saturating_sub(sidebar).max(24);
             LayoutPlan {
                 sidebar_width: sidebar,
                 main_width: main,
@@ -121,14 +126,19 @@ pub fn layout_for(shell: ShellKind, columns: u16, rows: u16) -> LayoutPlan {
 
 impl LayoutPlan {
     fn clamp_to(mut self, columns: usize, _rows: usize) -> Self {
-        if self.show_sidebar && self.sidebar_width + self.main_width + 4 > columns {
+        // The details pane is the one that yields: it holds context, while the
+        // sidebar is how the reader navigates at all.
+        if self.show_details && self.sidebar_width + self.main_width + self.details_width > columns
+        {
+            self.show_details = false;
+            self.details_width = 0;
+            self.main_width = columns.saturating_sub(self.sidebar_width).max(24);
+        }
+        // The sidebar only goes when even a minimum main pane would not fit.
+        if self.show_sidebar && self.sidebar_width + MIN_MAIN_COLUMNS > columns {
             self.show_sidebar = false;
             self.sidebar_width = 0;
             self.main_width = columns;
-        }
-        if self.show_details && self.main_width + self.details_width + 4 > columns {
-            self.show_details = false;
-            self.details_width = 0;
         }
         self
     }
@@ -446,6 +456,47 @@ fn page_frame(
     inner
 }
 
+/// The empty-transcript state.
+///
+/// A blank pane with one grey sentence wastes the moment the reader is most
+/// likely to be lost. This says what the product is, what it can do, and the
+/// two keys that get started.
+fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, strings: Strings) {
+    if area.height < 4 {
+        empty_state(frame, area, theme, strings.transcript_empty());
+        return;
+    }
+    let accent = Style::default()
+        .fg(theme.roles.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.roles.gray_dim);
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", strings.app_name()), accent)),
+        Line::from(Span::styled(
+            format!("  {}", strings.product_tagline()),
+            Style::default().fg(theme.roles.gray),
+        )),
+        Line::from(""),
+    ];
+    for (key, label) in [
+        ("/", strings.composer_command_menu()),
+        ("@", strings.composer_file_menu()),
+        ("$", strings.composer_skill_menu()),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key}  "), accent),
+            Span::styled(label.to_string(), dim),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", strings.help_hint()),
+        dim,
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 fn empty_state(frame: &mut Frame<'_>, area: Rect, theme: &TuiTheme, message: &str) {
     frame.render_widget(
         Paragraph::new(message.to_string())
@@ -620,6 +671,8 @@ fn render_agent(
     theme: &TuiTheme,
     strings: Strings,
 ) {
+    // Borders (2), then the draft itself; the info line sits on the bottom
+    // border rather than taking a row of its own.
     let composer_height = (app.composer.line_count().min(6) as u16 + 2).max(3);
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -634,39 +687,35 @@ fn render_agent(
     let inner = page_frame(frame, rows[0], theme, &title, focused);
 
     if app.transcript.is_empty() {
-        empty_state(frame, inner, theme, strings.transcript_empty());
+        render_welcome(frame, inner, theme, strings);
     } else {
         let height = usize::from(inner.height);
-        let lines = app
-            .transcript
-            .visible_lines(app.scroll, height, theme, strings);
-        // The visible selection is tracked by display line, so the highlighted
-        // block is always the one the viewport is showing.
-        let selected_line = app
-            .transcript
-            .offset_of_block(app.selection_for(Scope::Agent));
-        let offset = if app.scroll.follow {
-            app.transcript.total_height().saturating_sub(height)
-        } else {
-            app.scroll.offset
-        };
-        let rendered = lines
-            .into_iter()
-            .enumerate()
-            .map(|(index, line)| {
-                if offset + index == selected_line && focused {
-                    line.style(theme.selected())
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(rendered)), inner);
+        let selected = app.selection_for(Scope::Agent);
+        let mut scroll = app.scroll;
+        scroll.selected = Some(selected);
+        let lines = app.transcript.visible_lines(scroll, height, theme, strings);
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 
     render_composer(frame, rows[1], app, theme, strings);
 }
 
+/// Draw the composer.
+///
+/// The composer is the one place the user types, so it gets the interface's
+/// strongest affordances:
+///
+/// ```text
+/// ╭─ <session title> ─────────────────────────────╮
+/// │ ❯ the draft so far                             │
+/// ╰─ <agent> · <model> · <mode>          multiline╯
+/// ```
+///
+/// The top border carries the session, and the bottom border is an info line —
+/// model, mode and any warning — which is where a terminal UI can show context
+/// without spending a row on it. Both fade toward the canvas when the composer
+/// does not have focus, so "where will my keystrokes go" is answerable at a
+/// glance rather than by reading.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -675,30 +724,62 @@ fn render_composer(
     strings: Strings,
 ) {
     let focused = app.focus == crate::app::Focus::Composer;
-    let border = if focused {
-        theme.focus_style()
-    } else {
-        theme.border_style()
-    };
     let running = app
         .active_session()
         .is_some_and(|session| session.state == vibex_core::AgentSessionState::Running);
-    let hint = if running {
-        format!("{} · Ctrl+S", strings.composer_steer())
+
+    // Rail colour: the user's own accent when this is where typing lands, the
+    // dim grey otherwise.
+    let rail_color = if focused {
+        theme.roles.accent_user
     } else {
-        strings.composer_placeholder().to_string()
+        theme.roles.gray_dim
     };
+    let border_color = if focused {
+        theme.roles.border_focused
+    } else {
+        theme.roles.gray_dim
+    };
+
+    let title = app
+        .active_session()
+        .map(|session| session.title.clone())
+        .unwrap_or_else(|| strings.product_tagline().to_string());
+
     let block = bordered(theme)
-        .border_style(border)
-        .title(Span::styled(format!(" {hint} "), theme.muted()));
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(theme.roles.gray),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
 
-    let width = usize::from(inner.width);
+    let text_area = inner;
+
+    let prompt_width = 2;
+    let width = usize::from(text_area.width).saturating_sub(prompt_width);
+    let prefix = "❯";
+    let prefix_style = Style::default().fg(rail_color).add_modifier(Modifier::BOLD);
+
     if app.composer.text().is_empty() {
+        let placeholder = if running {
+            format!("{} · Ctrl+S", strings.composer_steer())
+        } else {
+            strings.composer_placeholder().to_string()
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("█", theme.accent()))),
-            inner,
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{prefix} "), prefix_style),
+                Span::styled(
+                    truncate_to_width(&placeholder, width, "…"),
+                    Style::default().fg(theme.roles.gray_dim),
+                ),
+            ])),
+            text_area,
         );
     } else {
         let (cursor_line, _) = app.composer.cursor_line_column();
@@ -708,22 +789,157 @@ fn render_composer(
             .into_iter()
             .enumerate()
             .map(|(index, (text, is_cursor_line))| {
-                // The line holding the cursor is emphasized so a long draft
-                // stays navigable; the rest is plain body text.
-                let style = if index == cursor_line && is_cursor_line {
-                    theme.base().add_modifier(Modifier::BOLD)
+                let gutter = if index == 0 {
+                    Span::styled(format!("{prefix} "), prefix_style)
                 } else {
-                    theme.base()
+                    Span::raw(" ".repeat(prompt_width))
                 };
-                Line::from(Span::styled(text, style))
+                // The cursor's line is drawn at full strength; the rest of a
+                // long draft recedes so the eye stays where typing happens.
+                let style = if index == cursor_line && is_cursor_line {
+                    theme.base()
+                } else {
+                    theme.base().add_modifier(Modifier::DIM)
+                };
+                Line::from(vec![gutter, Span::styled(text, style)])
             })
             .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+        frame.render_widget(Paragraph::new(Text::from(lines)), text_area);
+    }
+
+    // The info line is painted onto the bottom border. The rule continues
+    // around it, so the composer keeps a single clean outline while still
+    // carrying context -- a row of chrome that would otherwise be spent on `─`.
+    if area.height >= 2 {
+        let bottom = Rect {
+            y: area.y + area.height - 1,
+            x: area.x + 1,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        render_composer_info(frame, bottom, app, theme, strings, focused, running);
     }
 
     if let Some(menu) = app.completion.clone() {
-        render_completion(frame, inner, theme, &menu);
+        render_completion(frame, text_area, theme, &menu);
     }
+}
+
+/// The composer's info line: context on the left, mode on the right.
+///
+/// This is deliberately the bottom border rather than a separate row: a
+/// terminal has no room for chrome that only carries status, and a divider that
+/// also informs is free.
+fn render_composer_info(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+    focused: bool,
+    running: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let sep = |theme: &TuiTheme| {
+        Span::styled(
+            format!(" {} ", crate::transcript::chrome_separator()),
+            Style::default().fg(if focused {
+                theme.roles.gray_dim
+            } else {
+                theme.fade(theme.roles.gray_dim, 0.5)
+            }),
+        )
+    };
+    let flag = |theme: &TuiTheme| {
+        Style::default().fg(if focused {
+            theme.roles.gray
+        } else {
+            theme.fade(theme.roles.gray, 0.55)
+        })
+    };
+
+    let mut left = vec![Span::raw(" ")];
+    // Model identity, when the session has one.
+    if let Some(session) = app.active_session() {
+        left.push(Span::styled(
+            session.agent_id.to_string(),
+            flag(theme).add_modifier(Modifier::BOLD),
+        ));
+        if let Some(catalog) = app.runtime_options.as_ref()
+            && let Some(option) = catalog.options.first()
+        {
+            left.push(sep(theme));
+            left.push(Span::styled(option.model_label.clone(), flag(theme)));
+        }
+    } else {
+        // No session yet: name the page, which is the only true context there is.
+        let page = match app.page {
+            Page::Agent => strings.nav_agent(),
+            Page::Files => strings.nav_files(),
+            Page::Changes => strings.nav_changes(),
+            Page::Terminal => strings.nav_terminal(),
+            Page::Sessions => strings.nav_sessions(),
+            Page::Management => strings.nav_management(),
+            Page::Usage => strings.nav_usage(),
+            Page::Settings => strings.nav_settings(),
+            Page::Help => strings.nav_help(),
+            _ => strings.nav_management(),
+        };
+        left.push(Span::styled(page.to_string(), flag(theme)));
+    }
+    if running {
+        left.push(sep(theme));
+        left.push(Span::styled(
+            strings.running().to_string(),
+            Style::default().fg(theme.roles.accent_running),
+        ));
+    }
+    let pending = app.pending_permission_count();
+    if pending > 0 {
+        left.push(sep(theme));
+        left.push(Span::styled(
+            format!("⚠ {pending} {}", strings.approval_title()),
+            theme.warning().add_modifier(Modifier::BOLD),
+        ));
+    }
+    left.push(Span::raw(" "));
+
+    let mut right = Vec::new();
+    if app.composer.line_count() > 1 {
+        right.push(Span::styled(
+            strings.settings_keys().to_string(),
+            flag(theme),
+        ));
+    }
+    if focused {
+        right.push(Span::styled(
+            "▏",
+            Style::default().fg(theme.roles.accent_user),
+        ));
+    }
+    if !right.is_empty() {
+        right.push(Span::raw(" "));
+    }
+
+    // Render into a scratch line so the right-hand side can be placed against
+    // the far edge without the two halves colliding in a narrow terminal.
+    let left_line = Line::from(left);
+    let left_width = left_line.width() as u16;
+    let right_line = Line::from(right);
+    let right_width = right_line.width() as u16;
+    if left_width + right_width >= area.width {
+        frame.render_widget(Paragraph::new(left_line), area);
+        return;
+    }
+    frame.render_widget(Paragraph::new(left_line), area);
+    let right_area = Rect {
+        x: area.x + area.width - right_width,
+        width: right_width,
+        ..area
+    };
+    frame.render_widget(Paragraph::new(right_line), right_area);
 }
 
 fn render_completion(
@@ -1394,6 +1610,12 @@ fn render_help(
     frame.render_widget(List::new(items), inner);
 }
 
+/// The details pane: the facts about the open session, at a glance.
+///
+/// Details are for the things a reader checks without leaving the transcript --
+/// which runtime is answering, how full the context is, whether anything is
+/// waiting on them. Everything here is also reachable elsewhere; the pane
+/// exists so it does not have to be looked up.
 fn render_details(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1403,118 +1625,336 @@ fn render_details(
     focused: bool,
 ) {
     let inner = page_frame(frame, area, theme, strings.details(), focused);
-    let mut lines = Vec::new();
+    let mut rows: Vec<(String, String, Style)> = Vec::new();
+    let label = Style::default().fg(theme.roles.gray_dim);
+    let value = Style::default().fg(theme.roles.foreground);
+
     if let Some(session) = app.active_session() {
+        rows.push((
+            strings.details_state().to_string(),
+            format!("{:?}", session.state),
+            Style::default().fg(match session.state {
+                vibex_core::AgentSessionState::Running => theme.roles.accent_running,
+                vibex_core::AgentSessionState::Error => theme.roles.danger,
+                vibex_core::AgentSessionState::NeedsInput => theme.roles.accent_attention,
+                _ => theme.roles.foreground,
+            }),
+        ));
+        rows.push((
+            strings.details_agent().to_string(),
+            session.agent_id.to_string(),
+            value,
+        ));
+        if let Some(catalog) = app.runtime_options.as_ref()
+            && let Some(option) = catalog.options.first()
+        {
+            rows.push((
+                strings.details_model().to_string(),
+                option.model_label.clone(),
+                value,
+            ));
+        }
+        rows.push((
+            strings.details_workspace().to_string(),
+            session.workspace_root.clone(),
+            Style::default().fg(theme.roles.path),
+        ));
+    } else {
+        rows.push((
+            strings.details_state().to_string(),
+            strings.none().to_string(),
+            label,
+        ));
+    }
+
+    if let Some(branch) = app
+        .git_status
+        .as_ref()
+        .and_then(|status| status.branch.clone())
+    {
+        rows.push((
+            strings.details_branch().to_string(),
+            branch,
+            Style::default().fg(theme.roles.command),
+        ));
+    }
+
+    if let Some(usage) = app.management_data.usage_session.as_ref() {
+        let used = usage.total_tokens.unwrap_or(0);
+        let text = match usage.context_window_size_tokens {
+            Some(total) if total > 0 => {
+                format!("{} / {}", compact_tokens(used), compact_tokens(total))
+            }
+            _ => compact_tokens(used),
+        };
+        rows.push((strings.details_context().to_string(), text, value));
+    }
+
+    let pending = app.pending_permission_count();
+    rows.push((
+        strings.approval_label().to_string(),
+        pending.to_string(),
+        if pending > 0 {
+            Style::default()
+                .fg(theme.roles.accent_attention)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            label
+        },
+    ));
+
+    // Two columns, sized to the widest label, so nothing collides.
+    let label_width = rows
+        .iter()
+        .map(|(name, _, _)| display_width(name))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(inner.width).saturating_sub(8));
+    let mut lines = Vec::new();
+    for (name, text, style) in rows {
+        let name = truncate_to_width(&name, label_width, "…");
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", strings.session_state()), theme.muted()),
-            Span::styled(format!("{:?}", session.state), theme.base()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<14}", strings.session_workspace()),
-                theme.muted(),
-            ),
+            Span::styled(format!("{name:<label_width$}"), label),
+            Span::raw(" "),
             Span::styled(
                 truncate_to_width(
-                    &session.workspace_root,
-                    usize::from(inner.width).saturating_sub(16),
+                    &text,
+                    usize::from(inner.width).saturating_sub(label_width + 2),
                     "…",
                 ),
-                theme.base(),
+                style,
             ),
         ]));
     }
-    let approvals = app.pending_permission_count();
-    lines.push(Line::from(vec![
-        Span::styled(format!("{:<14}", strings.approval_title()), theme.muted()),
-        Span::styled(
-            approvals.to_string(),
-            if approvals > 0 {
-                theme.warning()
-            } else {
-                theme.base()
-            },
-        ),
-    ]));
-    for (label, value) in [
-        (strings.runtime_desired(), String::new()),
-        (strings.runtime_effective(), String::new()),
-    ] {
-        let _ = (label, value);
-    }
-    if let Some(runtime) = app.runtime_options.as_ref() {
-        for option in runtime.options.iter().take(4) {
+
+    if let Some(worktrees) = app.worktrees.as_ref()
+        && !worktrees.managed_worktrees.is_empty()
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} ({})",
+                strings.worktree_title(),
+                worktrees.managed_worktrees.len()
+            ),
+            label,
+        )));
+        for worktree in worktrees.managed_worktrees.iter().take(5) {
             lines.push(Line::from(Span::styled(
                 truncate_to_width(
-                    &format!("{} · {}", option.agent_label, option.model_label),
-                    usize::from(inner.width).saturating_sub(2),
+                    &format!(
+                        "  {}",
+                        worktree.branch.clone().unwrap_or_else(|| "-".to_string())
+                    ),
+                    usize::from(inner.width),
                     "…",
                 ),
-                theme.muted(),
+                Style::default().fg(theme.roles.gray),
             )));
         }
+    }
+
+    if lines.is_empty() {
+        empty_state(frame, inner, theme, strings.nothing_here());
+        return;
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// The key hint bar.
+///
+/// Keys are drawn bold and bright, labels dim: the key is what the reader is
+/// looking for and the label only confirms it. Hints that must survive a narrow
+/// terminal are pinned and drawn first, so shrinking the window degrades the bar
+/// from the least important end rather than truncating it arbitrarily.
 fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
     let scopes = app.documented_scopes();
     let bindings = app.keymap.advertised(&scopes);
-    let mut spans = vec![Span::styled(" ", theme.muted())];
+    let key_style = Style::default()
+        .fg(theme.roles.gray_bright)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(theme.roles.gray_dim);
+
+    let mut spans = vec![Span::raw(" ")];
     let mut used = 1usize;
     let budget = usize::from(area.width);
-    for binding in bindings {
+    for (index, binding) in bindings.iter().enumerate() {
         let Some(label) = binding.label else { continue };
         let text = format!("{} {}", binding.chord.display(), label);
         let width = display_width(&text) + 3;
-        if used + width > budget {
+        // The first few hints are the ones a reader needs most; they are kept
+        // even when the rest would not fit.
+        let pinned = index < PINNED_HINTS;
+        if used + width > budget && !pinned {
             break;
         }
+        if used + width > budget {
+            continue;
+        }
         used += width;
-        spans.push(Span::styled(binding.chord.display(), theme.accent()));
-        spans.push(Span::styled(format!(" {label}  "), theme.muted()));
+        spans.push(Span::styled(binding.chord.display(), key_style));
+        spans.push(Span::styled(format!(" {label}"), label_style));
+        spans.push(Span::styled(
+            "  ",
+            Style::default().fg(theme.roles.gray_dim),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// How many leading hints survive a narrow terminal.
+const PINNED_HINTS: usize = 3;
+
+/// The status bar: identity on the left, context in the centre, state on the
+/// right.
+///
+/// Splitting it into zones is what stops the bar from becoming a single
+/// left-aligned sentence whose tail is the first thing a narrow terminal eats.
+/// The centre carries the thing the reader checks most often — how full the
+/// context window is — with the colour blended across usage thresholds so the
+/// answer is available without reading the number.
 fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
     let strings = app.strings;
-    let (live_text, live_style) = match app.live {
-        crate::app::LiveState::Ready => (strings.done(), theme.success()),
-        crate::app::LiveState::Connecting => (strings.connecting(), theme.muted()),
-        crate::app::LiveState::Reconnecting => (strings.reconnecting(), theme.warning()),
-        crate::app::LiveState::Offline => (strings.disconnected(), theme.danger()),
+    let sep = || {
+        Span::styled(
+            format!(" {} ", crate::transcript::chrome_separator()),
+            Style::default().fg(theme.roles.gray_dim),
+        )
     };
-    let mut spans = vec![
-        Span::styled(format!(" {} ", app.seat.label(strings)), theme.accent()),
-        Span::styled("│ ", theme.border_style()),
-        Span::styled(live_text, live_style),
-        Span::styled(" │ ", theme.border_style()),
-        Span::styled(format!("{}: ", strings.settings_theme()), theme.muted()),
-        Span::styled(app.theme.name.to_string(), theme.base()),
+
+    // ---- left: where am I, and is it alive ------------------------------
+    let (live_text, live_color) = match app.live {
+        crate::app::LiveState::Ready => (strings.done(), theme.roles.accent_success),
+        crate::app::LiveState::Connecting => (strings.connecting(), theme.roles.gray),
+        crate::app::LiveState::Reconnecting => (strings.reconnecting(), theme.roles.warning),
+        crate::app::LiveState::Offline => (strings.disconnected(), theme.roles.danger),
+    };
+    let mut left = vec![
+        Span::raw(" "),
+        Span::styled(
+            app.seat.label(strings).to_string(),
+            Style::default()
+                .fg(theme.roles.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        sep(),
+        Span::styled(live_text, Style::default().fg(live_color)),
     ];
-    let pending = app.pending_permission_count();
-    if pending > 0 {
-        spans.push(Span::styled(" │ ", theme.border_style()));
-        spans.push(Span::styled(
-            format!("⚠ {pending} {}", strings.approval_title()),
-            theme.warning().add_modifier(Modifier::BOLD),
+    if app.pending_permission_count() > 0 {
+        left.push(sep());
+        left.push(Span::styled(
+            format!("⚠ {pending}", pending = app.pending_permission_count()),
+            Style::default()
+                .fg(theme.roles.accent_attention)
+                .add_modifier(Modifier::BOLD),
         ));
     }
+
+    // ---- centre: context usage ------------------------------------------
+    let centre = context_usage_line(app, theme);
+
+    // ---- right: appearance, then a transient message --------------------
+    let mut right = Vec::new();
     if let Some(toast) = &app.toast {
-        spans.push(Span::styled(" │ ", theme.border_style()));
-        let style = match toast.tone {
-            ToastTone::Info => theme.base(),
-            ToastTone::Success => theme.success(),
-            ToastTone::Warning => theme.warning(),
-            ToastTone::Danger => theme.danger(),
+        let color = match toast.tone {
+            ToastTone::Info => theme.roles.gray,
+            ToastTone::Success => theme.roles.accent_success,
+            ToastTone::Warning => theme.roles.warning,
+            ToastTone::Danger => theme.roles.danger,
         };
-        spans.push(Span::styled(
-            truncate_to_width(&toast.text, usize::from(area.width).saturating_sub(60), "…"),
-            style,
-        ));
+        right.push(Span::styled(toast.text.clone(), Style::default().fg(color)));
+        right.push(sep());
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    right.push(Span::styled(
+        app.theme.name.to_string(),
+        Style::default().fg(theme.roles.gray_dim),
+    ));
+    right.push(Span::raw(" "));
+
+    render_zoned_line(frame, area, left, centre, right);
+}
+
+/// The context-window readout.
+///
+/// Token counts are compacted (`8.5K / 1.0M`) and the colour is blended across
+/// usage thresholds, so the bar answers "how much room is left" from the corner
+/// of the eye. Vibex records no pricing, so no cost is shown.
+fn context_usage_line(app: &App, theme: &TuiTheme) -> Option<Vec<Span<'static>>> {
+    let usage = app.management_data.usage_session.as_ref()?;
+    let used = usage.total_tokens.unwrap_or(0);
+    let total = usage.context_window_size_tokens?;
+    if total == 0 {
+        return None;
+    }
+    let ratio = (used as f64 / total as f64).clamp(0.0, 1.0);
+    let color = if ratio >= 0.9 {
+        theme.roles.danger
+    } else if ratio >= 0.75 {
+        theme.roles.warning
+    } else if ratio >= 0.5 {
+        theme.roles.accent_user
+    } else {
+        theme.roles.gray
+    };
+    Some(vec![Span::styled(
+        format!("{} / {}", compact_tokens(used), compact_tokens(total)),
+        Style::default().fg(color),
+    )])
+}
+
+/// Compact a token count to at most four characters.
+///
+/// A status bar cannot afford eight digits for a number nobody reads exactly;
+/// the precise figure lives on the usage page.
+pub fn compact_tokens(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=9_999 => format!("{:.1}K", value as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}K", value / 1_000),
+        1_000_000..=9_999_999 => format!("{:.1}M", value as f64 / 1_000_000.0),
+        _ => format!("{}M", value / 1_000_000),
+    }
+}
+
+/// Paint a left/centre/right line, dropping the centre before the sides.
+fn render_zoned_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    left: Vec<Span<'static>>,
+    centre: Option<Vec<Span<'static>>>,
+    right: Vec<Span<'static>>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let left_line = Line::from(left);
+    let left_width = left_line.width() as u16;
+    let right_line = Line::from(right);
+    let right_width = right_line.width() as u16;
+    frame.render_widget(Paragraph::new(left_line), area);
+    if right_width + 1 < area.width {
+        let right_area = Rect {
+            x: area.x + area.width - right_width,
+            width: right_width,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(right_line), right_area);
+    }
+    let Some(centre) = centre else { return };
+    let centre_line = Line::from(centre);
+    let centre_width = centre_line.width() as u16;
+    let gutter = 2u16;
+    if left_width + centre_width + right_width + gutter * 2 > area.width {
+        // Not enough room for all three; the sides are load-bearing, so the
+        // centre yields rather than colliding.
+        return;
+    }
+    let centre_area = Rect {
+        x: area.x + (area.width.saturating_sub(centre_width)) / 2,
+        width: centre_width,
+        ..area
+    };
+    frame.render_widget(Paragraph::new(centre_line), centre_area);
 }
 
 fn render_overlay(

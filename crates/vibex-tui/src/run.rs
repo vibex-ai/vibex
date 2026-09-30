@@ -1,7 +1,7 @@
 //! The main loop: input reduction, frame scheduling, and worker message
 //! application.
 //!
-//! The loop follows the same discipline as the reference implementations:
+//! The loop holds to three rules:
 //!
 //! * **Dirty-frame scheduling.** A frame is drawn when input, a worker result,
 //!   or a tick actually changed something. With no input and no events the loop
@@ -29,6 +29,11 @@ use crate::worker::{AppMessage, Worker};
 /// Logical tick period. A tick never performs I/O; it only expires toasts and
 /// re-evaluates time-based state.
 pub const TICK: Duration = Duration::from_millis(200);
+/// Tick period while a turn is running, so the rail animation is smooth.
+///
+/// This is the only condition under which the interface repaints without input
+/// or an event, and it stops the moment the turn does.
+pub const ANIMATION_TICK: Duration = Duration::from_millis(120);
 /// Upper bound on frames per second.
 pub const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// Maximum key events drained in one batch.
@@ -155,11 +160,19 @@ fn event_loop(
         }
 
         // ---- tick ---------------------------------------------------------
-        if last_tick.elapsed() >= TICK {
+        let period = if app.transcript_animating() {
+            ANIMATION_TICK
+        } else {
+            TICK
+        };
+        if last_tick.elapsed() >= period {
             last_tick = Instant::now();
             let had_toast = app.toast.is_some();
             app.tick();
             if had_toast {
+                dirty = true;
+            }
+            if app.advance_transcript_animation() {
                 dirty = true;
             }
         }
