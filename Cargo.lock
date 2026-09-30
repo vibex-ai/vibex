@@ -10439,6 +10439,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vibex-backend",
+ "vibex-computer",
  "vibex-core",
  "vibex-db",
  "vibex-desktop-runtime",

@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 vibex-backend = { path = "../../crates/vibex-backend", features = ["native"] }
+vibex-computer = { path = "../../crates/computer" }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }

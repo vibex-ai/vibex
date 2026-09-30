@@ -5,6 +5,7 @@
 //! vibex tui                  same as above
 //! vibex connect <link|code>  pair with a runtime and attach to it
 //! vibex status               report which seat this home would use
+//! vibex computer <command>   drive the desktop through a running runtime
 //! vibex --help               usage
 //! vibex --version            version
 //! ```
@@ -50,6 +51,26 @@ impl From<SeatError> for Failure {
 }
 
 fn run(arguments: Vec<String>) -> Result<ExitCode, Failure> {
+    // The computer-use command line is a thin client of an *already running*
+    // runtime, so it is answered before any seat resolution: an Agent's shell
+    // must not start or attach to a runtime to call one desktop tool. The
+    // endpoint and its session token arrive in the environment the runtime
+    // gave that Agent.
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "computer")
+    {
+        return match vibex_computer::cli::run(&arguments[1..]) {
+            Ok(output) => {
+                println!("{output}");
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => Err(Failure::Message(match &error.recovery_hint {
+                Some(hint) => format!("{error}\n{hint}"),
+                None => error.to_string(),
+            })),
+        };
+    }
     if arguments.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Err(Failure::Usage(usage()));
     }
@@ -187,6 +208,9 @@ fn usage() -> String {
          \x20   in a home that does not match it.\n\
          \x20   vibex connect <vibex://… | pairing-code>\n\
          \x20   vibex status [--home <dir>]        report the seat without attaching\n\
+         \x20   vibex computer <command>           drive the desktop; needs the\n\
+         \x20                                     environment a running runtime\n\
+         \x20                                     gives an Agent session\n\
          \n\
          SEATS:\n\
          \x20   authority  this process starts and owns the runtime for the home\n\
@@ -213,7 +237,13 @@ mod tests {
     #[test]
     fn usage_documents_every_entry_point() {
         let text = usage();
-        for needle in ["vibex connect", "vibex status", "VIBEX_HOME", "authority"] {
+        for needle in [
+            "vibex connect",
+            "vibex status",
+            "vibex computer",
+            "VIBEX_HOME",
+            "authority",
+        ] {
             assert!(text.contains(needle), "usage is missing {needle}");
         }
     }
