@@ -380,6 +380,68 @@ the measured prefix and continuing tail, that repeated streaming measurements
 are monotonic, and that the final non-streaming measurement can converge
 downward.
 
+### Convention: A pane resize is a reflow, not an invalidation
+
+Every height the timeline virtualizes was measured against the content box its
+row was laid out in, so a pane width change re-wraps all of them. Rebuilding the
+row table from the estimator on that event is what makes a resize flicker: the
+docked editor panel tweens its width over roughly 200ms and a resize seam moves
+it every frame, so the timeline sees a new width on every frame of the gesture
+while its rows are sized against a wrapping they no longer have — clipped where
+the content grew, slack where it shrank — and the table snaps once the width
+settles. Keep the measured heights instead, as the seed the next prepaint
+corrects: a stale measurement is still a rendering of the real document, while
+the estimator only knows its text. What a resize drops is the width-derived
+caches — the memoized estimates, the turn layout fingerprints, and the streaming
+shrink candidates that would otherwise carry a never-shrink hold across the
+reflow. Heights prepaint already parked for the box being painted are not stale
+and must not be dropped either. Only a change that genuinely invalidates the
+measurements — a new content width cap, a display mode that reshapes the rows, a
+restored view whose geometry differs — drops them.
+
+The same rule applies one level down, to a turn's windowed process run. Each
+unit height is stamped with the content box it was measured in, and the
+never-shrink hold for a still-streaming unit only applies within one box: a
+smaller measurement after the pane moved is a reflow and must be accepted, even
+mid-stream. Holding it is what leaves a permanent blank band under every unit a
+squeeze touched, growing with each squeeze, because the run reserves its units'
+heights and a turn's intrinsic height is that reservation — the run cannot
+measure the slack away. A content-box change that does invalidate the
+measurements takes the process unit heights with it.
+
+The first-layout estimator reads the box it will paint into rather than a fixed
+column count, exactly as `MarkdownVirtualFlow` derives its wrapped columns from
+its own width. It answers for the rows that have never reported an intrinsic
+height — everything below the viewport, and the whole table for the frame a
+projection is adopted in — so a fixed count over-estimates a narrow timeline and
+under-counts a wide one, and every resize turns that into rows sized against the
+wrong wrapping. The memoized estimate keys on the derived column count, and the
+tool-card detail blocks estimate against the same box.
+
+```rust
+// Wrong: a resize drops what the rows already measured and re-guesses them.
+fn sync_timeline_layout_width(&mut self, width: f32) {
+    self.invalidate_timeline_layout_measurements();
+    self.rebuild_timeline_sizes();
+}
+
+// Correct: the measurements stay as the seed, the width-derived caches go.
+fn retarget_timeline_layout_width(&mut self) {
+    self.timeline_estimated_turn_heights.clear();
+    self.timeline_turn_layout_signature_cache.clear();
+    self.timeline_measured_turn_layout_signatures.clear();
+    self.timeline_streaming_shrink_candidates.clear();
+    self.rebuild_timeline_sizes();
+}
+```
+
+Regression coverage must assert that a resize keeps the measured turn heights
+and the parked prepaint heights while dropping the estimate, fingerprint and
+shrink-candidate caches; that a unit height measured in another content box is
+accepted over the held extent even while the unit streams, while a same-box
+transient dip is still held; that a content-box invalidation clears the process
+unit heights; and that the estimator's wrapped column count follows the pane.
+
 ### Convention: Existing-session composer drafts
 
 Unsent Composer state is local presentation state scoped by `VibexSessionId`.

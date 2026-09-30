@@ -588,6 +588,15 @@ const USER_MESSAGE_PILL_HORIZONTAL_INSET_PX: f32 = 30.0;
 const USER_MESSAGE_BODY_MIN_MAX_WIDTH_PX: f32 = 80.0;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
+/// Advance width the timeline's body text averages. The first-layout estimator
+/// counts characters instead of shaping the paragraph, so this is the ratio
+/// `vibex-markdown` already turns a content box into a wrapped line count with.
+const TIMELINE_ESTIMATED_CHAR_WIDTH_PX: f32 = 7.0;
+/// Wrapped-column bounds for that estimator: a floor that keeps a degenerate
+/// pane from estimating one character per line, and a ceiling above the widest
+/// content box the timeline ever paints into.
+const TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN: usize = 24;
+const TIMELINE_ESTIMATED_CHARS_PER_LINE_MAX: usize = 200;
 /// Settle window before a repeatable smaller intrinsic measurement may replace
 /// a streaming turn's held extent. Incomplete Markdown reparses shorter for far
 /// less than this window, while a real content reduction stays put.
@@ -3402,7 +3411,7 @@ pub struct SessionView {
     timeline_pending_turn_heights: BTreeMap<usize, (String, f32)>,
     timeline_estimated_turn_heights: BTreeMap<String, (u64, f32)>,
     timeline_turn_layout_signature_cache: BTreeMap<String, (u64, u64)>,
-    timeline_process_unit_heights: BTreeMap<String, (i64, f32)>,
+    timeline_process_unit_heights: BTreeMap<String, TimelineProcessUnitHeight>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
     timeline_reasoning_summaries: BTreeMap<String, (i64, TimelineReasoningSummarySnapshot)>,
@@ -18492,6 +18501,14 @@ impl VibexWorkbench {
         true
     }
 
+    /// Drops every height measured against the layout being replaced.
+    ///
+    /// For changes that really do invalidate the measurements — a new content
+    /// width cap, a display mode that reshapes the rows, a restored view whose
+    /// geometry differs — not for a pane that merely resized. A resize keeps
+    /// its measurements as the seed the next prepaint corrects; see
+    /// [`Self::retarget_timeline_layout_width`]. The process units go with the
+    /// turn heights because their wrapping follows the same content box.
     fn invalidate_timeline_layout_measurements(&mut self) {
         self.timeline_measured_turn_heights.clear();
         self.timeline_measured_turn_layout_signatures.clear();
@@ -18499,6 +18516,7 @@ impl VibexWorkbench {
         self.timeline_pending_turn_heights.clear();
         self.timeline_estimated_turn_heights.clear();
         self.timeline_turn_layout_signature_cache.clear();
+        self.timeline_process_unit_heights.clear();
         self.timeline_row_sizes = Rc::new(Vec::new());
         // A height prepaint parked for this view was measured against the layout
         // being dropped, so replaying it would restore the old extent.
@@ -18551,9 +18569,41 @@ impl VibexWorkbench {
         if !timeline_layout_width_changed(previous, Some(width)) {
             return;
         }
-        self.invalidate_timeline_layout_measurements();
-        self.rebuild_timeline_sizes();
+        self.retarget_timeline_layout_width();
         cx.notify();
+    }
+
+    /// Re-points the timeline's row table at a new pane width.
+    ///
+    /// A width change is a reflow, not a reason to forget what has already been
+    /// measured. The old code dropped every turn height here and rebuilt the
+    /// table from the estimator, so a width that moves - the docked editor
+    /// panel tweens its width over ~200ms, a resize seam moves every frame -
+    /// repainted the timeline from estimates for its whole duration: rows were
+    /// sized against a wrapping they no longer had (clipped where the content
+    /// had grown, slack where it had shrunk), the extent jumped as the estimates
+    /// replaced the measurements, and the table landed with a visible snap when
+    /// the width settled.
+    ///
+    /// The measured heights stay instead, as the seed the next prepaint
+    /// corrects: a stale measurement is still a rendering of the real document,
+    /// while the estimator only knows its text. What is dropped is everything
+    /// derived from the *old* content box - the memoized estimates (they are
+    /// computed from the box now, see [`Self::estimated_timeline_chars_per_line`]),
+    /// and the turn layout fingerprints and streaming shrink candidates that
+    /// let a never-shrink hold carry an extent measured in another box across
+    /// the reflow.
+    ///
+    /// Heights the current prepaint already parked are kept for the same
+    /// reason: they were measured in the box being painted, not the one being
+    /// left behind. Only a projection change drops those
+    /// ([`Self::invalidate_timeline_layout_measurements`]).
+    fn retarget_timeline_layout_width(&mut self) {
+        self.timeline_estimated_turn_heights.clear();
+        self.timeline_turn_layout_signature_cache.clear();
+        self.timeline_measured_turn_layout_signatures.clear();
+        self.timeline_streaming_shrink_candidates.clear();
+        self.rebuild_timeline_sizes();
     }
 
     fn streaming_timeline_row_state(
@@ -19028,6 +19078,10 @@ impl VibexWorkbench {
             .session
             .enhanced_file_operation_display
             .hash(&mut hasher);
+        // The estimate wraps its row bodies against the pane the timeline last
+        // painted into, so a memoized estimate stops being valid the moment
+        // that box changes.
+        self.estimated_timeline_chars_per_line().hash(&mut hasher);
         for row in turn
             .user_row
             .iter()
@@ -46841,14 +46895,44 @@ impl VibexWorkbench {
             .map(|item| item.timestamp_ms)
     }
 
+    /// The content box the first-layout estimator sizes its rows against.
+    ///
+    /// The last width a pane measured, or the configured content cap before the
+    /// first prepaint reports one. The list's own `px_4` comes off the pane, so
+    /// a row's text box is the pane less that padding.
+    fn estimated_timeline_content_width(&self) -> f32 {
+        self.timeline_layout_width
+            .filter(|width| width.is_finite() && *width > 0.0)
+            .map(|width| (width - AGENT_TIMELINE_LIST_PADDING_X_PX * 2.0).max(1.0))
+            .or_else(|| session_content_max_width(self.ui_state.session.content_width))
+            .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH)
+    }
+
+    /// Wrapped columns the first-layout estimator may assume for a row body.
+    ///
+    /// The estimate answers for the rows that have never reported an intrinsic
+    /// height, so it has to follow the box they will be laid out in instead of
+    /// a fixed column count. See [`estimated_chars_per_line`].
+    fn estimated_timeline_chars_per_line(&self) -> usize {
+        estimated_chars_per_line(self.estimated_timeline_content_width())
+    }
+
     // Height estimation provides the first virtual-list layout. Visible turns
     // report their intrinsic height after layout so rich Markdown spacing does
     // not depend on this approximation.
     fn estimated_timeline_row_height_projected(&self, row: &TimelineRow, conclusion: bool) -> f32 {
+        let chars_per_line = self.estimated_timeline_chars_per_line();
+        // A user bubble hugs the row's 78% column, so its text wraps sooner.
+        let bubble_chars_per_line = ((chars_per_line as f32) * USER_MESSAGE_COLUMN_WIDTH_RATIO)
+            .floor()
+            .max(16.0) as usize;
+        // Detail blocks sit inside a card of their own, a little narrower than
+        // the row body they belong to.
+        let detail_chars_per_line = chars_per_line.saturating_sub(8).max(24);
         let payload = self.timeline_row_latest_item(row).map(|item| &item.payload);
         match row.kind {
             TimelineRowKind::UserMessage => {
-                let lines = estimated_wrapped_lines(&row.body, 56) as f32;
+                let lines = estimated_wrapped_lines(&row.body, bubble_chars_per_line) as f32;
                 // bubble padding + text + gap + always-reserved hover action row
                 let base_height = lines * 24.0 + 20.0 + 4.0 + 26.0;
                 if self
@@ -46862,7 +46946,7 @@ impl VibexWorkbench {
                 }
             }
             TimelineRowKind::AgentMessage => {
-                let mut height = estimated_markdown_body_height(&row.body, 72) + 8.0;
+                let mut height = estimated_markdown_body_height(&row.body, chars_per_line) + 8.0;
                 if row.body.contains("](") {
                     height += 30.0;
                 }
@@ -46876,7 +46960,7 @@ impl VibexWorkbench {
                 if row.body.is_empty() {
                     4.0
                 } else if self.reasoning_row_expanded(&row.id) {
-                    estimated_markdown_body_height(&row.body, 72) + 4.0
+                    estimated_markdown_body_height(&row.body, chars_per_line) + 4.0
                 } else {
                     28.0
                 }
@@ -46885,7 +46969,8 @@ impl VibexWorkbench {
                 if row.body.is_empty() {
                     4.0
                 } else {
-                    ((estimated_wrapped_lines(&row.body, 72) as f32) * 24.0).min(288.0) + 4.0
+                    ((estimated_wrapped_lines(&row.body, chars_per_line) as f32) * 24.0).min(288.0)
+                        + 4.0
                 }
             }
             TimelineRowKind::Error => {
@@ -46894,7 +46979,7 @@ impl VibexWorkbench {
                 } else {
                     &row.body
                 };
-                let lines = estimated_wrapped_lines(text, 72) as f32;
+                let lines = estimated_wrapped_lines(text, chars_per_line) as f32;
                 if conclusion {
                     lines * 24.0 + 25.0
                 } else {
@@ -46922,14 +47007,19 @@ impl VibexWorkbench {
                     height += estimated_pre_block_height(&request.details[index].value) + 8.0;
                 }
                 if let Some(index) = lower_labels.iter().position(|label| label.contains("env")) {
-                    height += (estimated_wrapped_lines(&request.details[index].value, 72) as f32)
-                        * 20.0
-                        + 16.0
-                        + 8.0;
+                    height +=
+                        (estimated_wrapped_lines(&request.details[index].value, chars_per_line)
+                            as f32)
+                            * 20.0
+                            + 16.0
+                            + 8.0;
                 }
                 height += 8.0;
                 for detail in &request.details {
-                    height += (estimated_wrapped_lines(&detail.value, 60) as f32) * 20.0 + 6.0;
+                    height += (estimated_wrapped_lines(&detail.value, detail_chars_per_line)
+                        as f32)
+                        * 20.0
+                        + 6.0;
                 }
                 if row.pending_permission
                     && request.status == vibex_core::PermissionRequestStatus::Pending
@@ -46945,8 +47035,10 @@ impl VibexWorkbench {
                 if !elicitation_request_is_pending(row, request) {
                     return self.estimated_settled_elicitation_height(row, request);
                 }
-                let mut height =
-                    88.0 + (estimated_wrapped_lines(&request.message, 64) as f32) * 20.0 + 44.0;
+                let mut height = 88.0
+                    + (estimated_wrapped_lines(&request.message, detail_chars_per_line) as f32)
+                        * 20.0
+                    + 44.0;
                 for field in &request.fields {
                     height += 30.0;
                     if field.description.is_some() {
@@ -46991,7 +47083,7 @@ impl VibexWorkbench {
                     failed: command.status == vibex_core::CommandStatus::Failed,
                     in_progress: command.status == vibex_core::CommandStatus::Started,
                 };
-                let mut height = 40.0 + terminal_block.estimated_height() + 24.0;
+                let mut height = 40.0 + terminal_block.estimated_height(chars_per_line) + 24.0;
                 if command.cwd.is_some() {
                     height += 20.0;
                 }
@@ -47046,7 +47138,7 @@ impl VibexWorkbench {
                         if index > 0 {
                             height += 8.0;
                         }
-                        height += block.estimated_height();
+                        height += block.estimated_height(chars_per_line);
                     }
                     if row.file_path.is_some() {
                         height += 28.0 + 8.0;
@@ -47081,7 +47173,14 @@ impl VibexWorkbench {
             }
             return height;
         }
-        let mut height = 24.0 + (estimated_wrapped_lines(&request.message, 64) as f32) * 20.0;
+        let mut height = 24.0
+            + (estimated_wrapped_lines(
+                &request.message,
+                self.estimated_timeline_chars_per_line()
+                    .saturating_sub(8)
+                    .max(24),
+            ) as f32)
+                * 20.0;
         if request
             .description
             .as_deref()
@@ -47237,12 +47336,12 @@ impl VibexWorkbench {
     ) -> (Arc<Vec<Pixels>>, Arc<Vec<Pixels>>) {
         let mut sizes = Vec::with_capacity(units.len());
         for unit in units {
-            let height = self
-                .timeline_process_unit_heights
-                .get(&unit.id)
-                .filter(|(revision, _)| *revision == unit.revision || unit.streaming)
-                .map(|(_, height)| *height)
-                .unwrap_or(unit.estimated_height);
+            let height = cached_timeline_process_unit_height(
+                self.timeline_process_unit_heights.get(&unit.id),
+                unit.revision,
+                unit.streaming,
+            )
+            .unwrap_or(unit.estimated_height);
             sizes.push(px(height.max(1.0)));
         }
         let mut origins = Vec::with_capacity(sizes.len());
@@ -47259,12 +47358,19 @@ impl VibexWorkbench {
 
     /// Records what the windowed run measured, so the units it did not build
     /// this frame keep a real height instead of an estimate.
+    ///
+    /// The layout width is stamped with the measurement: the run's units are
+    /// built before the surface reports its width for the frame, so this is the
+    /// box the pane had while the unit was laid out. It is what lets the settle
+    /// rule tell a one-box reparse from a reflow (see
+    /// [`stable_process_unit_height`]).
     fn record_timeline_process_unit_heights(
         &mut self,
         units: &[TimelineProcessUnit],
         measurements: &[(usize, f32)],
         cx: &mut Context<Self>,
     ) {
+        let layout_width = self.timeline_layout_width;
         let mut changed = false;
         for (index, measured) in measurements {
             let Some(unit) = units.get(*index) else {
@@ -47274,17 +47380,21 @@ impl VibexWorkbench {
                 continue;
             }
             let measured = measured.ceil().max(1.0);
-            let current = self
-                .timeline_process_unit_heights
-                .get(&unit.id)
-                .map(|(_, height)| *height);
-            let settled = stable_process_unit_height(current, measured, unit.streaming);
-            // The revision is refreshed even when the height did not move, so
-            // the layout lookup keeps matching — but a chunk that only advanced
-            // the revision must not ask for another frame.
-            let moved = current.is_none_or(|height| (height - settled).abs() >= 1.0);
+            let current = self.timeline_process_unit_heights.get(&unit.id).copied();
+            let settled = settle_timeline_process_unit_height(
+                current,
+                unit.revision,
+                measured,
+                unit.streaming,
+                layout_width,
+            );
+            // The revision and the box are refreshed even when the height did
+            // not move, so the layout lookup keeps matching — but a chunk that
+            // only advanced the revision must not ask for another frame.
+            let moved =
+                current.is_none_or(|current| (current.height - settled.height).abs() >= 1.0);
             self.timeline_process_unit_heights
-                .insert(unit.id.clone(), (unit.revision, settled));
+                .insert(unit.id.clone(), settled);
             changed |= moved;
         }
         if changed {
@@ -47340,6 +47450,7 @@ impl VibexWorkbench {
         explicit_process_expansion: Option<bool>,
     ) -> f32 {
         let mut height = 40.0;
+        let chars_per_line = self.estimated_timeline_chars_per_line();
         if let Some(user_row) = turn.user_row.as_ref() {
             height += self.estimated_timeline_row_height_projected(user_row, false) + 12.0;
         }
@@ -47373,7 +47484,7 @@ impl VibexWorkbench {
                         .map(|body| {
                             let key = format!("reasoning-live:{}", turn.id);
                             if self.reasoning_row_expanded(&key) {
-                                estimated_markdown_body_height(body, 72) + 4.0
+                                estimated_markdown_body_height(body, chars_per_line) + 4.0
                             } else {
                                 28.0
                             }
@@ -54950,7 +55061,9 @@ impl ToolCardDetailBlock {
         }
     }
 
-    fn estimated_height(&self) -> f32 {
+    /// First-layout height of the block, wrapped against the content box the
+    /// card will paint into.
+    fn estimated_height(&self, chars_per_line: usize) -> f32 {
         match self {
             Self::Terminal {
                 command,
@@ -54973,7 +55086,8 @@ impl ToolCardDetailBlock {
                 let _ = query;
                 let mut height = 36.0;
                 if let Some(result) = result {
-                    height += (estimated_wrapped_lines(result, 72) as f32) * 20.0 + 20.0;
+                    height +=
+                        (estimated_wrapped_lines(result, chars_per_line) as f32) * 20.0 + 20.0;
                 }
                 height
             }
@@ -54981,13 +55095,16 @@ impl ToolCardDetailBlock {
                 let _ = path;
                 let mut height = 36.0;
                 if let Some(summary) = summary {
-                    height += (estimated_wrapped_lines(summary, 72) as f32) * 20.0 + 4.0;
+                    height +=
+                        (estimated_wrapped_lines(summary, chars_per_line) as f32) * 20.0 + 4.0;
                 }
                 height
             }
             Self::Mono { value, .. } => 24.0 + estimated_pre_block_height(value),
             Self::Rows { rows } => 24.0 + rows.len() as f32 * 24.0,
-            Self::Text { value, .. } => (estimated_wrapped_lines(value, 72) as f32) * 20.0 + 16.0,
+            Self::Text { value, .. } => {
+                (estimated_wrapped_lines(value, chars_per_line) as f32) * 20.0 + 16.0
+            }
         }
     }
 }
@@ -55953,6 +56070,25 @@ fn tool_card_projection(
         },
     }
 }
+/// Characters per line a content box `width` pixels wide fits.
+///
+/// The first-layout estimator answers for the rows that have never reported an
+/// intrinsic height — everything below the viewport, and the whole table for
+/// the frame a projection is adopted in — so the column count has to follow the
+/// box those rows are about to be laid out in. A fixed count over-estimated a
+/// narrow timeline's rows and under-counted a wide one's, which every pane
+/// resize turned into a rebuilt row table whose heights could not match the
+/// content it was sizing.
+fn estimated_chars_per_line(width: f32) -> usize {
+    if !width.is_finite() || width <= 0.0 {
+        return TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN;
+    }
+    (width / TIMELINE_ESTIMATED_CHAR_WIDTH_PX).floor().clamp(
+        TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN as f32,
+        TIMELINE_ESTIMATED_CHARS_PER_LINE_MAX as f32,
+    ) as usize
+}
+
 fn estimated_wrapped_lines(text: &str, chars_per_line: usize) -> usize {
     text.lines()
         .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
@@ -56586,16 +56722,96 @@ impl TimelineProcessRun {
     }
 }
 
+/// One process unit's measured height.
+///
+/// The height is only as good as the content box it was measured in: a unit the
+/// pane wrapped into four lines at 420px paints two at 880px, so the box the
+/// measurement belongs to is part of the entry. Without it every squeeze of the
+/// timeline left the taller wrapping behind, the run reserved the difference as
+/// blank height, and the units below were pushed down by it — the gap grew with
+/// each squeeze and never came back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TimelineProcessUnitHeight {
+    /// Content revision the measurement belongs to.
+    revision: i64,
+    /// Layout width the unit was measured in, while one is known.
+    layout_width: Option<f32>,
+    /// The measured height.
+    height: f32,
+}
+
+/// The height a run may lay one of its units out at.
+///
+/// The last height measured for the unit's content answers, and only a
+/// measurement whose content is gone (a new revision on a unit that already
+/// settled) is refused. Whether the height still describes the *current* box is
+/// the settle rule's business, not this lookup's: a height from the previous
+/// box is still a rendering of the same document, and the estimate it would be
+/// replaced with only knows the text.
+fn cached_timeline_process_unit_height(
+    cached: Option<&TimelineProcessUnitHeight>,
+    revision: i64,
+    streaming: bool,
+) -> Option<f32> {
+    let cached = cached?;
+    (cached.revision == revision || streaming).then_some(cached.height)
+}
+
+/// Whether two measurements describe the same content box.
+///
+/// A box nobody reported yet cannot prove a measurement stale, so an unknown
+/// width counts as the same box. That leaves the child-agent timeline, which
+/// never reports a pane width, on the behaviour it had before the timeline
+/// tracked one.
+fn same_timeline_layout_width(measured: Option<f32>, current: Option<f32>) -> bool {
+    match (measured, current) {
+        (Some(measured), Some(current)) => {
+            (measured - current).abs() < AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX
+        }
+        _ => true,
+    }
+}
+
+/// Folds one measurement into a unit's cached height.
+fn settle_timeline_process_unit_height(
+    cached: Option<TimelineProcessUnitHeight>,
+    revision: i64,
+    measured: f32,
+    streaming: bool,
+    layout_width: Option<f32>,
+) -> TimelineProcessUnitHeight {
+    TimelineProcessUnitHeight {
+        revision,
+        layout_width,
+        height: stable_process_unit_height(cached, measured, streaming, layout_width),
+    }
+}
+
 /// The height a process unit settles at after a measurement.
 ///
-/// While a unit is still streaming it never shrinks: incomplete Markdown lays
-/// out shorter between parses, and the outer timeline measures the run's total,
-/// so following a transient dip makes the whole turn — and the viewport
-/// following it — bounce. A settled unit takes the measurement as it is.
-fn stable_process_unit_height(current: Option<f32>, measured: f32, streaming: bool) -> f32 {
+/// While a unit is still streaming it never shrinks *within one content box*:
+/// incomplete Markdown lays out shorter between parses, and the outer timeline
+/// measures the run's total, so following a transient dip makes the whole turn —
+/// and the viewport following it — bounce. A settled unit takes the measurement
+/// as it is.
+///
+/// A measurement taken in another box is not that transient. The hold is what
+/// made a narrower pane's height permanent: each squeeze re-measured the units
+/// on screen into more lines, and once the pane came back the smaller
+/// measurement was refused, so the run kept reserving the taller wrapping for
+/// the rest of the session. A reflow is accepted even mid-stream.
+fn stable_process_unit_height(
+    current: Option<TimelineProcessUnitHeight>,
+    measured: f32,
+    streaming: bool,
+    layout_width: Option<f32>,
+) -> f32 {
     match current {
-        Some(height) if (height - measured).abs() < 1.0 => height,
-        Some(height) if streaming && measured < height => height,
+        Some(current) if !same_timeline_layout_width(current.layout_width, layout_width) => {
+            measured
+        }
+        Some(current) if (current.height - measured).abs() < 1.0 => current.height,
+        Some(current) if streaming && measured < current.height => current.height,
         _ => measured,
     }
 }
@@ -69995,7 +70211,7 @@ mod tests {
             }
             other => panic!("expected terminal block, got {other:?}"),
         }
-        assert!(projection.details[0].estimated_height() > 24.0);
+        assert!(projection.details[0].estimated_height(72) > 24.0);
     }
 
     #[test]
@@ -87500,35 +87716,281 @@ mod tests {
         );
     }
 
+    /// A unit height as the run's recorder stamps it: the measurement plus the
+    /// content box it was taken in.
+    fn measured_process_unit(height: f32, layout_width: f32) -> TimelineProcessUnitHeight {
+        TimelineProcessUnitHeight {
+            revision: 7,
+            layout_width: Some(layout_width),
+            height,
+        }
+    }
+
     #[test]
     fn a_streaming_process_unit_never_shrinks_between_parses() {
         // A streaming unit's revision advances with every chunk and incomplete
         // Markdown transiently lays out shorter between parses. Following
         // either makes the run — and with it the whole timeline — bounce while
         // a turn streams, so the measured extent only ever grows.
+        let box_800 = measured_process_unit(240.0, 800.0);
         assert_eq!(
-            stable_process_unit_height(Some(240.0), 120.0, true),
+            stable_process_unit_height(Some(box_800), 120.0, true, Some(800.0)),
             240.0,
             "a streaming unit keeps the larger extent"
         );
         assert_eq!(
-            stable_process_unit_height(Some(120.0), 240.0, true),
+            stable_process_unit_height(
+                Some(measured_process_unit(120.0, 800.0)),
+                240.0,
+                true,
+                Some(800.0)
+            ),
             240.0,
             "a streaming unit still grows"
         );
         assert_eq!(
-            stable_process_unit_height(Some(240.0), 120.0, false),
+            stable_process_unit_height(Some(box_800), 120.0, false, Some(800.0)),
             120.0,
             "a settled unit accepts a real shrink"
         );
         assert_eq!(
-            stable_process_unit_height(None, 120.0, true),
+            stable_process_unit_height(None, 120.0, true, Some(800.0)),
             120.0,
             "the first measurement is always taken"
         );
         // Sub-pixel noise is not a change at all.
-        assert_eq!(stable_process_unit_height(Some(120.0), 120.4, true), 120.0);
-        assert_eq!(stable_process_unit_height(Some(120.0), 120.4, false), 120.0);
+        assert_eq!(
+            stable_process_unit_height(Some(box_800), 240.4, true, Some(800.0)),
+            240.0
+        );
+        assert_eq!(
+            stable_process_unit_height(Some(box_800), 240.4, false, Some(800.0)),
+            240.0
+        );
+    }
+
+    #[test]
+    fn a_layout_width_change_releases_a_held_process_unit_height() {
+        // Squeezing the timeline wraps the unit into more lines, so it measures
+        // taller. Coming back to the wider pane it measures shorter again, and
+        // that shorter height has to be taken: holding it — the bug — left the
+        // run reserving the narrow wrapping as blank height under every unit it
+        // had touched, which grew with each squeeze and never healed.
+        let squeezed = measured_process_unit(240.0, 420.0);
+        assert_eq!(
+            stable_process_unit_height(Some(squeezed), 120.0, true, Some(880.0)),
+            120.0,
+            "a measurement from another content box is a reflow, not a transient dip"
+        );
+        let settled =
+            settle_timeline_process_unit_height(Some(squeezed), 7, 120.0, true, Some(880.0));
+        assert_eq!(settled.height, 120.0);
+        assert_eq!(settled.layout_width, Some(880.0));
+
+        // Within one box the hold still protects a streaming row, so the
+        // reflow rule must not have replaced it.
+        let same_box = measured_process_unit(240.0, 880.0);
+        assert_eq!(
+            stable_process_unit_height(Some(same_box), 120.0, true, Some(880.0)),
+            240.0,
+            "a transient dip in the same box is still held"
+        );
+
+        // A height the run cannot place is still the best answer it has: the
+        // stale measurement beats the text-only estimate until the prepaint
+        // corrects it.
+        assert_eq!(
+            cached_timeline_process_unit_height(Some(&squeezed), 7, false),
+            Some(240.0)
+        );
+        // Only a unit whose content is gone falls back.
+        assert_eq!(
+            cached_timeline_process_unit_height(Some(&squeezed), 8, false),
+            None
+        );
+        assert_eq!(
+            cached_timeline_process_unit_height(Some(&squeezed), 8, true),
+            Some(240.0),
+            "a streaming unit's revision advances with every chunk"
+        );
+
+        // An unknown box cannot prove a measurement stale, so the hold stays.
+        assert!(same_timeline_layout_width(None, Some(800.0)));
+        assert!(same_timeline_layout_width(Some(800.0), None));
+        assert!(same_timeline_layout_width(Some(800.0), Some(800.4)));
+        assert!(!same_timeline_layout_width(Some(420.0), Some(880.0)));
+    }
+
+    #[test]
+    fn the_timeline_estimator_wraps_against_the_pane_it_paints_into() {
+        // The first-layout estimate has to follow the content box: a fixed
+        // column count sized every row of a narrow pane against a wide one's
+        // wrapping (and the reverse), which the width change then turned into
+        // clipped rows and slack.
+        assert_eq!(estimated_chars_per_line(420.0), 60);
+        assert_eq!(estimated_chars_per_line(880.0), 125);
+        assert!(estimated_chars_per_line(420.0) < estimated_chars_per_line(880.0));
+        // Degenerate boxes fall back to the floor instead of dividing by zero.
+        assert_eq!(
+            estimated_chars_per_line(0.0),
+            TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN
+        );
+        assert_eq!(
+            estimated_chars_per_line(f32::NAN),
+            TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN
+        );
+        assert_eq!(
+            estimated_chars_per_line(20.0),
+            TIMELINE_ESTIMATED_CHARS_PER_LINE_MIN
+        );
+        assert_eq!(
+            estimated_chars_per_line(100_000.0),
+            TIMELINE_ESTIMATED_CHARS_PER_LINE_MAX
+        );
+
+        // The body estimate is what the row heights are built from, so it has
+        // to move with the box too.
+        let body = "The pagination work has landed five commits while its gates run.";
+        assert!(
+            estimated_markdown_body_height(body, estimated_chars_per_line(420.0))
+                > estimated_markdown_body_height(body, estimated_chars_per_line(880.0)),
+            "a narrower box wraps the same body into more lines"
+        );
+    }
+
+    /// Every estimator path reads the pane, so a row that has never reported an
+    /// intrinsic height is still sized against the box it is about to be laid
+    /// out in.
+    #[test]
+    fn timeline_estimates_read_the_content_box_they_will_paint_into() {
+        let source = include_str!("app.rs");
+        let content_width = source
+            .split_once("    fn estimated_timeline_content_width(")
+            .and_then(|(_, tail)| tail.split_once("\n    // Height estimation provides"))
+            .map(|(body, _)| body)
+            .expect("the estimator's content box should remain inspectable");
+        assert!(content_width.contains("self.timeline_layout_width"));
+        assert!(content_width.contains("AGENT_TIMELINE_LIST_PADDING_X_PX"));
+        assert!(content_width.contains("session_content_max_width("));
+
+        let row = source
+            .split_once("    fn estimated_timeline_row_height_projected(")
+            .and_then(|(_, tail)| tail.split_once("\n            TimelineRowKind::Command"))
+            .map(|(body, _)| body)
+            .expect("the row estimator should remain inspectable");
+        assert!(row.contains("let chars_per_line = self.estimated_timeline_chars_per_line();"));
+        assert!(row.contains("bubble_chars_per_line"));
+        assert!(row.contains("detail_chars_per_line"));
+        assert!(
+            !row.contains("estimated_markdown_body_height(&row.body, 72)")
+                && !row.contains("estimated_wrapped_lines(&row.body, 72)"),
+            "the row body estimate must follow the content box, not a fixed column count"
+        );
+
+        let turn = source
+            .split_once("    fn estimated_timeline_turn_height_projected(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_inline_user_message_editor("))
+            .map(|(body, _)| body)
+            .expect("the turn estimator should remain inspectable");
+        assert!(turn.contains("let chars_per_line = self.estimated_timeline_chars_per_line();"));
+        assert!(!turn.contains("estimated_markdown_body_height(body, 72)"));
+
+        // The memoized estimate keys on the box it was computed for.
+        let signature = source
+            .split_once("    fn timeline_turn_estimate_signature(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Parks a turn height prepaint observed")
+            })
+            .map(|(body, _)| body)
+            .expect("the estimate signature should remain inspectable");
+        assert!(signature.contains("self.estimated_timeline_chars_per_line().hash(&mut hasher);"));
+    }
+
+    /// A pane resize is a reflow, not an invalidation.
+    ///
+    /// The docked editor panel tweens its width over ~200ms and a resize seam
+    /// moves it every frame, so the timeline sees a new width on every frame of
+    /// the gesture. Rebuilding the row table from the estimator there — and
+    /// dropping the heights prepaint had just parked for the box being painted —
+    /// painted the whole gesture from estimates: rows were sized against a
+    /// wrapping they no longer had, the extent jumped as estimates replaced
+    /// measurements, and the table snapped once the width settled.
+    #[test]
+    fn a_pane_resize_keeps_the_measured_row_extents() {
+        let source = include_str!("app.rs");
+
+        let sync = source
+            .split_once("    fn sync_timeline_layout_width(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Re-points the timeline's row table"))
+            .map(|(body, _)| body)
+            .expect("the pane width sync should remain inspectable");
+        assert!(sync.contains("self.retarget_timeline_layout_width();"));
+        assert!(
+            !sync.contains("invalidate_timeline_layout_measurements"),
+            "a resize must not drop every measured height"
+        );
+
+        let retarget = source
+            .split_once("    fn retarget_timeline_layout_width(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn streaming_timeline_row_state("))
+            .map(|(body, _)| body)
+            .expect("the width retarget should remain inspectable");
+        assert!(
+            !retarget.contains("timeline_measured_turn_heights.clear()"),
+            "the measurements stay as the seed the next prepaint corrects"
+        );
+        assert!(
+            !retarget.contains("invalidate_deferred_timeline_turn_heights"),
+            "the heights parked for the box being painted are not stale"
+        );
+        assert!(retarget.contains("self.timeline_estimated_turn_heights.clear();"));
+        assert!(retarget.contains("self.timeline_turn_layout_signature_cache.clear();"));
+        assert!(
+            retarget.contains("self.timeline_measured_turn_layout_signatures.clear();"),
+            "a smaller measurement across a reflow is not a shrink to hold"
+        );
+        assert!(retarget.contains("self.timeline_streaming_shrink_candidates.clear();"));
+        assert!(retarget.contains("self.rebuild_timeline_sizes();"));
+    }
+
+    /// The run's unit heights are stamped with the content box they were
+    /// measured in, and the run settles them through the width-aware rule.
+    #[test]
+    fn process_unit_heights_are_stamped_with_their_content_box() {
+        let source = include_str!("app.rs");
+
+        let recorder = source
+            .split_once("    fn record_timeline_process_unit_heights(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The unit holding the find bar's pending reveal")
+            })
+            .map(|(body, _)| body)
+            .expect("the process unit recorder should remain inspectable");
+        assert!(recorder.contains("let layout_width = self.timeline_layout_width;"));
+        assert!(recorder.contains("settle_timeline_process_unit_height("));
+        assert!(
+            !recorder.contains("stable_process_unit_height(current, measured, unit.streaming)")
+        );
+
+        let layout = source
+            .split_once("    fn timeline_process_run_layout(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Records what the windowed run measured")
+            })
+            .map(|(body, _)| body)
+            .expect("the process run layout should remain inspectable");
+        assert!(layout.contains("cached_timeline_process_unit_height("));
+
+        // A content-box change that really does invalidate the measurements
+        // takes the process units with it: their wrapping follows the same box,
+        // so a taller height kept across it is the slack the resize fix removes.
+        let invalidation = source
+            .split_once("    fn invalidate_timeline_layout_measurements(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Records the width a pane measured"))
+            .map(|(body, _)| body)
+            .expect("timeline layout invalidation should remain inspectable");
+        assert!(invalidation.contains("self.timeline_process_unit_heights.clear();"));
+        assert!(invalidation.contains("self.invalidate_deferred_timeline_turn_heights();"));
     }
 
     #[test]
