@@ -4146,6 +4146,33 @@ ResolvedAgentProviderProjection {
   decides: `{"steered":true}` is `Injected`, `{"steered":false}` with any
   `reason` (`idle`, `stale`) is `PromptRequired`, and `-32601` maps back to
   `acp_steering_unsupported`.
+- Cline delivers a generated image as an ordinary `agent_message_chunk` whose
+  `content` is `{ "type": "image", "data": <base64>, "mimeType": ... }` — not a
+  tool call and not a tool result — and falls back to a plain text placeholder
+  `[Generated <modality>: <mediaType>]` when the media is not a base64 image.
+  The `agent_message_chunk` arm reads only text, so today that chunk produces no
+  event at all and the generation is invisible. Note what rendering would take:
+  `generated_image_preview_source` resolves a reference through
+  `generated_image_local_source`, which requires the path to start with the
+  session's workspace root, and `raw_extension` truncates its blocks — so
+  neither an inline `data:` URI nor a private-root path can be displayed.
+  Surfacing the pixels therefore needs a media location inside the workspace, or
+  a preview path that also accepts a Vibex-owned media directory. That is a
+  product decision, not a parsing one, which is why the wire shape is recorded
+  here while the chunk stays dark.
+- DeepSeek Harness holds its model selection in `$DSH_HOME/acp-standalone-model.json`
+  (`{"provider":"acp","model":"...","reasoningEffort":"..."}`), and reads
+  settings.yaml only as a fallback for the model plus `permission.defaultPreset`.
+  Do not move this Agent's pin until one thing is settled by experiment rather
+  than by reading bundles: which layer consumes the projected `llm-pi-ai`
+  provider route in 0.4.35. The adapter's own legacy reader takes just those two
+  keys, while the bundled harness composes its tree from bundle patches plus a
+  home layer whose profile directory the standalone path does not name anywhere
+  this repository can see. The overlay projects a provider route with
+  `apiKeyEnv`, so a settings.yaml write that the harness stopped reading would
+  fail silently — the Agent would start and simply not use the configured
+  Provider. Install 0.4.35, project a Provider, and observe whether the route is
+  honoured before touching the pin.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
