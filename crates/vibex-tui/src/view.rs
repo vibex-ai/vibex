@@ -3422,6 +3422,77 @@ fn composer_line_spans(
     spans
 }
 
+/// One row of the key-binding editor: a scope heading or one binding.
+pub struct KeyRow<'a> {
+    pub header: Option<Scope>,
+    pub binding: Option<&'a crate::keymap::Binding>,
+}
+
+/// The rows the editor shows, grouped by scope in declaration order.
+///
+/// The query matches the chord, the action label, its identifier and its help
+/// text, so "ctrl" and "queue" are both useful searches. A heading appears only
+/// when something under it matched.
+pub fn key_editor_rows<'a>(app: &'a App, query: &str) -> Vec<KeyRow<'a>> {
+    let needle = query.trim().to_lowercase();
+    let matches = |binding: &crate::keymap::Binding| {
+        if needle.is_empty() {
+            return true;
+        }
+        binding.chord.display().to_lowercase().contains(&needle)
+            || binding
+                .label
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&needle)
+            || binding.intent.id().contains(&needle)
+            || binding.intent.help().to_lowercase().contains(&needle)
+            || binding.scope.id().contains(&needle)
+    };
+    let mut rows = Vec::new();
+    for scope in Scope::ALL {
+        let bindings = app
+            .keymap
+            .bindings()
+            .iter()
+            .filter(|binding| binding.scope == *scope && binding.label.is_some())
+            .filter(|binding| matches(binding))
+            .collect::<Vec<_>>();
+        if bindings.is_empty() {
+            continue;
+        }
+        rows.push(KeyRow {
+            header: Some(*scope),
+            binding: None,
+        });
+        rows.extend(bindings.into_iter().map(|binding| KeyRow {
+            header: None,
+            binding: Some(binding),
+        }));
+    }
+    rows
+}
+
+/// The next row in `delta` direction that is a binding rather than a heading.
+///
+/// A heading is a label, not a target: `Enter` on one would have nothing to
+/// rebind, so the cursor steps over it.
+pub fn step_key_row(rows: &[KeyRow<'_>], from: usize, delta: isize) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut index = from.min(rows.len() - 1) as isize;
+    loop {
+        index += delta;
+        if index < 0 || index as usize >= rows.len() {
+            return from.min(rows.len() - 1);
+        }
+        if rows[index as usize].binding.is_some() {
+            return index as usize;
+        }
+    }
+}
+
 /// One row of the shortcuts cheatsheet.
 pub struct ShortcutRow<'a> {
     /// A category header, when the row is not a binding.
@@ -3552,6 +3623,130 @@ fn render_shortcut_cheatsheet(
         }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The key-binding editor: a grouped list whose selected row can be rebound in
+/// place.
+///
+/// The editor writes the same file the loader reads, and refuses a chord that
+/// another action already owns rather than silently shadowing it — a duplicate
+/// binding is invisible at runtime, so it must be impossible to create one by
+/// accident here.
+/// What the editor is showing, bundled so the renderer stays a function of one
+/// state value rather than of five positional flags.
+struct KeysEditorView<'a> {
+    query: &'a str,
+    selected: usize,
+    capturing: Option<Intent>,
+    message: Option<&'a str>,
+    dirty: bool,
+}
+
+fn render_keys_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &TuiTheme,
+    strings: Strings,
+    view: KeysEditorView<'_>,
+) {
+    let KeysEditorView {
+        query,
+        selected,
+        capturing,
+        message,
+        dirty,
+    } = view;
+    let rows = key_editor_rows(app, query);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.help_no_keys()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    let selected = selected.min(rows.len().saturating_sub(1));
+    let height = usize::from(area.height).saturating_sub(1);
+    let offset = selected.saturating_sub(height.saturating_sub(1));
+    for (index, row) in rows.iter().enumerate().skip(offset).take(height) {
+        let active = index == selected;
+        match row.header {
+            Some(scope) => lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    scope.id().to_uppercase(),
+                    Style::default()
+                        .fg(theme.roles.gray_dim)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            None => {
+                let Some(binding) = row.binding else { continue };
+                let label = binding.label.unwrap_or_default();
+                let style = if active {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                // While capturing, the chord column is the prompt: it is where
+                // the new keys will appear, so the reader's eye is already
+                // there.
+                let chord = if capturing == Some(binding.intent) {
+                    format!("{:<14}", strings.keys_press())
+                } else {
+                    format!("{:<14}", binding.chord.display())
+                };
+                let mut spans = vec![
+                    Span::styled(if active { "  ▸ " } else { "    " }, style),
+                    Span::styled(chord, style),
+                    Span::styled(label.to_string(), style),
+                ];
+                if app.keymap.is_overridden(binding.intent) {
+                    spans.push(Span::styled(
+                        format!("  {}", crate::glyphs::diamond_dotted(app.glyph_tier())),
+                        Style::default().fg(theme.roles.accent_attention),
+                    ));
+                }
+                spans.push(Span::styled(
+                    format!("   {}", binding.intent.id()),
+                    Style::default().fg(theme.roles.gray_dim),
+                ));
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    // The last row of the content area reports the filter, the last attempt or
+    // the unsaved state, in that order of urgency.
+    let footer = Rect {
+        y: area.bottom().saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    let (text, tone) = if let Some(message) = message {
+        (message.to_string(), theme.roles.danger)
+    } else if capturing.is_some() {
+        (
+            strings.keys_capture_hint().to_string(),
+            theme.roles.accent_attention,
+        )
+    } else if !query.trim().is_empty() {
+        (format!("/{}", query.trim()), theme.roles.foreground)
+    } else if dirty {
+        (
+            strings.keys_unsaved().to_string(),
+            theme.roles.accent_attention,
+        )
+    } else {
+        (strings.keys_saved_hint().to_string(), theme.roles.gray_dim)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_to_width(&text, usize::from(footer.width), "…"),
+            Style::default().fg(tone),
+        ))),
+        footer,
+    );
 }
 
 /// Human label for a cheatsheet category.
@@ -3893,6 +4088,48 @@ fn render_overlay(
                 query,
                 *selected,
                 collapsed,
+            );
+        }
+        Overlay::Keys {
+            query,
+            selected,
+            capturing,
+            message,
+            dirty,
+        } => {
+            let title = if *dirty {
+                format!("{} {}", strings.settings_keys(), "●")
+            } else {
+                strings.settings_keys().to_string()
+            };
+            let chrome = modal_chrome(
+                app,
+                &title,
+                ModalSizing::large(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.keys_rebind()),
+                    ModalHint::new("d", strings.keys_default()),
+                    ModalHint::new("s", strings.keys_save()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
+            render_keys_editor(
+                frame,
+                layout.content,
+                app,
+                theme,
+                strings,
+                KeysEditorView {
+                    query,
+                    selected: *selected,
+                    capturing: *capturing,
+                    message: message.as_deref(),
+                    dirty: *dirty,
+                },
             );
         }
         Overlay::Confirm { title, body, .. } => {

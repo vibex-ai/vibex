@@ -23,7 +23,7 @@ use vibex_ui::{AgentWorkflowController, ManagementWorkflowController};
 
 use crate::action::Intent;
 use crate::composer::{CompletionMenu, ComposerBuffer, ComposerHistory};
-use crate::keymap::{Keymap, Scope};
+use crate::keymap::{Chord, Keymap, Scope};
 use crate::locale::{Locale, Strings};
 use crate::theme::{ColorCapability, TuiTheme};
 use crate::transcript::{Block, ScrollState, Transcript};
@@ -149,6 +149,18 @@ pub enum Overlay {
     RuntimePicker { selected: usize },
     /// A read-only detail view for one transcript block.
     BlockDetails { block: usize, scroll: usize },
+    /// The key-binding editor: every binding, rebindable in place.
+    Keys {
+        query: String,
+        /// Index into the rows the editor last drew, headers included.
+        selected: usize,
+        /// The binding waiting for a chord, while one is being captured.
+        capturing: Option<Intent>,
+        /// Why the last attempt was refused, or what just happened.
+        message: Option<String>,
+        /// Whether the in-memory table differs from the file on disk.
+        dirty: bool,
+    },
     /// A read-only text view (diff, file contents, diagnostics report).
     TextView {
         title: String,
@@ -1605,6 +1617,97 @@ impl App {
             head: (line, column),
             dragging: true,
         });
+    }
+
+    /// Start capturing a chord for `intent`.
+    pub fn begin_key_capture(&mut self, intent: Intent) {
+        if let Some(Overlay::Keys {
+            query,
+            selected,
+            message,
+            dirty,
+            ..
+        }) = self.overlay.clone()
+        {
+            self.overlay = Some(Overlay::Keys {
+                query,
+                selected,
+                capturing: Some(intent),
+                message,
+                dirty,
+            });
+        }
+    }
+
+    /// Apply a captured chord, refusing one that another intent already owns.
+    ///
+    /// A duplicate is refused rather than accepted-with-a-warning because
+    /// dispatch takes the first match in the table: the losing action would
+    /// stop working with nothing on screen to say so. The message names the
+    /// owner so the reader can free the chord first.
+    pub fn finish_key_capture(&mut self, chord: Chord) {
+        let Some(Overlay::Keys {
+            query,
+            selected,
+            capturing,
+            dirty,
+            ..
+        }) = self.overlay.clone()
+        else {
+            return;
+        };
+        let Some(intent) = capturing else {
+            return;
+        };
+        let scope = intent.default_scope();
+        let message = match self.keymap.conflict(scope, chord, intent) {
+            Some(owner) => Some(format!(
+                "{}: {owner_id} ({scope_id})",
+                self.strings.keys_conflict(),
+                owner_id = owner.id(),
+                scope_id = owner.default_scope().id(),
+            )),
+            None => {
+                self.keymap.rebind(intent, chord);
+                None
+            }
+        };
+        self.overlay = Some(Overlay::Keys {
+            query,
+            selected,
+            capturing: None,
+            message,
+            dirty: dirty || self.keymap.is_overridden(intent),
+        });
+    }
+
+    /// Put the selected binding back on its default chord.
+    pub fn reset_key_binding(&mut self, intent: Intent) {
+        self.keymap.reset(intent);
+        if let Some(Overlay::Keys {
+            query,
+            selected,
+            capturing,
+            dirty,
+            ..
+        }) = self.overlay.clone()
+        {
+            self.overlay = Some(Overlay::Keys {
+                query,
+                selected,
+                capturing,
+                message: None,
+                dirty: dirty || self.keymap.is_overridden(intent),
+            });
+        }
+    }
+
+    /// Write the current bindings to the user's key file.
+    pub fn save_keymap(&mut self) -> Result<String, String> {
+        let path =
+            Keymap::user_path().ok_or_else(|| "no home directory for tui-keys.toml".to_string())?;
+        self.keymap.save(&path)?;
+        Ok(path.display().to_string())
     }
 
     /// Extend the draft selection to the cell under a drag.

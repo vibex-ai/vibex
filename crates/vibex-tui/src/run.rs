@@ -444,6 +444,135 @@ fn handle_key(
                 _ => {}
             }
         }
+        // The key-binding editor. While a chord is being captured every key is
+        // data — including `d` and `s`, which are "reset" and "save" only in
+        // the list — so the capture arm comes first and consumes whatever
+        // arrives.
+        if let Some(Overlay::Keys {
+            query,
+            selected,
+            capturing,
+            message,
+            dirty,
+        }) = app.overlay.clone()
+        {
+            if capturing.is_some() {
+                if key.code == KeyCode::Esc {
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected,
+                        capturing: None,
+                        message: Some(app.strings.keys_capture_cancelled().to_string()),
+                        dirty,
+                    });
+                } else {
+                    app.finish_key_capture(Chord::from_event(key));
+                }
+                return Ok(false);
+            }
+            let rows = crate::view::key_editor_rows(app, &query);
+            let selected = selected.min(rows.len().saturating_sub(1));
+            let intent_at = |index: usize| {
+                rows.get(index)
+                    .and_then(|row| row.binding)
+                    .map(|binding| binding.intent)
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    let mut query = query;
+                    query.pop();
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected: 0,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Delete => {
+                    app.overlay = Some(Overlay::Keys {
+                        query: String::new(),
+                        selected: 0,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                    return Ok(false);
+                }
+                // `/` is the filter key the other lists use; it starts an
+                // empty query rather than being typed into one.
+                // `/` is the filter key the other lists use; it starts an
+                // empty query rather than being typed into one.
+                KeyCode::Char('/') if query.is_empty() => return Ok(false),
+                KeyCode::Up => {
+                    let next = crate::view::step_key_row(&rows, selected, -1);
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected: next,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    let next = crate::view::step_key_row(&rows, selected, 1);
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected: next,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    if let Some(intent) = intent_at(selected) {
+                        app.begin_key_capture(intent);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(intent) = intent_at(selected) {
+                        app.reset_key_binding(intent);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let (message, dirty) = match app.save_keymap() {
+                        Ok(path) => (Some(format!("{}: {path}", app.strings.keys_saved())), false),
+                        Err(error) => (Some(error), dirty),
+                    };
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let mut query = query;
+                    query.push(character);
+                    app.overlay = Some(Overlay::Keys {
+                        query,
+                        selected: 0,
+                        capturing: None,
+                        message,
+                        dirty,
+                    });
+                    return Ok(false);
+                }
+                // Anything else — `Ctrl+Q`, the function keys — falls through
+                // to the binding table, so the editor does not trap the reader.
+                _ => {}
+            }
+        }
         // The approval card accepts a digit as a direct option selection.
         if let Some(Overlay::Approval { .. }) = app.overlay
             && let KeyCode::Char(digit) = key.code

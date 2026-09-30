@@ -940,6 +940,10 @@ impl App {
         };
         match overlay {
             Overlay::Palette { query, selected } => self.perform_palette(intent, query, selected),
+            // The editor owns its keys directly, including the captured chord;
+            // only the overlay-wide intents reach the reducer, and the two that
+            // mean something here are handled above.
+            Overlay::Keys { .. } => Outcome::quiet(),
             Overlay::Help {
                 query,
                 selected,
@@ -2033,8 +2037,28 @@ impl App {
                 self.begin_setting_edit(row);
                 Outcome::effects(vec![])
             }
-            crate::settings::SettingKind::Action => self.perform(Intent::ReloadKeymap),
+            crate::settings::SettingKind::Action => self.open_setting_action(row),
             crate::settings::SettingKind::ReadOnly => Outcome::quiet(),
+        }
+    }
+
+    /// Run the action a settings row owns.
+    fn open_setting_action(&mut self, row: crate::settings::SettingRow) -> Outcome {
+        match row {
+            // The bindings row opens the editor rather than only re-reading the
+            // file: the reload is one key inside it, and a hint that names a
+            // path is not an interface.
+            crate::settings::SettingRow::Keys => {
+                self.overlay = Some(Overlay::Keys {
+                    query: String::new(),
+                    selected: 0,
+                    capturing: None,
+                    message: None,
+                    dirty: false,
+                });
+                Outcome::effects(vec![])
+            }
+            _ => self.perform(Intent::ReloadKeymap),
         }
     }
 
@@ -2061,7 +2085,7 @@ impl App {
                 self.apply_setting_value(row, &value);
                 Outcome::effects(vec![])
             }
-            crate::settings::SettingKind::Action => self.perform(Intent::ReloadKeymap),
+            crate::settings::SettingKind::Action => self.open_setting_action(row),
             crate::settings::SettingKind::Text | crate::settings::SettingKind::ReadOnly => {
                 Outcome::quiet()
             }

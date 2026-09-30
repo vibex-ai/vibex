@@ -563,6 +563,32 @@ strings! {
         "在 ~/.vibex/tui-keys.toml 中重新對應"
     },
     settings_keymap_reloaded => { "Key bindings reloaded", "键位已重新加载", "鍵位已重新載入" },
+    keys_press => { "press a key…", "请按键…", "請按鍵…" },
+    keys_capture_hint => {
+        "Press the chord that should run this action; Esc cancels",
+        "按下要绑定到该动作的组合键；Esc 取消",
+        "按下要綁定到該動作的組合鍵；Esc 取消"
+    },
+    keys_capture_cancelled => { "Rebinding cancelled", "已取消重映射", "已取消重新對應" },
+    keys_conflict => {
+        "That chord is already taken by",
+        "该组合键已被占用：",
+        "該組合鍵已被占用："
+    },
+    keys_rebind => { "Rebind", "重绑", "重新綁定" },
+    keys_default => { "Default", "恢复默认", "恢復預設" },
+    keys_save => { "Save", "保存", "儲存" },
+    keys_saved => { "Key bindings saved", "键位已保存", "鍵位已儲存" },
+    keys_saved_hint => {
+        "s writes ~/.vibex/tui-keys.toml",
+        "按 s 写入 ~/.vibex/tui-keys.toml",
+        "按 s 寫入 ~/.vibex/tui-keys.toml"
+    },
+    keys_unsaved => {
+        "Unsaved changes — press s to write ~/.vibex/tui-keys.toml",
+        "有未保存的修改 — 按 s 写入 ~/.vibex/tui-keys.toml",
+        "有未儲存的修改 — 按 s 寫入 ~/.vibex/tui-keys.toml"
+    },
     settings_keymap_error => {
         "Key binding file could not be read; using defaults",
         "无法读取键位文件；使用默认键位",

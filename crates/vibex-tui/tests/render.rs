@@ -821,6 +821,65 @@ fn select_setting(app: &mut App, row: vibex_tui::settings::SettingRow) {
 }
 
 #[test]
+fn the_settings_keys_row_opens_the_binding_editor() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Overlay;
+    use vibex_tui::settings::SettingRow;
+    let mut app = settings_app(120, 40);
+    select_setting(&mut app, SettingRow::Keys);
+    app.perform(Intent::ActivateSetting);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Keys { .. })),
+        "the key-bindings row did not open the editor"
+    );
+    let lines = render(&mut app, 120, 40);
+    let screen = text(&lines);
+    assert!(screen.contains("Command palette"), "{screen}");
+    assert!(screen.contains("Ctrl+P"), "{screen}");
+    // Scopes are headings, so the list says where each chord applies.
+    assert!(screen.contains("GLOBAL"), "{screen}");
+}
+
+#[test]
+fn a_conflicting_rebind_is_refused_and_named() {
+    use vibex_tui::action::Intent;
+    use vibex_tui::app::Overlay;
+    use vibex_tui::keymap::{Chord, Scope};
+    let mut app = app(120, 40);
+    app.overlay = Some(Overlay::Keys {
+        query: String::new(),
+        selected: 0,
+        capturing: None,
+        message: None,
+        dirty: false,
+    });
+    // `Ctrl+P` belongs to the command palette; rebinding the settings action to
+    // it would shadow the palette with nothing on screen to say so.
+    app.begin_key_capture(Intent::OpenSettings);
+    app.finish_key_capture(Chord::ctrl('p'));
+    assert!(
+        !app.keymap.is_overridden(Intent::OpenSettings),
+        "a shadowing chord was accepted"
+    );
+    let Some(Overlay::Keys { message, .. }) = app.overlay.clone() else {
+        panic!("the editor closed on a refused chord");
+    };
+    let message = message.expect("the refusal explains itself");
+    assert!(message.contains("command_palette"), "{message}");
+    // A free chord goes through and marks the table dirty.
+    let free = Chord::ctrl('j');
+    assert_eq!(
+        app.keymap
+            .conflict(Scope::Global, free, Intent::OpenSettings),
+        None,
+        "the test picked a chord something else already owns"
+    );
+    app.begin_key_capture(Intent::OpenSettings);
+    app.finish_key_capture(free);
+    assert_eq!(app.keymap.chord_for(Intent::OpenSettings), Some(free));
+}
+
+#[test]
 fn the_settings_filter_narrows_the_list_to_matching_rows() {
     use vibex_tui::settings::SettingRow;
     let mut app = settings_app(120, 40);

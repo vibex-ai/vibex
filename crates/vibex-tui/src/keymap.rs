@@ -1749,6 +1749,56 @@ impl Keymap {
             .map(|binding| binding.chord)
     }
 
+    /// Whether the user has moved this intent off its default chord.
+    pub fn is_overridden(&self, intent: Intent) -> bool {
+        self.overrides.contains_key(&intent)
+    }
+
+    /// The chord this intent is bound to out of the box, if it has one.
+    pub fn default_chord(intent: Intent) -> Option<Chord> {
+        DEFAULT_BINDINGS
+            .iter()
+            .find(|binding| binding.intent == intent)
+            .map(|binding| binding.chord)
+    }
+
+    /// Put one intent back on its default chord.
+    ///
+    /// Rebuilding from the defaults and re-applying the remaining overrides is
+    /// what restores aliases too: a rebind collapses them, and there is no
+    /// information left in the live table to un-collapse them one by one.
+    pub fn reset(&mut self, intent: Intent) {
+        if self.overrides.remove(&intent).is_none() {
+            return;
+        }
+        let remaining = self.overrides.clone();
+        *self = Self::built_in();
+        for (intent, chord) in remaining {
+            self.rebind(intent, chord);
+        }
+    }
+
+    /// Write the overrides to `path`, creating the directory when it is absent.
+    ///
+    /// Every failure is reported as a string rather than an error type: the
+    /// caller shows it and keeps the in-memory keymap, so a read-only home
+    /// directory costs a message, not the edit.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        let overrides = self
+            .overrides
+            .iter()
+            .map(|(intent, chord)| (intent.id().to_string(), chord.display()))
+            .collect::<BTreeMap<_, _>>();
+        std::fs::write(path, toml_lite::render(&overrides))
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+
     /// Whether a chord is already taken in `scope` by a different intent.
     pub fn conflict(&self, scope: Scope, chord: Chord, intent: Intent) -> Option<Intent> {
         self.bindings
@@ -1795,6 +1845,24 @@ pub mod toml_lite {
             out.insert(key, value);
         }
         (out, warnings)
+    }
+
+    /// Serialise overrides back into the file the parser reads.
+    ///
+    /// The header is written every time so a file the editor created explains
+    /// itself; the actions are sorted by the map, which keeps the diff of two
+    /// saves to the line that actually changed.
+    pub fn render(overrides: &BTreeMap<String, String>) -> String {
+        let mut out = String::from(
+            "# Vibex TUI key bindings.\n\
+             # Each line moves one action off its default chord:\n\
+             #   action_id = \"Ctrl+P\"\n\
+             # Delete a line to go back to the default. F9 reloads this file.\n",
+        );
+        for (action, chord) in overrides {
+            out.push_str(&format!("{action} = \"{chord}\"\n"));
+        }
+        out
     }
 }
 
@@ -1950,6 +2018,61 @@ mod tests {
             Some(Intent::OpenSettings)
         );
         assert_eq!(keymap.warnings.len(), 3, "{:?}", keymap.warnings);
+    }
+
+    #[test]
+    fn saved_overrides_reload_from_the_written_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tui-keys.toml");
+        let mut keymap = Keymap::built_in();
+        keymap.rebind(Intent::OpenCommandPalette, Chord::ctrl('j'));
+        keymap.save(&path).expect("the file is writable");
+
+        // The file names the action, not the enum: it is the same grammar the
+        // loader reads, and a human has to be able to edit it.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("command_palette = \"Ctrl+J\""),
+            "{written}"
+        );
+
+        let reloaded = Keymap::load(&path);
+        assert_eq!(
+            reloaded.chord_for(Intent::OpenCommandPalette),
+            Some(Chord::ctrl('j'))
+        );
+        assert!(reloaded.is_overridden(Intent::OpenCommandPalette));
+        assert!(reloaded.warnings.is_empty(), "{:?}", reloaded.warnings);
+    }
+
+    #[test]
+    fn resetting_an_override_restores_the_default_and_its_aliases() {
+        let mut keymap = Keymap::built_in();
+        keymap.rebind(Intent::OpenCommandPalette, Chord::ctrl('j'));
+        assert!(keymap.is_overridden(Intent::OpenCommandPalette));
+        // While the override is live the old chord is free for someone else.
+        assert_eq!(
+            keymap.conflict(Scope::Global, Chord::ctrl('p'), Intent::OpenSettings),
+            None
+        );
+
+        keymap.reset(Intent::OpenCommandPalette);
+        assert_eq!(
+            keymap.conflict(Scope::Global, Chord::ctrl('p'), Intent::OpenSettings),
+            Some(Intent::OpenCommandPalette)
+        );
+        assert!(!keymap.is_overridden(Intent::OpenCommandPalette));
+        assert_eq!(
+            keymap.chord_for(Intent::OpenCommandPalette),
+            Some(Chord::ctrl('p'))
+        );
+        // The hidden `:` alias comes back with it, which a field-by-field
+        // restore could not have done: a rebind had collapsed it.
+        assert_eq!(
+            keymap.resolve(&[Scope::Global], Chord::plain(KeyCode::Char(':'))),
+            Some(Intent::OpenCommandPalette)
+        );
+        assert!(keymap.warnings.is_empty(), "{:?}", keymap.warnings);
     }
 
     #[test]
