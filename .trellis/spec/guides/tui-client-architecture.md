@@ -113,17 +113,57 @@ Rules:
 * the PTY layer asserts that a byte written while the interface owns the screen
   never reaches the terminal, which is the measured form of this rule.
 
-## 4. Visual language
+## 4. Screen composition
 
-Structure is carried by three devices, in this order of importance:
+The screen is **one vertical stack of full-width bands**, computed by
+`crate::layout::compute`:
+
+```text
+outer padding (1 row top/bottom, 2 columns each side)
+  status band          1 row, always
+  [gap] [tasks]        only when background work exists
+  [gap] [todo]         only when the session has steps
+  [gap]
+  transcript           fills; Min(5) rows, the only flexible band
+  [gap] [queue]        only when messages are held
+  [gap] turn status    while running, waiting, or reporting a live session
+  [gap] [banner]       transient messages
+  prompt gap           1 row
+  prompt               borders + one blank row + the draft
+  shortcut band        1 row, always last
+outer padding
+```
+
+Rules that make this work:
+
+* **No permanently-boxed side pane.** Every border costs two columns or two rows
+  the content does not get; on a fixed grid that is the whole budget. Navigation
+  is a full-screen view or an overlay instead.
+* **The transcript has no frame.** Its structure is the per-block rail, which is
+  inside the content rather than around it.
+* **Optional bands collapse to zero height**, never to a smaller size, and the
+  frame skips their renderers entirely. `SHORT_TERMINAL_ROWS` drops the banner,
+  tasks and todo bands before it touches the transcript or the composer.
+* **`layout::compute` is pure data.** The composition is asserted at every
+  terminal size without rendering anything.
+* The gutter is taken from the transcript's right edge and only when the
+  transcript is at least `MIN_TRANSCRIPT_FOR_GUTTER` wide; below that the two
+  columns go back to the prose.
+
+## 5. Visual language
+
+Structure is carried by four devices, in this order of importance:
 
 1. **The rail.** Every transcript block owns a one-column bar down its whole
    height, coloured by block role (`ThemeRole::accent_*`, selected through
    `TuiTheme::rail`). It is a filled cell, not a drawn glyph, and it is
    *background*-coloured — a foreground-coloured space is invisible.
-2. **Layered surfaces.** `surface` / `surface_raised` / `surface_highlight` step
+2. **The turn rail.** One tick per turn in the gutter, positioned by
+   conversation order, with chevrons to jump a turn at a time. It maps the
+   session, not the buffer.
+3. **Layered surfaces.** `surface` / `surface_raised` / `surface_highlight` step
    away from `background`, so a plane change is visible without a border.
-3. **A three-step grey scale.** `gray_dim` for punctuation and chrome, `gray`
+4. **A three-step grey scale.** `gray_dim` for punctuation and chrome, `gray`
    for muted body, `gray_bright` for secondary labels. One grey cannot do three
    jobs without everything competing.
 
@@ -139,10 +179,22 @@ Rules that follow:
   colour switch, so a blurred pane stays recognisable.
 * Colour is never the only carrier. When `has_color()` is false the rail becomes
   a drawn glyph and bands disappear.
-* The only animation is the rail of a block that is working, and it runs only
-  while `Transcript::is_animating()` is true.
+* **Everything structural comes from `crate::glyphs`**, which declares each
+  glyph's fallback and the width invariant it must keep. The prompt arrow is
+  always two columns and every spinner frame always one, so a degradation never
+  shifts the layout.
 
-## 5. Rendering
+### Surfaces that must not regress
+
+| Surface | Contract |
+| --- | --- |
+| Status band | location on the left, status segments right-aligned as a group joined by ` │ `. A left-aligned list pushes the state off the edge exactly when a narrow terminal makes it worth reading. |
+| Turn status | spinner + activity on the left, elapsed and tokens right-aligned. Present whenever a turn is running or the session is alive; idle has its own slower pulse so a connected session does not look busy. |
+| Composer | one blank row above the draft; the bottom border *is* the info line, using ` · `; the mode prefix says what the draft will do. |
+| Completion | a drawer above the composer: two full-width rules, no corners, count on the top rule, selection marker is the composer's own arrow. |
+| Shortcut band | `KEYS:LABEL` joined by a rule; keys bright, labels dim; leading hints survive a narrow terminal. |
+
+## 6. Rendering
 
 The transcript is the performance-critical surface and follows four rules:
 
@@ -161,7 +213,7 @@ carrier of meaning. Icon and border glyphs degrade to ASCII when the locale is
 not UTF-8. All width arithmetic goes through `unicode-width`; `chars().count()`
 is never a column count.
 
-## 6. Interaction
+## 7. Interaction
 
 * One binding table per scope drives **dispatch, the key bar and `?` help**
   simultaneously. They cannot drift.
@@ -175,7 +227,7 @@ is never a column count.
 * Every action has a keyboard path. The mouse is an enhancement only.
 * Every page renders through the shared page frame; no page hand-rolls chrome.
 
-## 7. Security
+## 8. Security
 
 | Rule | Requirement |
 | --- | --- |
@@ -188,7 +240,7 @@ is never a column count.
 | R7 | The client never opens the runtime database, except for the documented local bootstrap path. |
 | R8 | Non-loopback transport is HTTPS/WSS. Pinned TLS is preferred; plain HTTP only on loopback with an explicit opt-in. |
 
-## 8. Testing
+## 9. Testing
 
 | Layer | What it proves |
 | --- | --- |

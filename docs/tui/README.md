@@ -64,9 +64,26 @@ If the home is locked and the runtime is not accepting local clients, the client
 prints three ways out: enable *Settings → Remote Access → Direct*, quit the
 desktop app, or connect to another runtime with `vibex connect`.
 
+## Screen composition
+
+One vertical stack of full-width bands — status, transcript, turn status,
+composer, shortcut bar. There are no permanently-boxed side panes: every border
+costs two columns or two rows that the content does not get, and on a fixed grid
+that is the whole budget. The transcript is what is being read, so it takes the
+full width, and the structure inside it — the per-block rail — does the work a
+frame would.
+
+Navigation that would otherwise be a permanent column is a full-screen view
+(Sessions, Files, Changes) or an overlay, which is also the only way a session
+row can show a title, workspace, state and age without truncating all four.
+
+Optional bands (background tasks, queued messages, banners) collapse to zero
+height rather than to a smaller size, and a short terminal drops them before it
+touches the transcript or the composer.
+
 ## Visual language
 
-Three ideas carry the interface.
+Four ideas carry the interface.
 
 **The rail.** Every transcript block owns a one-column colour bar down its whole
 height. It gives each block a visible left edge, so a long tool output stays one
@@ -100,9 +117,34 @@ canvas. The grey scale has three steps — dim for punctuation and chrome, mediu
 for muted body, bright for secondary labels — because one grey cannot do three
 jobs without everything competing.
 
+**The turn rail.** One tick per turn in the right gutter, positioned by
+conversation order rather than scroll proportion, so it maps the session rather
+than the buffer. Chevrons either end jump a turn at a time. It shares the two
+columns the scrollbar would use, and a single-turn session falls back to a
+scrollbar because a lone tick is noise.
+
 **Focus is a fade, not a switch.** Panes that do not have the keyboard keep
 their colour and drop in weight, and the composer's rail goes from the accent to
 dim grey. That makes "where will my keystrokes go" answerable at a glance.
+
+**Glyphs have fallbacks.** Terminals disagree about more than colour: the
+conservative Windows console does no font fallback, so a glyph outside its
+raster font is tofu. Every chrome glyph declares an ASCII fallback and the width
+it must keep, so a degradation never shifts the layout.
+
+### Turn status
+
+The row above the composer is where the interface reports what is happening:
+
+```text
+⠹ read src/net/upload.rs                                     1m12s ⇣12K
+○ Idle                                                        1m12s ⇣12K
+◆ 2 Approvals
+```
+
+It sits between the transcript and the composer because it must never scroll
+away. Idle has its own slower pulse, so a connected session does not look like a
+working one.
 
 ### Composer
 
@@ -123,11 +165,29 @@ whose tail is the first thing a narrow terminal eats. The centre is the
 context-window readout — `8.5K / 1.0M`, with the colour moving through the
 usage thresholds — so the answer is available without reading the number.
 
-### Key bar
+### Composer modes
 
-Keys are drawn bold and bright, labels dim: the key is what the reader is
-looking for and the label only confirms it. The leading hints survive a narrow
-terminal, so shrinking the window degrades the bar from the least important end.
+The prefix says what the draft will do, in the place the reader is already
+looking:
+
+| Prefix | Mode | Sends as |
+| --- | --- | --- |
+| `❯` | normal | a message to the Agent |
+| `!` | shell | a shell command |
+| `?` | history search | a query over sent messages |
+
+### Completion
+
+Typing `/`, `@` or `$` opens a drawer above the composer: two full-width rules,
+no corners, the match count on the top rule, and the composer's own arrow as the
+selection marker so the highlighted row lines up with the text being typed.
+
+### Shortcut band
+
+`KEYS:LABEL` joined by a rule; keys are drawn bright and labels dim, because the
+key is what the reader is looking for and the label only confirms it. The
+leading hints survive a narrow terminal, so shrinking the window degrades the
+band from the least important end.
 
 ## Pages
 
