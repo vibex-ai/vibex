@@ -55,6 +55,8 @@ pub struct BandRequest {
     pub turn_status: u16,
     /// A transient message row (mode switch, tip).
     pub banner: u16,
+    /// The collapsible panel above the composer: what the session is running.
+    pub dock: u16,
     /// The composer's total height, borders included.
     pub prompt: u16,
     /// Rows between the transcript and the composer.
@@ -79,6 +81,7 @@ pub struct Bands {
     pub queue: Rect,
     pub turn_status: Rect,
     pub banner: Rect,
+    pub dock: Rect,
     pub prompt: Rect,
     pub status_line: Rect,
     pub shortcuts: Rect,
@@ -126,6 +129,9 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
     // A short terminal gives up its optional rows before it gives up any of the
     // transcript or the composer.
     let banner = if short { 0 } else { request.banner };
+    // The dock is a convenience panel, so a short terminal gives its rows back
+    // to the transcript before anything essential is dropped.
+    let dock = if short { 0 } else { request.dock };
     let tasks = if short { 0 } else { request.tasks };
     let todo = if short { 0 } else { request.todo };
     let turn_status = request.turn_status;
@@ -150,7 +156,7 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
     }
     constraints.push(Constraint::Length(gap(1)));
     constraints.push(Constraint::Min(SCROLLBACK_MIN_ROWS));
-    for height in [queue, turn_status, banner] {
+    for height in [queue, turn_status, banner, dock] {
         if height > 0 {
             constraints.push(Constraint::Length(1));
             constraints.push(Constraint::Length(height));
@@ -204,6 +210,12 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
     } else {
         Rect::default()
     };
+    let dock_rect = if dock > 0 {
+        take();
+        take()
+    } else {
+        Rect::default()
+    };
     if request.prompt_gap > 0 {
         take();
     }
@@ -244,6 +256,7 @@ pub fn compute(area: Rect, request: BandRequest) -> Bands {
         queue: queue_rect,
         turn_status: turn_status_rect,
         banner: banner_rect,
+        dock: dock_rect,
         prompt,
         status_line: status_line_rect,
         shortcuts: shortcuts_rect,
@@ -297,6 +310,26 @@ mod tests {
     }
 
     #[test]
+    fn the_dock_sits_directly_above_the_composer() {
+        let bands = compute(
+            Rect::new(0, 0, 120, 40),
+            BandRequest {
+                turn_status: 1,
+                banner: 1,
+                dock: 4,
+                prompt: 4,
+                prompt_gap: 1,
+                shortcuts: 1,
+                ..BandRequest::default()
+            },
+        );
+        // Banner, then dock, then the gap, then the prompt.
+        assert_eq!(bands.dock.y, bands.banner.bottom() + 1);
+        assert_eq!(bands.prompt.y, bands.dock.bottom() + 1);
+        assert!(bands.dock.height >= 1);
+    }
+
+    #[test]
     fn a_short_terminal_drops_optional_bands_before_the_transcript() {
         let tall = compute(
             Rect::new(0, 0, 120, 40),
@@ -340,6 +373,7 @@ mod tests {
                     queue: 2,
                     turn_status: 1,
                     banner: 1,
+                    dock: 4,
                     prompt: 4,
                     prompt_gap: 1,
                     shortcuts: 1,
@@ -400,6 +434,7 @@ mod tests {
                 queue: 2,
                 turn_status: 1,
                 banner: 1,
+                dock: 3,
                 status_line: 1,
                 prompt: 4,
                 prompt_gap: 1,
@@ -415,6 +450,7 @@ mod tests {
             bands.queue,
             bands.turn_status,
             bands.banner,
+            bands.dock,
             bands.prompt,
             bands.status_line,
             bands.shortcuts,

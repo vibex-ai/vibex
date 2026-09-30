@@ -775,6 +775,24 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
         Intent::OpenFiles,
         "Files",
     ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('d'), KeyModifiers::ALT),
+        Intent::ToggleDock,
+        "Dock",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('g'), KeyModifiers::ALT),
+        Intent::DockActivate,
+        "Dock open",
+    ),
+    binding(
+        Scope::Agent,
+        Chord::new(KeyCode::Char('h'), KeyModifiers::ALT),
+        Intent::DockHideDone,
+        "Hide done",
+    ),
     // ---- composer -------------------------------------------------------
     binding(
         Scope::Composer,

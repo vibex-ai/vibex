@@ -166,6 +166,23 @@ strings! {
     session_card_messages => { "Messages", "消息数", "訊息數" },
     session_card_turns => { "Turns", "轮次", "輪次" },
     session_card_tools => { "Tools", "工具", "工具" },
+    dock_agents => { "Agents", "子代理", "子代理" },
+    dock_plan => { "Plan", "计划", "計畫" },
+    dock_queue => { "Held", "排队", "排隊" },
+    dock_title => { "Running", "运行中", "執行中" },
+    dock_more => { "more", "更多", "更多" },
+    dock_empty => {
+        "Nothing running — agents, the plan and held messages appear here",
+        "当前没有运行中的内容 — 子代理、计划与排队消息会显示在这里",
+        "目前沒有執行中的內容 — 子代理、計畫與排隊訊息會顯示在這裡"
+    },
+    dock_hint => {
+        "Alt+J/K move · Alt+G open · Alt+H hide done · Alt+D close",
+        "Alt+J/K 移动 · Alt+G 打开 · Alt+H 隐藏已完成 · Alt+D 关闭",
+        "Alt+J/K 移動 · Alt+G 開啟 · Alt+H 隱藏已完成 · Alt+D 關閉"
+    },
+    dock_hidden_done => { "Finished work hidden", "已隐藏已完成项", "已隱藏已完成項" },
+    dock_shown_done => { "Finished work shown", "已显示已完成项", "已顯示已完成項" },
     sidebar_pinned => { "Pinned to the top", "已置顶", "已置頂" },
     sidebar_unpinned => { "Pin removed", "已取消置顶", "已取消置頂" },
     sidebar_pinned_first => {

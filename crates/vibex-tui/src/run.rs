@@ -1003,6 +1003,20 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
                 }
                 return true;
             }
+            // A dock row selects; a second click on the same row opens it, the
+            // same contract the other lists use.
+            if let Some(region) = app.regions.dock
+                && rect_contains(region, mouse.column, mouse.row)
+            {
+                let index = usize::from(mouse.row - region.y);
+                if index < app.dock_rows().len() {
+                    app.dock_selection = Some(index);
+                    if app.double_click_at(mouse.column, mouse.row) {
+                        app.activate_dock_row();
+                    }
+                }
+                return true;
+            }
             // The queue band selects a held message.
             if let Some(region) = app.regions.queue
                 && rect_contains(region, mouse.column, mouse.row)

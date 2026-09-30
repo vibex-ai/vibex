@@ -451,6 +451,14 @@ pub struct App {
     /// Whether the session list groups sessions under their workspace, or shows
     /// them as one flat run. Persisted with the rest of the arrangement.
     pub sidebar_grouped: bool,
+    /// Whether the dock panel above the composer is open.
+    pub dock_open: bool,
+    /// Which dock row the cursor is on, while the dock owns the keys.
+    pub dock_selection: Option<usize>,
+    /// Dock sections the reader has folded away.
+    pub dock_collapsed: std::collections::BTreeSet<DockSection>,
+    /// Whether finished agents and completed plan steps are hidden.
+    pub dock_hide_done: bool,
     /// Where the arrangement is written; `None` keeps it in memory only.
     pub sidebar_path: Option<std::path::PathBuf>,
     /// The last left click, so two clicks in the same cell can be told apart
@@ -487,6 +495,57 @@ pub enum ComposerMode {
     Shell,
     /// Treat the draft as a search over sent messages.
     HistorySearch,
+}
+
+/// How many rows the dock may take from the transcript.
+///
+/// It is a glance, not a screen: past a handful of rows the reader should open
+/// the transcript, which is where the detail actually lives.
+pub const MAX_DOCK_ROWS: usize = 8;
+
+/// One section of the dock panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DockSection {
+    Agents,
+    Plan,
+    Queue,
+}
+
+impl DockSection {
+    pub const ALL: [DockSection; 3] = [Self::Agents, Self::Plan, Self::Queue];
+
+    pub const fn label(self, strings: Strings) -> &'static str {
+        match self {
+            DockSection::Agents => strings.dock_agents(),
+            DockSection::Plan => strings.dock_plan(),
+            DockSection::Queue => strings.dock_queue(),
+        }
+    }
+}
+
+/// One line of the dock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockRow {
+    /// A section heading, which the cursor steps over.
+    Header { section: DockSection, count: usize },
+    /// A delegated child agent.
+    Agent {
+        label: String,
+        status: vibex_core::ToolCallStatus,
+        summary: String,
+        /// The transcript block the row stands for, so activating it can go
+        /// there. Blocks are keyed by id rather than by sequence because a row
+        /// can cover several items.
+        block_id: String,
+    },
+    /// One step of the current plan.
+    Plan {
+        title: String,
+        status: vibex_core::PlanStepStatus,
+        block_id: String,
+    },
+    /// A message held until the running turn ends.
+    Queue { index: usize, text: String },
 }
 
 /// How far through its plan the session is.
@@ -553,6 +612,8 @@ pub struct FrameRegions {
     pub composer: Option<ratatui::layout::Rect>,
     /// The queue band's rows, for click-to-select.
     pub queue: Option<ratatui::layout::Rect>,
+    /// The dock panel's rows, for click-to-select.
+    pub dock: Option<ratatui::layout::Rect>,
     /// The banner row, which a click dismisses.
     pub banner: Option<ratatui::layout::Rect>,
     /// A row-per-index list the frame drew: its rect and the scope it selects
@@ -749,6 +810,10 @@ impl App {
             recent_commands: Vec::new(),
             text_selection: None,
             draft_selecting: false,
+            dock_open: false,
+            dock_selection: None,
+            dock_collapsed: std::collections::BTreeSet::new(),
+            dock_hide_done: false,
             last_click: None,
             queued_messages: Vec::new(),
             queue_selection: None,
@@ -1157,6 +1222,245 @@ impl App {
     /// Pending questions from the Agent, which also block the turn.
     pub fn pending_elicitations(&self) -> usize {
         self.agent.state.elicitation_surfaces(self.shell).len()
+    }
+
+    /// The dock's rows: delegated agents, the current plan and the held queue.
+    ///
+    /// Everything here is derived from the transcript the reader can already
+    /// see, so the panel cannot disagree with the page behind it. Sections with
+    /// nothing in them are left out rather than drawn empty.
+    pub fn dock_rows(&self) -> Vec<DockRow> {
+        let items = &self.agent.state.timeline.items;
+        let mut rows = Vec::new();
+
+        // Delegated child agents, newest row first and one row per delegation:
+        // a child that reports progress must not grow the panel every time.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut agents = Vec::new();
+        for row in &self.projection.rows {
+            let Some(delegation) = vibex_desktop_model::timeline_row_delegation(row, items) else {
+                continue;
+            };
+            if !seen.insert(delegation.delegation_id.to_string()) {
+                continue;
+            }
+            if self.dock_hide_done && delegation.status == vibex_core::ToolCallStatus::Completed {
+                continue;
+            }
+            agents.push((
+                row.id.clone(),
+                delegation.agent_label.unwrap_or(delegation.action),
+                delegation.status,
+                delegation.summary,
+            ));
+        }
+        if !agents.is_empty() {
+            rows.push(DockRow::Header {
+                section: DockSection::Agents,
+                count: agents.len(),
+            });
+            if !self.dock_collapsed.contains(&DockSection::Agents) {
+                rows.extend(
+                    agents
+                        .into_iter()
+                        .map(|(block_id, label, status, summary)| DockRow::Agent {
+                            label,
+                            status,
+                            summary,
+                            block_id,
+                        }),
+                );
+            }
+        }
+
+        if let Some(plan) = vibex_desktop_model::current_agent_plan(items) {
+            let plan_block = self
+                .projection
+                .rows
+                .iter()
+                .find(|row| {
+                    row.first_sequence <= plan.sequence && plan.sequence <= row.last_sequence
+                })
+                .map(|row| row.id.clone())
+                .unwrap_or_default();
+            let block_id = plan_block;
+            let steps = plan
+                .steps
+                .iter()
+                .filter(|step| {
+                    !self.dock_hide_done || step.status != vibex_core::PlanStepStatus::Completed
+                })
+                .collect::<Vec<_>>();
+            if !steps.is_empty() {
+                rows.push(DockRow::Header {
+                    section: DockSection::Plan,
+                    count: steps.len(),
+                });
+                if !self.dock_collapsed.contains(&DockSection::Plan) {
+                    rows.extend(steps.into_iter().map(|step| DockRow::Plan {
+                        title: step.title.clone(),
+                        status: step.status,
+                        block_id: block_id.clone(),
+                    }));
+                }
+            }
+        }
+
+        if rows.iter().all(|row| {
+            !matches!(
+                row,
+                DockRow::Header {
+                    section: DockSection::Plan,
+                    ..
+                }
+            )
+        }) && let Some(progress) = self.todo_progress()
+        {
+            // No structured plan item reached this client, but the transcript
+            // still carries the plan block the reader can see. Showing what is
+            // known beats showing nothing.
+            let block_id = self
+                .transcript
+                .blocks()
+                .iter()
+                .rev()
+                .find(|block| {
+                    matches!(
+                        block.kind,
+                        vibex_desktop_model::TimelineRowKind::TodoUpdate
+                            | vibex_desktop_model::TimelineRowKind::Plan
+                    )
+                })
+                .map(|block| block.id.clone())
+                .unwrap_or_default();
+            rows.push(DockRow::Header {
+                section: DockSection::Plan,
+                count: progress.total,
+            });
+            if !self.dock_collapsed.contains(&DockSection::Plan) {
+                // A running step is never "done", whatever the counts say.
+                if let Some(running) = progress.running.as_ref() {
+                    rows.push(DockRow::Plan {
+                        title: running.clone(),
+                        status: vibex_core::PlanStepStatus::Running,
+                        block_id: block_id.clone(),
+                    });
+                }
+                if !(self.dock_hide_done && progress.done == progress.total) {
+                    rows.push(DockRow::Plan {
+                        title: format!("{} {}/{}", progress.title, progress.done, progress.total),
+                        status: if progress.done == progress.total {
+                            vibex_core::PlanStepStatus::Completed
+                        } else {
+                            vibex_core::PlanStepStatus::Pending
+                        },
+                        block_id,
+                    });
+                }
+            }
+        }
+
+        if !self.queued_messages.is_empty() {
+            rows.push(DockRow::Header {
+                section: DockSection::Queue,
+                count: self.queued_messages.len(),
+            });
+            if !self.dock_collapsed.contains(&DockSection::Queue) {
+                rows.extend(
+                    self.queued_messages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, text)| DockRow::Queue {
+                            index,
+                            text: text.lines().next().unwrap_or_default().to_string(),
+                        }),
+                );
+            }
+        }
+        rows
+    }
+
+    /// The dock's height: a title row plus the rows it can show.
+    pub fn dock_height(&self) -> u16 {
+        let rows = self.dock_rows().len();
+        if rows == 0 {
+            return 0;
+        }
+        let visible = rows.min(MAX_DOCK_ROWS.saturating_sub(1));
+        (visible + 1) as u16
+    }
+
+    /// Step the dock cursor, skipping headings.
+    pub fn step_dock_selection(&mut self, delta: isize) -> bool {
+        let rows = self.dock_rows();
+        if rows.is_empty() {
+            self.dock_selection = None;
+            return false;
+        }
+        let start = self
+            .dock_selection
+            .filter(|index| *index < rows.len())
+            .unwrap_or(0);
+        let mut index = start as isize;
+        loop {
+            index += delta;
+            if index < 0 || index as usize >= rows.len() {
+                self.dock_selection = Some(start);
+                return false;
+            }
+            if !matches!(rows[index as usize], DockRow::Header { .. }) {
+                self.dock_selection = Some(index as usize);
+                return true;
+            }
+        }
+    }
+
+    /// Act on the dock row under the cursor.
+    pub fn activate_dock_row(&mut self) -> bool {
+        let rows = self.dock_rows();
+        let Some(index) = self.dock_selection.filter(|index| *index < rows.len()) else {
+            return false;
+        };
+        match rows[index].clone() {
+            DockRow::Header { section, .. } => {
+                if !self.dock_collapsed.remove(&section) {
+                    self.dock_collapsed.insert(section);
+                }
+                true
+            }
+            DockRow::Queue { index, .. } => {
+                self.queue_selection = Some(index);
+                self.edit_queued_message()
+            }
+            // A plan step or an agent is a place in the transcript, so the
+            // action is "show me that", the same thing clicking its tick does.
+            DockRow::Plan { block_id, .. } | DockRow::Agent { block_id, .. } => {
+                let block = self
+                    .transcript
+                    .blocks()
+                    .iter()
+                    .position(|block| block.id == block_id);
+                let Some(block) = block else {
+                    return false;
+                };
+                self.scroll.follow = false;
+                self.scroll.offset = self.transcript.line_of_block(block);
+                self.set_selection(Scope::Agent, block);
+                self.focus = Focus::Main;
+                true
+            }
+        }
+    }
+
+    /// Fold finished work out of the dock, or bring it back.
+    pub fn toggle_dock_hide_done(&mut self) -> bool {
+        self.dock_hide_done = !self.dock_hide_done;
+        self.dock_hide_done
+    }
+
+    /// Whether the dock owns the list keys right now.
+    pub fn dock_is_focused(&self) -> bool {
+        self.dock_open && self.dock_selection.is_some()
     }
 
     /// How much background work the session is running.

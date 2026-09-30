@@ -154,6 +154,16 @@ impl App {
             }
 
             // ---- selection motion ----------------------------------------
+            // The dock's cursor is a second cursor on the agent page; while it
+            // is up, the list keys belong to it.
+            Intent::SelectPrevious if self.dock_is_focused() => {
+                self.step_dock_selection(-1);
+                Outcome::effects(vec![])
+            }
+            Intent::SelectNext if self.dock_is_focused() => {
+                self.step_dock_selection(1);
+                Outcome::effects(vec![])
+            }
             Intent::SelectPrevious => self.move_selection(-1),
             Intent::SelectNext => self.move_selection(1),
             Intent::ScrollPageUp => {
@@ -523,6 +533,39 @@ impl App {
                 self.history.push(text.clone());
                 effects.push(Effect::SendMessage { session_id, text });
                 Outcome::effects(effects)
+            }
+            Intent::ToggleDock => {
+                self.dock_open = !self.dock_open;
+                if self.dock_open {
+                    // Opening the panel puts the cursor in it, because that is
+                    // the only reason to open it: something is running and the
+                    // reader wants to act on it.
+                    self.dock_selection = Some(0);
+                    self.step_dock_selection(1);
+                    if self.dock_rows().is_empty() {
+                        self.dock_selection = Some(0);
+                    }
+                } else {
+                    self.dock_selection = None;
+                }
+                Outcome::effects(vec![])
+            }
+            Intent::DockActivate => {
+                self.activate_dock_row();
+                Outcome::effects(vec![])
+            }
+            Intent::DockHideDone => {
+                let hidden = self.toggle_dock_hide_done();
+                let message = if hidden {
+                    self.strings.dock_hidden_done()
+                } else {
+                    self.strings.dock_shown_done()
+                };
+                self.toast(Toast::info(message));
+                // The row the cursor was on may have just disappeared.
+                let last = self.dock_rows().len().saturating_sub(1);
+                self.dock_selection = self.dock_selection.map(|index| index.min(last));
+                Outcome::effects(vec![])
             }
             Intent::BeginTranscriptSearch => {
                 self.page = Page::Agent;
@@ -1415,6 +1458,13 @@ impl App {
     fn go_back(&mut self) -> Outcome {
         if self.overlay.is_some() {
             self.overlay = None;
+            return Outcome::effects(vec![]);
+        }
+        // The dock is the innermost panel above the composer, so it folds away
+        // before the page around it does.
+        if self.dock_open {
+            self.dock_open = false;
+            self.dock_selection = None;
             return Outcome::effects(vec![]);
         }
         // A copied selection stays highlighted until the reader dismisses it,

@@ -547,6 +547,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         app.regions.banner = Some(bands.banner);
         render_banner(frame, bands.banner, app, &theme, strings);
     }
+    // The dock is the one band that comes and goes on a key, so its hit rect is
+    // cleared rather than left pointing at rows that are no longer drawn.
+    app.regions.dock = None;
+    if Bands::is_visible(bands.dock) {
+        render_dock_band(frame, bands.dock, app, &theme, strings);
+    }
     if Bands::is_visible(bands.prompt) {
         render_prompt(frame, bands.prompt, app, &theme, strings);
     }
@@ -586,10 +592,21 @@ fn band_request(app: &App) -> crate::layout::BandRequest {
         } else {
             0
         },
-        todo: u16::from(app.todo_total_count() > 0),
-        queue: if queued > 0 { (queued + 1).min(5) } else { 0 },
+        // The dock already lists the plan and the held queue, so its sections
+        // replace those bands while it is open rather than saying it twice.
+        todo: if app.dock_open {
+            0
+        } else {
+            u16::from(app.todo_total_count() > 0)
+        },
+        queue: if app.dock_open || queued == 0 {
+            0
+        } else {
+            (queued + 1).min(5)
+        },
         turn_status,
         banner: u16::from(app.banner.is_some()),
+        dock: if app.dock_open { app.dock_height() } else { 0 },
         // The composer belongs to a session. On a page with no session context
         // there is nothing to send, so the band is not allocated and the
         // transcript gets its rows instead.
@@ -1481,6 +1498,216 @@ fn render_queue_band(
         ]));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The dock: agents, the plan and the held queue, in one panel above the
+/// composer.
+///
+/// It is a band rather than an overlay because it answers a question the reader
+/// asks *while* typing -- is anything still running? -- and an overlay would
+/// make them leave the thing they are doing to find out.
+fn render_dock_band(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    theme: &TuiTheme,
+    strings: Strings,
+) {
+    let rows = app.dock_rows();
+    let focused = app.dock_is_focused();
+    app.regions.dock = Some(Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    });
+    let mut header = vec![Span::styled(
+        format!(
+            "{} {}",
+            crate::glyphs::diamond_dotted(app.glyph_tier()),
+            strings.dock_title()
+        ),
+        Style::default()
+            .fg(theme.roles.accent_user)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if focused {
+        header.push(Span::styled(
+            format!("  {}", strings.dock_hint()),
+            Style::default().fg(theme.roles.gray_dim),
+        ));
+    }
+    let mut lines = vec![Line::from(header)];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", strings.dock_empty()),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
+    let visible = usize::from(area.height).saturating_sub(1);
+    // The rows can shrink under the cursor as work finishes, so the selection
+    // is clamped here rather than trusted.
+    let selected = app.dock_selection.unwrap_or(0).min(rows.len() - 1);
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    let shown = rows.iter().enumerate().skip(offset).take(visible);
+    let mut hidden = rows.len().saturating_sub(offset + visible);
+    for (index, row) in shown {
+        let active = focused && index == selected;
+        let base = if active {
+            theme.selected()
+        } else {
+            theme.base()
+        };
+        match row {
+            crate::app::DockRow::Header { section, count } => {
+                let folded = app.dock_collapsed.contains(section);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "  {} ",
+                            crate::glyphs::disclosure(!folded, app.glyph_tier())
+                        ),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(
+                        format!("{} {count}", section.label(strings)),
+                        Style::default()
+                            .fg(theme.roles.foreground)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            crate::app::DockRow::Agent {
+                label,
+                status,
+                summary,
+                ..
+            } => {
+                let (marker, tone) = dock_status_marker(*status, app.animation_phase(), theme, app);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if active { "▸" } else { " " }),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(format!("{marker} "), Style::default().fg(tone)),
+                    Span::styled(truncate_to_width(label, 18, "…"), base),
+                    Span::styled(
+                        format!(
+                            "  {}",
+                            truncate_to_width(
+                                summary,
+                                usize::from(area.width).saturating_sub(28),
+                                "…"
+                            )
+                        ),
+                        if active {
+                            base
+                        } else {
+                            Style::default().fg(theme.roles.gray)
+                        },
+                    ),
+                ]));
+            }
+            crate::app::DockRow::Plan { title, status, .. } => {
+                let marker = match status {
+                    vibex_core::PlanStepStatus::Completed => {
+                        crate::glyphs::check_mark(app.glyph_tier())
+                    }
+                    vibex_core::PlanStepStatus::Running => crate::glyphs::frame_at(
+                        crate::glyphs::spinner_frames(app.glyph_tier()),
+                        app.animation_phase(),
+                        4,
+                    ),
+                    vibex_core::PlanStepStatus::Failed => crate::glyphs::ballot_x(app.glyph_tier()),
+                    vibex_core::PlanStepStatus::Pending => "·",
+                };
+                let tone = match status {
+                    vibex_core::PlanStepStatus::Completed => theme.roles.success,
+                    vibex_core::PlanStepStatus::Running => theme.roles.accent_running,
+                    vibex_core::PlanStepStatus::Failed => theme.roles.danger,
+                    vibex_core::PlanStepStatus::Pending => theme.roles.gray_dim,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if active { "▸" } else { " " }),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(format!("{marker} "), Style::default().fg(tone)),
+                    Span::styled(
+                        truncate_to_width(title, usize::from(area.width).saturating_sub(8), "…"),
+                        if active {
+                            base
+                        } else if *status == vibex_core::PlanStepStatus::Completed {
+                            Style::default()
+                                .fg(theme.roles.gray_dim)
+                                .add_modifier(Modifier::CROSSED_OUT)
+                        } else {
+                            Style::default().fg(theme.roles.gray)
+                        },
+                    ),
+                ]));
+            }
+            crate::app::DockRow::Queue { index, text } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if active { "▸" } else { " " }),
+                        Style::default().fg(theme.roles.accent_user),
+                    ),
+                    Span::styled(
+                        format!("#{} ", index + 1),
+                        Style::default().fg(theme.roles.gray_dim),
+                    ),
+                    Span::styled(
+                        truncate_to_width(text, usize::from(area.width).saturating_sub(8), "…"),
+                        base,
+                    ),
+                ]));
+            }
+        }
+        if hidden > 0 && index == rows.len().saturating_sub(1) {
+            hidden = 0;
+        }
+    }
+    if hidden > 0 && lines.len() > visible {
+        // The last visible row is given up to say how much is below, which is
+        // more useful than the row that would have been clipped there.
+        lines.truncate(visible);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} {} {}",
+                crate::glyphs::chevron(false, app.glyph_tier()),
+                hidden,
+                strings.dock_more()
+            ),
+            Style::default().fg(theme.roles.gray_dim),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// The spinner or mark for an agent's state, with its colour.
+fn dock_status_marker(
+    status: vibex_core::ToolCallStatus,
+    phase: u32,
+    theme: &TuiTheme,
+    app: &App,
+) -> (&'static str, ratatui::style::Color) {
+    match status {
+        vibex_core::ToolCallStatus::Started | vibex_core::ToolCallStatus::Progress => (
+            crate::glyphs::frame_at(crate::glyphs::spinner_frames(app.glyph_tier()), phase, 4),
+            theme.roles.accent_running,
+        ),
+        vibex_core::ToolCallStatus::Completed => (
+            crate::glyphs::check_mark(app.glyph_tier()),
+            theme.roles.success,
+        ),
+        vibex_core::ToolCallStatus::Failed => (
+            crate::glyphs::ballot_x(app.glyph_tier()),
+            theme.roles.danger,
+        ),
+    }
 }
 
 /// The prompt band.

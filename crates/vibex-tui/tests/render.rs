@@ -915,6 +915,106 @@ fn select_setting(app: &mut App, row: vibex_tui::settings::SettingRow) {
     app.set_selection(Scope::Settings, index);
 }
 
+/// A plan block, which is the shape the runtime publishes a plan in.
+fn plan_block() -> vibex_tui::transcript::Block {
+    vibex_tui::transcript::Block {
+        id: "todo-dock".to_string(),
+        kind: vibex_desktop_model::TimelineRowKind::TodoUpdate,
+        title: "Ship the dock".to_string(),
+        body: "Completed: read the design\nRunning: write the band\nPending: add a test"
+            .to_string(),
+        turn_id: Some("turn-1".to_string()),
+        sequence: 1,
+        expanded: false,
+        collapsible: true,
+        streaming: false,
+        failed: false,
+        pending_permission: false,
+        file_path: None,
+        runtime_attribution: None,
+        conclusion: false,
+        group: vibex_tui::transcript::GroupRole::Solo,
+    }
+}
+
+#[test]
+fn the_dock_lists_the_plan_and_the_held_queue() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(vec![plan_block()]);
+    app.enqueue_message("fix the flake".to_string());
+    app.perform(Intent::ToggleDock);
+    let screen = text(&render(&mut app, 120, 40));
+    for needle in ["Running", "Plan", "write the band", "Held", "fix the flake"] {
+        assert!(screen.contains(needle), "the dock lost {needle}:\n{screen}");
+    }
+    // The band publishes its rows so the mouse can select them.
+    assert!(app.regions.dock.is_some(), "the dock is not clickable");
+
+    // Esc folds the panel away before it means anything else.
+    app.perform(Intent::Back);
+    assert!(!app.dock_open, "Esc left the dock open");
+    let closed = text(&render(&mut app, 120, 40));
+    assert!(
+        !closed.contains("Held"),
+        "the dock's own section heading outlived it:\n{closed}"
+    );
+    assert!(
+        app.regions.dock.is_none(),
+        "the closed dock kept its hit rect"
+    );
+}
+
+#[test]
+fn the_dock_cursor_skips_headings_and_takes_a_held_message_back() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(vec![plan_block()]);
+    app.enqueue_message("fix the flake".to_string());
+    app.perform(Intent::ToggleDock);
+    let rows = app.dock_rows();
+    // Sections are headings plus their rows; the queue row is last.
+    let queue_row = rows
+        .iter()
+        .position(|row| matches!(row, vibex_tui::app::DockRow::Queue { .. }))
+        .expect("the held message is listed");
+    // Walking down from the top lands on bindings only, never on a heading.
+    for _ in 0..rows.len() {
+        assert!(
+            !matches!(
+                rows[app.dock_selection.expect("the dock has a cursor")],
+                vibex_tui::app::DockRow::Header { .. }
+            ),
+            "the cursor stopped on a heading"
+        );
+        // `j`/`Down` move the dock cursor while it owns the keys.
+        app.perform(Intent::SelectNext);
+    }
+    app.dock_selection = Some(queue_row);
+    app.perform(Intent::DockActivate);
+    assert_eq!(app.composer.text(), "fix the flake");
+    assert!(app.queued_messages.is_empty(), "the message was not taken");
+}
+
+#[test]
+fn hiding_finished_dock_work_leaves_the_running_step() {
+    use vibex_tui::action::Intent;
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.transcript.set_blocks(vec![plan_block()]);
+    app.perform(Intent::ToggleDock);
+    let before = text(&render(&mut app, 120, 40));
+    assert!(before.contains("1/3"), "{before}");
+    app.perform(Intent::DockHideDone);
+    let after = text(&render(&mut app, 120, 40));
+    assert!(
+        after.contains("write the band"),
+        "a running step was hidden as finished:\n{after}"
+    );
+}
+
 #[test]
 fn the_settings_keys_row_opens_the_binding_editor() {
     use vibex_tui::action::Intent;
