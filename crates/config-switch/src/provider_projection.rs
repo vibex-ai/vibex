@@ -3219,6 +3219,13 @@ fn grok_overlay(
     serialized_toml(serde_json::json!({
         "model": serde_json::Value::Object(model_table),
         "models": {"default": model_id},
+        // Vibex owns the install, so the Agent must not swap its own binary out
+        // from under a live ACP session. xAI documents `[cli] auto_update`
+        // ("check for CLI updates on launch", on when unset) in the same
+        // user-level `config.toml` this overlay already writes `[model.<id>]`
+        // into, and that the project-level file would ignore. The other
+        // managed Agents in this catalog switch self-update off the same way.
+        "cli": {"auto_update": false},
     }))
 }
 
@@ -7315,6 +7322,34 @@ mod tests {
 
         assert_eq!(updated.display_name, "Revision test updated");
         assert_eq!(updated.revision, created.revision + 1);
+    }
+
+    /// Vibex owns the Agent's install, so the managed overlay switches grok's
+    /// own updater off. Otherwise a background self-update can replace the
+    /// binary a live ACP session was launched from, which is the same failure
+    /// the other managed Agents already avoid.
+    #[test]
+    fn grok_overlay_switches_the_agents_own_updater_off() {
+        let (provider, _, binding, _) = fixture(ConfigOverlayStrategy::GrokToml);
+        let overlay = build_overlay(
+            &ConfigOverlayStrategy::GrokToml,
+            &provider,
+            &binding,
+            provider.endpoints.first(),
+            None,
+            Some("VIBEX_GROK_API_KEY"),
+        )
+        .unwrap();
+        assert_eq!(overlay.relative_path, "config.toml");
+        assert!(
+            overlay.content.contains("auto_update = false"),
+            "grok overlay must pin the updater off:\n{}",
+            overlay.content
+        );
+        // The section it lives in is grok's, and the projection keeps writing
+        // its own tables beside it.
+        assert!(overlay.content.contains("[cli]"), "{}", overlay.content);
+        assert!(overlay.content.contains("[models]"), "{}", overlay.content);
     }
 
     /// Each Agent exposes its own protocol vocabulary, and every selector must
