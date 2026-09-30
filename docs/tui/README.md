@@ -277,6 +277,14 @@ until it contains an uppercase letter, highlighted in place. `Enter` keeps the
 matches and `n` / `p` step through them, wrapping at the ends. Invalid patterns
 say so rather than silently matching nothing.
 
+Opening a session hydrates a window rather than the whole archive, so scrolling
+to the top of the transcript (`PageUp`, `Ctrl+U`, `Home`, the wheel) fetches the
+next older page, and `u` asks for one explicitly. The page is prepended above
+the viewport and the reader keeps their place: the block they were looking at
+stays on the first visible line. A backend that predates the cursor answers with
+the newest page instead; the client detects that and stops asking rather than
+prepending the wrong end of the conversation.
+
 A drag with the mouse selects text over as many lines as it covers, scrolling at
 the edges, and copies on release. A double click takes the whole word, so
 `src/net/upload.rs` arrives in one piece. `Esc` dismisses the highlight; `y`

@@ -60,6 +60,35 @@ fn response_for(
 impl App {
     /// Apply one intent.
     pub fn perform(&mut self, intent: Intent) -> Outcome {
+        let mut outcome = self.perform_intent(intent);
+        // Scrolling up to the very top is the asking gesture for older
+        // history; `LoadOlderHistory` is the explicit one. The controller
+        // refuses while a page is in flight, so holding a scroll key down
+        // cannot fire a request per repeat.
+        if matches!(
+            intent,
+            Intent::ScrollPageUp
+                | Intent::ScrollHalfPageUp
+                | Intent::ScrollToTop
+                | Intent::SelectPrevious
+        ) {
+            self.request_older_history_at_top(&mut outcome);
+        }
+        outcome
+    }
+
+    /// Queue an older-page fetch when the transcript is parked at its top.
+    fn request_older_history_at_top(&mut self, outcome: &mut Outcome) {
+        if !self.at_transcript_top() {
+            return;
+        }
+        if let Some(effect) = self.load_older_history() {
+            outcome.effects.push(effect);
+            outcome.dirty = true;
+        }
+    }
+
+    fn perform_intent(&mut self, intent: Intent) -> Outcome {
         // An overlay swallows most intents; the overlay's own intents and the
         // global escape hatches still apply.
         if self.overlay.is_some() {
@@ -181,6 +210,15 @@ impl App {
                 self.scroll.follow = true;
                 Outcome::effects(vec![])
             }
+            Intent::LoadOlderHistory => {
+                // An explicit ask, so it works even when the transcript has
+                // not been scrolled: the loaded page still lands above the
+                // viewport and the reader keeps their place.
+                match self.load_older_history() {
+                    Some(effect) => Outcome::effects(vec![effect]),
+                    None => Outcome::quiet(),
+                }
+            }
             Intent::ShowDetails => {
                 self.focus = Focus::Details;
                 Outcome::effects(vec![])
@@ -218,8 +256,18 @@ impl App {
                     self.toggle_sidebar_collapsed_for(&row.project_id);
                     return Outcome::effects(vec![]);
                 };
+                // The controller issues the load ticket before the fetch, so
+                // the snapshot is applied in the generation it was requested
+                // for and live events for the session stop being stale.
+                let ticket = match self.agent.begin_session_load(session_id.clone()) {
+                    Ok(ticket) => ticket,
+                    Err(error) => {
+                        self.toast(Toast::danger(error.message));
+                        return Outcome::quiet();
+                    }
+                };
                 self.open_session(session_id.clone());
-                Outcome::effects(vec![Effect::OpenSession { session_id }])
+                Outcome::effects(vec![Effect::OpenSession { session_id, ticket }])
             }
             Intent::EnterSession => {
                 let outcome = self.perform(Intent::OpenSelectedSession);
@@ -2306,6 +2354,101 @@ impl ElicitationDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibex_core::VibexSessionId;
+
+    /// An app whose Agent capabilities are advertised, which the disconnected
+    /// facade is not: the reducer must be able to issue an older-page request
+    /// for the trigger under test.
+    fn capable_app() -> App {
+        let backend = std::sync::Arc::new(vibex_backend::DisconnectedBackend);
+        let facade = vibex_backend::BackendFacade::new(
+            vibex_backend::BackendCapabilitySnapshot::desktop_native_v1(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend,
+        );
+        let mut app = App::new(facade, crate::app::AppOptions::default());
+        app.resize(100, 30);
+        app
+    }
+
+    fn history_item(session_id: &VibexSessionId, sequence: i64) -> vibex_core::TimelineItem {
+        vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: 1_000 + sequence,
+            source: vibex_core::TimelineSource::User,
+            kind: vibex_core::TimelineItemKind::UserMessage,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload: vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: format!("message {sequence}"),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn reaching_the_top_of_the_transcript_asks_for_older_history_once() {
+        let mut app = capable_app();
+        let session_id = VibexSessionId::new();
+        app.navigate_to(Page::Agent);
+        app.agent.state.selected_session_id = Some(session_id.clone());
+        app.agent.state.timeline.replace_authoritative(
+            session_id.clone(),
+            [history_item(&session_id, 3), history_item(&session_id, 4)],
+        );
+        app.agent.state.timeline_has_older = true;
+
+        // No scrolling intent, no request.
+        assert!(app.perform(Intent::ScrollPageDown).effects.is_empty());
+
+        // The explicit key asks for the page below the oldest loaded item even
+        // while the transcript is still following the tail.
+        let explicit = app.perform(Intent::LoadOlderHistory);
+        let [Effect::LoadOlder { ticket }] = explicit.effects.as_slice() else {
+            panic!(
+                "expected one older-page request, got {:?}",
+                explicit.effects
+            );
+        };
+        assert_eq!(ticket.session_id, session_id);
+        assert_eq!(ticket.before_sequence, 3);
+
+        // Scrolling to the top while that request is in flight must not stack
+        // a second one.
+        app.scroll.follow = false;
+        app.scroll.offset = 0;
+        assert!(app.at_transcript_top());
+        assert!(app.perform(Intent::ScrollHalfPageUp).effects.is_empty());
+
+        // An empty page means the history is exhausted, so the trigger stops.
+        let ticket = ticket.clone();
+        let page = vibex_core::TimelinePage {
+            session_id: session_id.clone(),
+            items: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: true,
+        };
+        assert!(
+            app.agent
+                .apply_timeline_before(&ticket, Ok(page))
+                .expect("an empty page is not an error")
+        );
+        assert!(!app.at_transcript_top());
+        assert!(app.perform(Intent::ScrollHalfPageUp).effects.is_empty());
+    }
 
     #[test]
     fn every_response_kind_resolves_to_an_advertised_option() {

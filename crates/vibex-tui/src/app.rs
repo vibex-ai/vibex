@@ -1149,23 +1149,71 @@ impl App {
     }
 
     /// Rebuild the transcript from the shared controller's projection.
+    ///
+    /// A prepend grows the content above the viewport, so the reader's place
+    /// is anchored to the block that was under the first visible line rather
+    /// than to the absolute line offset it used to sit at.
     pub fn sync_transcript(&mut self) {
         let view = self
             .agent
             .state
             .view(&self.projection.sidebar, "", self.shell);
         self.projection.rows = view.timeline_rows.clone();
-        let blocks = view.timeline_rows.iter().map(block_from_row).collect();
+        let blocks: Vec<Block> = view.timeline_rows.iter().map(block_from_row).collect();
+        // A prepend is the only change that moves the content under the
+        // viewport, and it is recognisable from the head alone: the block that
+        // used to start the transcript now sits further down. An append, a
+        // streamed update, or an in-place replacement leaves the line offset
+        // exact, so the anchor lookup — which lays the whole transcript out —
+        // only runs when it can be needed.
+        let prepended = !self.scroll.follow
+            && self
+                .transcript
+                .block(0)
+                .is_some_and(|head| blocks.first().is_some_and(|first| first.id != head.id));
+        let anchor = if prepended {
+            self.transcript
+                .block_at_line(self.scroll.offset)
+                .and_then(|index| self.transcript.block(index).map(|block| block.id.clone()))
+        } else {
+            None
+        };
         let change = self.transcript.set_blocks(blocks);
         if change.appended > 0 {
             // New content resumes following unless the user scrolled away.
             if self.scroll.follow {
                 self.scroll.offset = 0;
+            } else if let Some(offset) = anchor
+                .as_deref()
+                .and_then(|id| self.transcript.index_of_block(id))
+                .map(|index| self.transcript.offset_of_block(index))
+            {
+                self.scroll.offset = offset;
             }
         }
         // Streaming content can add or invalidate matches, so an open search
         // is re-run rather than left pointing at blocks that have changed.
         self.refresh_search_matches();
+    }
+
+    /// Ask for one more page of older history, if there is one to ask for.
+    ///
+    /// The controller refuses when nothing is selected, when the projection
+    /// already starts at sequence 0, or when an older page is already in
+    /// flight, so a caller may offer this on every scroll gesture.
+    pub fn load_older_history(&mut self) -> Option<Effect> {
+        let ticket = self.agent.begin_timeline_before().ok()?;
+        Some(Effect::LoadOlder { ticket })
+    }
+
+    /// Whether the reader is parked at the very top of a scrolled transcript.
+    pub fn at_transcript_top(&self) -> bool {
+        self.page == Page::Agent
+            && self.overlay.is_none()
+            && !self.filtering
+            && !self.scroll.follow
+            && self.scroll.offset == 0
+            && self.agent.state.timeline_has_older
     }
 
     /// Open the transcript search bar.
@@ -1839,8 +1887,15 @@ pub enum Effect {
     },
     OpenSession {
         session_id: VibexSessionId,
+        /// Issued by the shared controller before the fetch starts, so the
+        /// snapshot lands in the generation it was requested for.
+        ticket: vibex_ui::AgentSessionLoadTicket,
     },
     RefreshTimeline,
+    /// Fetch one page of timeline history below the ticket's cursor.
+    LoadOlder {
+        ticket: vibex_ui::AgentTimelineBeforeTicket,
+    },
     ListRuntimeOptions,
     CreateSession {
         workspace_root: String,
@@ -2048,6 +2103,7 @@ impl Effect {
             Effect::ListSessions { .. } => "sessions",
             Effect::OpenSession { .. } => "open_session",
             Effect::RefreshTimeline => "timeline",
+            Effect::LoadOlder { .. } => "older_timeline",
             Effect::ListRuntimeOptions => "runtime_options",
             Effect::CreateSession { .. } => "create_session",
             Effect::RenameSession { .. } => "rename_session",
