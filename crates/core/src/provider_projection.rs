@@ -41,7 +41,7 @@ pub const ZCODE_PROJECTION_DESCRIPTOR_ID: &str = "projection_zcode_private_confi
 
 const CLAUDE_AGENT_ID: &str = "claude";
 const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
-const CLAUDE_ADAPTER_VERSION: &str = "0.71.0";
+const CLAUDE_ADAPTER_VERSION: &str = "0.84.0";
 pub const CLAUDE_COMPATIBLE_ADAPTER_VERSION_REQUIREMENT: &str = ">=0.71.0";
 const CODEX_AGENT_ID: &str = "codex";
 const CODEX_ADAPTER_ID: &str = "codex-acp";
@@ -57,8 +57,12 @@ const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
 pub const ZCODE_ADAPTER_VERSION: &str = "0.37.1";
 /// Automatic provider projection remains available after an Agent upgrade
 /// once the runtime is at least the first verified version for its descriptor.
+///
+/// The pin and the floor are separate statements: the pin moves to the release
+/// Vibex verifies, installs, and rolls back to, while the floor stays on the
+/// oldest runtime the inline-provider projection still supports.
 pub const OPENCODE_COMPATIBLE_VERSION_REQUIREMENT: &str = ">=1.17.9";
-pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.18.11";
+pub const OPENCODE_LAST_VERIFIED_VERSION: &str = "1.18.33";
 
 const MAX_DISPLAY_NAME_LEN: usize = 160;
 const MAX_MODEL_COUNT: usize = 512;

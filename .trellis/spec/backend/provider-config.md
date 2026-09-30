@@ -4011,23 +4011,64 @@ ResolvedAgentProviderProjection {
   semantic versions: Copilot `>=1.0.78`, CodeWhale `>=0.8.55`, crow-cli
   `>=0.1.23`, DeepSeek Harness ACP `>=0.4.32`, Dirac `>=0.4.1`, Factory Droid
   `>=0.153.1`, Goose `>=1.33.1`,
-  Grok `>=0.2.11`, Hermes `>=0.19.0`, Kilo
+  Grok `>=1.0.8`, Hermes `>=0.19.0`, Kilo
   `>=7.2.40`, Kimi `>=1.49.0`, Mistral Vibe `>=2.9.3`, Poolside `>=1.0.0`,
   Pi `>=0.0.33`, Qwen Code `>=0.18.4`, Stakpak `>=0.3.80`, and VT Code
   `>=0.96.14`. Older, missing, manual, or non-semantic versions never inherit
   these schemas.
 - The catalog version is the pin — the release Vibex verifies, installs, and
   rolls back to — and the compatibility floor is a separate statement. They
-  are the same value unless the catalog entry declares
-  `compatible_version`, which it does only when a newer release changed a wire
-  detail and Vibex kept a read-back shim for the older spelling. DeepSeek
-  Harness is the one such Agent: the pin is `0.4.33` while the floor stays
-  `0.4.32`, because `0.4.33` qualifies every ACP model option id as
-  `route::model` and Vibex answers that spelling with a read-back alias rather
-  than dropping `0.4.32`. Bumping the pin alone must not raise the floor: an
-  already-installed runtime below the pin but at or above the floor keeps the
-  typed projection instead of collapsing to the conservative surface with
-  `agent_projection_version_mismatch`.
+  are the same value unless the entry declares `compatible_version`, or, for a
+  builtin, unless the projection gates on its own version-requirement constant.
+  Bumping the pin alone must not raise the floor: an already-installed runtime
+  below the pin but at or above the floor keeps the typed projection instead of
+  collapsing to the conservative surface with
+  `agent_projection_version_mismatch`. Two kinds of Agent sit above their floor:
+  - Agents whose newer release changed a wire detail, where Vibex answers the
+    older spelling with a read-back shim. DeepSeek Harness is the reference: the
+    pin is `0.4.33` while the floor stays `0.4.32`, because `0.4.33` qualifies
+    every ACP model option id as `route::model` and Vibex answers that spelling
+    with a read-back alias rather than dropping `0.4.32`.
+  - Agents whose pin moved forward on a review that found no change to the
+    projection contract: CodeBuddy `2.160.0` over `>=2.109.0`, Copilot `1.0.89`
+    over `>=1.0.78`, Gemini `0.62.0` over `>=0.47.0`, Grok `1.0.44` over
+    `>=1.0.8`, Pi `0.0.34` over `>=0.0.33`, and Claude Code, whose adapter pin
+    is `0.84.0` while `CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT` stays
+    `>=0.71.0` because the alias contract resolves the same `model` values in
+    both releases. The older release is still projected, so the floor stays
+    where the contract was last verified.
+- A pin stays behind its Agent's newest release when the release changes a
+  contract Vibex has to implement, not when it only changes a version string.
+  The held pins and their reasons:
+  - Codex — `codex-acp` 2.0.1 moves the compatibility identity to
+    `adapter=codex-acp@2.0.1;runtime=@openai/codex@^0.159.1`. Every quirk,
+    config alias and event enricher is registered against the exact `1.8.0`
+    identity, so all of them go stale until each is re-verified on 2.0.1.
+  - Cline — 3.0.65 resolves an initial model through
+    `resolveDefaultModelId(provider, CLINE_MODEL, catalogue)`: an id outside the
+    selected provider's catalogue is no longer used verbatim but silently
+    replaced by that provider's default. Projecting a Model through
+    `CLINE_MODEL` therefore has to validate the id against the advertised
+    catalogue first. The ACP `model` config-option write path is unchanged.
+  - Kimi — 1.52.0, the archived CLI's final release, replaces its entry point
+    with a deprecation gate that prints a migration notice and exits 0 without
+    ever speaking ACP. The pin stays on 1.49.0 until the Agent moves to the
+    successor `kimi-code` CLI, which also renames the config root and several
+    provider-type spellings.
+  - DeepSeek Harness — 0.4.35 moves the bundled runtime to `0.1.7-rc.2`, turns
+    `settings.yaml` into a one-shot import that is renamed on read, drops the
+    Chat Completions `protocol` option in favour of the Messages base URL, and
+    shrinks the default model catalogue. The settings overlay must be rewritten
+    before the pin moves.
+  - Cursor — Cursor publishes no CLI release notes for September, and its own
+    installer and Homebrew cask resolve to `2026.09.28-64d2043`, a version
+    string whose real shape carries a commit suffix this catalog does not
+    model. The pin stays on the last release with published notes and a
+    resolvable artifact rather than claiming the Registry's version, which no
+    source confirms. Antigravity is the opposite case and did move: Google
+    publishes no changelog for its ACP server either, but the ACP Registry's
+    daily protocol probes cover 1.0.0, 1.1.1 and 1.2.1 and report an identical
+    ACP surface at all three.
 - Explicit refresh may run `<binary> --version` only for these trusted binary
   names: `copilot`, `codewhale`, `crow-cli`, `goose`, `grok`, `hermes`, `kilo`,
   `kimi`, `vibe-acp`, `pool`, `stakpak`, and `vtcode`. Dirac, Factory Droid,
@@ -4225,7 +4266,7 @@ check:agent-provider-runtime[:self-test]
   `Unsupported` follows the same rule with `Unsupported` status.
 - GLM Agent `1.1.4` projects only the documented
   `ACP_GLM_BASE_URL`/`Z_AI_API_KEY`/`ACP_GLM_MODEL` environment contract.
-  CodeBuddy `2.109.0` projects only
+  CodeBuddy `2.160.0` projects only
   `CODEBUDDY_BASE_URL`/`CODEBUDDY_API_KEY`/`CODEBUDDY_MODEL`. Both are
   process-scoped, restart-based, and remain `Documented` until a real smoke
   confirms the effective provider and model.

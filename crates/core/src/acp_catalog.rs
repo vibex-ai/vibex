@@ -75,10 +75,17 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "antigravity",
         "Google Antigravity",
         "Google's AI coding agent connected through its first-party ACP server",
-        "1.0.0",
+        // Google publishes no changelog for the ACP server, so this pin rests on
+        // the ACP Registry's daily protocol probes: 1.0.0, 1.1.1 and 1.2.1 report
+        // the same protocolVersion, auth methods, capabilities and method
+        // results, and launch the same `agy_acp_server.par --uid=`. Only the
+        // release archive changed its name at 1.2.0, which does not reach Vibex
+        // because the archive URL comes from the Registry rather than a template.
+        "1.2.1",
         "https://antigravity.google/docs/ide/extensions",
         &["agy_acp_server"],
-    ),
+    )
+    .with_compatible_version("1.0.0"),
     AcpAgentCatalogEntry::new(
         "amp-acp",
         "Amp",
@@ -108,23 +115,25 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "copilot",
         "GitHub Copilot",
         "GitHub Copilot CLI agent connected through ACP",
-        "1.0.78",
+        "1.0.89",
         "https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli",
         &["copilot", "--acp"],
-    ),
+    )
+    .with_compatible_version("1.0.78"),
     AcpAgentCatalogEntry::new(
         "codebuddy-code",
         "Codebuddy",
         "Tencent Cloud's official intelligent coding tool",
-        "2.109.0",
+        "2.160.0",
         "https://www.codebuddy.cn/cli/",
         &[
             "npx",
             "-y",
-            "@tencent-ai/codebuddy-code@2.109.0",
+            "@tencent-ai/codebuddy-code@2.160.0",
             "--acp",
         ],
-    ),
+    )
+    .with_compatible_version("2.109.0"),
     AcpAgentCatalogEntry::new(
         "codewhale",
         "CodeWhale",
@@ -145,6 +154,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "cursor",
         "Cursor",
         "Cursor's coding agent",
+        // The ACP Registry advertises `2026.09.26`, but Cursor publishes no
+        // CLI release notes for September and its own installer and Homebrew
+        // cask both resolve to `2026.09.28-64d2043` — a version string whose
+        // real shape carries a commit suffix this catalog does not model. The
+        // pin stays on the last release with published notes and a resolvable
+        // artifact rather than claiming a version nobody can point at.
         "2026.03.30",
         "https://docs.cursor.com/en/cli/overview",
         &["cursor-agent", "acp"],
@@ -222,10 +237,11 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "gemini",
         "Gemini CLI",
         "Google's official CLI for Gemini",
-        "0.47.0",
+        "0.62.0",
         "https://geminicli.com",
-        &["npx", "-y", "@google/gemini-cli@0.47.0", "--acp"],
-    ),
+        &["npx", "-y", "@google/gemini-cli@0.62.0", "--acp"],
+    )
+    .with_compatible_version("0.47.0"),
     AcpAgentCatalogEntry::new(
         "glm-acp-agent",
         "GLM Agent",
@@ -246,10 +262,15 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "grok",
         "Grok Build",
         "xAI's Grok Build agentic coding CLI with plan mode and parallel subagents. Requires a SuperGrok or X Premium+ subscription.",
-        "1.0.8",
+        // The registry's newest grok build is 1.0.45, which xAI publishes only
+        // on its alpha and enterprise channels; `https://x.ai/cli/stable` and
+        // the public changelog both stop at 1.0.44. Pin the release with a
+        // published channel and release notes instead of the unreviewed build.
+        "1.0.44",
         "https://docs.x.ai/build/overview",
         &["grok", "agent", "stdio"],
-    ),
+    )
+    .with_compatible_version("1.0.8"),
     AcpAgentCatalogEntry::new(
         "hermes",
         "Hermes",
@@ -286,6 +307,12 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "kimi",
         "Kimi Code CLI",
         "Moonshot AI's open-source terminal coding agent",
+        // 1.52.0 is the archived CLI's final release, and its entry point is a
+        // deprecation gate: `kimi acp` prints a migration notice and exits 0
+        // without ever speaking ACP, so the pin cannot move to it. The agent is
+        // end-of-life upstream; staying on the last release that still serves
+        // ACP is deliberate, and migrating to the successor `kimi-code` CLI is
+        // a separate, larger change.
         "1.49.0",
         "https://github.com/MoonshotAI/kimi-cli",
         &["kimi", "acp"],
@@ -333,10 +360,11 @@ const ACP_AGENT_CATALOG: &[AcpAgentCatalogEntry] = &[
         "pi",
         "Pi",
         "Pi coding agent connected through ACP",
-        "0.0.33",
+        "0.0.34",
         "https://github.com/svkozak/pi-acp",
-        &["npx", "-y", "pi-acp@0.0.33"],
-    ),
+        &["npx", "-y", "pi-acp@0.0.34"],
+    )
+    .with_compatible_version("0.0.33"),
     AcpAgentCatalogEntry::new(
         "qoder",
         "Qoder CLI",
@@ -427,8 +455,9 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "antigravity")
             .unwrap();
-        assert_eq!(antigravity.version, "1.0.0");
+        assert_eq!(antigravity.version, "1.2.1");
         assert_eq!(antigravity.command, &["agy_acp_server"]);
+        assert_eq!(antigravity.compatible_version, Some("1.0.0"));
         assert_eq!(
             entries
                 .iter()
@@ -438,8 +467,9 @@ mod tests {
             "Augment CLI"
         );
         let pi = entries.iter().find(|entry| entry.id == "pi").unwrap();
-        assert_eq!(pi.version, "0.0.33");
-        assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.33"]);
+        assert_eq!(pi.version, "0.0.34");
+        assert_eq!(pi.command, &["npx", "-y", "pi-acp@0.0.34"]);
+        assert_eq!(pi.compatible_version, Some("0.0.33"));
         let deepseek = entries
             .iter()
             .find(|entry| entry.id == "deepseek-harness")
@@ -459,9 +489,61 @@ mod tests {
             acp_agent_verified_version("deepseek-harness"),
             Some("0.4.33")
         );
-        assert_eq!(acp_agent_verified_version("gemini"), Some("0.47.0"));
+        assert_eq!(acp_agent_verified_version("gemini"), Some("0.62.0"));
         assert_eq!(acp_agent_verified_version("devin"), None);
         assert_eq!(acp_agent_verified_version("kiro"), None);
         assert_eq!(acp_agent_verified_version("not-a-catalog-agent"), None);
+    }
+
+    /// Moving a pin forward must not move the compatibility floor with it.
+    ///
+    /// The floor is a separate statement from the pin: raising it would turn an
+    /// already-installed older runtime into a conservative one, hiding the
+    /// provider editor and failing `session/new` with
+    /// `agent_projection_version_mismatch` for a release the projection still
+    /// supports. Every Agent bumped here therefore keeps its previous release as
+    /// the floor.
+    #[test]
+    fn moved_pins_keep_their_compatibility_floor() {
+        for (agent_id, pin, floor) in [
+            ("antigravity", "1.2.1", "1.0.0"),
+            ("codebuddy-code", "2.160.0", "2.109.0"),
+            ("copilot", "1.0.89", "1.0.78"),
+            ("gemini", "0.62.0", "0.47.0"),
+            ("grok", "1.0.44", "1.0.8"),
+            ("pi", "0.0.34", "0.0.33"),
+        ] {
+            let entry = acp_agent_catalog_entries()
+                .iter()
+                .find(|entry| entry.id == agent_id)
+                .unwrap_or_else(|| panic!("{agent_id} is a catalog Agent"));
+            assert_eq!(entry.version, pin, "{agent_id} pin");
+            assert_eq!(entry.compatible_version, Some(floor), "{agent_id} floor");
+            assert_eq!(acp_agent_verified_version(agent_id), Some(pin));
+        }
+    }
+
+    /// A pinned distribution spec and the entry version move together: the
+    /// parser, the install fingerprint, and the version the record reports all
+    /// read both. Rewriting only one produces an entry the installer rejects as
+    /// `agent_npm_spec_invalid` / `agent_uvx_spec_not_exact`.
+    #[test]
+    fn pinned_distribution_specs_carry_the_entry_version() {
+        for entry in acp_agent_catalog_entries() {
+            if !matches!(entry.command.first().copied(), Some("npx" | "uvx")) {
+                continue;
+            }
+            let spec = entry
+                .command
+                .get(2)
+                .unwrap_or_else(|| panic!("{} declares an exact spec", entry.id));
+            assert!(
+                spec.ends_with(&format!("@{}", entry.version))
+                    || spec.ends_with(&format!("=={}", entry.version)),
+                "{} pins {spec}, which does not carry version {}",
+                entry.id,
+                entry.version
+            );
+        }
     }
 }

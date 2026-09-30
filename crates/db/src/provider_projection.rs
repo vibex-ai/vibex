@@ -1209,7 +1209,7 @@ fn legacy_runtime_identity(
             {
                 (
                     "claude-agent-acp",
-                    Some("0.71.0".to_string()),
+                    Some("0.84.0".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,
@@ -2112,7 +2112,7 @@ mod tests {
         for (agent_id, expected_version) in [
             ("dirac", "0.4.1"),
             ("factory-droid", "0.153.1"),
-            ("pi", "0.0.33"),
+            ("pi", "0.0.34"),
             ("qwen-code", "0.18.4"),
         ] {
             let entry = acp_agent_catalog_entries()

@@ -4816,7 +4816,7 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     let mut preset = acp_catalog_preset(
         "claude-agent-acp",
         "Claude Code (ACP)",
-        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.71.0 Adapter managed by the Compatibility Registry.",
+        "Claude Code through the fixed @agentclientprotocol/claude-agent-acp@0.84.0 Adapter managed by the Compatibility Registry.",
         "claude-agent-acp",
         &[],
         &["local", "acp", "claude"],
@@ -4824,7 +4824,8 @@ fn claude_acp_preset() -> AcpProviderCatalogPreset {
     // Session modes the pinned adapter advertises unconditionally; gated
     // modes (bypassPermissions) are discovered live by the runtime
     // option catalog probe instead of being promised here. `auto` is part of
-    // the 0.71.0 catalog; the bridge clamps it per-model.
+    // the 0.84.0 catalog, which advertises the same ids as 0.71.0 did; the
+    // bridge clamps it per-model.
     preset.default_config.modes = ["default", "acceptEdits", "plan", "auto"]
         .into_iter()
         .map(ToString::to_string)
@@ -8424,7 +8425,7 @@ mod tests {
             (
                 "gemini",
                 "npx",
-                &["-y", "@google/gemini-cli@0.47.0", "--acp"][..],
+                &["-y", "@google/gemini-cli@0.62.0", "--acp"][..],
             ),
             (
                 "qwen-code",

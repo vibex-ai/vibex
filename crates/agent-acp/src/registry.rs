@@ -23,8 +23,11 @@ use crate::protocol::{
 pub const CLAUDE_AGENT_ID: &str = "claude";
 pub const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 pub const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-pub const CLAUDE_ADAPTER_VERSION: &str = "0.71.0";
-pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-fX9AmmsVzke02EH0mnD6CsVWiCsoIw3C9GagUgRMlRG2MnzztCKgziWlWqA00trChfq0vsDN6jYmNDk85hjWEw==";
+pub const CLAUDE_ADAPTER_VERSION: &str = "0.84.0";
+pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-Zhjyxvm7USDB/BAFx2L6U6rA3spJ6qwEDFbLgByzpmQMeZGuAlZPXhMcAc+Xsndj9kDh+OFJNjETRwGJCR1eTQ==";
+/// The alias contract did not move with the pin: 0.84.0 resolves the same
+/// `model` values to the same `ANTHROPIC_DEFAULT_*_MODEL`-derived picker rows
+/// that 0.71.0 did, so the floor stays where the behaviour was first verified.
 pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.71.0";
 
 pub const CODEX_AGENT_ID: &str = "codex";
@@ -940,7 +943,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         }],
         required_launch_env: Vec::new(),
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: claude-agent-acp@0.71.0",
+            "real bridge contract schema v2: claude-agent-acp@0.84.0",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
