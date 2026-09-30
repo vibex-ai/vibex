@@ -1417,6 +1417,51 @@ fn decode_action(value: Value) -> ComputerResult<EngineActionResult> {
     Ok(result.into())
 }
 
+/// Runs the helper entry point from its environment, until its parent goes
+/// away.
+///
+/// Both binaries that may host the runtime call this, so the helper has exactly
+/// one implementation: the process that spawns it is the process the operating
+/// system attaches its screen and accessibility grants to, and a second copy of
+/// this wiring is a second place to get that wrong.
+pub fn run_helper_from_environment() -> Result<(), String> {
+    let configuration = helper_config_from_environment().map_err(|error| error.to_string())?;
+    let mut engine = crate::driver::CuaDriverCli::new(
+        configuration
+            .driver
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(crate::driver::DRIVER_COMMAND)),
+    );
+    if let Some(enabled) = std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable())
+    {
+        engine = engine.with_env(
+            vibex_core::ComputerPlatform::wayland_opt_in_variable(),
+            enabled.to_string_lossy().to_string(),
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start the helper runtime: {error}"))?;
+    runtime.block_on(async move {
+        // The protocol is newline-delimited JSON over the helper's own standard
+        // streams, so the parent's death is visible as EOF.
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let stdout = tokio::io::stdout();
+        run_helper_with_engine(
+            std::sync::Arc::new(engine),
+            configuration.token,
+            configuration.owner,
+            configuration.parent_pid,
+            stdin,
+            stdout,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+}
+
 /// Everything the helper needs to start, read from its environment.
 pub struct HelperConfiguration {
     /// The token a client must present in its handshake.

@@ -11,6 +11,7 @@ qrcode.workspace = true
 tokio.workspace = true
 vibex-agent = { path = "../../crates/agent" }
 vibex-browser = { path = "../../crates/browser" }
+vibex-computer = { path = "../../crates/computer" }
 vibex-core = { path = "../../crates/core" }
 vibex-db = { path = "../../crates/db" }
 vibex-desktop-runtime = { path = "../../crates/desktop-runtime" }

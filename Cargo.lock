@@ -10863,6 +10863,7 @@ dependencies = [
  "vibex-agent",
  "vibex-browser",
  "vibex-client",
+ "vibex-computer",
  "vibex-core",
  "vibex-db",
  "vibex-desktop-runtime",

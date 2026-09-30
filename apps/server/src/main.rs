@@ -35,6 +35,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
+    // The computer-use helper is spawned by the runtime that owns the desktop
+    // session, and a headless deployment on a host with a desktop session is a
+    // supported shape. The same binary therefore serves the helper, the stdio
+    // bridge and the command line.
+    if arguments.len() == 1 && arguments[0] == "--computer-helper" {
+        if let Err(error) = vibex_computer::helper::run_helper_from_environment() {
+            eprintln!("Computer-use helper failed: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if arguments.len() == 1 && arguments[0] == "--computer-mcp" {
+        if let Err(error) = vibex_computer::stdio::run_computer_mcp_stdio() {
+            eprintln!("Computer MCP sidecar failed: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "computer")
+    {
+        match vibex_computer::cli::run(&arguments[1..]) {
+            Ok(output) => {
+                println!("{output}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                if let Some(hint) = &error.recovery_hint {
+                    eprintln!("{hint}");
+                }
+                std::process::exit(2);
+            }
+        }
+    }
     let command = Command::parse(arguments)?;
     match command {
         Command::Help => print_help(),
@@ -516,6 +552,11 @@ fn print_help() {
     println!("Usage: vibex-server [serve|status|pairing-code|revoke|config-check|tui]");
     println!("  --agent-delegation-mcp                run the Agent delegation MCP stdio sidecar");
     println!("  --browser-mcp                         run the embedded browser MCP stdio sidecar");
+    println!(
+        "  --computer-helper                     run the computer-use engine helper (spawned by the runtime)"
+    );
+    println!("  --computer-mcp                        run the computer-use MCP stdio sidecar");
+    println!("  computer <command>                    drive the desktop of a running runtime");
     println!("  serve [--no-pairing]                 run the authoritative headless runtime");
     println!("  pairing-code [--permission full-control] [--ttl-ms N]");
     println!("                                       mint a one-time code plus its pairing link");

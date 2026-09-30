@@ -118,47 +118,10 @@ fn run_tui(local: bool) {
 
 /// Runs the computer-use helper until its parent goes away.
 ///
-/// The helper is the only process that talks to the desktop driver. It
-/// authenticates before it does anything, owns a single-owner lock file,
-/// releases held input when its parent dies, and exits after thirty
-/// unauthenticated seconds.
+/// The helper entry point itself lives in the computer crate, because the
+/// headless server hosts the same helper and the wiring must exist once.
 fn run_computer_helper() -> Result<(), String> {
-    let configuration = vibex_computer::helper::helper_config_from_environment()
-        .map_err(|error| error.to_string())?;
-    let mut engine = vibex_computer::CuaDriverCli::new(
-        configuration
-            .driver
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(vibex_computer::DRIVER_COMMAND)),
-    );
-    if let Some(enable) = std::env::var_os(vibex_core::ComputerPlatform::wayland_opt_in_variable())
-    {
-        engine = engine.with_env(
-            vibex_core::ComputerPlatform::wayland_opt_in_variable(),
-            enable.to_string_lossy().to_string(),
-        );
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to start the helper runtime: {error}"))?;
-    runtime.block_on(async move {
-        // The helper's protocol is newline-delimited JSON over its own
-        // standard streams, so the parent's death is visible as EOF.
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let stdout = tokio::io::stdout();
-        vibex_computer::run_helper_with_engine(
-            std::sync::Arc::new(engine),
-            configuration.token,
-            configuration.owner,
-            configuration.parent_pid,
-            stdin,
-            stdout,
-        )
-        .await
-        .map_err(|error| error.to_string())
-    })
+    vibex_computer::helper::run_helper_from_environment()
 }
 
 fn main() {
