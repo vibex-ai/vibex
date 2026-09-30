@@ -391,6 +391,21 @@ impl Transcript {
         Some(0)
     }
 
+    /// The first block of the `turn`-th turn, for a click on the rail.
+    pub fn block_of_turn(&self, turn: usize) -> Option<usize> {
+        let mut seen: Vec<Option<&str>> = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let key = block.turn_id.as_deref();
+            if !seen.contains(&key) {
+                if seen.len() == turn {
+                    return Some(index);
+                }
+                seen.push(key);
+            }
+        }
+        None
+    }
+
     /// The line offset the viewport currently starts at.
     ///
     /// Kept in sync by [`Transcript::visible_lines`] so the rail and the

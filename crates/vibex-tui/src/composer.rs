@@ -182,6 +182,9 @@ pub struct ComposerBuffer {
     kill_buffer: String,
     /// Collapsed pastes, in buffer order.
     chips: Vec<PasteChip>,
+    /// The width the last `display_lines` call used, so a click can map a
+    /// screen row back to a wrapped row without the renderer passing it in.
+    last_display_width: usize,
 }
 
 impl Default for ComposerBuffer {
@@ -199,6 +202,7 @@ impl Default for ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            last_display_width: 80,
         }
     }
 }
@@ -220,6 +224,7 @@ impl ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            last_display_width: 80,
         }
     }
 
@@ -783,6 +788,40 @@ impl ComposerBuffer {
         self.preferred_column = None;
     }
 
+    /// Put the cursor on a display cell, for a click in the composer.
+    ///
+    /// `row` counts wrapped display rows, which is what the renderer laid out;
+    /// the mapping back to a logical line is done by walking the same wrapping
+    /// the renderer used.
+    pub fn move_cursor_to_cell(&mut self, row: u16, column: u16) {
+        let width = self.last_display_width.max(1);
+        let mut remaining = usize::from(row);
+        for line in 0..self.line_count() {
+            let (start, end) = self.line_range(line);
+            let wrapped = crate::text::wrap_text(&self.text[start..end], width);
+            let segments = wrapped.len().max(1);
+            if remaining < segments {
+                let offset = wrapped
+                    .get(remaining)
+                    .map(|segment| segment.source_start)
+                    .unwrap_or(0);
+                let segment_text = wrapped
+                    .get(remaining)
+                    .map(|segment| segment.text.clone())
+                    .unwrap_or_default();
+                let column = byte_offset_for_column(&segment_text, usize::from(column));
+                self.cursor = start + offset + column;
+                self.preferred_column = None;
+                self.break_batch();
+                return;
+            }
+            remaining -= segments;
+        }
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+        self.break_batch();
+    }
+
     /// Line index and column (in display columns) of the cursor.
     pub fn cursor_line_column(&self) -> (usize, usize) {
         let before = &self.text[..self.cursor];
@@ -963,7 +1002,8 @@ impl ComposerBuffer {
     }
 
     /// The visual lines of the buffer, wrapped to `width`.
-    pub fn display_lines(&self, width: usize) -> Vec<(String, bool)> {
+    pub fn display_lines(&mut self, width: usize) -> Vec<(String, bool)> {
+        self.last_display_width = width.max(1);
         let (cursor_line, _) = self.cursor_line_column();
         let mut out = Vec::new();
         for line in 0..self.line_count() {

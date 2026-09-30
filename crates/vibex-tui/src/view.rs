@@ -970,11 +970,16 @@ fn render_session_view(
                 .session_id
                 .as_ref()
                 .is_some_and(|session_id| app.selected_session_id() == Some(session_id));
+            let hovered = app.hover == Some((Scope::Sessions, index));
             let style = if index == selected {
                 Style::default()
                     .fg(theme.roles.background)
                     .bg(theme.roles.accent_user)
                     .add_modifier(Modifier::BOLD)
+            } else if hovered {
+                Style::default()
+                    .fg(theme.roles.foreground)
+                    .bg(theme.roles.surface_highlight)
             } else if active {
                 Style::default()
                     .fg(theme.roles.accent_user)
@@ -1016,6 +1021,12 @@ fn render_session_view(
             ListItem::new(Text::from(lines))
         })
         .collect::<Vec<_>>();
+    app.regions.list = Some(crate::app::ListRegion {
+        rect: list_area,
+        scope: Scope::Sessions,
+        rows: rows.len(),
+        first_line: 0,
+    });
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(rows.len().saturating_sub(1))));
     frame.render_stateful_widget(List::new(items), list_area, &mut state);
@@ -1226,6 +1237,14 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTh
             continue;
         }
         let is_active = active == Some(turn);
+        app.regions.turns.push((
+            Rect {
+                y: area.y + row as u16,
+                height: 1,
+                ..area
+            },
+            turn,
+        ));
         lines.push(Line::from(Span::styled(
             if is_active {
                 crate::glyphs::timeline_tick_active(tier)
@@ -1385,7 +1404,7 @@ fn render_banner(
 fn render_queue_band(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &TuiTheme,
     strings: Strings,
 ) {
@@ -1406,6 +1425,11 @@ fn render_queue_band(
             Style::default().fg(theme.roles.gray_dim),
         ));
     }
+    app.regions.queue = Some(Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    });
     let mut lines = vec![Line::from(header)];
     let visible = usize::from(area.height).saturating_sub(1);
     // Scroll the window so the cursor stays visible: a queue can be longer than
@@ -1462,7 +1486,7 @@ fn render_prompt(
 }
 
 /// The shortcut band at the very bottom.
-fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
+fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     if !Bands::is_visible(area) {
         return;
     }
@@ -1967,6 +1991,8 @@ fn render_composer(
         .fg(prefix_color)
         .add_modifier(Modifier::BOLD);
 
+    // A click anywhere in the box puts the cursor there, empty or not.
+    app.regions.composer = Some(text_area);
     if app.composer.text().is_empty() {
         // The placeholder explains the mode rather than the product: the mode is
         // the thing the reader cannot guess from an empty box.
@@ -2554,6 +2580,8 @@ fn render_management(
             };
             let style = if index == selected {
                 theme.selected()
+            } else if app.hover == Some((Scope::Management, index)) {
+                theme.base().bg(theme.roles.surface_highlight)
             } else {
                 theme.base()
             };
@@ -2563,6 +2591,12 @@ fn render_management(
             ]))
         })
         .collect::<Vec<_>>();
+    app.regions.list = Some(crate::app::ListRegion {
+        rect: inner,
+        scope: Scope::Management,
+        rows: rows.len(),
+        first_line: 0,
+    });
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(rows.len() - 1)));
     frame.render_stateful_widget(List::new(items), inner, &mut state);
@@ -2690,6 +2724,12 @@ fn render_entry_list(
             ]))
         })
         .collect::<Vec<_>>();
+    app.regions.list = Some(crate::app::ListRegion {
+        rect: inner,
+        scope: app.page.scope(),
+        rows: entries.len(),
+        first_line: 0,
+    });
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected.min(entries.len() - 1)));
     frame.render_stateful_widget(List::new(items), inner, &mut state);
@@ -3494,7 +3534,7 @@ fn category_label(category: crate::keymap::Category, strings: Strings) -> &'stat
 /// looking for and the label only confirms it. Hints that must survive a narrow
 /// terminal are pinned and drawn first, so shrinking the window degrades the bar
 /// from the least important end rather than truncating it arbitrarily.
-fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme) {
+fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &TuiTheme) {
     let scopes = app.documented_scopes();
     let bindings = app.keymap.advertised(&scopes);
     let key_style = Style::default()
@@ -3527,6 +3567,17 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &TuiTheme
             ));
         }
         first = false;
+        // The band doubles as a menu: a hint is a button whose label is the key
+        // that would do exactly the same thing.
+        app.regions.hints.push((
+            Rect {
+                x: area.x + (used - width + 1) as u16,
+                y: area.y,
+                width: width as u16,
+                height: 1,
+            },
+            binding.intent,
+        ));
         spans.push(Span::styled(binding.chord.display(), key_style));
         spans.push(Span::styled(format!(":{label}"), label_style));
     }

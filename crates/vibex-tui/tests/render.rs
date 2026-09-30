@@ -921,6 +921,72 @@ fn resetting_a_setting_asks_first_and_then_restores_the_default() {
 }
 
 #[test]
+fn the_frame_publishes_the_regions_the_mouse_needs() {
+    use vibex_tui::keymap::Scope;
+    let mut app = app(120, 40);
+    app.agent
+        .apply_sessions(Ok(vec![seeded_session("session_mouse001", "a session")]))
+        .expect("sessions apply");
+    app.perform(vibex_tui::action::Intent::GotoSessions);
+    let _ = render(&mut app, 120, 40);
+    let list = app.regions.list.expect("the session list is clickable");
+    assert_eq!(list.scope, Scope::Sessions);
+    assert!(list.rows > 0 && list.rect.height > 0);
+    // A click on the first row maps to row 0; one above the list maps to none.
+    assert_eq!(
+        vibex_tui::app::list_row_at(&list, list.rect.x + 1, list.rect.y),
+        Some(0)
+    );
+    assert_eq!(
+        vibex_tui::app::list_row_at(&list, list.rect.x + 1, list.rect.y.saturating_sub(1)),
+        None
+    );
+    assert!(
+        !app.regions.hints.is_empty(),
+        "the shortcut band is not clickable"
+    );
+
+    // The composer belongs to the session pages, and publishes its text rows
+    // there so a click can place the cursor.
+    app.navigate_to(Page::Agent);
+    let _ = render(&mut app, 120, 40);
+    assert!(app.regions.composer.is_some());
+}
+
+#[test]
+fn the_turn_rail_publishes_a_tick_per_turn() {
+    let mut app = transcript_app(120, 44);
+    // Two turns, so the rail draws ticks rather than a scrollbar.
+    let mut blocks = app.transcript.blocks().to_vec();
+    blocks[1].turn_id = Some("turn-2".to_string());
+    app.transcript.set_blocks(blocks);
+    app.scroll.follow = false;
+    app.scroll.offset = 4;
+    let _ = render(&mut app, 120, 44);
+    assert!(
+        !app.regions.turns.is_empty(),
+        "the rail published no clickable ticks"
+    );
+    let (rect, turn) = app.regions.turns[0];
+    assert!(rect.height == 1);
+    assert!(turn < app.transcript.turn_count());
+}
+
+#[test]
+fn a_composer_click_places_the_cursor() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.set_text("first line\nsecond line");
+    let _ = render(&mut app, 120, 40);
+    app.composer.move_cursor_to_cell(0, 5);
+    assert_eq!(app.composer.cursor(), 5);
+    app.composer.move_cursor_to_cell(1, 3);
+    // The second display row starts after the newline.
+    assert_eq!(&app.composer.text()[app.composer.cursor()..], "ond line");
+}
+
+#[test]
 fn the_queue_band_shows_the_cursor_and_its_keys() {
     let mut app = app(120, 40);
     app.navigate_to(Page::Agent);

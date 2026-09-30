@@ -768,6 +768,77 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             if app.overlay.is_some() {
                 return false;
             }
+            // A hint in the shortcut band is a button: clicking it runs the
+            // intent the key would have run.
+            if let Some((_, intent)) = app
+                .regions
+                .hints
+                .iter()
+                .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
+                .copied()
+            {
+                let outcome = app.perform(intent);
+                dispatch_all(worker, &outcome);
+                return true;
+            }
+            // A list row selects; a second click on the same row activates it.
+            if let Some(region) = app.regions.list
+                && let Some(index) = crate::app::list_row_at(&region, mouse.column, mouse.row)
+            {
+                let repeat = app.double_click_at(mouse.column, mouse.row);
+                app.set_selection(region.scope, index);
+                if repeat {
+                    let intent = match region.scope {
+                        crate::keymap::Scope::Sessions => {
+                            crate::action::Intent::OpenSelectedSession
+                        }
+                        crate::keymap::Scope::Management => {
+                            crate::action::Intent::OpenManagementSection
+                        }
+                        _ => crate::action::Intent::ActivateSetting,
+                    };
+                    let outcome = app.perform(intent);
+                    dispatch_all(worker, &outcome);
+                }
+                return true;
+            }
+            // A turn tick scrolls to that turn.
+            if let Some((_, turn)) = app
+                .regions
+                .turns
+                .iter()
+                .find(|(rect, _)| rect_contains(*rect, mouse.column, mouse.row))
+                .copied()
+            {
+                let block = app.transcript.block_of_turn(turn);
+                if let Some(block) = block {
+                    app.scroll.follow = false;
+                    app.scroll.offset = app.transcript.line_of_block(block);
+                    app.set_selection(crate::keymap::Scope::Agent, block);
+                }
+                return true;
+            }
+            // The queue band selects a held message.
+            if let Some(region) = app.regions.queue
+                && rect_contains(region, mouse.column, mouse.row)
+            {
+                let index = usize::from(mouse.row - region.y);
+                if index < app.queued_messages.len() {
+                    app.queue_selection = Some(index);
+                    if app.double_click_at(mouse.column, mouse.row) {
+                        app.edit_queued_message();
+                    }
+                }
+                return true;
+            }
+            // The composer places the cursor on the cell that was clicked.
+            if let Some(region) = app.regions.composer
+                && rect_contains(region, mouse.column, mouse.row)
+            {
+                app.composer
+                    .move_cursor_to_cell(mouse.row - region.y, mouse.column - region.x);
+                return true;
+            }
             if app.page != Page::Agent {
                 return false;
             }
@@ -786,6 +857,29 @@ fn handle_mouse(app: &mut App, worker: &Worker, mouse: MouseEvent) -> bool {
             app.clear_text_selection();
             app.begin_text_selection(line, column);
             true
+        }
+        MouseEventKind::Moved => {
+            let hover = app
+                .regions
+                .list
+                .as_ref()
+                .and_then(|region| {
+                    crate::app::list_row_at(region, mouse.column, mouse.row)
+                        .map(|index| (region.scope, index))
+                })
+                .or_else(|| {
+                    app.regions.queue.and_then(|region| {
+                        rect_contains(region, mouse.column, mouse.row).then_some((
+                            crate::keymap::Scope::Agent,
+                            usize::from(mouse.row - region.y),
+                        ))
+                    })
+                });
+            if app.hover != hover {
+                app.hover = hover;
+                return true;
+            }
+            false
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             let Some((line, column)) = mouse_cell_clamped(app, mouse.column, mouse.row) else {

@@ -387,6 +387,8 @@ pub struct App {
     pub session_cards: std::collections::BTreeSet<String>,
     /// The transcript search in progress, when the search bar is open.
     pub search: Option<crate::search::SearchState>,
+    /// The list row the pointer is over, so a list can show it lit.
+    pub hover: Option<(crate::keymap::Scope, usize)>,
     /// Which sent message the composer's history drawer points at.
     pub history_selection: usize,
     /// Commands run from the palette, most recent first.
@@ -453,13 +455,49 @@ pub struct Banner {
 /// The renderer is the only code that knows where a band landed, so it
 /// publishes what the mouse layer needs rather than the mouse layer
 /// recomputing the layout with a second copy of the maths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FrameRegions {
     /// The rows that actually show transcript text: the band, less the pinned
     /// header and the search bar.
     pub scrollback: ratatui::layout::Rect,
     /// The close affordance on the open modal's top border.
     pub modal_close: Option<ratatui::layout::Rect>,
+    /// The composer's text rows, for click-to-place-the-cursor.
+    pub composer: Option<ratatui::layout::Rect>,
+    /// The queue band's rows, for click-to-select.
+    pub queue: Option<ratatui::layout::Rect>,
+    /// A row-per-index list the frame drew: its rect and the scope it selects
+    /// in. Clicking row `n` selects entry `n`.
+    pub list: Option<ListRegion>,
+    /// The turn rail's ticks, one rect per turn.
+    pub turns: Vec<(ratatui::layout::Rect, usize)>,
+    /// The shortcut band's hints, so a click runs the same intent as the key.
+    pub hints: Vec<(ratatui::layout::Rect, crate::action::Intent)>,
+}
+
+/// A clickable list drawn by a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListRegion {
+    pub rect: ratatui::layout::Rect,
+    pub scope: crate::keymap::Scope,
+    /// Row indices that are selectable, in screen order. A list with group
+    /// headers has fewer selectable rows than it has lines.
+    pub rows: usize,
+    /// Lines between the top of the rect and the first selectable row.
+    pub first_line: usize,
+}
+
+/// Which row a pointer is over, if any.
+pub fn list_row_at(region: &ListRegion, column: u16, row: u16) -> Option<usize> {
+    if column < region.rect.x
+        || column >= region.rect.right()
+        || row < region.rect.y
+        || row >= region.rect.bottom()
+    {
+        return None;
+    }
+    let index = usize::from(row - region.rect.y).checked_sub(region.first_line)?;
+    (index < region.rows).then_some(index)
 }
 
 /// A free-text selection over the transcript, in display coordinates.
@@ -601,6 +639,7 @@ impl App {
             draft_clear_armed: false,
             session_cards: std::collections::BTreeSet::new(),
             search: None,
+            hover: None,
             history_selection: 0,
             recent_commands: Vec::new(),
             text_selection: None,
@@ -1187,6 +1226,22 @@ impl App {
         self.recent_commands.retain(|candidate| candidate != &id);
         self.recent_commands.insert(0, id);
         self.recent_commands.truncate(MAX_RECENT_COMMANDS);
+    }
+
+    /// Whether this click is the second of a double click.
+    ///
+    /// Shared by every clickable surface: a row, a queue entry, a transcript
+    /// block. The window is the usual one, and the cell must match, so two
+    /// clicks on different rows stay two clicks.
+    pub fn double_click_at(&mut self, column: u16, row: u16) -> bool {
+        let now = std::time::Instant::now();
+        let repeat = self.last_click.is_some_and(|(at, last_line, last_column)| {
+            last_line == usize::from(row)
+                && last_column == column
+                && now.duration_since(at) < std::time::Duration::from_millis(400)
+        });
+        self.last_click = (!repeat).then_some((now, usize::from(row), column));
+        repeat
     }
 
     // ---- the send queue --------------------------------------------------
