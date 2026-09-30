@@ -2629,13 +2629,15 @@ impl AppOptions {
 /// Whether a projected row earns a row in the transcript.
 ///
 /// A timeline carries bookkeeping as well as conversation, and a character grid
-/// pays for every line it shows: a plan update is already rendered by the dock,
-/// and the *resolution* of an approval is visible in the request that stays on
-/// screen. Drawing them again costs the reader the thing they are reading for.
+/// pays for every line it shows. A plan is already on screen twice — as a
+/// progress band with the running step, and in full in the dock — and the
+/// *resolution* of an approval is visible in the request that stays on screen.
+/// Drawing them again costs the reader the thing they are reading for.
 pub fn row_is_rendered(row: &TimelineRow) -> bool {
     !matches!(
         row.kind,
         vibex_desktop_model::TimelineRowKind::TodoUpdate
+            | vibex_desktop_model::TimelineRowKind::Plan
             | vibex_desktop_model::TimelineRowKind::PermissionResolution
             | vibex_desktop_model::TimelineRowKind::ElicitationResolution
     )

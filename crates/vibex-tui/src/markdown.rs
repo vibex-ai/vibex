@@ -218,10 +218,7 @@ pub fn freeze_point(source: &str, from: usize) -> usize {
             previous = Some(text);
             continue;
         }
-        if text.trim().is_empty()
-            && !fence_open
-            && previous.is_some_and(|previous| is_top_level_block_end(previous))
-        {
+        if text.trim().is_empty() && !fence_open && previous.is_some_and(is_top_level_block_end) {
             // Freeze after the blank line: the paragraph break belongs to the
             // frozen part, so the tail never starts with an empty row.
             checkpoint = offset;
