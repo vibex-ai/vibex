@@ -946,6 +946,12 @@ pub static DEFAULT_BINDINGS: &[Binding] = &[
     // larger edits (kill, redo, word motion).
     binding(
         Scope::Composer,
+        Chord::new(KeyCode::Char('i'), KeyModifiers::ALT),
+        Intent::AttachImage,
+        "Image",
+    ),
+    binding(
+        Scope::Composer,
         Chord::new(KeyCode::Char('a'), KeyModifiers::ALT),
         Intent::SelectAllDraft,
         "Select all",

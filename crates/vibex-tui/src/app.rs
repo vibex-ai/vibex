@@ -187,6 +187,7 @@ pub enum PromptField {
     DeviceRevokeReason,
     RestoreBackupId,
     WorktreeBranch,
+    ImagePath,
 }
 
 /// A transient status message.
@@ -363,6 +364,18 @@ pub struct ProjectionState {
     pub sidebar_collapsed: bool,
 }
 
+/// A message waiting for the running turn to end.
+///
+/// It carries its images, because "send this later" must send the same thing
+/// the reader composed, and the composer is emptied the moment it is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMessage {
+    pub text: String,
+    /// The pre-wire form of the images, so pulling the message back into the
+    /// composer restores exactly what was there.
+    pub images: Vec<crate::composer::ImageAttachment>,
+}
+
 /// The whole application.
 pub struct App {
     pub facade: BackendFacade,
@@ -465,7 +478,7 @@ pub struct App {
     /// from two clicks in different ones.
     pub last_click: Option<(std::time::Instant, usize, u16)>,
     /// Messages held back until the running turn ends.
-    pub queued_messages: Vec<String>,
+    pub queued_messages: Vec<QueuedMessage>,
     /// Which queued message the queue band's cursor is on.
     pub queue_selection: Option<usize>,
     /// A transient message above the composer, dismissed on the next key.
@@ -1370,9 +1383,9 @@ impl App {
                     self.queued_messages
                         .iter()
                         .enumerate()
-                        .map(|(index, text)| DockRow::Queue {
+                        .map(|(index, message)| DockRow::Queue {
                             index,
-                            text: text.lines().next().unwrap_or_default().to_string(),
+                            text: message.text.lines().next().unwrap_or_default().to_string(),
                         }),
                 );
             }
@@ -1863,7 +1876,12 @@ impl App {
 
     /// Hold a message until the running turn ends.
     pub fn enqueue_message(&mut self, text: String) {
-        self.queued_messages.push(text);
+        self.enqueue(text, Vec::new());
+    }
+
+    /// Hold a message -- text and images together -- until the turn ends.
+    pub fn enqueue(&mut self, text: String, images: Vec<crate::composer::ImageAttachment>) {
+        self.queued_messages.push(QueuedMessage { text, images });
         self.queue_selection = Some(self.queued_messages.len() - 1);
     }
 
@@ -1886,7 +1904,7 @@ impl App {
         else {
             return false;
         };
-        let text = self.queued_messages.remove(index);
+        let queued = self.queued_messages.remove(index);
         self.queue_selection = if self.queued_messages.is_empty() {
             None
         } else {
@@ -1895,10 +1913,17 @@ impl App {
         // A draft already in the composer is not thrown away: it goes to the
         // front of the queue, which is where the reader would look for it.
         let draft = self.composer.text().to_string();
-        if !draft.trim().is_empty() {
-            self.queued_messages.insert(index, draft);
+        let images = self.composer.images();
+        if !draft.trim().is_empty() || !images.is_empty() {
+            self.queued_messages.insert(
+                index,
+                QueuedMessage {
+                    text: draft,
+                    images,
+                },
+            );
         }
-        self.composer.set_text(text);
+        self.composer.set_draft(queued.text, queued.images);
         self.focus = Focus::Composer;
         self.composer_mode = ComposerMode::Normal;
         true
@@ -1939,17 +1964,22 @@ impl App {
     }
 
     /// Take the selected queued message out, to be sent immediately.
-    pub fn take_queued_message(&mut self) -> Option<String> {
+    pub fn take_queued_message(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
         let index = self
             .queue_selection
             .filter(|index| *index < self.queued_messages.len())?;
-        let text = self.queued_messages.remove(index);
+        let queued = self.queued_messages.remove(index);
         self.queue_selection = if self.queued_messages.is_empty() {
             None
         } else {
             Some(index.min(self.queued_messages.len() - 1))
         };
-        Some(text)
+        let attachments = queued
+            .images
+            .iter()
+            .map(crate::composer::message_attachment)
+            .collect();
+        Some((queued.text, attachments))
     }
 
     /// Send the next held message once the turn has ended.
@@ -1957,21 +1987,26 @@ impl App {
     /// Called after every worker message rather than on a special "turn ended"
     /// event: the client has no such event, and a queue that only drains on one
     /// signal would stall the moment that signal changed shape.
-    pub fn drain_queue(&mut self) -> Option<String> {
+    pub fn drain_queue(&mut self) -> Option<(String, Vec<vibex_core::MessageAttachment>)> {
         if self.queued_messages.is_empty() || self.session_running() {
             return None;
         }
         if !self.live.is_live() {
             return None;
         }
-        let text = self.queued_messages.remove(0);
+        let queued = self.queued_messages.remove(0);
         self.queue_selection = if self.queued_messages.is_empty() {
             None
         } else {
             Some(0)
         };
-        self.history.push(text.clone());
-        Some(text)
+        self.history.push(queued.text.clone());
+        let attachments = queued
+            .images
+            .iter()
+            .map(crate::composer::message_attachment)
+            .collect();
+        Some((queued.text, attachments))
     }
 
     // ---- composer history search ----------------------------------------
@@ -2173,6 +2208,61 @@ impl App {
             message,
             dirty: dirty || self.keymap.is_overridden(intent),
         });
+    }
+
+    /// Whether a paste is a path to an image file, and should be attached.
+    ///
+    /// Only a single existing file with an image extension qualifies: anything
+    /// else — a paragraph, a list of paths, a directory — is text the reader
+    /// meant to put in the draft.
+    pub fn image_path_from_paste(text: &str) -> Option<String> {
+        let trimmed = text.trim().trim_matches('"');
+        if trimmed.is_empty() || text.contains('\n') || trimmed.len() > 4096 {
+            return None;
+        }
+        crate::composer::image_mime_for_path(trimmed)?;
+        std::path::Path::new(trimmed)
+            .is_file()
+            .then(|| trimmed.to_string())
+    }
+
+    /// Attach an image from a path on the authority host or the local machine.
+    pub fn attach_image_path(&mut self, path: &str) -> Result<String, String> {
+        let trimmed = path.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            return Err(self.strings.image_not_found().to_string());
+        }
+        let Some(mime) = crate::composer::image_mime_for_path(trimmed) else {
+            return Err(self.strings.image_unsupported().to_string());
+        };
+        let metadata = std::fs::metadata(trimmed)
+            .map_err(|_| format!("{}: {trimmed}", self.strings.image_not_found()))?;
+        if metadata.len() as usize > crate::composer::IMAGE_MAX_BYTES {
+            return Err(self.strings.image_too_large().to_string());
+        }
+        self.composer
+            .insert_image(
+                mime,
+                crate::composer::ImageSource::Path(trimmed.to_string()),
+            )
+            .ok_or_else(|| self.strings.image_cap().to_string())
+    }
+
+    /// Attach an image whose bytes were read from the clipboard.
+    pub fn attach_image_bytes(
+        &mut self,
+        mime_type: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Result<String, String> {
+        if bytes.len() > crate::composer::IMAGE_MAX_BYTES {
+            return Err(self.strings.image_too_large().to_string());
+        }
+        self.composer
+            .insert_image(
+                mime_type,
+                crate::composer::ImageSource::Bytes(std::sync::Arc::new(bytes)),
+            )
+            .ok_or_else(|| self.strings.image_cap().to_string())
     }
 
     /// Put the selected binding back on its default chord.
@@ -2497,16 +2587,24 @@ pub enum Effect {
     SendMessage {
         session_id: VibexSessionId,
         text: String,
+        /// Images the prompt carries, in the order they were attached.
+        attachments: Vec<vibex_core::MessageAttachment>,
     },
     ContinueTurn {
         session_id: VibexSessionId,
     },
+    /// Ask the host for an image on the system clipboard.
+    ///
+    /// Reading a clipboard is I/O and belongs to the worker; the reducer asks
+    /// and gets an [`crate::worker::AppMessage::ClipboardImage`] back.
+    ReadClipboardImage,
     Interrupt {
         session_id: VibexSessionId,
     },
     SteerMessage {
         session_id: VibexSessionId,
         text: String,
+        attachments: Vec<vibex_core::MessageAttachment>,
         fallback_to_resend: bool,
     },
     ResolvePermission {
@@ -2689,6 +2787,7 @@ impl Effect {
             Effect::ArchiveSession { .. } => "archive_session",
             Effect::DeleteSession { .. } => "delete_session",
             Effect::ForkSession { .. } => "fork_session",
+            Effect::ReadClipboardImage => "read_clipboard_image",
             Effect::SendMessage { .. } => "send_message",
             Effect::ContinueTurn { .. } => "continue_turn",
             Effect::Interrupt { .. } => "interrupt",
@@ -2834,6 +2933,68 @@ mod tests {
                 .next()
                 .is_none(),
             "an app without a path still wrote something"
+        );
+    }
+
+    #[test]
+    fn only_an_existing_image_file_is_a_pasted_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let shot = directory.path().join("shot.png");
+        std::fs::write(&shot, b"png").unwrap();
+        let notes = directory.path().join("notes.txt");
+        std::fs::write(&notes, b"words").unwrap();
+
+        assert_eq!(
+            App::image_path_from_paste(&format!("  {}  ", shot.display())),
+            Some(shot.display().to_string())
+        );
+        // A text file, a file that does not exist, and a paragraph are all
+        // text the reader meant to type.
+        assert_eq!(
+            App::image_path_from_paste(&notes.display().to_string()),
+            None
+        );
+        assert_eq!(
+            App::image_path_from_paste(&directory.path().join("gone.png").display().to_string()),
+            None
+        );
+        assert_eq!(
+            App::image_path_from_paste(&format!("look at {}\nand this", shot.display())),
+            None
+        );
+        assert_eq!(App::image_path_from_paste(""), None);
+    }
+
+    #[test]
+    fn a_queued_message_keeps_its_images_when_it_is_pulled_back() {
+        let mut app = arrangement_app(&tempfile::tempdir().unwrap().path().join("unused.json"));
+        app.composer.insert_str("see this ");
+        app.composer
+            .insert_image(
+                "image/png",
+                crate::composer::ImageSource::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
+            )
+            .expect("the image attaches");
+        let (text, images) = app.composer.take_with_attachments();
+        app.enqueue(text, images);
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.queued_messages[0].images.len(), 1);
+
+        // Pulling it back restores the picture, not just the words.
+        app.queue_selection = Some(0);
+        assert!(app.edit_queued_message());
+        assert_eq!(app.composer.image_count(), 1);
+        assert!(app.composer.text().contains("[Image #1]"));
+
+        // And holding it again carries it a second time.
+        let (text, images) = app.composer.take_with_attachments();
+        app.enqueue(text, images);
+        app.live = LiveState::Ready;
+        let drained = app.drain_queue().expect("the queue releases the message");
+        assert_eq!(drained.1.len(), 1);
+        assert_eq!(
+            drained.1[0].uri.as_deref(),
+            Some("data:image/png;base64,AQID")
         );
     }
 

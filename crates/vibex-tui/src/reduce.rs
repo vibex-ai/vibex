@@ -515,7 +515,7 @@ impl App {
                 Outcome::effects(vec![])
             }
             Intent::QueueSendNow => {
-                let Some(text) = self.take_queued_message() else {
+                let Some((text, attachments)) = self.take_queued_message() else {
                     return Outcome::quiet();
                 };
                 let Some(session_id) = self.selected_session_id().cloned() else {
@@ -531,9 +531,14 @@ impl App {
                     });
                 }
                 self.history.push(text.clone());
-                effects.push(Effect::SendMessage { session_id, text });
+                effects.push(Effect::SendMessage {
+                    session_id,
+                    text,
+                    attachments,
+                });
                 Outcome::effects(effects)
             }
+            Intent::AttachImage => Outcome::effects(vec![Effect::ReadClipboardImage]),
             Intent::ToggleDock => {
                 self.dock_open = !self.dock_open;
                 if self.dock_open {
@@ -1333,6 +1338,16 @@ impl App {
             PromptField::WorkspacePath => {
                 Outcome::effects(vec![Effect::OpenWorkspace { root_path: trimmed }])
             }
+            PromptField::ImagePath => {
+                match self.attach_image_path(&trimmed) {
+                    Ok(label) => {
+                        let message = format!("{} {label}", self.strings.image_attached());
+                        self.toast(Toast::success(message));
+                    }
+                    Err(error) => self.toast(Toast::warning(error)),
+                }
+                Outcome::effects(vec![])
+            }
             PromptField::CommitMessage => {
                 let Some(workspace_id) = self.active_workspace_id() else {
                     return Outcome::quiet();
@@ -1770,18 +1785,26 @@ impl App {
             ));
             return Outcome::quiet();
         }
-        let text = self.composer.take_expanded();
+        let (text, images) = self.composer.take_with_attachments();
         self.completion = None;
         // A message written while a turn is running is held rather than sent:
         // the runtime would have to interleave it with work already in flight.
         if self.session_running() {
-            self.enqueue_message(text);
+            self.enqueue(text, images);
             self.toast(Toast::info(self.strings.queue_held().to_string()));
             return Outcome::effects(vec![]);
         }
         self.history.push(text.clone());
         self.scroll.follow = true;
-        Outcome::effects(vec![Effect::SendMessage { session_id, text }])
+        let attachments = images
+            .iter()
+            .map(crate::composer::message_attachment)
+            .collect();
+        Outcome::effects(vec![Effect::SendMessage {
+            session_id,
+            text,
+            attachments,
+        }])
     }
 
     fn steer_composer(&mut self) -> Outcome {
@@ -1792,7 +1815,7 @@ impl App {
         let Some(session_id) = self.selected_session_id().cloned() else {
             return Outcome::quiet();
         };
-        let text = self.composer.take_expanded();
+        let (text, images) = self.composer.take_with_attachments();
         self.history.push(text.clone());
         // Remote seats have no steering RPC, so the worker falls back to
         // interrupt + resend and says so.
@@ -1802,9 +1825,14 @@ impl App {
                 self.strings.composer_steer_unavailable().to_string(),
             ));
         }
+        let attachments = images
+            .iter()
+            .map(crate::composer::message_attachment)
+            .collect();
         Outcome::effects(vec![Effect::SteerMessage {
             session_id,
             text,
+            attachments,
             fallback_to_resend: fallback,
         }])
     }
@@ -2229,6 +2257,7 @@ pub mod payloads {
     pub fn send_message(
         session_id: vibex_core::VibexSessionId,
         text: String,
+        attachments: Vec<vibex_core::MessageAttachment>,
         desired_runtime: vibex_core::SessionRuntimeSelection,
     ) -> MutationRequest<SendAgentMessageRequest> {
         MutationRequest::new(SendAgentMessageRequest {
@@ -2236,7 +2265,7 @@ pub mod payloads {
             message_idempotency_key: RequestId::new().as_str().to_string(),
             desired_runtime,
             text,
-            attachments: Vec::new(),
+            attachments,
             reasoning_effort: None,
             correlation_id: None,
             delivery: vibex_core::UserMessageDelivery::Prompt,
@@ -2272,11 +2301,12 @@ pub mod payloads {
     pub fn steer_message(
         session_id: vibex_core::VibexSessionId,
         text: String,
+        attachments: Vec<vibex_core::MessageAttachment>,
     ) -> MutationRequest<SteerAgentMessageRequest> {
         MutationRequest::new(SteerAgentMessageRequest {
             session_id,
             text,
-            attachments: Vec::new(),
+            attachments,
             correlation_id: None,
         })
     }

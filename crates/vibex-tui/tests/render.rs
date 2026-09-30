@@ -900,6 +900,14 @@ fn a_dragged_selection_becomes_the_text_on_the_clipboard() {
     assert!(app.selected_text().is_none());
 }
 
+/// The text of each held message, for the tests that only care about words.
+fn queued_texts(app: &App) -> Vec<String> {
+    app.queued_messages
+        .iter()
+        .map(|message| message.text.clone())
+        .collect()
+}
+
 fn settings_app(width: u16, height: u16) -> App {
     let mut app = app(width, height);
     app.perform(vibex_tui::action::Intent::OpenSettings);
@@ -1012,6 +1020,41 @@ fn hiding_finished_dock_work_leaves_the_running_step() {
     assert!(
         after.contains("write the band"),
         "a running step was hidden as finished:\n{after}"
+    );
+}
+
+#[test]
+fn an_attached_image_shows_as_a_chip_and_a_count() {
+    let mut app = app(120, 40);
+    app.navigate_to(Page::Agent);
+    app.focus = vibex_tui::app::Focus::Composer;
+    app.composer.insert_str("look at this ");
+    app.composer
+        .insert_image(
+            "image/png",
+            vibex_tui::composer::ImageSource::Path("/tmp/shot.png".into()),
+        )
+        .expect("the image attaches");
+    let screen = text(&render(&mut app, 120, 40));
+    assert!(screen.contains("[Image #1]"), "{screen}");
+    // The info line turns the attachment into a number the reader can check.
+    assert!(screen.contains("1 images"), "{screen}");
+    // The label is not part of what the Agent is told in words.
+    assert_eq!(app.composer.expanded_text(), "look at this ");
+}
+
+#[test]
+fn a_pasted_image_path_attaches_instead_of_typing_the_path() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let shot = directory.path().join("shot.png");
+    std::fs::write(&shot, b"png").expect("write");
+    assert_eq!(
+        vibex_tui::app::App::image_path_from_paste(&shot.display().to_string()),
+        Some(shot.display().to_string())
+    );
+    assert_eq!(
+        vibex_tui::app::App::image_path_from_paste("just some words"),
+        None
     );
 }
 
@@ -1388,12 +1431,12 @@ fn queue_editing_moves_a_message_back_into_the_draft() {
     app.queue_selection = Some(1);
     assert!(app.edit_queued_message());
     assert_eq!(app.composer.text(), "second");
-    assert_eq!(app.queued_messages, vec!["first".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["first".to_string()]);
     // The draft that was there is not lost: it joins the queue.
     app.composer.set_text("a new draft");
     app.queue_selection = Some(0);
     assert!(app.edit_queued_message());
-    assert_eq!(app.queued_messages, vec!["a new draft".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["a new draft".to_string()]);
 }
 
 #[test]
@@ -1404,12 +1447,12 @@ fn queue_reordering_and_dropping_keep_the_cursor_sane() {
     }
     app.queue_selection = Some(1);
     assert!(app.move_queued_message(-1));
-    assert_eq!(app.queued_messages, vec!["two", "one", "three"]);
+    assert_eq!(queued_texts(&app), vec!["two", "one", "three"]);
     assert_eq!(app.queue_selection, Some(0));
     // At the top, raising again is a no-op rather than a wrap.
     assert!(!app.move_queued_message(-1));
     assert!(app.delete_queued_message());
-    assert_eq!(app.queued_messages, vec!["one", "three"]);
+    assert_eq!(queued_texts(&app), vec!["one", "three"]);
     assert_eq!(app.queue_selection, Some(0));
 }
 
@@ -1424,7 +1467,10 @@ fn a_held_message_is_sent_once_the_turn_ends() {
     app.agent.state.active_session.resolve(session.clone());
     // Idle: the queue drains immediately.
     app.enqueue_message("held".to_string());
-    assert_eq!(app.drain_queue().as_deref(), Some("held"));
+    assert_eq!(
+        app.drain_queue().map(|(text, _)| text).as_deref(),
+        Some("held")
+    );
     assert!(app.queued_messages.is_empty());
 
     // Running: nothing drains until the state changes.
@@ -1435,7 +1481,10 @@ fn a_held_message_is_sent_once_the_turn_ends() {
     assert!(app.drain_queue().is_none());
     running.state = vibex_core::AgentSessionState::Idle;
     app.agent.state.active_session.resolve(running);
-    assert_eq!(app.drain_queue().as_deref(), Some("waits"));
+    assert_eq!(
+        app.drain_queue().map(|(text, _)| text).as_deref(),
+        Some("waits")
+    );
 }
 
 #[test]

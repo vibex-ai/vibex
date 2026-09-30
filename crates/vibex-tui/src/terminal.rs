@@ -263,6 +263,85 @@ pub fn copy_to_clipboard(text: &str) -> BackendResult<()> {
         .map_err(|error| BackendError::failed("tui_clipboard_unavailable", error.to_string()))
 }
 
+/// How long a clipboard helper may take before it is killed.
+///
+/// These programs talk to a clipboard owner that may be gone; a request that
+/// has not answered in a moment is not going to.
+const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Read an image off the system clipboard, if there is one.
+///
+/// A terminal gives a client no way to ask for pixels, so this shells out to
+/// whichever clipboard tool the desktop provides: `wl-paste` on Wayland,
+/// `xclip` under X11, `pngpaste` on macOS. A machine with none of them simply
+/// has no clipboard images, which is reported as `None` rather than an error —
+/// the reader can still attach a file by path.
+pub fn read_clipboard_image() -> Option<(String, Vec<u8>)> {
+    for (program, args) in [
+        ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+        ),
+        ("pngpaste", vec!["-"]),
+    ] {
+        if let Some(bytes) = run_clipboard_command(program, &args) {
+            return Some(("image/png".to_string(), bytes));
+        }
+    }
+    None
+}
+
+/// Run one clipboard helper, with a deadline and a size cap.
+fn run_clipboard_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // The pipe fills long before an image is done, so a reader thread drains it
+    // while the parent watches the clock.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = std::time::Instant::now() + CLIPBOARD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let bytes = reader.join().unwrap_or_default();
+                if !status.success() || bytes.is_empty() {
+                    return None;
+                }
+                return Some(bytes);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // A helper that overruns is killed: the reader thread sees EOF and
+            // ends by itself.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    }
+}
+
+/// Base64 for a data URL, exposed so attachments do not grow a second copy.
+pub fn encode_base64(input: &[u8]) -> String {
+    base64_encode::encode(input)
+}
+
 /// Minimal base64 so the client does not pull a dependency for one call.
 mod base64_encode {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

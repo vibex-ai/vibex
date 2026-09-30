@@ -31,6 +31,9 @@ use crate::reduce::payloads;
 #[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
     Sessions(BackendResult<Vec<AgentSession>>),
+    /// An image off the system clipboard: its media type and bytes, or `None`
+    /// when there is none or the desktop offers no way to read one.
+    ClipboardImage(Option<(String, Vec<u8>)>),
     SessionOpened(BackendResult<Box<vibex_ui::AgentSessionSnapshot>>),
     TimelineRefreshed(BackendResult<i64>),
     RuntimeOptions(BackendResult<vibex_core::SessionRuntimeOptionCatalog>),
@@ -264,7 +267,11 @@ impl Dispatch {
                     Err(error) => self.send(AppMessage::SessionCreated(Err(error))),
                 }
             }
-            Effect::SendMessage { session_id, text } => {
+            Effect::SendMessage {
+                session_id,
+                text,
+                attachments,
+            } => {
                 let runtime = match self.current_runtime_selection().await {
                     Ok(selection) => selection,
                     Err(error) => {
@@ -272,11 +279,21 @@ impl Dispatch {
                         return;
                     }
                 };
-                let request = payloads::send_message(session_id, text, runtime);
+                let request =
+                    payloads::send_message(session_id, text, attachments.clone(), runtime);
                 match self.facade.agent().send_message(request).await {
                     Ok(_) => self.ok("send_message"),
                     Err(error) => self.failure("send_message", error),
                 }
+            }
+            Effect::ReadClipboardImage => {
+                // Talking to a clipboard owner can block for the whole
+                // deadline, so it runs off the worker's own thread.
+                let image = tokio::task::spawn_blocking(crate::terminal::read_clipboard_image)
+                    .await
+                    .ok()
+                    .flatten();
+                self.send(AppMessage::ClipboardImage(image));
             }
             Effect::ContinueTurn { session_id } => {
                 let request = payloads::continue_turn(session_id);
@@ -295,6 +312,7 @@ impl Dispatch {
             Effect::SteerMessage {
                 session_id,
                 text,
+                attachments,
                 fallback_to_resend,
             } => {
                 let supported = self
@@ -304,7 +322,7 @@ impl Dispatch {
                     .await
                     .unwrap_or(false);
                 if supported {
-                    let request = payloads::steer_message(session_id, text);
+                    let request = payloads::steer_message(session_id, text, attachments.clone());
                     match self.facade.agent().steer_message(request).await {
                         Ok(_) => self.ok("steer_message"),
                         Err(error) => self.failure("steer_message", error),
@@ -334,7 +352,8 @@ impl Dispatch {
                         return;
                     }
                 };
-                let request = payloads::send_message(session_id, text, runtime);
+                let request =
+                    payloads::send_message(session_id, text, attachments.clone(), runtime);
                 match self.facade.agent().send_message(request).await {
                     Ok(_) => self.ok("steer_message"),
                     Err(error) => self.failure("steer_message", error),

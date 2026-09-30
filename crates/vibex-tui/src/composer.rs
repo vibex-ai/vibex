@@ -139,7 +139,7 @@ impl EditKind {
 struct Snapshot {
     text: String,
     cursor: usize,
-    chips: Vec<PasteChip>,
+    chips: Vec<Chip>,
     selection: Option<DraftSelection>,
 }
 
@@ -171,21 +171,49 @@ pub struct DisplayRow {
     pub source_start: usize,
 }
 
-/// A pasted block collapsed into a label until the message is sent.
+/// A pasted block or an attached image, collapsed into a label until the
+/// message is sent.
 ///
-/// The buffer's text holds the label (`[Pasted: 42 lines]`), so everything
-/// that measures, wraps or moves the cursor keeps working unchanged; the
-/// original bytes ride alongside and are substituted back in
-/// [`ComposerBuffer::expanded_text`] on the way out. A chip is atomic: the
+/// The buffer's text holds the label (`[Pasted: 42 lines]`, `[Image #1]`), so
+/// everything that measures, wraps or moves the cursor keeps working
+/// unchanged; what the label stands for rides alongside. A chip is atomic: the
 /// cursor steps over it and one `Backspace` removes all of it, because a
 /// hundred-line paste must not be a hundred keys to undo.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PasteChip {
+struct Chip {
     /// Byte range of the label inside the buffer text.
     start: usize,
     end: usize,
     label: String,
-    content: String,
+    payload: ChipPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChipPayload {
+    /// A collapsed paste: the bytes the label stands for, put back verbatim on
+    /// the way out.
+    Paste(String),
+    /// An image the prompt carries as an attachment.
+    Image(ImageAttachment),
+}
+
+/// An image attached to the draft, before it is turned into a wire attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// `Image #1`, exactly as the label reads.
+    pub label: String,
+    pub mime_type: String,
+    pub source: ImageSource,
+}
+
+/// Where an attached image's bytes live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// A file the runtime can read itself.
+    Path(String),
+    /// Bytes read from the clipboard modelessly. Shared so that the undo
+    /// history can hold a snapshot without copying the pixels.
+    Bytes(std::sync::Arc<Vec<u8>>),
 }
 
 /// The line count at which a paste collapses into a chip.
@@ -193,6 +221,15 @@ pub const PASTE_CHIP_LINES: usize = 4;
 /// The byte size at which a paste collapses into a chip however few lines it
 /// has. A single-line minified log is still not something to put in a prompt.
 pub const PASTE_CHIP_BYTES: usize = 10_000;
+/// How many images one prompt may carry.
+///
+/// The wire accepts more, but an Agent's context does not: a dozen screenshots
+/// is a turn nobody asked for, and the reader cannot see them all in the
+/// composer.
+pub const IMAGE_CAP: usize = 10;
+/// The largest image the client will attach, matching the ACP adapter's own
+/// limit so the reader is told before the Agent silently degrades the block.
+pub const IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 /// A multi-line editable buffer with a grapheme-aligned cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +246,11 @@ pub struct ComposerBuffer {
     last_edit: Option<EditKind>,
     /// The last killed text, put back by `Ctrl+Y`.
     kill_buffer: String,
-    /// Collapsed pastes, in buffer order.
-    chips: Vec<PasteChip>,
+    /// Collapsed pastes and attached images, in buffer order.
+    chips: Vec<Chip>,
+    /// The number the next attached image gets. Monotonic for the draft, so a
+    /// label never refers to two different pictures.
+    next_image_number: u32,
     /// The draft selection, while one is being made.
     selection: Option<DraftSelection>,
     /// The width the last `display_lines` call used, so a click can map a
@@ -234,6 +274,7 @@ impl Default for ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            next_image_number: 1,
             selection: None,
             last_display_width: 80,
         }
@@ -258,6 +299,7 @@ impl ComposerBuffer {
             last_edit: None,
             kill_buffer: String::new(),
             chips: Vec::new(),
+            next_image_number: 1,
             selection: None,
             last_display_width: 80,
         }
@@ -344,7 +386,12 @@ impl ComposerBuffer {
                 continue;
             }
             out.push_str(&self.text[cursor..chip.start]);
-            out.push_str(&chip.content);
+            match &chip.payload {
+                ChipPayload::Paste(content) => out.push_str(content),
+                // What goes to the clipboard should read like the draft, and
+                // the draft shows the label.
+                ChipPayload::Image(_) => out.push_str(&chip.label),
+            }
             cursor = chip.end;
         }
         out.push_str(&self.text[cursor..end]);
@@ -551,7 +598,7 @@ impl ComposerBuffer {
             self.chips
                 .iter()
                 .position(|chip| chip.end == self.cursor || chip.start == self.cursor)
-        }) && self.chips[index].content == value
+        }) && self.chips[index].payload == ChipPayload::Paste(value.clone())
         {
             // The paste is already here, collapsed: show it rather than
             // inserting a second copy of the same bytes.
@@ -569,26 +616,31 @@ impl ComposerBuffer {
         let end = start + label.len();
         self.cursor = end;
         self.preferred_column = None;
-        self.chips.push(PasteChip {
+        self.chips.push(Chip {
             start,
             end,
             label,
-            content: value,
+            payload: ChipPayload::Paste(value),
         });
         self.chips.sort_by_key(|chip| chip.start);
         self.record(EditKind::Block);
         true
     }
 
-    /// Replace one chip's label with its content, in place.
+    /// Replace one paste chip's label with its content, in place.
+    ///
+    /// An image chip has no text to expand into, so it declines.
     fn expand_chip(&mut self, index: usize) -> bool {
         let Some(chip) = self.chips.get(index).cloned() else {
             return false;
         };
-        self.text.replace_range(chip.start..chip.end, &chip.content);
+        let ChipPayload::Paste(content) = chip.payload else {
+            return false;
+        };
+        self.text.replace_range(chip.start..chip.end, &content);
         self.chips.remove(index);
-        self.cursor = chip.start + chip.content.len();
-        let delta = chip.content.len() as isize - (chip.end - chip.start) as isize;
+        self.cursor = chip.start + content.len();
+        let delta = content.len() as isize - (chip.end - chip.start) as isize;
         self.shift_chips(chip.end, delta);
         self.preferred_column = None;
         self.record(EditKind::Block);
@@ -604,11 +656,93 @@ impl ComposerBuffer {
                 continue;
             }
             out.push_str(&self.text[cursor..chip.start]);
-            out.push_str(&chip.content);
+            // An image chip is an attachment, not text: its label is dropped so
+            // the Agent is not told about a placeholder it cannot see.
+            if let ChipPayload::Paste(content) = &chip.payload {
+                out.push_str(content);
+            }
             cursor = chip.end;
         }
         out.push_str(&self.text[cursor..]);
         out
+    }
+
+    /// The images the draft carries, in the order they were attached.
+    pub fn images(&self) -> Vec<ImageAttachment> {
+        self.chips
+            .iter()
+            .filter_map(|chip| match &chip.payload {
+                ChipPayload::Image(image) => Some(image.clone()),
+                ChipPayload::Paste(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.chips
+            .iter()
+            .filter(|chip| matches!(chip.payload, ChipPayload::Image(_)))
+            .count()
+    }
+
+    /// Attach an image at the cursor, as `[Image #N]` and a trailing space.
+    ///
+    /// Returns the label it was given, or `None` when the draft already holds
+    /// as many images as a prompt should carry.
+    pub fn insert_image(
+        &mut self,
+        mime_type: impl Into<String>,
+        source: ImageSource,
+    ) -> Option<String> {
+        if self.image_count() >= IMAGE_CAP {
+            return None;
+        }
+        self.delete_selection();
+        let number = self.next_image_number;
+        self.next_image_number += 1;
+        let label = format!("[Image #{number}]");
+        let start = self.cursor;
+        self.text.insert_str(start, &label);
+        let end = start + label.len();
+        self.cursor = end;
+        self.preferred_column = None;
+        self.reshape_chips(start, start);
+        self.shift_chips(start, label.len() as isize);
+        self.chips.push(Chip {
+            start,
+            end,
+            label: label.clone(),
+            payload: ChipPayload::Image(ImageAttachment {
+                label: label.clone(),
+                mime_type: mime_type.into(),
+                source,
+            }),
+        });
+        self.chips.sort_by_key(|chip| chip.start);
+        self.record(EditKind::Block);
+        Some(label)
+    }
+
+    /// Load a draft that was taken away earlier: its text, then the images it
+    /// carried, put back at the end.
+    ///
+    /// The labels are regenerated rather than remembered: a label is only a
+    /// number, and what matters is that the picture reaches the Agent.
+    pub fn set_draft(&mut self, text: impl Into<String>, images: Vec<ImageAttachment>) {
+        self.set_text(text);
+        for image in images {
+            self.insert_image(image.mime_type, image.source);
+        }
+    }
+
+    /// Take the text and the images out together, leaving an empty buffer.
+    ///
+    /// The two travel as one value because the message is one thing: a caller
+    /// that took the text and then asked for the images could lose them to an
+    /// intervening edit.
+    pub fn take_with_attachments(&mut self) -> (String, Vec<ImageAttachment>) {
+        let images = self.images();
+        (self.take_expanded(), images)
     }
 
     /// Take the expanded text out, leaving an empty buffer.
@@ -619,6 +753,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.next_image_number = 1;
         self.record(EditKind::Block);
         text
     }
@@ -680,6 +815,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.next_image_number = 1;
         self.record(EditKind::Block);
     }
 
@@ -689,6 +825,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.next_image_number = 1;
         self.record(EditKind::Block);
     }
 
@@ -699,6 +836,7 @@ impl ComposerBuffer {
         self.preferred_column = None;
         self.selection = None;
         self.chips.clear();
+        self.next_image_number = 1;
         self.record(EditKind::Block);
         text
     }
@@ -1320,6 +1458,44 @@ impl ComposerBuffer {
             .into_iter()
             .map(|row| (row.text, row.cursor_line))
             .collect()
+    }
+}
+
+/// The wire form of an attached image.
+///
+/// An image read from the clipboard has nowhere to live but the message, so it
+/// travels as a data URL; a file the runtime can read itself is passed by path
+/// and never copied through the client.
+pub fn message_attachment(image: &ImageAttachment) -> vibex_core::MessageAttachment {
+    let uri = match &image.source {
+        ImageSource::Path(path) => path.clone(),
+        ImageSource::Bytes(bytes) => format!(
+            "data:{};base64,{}",
+            image.mime_type,
+            crate::terminal::encode_base64(bytes)
+        ),
+    };
+    vibex_core::MessageAttachment {
+        label: image.label.clone(),
+        mime_type: Some(image.mime_type.clone()),
+        uri: Some(uri),
+        inline_text_offset: None,
+    }
+}
+
+/// The image type for a path, when its extension names one.
+pub fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
     }
 }
 
@@ -1991,6 +2167,143 @@ mod tests {
         assert_eq!(buffer.selection(), Some((0, 3)));
         buffer.extend_word_right();
         assert_eq!(buffer.selection(), Some((0, 7)));
+    }
+
+    /// The bytes a clipboard image would arrive with.
+    fn png_bytes() -> Vec<u8> {
+        vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+    }
+
+    #[test]
+    fn an_image_attaches_as_a_chip_and_leaves_the_text() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("look at this ");
+        let label = buffer
+            .insert_image(
+                "image/png",
+                ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+            )
+            .expect("the first image fits");
+        assert_eq!(label, "[Image #1]");
+        assert_eq!(buffer.text(), "look at this [Image #1]");
+        assert_eq!(buffer.image_count(), 1);
+        // The label is a placeholder: what the Agent receives is the picture.
+        assert_eq!(buffer.expanded_text(), "look at this ");
+        let images = buffer.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].label, "[Image #1]");
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn an_image_chip_is_one_object() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("before ");
+        buffer.insert_image("image/png", ImageSource::Path("/tmp/a.png".into()));
+        assert_eq!(buffer.text(), "before [Image #1]");
+        // The cursor sits just past the label, so one press removes all of it.
+        assert!(buffer.backspace());
+        assert_eq!(buffer.text(), "before ");
+        assert_eq!(buffer.image_count(), 0);
+    }
+
+    #[test]
+    fn a_draft_taken_for_sending_carries_its_images() {
+        let mut buffer = ComposerBuffer::default();
+        buffer.insert_str("see ");
+        buffer.insert_image("image/png", ImageSource::Path("/tmp/shot.png".into()));
+        let (text, images) = buffer.take_with_attachments();
+        assert_eq!(text, "see ");
+        assert_eq!(images.len(), 1);
+        assert!(buffer.text().is_empty());
+        assert_eq!(buffer.image_count(), 0);
+    }
+
+    #[test]
+    fn the_image_cap_refuses_the_eleventh() {
+        let mut buffer = ComposerBuffer::default();
+        for index in 0..IMAGE_CAP {
+            assert!(
+                buffer
+                    .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
+                    .is_some(),
+                "image {index} was refused below the cap"
+            );
+        }
+        assert!(buffer.image_count() == IMAGE_CAP);
+        assert!(
+            buffer
+                .insert_image("image/png", ImageSource::Path("/tmp/a.png".into()))
+                .is_none(),
+            "the cap did not hold"
+        );
+    }
+
+    #[test]
+    fn image_labels_are_not_recycled_within_a_draft() {
+        let mut buffer = ComposerBuffer::default();
+        assert_eq!(
+            buffer.insert_image("image/png", ImageSource::Path("/tmp/a.png".into())),
+            Some("[Image #1]".to_string())
+        );
+        buffer.move_to_start();
+        assert!(buffer.delete());
+        assert_eq!(buffer.image_count(), 0);
+        // The second image is #2: a number that once named a picture must never
+        // name a different one.
+        assert_eq!(
+            buffer.insert_image("image/png", ImageSource::Path("/tmp/b.png".into())),
+            Some("[Image #2]".to_string())
+        );
+        // Emptied, the draft starts counting again.
+        buffer.take_expanded();
+        assert_eq!(
+            buffer.insert_image("image/png", ImageSource::Path("/tmp/c.png".into())),
+            Some("[Image #1]".to_string())
+        );
+    }
+
+    #[test]
+    fn the_wire_form_of_an_image_is_a_path_or_a_data_url() {
+        let path = message_attachment(&ImageAttachment {
+            label: "[Image #1]".into(),
+            mime_type: "image/png".into(),
+            source: ImageSource::Path("/tmp/shot.png".into()),
+        });
+        assert_eq!(path.uri.as_deref(), Some("/tmp/shot.png"));
+        assert_eq!(path.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(path.label, "[Image #1]");
+
+        let bytes = message_attachment(&ImageAttachment {
+            label: "[Image #2]".into(),
+            mime_type: "image/png".into(),
+            source: ImageSource::Bytes(std::sync::Arc::new(png_bytes())),
+        });
+        assert_eq!(
+            bytes.uri.as_deref(),
+            Some("data:image/png;base64,iVBORw0KGgo=")
+        );
+    }
+
+    #[test]
+    fn restoring_a_draft_puts_its_images_back() {
+        let mut buffer = ComposerBuffer::default();
+        let image = ImageAttachment {
+            label: "[Image #1]".into(),
+            mime_type: "image/png".into(),
+            source: ImageSource::Path("/tmp/shot.png".into()),
+        };
+        buffer.set_draft("see this ", vec![image]);
+        assert_eq!(buffer.text(), "see this [Image #1]");
+        assert_eq!(buffer.image_count(), 1);
+    }
+
+    #[test]
+    fn only_an_image_extension_names_an_image() {
+        assert_eq!(image_mime_for_path("/tmp/a.PNG"), Some("image/png"));
+        assert_eq!(image_mime_for_path("/tmp/a.jpeg"), Some("image/jpeg"));
+        assert_eq!(image_mime_for_path("/tmp/a.txt"), None);
+        assert_eq!(image_mime_for_path("/tmp/a"), None);
     }
 
     #[test]

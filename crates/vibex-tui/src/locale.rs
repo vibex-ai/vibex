@@ -274,6 +274,30 @@ strings! {
         "草稿中还没有剪切过内容",
         "草稿中還沒有剪下過內容"
     },
+    image_attached => { "Image attached", "已附加图片", "已附加圖片" },
+    image_not_found => { "No such image file", "找不到该图片文件", "找不到該圖片檔案" },
+    image_unsupported => {
+        "That file is not an image this client can attach",
+        "该文件不是本客户端可附加的图片格式",
+        "該檔案不是本客戶端可附加的圖片格式"
+    },
+    image_too_large => {
+        "Image is larger than 5 MB",
+        "图片超过 5 MB",
+        "圖片超過 5 MB"
+    },
+    image_cap => {
+        "A prompt can carry at most 10 images",
+        "一条消息最多附加 10 张图片",
+        "一則訊息最多附加 10 張圖片"
+    },
+    image_clipboard_empty => {
+        "No image on the clipboard — type a path instead",
+        "剪贴板里没有图片 — 请改为输入路径",
+        "剪貼簿裡沒有圖片 — 請改為輸入路徑"
+    },
+    image_path_title => { "Image path", "图片路径", "圖片路徑" },
+    image_count => { "images", "张图片", "張圖片" },
     composer_nothing_selected => {
         "Select part of the draft first",
         "请先选中草稿中的内容",

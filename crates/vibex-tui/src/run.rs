@@ -137,6 +137,16 @@ fn event_loop(
                             search.set_query(query);
                         }
                         app.refresh_search_matches();
+                    } else if let Some(path) = crate::app::App::image_path_from_paste(&text) {
+                        // A pasted path to a picture is a request to attach it,
+                        // not to write its name into the prompt.
+                        match app.attach_image_path(&path) {
+                            Ok(label) => {
+                                let message = format!("{} {label}", app.strings.image_attached());
+                                app.toast(Toast::success(message));
+                            }
+                            Err(error) => app.toast(Toast::warning(error)),
+                        }
                     } else {
                         // A big paste collapses into a chip so the draft stays
                         // readable; the bytes are put back when it is sent.
@@ -182,10 +192,14 @@ fn event_loop(
         // A turn that has ended releases the next held message. Checked here,
         // after worker results have been applied, because that is the only
         // moment the session's state can have changed.
-        if let Some(text) = app.drain_queue()
+        if let Some((text, attachments)) = app.drain_queue()
             && let Some(session_id) = app.selected_session_id().cloned()
         {
-            worker.dispatch(crate::app::Effect::SendMessage { session_id, text });
+            worker.dispatch(crate::app::Effect::SendMessage {
+                session_id,
+                text,
+                attachments,
+            });
             dirty = true;
         }
 
@@ -1163,6 +1177,25 @@ fn mouse_cell_clamped(app: &mut App, column: u16, row: u16) -> Option<(usize, u1
 
 fn apply_message(app: &mut App, message: AppMessage) -> BackendResult<()> {
     match message {
+        AppMessage::ClipboardImage(image) => match image {
+            Some((mime_type, bytes)) => match app.attach_image_bytes(mime_type, bytes) {
+                Ok(label) => {
+                    let message = format!("{} {label}", app.strings.image_attached());
+                    app.toast(Toast::success(message));
+                }
+                Err(error) => app.toast(Toast::warning(error)),
+            },
+            // No clipboard image: the reader can still name a file, and saying
+            // so is better than a key that appears to do nothing.
+            None => {
+                app.overlay = Some(crate::app::Overlay::Prompt {
+                    title: app.strings.image_path_title().to_string(),
+                    field: crate::app::PromptField::ImagePath,
+                    value: String::new(),
+                });
+                app.toast(Toast::info(app.strings.image_clipboard_empty().to_string()));
+            }
+        },
         AppMessage::Sessions(result) => {
             if let Err(error) = app.agent.apply_sessions(result) {
                 app.toast(Toast::danger(error.message));

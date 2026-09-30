@@ -1485,7 +1485,7 @@ fn render_queue_band(
             ),
             Span::styled(
                 truncate_to_width(
-                    message.lines().next().unwrap_or_default(),
+                    message.text.lines().next().unwrap_or_default(),
                     usize::from(area.width).saturating_sub(6),
                     "…",
                 ),
@@ -2488,6 +2488,16 @@ fn render_composer_info(
         left.push(Span::styled(
             strings.running().to_string(),
             Style::default().fg(theme.roles.accent_running),
+        ));
+    }
+    // Attached images are invisible in the draft beyond their labels, so the
+    // info line is where the count becomes a number the reader can check.
+    let images = app.composer.image_count();
+    if images > 0 {
+        left.push(sep(theme));
+        left.push(Span::styled(
+            format!("🖼 {images} {}", strings.image_count()),
+            flag(theme),
         ));
     }
     let pending = app.pending_permission_count();
