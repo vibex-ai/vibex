@@ -332,6 +332,21 @@ is never a column count.
   nothing and says `bad pattern`, zero-width matches are skipped. Matches are
   highlighted by splitting the *rendered* line, so markdown that renders away
   cannot shift a match.
+* **History pages in both directions, with the cursor as the contract.**
+  `FetchTimelineRequest` carries `after_sequence` or `before_sequence` (never
+  both; `after` wins), and the response's `has_older` is the only thing that
+  authorises another backward request. The controller owns the lifecycle in a
+  ticket: it refuses while a page is in flight or older history is exhausted,
+  validates that every item of a backward page is older than the cursor — serde
+  ignores unknown fields, so a backend that predates the cursor would otherwise
+  answer with the newest page — and turns paging off permanently when that
+  happens rather than retrying per gesture. A prepend trims from the *newest*
+  end at the item budget, because the oldest items are what was just fetched.
+* **A prepend anchors the viewport by block id, not by offset.** `ScrollState`
+  counts display lines from the top, so inserting a page above the viewport
+  moves everything the reader was looking at. `sync_transcript` only re-anchors
+  when a prepend actually happened, and it anchors to the block id that was on
+  the first visible line.
 * **A mouse text selection copies through OSC 52** — the same route as every
   other copy, so no clipboard crate enters the dependency graph. A selection is
   `(display line, column)` in the published transcript rect, extracted through
