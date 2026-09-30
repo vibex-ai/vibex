@@ -18,6 +18,7 @@
 //! keymap    one binding table per scope: dispatch + key bar + help
 //! layout    the screen as a vertical stack of full-width bands
 //! glyphs    the chrome glyph vocabulary, with per-terminal fallbacks
+//! modal     the one chrome every popup is drawn through
 //! composer  the edit buffer, completion triggers and history
 //! transcript block cache, incremental layout, viewport-only rendering
 //! view      page shells, overlays, the key bar
@@ -36,6 +37,7 @@ pub mod keymap;
 pub mod layout;
 pub mod locale;
 pub mod markdown;
+pub mod modal;
 pub mod reduce;
 pub mod run;
 pub mod terminal;

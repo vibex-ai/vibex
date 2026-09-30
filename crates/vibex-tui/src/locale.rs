@@ -93,6 +93,23 @@ strings! {
     archived => { "Archived", "已归档", "已封存" },
     copied => { "Copied", "已复制", "已複製" },
     nothing_here => { "Nothing here yet", "这里还没有内容", "這裡還沒有內容" },
+    // Footer verbs. They are shorter than the destination labels because a
+    // modal footer is a key legend, not a sentence.
+    hint_nav => { "nav", "移动", "移動" },
+    hint_select => { "select", "选择", "選擇" },
+    hint_scroll => { "scroll", "滚动", "捲動" },
+    hint_run => { "run", "执行", "執行" },
+    hint_expand => { "expand", "展开", "展開" },
+    hint_collapse => { "collapse", "收起", "收合" },
+    hint_toggle => { "toggle", "切换", "切換" },
+    hint_edit => { "edit", "编辑", "編輯" },
+    hint_previous => { "prev", "上一个", "上一個" },
+    hint_next => { "next", "下一个", "下一個" },
+    hint_clear => { "clear", "清空", "清空" },
+    hint_commit => { "keep", "保留", "保留" },
+    hint_revert => { "revert", "还原", "還原" },
+    hint_reset => { "reset", "重置", "重設" },
+    hint_confirm_delete => { "confirm delete", "确认删除", "確認刪除" },
 
     // ---- destinations ---------------------------------------------------
     nav_sessions => { "Sessions", "会话", "工作階段" },

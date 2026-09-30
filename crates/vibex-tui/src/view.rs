@@ -13,33 +13,9 @@ use qrcode::render::unicode::Dense1x2;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
-
-/// A block whose border glyphs match the terminal's capability.
-///
-/// A non-UTF-8 locale must still get a usable frame, so the box-drawing set is
-/// swapped for `+-|` rather than assuming the glyphs will render.
-fn bordered(theme: &TuiTheme) -> Block<'static> {
-    let block = Block::default().borders(Borders::ALL);
-    match theme.glyphs() {
-        GlyphMode::Unicode => block.border_type(BorderType::Rounded),
-        GlyphMode::Ascii => block
-            .border_type(BorderType::Plain)
-            .border_set(border::Set {
-                top_left: "+",
-                top_right: "+",
-                bottom_left: "+",
-                bottom_right: "+",
-                horizontal_top: "-",
-                horizontal_bottom: "-",
-                vertical_left: "|",
-                vertical_right: "|",
-            }),
-    }
-}
 use vibex_ui::shell::ShellKind;
 
 use crate::action::Intent;
@@ -50,8 +26,17 @@ use crate::app::{
 use crate::keymap::Scope;
 use crate::layout::{Bands, MIN_RAIL_TURNS};
 use crate::locale::Strings;
+use crate::modal::{self, ModalChrome, ModalHint, ModalSizing};
 use crate::text::{display_width, truncate_to_width};
-use crate::theme::{GlyphMode, TuiTheme};
+use crate::theme::TuiTheme;
+
+/// A block whose border glyphs match the terminal's capability.
+///
+/// A non-UTF-8 locale must still get a usable frame, so the box-drawing set is
+/// swapped for `+-|` rather than assuming the glyphs will render.
+fn bordered(theme: &TuiTheme) -> Block<'static> {
+    modal::border_block(theme)
+}
 
 /// Which seat the client is attached by. Decided by the composition root, not
 /// by the library.
@@ -2386,17 +2371,23 @@ fn render_overlay(
     match overlay {
         Overlay::Palette { query, selected } => {
             let matches = palette_matches(query, strings);
-            let height = (matches.len() as u16 + 4).min(area.height.saturating_sub(4));
-            let width = area.width.saturating_sub(8).min(72);
-            let rect = centered(area, width, height);
-            frame.render_widget(Clear, rect);
-            let block = overlay_block(theme, strings.palette_title());
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+            let chrome = modal_chrome(
+                app,
+                strings.palette_title(),
+                ModalSizing::palette(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.hint_run()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(inner);
+                .split(layout.content);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("> ", theme.accent()),
@@ -2425,15 +2416,18 @@ fn render_overlay(
             frame.render_stateful_widget(List::new(items), rows[1], &mut state);
         }
         Overlay::Help { scroll, .. } => {
-            let rect = centered(
-                area,
-                area.width.saturating_sub(8).min(90),
-                area.height.saturating_sub(6),
+            let chrome = modal_chrome(
+                app,
+                strings.help_title(),
+                ModalSizing::large(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_scroll()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
             );
-            frame.render_widget(Clear, rect);
-            let block = overlay_block(theme, strings.help_title());
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
             let mut lines = Vec::new();
             for binding in app.keymap.bindings() {
                 let Some(label) = binding.label else { continue };
@@ -2451,16 +2445,23 @@ fn render_overlay(
             let visible = lines
                 .into_iter()
                 .skip(offset)
-                .take(usize::from(inner.height))
+                .take(usize::from(layout.content.height))
                 .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+            frame.render_widget(Paragraph::new(Text::from(visible)), layout.content);
         }
         Overlay::Confirm { title, body, .. } => {
-            let rect = centered(area, 64.min(area.width.saturating_sub(4)), 7);
-            frame.render_widget(Clear, rect);
-            let block = overlay_block(theme, title);
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+            let chrome = modal_chrome(
+                app,
+                title,
+                ModalSizing::prompt(),
+                vec![
+                    ModalHint::new("Enter", strings.confirm()),
+                    ModalHint::new("Esc", strings.cancel()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
                     Line::from(Span::styled(body.clone(), theme.base())),
@@ -2474,7 +2475,7 @@ fn render_overlay(
                     ]),
                 ]))
                 .wrap(Wrap { trim: true }),
-                inner,
+                layout.content,
             );
         }
         Overlay::Prompt {
@@ -2482,11 +2483,18 @@ fn render_overlay(
             value,
             field,
         } => {
-            let rect = centered(area, 64.min(area.width.saturating_sub(4)), 6);
-            frame.render_widget(Clear, rect);
-            let block = overlay_block(theme, title);
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+            let chrome = modal_chrome(
+                app,
+                title,
+                ModalSizing::prompt(),
+                vec![
+                    ModalHint::new("Enter", strings.confirm()),
+                    ModalHint::new("Esc", strings.cancel()),
+                ],
+            );
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
             let masked = matches!(field, crate::app::PromptField::ProviderSecret);
             let shown = if masked {
                 "•".repeat(value.chars().count())
@@ -2502,7 +2510,7 @@ fn render_overlay(
             }
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-                inner,
+                layout.content,
             );
         }
         Overlay::Approval { selected } => render_approval(frame, area, app, *selected, theme),
@@ -2520,15 +2528,19 @@ fn render_overlay(
                 .as_ref()
                 .map(|catalog| catalog.options.clone())
                 .unwrap_or_default();
-            let rect = centered(
-                area,
-                72.min(area.width.saturating_sub(4)),
-                (options.len() as u16 + 3).min(area.height.saturating_sub(4)),
+            let chrome = modal_chrome(
+                app,
+                strings.runtime_title(),
+                ModalSizing::picker(),
+                vec![
+                    ModalHint::new("↑↓", strings.hint_nav()),
+                    ModalHint::new("Enter", strings.hint_select()),
+                    ModalHint::new("Esc", strings.close()),
+                ],
             );
-            frame.render_widget(Clear, rect);
-            let block = overlay_block(theme, strings.runtime_title());
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
+            let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+                return;
+            };
             let items = options
                 .iter()
                 .enumerate()
@@ -2553,19 +2565,19 @@ fn render_overlay(
                 .collect::<Vec<_>>();
             let mut state = ratatui::widgets::ListState::default();
             state.select(Some((*selected).min(options.len().saturating_sub(1))));
-            frame.render_stateful_widget(List::new(items), inner, &mut state);
+            frame.render_stateful_widget(List::new(items), layout.content, &mut state);
         }
         Overlay::BlockDetails { block, scroll } => {
             let detail = block_detail_text(&mut app.transcript, *block);
             if let Some((title, body)) = detail {
-                render_text_view(frame, area, &title, &body, *scroll, theme);
+                render_text_view(frame, area, app, &title, &body, *scroll, theme);
             }
         }
         Overlay::TextView {
             title,
             body,
             scroll,
-        } => render_text_view(frame, area, title, body, *scroll, theme),
+        } => render_text_view(frame, area, app, title, body, *scroll, theme),
     }
 }
 
@@ -2581,9 +2593,6 @@ fn render_approval(
     let Some(approval) = approvals.get(selected) else {
         return;
     };
-    let height = (approval.details.len() as u16 + 8).min(area.height.saturating_sub(4));
-    let rect = centered(area, area.width.saturating_sub(8).min(80), height.max(8));
-    frame.render_widget(Clear, rect);
     // The risk taxonomy is the provider's; the terminal only maps it onto how
     // loudly the card should read.
     let risk = match approval.risk_category {
@@ -2596,17 +2605,25 @@ fn render_approval(
         vibex_core::PermissionRiskCategory::Network => strings.risk_high(),
         vibex_core::PermissionRiskCategory::ProviderConfigExport => strings.risk_high(),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(theme.warning())
-        .style(theme.base())
-        .title(Span::styled(
-            format!(" ⚠ {} ", strings.approval_title()),
-            theme.warning().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let title = format!(
+        "{0} {1}",
+        crate::glyphs::diamond_filled(app.glyph_tier()),
+        strings.approval_title()
+    );
+    let chrome = modal_chrome(
+        app,
+        &title,
+        ModalSizing::card(),
+        vec![
+            ModalHint::new("a", strings.approval_allow()),
+            ModalHint::new("d", strings.approval_deny()),
+            ModalHint::new("Ctrl+A", strings.approval_always()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+        return;
+    };
 
     let mut lines = vec![
         Line::from(Span::styled(approval.title.clone(), theme.strong())),
@@ -2622,7 +2639,7 @@ fn render_approval(
             Span::styled(
                 truncate_to_width(
                     value,
-                    usize::from(inner.width).saturating_sub(label.len() + 4),
+                    usize::from(layout.content.width).saturating_sub(label.len() + 4),
                     "…",
                 ),
                 theme.base(),
@@ -2653,7 +2670,7 @@ fn render_approval(
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        inner,
+        layout.content,
     );
 }
 
@@ -2670,20 +2687,20 @@ fn render_elicitation(
         return;
     };
     let request = surface.request.clone();
-    let height = (request.fields.len() as u16 * 2 + 6).min(area.height.saturating_sub(4));
-    let rect = centered(area, area.width.saturating_sub(8).min(80), height.max(8));
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(theme.warning())
-        .style(theme.base())
-        .title(Span::styled(
-            format!(" {} ", strings.elicitation_title()),
-            theme.warning().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let chrome = modal_chrome(
+        app,
+        strings.elicitation_title(),
+        ModalSizing::card(),
+        vec![
+            ModalHint::new("Tab", strings.hint_next()),
+            ModalHint::new("Shift+Tab", strings.hint_previous()),
+            ModalHint::new("Enter", strings.elicitation_submit()),
+            ModalHint::new("Esc", strings.close()),
+        ],
+    );
+    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+        return;
+    };
 
     let mut lines = Vec::new();
     if let Some(title) = request.title.as_ref().filter(|title| !title.is_empty()) {
@@ -2732,7 +2749,7 @@ fn render_elicitation(
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),
-        inner,
+        layout.content,
     );
 }
 
@@ -2784,27 +2801,19 @@ fn render_pairing(
     theme: &TuiTheme,
 ) {
     let strings = app.strings;
-    let rect = centered(
-        area,
-        area.width.saturating_sub(8).min(76),
-        area.height.saturating_sub(6),
+    let chrome = modal_chrome(
+        app,
+        strings.devices_pairing_code(),
+        ModalSizing::picker(),
+        vec![ModalHint::new("Esc", strings.close())],
     );
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(theme.accent())
-        .style(theme.base())
-        .title(Span::styled(
-            format!(" {} ", strings.devices_pairing_code()),
-            theme.strong(),
-        ));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+        return;
+    };
     let rows = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(24), Constraint::Length(46)])
-        .split(inner);
+        .split(layout.content);
 
     let permission_label = match permission {
         vibex_core::RemoteDevicePermissionLevel::ReadOnly => strings.permission_read_only(),
@@ -2841,24 +2850,28 @@ fn render_pairing(
 fn render_text_view(
     frame: &mut Frame<'_>,
     area: Rect,
+    app: &App,
     title: &str,
     body: &str,
     scroll: usize,
     theme: &TuiTheme,
 ) {
-    let rect = centered(
-        area,
-        area.width.saturating_sub(6),
-        area.height.saturating_sub(4),
+    let chrome = modal_chrome(
+        app,
+        title,
+        ModalSizing::document(),
+        vec![
+            ModalHint::new("↑↓", strings_of(app).hint_scroll()),
+            ModalHint::new("Esc", strings_of(app).close()),
+        ],
     );
-    frame.render_widget(Clear, rect);
-    let block = overlay_block(theme, title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let Some(layout) = modal::render_modal(frame, area, &chrome, theme) else {
+        return;
+    };
     let lines = body
         .split('\n')
         .skip(scroll)
-        .take(usize::from(inner.height))
+        .take(usize::from(layout.content.height))
         .map(|line| {
             let style = if line.starts_with('+') && !line.starts_with("+++") {
                 theme.success()
@@ -2870,30 +2883,27 @@ fn render_text_view(
                 theme.base()
             };
             Line::from(Span::styled(
-                truncate_to_width(line, usize::from(inner.width), "…"),
+                truncate_to_width(line, usize::from(layout.content.width), "…"),
                 style,
             ))
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)), layout.content);
 }
 
-fn overlay_block(theme: &TuiTheme, title: &str) -> Block<'static> {
-    bordered(theme)
-        .border_style(theme.focus_style())
-        .style(theme.base())
-        .title(Span::styled(format!(" {title} "), theme.strong()))
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
+/// Build a modal's chrome, giving the margins back on a compact terminal.
+fn modal_chrome<'a>(
+    app: &App,
+    title: &'a str,
+    sizing: ModalSizing,
+    hints: Vec<ModalHint>,
+) -> ModalChrome<'a> {
+    let sizing = if app.is_compact() {
+        sizing.compact()
+    } else {
+        sizing
+    };
+    ModalChrome::new(title, sizing).hints(hints)
 }
 
 /// The message shown when the terminal cannot host the interface at all.
@@ -3006,9 +3016,9 @@ mod tests {
     }
 
     #[test]
-    fn centered_rects_stay_inside_the_frame() {
+    fn modal_rects_stay_inside_the_frame() {
         let area = Rect::new(0, 0, 80, 24);
-        let rect = centered(area, 200, 100);
+        let rect = modal::dimensions(area, ModalSizing::document());
         assert!(rect.right() <= area.right());
         assert!(rect.bottom() <= area.bottom());
     }

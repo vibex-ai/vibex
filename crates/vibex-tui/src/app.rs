@@ -387,6 +387,9 @@ pub struct App {
     /// The crossterm-reported terminal size, used by renderers that need to
     /// make a layout decision before the frame buffer exists.
     pub viewport: (u16, u16),
+    /// Regions the last frame published for mouse hit-testing: the transcript
+    /// band and the close affordance of the modal, when one is open.
+    pub regions: FrameRegions,
 
     /// Runtime catalog, kept for the runtime picker.
     pub runtime_options: Option<vibex_core::SessionRuntimeOptionCatalog>,
@@ -435,6 +438,20 @@ pub enum ComposerMode {
 pub struct Banner {
     pub text: String,
     pub tone: BannerTone,
+}
+
+/// Regions the last frame painted, kept so a mouse event can be mapped back to
+/// the thing under the pointer.
+///
+/// The renderer is the only code that knows where a band landed, so it
+/// publishes what the mouse layer needs rather than the mouse layer
+/// recomputing the layout with a second copy of the maths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameRegions {
+    /// The transcript rectangle, excluding the gutter.
+    pub scrollback: ratatui::layout::Rect,
+    /// The close affordance on the open modal's top border.
+    pub modal_close: Option<ratatui::layout::Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +553,7 @@ impl App {
             diff_text: None,
             text_view: None,
             viewport: (120, 40),
+            regions: FrameRegions::default(),
             runtime_options: None,
             workspace_path: None,
             elicitation_draft: crate::reduce::ElicitationDraft::default(),
@@ -730,6 +748,11 @@ impl App {
                 .collapsed_ids
                 .insert(project_id.to_string());
         }
+    }
+
+    /// Whether the terminal is narrow enough that chrome must give way.
+    pub fn is_compact(&self) -> bool {
+        self.shell == ShellKind::Compact
     }
 
     /// Which glyph tier the terminal can render.
