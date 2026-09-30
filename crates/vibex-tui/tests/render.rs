@@ -1268,7 +1268,8 @@ fn markdown_styling_reaches_the_screen() {
     let mut block = seeded_block(
         "styled-body",
         TimelineRowKind::AgentMessage,
-        "### 渲染标题\n\n正文里有 `inline_code` 片段，还有 **重点** 内容。",
+        "### 渲染标题\n\n正文里有 `inline_code` 片段，还有 **重点** 内容。\n\n\
+         升级 `vibex-tui` 到 `0.1.0-rc.7`，改 `crates/vibex-tui/src/view.rs`。",
     );
     block.expanded = true;
     block.collapsible = true;
@@ -1360,6 +1361,37 @@ fn markdown_styling_reaches_the_screen() {
             .iter()
             .all(|cell| cell.style().bg != Some(roles.code_background)),
         "an inline literal still wears a code background:\n{screen}"
+    );
+
+    // A literal is coloured by what it is, so the version and the path in one
+    // sentence are findable at a glance rather than by reading the line.
+    let span_colour = |needle: &str| {
+        let row = rows
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is on screen:\n{screen}"));
+        // Column, not byte offset: the row is full of double-width glyphs.
+        let byte = rows[row].find(needle).expect("the needle is in the row");
+        let column = vibex_tui::text::display_width(&rows[row][..byte]).min(119) as u16;
+        (column..120)
+            .filter_map(|column| buffer.cell((column, row as u16)))
+            .find(|cell| cell.symbol().chars().any(char::is_alphanumeric))
+            .and_then(|cell| cell.style().fg)
+    };
+    assert_eq!(
+        span_colour("vibex-tui "),
+        Some(theme.markdown.code),
+        "an identifier is not drawn as code:\n{screen}"
+    );
+    assert_eq!(
+        span_colour("0.1.0-rc.7"),
+        Some(theme.markdown.code_number),
+        "a version is not drawn as a number:\n{screen}"
+    );
+    assert_eq!(
+        span_colour("crates/vibex-tui/src/view.rs"),
+        Some(theme.markdown.code_path),
+        "a path is not drawn as a path:\n{screen}"
     );
 }
 

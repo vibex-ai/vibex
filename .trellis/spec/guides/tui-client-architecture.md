@@ -286,13 +286,27 @@ Measured contract: with no input and no events the loop produces **zero frames**
 Folding happens *before* wrapping, so a collapsed block never pays for the lines
 it will not show.
 
+**A literal is coloured by what it is, not by the fact that it is code.** One
+colour for every code span is what makes a technical paragraph read as a single
+grey block: `cargo run -p vibex-tui`, `crates/vibex-tui/src/view.rs` and
+`0.1.0-rc.7` are three different kinds of fact, and a reader scanning for the
+version should not have to read every path to find it. `classify_literal` sorts
+a span into a count or version, a path, file or glob, and everything else, and
+the palette carries a hue for each — plus one for a token that is neither prose
+nor program text, which is where a keycap and an inline formula land. The
+classes are deliberately coarse and the rules deliberately conservative: a
+version has to *start* with a digit, so `deepseek-v4.1-flash` stays a name, and
+a file name has to look like one. A test asserts the hues stay distinct in every
+shipped theme, because a class the reader cannot tell apart is a class that is
+not there.
+
 **Markdown is coloured by syntax role, and the role decides the colour.** Body
 prose is `gray_bright`, one step below `foreground`. A heading level takes its
 own hue from the theme's chart ladder — three chromatic steps for levels 1–3,
 then the greys, because a document that nests deeper than three levels is
 outlining — which is what makes an outline legible at a glance and survives a
-terminal whose CJK face has no bold cut. Literals take the syntax palette's code
-colour with no background of their own; links their own accent; and everything
+terminal whose CJK face has no bold cut. Literals take their class's colour from the syntax
+palette with no background of their own; links their own accent; and everything
 that is punctuation rather than content — bullets, ordered markers, task boxes,
 quote bars, thematic breaks, table borders — one muted step. Emphasis is weight
 and slant only: colour keeps meaning "this is a different kind of thing".

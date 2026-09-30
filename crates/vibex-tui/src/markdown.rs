@@ -54,6 +54,86 @@ impl RenderedMarkdown {
     }
 }
 
+/// What kind of thing an inline literal is.
+///
+/// One colour for every code span is what makes a technical paragraph read as a
+/// single grey block: `cargo run -p vibex-tui`, `crates/vibex-tui/src/view.rs`
+/// and `0.1.0-rc.7` are three different kinds of fact, and a reader scanning for
+/// the version should not have to read the paths to find it. The classes are
+/// deliberately coarse — a count, a path, and everything else — so a span is
+/// never coloured in a way the reader has to work out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteralKind {
+    /// A count, a version, a port, a duration: `384`, `1.97.0`, `v0.1.0-rc.7`.
+    Number,
+    /// A path, a file, a glob: `crates/vibex-tui`, `AGENTS.md`, `apps/*`.
+    Path,
+    /// Everything else: an identifier, a keyword, an expression, a flag.
+    Code,
+}
+
+/// Classify an inline literal so it can be coloured by what it is.
+pub fn classify_literal(text: &str) -> LiteralKind {
+    let text = text.trim();
+    if text.is_empty() {
+        return LiteralKind::Code;
+    }
+    if is_number_like(text) {
+        return LiteralKind::Number;
+    }
+    if is_path_like(text) {
+        return LiteralKind::Path;
+    }
+    LiteralKind::Code
+}
+
+/// Digits with separators, an optional `v` prefix and an `-rc1`-style suffix.
+///
+/// The text has to *start* with a digit: `deepseek-v4.1-flash` is a name that
+/// happens to contain a number, not a version.
+fn is_number_like(text: &str) -> bool {
+    let body = text.strip_prefix(['v', 'V']).unwrap_or(text);
+    if !body.starts_with(|character: char| character.is_ascii_digit()) {
+        return false;
+    }
+    body.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+    })
+}
+
+/// A slash, a glob, a leading dot, or a file name with a short extension.
+fn is_path_like(text: &str) -> bool {
+    if text.contains(['/', '\\', '*']) {
+        return true;
+    }
+    if text.starts_with(['.', '~']) {
+        return true;
+    }
+    if text.contains(char::is_whitespace) {
+        return false;
+    }
+    // `composer.rs:1230` names a file and a line in it.
+    let text = match text.rsplit_once(':') {
+        Some((head, tail))
+            if !tail.is_empty() && tail.chars().all(|character| character.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => text,
+    };
+    match text.rsplit_once('.') {
+        Some((stem, extension)) => {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 6
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
 /// Render markdown at a given width.
 pub fn render_markdown(
     source: &str,
@@ -893,11 +973,16 @@ impl<'a> Builder<'a> {
             Inline::Code(text) => {
                 // No backticks: the colour is the marker. A literal takes the
                 // syntax palette's own colour rather than a background, so a
-                // sentence with three code spans in it stays a sentence.
-                out.push(Span::styled(
-                    text.clone(),
-                    Style::default().fg(self.theme.markdown.code),
-                ));
+                // sentence with three code spans in it stays a sentence — and
+                // the colour says which *kind* of literal it is, so the version
+                // in a paragraph is findable without reading the paths.
+                let palette = self.theme.markdown;
+                let colour = match classify_literal(text) {
+                    LiteralKind::Number => palette.code_number,
+                    LiteralKind::Path => palette.code_path,
+                    LiteralKind::Code => palette.code,
+                };
+                out.push(Span::styled(text.clone(), Style::default().fg(colour)));
             }
             Inline::Emphasis(children) => {
                 self.inlines_into(children, style.add_modifier(Modifier::ITALIC), out);
@@ -927,13 +1012,18 @@ impl<'a> Builder<'a> {
                 self.inlines_into(children, style.add_modifier(Modifier::REVERSED), out);
             }
             Inline::Keycap(children) => {
+                // A key is a token the reader has to find in the sentence, so
+                // it wears a colour rather than only brackets.
+                let key = style
+                    .fg(self.theme.markdown.special)
+                    .add_modifier(Modifier::BOLD);
                 let mut inner = Vec::new();
-                self.inlines_into(children, style.add_modifier(Modifier::BOLD), &mut inner);
+                self.inlines_into(children, key, &mut inner);
                 let text = inner
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>();
-                out.push(Span::styled(format!("[{text}]"), style));
+                out.push(Span::styled(format!("[{text}]"), key));
             }
             Inline::Link {
                 destination,
@@ -972,7 +1062,10 @@ impl<'a> Builder<'a> {
                 ));
             }
             Inline::Math(source) => {
-                out.push(Span::styled(format!("${source}$"), self.theme.accent()));
+                out.push(Span::styled(
+                    format!("${source}$"),
+                    Style::default().fg(self.theme.markdown.special),
+                ));
             }
             Inline::Break => out.push(Span::raw(" ")),
             Inline::FootnoteReference(label) => {
@@ -1786,6 +1879,81 @@ Second paragraph that arrives later.
         // A closed fence *is* settled.
         let closed = "```rust\ncode\n```\n\nnext\n";
         assert!(freeze_point(closed, 0) > 0, "a closed fence can freeze");
+    }
+
+    #[test]
+    fn literals_are_classified_by_what_they_are() {
+        let cases = [
+            ("384", LiteralKind::Number),
+            ("22", LiteralKind::Number),
+            ("1.97.0", LiteralKind::Number),
+            ("v0.1.0-rc.7", LiteralKind::Number),
+            ("0.1.0-rc.7", LiteralKind::Number),
+            ("AGPL-3.0+", LiteralKind::Code),
+            ("deepseek-v4.1-flash", LiteralKind::Code),
+            ("#1abc9c", LiteralKind::Code),
+            ("apps/desktop", LiteralKind::Path),
+            ("crates/vibex-tui/src/composer.rs", LiteralKind::Path),
+            ("composer.rs:1230", LiteralKind::Path),
+            ("apps/*", LiteralKind::Path),
+            ("AGENTS.md", LiteralKind::Path),
+            (".gitignore", LiteralKind::Path),
+            ("~/.vibex/tui-keys.toml", LiteralKind::Path),
+            ("e.g.", LiteralKind::Code),
+            ("i.e", LiteralKind::Path),
+            ("ThemeRole", LiteralKind::Code),
+            ("--locked", LiteralKind::Code),
+            ("std::io::Read", LiteralKind::Code),
+            ("", LiteralKind::Code),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                classify_literal(text),
+                expected,
+                "classified {text:?} wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paragraph_colours_its_literals_by_class() {
+        // The point of the classes: a reader scanning a paragraph for the
+        // version, the file, or the API name finds each by colour.
+        let theme = theme(ColorMode::TrueColor);
+        let rendered = render(
+            "Upgrade `vibex-tui` to `0.1.0-rc.7` in `crates/vibex-tui/Cargo.toml`.",
+            72,
+        );
+        let spans = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| (span.content.to_string(), span.style.fg))
+            .collect::<Vec<_>>();
+        let colour = |needle: &str| {
+            spans
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is not in {spans:?}"))
+                .1
+        };
+        assert_eq!(colour("vibex-tui"), Some(theme.markdown.code));
+        assert_eq!(colour("0.1.0-rc.7"), Some(theme.markdown.code_number));
+        assert_eq!(
+            colour("Cargo.toml"),
+            Some(theme.markdown.code_path),
+            "a file name is a path"
+        );
+        let roles = [
+            theme.markdown.code,
+            theme.markdown.code_number,
+            theme.markdown.code_path,
+        ];
+        for (index, left) in roles.iter().enumerate() {
+            for right in &roles[index + 1..] {
+                assert_ne!(left, right, "two literal classes share a colour");
+            }
+        }
     }
 
     #[test]

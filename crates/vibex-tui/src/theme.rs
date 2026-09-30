@@ -384,8 +384,17 @@ pub struct MarkdownPalette {
     /// a document rarely goes that deep, and when it does the deepest levels
     /// are structure, not emphasis.
     pub heading: [Color; 6],
-    /// Inline code and the body of a fenced block.
+    /// Inline code and the body of a fenced block: a literal that is a name or
+    /// an expression.
     pub code: Color,
+    /// A literal that is a count, a version or a measurement.
+    pub code_number: Color,
+    /// A literal that is a path, a file name or a glob.
+    pub code_path: Color,
+    /// A token that is neither prose nor program text: a key to press, a
+    /// formula. It gets the hue a type name gets, because that is what it is —
+    /// a name that belongs to the system rather than to the sentence.
+    pub special: Color,
     /// The language label on a fence, which names the literal rather than being
     /// one.
     pub code_language: Color,
@@ -422,6 +431,9 @@ pub struct SyntaxPalette {
     pub type_name: Option<Color>,
     /// `text.code.span`: the colour of a literal that is not being highlighted.
     pub code: Option<Color>,
+    /// `attribute`: a name that belongs to a system rather than to the program —
+    /// a path, a file, a field.
+    pub attribute: Option<Color>,
     /// `title`: a symbol definition or a heading inside code.
     pub title: Option<Color>,
 }
@@ -451,6 +463,7 @@ impl SyntaxPalette {
             function: lookup("function"),
             type_name: lookup("type"),
             code: lookup("text.code.span"),
+            attribute: lookup("attribute"),
             title: lookup("title"),
         }
     }
@@ -618,6 +631,21 @@ impl TuiTheme {
             code: syntax
                 .code
                 .unwrap_or_else(|| color(token("chart-category-3", 0x4bbf9a))),
+            // Numbers and paths are the two other things a sentence is full of
+            // once it mentions code, and one colour for all three is what makes
+            // a technical paragraph read as one grey block.
+            code_number: syntax
+                .number
+                .unwrap_or_else(|| color(token("chart-category-4", 0xd8a94a))),
+            code_path: syntax
+                .attribute
+                .unwrap_or_else(|| color(token("chart-category-2", 0x5aa6d8))),
+            // A theme may paint a type name and a literal the same colour; the
+            // palette cannot, or a keycap stops being findable in a sentence.
+            special: syntax
+                .type_name
+                .filter(|colour| Some(*colour) != syntax.code)
+                .unwrap_or_else(|| color(token("chart-category-9", 0x99a6f0))),
             code_language: color(mix_rgb(body_rgb, background_rgb, 0.3)),
             link: color(token("chart-category-2", 0x5aa6d8)),
             link_target: color(mix_rgb(body_rgb, background_rgb, 0.3)),
@@ -922,6 +950,14 @@ mod tests {
                     (markdown.heading[0], markdown.code),
                     (markdown.heading[0], markdown.link),
                     (markdown.code, markdown.link),
+                    // A literal is one of three kinds, and the three kinds are
+                    // what give a technical paragraph its relief.
+                    (markdown.code, markdown.code_number),
+                    (markdown.code, markdown.code_path),
+                    (markdown.code_number, markdown.code_path),
+                    (markdown.code_number, markdown.link),
+                    (markdown.special, markdown.link),
+                    (markdown.special, markdown.code),
                     (markdown.table_border, markdown.rule),
                 ] {
                     assert_ne!(
